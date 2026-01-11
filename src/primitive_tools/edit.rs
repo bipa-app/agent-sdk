@@ -165,3 +165,364 @@ fn truncate_string(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn create_test_tool(
+        fs: Arc<InMemoryFileSystem>,
+        capabilities: AgentCapabilities,
+    ) -> EditTool<InMemoryFileSystem> {
+        EditTool::new(fs, capabilities)
+    }
+
+    fn tool_ctx() -> ToolContext<()> {
+        ToolContext::new(())
+    }
+
+    // ===================
+    // Unit Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_edit_simple_replacement() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "Hello, World!").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "World",
+                    "new_string": "Rust"
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("1 occurrence"));
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "Hello, Rust!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_replace_all_true() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "foo bar foo baz foo").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "foo",
+                    "new_string": "qux",
+                    "replace_all": true
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("3 occurrence"));
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "qux bar qux baz qux");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_multiline_replacement() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.rs", "fn main() {\n    println!(\"Hello\");\n}")
+            .await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.rs",
+                    "old_string": "println!(\"Hello\");",
+                    "new_string": "println!(\"Hello, World!\");\n    println!(\"Goodbye!\");"
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+
+        let content = fs.read_file("/workspace/test.rs").await?;
+        assert!(content.contains("Hello, World!"));
+        assert!(content.contains("Goodbye!"));
+        Ok(())
+    }
+
+    // ===================
+    // Integration Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_edit_permission_denied() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "content").await?;
+
+        // Read-only capabilities
+        let caps = AgentCapabilities::read_only();
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "content",
+                    "new_string": "new content"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_denied_path() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("secrets/config.txt", "secret=value").await?;
+
+        let caps = AgentCapabilities::full_access()
+            .with_denied_paths(vec!["/workspace/secrets/**".into()]);
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/secrets/config.txt",
+                    "old_string": "value",
+                    "new_string": "newvalue"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    // ===================
+    // Edge Cases
+    // ===================
+
+    #[tokio::test]
+    async fn test_edit_string_not_found() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "Hello, World!").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "Rust",
+                    "new_string": "Go"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("String not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_multiple_occurrences_without_replace_all() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "foo bar foo baz").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "foo",
+                    "new_string": "qux"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("2 occurrences"));
+        assert!(result.output.contains("replace_all"));
+
+        // File should not have changed
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "foo bar foo baz");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_not_found() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/nonexistent.txt",
+                    "old_string": "foo",
+                    "new_string": "bar"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("File not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_directory_path() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.create_dir("/workspace/subdir").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/subdir",
+                    "old_string": "foo",
+                    "new_string": "bar"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("is a directory"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_empty_new_string_deletes() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "Hello, World!").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": ", World",
+                    "new_string": ""
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "Hello!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_special_characters() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "特殊字符 emoji 🎉 here").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "🎉",
+                    "new_string": "🚀"
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert!(content.contains("🚀"));
+        assert!(!content.contains("🎉"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_metadata() {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        assert_eq!(tool.name(), "edit");
+        assert_eq!(tool.tier(), ToolTier::Confirm);
+        assert!(tool.description().contains("Edit"));
+
+        let schema = tool.input_schema();
+        assert!(schema.get("properties").is_some());
+        assert!(schema["properties"].get("path").is_some());
+        assert!(schema["properties"].get("old_string").is_some());
+        assert!(schema["properties"].get("new_string").is_some());
+        assert!(schema["properties"].get("replace_all").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_edit_invalid_input() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // Missing required fields
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/test.txt"}))
+            .await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_string_function() {
+        assert_eq!(truncate_string("short", 10), "short");
+        assert_eq!(
+            truncate_string("this is a longer string", 10),
+            "this is a ..."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_preserves_surrounding_content() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let original = "line 1\nline 2 with target\nline 3";
+        fs.write_file("test.txt", original).await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "target",
+                    "new_string": "replacement"
+                }),
+            )
+            .await?;
+
+        assert!(result.success);
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "line 1\nline 2 with replacement\nline 3");
+        Ok(())
+    }
+}

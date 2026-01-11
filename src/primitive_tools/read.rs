@@ -149,3 +149,327 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
         Ok(ToolResult::success(output))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn create_test_tool(
+        fs: Arc<InMemoryFileSystem>,
+        capabilities: AgentCapabilities,
+    ) -> ReadTool<InMemoryFileSystem> {
+        ReadTool::new(fs, capabilities)
+    }
+
+    fn tool_ctx() -> ToolContext<()> {
+        ToolContext::new(())
+    }
+
+    // ===================
+    // Unit Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_read_entire_file() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "line 1\nline 2\nline 3").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/test.txt"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("line 1"));
+        assert!(result.output.contains("line 2"));
+        assert!(result.output.contains("line 3"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_with_offset() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
+            .await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "offset": 3}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 3-5 of 5 total"));
+        assert!(result.output.contains("line 3"));
+        assert!(result.output.contains("line 4"));
+        assert!(result.output.contains("line 5"));
+        assert!(!result.output.contains("\tline 1")); // Should not include line 1
+        assert!(!result.output.contains("\tline 2")); // Should not include line 2
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_with_limit() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
+            .await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "limit": 2}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 1-2 of 5 total"));
+        assert!(result.output.contains("line 1"));
+        assert!(result.output.contains("line 2"));
+        assert!(!result.output.contains("\tline 3"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_with_offset_and_limit() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
+            .await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "offset": 2, "limit": 2}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 2-3 of 5 total"));
+        assert!(result.output.contains("line 2"));
+        assert!(result.output.contains("line 3"));
+        assert!(!result.output.contains("\tline 1"));
+        assert!(!result.output.contains("\tline 4"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_nonexistent_file() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/nonexistent.txt"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("File not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_directory_returns_error() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.create_dir("/workspace/subdir").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/subdir"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("is a directory"));
+        Ok(())
+    }
+
+    // ===================
+    // Integration Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_read_permission_denied() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("secret.txt", "secret content").await?;
+
+        // Create read-only capabilities that deny all paths
+        let caps = AgentCapabilities::none();
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/secret.txt"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_denied_path_via_capabilities() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("secrets/api_key.txt", "API_KEY=secret")
+            .await?;
+
+        // Custom capabilities that deny secrets directory with absolute path pattern
+        let caps =
+            AgentCapabilities::read_only().with_denied_paths(vec!["/workspace/secrets/**".into()]);
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/secrets/api_key.txt"}),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_allowed_path_restriction() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("config/settings.toml", "key = value").await?;
+
+        // Only allow reading from src/
+        let caps = AgentCapabilities::read_only()
+            .with_denied_paths(vec![])
+            .with_allowed_paths(vec!["/workspace/src/**".into()]);
+
+        let tool = create_test_tool(Arc::clone(&fs), caps.clone());
+
+        // Should be able to read from src/
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/src/main.rs"}))
+            .await?;
+        assert!(result.success);
+
+        // Should NOT be able to read from config/
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/config/settings.toml"}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    // ===================
+    // Edge Cases
+    // ===================
+
+    #[tokio::test]
+    async fn test_read_empty_file() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("empty.txt", "").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/empty.txt"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("(empty file)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_large_file_with_pagination() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        // Create a file with 100 lines
+        let content: String = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs.write_file("large.txt", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // Read lines 50-60
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/large.txt", "offset": 50, "limit": 10}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 50-59 of 100 total"));
+        assert!(result.output.contains("line 50"));
+        assert!(result.output.contains("line 59"));
+        assert!(!result.output.contains("\tline 49"));
+        assert!(!result.output.contains("\tline 60"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_offset_beyond_file_length() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("short.txt", "line 1\nline 2").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/short.txt", "offset": 100}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("(empty file)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_special_characters() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let content = "特殊字符\néàü\n🎉emoji\ntab\there";
+        fs.write_file("special.txt", content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/special.txt"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("特殊字符"));
+        assert!(result.output.contains("éàü"));
+        assert!(result.output.contains("🎉emoji"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_metadata() {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        assert_eq!(tool.name(), "read");
+        assert_eq!(tool.tier(), ToolTier::Observe);
+        assert!(tool.description().contains("Read"));
+
+        let schema = tool.input_schema();
+        assert!(schema.get("properties").is_some());
+        assert!(schema["properties"].get("path").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_invalid_input() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // Missing required path field
+        let result = tool.execute(&tool_ctx(), json!({})).await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+}
