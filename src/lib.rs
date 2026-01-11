@@ -22,9 +22,13 @@
 #![forbid(unsafe_code)]
 
 mod events;
+
+pub mod llm;
 mod types;
 
 pub use events::AgentEvent;
+pub use llm::LlmProvider;
+
 pub use types::{
     AgentConfig, AgentState, PendingAction, ThreadId, TokenUsage, ToolResult, ToolTier,
 };
