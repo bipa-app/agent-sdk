@@ -9,20 +9,14 @@
 //! # Example
 //!
 //! ```ignore
-//! use agent_sdk::{
-//!     AgentLoop, AgentConfig, InMemoryStore, DefaultHooks, ToolRegistry, ToolContext, ThreadId,
-//!     providers::AnthropicProvider,
-//! };
+//! use agent_sdk::{builder, ToolContext, ThreadId, providers::AnthropicProvider};
 //!
-//! let provider = AnthropicProvider::sonnet(api_key);
-//! let tools = ToolRegistry::new();
-//! let hooks = DefaultHooks;
-//! let message_store = InMemoryStore::new();
-//! let state_store = InMemoryStore::new();
-//! let config = AgentConfig::default();
+//! // Build agent with defaults (in-memory stores, default hooks)
+//! let agent = builder()
+//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .build();
 //!
-//! let agent = AgentLoop::new(provider, tools, hooks, message_store, state_store, config);
-//!
+//! // Run the agent
 //! let thread_id = ThreadId::new();
 //! let tool_ctx = ToolContext::new(());
 //! let mut events = agent.run(thread_id, "Hello!".to_string(), tool_ctx);
@@ -30,6 +24,35 @@
 //! while let Some(event) = events.recv().await {
 //!     println!("{:?}", event);
 //! }
+//! ```
+//!
+//! # Custom Configuration
+//!
+//! ```ignore
+//! use agent_sdk::{builder, AgentConfig, ToolRegistry, providers::AnthropicProvider};
+//!
+//! let agent = builder()
+//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .tools(my_tools)
+//!     .config(AgentConfig {
+//!         max_turns: 20,
+//!         system_prompt: "You are a helpful assistant.".to_string(),
+//!         ..Default::default()
+//!     })
+//!     .build();
+//! ```
+//!
+//! # Custom Stores and Hooks
+//!
+//! ```ignore
+//! use agent_sdk::builder;
+//!
+//! let agent = builder()
+//!     .provider(my_provider)
+//!     .hooks(my_hooks)
+//!     .message_store(my_message_store)
+//!     .state_store(my_state_store)
+//!     .build_with_stores();
 //! ```
 
 #![forbid(unsafe_code)]
@@ -47,7 +70,7 @@ mod stores;
 mod tools;
 mod types;
 
-pub use agent_loop::AgentLoop;
+pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use events::AgentEvent;
