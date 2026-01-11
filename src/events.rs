@@ -1,0 +1,141 @@
+use crate::types::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Events emitted by the agent loop during execution.
+/// These are streamed to the client for real-time UI updates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// Agent loop has started
+    Start { thread_id: ThreadId, turn: usize },
+
+    /// Agent is "thinking" - streaming text that may be shown as typing indicator
+    Thinking { text: String },
+
+    /// A text delta for streaming responses
+    TextDelta { delta: String },
+
+    /// Complete text block from the agent
+    Text { text: String },
+
+    /// Agent is about to call a tool
+    ToolCallStart {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        tier: ToolTier,
+    },
+
+    /// Tool execution completed
+    ToolCallEnd {
+        id: String,
+        name: String,
+        result: ToolResult,
+    },
+
+    /// Tool requires confirmation before execution
+    ToolRequiresConfirmation {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        description: String,
+    },
+
+    /// Tool requires PIN verification
+    ToolRequiresPin {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        description: String,
+    },
+
+    /// Agent turn completed (one LLM round-trip)
+    TurnComplete { turn: usize, usage: TokenUsage },
+
+    /// Agent loop completed successfully
+    Done {
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        duration: Duration,
+    },
+
+    /// An error occurred during execution
+    Error { message: String, recoverable: bool },
+}
+
+impl AgentEvent {
+    #[must_use]
+    pub const fn start(thread_id: ThreadId, turn: usize) -> Self {
+        Self::Start { thread_id, turn }
+    }
+
+    #[must_use]
+    pub fn thinking(text: impl Into<String>) -> Self {
+        Self::Thinking { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn text_delta(delta: impl Into<String>) -> Self {
+        Self::TextDelta {
+            delta: delta.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn tool_call_start(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+        tier: ToolTier,
+    ) -> Self {
+        Self::ToolCallStart {
+            id: id.into(),
+            name: name.into(),
+            input,
+            tier,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_call_end(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        result: ToolResult,
+    ) -> Self {
+        Self::ToolCallEnd {
+            id: id.into(),
+            name: name.into(),
+            result,
+        }
+    }
+
+    #[must_use]
+    pub const fn done(
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        duration: Duration,
+    ) -> Self {
+        Self::Done {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+        }
+    }
+
+    #[must_use]
+    pub fn error(message: impl Into<String>, recoverable: bool) -> Self {
+        Self::Error {
+            message: message.into(),
+            recoverable,
+        }
+    }
+}
