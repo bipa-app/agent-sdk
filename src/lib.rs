@@ -66,6 +66,7 @@ mod hooks;
 pub mod llm;
 pub mod primitive_tools;
 pub mod providers;
+pub mod skills;
 mod stores;
 mod tools;
 mod types;

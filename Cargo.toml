@@ -13,6 +13,7 @@ async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 anyhow = "1"
 thiserror = "2"
 regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl"] }
@@ -27,6 +28,7 @@ log = "0.4"
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = "0.3"
+tempfile = "3"
 
 [[example]]
 name = "basic_agent"
