@@ -398,7 +398,12 @@ impl Environment for InMemoryFileSystem {
             .ok()
             .context("lock poisoned")?
             .contains_key(&path);
-        let in_dirs = self.dirs.read().ok().context("lock poisoned")?.contains(&path);
+        let in_dirs = self
+            .dirs
+            .read()
+            .ok()
+            .context("lock poisoned")?
+            .contains(&path);
         Ok(in_files || in_dirs)
     }
 
@@ -460,7 +465,13 @@ impl Environment for InMemoryFileSystem {
         let prefix = format!("{}/", path.trim_end_matches('/'));
 
         // Check if directory exists
-        if !self.dirs.read().ok().context("lock poisoned")?.contains(&path) {
+        if !self
+            .dirs
+            .read()
+            .ok()
+            .context("lock poisoned")?
+            .contains(&path)
+        {
             anyhow::bail!("Directory not found: {path}");
         }
 
@@ -497,7 +508,11 @@ impl Environment for InMemoryFileSystem {
                 anyhow::bail!("Directory not empty: {path}");
             }
 
-            self.dirs.write().ok().context("lock poisoned")?.remove(&path);
+            self.dirs
+                .write()
+                .ok()
+                .context("lock poisoned")?
+                .remove(&path);
         }
 
         Ok(())
