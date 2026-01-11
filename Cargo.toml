@@ -19,7 +19,7 @@ regex = { version = "1.10", default-features = false, features = ["std", "unicod
 glob = { version = "0.3", default-features = false }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["serde", "std"] }
+time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
 reqwest = { version = "0.12", features = ["json"] }
 bytes = "1"
 log = "0.4"

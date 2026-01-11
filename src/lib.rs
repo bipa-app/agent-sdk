@@ -20,3 +20,11 @@
 //! ```
 
 #![forbid(unsafe_code)]
+
+mod events;
+mod types;
+
+pub use events::AgentEvent;
+pub use types::{
+    AgentConfig, AgentState, PendingAction, ThreadId, TokenUsage, ToolResult, ToolTier,
+};
