@@ -26,6 +26,23 @@ log = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "basic_agent"
+path = "examples/basic_agent.rs"
+
+[[example]]
+name = "custom_tool"
+path = "examples/custom_tool.rs"
+
+[[example]]
+name = "custom_hooks"
+path = "examples/custom_hooks.rs"
+
+[[example]]
+name = "with_primitive_tools"
+path = "examples/with_primitive_tools.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

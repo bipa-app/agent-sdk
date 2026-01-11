@@ -1,3 +1,32 @@
+//! Agent loop orchestration module.
+//!
+//! This module contains the core agent loop that orchestrates LLM calls,
+//! tool execution, and event handling. The agent loop is the main entry point
+//! for running an AI agent.
+//!
+//! # Architecture
+//!
+//! The agent loop works as follows:
+//! 1. Receives a user message
+//! 2. Sends the message to the LLM provider
+//! 3. Processes the LLM response (text or tool calls)
+//! 4. If tool calls are present, executes them and feeds results back to LLM
+//! 5. Repeats until the LLM responds with only text (no tool calls)
+//! 6. Emits events throughout for real-time UI updates
+//!
+//! # Building an Agent
+//!
+//! Use the builder pattern via [`builder()`] or [`AgentLoopBuilder`]:
+//!
+//! ```ignore
+//! use agent_sdk::{builder, providers::AnthropicProvider};
+//!
+//! let agent = builder()
+//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .tools(my_tools)
+//!     .build();
+//! ```
+
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
@@ -205,6 +234,34 @@ where
 }
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
+///
+/// `AgentLoop` is the core component that:
+/// - Manages conversation state via message and state stores
+/// - Calls the LLM provider and processes responses
+/// - Executes tools through the tool registry
+/// - Emits events for real-time updates via an async channel
+/// - Enforces hooks for tool permissions and lifecycle events
+///
+/// # Type Parameters
+///
+/// - `Ctx`: Application-specific context passed to tools (e.g., user ID, database)
+/// - `P`: The LLM provider implementation
+/// - `H`: The hooks implementation for lifecycle customization
+/// - `M`: The message store implementation
+/// - `S`: The state store implementation
+///
+/// # Running the Agent
+///
+/// ```ignore
+/// let mut events = agent.run(thread_id, "Hello!".to_string(), tool_ctx);
+/// while let Some(event) = events.recv().await {
+///     match event {
+///         AgentEvent::Text { text } => println!("{}", text),
+///         AgentEvent::Done { .. } => break,
+///         _ => {}
+///     }
+/// }
+/// ```
 pub struct AgentLoop<Ctx, P, H, M, S>
 where
     P: LlmProvider,
@@ -601,5 +658,511 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
     Message {
         role: Role::Assistant,
         content: Content::Blocks(blocks),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::AllowAllHooks;
+    use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
+    use crate::stores::InMemoryStore;
+    use crate::tools::{Tool, ToolContext, ToolRegistry};
+    use crate::types::{AgentConfig, ToolResult, ToolTier};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ===================
+    // Mock LLM Provider
+    // ===================
+
+    struct MockProvider {
+        responses: RwLock<Vec<ChatOutcome>>,
+        call_count: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<ChatOutcome>) -> Self {
+            Self {
+                responses: RwLock::new(responses),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn text_response(text: &str) -> ChatOutcome {
+            ChatOutcome::Success(ChatResponse {
+                id: "msg_1".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+                model: "mock-model".to_string(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                },
+            })
+        }
+
+        fn tool_use_response(
+            tool_id: &str,
+            tool_name: &str,
+            input: serde_json::Value,
+        ) -> ChatOutcome {
+            ChatOutcome::Success(ChatResponse {
+                id: "msg_1".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_id.to_string(),
+                    name: tool_name.to_string(),
+                    input,
+                }],
+                model: "mock-model".to_string(),
+                stop_reason: Some(StopReason::ToolUse),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                },
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let responses = self.responses.read().unwrap();
+            if idx < responses.len() {
+                Ok(responses[idx].clone())
+            } else {
+                // Default: end conversation
+                Ok(Self::text_response("Done"))
+            }
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    // Make ChatOutcome clonable for tests
+    impl Clone for ChatOutcome {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Success(r) => Self::Success(r.clone()),
+                Self::RateLimited => Self::RateLimited,
+                Self::InvalidRequest(s) => Self::InvalidRequest(s.clone()),
+                Self::ServerError(s) => Self::ServerError(s.clone()),
+            }
+        }
+    }
+
+    // ===================
+    // Mock Tool
+    // ===================
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool<()> for EchoTool {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Echo the input message"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            })
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Observe
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            input: serde_json::Value,
+        ) -> Result<ToolResult> {
+            let message = input
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no message");
+            Ok(ToolResult::success(format!("Echo: {message}")))
+        }
+    }
+
+    // ===================
+    // Builder Tests
+    // ===================
+
+    #[test]
+    fn test_builder_creates_agent_loop() {
+        let provider = MockProvider::new(vec![]);
+        let agent = builder::<()>().provider(provider).build();
+
+        assert_eq!(agent.config.max_turns, 10);
+        assert_eq!(agent.config.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_builder_with_custom_config() {
+        let provider = MockProvider::new(vec![]);
+        let config = AgentConfig {
+            max_turns: 5,
+            max_tokens: 2048,
+            system_prompt: "Custom prompt".to_string(),
+            model: "custom-model".to_string(),
+        };
+
+        let agent = builder::<()>().provider(provider).config(config).build();
+
+        assert_eq!(agent.config.max_turns, 5);
+        assert_eq!(agent.config.max_tokens, 2048);
+        assert_eq!(agent.config.system_prompt, "Custom prompt");
+    }
+
+    #[test]
+    fn test_builder_with_tools() {
+        let provider = MockProvider::new(vec![]);
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+
+        assert_eq!(agent.tools.len(), 1);
+    }
+
+    #[test]
+    fn test_builder_with_custom_stores() {
+        let provider = MockProvider::new(vec![]);
+        let message_store = InMemoryStore::new();
+        let state_store = InMemoryStore::new();
+
+        let agent = builder::<()>()
+            .provider(provider)
+            .hooks(AllowAllHooks)
+            .message_store(message_store)
+            .state_store(state_store)
+            .build_with_stores();
+
+        // Just verify it builds without panicking
+        assert_eq!(agent.config.max_turns, 10);
+    }
+
+    // ===================
+    // Run Loop Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_simple_text_response() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hello, user!")]);
+
+        let agent = builder::<()>().provider(provider).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have: Start, Text, Done
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Text { .. })));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_execution() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            // First call: request tool use
+            MockProvider::tool_use_response("tool_1", "echo", json!({"message": "test"})),
+            // Second call: respond with text
+            MockProvider::text_response("Tool executed successfully"),
+        ]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Run echo".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have tool call events
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCallStart { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCallEnd { .. }))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_max_turns_limit() -> anyhow::Result<()> {
+        // Provider that always requests a tool
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("tool_1", "echo", json!({"message": "1"})),
+            MockProvider::tool_use_response("tool_2", "echo", json!({"message": "2"})),
+            MockProvider::tool_use_response("tool_3", "echo", json!({"message": "3"})),
+            MockProvider::tool_use_response("tool_4", "echo", json!({"message": "4"})),
+        ]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+
+        let config = AgentConfig {
+            max_turns: 2,
+            ..Default::default()
+        };
+
+        let agent = builder::<()>()
+            .provider(provider)
+            .tools(tools)
+            .config(config)
+            .build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Loop".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have an error about max turns
+        assert!(events.iter().any(|e| {
+            matches!(e, AgentEvent::Error { message, .. } if message.contains("Maximum turns"))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_handling() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            // Request unknown tool
+            MockProvider::tool_use_response("tool_1", "nonexistent_tool", json!({})),
+            // LLM gets tool error and ends conversation
+            MockProvider::text_response("I couldn't find that tool."),
+        ]);
+
+        // Empty tool registry
+        let tools = ToolRegistry::new();
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Call unknown".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Unknown tool errors are returned to the LLM (not emitted as ToolCallEnd)
+        // The conversation should complete successfully with a Done event
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+
+        // The LLM's response about the missing tool should be in the events
+        assert!(
+            events.iter().any(|e| {
+                matches!(e, AgentEvent::Text { text } if text.contains("couldn't find"))
+            })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_handling() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![ChatOutcome::RateLimited]);
+
+        let agent = builder::<()>().provider(provider).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have rate limit error
+        assert!(events.iter().any(|e| {
+            matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_error_handling() -> anyhow::Result<()> {
+        let provider =
+            MockProvider::new(vec![ChatOutcome::ServerError("Internal error".to_string())]);
+
+        let agent = builder::<()>().provider(provider).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have server error
+        assert!(events.iter().any(|e| {
+            matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
+        }));
+
+        Ok(())
+    }
+
+    // ===================
+    // Helper Function Tests
+    // ===================
+
+    #[test]
+    fn test_extract_content_text_only() {
+        let response = ChatResponse {
+            id: "msg_1".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+            model: "test".to_string(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        };
+
+        let (text, tool_uses) = extract_content(&response);
+        assert_eq!(text, Some("Hello".to_string()));
+        assert!(tool_uses.is_empty());
+    }
+
+    #[test]
+    fn test_extract_content_tool_use() {
+        let response = ChatResponse {
+            id: "msg_1".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "tool_1".to_string(),
+                name: "test_tool".to_string(),
+                input: json!({"key": "value"}),
+            }],
+            model: "test".to_string(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        };
+
+        let (text, tool_uses) = extract_content(&response);
+        assert!(text.is_none());
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].1, "test_tool");
+    }
+
+    #[test]
+    fn test_extract_content_mixed() {
+        let response = ChatResponse {
+            id: "msg_1".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "Let me help".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "helper".to_string(),
+                    input: json!({}),
+                },
+            ],
+            model: "test".to_string(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        };
+
+        let (text, tool_uses) = extract_content(&response);
+        assert_eq!(text, Some("Let me help".to_string()));
+        assert_eq!(tool_uses.len(), 1);
+    }
+
+    #[test]
+    fn test_millis_to_u64() {
+        assert_eq!(millis_to_u64(0), 0);
+        assert_eq!(millis_to_u64(1000), 1000);
+        assert_eq!(millis_to_u64(u128::from(u64::MAX)), u64::MAX);
+        assert_eq!(millis_to_u64(u128::from(u64::MAX) + 1), u64::MAX);
+    }
+
+    #[test]
+    fn test_build_assistant_message() {
+        let response = ChatResponse {
+            id: "msg_1".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "Response text".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({"message": "test"}),
+                },
+            ],
+            model: "test".to_string(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        };
+
+        let msg = build_assistant_message(&response);
+        assert_eq!(msg.role, Role::Assistant);
+
+        if let Content::Blocks(blocks) = msg.content {
+            assert_eq!(blocks.len(), 2);
+        } else {
+            panic!("Expected Content::Blocks");
+        }
     }
 }

@@ -120,3 +120,252 @@ impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
         Ok(ToolResult::success(output))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentCapabilities, InMemoryFileSystem};
+
+    fn create_test_tool(
+        fs: Arc<InMemoryFileSystem>,
+        capabilities: AgentCapabilities,
+    ) -> GlobTool<InMemoryFileSystem> {
+        GlobTool::new(fs, capabilities)
+    }
+
+    fn tool_ctx() -> ToolContext<()> {
+        ToolContext::new(())
+    }
+
+    // ===================
+    // Unit Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_glob_simple_pattern() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("src/lib.rs", "pub mod foo;").await?;
+        fs.write_file("README.md", "# README").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "src/*.rs"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 2 files"));
+        assert!(result.output.contains("main.rs"));
+        assert!(result.output.contains("lib.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_recursive_pattern() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("src/lib/utils.rs", "pub fn util() {}")
+            .await?;
+        fs.write_file("tests/test.rs", "// test").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "**/*.rs"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 3 files"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_no_matches() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "*.py"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("No files found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_with_path() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("tests/test.rs", "// test").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"pattern": "*.rs", "path": "/workspace/src"}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 1 files"));
+        assert!(result.output.contains("main.rs"));
+        Ok(())
+    }
+
+    // ===================
+    // Integration Tests
+    // ===================
+
+    #[tokio::test]
+    async fn test_glob_permission_denied() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+
+        // No read permission
+        let caps = AgentCapabilities::none();
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "**/*.rs"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Permission denied"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_filters_inaccessible_files() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("secrets/key.rs", "// secret").await?;
+
+        // Allow src but deny secrets
+        let caps =
+            AgentCapabilities::read_only().with_denied_paths(vec!["/workspace/secrets/**".into()]);
+
+        let tool = create_test_tool(fs, caps);
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "**/*.rs"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 1 files"));
+        assert!(result.output.contains("main.rs"));
+        assert!(!result.output.contains("key.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_allowed_paths_restriction() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("config/settings.toml", "key = value").await?;
+
+        // Full access with denied paths for config
+        let caps =
+            AgentCapabilities::read_only().with_denied_paths(vec!["/workspace/config/**".into()]);
+
+        let tool = create_test_tool(fs, caps);
+
+        // Searching should return src files but not config
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "**/*"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("main.rs"));
+        assert!(!result.output.contains("settings.toml"));
+        Ok(())
+    }
+
+    // ===================
+    // Edge Cases
+    // ===================
+
+    #[tokio::test]
+    async fn test_glob_empty_directory() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.create_dir("/workspace/empty").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"pattern": "*", "path": "/workspace/empty"}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("No files found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_many_files_truncated() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        // Create 150 files
+        for i in 0..150 {
+            fs.write_file(&format!("files/file{i}.txt"), "content")
+                .await?;
+        }
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "files/*.txt"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 150 files"));
+        assert!(result.output.contains("showing first 100"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_tool_metadata() {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        assert_eq!(tool.name(), "glob");
+        assert_eq!(tool.tier(), ToolTier::Observe);
+        assert!(tool.description().contains("glob"));
+
+        let schema = tool.input_schema();
+        assert!(schema.get("properties").is_some());
+        assert!(schema["properties"].get("pattern").is_some());
+        assert!(schema["properties"].get("path").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_glob_invalid_input() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // Missing required pattern field
+        let result = tool.execute(&tool_ctx(), json!({})).await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_specific_file_extension() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("main.rs", "fn main() {}").await?;
+        fs.write_file("main.go", "package main").await?;
+        fs.write_file("main.py", "def main(): pass").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "*.rs"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 1 files"));
+        assert!(result.output.contains("main.rs"));
+        assert!(!result.output.contains("main.go"));
+        assert!(!result.output.contains("main.py"));
+        Ok(())
+    }
+}

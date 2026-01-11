@@ -1,3 +1,18 @@
+//! Agent lifecycle hooks for customization.
+//!
+//! Hooks allow you to intercept and customize agent behavior at key points:
+//!
+//! - [`AgentHooks::pre_tool_use`] - Control tool execution permissions
+//! - [`AgentHooks::post_tool_use`] - React to tool completion
+//! - [`AgentHooks::on_event`] - Log or process events
+//! - [`AgentHooks::on_error`] - Handle errors and decide recovery
+//!
+//! # Built-in Implementations
+//!
+//! - [`DefaultHooks`] - Tier-based permissions (default)
+//! - [`AllowAllHooks`] - Allow all tools without confirmation
+//! - [`LoggingHooks`] - Debug logging for all events
+
 use crate::events::AgentEvent;
 use crate::llm;
 use crate::types::{ToolResult, ToolTier};

@@ -1,3 +1,31 @@
+//! Tool definition and registry.
+//!
+//! Tools allow the LLM to perform actions in the real world. This module provides:
+//!
+//! - [`Tool`] trait - Define custom tools the LLM can call
+//! - [`ToolRegistry`] - Collection of available tools
+//! - [`ToolContext`] - Context passed to tool execution
+//!
+//! # Implementing a Tool
+//!
+//! ```ignore
+//! use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier};
+//!
+//! struct MyTool;
+//!
+//! #[async_trait]
+//! impl Tool<MyContext> for MyTool {
+//!     fn name(&self) -> &str { "my_tool" }
+//!     fn description(&self) -> &str { "Does something useful" }
+//!     fn input_schema(&self) -> Value { json!({ "type": "object" }) }
+//!     fn tier(&self) -> ToolTier { ToolTier::Observe }
+//!
+//!     async fn execute(&self, ctx: &ToolContext<MyContext>, input: Value) -> Result<ToolResult> {
+//!         Ok(ToolResult::success("Done!"))
+//!     }
+//! }
+//! ```
+
 use crate::llm;
 use crate::types::{ToolResult, ToolTier};
 use anyhow::Result;
