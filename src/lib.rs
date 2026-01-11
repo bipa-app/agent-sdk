@@ -64,6 +64,7 @@ mod events;
 mod filesystem;
 mod hooks;
 pub mod llm;
+pub mod mcp;
 pub mod primitive_tools;
 pub mod providers;
 pub mod skills;
