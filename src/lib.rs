@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_loop;
 mod capabilities;
 mod environment;
 mod events;
@@ -32,6 +33,7 @@ mod stores;
 mod tools;
 mod types;
 
+pub use agent_loop::AgentLoop;
 pub use capabilities::AgentCapabilities;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use events::AgentEvent;
