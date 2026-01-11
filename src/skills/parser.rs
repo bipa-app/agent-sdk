@@ -186,7 +186,10 @@ You are an expert code reviewer.
         assert_eq!(skill.name, "code-review");
         assert_eq!(skill.description, "Review code for quality");
         assert_eq!(skill.tools, vec!["read", "grep", "glob"]);
-        assert_eq!(skill.denied_tools, Some(vec!["bash".into(), "write".into()]));
+        assert_eq!(
+            skill.denied_tools,
+            Some(vec!["bash".into(), "write".into()])
+        );
         assert!(skill.system_prompt.contains("# Code Review"));
         assert!(skill.system_prompt.contains("## Guidelines"));
 
@@ -231,9 +234,21 @@ Custom skill.
         let skill = parse_skill_file(content)?;
 
         assert_eq!(skill.name, "custom");
-        assert_eq!(skill.metadata.get("version").and_then(|v| v.as_str()), Some("1.0"));
-        assert_eq!(skill.metadata.get("author").and_then(|v| v.as_str()), Some("test"));
-        assert_eq!(skill.metadata.get("custom_field").and_then(serde_json::Value::as_i64), Some(42));
+        assert_eq!(
+            skill.metadata.get("version").and_then(|v| v.as_str()),
+            Some("1.0")
+        );
+        assert_eq!(
+            skill.metadata.get("author").and_then(|v| v.as_str()),
+            Some("test")
+        );
+        assert_eq!(
+            skill
+                .metadata
+                .get("custom_field")
+                .and_then(serde_json::Value::as_i64),
+            Some(42)
+        );
 
         Ok(())
     }
@@ -253,10 +268,12 @@ name: broken
 ";
         let result = parse_skill_file(content);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("closing frontmatter"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("closing frontmatter")
+        );
     }
 
     #[test]
