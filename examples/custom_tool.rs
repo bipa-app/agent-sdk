@@ -21,11 +21,11 @@ struct CalculatorTool;
 
 #[async_trait]
 impl Tool<()> for CalculatorTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "calculator"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Add two numbers together. Use this when you need to perform addition."
     }
 
@@ -54,12 +54,12 @@ impl Tool<()> for CalculatorTool {
     async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
         let a = input
             .get("a")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'a' parameter"))?;
 
         let b = input
             .get("b")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'b' parameter"))?;
 
         let result = a + b;
@@ -73,11 +73,11 @@ struct CurrentTimeTool;
 
 #[async_trait]
 impl Tool<()> for CurrentTimeTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "current_time"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Get the current date and time in UTC."
     }
 

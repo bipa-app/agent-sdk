@@ -741,7 +741,7 @@ mod tests {
             }
         }
 
-        fn model(&self) -> &str {
+        fn model(&self) -> &'static str {
             "mock-model"
         }
 
@@ -770,11 +770,11 @@ mod tests {
 
     #[async_trait]
     impl Tool<()> for EchoTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "echo"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Echo the input message"
         }
 
@@ -1130,8 +1130,8 @@ mod tests {
     fn test_millis_to_u64() {
         assert_eq!(millis_to_u64(0), 0);
         assert_eq!(millis_to_u64(1000), 1000);
-        assert_eq!(millis_to_u64(u64::MAX as u128), u64::MAX);
-        assert_eq!(millis_to_u64(u64::MAX as u128 + 1), u64::MAX);
+        assert_eq!(millis_to_u64(u128::from(u64::MAX)), u64::MAX);
+        assert_eq!(millis_to_u64(u128::from(u64::MAX) + 1), u64::MAX);
     }
 
     #[test]

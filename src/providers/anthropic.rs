@@ -511,7 +511,7 @@ mod tests {
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "test.txt");
             }
-            _ => panic!("Expected ToolUse content block"),
+            ApiResponseContentBlock::Text { .. } => panic!("Expected ToolUse content block"),
         }
     }
 

@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
 
-    println!("Starting conversation (thread: {})\n", thread_id);
+    println!("Starting conversation (thread: {thread_id})\n");
 
     // Run the agent with a simple prompt
     let mut events = agent.run(

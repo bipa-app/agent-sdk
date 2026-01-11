@@ -22,11 +22,11 @@ struct SendEmailTool;
 
 #[async_trait]
 impl Tool<()> for SendEmailTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "send_email"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Send an email to a recipient. Use this to send messages to people."
     }
 
@@ -80,7 +80,7 @@ struct CustomHooks {
 }
 
 impl CustomHooks {
-    fn new(max_tool_calls: usize) -> Self {
+    const fn new(max_tool_calls: usize) -> Self {
         Self {
             tool_call_count: AtomicUsize::new(0),
             max_tool_calls,
