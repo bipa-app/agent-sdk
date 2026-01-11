@@ -69,6 +69,7 @@ pub mod primitive_tools;
 pub mod providers;
 pub mod skills;
 mod stores;
+pub mod subagent;
 mod tools;
 mod types;
 pub mod web;
