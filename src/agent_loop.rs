@@ -27,6 +27,7 @@
 //!     .build();
 //! ```
 
+use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
@@ -61,6 +62,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     message_store: Option<M>,
     state_store: Option<S>,
     config: Option<AgentConfig>,
+    compaction_config: Option<CompactionConfig>,
 }
 
 impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
@@ -74,6 +76,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             message_store: None,
             state_store: None,
             config: None,
+            compaction_config: None,
         }
     }
 }
@@ -95,6 +98,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: self.state_store,
             config: self.config,
+            compaction_config: self.compaction_config,
         }
     }
 
@@ -115,6 +119,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: self.state_store,
             config: self.config,
+            compaction_config: self.compaction_config,
         }
     }
 
@@ -131,6 +136,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: Some(message_store),
             state_store: self.state_store,
             config: self.config,
+            compaction_config: self.compaction_config,
         }
     }
 
@@ -147,6 +153,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: Some(state_store),
             config: self.config,
+            compaction_config: self.compaction_config,
         }
     }
 
@@ -155,6 +162,38 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     pub fn config(mut self, config: AgentConfig) -> Self {
         self.config = Some(config);
         self
+    }
+
+    /// Enable context compaction with the given configuration.
+    ///
+    /// When enabled, the agent will automatically compact conversation history
+    /// when it exceeds the configured token threshold.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use agent_sdk::{builder, context::CompactionConfig};
+    ///
+    /// let agent = builder()
+    ///     .provider(my_provider)
+    ///     .with_compaction(CompactionConfig::default())
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub const fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction_config = Some(config);
+        self
+    }
+
+    /// Enable context compaction with default settings.
+    ///
+    /// This is a convenience method equivalent to:
+    /// ```ignore
+    /// builder.with_compaction(CompactionConfig::default())
+    /// ```
+    #[must_use]
+    pub fn with_auto_compaction(self) -> Self {
+        self.with_compaction(CompactionConfig::default())
     }
 
     /// Apply a skill configuration.
@@ -226,6 +265,7 @@ where
             message_store: Arc::new(InMemoryStore::new()),
             state_store: Arc::new(InMemoryStore::new()),
             config,
+            compaction_config: self.compaction_config,
         }
     }
 }
@@ -269,6 +309,7 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             config,
+            compaction_config: self.compaction_config,
         }
     }
 }
@@ -315,6 +356,7 @@ where
     message_store: Arc<M>,
     state_store: Arc<S>,
     config: AgentConfig,
+    compaction_config: Option<CompactionConfig>,
 }
 
 /// Create a new builder for constructing an `AgentLoop`.
@@ -348,6 +390,29 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             config,
+            compaction_config: None,
+        }
+    }
+
+    /// Create a new agent loop with compaction enabled.
+    #[must_use]
+    pub fn with_compaction(
+        provider: P,
+        tools: ToolRegistry<Ctx>,
+        hooks: H,
+        message_store: M,
+        state_store: S,
+        config: AgentConfig,
+        compaction_config: CompactionConfig,
+    ) -> Self {
+        Self {
+            provider: Arc::new(provider),
+            tools: Arc::new(tools),
+            hooks: Arc::new(hooks),
+            message_store: Arc::new(message_store),
+            state_store: Arc::new(state_store),
+            config,
+            compaction_config: Some(compaction_config),
         }
     }
 
@@ -370,6 +435,7 @@ where
         let message_store = Arc::clone(&self.message_store);
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
+        let compaction_config = self.compaction_config.clone();
 
         tokio::spawn(async move {
             let result = run_loop(
@@ -383,6 +449,7 @@ where
                 message_store,
                 state_store,
                 config,
+                compaction_config,
             )
             .await;
 
@@ -407,6 +474,7 @@ async fn run_loop<Ctx, P, H, M, S>(
     message_store: Arc<M>,
     state_store: Arc<S>,
     config: AgentConfig,
+    compaction_config: Option<CompactionConfig>,
 ) -> Result<()>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -451,7 +519,53 @@ where
             .await;
 
         // Get message history
-        let messages = message_store.get_history(&thread_id).await?;
+        let mut messages = message_store.get_history(&thread_id).await?;
+
+        // Check if compaction is needed
+        if let Some(ref compact_config) = compaction_config {
+            let compactor = LlmContextCompactor::new(Arc::clone(&provider), compact_config.clone());
+            if compactor.needs_compaction(&messages) {
+                debug!(
+                    turn,
+                    message_count = messages.len(),
+                    "Context compaction triggered"
+                );
+
+                match compactor.compact_history(messages).await {
+                    Ok(result) => {
+                        // Replace history in store
+                        message_store
+                            .replace_history(&thread_id, result.messages.clone())
+                            .await?;
+
+                        // Emit compaction event
+                        tx.send(AgentEvent::context_compacted(
+                            result.original_count,
+                            result.new_count,
+                            result.original_tokens,
+                            result.new_tokens,
+                        ))
+                        .await?;
+
+                        info!(
+                            original_count = result.original_count,
+                            new_count = result.new_count,
+                            original_tokens = result.original_tokens,
+                            new_tokens = result.new_tokens,
+                            "Context compacted successfully"
+                        );
+
+                        // Use the compacted messages
+                        messages = result.messages;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Context compaction failed, continuing with full history");
+                        // Continue with original messages on failure
+                        messages = message_store.get_history(&thread_id).await?;
+                    }
+                }
+            }
+        }
 
         // Build chat request
         let llm_tools = if tools.is_empty() {
