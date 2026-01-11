@@ -87,6 +87,14 @@ pub struct ToolRegistry<Ctx> {
     tools: HashMap<String, Arc<dyn Tool<Ctx>>>,
 }
 
+impl<Ctx> Clone for ToolRegistry<Ctx> {
+    fn clone(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+        }
+    }
+}
+
 impl<Ctx> Default for ToolRegistry<Ctx> {
     fn default() -> Self {
         Self::new()

@@ -1,0 +1,408 @@
+//! Subagent support for spawning child agents.
+//!
+//! This module provides the ability to spawn subagents from within an agent.
+//! Subagents are isolated agent instances that run to completion and return
+//! only their final response to the parent agent.
+//!
+//! # Overview
+//!
+//! Subagents are useful for:
+//! - Delegating complex subtasks to specialized agents
+//! - Running parallel investigations
+//! - Isolating context for specific operations
+//!
+//! # Example
+//!
+//! ```ignore
+//! use agent_sdk::subagent::{SubagentTool, SubagentConfig};
+//!
+//! let config = SubagentConfig::new("researcher")
+//!     .with_system_prompt("You are a research specialist...")
+//!     .with_max_turns(10);
+//!
+//! let tool = SubagentTool::new(config, provider, tools);
+//! registry.register(tool);
+//! ```
+//!
+//! # Behavior
+//!
+//! When a subagent runs:
+//! 1. A new isolated thread is created
+//! 2. The subagent runs until completion or max turns
+//! 3. Only the final text response is returned to the parent
+//! 4. The parent does not see the subagent's intermediate tool calls
+
+use crate::events::AgentEvent;
+use crate::hooks::{AgentHooks, DefaultHooks};
+use crate::llm::LlmProvider;
+use crate::stores::{InMemoryStore, MessageStore, StateStore};
+use crate::tools::{Tool, ToolContext, ToolRegistry};
+use crate::types::{AgentConfig, ThreadId, TokenUsage, ToolResult, ToolTier};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Configuration for a subagent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    /// Name of the subagent (for identification).
+    pub name: String,
+    /// System prompt for the subagent.
+    pub system_prompt: String,
+    /// Maximum number of turns before stopping.
+    pub max_turns: usize,
+    /// Optional timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+impl SubagentConfig {
+    /// Create a new subagent configuration.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            timeout_ms: None,
+        }
+    }
+
+    /// Set the system prompt.
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+
+    /// Set the maximum number of turns.
+    #[must_use]
+    pub const fn with_max_turns(mut self, max: usize) -> Self {
+        self.max_turns = max;
+        self
+    }
+
+    /// Set the timeout in milliseconds.
+    #[must_use]
+    pub const fn with_timeout_ms(mut self, timeout: u64) -> Self {
+        self.timeout_ms = Some(timeout);
+        self
+    }
+}
+
+/// Result from a subagent execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentResult {
+    /// Name of the subagent.
+    pub name: String,
+    /// The final text response (only visible part to parent).
+    pub final_response: String,
+    /// Total number of turns taken.
+    pub total_turns: usize,
+    /// Token usage statistics.
+    pub usage: TokenUsage,
+    /// Whether the subagent completed successfully.
+    pub success: bool,
+    /// Duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Tool for spawning subagents.
+///
+/// This tool allows an agent to spawn a child agent that runs independently
+/// and returns only its final response.
+///
+/// # Example
+///
+/// ```ignore
+/// use agent_sdk::subagent::{SubagentTool, SubagentConfig};
+///
+/// let config = SubagentConfig::new("analyzer")
+///     .with_system_prompt("You analyze code...");
+///
+/// let tool = SubagentTool::new(config, provider.clone(), tools.clone());
+/// ```
+pub struct SubagentTool<P, H = DefaultHooks, M = InMemoryStore, S = InMemoryStore>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    config: SubagentConfig,
+    provider: Arc<P>,
+    tools: Arc<ToolRegistry<()>>,
+    hooks: Arc<H>,
+    message_store_factory: Arc<dyn Fn() -> M + Send + Sync>,
+    state_store_factory: Arc<dyn Fn() -> S + Send + Sync>,
+}
+
+impl<P> SubagentTool<P, DefaultHooks, InMemoryStore, InMemoryStore>
+where
+    P: LlmProvider + 'static,
+{
+    /// Create a new subagent tool with default hooks and in-memory stores.
+    #[must_use]
+    pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
+        Self {
+            config,
+            provider,
+            tools,
+            hooks: Arc::new(DefaultHooks),
+            message_store_factory: Arc::new(InMemoryStore::new),
+            state_store_factory: Arc::new(InMemoryStore::new),
+        }
+    }
+}
+
+impl<P, H, M, S> SubagentTool<P, H, M, S>
+where
+    P: LlmProvider + Clone + 'static,
+    H: AgentHooks + Clone + 'static,
+    M: MessageStore + 'static,
+    S: StateStore + 'static,
+{
+    /// Create with custom hooks.
+    #[must_use]
+    pub fn with_hooks<H2: AgentHooks + Clone + 'static>(
+        self,
+        hooks: Arc<H2>,
+    ) -> SubagentTool<P, H2, M, S> {
+        SubagentTool {
+            config: self.config,
+            provider: self.provider,
+            tools: self.tools,
+            hooks,
+            message_store_factory: self.message_store_factory,
+            state_store_factory: self.state_store_factory,
+        }
+    }
+
+    /// Create with custom store factories.
+    #[must_use]
+    pub fn with_stores<M2, S2, MF, SF>(
+        self,
+        message_factory: MF,
+        state_factory: SF,
+    ) -> SubagentTool<P, H, M2, S2>
+    where
+        M2: MessageStore + 'static,
+        S2: StateStore + 'static,
+        MF: Fn() -> M2 + Send + Sync + 'static,
+        SF: Fn() -> S2 + Send + Sync + 'static,
+    {
+        SubagentTool {
+            config: self.config,
+            provider: self.provider,
+            tools: self.tools,
+            hooks: self.hooks,
+            message_store_factory: Arc::new(message_factory),
+            state_store_factory: Arc::new(state_factory),
+        }
+    }
+
+    /// Get the subagent configuration.
+    #[must_use]
+    pub const fn config(&self) -> &SubagentConfig {
+        &self.config
+    }
+
+    /// Run the subagent with a task.
+    async fn run_subagent(&self, task: &str) -> Result<SubagentResult> {
+        use crate::agent_loop::AgentLoop;
+
+        let start = Instant::now();
+        let thread_id = ThreadId::new();
+
+        // Create stores for this subagent run
+        let message_store = (self.message_store_factory)();
+        let state_store = (self.state_store_factory)();
+
+        // Create agent config
+        let agent_config = AgentConfig {
+            max_turns: self.config.max_turns,
+            system_prompt: self.config.system_prompt.clone(),
+            ..Default::default()
+        };
+
+        // Build the subagent
+        let agent = AgentLoop::new(
+            (*self.provider).clone(),
+            (*self.tools).clone(),
+            (*self.hooks).clone(),
+            message_store,
+            state_store,
+            agent_config,
+        );
+
+        // Create tool context
+        let tool_ctx = ToolContext::new(());
+
+        // Run with optional timeout
+        let mut rx = agent.run(thread_id, task.to_string(), tool_ctx);
+
+        let mut final_response = String::new();
+        let mut total_turns = 0;
+        let mut total_usage = TokenUsage::default();
+        let mut success = true;
+
+        let timeout_duration = self.config.timeout_ms.map(Duration::from_millis);
+
+        loop {
+            let recv_result = if let Some(timeout) = timeout_duration {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    final_response = "Subagent timed out".to_string();
+                    success = false;
+                    break;
+                }
+                tokio::time::timeout(remaining, rx.recv()).await
+            } else {
+                Ok(rx.recv().await)
+            };
+
+            match recv_result {
+                Ok(Some(event)) => match event {
+                    AgentEvent::Text { text } => {
+                        final_response.push_str(&text);
+                    }
+                    AgentEvent::TurnComplete { turn, usage, .. } => {
+                        total_turns = turn;
+                        total_usage.add(&usage);
+                    }
+                    AgentEvent::Done {
+                        total_turns: turns, ..
+                    } => {
+                        total_turns = turns;
+                        break;
+                    }
+                    AgentEvent::Error { message, .. } => {
+                        final_response = message;
+                        success = false;
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => {
+                    final_response = "Subagent timed out".to_string();
+                    success = false;
+                    break;
+                }
+            }
+        }
+
+        Ok(SubagentResult {
+            name: self.config.name.clone(),
+            final_response,
+            total_turns,
+            usage: total_usage,
+            success,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+#[async_trait]
+impl<P, H, M, S> Tool<()> for SubagentTool<P, H, M, S>
+where
+    P: LlmProvider + Clone + 'static,
+    H: AgentHooks + Clone + 'static,
+    M: MessageStore + 'static,
+    S: StateStore + 'static,
+{
+    fn name(&self) -> &'static str {
+        // Leak the name to get 'static lifetime (acceptable for long-lived tools)
+        Box::leak(format!("subagent_{}", self.config.name).into_boxed_str())
+    }
+
+    fn description(&self) -> &'static str {
+        Box::leak(
+            format!(
+                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
+                self.config.name
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task or question for the subagent to handle"
+                }
+            },
+            "required": ["task"]
+        })
+    }
+
+    fn tier(&self) -> ToolTier {
+        // Subagent spawning requires confirmation
+        ToolTier::Confirm
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+        let task = input
+            .get("task")
+            .and_then(Value::as_str)
+            .context("Missing 'task' parameter")?;
+
+        let result = self.run_subagent(task).await?;
+
+        Ok(ToolResult {
+            success: result.success,
+            output: result.final_response.clone(),
+            data: Some(serde_json::to_value(&result).unwrap_or_default()),
+            duration_ms: Some(result.duration_ms),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subagent_config_builder() {
+        let config = SubagentConfig::new("test")
+            .with_system_prompt("Test prompt")
+            .with_max_turns(5)
+            .with_timeout_ms(30000);
+
+        assert_eq!(config.name, "test");
+        assert_eq!(config.system_prompt, "Test prompt");
+        assert_eq!(config.max_turns, 5);
+        assert_eq!(config.timeout_ms, Some(30000));
+    }
+
+    #[test]
+    fn test_subagent_config_defaults() {
+        let config = SubagentConfig::new("default");
+
+        assert_eq!(config.name, "default");
+        assert!(config.system_prompt.is_empty());
+        assert_eq!(config.max_turns, 10);
+        assert_eq!(config.timeout_ms, None);
+    }
+
+    #[test]
+    fn test_subagent_result_serialization() {
+        let result = SubagentResult {
+            name: "test".to_string(),
+            final_response: "Done".to_string(),
+            total_turns: 3,
+            usage: TokenUsage::default(),
+            success: true,
+            duration_ms: 1000,
+        };
+
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("test"));
+        assert!(json.contains("Done"));
+    }
+}
