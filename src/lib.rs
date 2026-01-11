@@ -9,14 +9,27 @@
 //! # Example
 //!
 //! ```ignore
-//! use agent_sdk::{AgentLoop, AgentConfig};
+//! use agent_sdk::{
+//!     AgentLoop, AgentConfig, InMemoryStore, DefaultHooks, ToolRegistry, ToolContext, ThreadId,
+//!     providers::AnthropicProvider,
+//! };
 //!
-//! let agent = AgentLoop::builder()
-//!     .provider(your_provider)
-//!     .config(AgentConfig::default())
-//!     .build();
+//! let provider = AnthropicProvider::sonnet(api_key);
+//! let tools = ToolRegistry::new();
+//! let hooks = DefaultHooks;
+//! let message_store = InMemoryStore::new();
+//! let state_store = InMemoryStore::new();
+//! let config = AgentConfig::default();
 //!
-//! let events = agent.run("Hello!").await;
+//! let agent = AgentLoop::new(provider, tools, hooks, message_store, state_store, config);
+//!
+//! let thread_id = ThreadId::new();
+//! let tool_ctx = ToolContext::new(());
+//! let mut events = agent.run(thread_id, "Hello!".to_string(), tool_ctx);
+//!
+//! while let Some(event) = events.recv().await {
+//!     println!("{:?}", event);
+//! }
 //! ```
 
 #![forbid(unsafe_code)]
@@ -29,6 +42,7 @@ mod filesystem;
 mod hooks;
 pub mod llm;
 pub mod primitive_tools;
+pub mod providers;
 mod stores;
 mod tools;
 mod types;
