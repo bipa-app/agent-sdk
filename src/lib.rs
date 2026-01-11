@@ -69,6 +69,7 @@ pub mod providers;
 mod stores;
 mod tools;
 mod types;
+pub mod web;
 
 pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;
