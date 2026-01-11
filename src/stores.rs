@@ -47,6 +47,17 @@ pub trait MessageStore: Send + Sync {
     async fn count(&self, thread_id: &ThreadId) -> Result<usize> {
         Ok(self.get_history(thread_id).await?.len())
     }
+
+    /// Replace the entire message history for a thread.
+    /// Used for context compaction to replace old messages with a summary.
+    ///
+    /// # Errors
+    /// Returns an error if the history cannot be replaced.
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+    ) -> Result<()>;
 }
 
 /// Trait for storing agent state checkpoints.
@@ -113,6 +124,19 @@ impl MessageStore for InMemoryStore {
             .remove(&thread_id.0);
         Ok(())
     }
+
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+    ) -> Result<()> {
+        self.messages
+            .write()
+            .ok()
+            .context("lock poisoned")?
+            .insert(thread_id.0.clone(), messages);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -173,6 +197,38 @@ mod tests {
         store.clear(&thread_id).await?;
         let history = store.get_history(&thread_id).await?;
         assert!(history.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replace_history() -> Result<()> {
+        let store = InMemoryStore::new();
+        let thread_id = ThreadId::new();
+
+        // Add some messages
+        store.append(&thread_id, Message::user("Hello")).await?;
+        store
+            .append(&thread_id, Message::assistant("Hi there!"))
+            .await?;
+        store
+            .append(&thread_id, Message::user("How are you?"))
+            .await?;
+
+        // Verify original messages
+        let history = store.get_history(&thread_id).await?;
+        assert_eq!(history.len(), 3);
+
+        // Replace with compacted history
+        let new_history = vec![
+            Message::user("[Summary] Previous conversation about greetings"),
+            Message::assistant("I understand the context. Continuing..."),
+        ];
+        store.replace_history(&thread_id, new_history).await?;
+
+        // Verify replaced history
+        let history = store.get_history(&thread_id).await?;
+        assert_eq!(history.len(), 2);
 
         Ok(())
     }

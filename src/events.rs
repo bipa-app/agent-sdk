@@ -77,6 +77,18 @@ pub enum AgentEvent {
 
     /// An error occurred during execution
     Error { message: String, recoverable: bool },
+
+    /// Context was compacted to reduce size
+    ContextCompacted {
+        /// Number of messages before compaction
+        original_count: usize,
+        /// Number of messages after compaction
+        new_count: usize,
+        /// Estimated tokens before compaction
+        original_tokens: usize,
+        /// Estimated tokens after compaction
+        new_tokens: usize,
+    },
 }
 
 impl AgentEvent {
@@ -150,6 +162,21 @@ impl AgentEvent {
         Self::Error {
             message: message.into(),
             recoverable,
+        }
+    }
+
+    #[must_use]
+    pub const fn context_compacted(
+        original_count: usize,
+        new_count: usize,
+        original_tokens: usize,
+        new_tokens: usize,
+    ) -> Self {
+        Self::ContextCompacted {
+            original_count,
+            new_count,
+            original_tokens,
+            new_tokens,
         }
     }
 }

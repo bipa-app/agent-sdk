@@ -59,6 +59,7 @@
 
 mod agent_loop;
 mod capabilities;
+pub mod context;
 mod environment;
 mod events;
 mod filesystem;
