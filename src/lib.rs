@@ -22,13 +22,17 @@
 #![forbid(unsafe_code)]
 
 mod events;
-
+mod hooks;
 pub mod llm;
+mod stores;
+mod tools;
 mod types;
 
 pub use events::AgentEvent;
+pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::LlmProvider;
-
+pub use stores::{InMemoryStore, MessageStore, StateStore};
+pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use types::{
     AgentConfig, AgentState, PendingAction, ThreadId, TokenUsage, ToolResult, ToolTier,
 };
