@@ -27,6 +27,7 @@ mod events;
 mod filesystem;
 mod hooks;
 pub mod llm;
+pub mod primitive_tools;
 mod stores;
 mod tools;
 mod types;
