@@ -21,14 +21,20 @@
 
 #![forbid(unsafe_code)]
 
+mod capabilities;
+mod environment;
 mod events;
+mod filesystem;
 mod hooks;
 pub mod llm;
 mod stores;
 mod tools;
 mod types;
 
+pub use capabilities::AgentCapabilities;
+pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use events::AgentEvent;
+pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::LlmProvider;
 pub use stores::{InMemoryStore, MessageStore, StateStore};

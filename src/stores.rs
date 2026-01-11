@@ -1,6 +1,6 @@
 use crate::llm;
 use crate::types::{AgentState, ThreadId};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -79,7 +79,8 @@ impl MessageStore for InMemoryStore {
     async fn append(&self, thread_id: &ThreadId, message: llm::Message) -> Result<()> {
         self.messages
             .write()
-            .unwrap()
+            .ok()
+            .context("lock poisoned")?
             .entry(thread_id.0.clone())
             .or_default()
             .push(message);
@@ -87,12 +88,16 @@ impl MessageStore for InMemoryStore {
     }
 
     async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
-        let messages = self.messages.read().unwrap();
+        let messages = self.messages.read().ok().context("lock poisoned")?;
         Ok(messages.get(&thread_id.0).cloned().unwrap_or_default())
     }
 
     async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
-        self.messages.write().unwrap().remove(&thread_id.0);
+        self.messages
+            .write()
+            .ok()
+            .context("lock poisoned")?
+            .remove(&thread_id.0);
         Ok(())
     }
 }
@@ -102,18 +107,23 @@ impl StateStore for InMemoryStore {
     async fn save(&self, state: &AgentState) -> Result<()> {
         self.states
             .write()
-            .unwrap()
+            .ok()
+            .context("lock poisoned")?
             .insert(state.thread_id.0.clone(), state.clone());
         Ok(())
     }
 
     async fn load(&self, thread_id: &ThreadId) -> Result<Option<AgentState>> {
-        let states = self.states.read().unwrap();
+        let states = self.states.read().ok().context("lock poisoned")?;
         Ok(states.get(&thread_id.0).cloned())
     }
 
     async fn delete(&self, thread_id: &ThreadId) -> Result<()> {
-        self.states.write().unwrap().remove(&thread_id.0);
+        self.states
+            .write()
+            .ok()
+            .context("lock poisoned")?
+            .remove(&thread_id.0);
         Ok(())
     }
 }
@@ -124,59 +134,61 @@ mod tests {
     use crate::llm::Message;
 
     #[tokio::test]
-    async fn test_in_memory_message_store() {
+    async fn test_in_memory_message_store() -> Result<()> {
         let store = InMemoryStore::new();
         let thread_id = ThreadId::new();
 
         // Initially empty
-        let history = store.get_history(&thread_id).await.unwrap();
+        let history = store.get_history(&thread_id).await?;
         assert!(history.is_empty());
 
         // Add messages
-        store
-            .append(&thread_id, Message::user("Hello"))
-            .await
-            .unwrap();
+        store.append(&thread_id, Message::user("Hello")).await?;
         store
             .append(&thread_id, Message::assistant("Hi there!"))
-            .await
-            .unwrap();
+            .await?;
 
         // Retrieve messages
-        let history = store.get_history(&thread_id).await.unwrap();
+        let history = store.get_history(&thread_id).await?;
         assert_eq!(history.len(), 2);
 
         // Count
-        let count = store.count(&thread_id).await.unwrap();
+        let count = store.count(&thread_id).await?;
         assert_eq!(count, 2);
 
         // Clear
-        store.clear(&thread_id).await.unwrap();
-        let history = store.get_history(&thread_id).await.unwrap();
+        store.clear(&thread_id).await?;
+        let history = store.get_history(&thread_id).await?;
         assert!(history.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_in_memory_state_store() {
+    async fn test_in_memory_state_store() -> Result<()> {
         let store = InMemoryStore::new();
         let thread_id = ThreadId::new();
 
         // Initially none
-        let state = store.load(&thread_id).await.unwrap();
+        let state = store.load(&thread_id).await?;
         assert!(state.is_none());
 
         // Save state
         let state = AgentState::new(thread_id.clone());
-        store.save(&state).await.unwrap();
+        store.save(&state).await?;
 
         // Load state
-        let loaded = store.load(&thread_id).await.unwrap();
+        let loaded = store.load(&thread_id).await?;
         assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().thread_id, thread_id);
+        if let Some(loaded_state) = loaded {
+            assert_eq!(loaded_state.thread_id, thread_id);
+        }
 
         // Delete state
-        store.delete(&thread_id).await.unwrap();
-        let state = store.load(&thread_id).await.unwrap();
+        store.delete(&thread_id).await?;
+        let state = store.load(&thread_id).await?;
         assert!(state.is_none());
+
+        Ok(())
     }
 }

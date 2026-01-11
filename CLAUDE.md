@@ -166,3 +166,23 @@ pub trait DataFetcher {
 3. **Use `tracing`** for logging
 4. **Prefer inline full paths** for clarity: `llm::Message::user("hi")`
 5. **No unsafe code** - `#[forbid(unsafe_code)]` is enforced
+6. **Never use `unwrap()` or `expect()`** - Always propagate errors with `?` and add context:
+
+```rust
+// BAD: Panics without context
+let value = some_result.unwrap();
+let value = some_result.expect("something failed");
+let lock = mutex.lock().unwrap();
+
+// GOOD: Propagate errors with context
+let value = some_result.context("failed to get value")?;
+
+// For RwLock/Mutex: convert poison error to anyhow error
+let lock = self.data.read().ok().context("lock poisoned")?;
+let lock = self.data.write().ok().context("lock poisoned")?;
+
+// For Option types
+let value = some_option.context("value was None")?;
+```
+
+This rule applies to both production code AND tests. In tests, return `Result<()>` and use `?`.
