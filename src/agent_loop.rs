@@ -1,10 +1,10 @@
 use crate::events::AgentEvent;
-use crate::hooks::{AgentHooks, ToolDecision};
+use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role,
     StopReason,
 };
-use crate::stores::{MessageStore, StateStore};
+use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentState, ThreadId, TokenUsage, ToolResult};
 use anyhow::Result;
@@ -12,6 +12,197 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Builder for constructing an `AgentLoop`.
+///
+/// # Example
+///
+/// ```ignore
+/// let agent = AgentLoop::builder()
+///     .provider(my_provider)
+///     .tools(my_tools)
+///     .config(AgentConfig::default())
+///     .build();
+/// ```
+pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
+    provider: Option<P>,
+    tools: Option<ToolRegistry<Ctx>>,
+    hooks: Option<H>,
+    message_store: Option<M>,
+    state_store: Option<S>,
+    config: Option<AgentConfig>,
+}
+
+impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
+    /// Create a new builder with no components set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            provider: None,
+            tools: None,
+            hooks: None,
+            message_store: None,
+            state_store: None,
+            config: None,
+        }
+    }
+}
+
+impl<Ctx> Default for AgentLoopBuilder<Ctx, (), (), (), ()> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
+    /// Set the LLM provider.
+    #[must_use]
+    pub fn provider<P2: LlmProvider>(self, provider: P2) -> AgentLoopBuilder<Ctx, P2, H, M, S> {
+        AgentLoopBuilder {
+            provider: Some(provider),
+            tools: self.tools,
+            hooks: self.hooks,
+            message_store: self.message_store,
+            state_store: self.state_store,
+            config: self.config,
+        }
+    }
+
+    /// Set the tool registry.
+    #[must_use]
+    pub fn tools(mut self, tools: ToolRegistry<Ctx>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set the agent hooks.
+    #[must_use]
+    pub fn hooks<H2: AgentHooks>(self, hooks: H2) -> AgentLoopBuilder<Ctx, P, H2, M, S> {
+        AgentLoopBuilder {
+            provider: self.provider,
+            tools: self.tools,
+            hooks: Some(hooks),
+            message_store: self.message_store,
+            state_store: self.state_store,
+            config: self.config,
+        }
+    }
+
+    /// Set the message store.
+    #[must_use]
+    pub fn message_store<M2: MessageStore>(
+        self,
+        message_store: M2,
+    ) -> AgentLoopBuilder<Ctx, P, H, M2, S> {
+        AgentLoopBuilder {
+            provider: self.provider,
+            tools: self.tools,
+            hooks: self.hooks,
+            message_store: Some(message_store),
+            state_store: self.state_store,
+            config: self.config,
+        }
+    }
+
+    /// Set the state store.
+    #[must_use]
+    pub fn state_store<S2: StateStore>(
+        self,
+        state_store: S2,
+    ) -> AgentLoopBuilder<Ctx, P, H, M, S2> {
+        AgentLoopBuilder {
+            provider: self.provider,
+            tools: self.tools,
+            hooks: self.hooks,
+            message_store: self.message_store,
+            state_store: Some(state_store),
+            config: self.config,
+        }
+    }
+
+    /// Set the agent configuration.
+    #[must_use]
+    pub fn config(mut self, config: AgentConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+}
+
+impl<Ctx, P> AgentLoopBuilder<Ctx, P, (), (), ()>
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider + 'static,
+{
+    /// Build the agent loop with default hooks and in-memory stores.
+    ///
+    /// This is a convenience method that uses:
+    /// - `DefaultHooks` for hooks
+    /// - `InMemoryStore` for message store
+    /// - `InMemoryStore` for state store
+    /// - `AgentConfig::default()` if no config is set
+    ///
+    /// # Panics
+    ///
+    /// Panics if a provider has not been set.
+    #[must_use]
+    pub fn build(self) -> AgentLoop<Ctx, P, DefaultHooks, InMemoryStore, InMemoryStore> {
+        let provider = self.provider.expect("provider is required");
+        let tools = self.tools.unwrap_or_default();
+        let config = self.config.unwrap_or_default();
+
+        AgentLoop {
+            provider: Arc::new(provider),
+            tools: Arc::new(tools),
+            hooks: Arc::new(DefaultHooks),
+            message_store: Arc::new(InMemoryStore::new()),
+            state_store: Arc::new(InMemoryStore::new()),
+            config,
+        }
+    }
+}
+
+impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S>
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider + 'static,
+    H: AgentHooks + 'static,
+    M: MessageStore + 'static,
+    S: StateStore + 'static,
+{
+    /// Build the agent loop with all custom components.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the following have not been set:
+    /// - `provider`
+    /// - `hooks`
+    /// - `message_store`
+    /// - `state_store`
+    #[must_use]
+    pub fn build_with_stores(self) -> AgentLoop<Ctx, P, H, M, S> {
+        let provider = self.provider.expect("provider is required");
+        let tools = self.tools.unwrap_or_default();
+        let hooks = self
+            .hooks
+            .expect("hooks is required when using build_with_stores");
+        let message_store = self
+            .message_store
+            .expect("message_store is required when using build_with_stores");
+        let state_store = self
+            .state_store
+            .expect("state_store is required when using build_with_stores");
+        let config = self.config.unwrap_or_default();
+
+        AgentLoop {
+            provider: Arc::new(provider),
+            tools: Arc::new(tools),
+            hooks: Arc::new(hooks),
+            message_store: Arc::new(message_store),
+            state_store: Arc::new(state_store),
+            config,
+        }
+    }
+}
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
 pub struct AgentLoop<Ctx, P, H, M, S>
@@ -29,6 +220,12 @@ where
     config: AgentConfig,
 }
 
+/// Create a new builder for constructing an `AgentLoop`.
+#[must_use]
+pub const fn builder<Ctx>() -> AgentLoopBuilder<Ctx, (), (), (), ()> {
+    AgentLoopBuilder::new()
+}
+
 impl<Ctx, P, H, M, S> AgentLoop<Ctx, P, H, M, S>
 where
     Ctx: Send + Sync + 'static,
@@ -37,6 +234,7 @@ where
     M: MessageStore + 'static,
     S: StateStore + 'static,
 {
+    /// Create a new agent loop with all components specified directly.
     #[must_use]
     pub fn new(
         provider: P,
