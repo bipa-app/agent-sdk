@@ -1,3 +1,32 @@
+//! Agent loop orchestration module.
+//!
+//! This module contains the core agent loop that orchestrates LLM calls,
+//! tool execution, and event handling. The agent loop is the main entry point
+//! for running an AI agent.
+//!
+//! # Architecture
+//!
+//! The agent loop works as follows:
+//! 1. Receives a user message
+//! 2. Sends the message to the LLM provider
+//! 3. Processes the LLM response (text or tool calls)
+//! 4. If tool calls are present, executes them and feeds results back to LLM
+//! 5. Repeats until the LLM responds with only text (no tool calls)
+//! 6. Emits events throughout for real-time UI updates
+//!
+//! # Building an Agent
+//!
+//! Use the builder pattern via [`builder()`] or [`AgentLoopBuilder`]:
+//!
+//! ```ignore
+//! use agent_sdk::{builder, providers::AnthropicProvider};
+//!
+//! let agent = builder()
+//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .tools(my_tools)
+//!     .build();
+//! ```
+
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
@@ -205,6 +234,34 @@ where
 }
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
+///
+/// `AgentLoop` is the core component that:
+/// - Manages conversation state via message and state stores
+/// - Calls the LLM provider and processes responses
+/// - Executes tools through the tool registry
+/// - Emits events for real-time updates via an async channel
+/// - Enforces hooks for tool permissions and lifecycle events
+///
+/// # Type Parameters
+///
+/// - `Ctx`: Application-specific context passed to tools (e.g., user ID, database)
+/// - `P`: The LLM provider implementation
+/// - `H`: The hooks implementation for lifecycle customization
+/// - `M`: The message store implementation
+/// - `S`: The state store implementation
+///
+/// # Running the Agent
+///
+/// ```ignore
+/// let mut events = agent.run(thread_id, "Hello!".to_string(), tool_ctx);
+/// while let Some(event) = events.recv().await {
+///     match event {
+///         AgentEvent::Text { text } => println!("{}", text),
+///         AgentEvent::Done { .. } => break,
+///         _ => {}
+///     }
+/// }
+/// ```
 pub struct AgentLoop<Ctx, P, H, M, S>
 where
     P: LlmProvider,

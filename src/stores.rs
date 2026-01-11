@@ -1,3 +1,16 @@
+//! Storage traits for message history and agent state.
+//!
+//! The SDK uses two storage abstractions:
+//!
+//! - [`MessageStore`] - Stores conversation message history per thread
+//! - [`StateStore`] - Stores agent state checkpoints for recovery
+//!
+//! # Built-in Implementation
+//!
+//! [`InMemoryStore`] implements both traits and is suitable for testing
+//! and single-process deployments. For production, implement custom stores
+//! backed by your database (e.g., Postgres, Redis).
+
 use crate::llm;
 use crate::types::{AgentState, ThreadId};
 use anyhow::{Context, Result};

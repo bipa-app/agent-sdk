@@ -1,3 +1,15 @@
+//! Core types for the agent SDK.
+//!
+//! This module contains the fundamental types used throughout the SDK:
+//!
+//! - [`ThreadId`]: Unique identifier for conversation threads
+//! - [`AgentConfig`]: Configuration for the agent loop
+//! - [`TokenUsage`]: Token consumption statistics
+//! - [`ToolResult`]: Result returned from tool execution
+//! - [`ToolTier`]: Permission tiers for tools
+//! - [`PendingAction`]: Actions awaiting user confirmation
+//! - [`AgentState`]: Checkpointable agent state
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;

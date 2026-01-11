@@ -1,3 +1,17 @@
+//! Agent events for real-time streaming.
+//!
+//! The [`AgentEvent`] enum represents all events that can occur during agent
+//! execution. These events are streamed via an async channel for real-time
+//! UI updates and logging.
+//!
+//! # Event Flow
+//!
+//! A typical event sequence looks like:
+//! 1. `Start` - Agent begins processing
+//! 2. `Text` / `ToolCallStart` / `ToolCallEnd` - Processing events
+//! 3. `TurnComplete` - One LLM round-trip finished
+//! 4. `Done` - Agent completed successfully, or `Error` if failed
+
 use crate::types::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
