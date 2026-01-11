@@ -136,6 +136,23 @@ impl<Ctx> ToolRegistry<Ctx> {
         self.tools.is_empty()
     }
 
+    /// Filter tools by a predicate.
+    ///
+    /// Removes tools for which the predicate returns false.
+    /// The predicate receives the tool name.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// registry.filter(|name| name != "bash");
+    /// ```
+    pub fn filter<F>(&mut self, predicate: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.tools.retain(|name, _| predicate(name));
+    }
+
     /// Convert tools to LLM tool definitions
     #[must_use]
     pub fn to_llm_tools(&self) -> Vec<llm::Tool> {
@@ -202,5 +219,64 @@ mod tests {
         let llm_tools = registry.to_llm_tools();
         assert_eq!(llm_tools.len(), 1);
         assert_eq!(llm_tools[0].name, "mock_tool");
+    }
+
+    struct AnotherTool;
+
+    #[async_trait]
+    impl Tool<()> for AnotherTool {
+        fn name(&self) -> &'static str {
+            "another_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "Another tool for testing"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success("Done"))
+        }
+    }
+
+    #[test]
+    fn test_filter_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(AnotherTool);
+
+        assert_eq!(registry.len(), 2);
+
+        // Filter out mock_tool
+        registry.filter(|name| name != "mock_tool");
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("mock_tool").is_none());
+        assert!(registry.get("another_tool").is_some());
+    }
+
+    #[test]
+    fn test_filter_tools_keep_all() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(AnotherTool);
+
+        registry.filter(|_| true);
+
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_remove_all() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(AnotherTool);
+
+        registry.filter(|_| false);
+
+        assert!(registry.is_empty());
     }
 }

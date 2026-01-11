@@ -33,6 +33,7 @@ use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role,
     StopReason,
 };
+use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentState, ThreadId, TokenUsage, ToolResult};
@@ -153,6 +154,45 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn config(mut self, config: AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Apply a skill configuration.
+    ///
+    /// This merges the skill's system prompt with the existing configuration
+    /// and filters tools based on the skill's allowed/denied lists.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let skill = Skill::new("code-review", "You are a code reviewer...")
+    ///     .with_denied_tools(vec!["bash".into()]);
+    ///
+    /// let agent = builder()
+    ///     .provider(provider)
+    ///     .tools(tools)
+    ///     .with_skill(skill)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_skill(mut self, skill: Skill) -> Self
+    where
+        Ctx: Send + Sync + 'static,
+    {
+        // Filter tools based on skill configuration first (before moving skill)
+        if let Some(ref mut tools) = self.tools {
+            tools.filter(|name| skill.is_tool_allowed(name));
+        }
+
+        // Merge system prompt
+        let mut config = self.config.take().unwrap_or_default();
+        if config.system_prompt.is_empty() {
+            config.system_prompt = skill.system_prompt;
+        } else {
+            config.system_prompt = format!("{}\n\n{}", config.system_prompt, skill.system_prompt);
+        }
+        self.config = Some(config);
+
         self
     }
 }
