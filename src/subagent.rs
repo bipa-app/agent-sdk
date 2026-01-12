@@ -92,6 +92,21 @@ impl SubagentConfig {
     }
 }
 
+/// Log entry for a single tool call within a subagent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCallLog {
+    /// Tool name.
+    pub name: String,
+    /// Brief context/args (e.g., file path, command).
+    pub context: String,
+    /// Brief result summary.
+    pub result: String,
+    /// Whether the tool call succeeded.
+    pub success: bool,
+    /// Duration in milliseconds.
+    pub duration_ms: Option<u64>,
+}
+
 /// Result from a subagent execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubagentResult {
@@ -101,6 +116,10 @@ pub struct SubagentResult {
     pub final_response: String,
     /// Total number of turns taken.
     pub total_turns: usize,
+    /// Number of tool calls made by the subagent.
+    pub tool_count: u32,
+    /// Log of tool calls made by the subagent.
+    pub tool_logs: Vec<ToolCallLog>,
     /// Token usage statistics.
     pub usage: TokenUsage,
     /// Whether the subagent completed successfully.
@@ -210,6 +229,7 @@ where
     }
 
     /// Run the subagent with a task.
+    #[allow(clippy::too_many_lines)]
     async fn run_subagent(&self, task: &str) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
@@ -245,6 +265,10 @@ where
 
         let mut final_response = String::new();
         let mut total_turns = 0;
+        let mut tool_count = 0u32;
+        let mut tool_logs: Vec<ToolCallLog> = Vec::new();
+        let mut pending_tools: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
         let mut total_usage = TokenUsage::default();
         let mut success = true;
 
@@ -267,6 +291,29 @@ where
                 Ok(Some(event)) => match event {
                     AgentEvent::Text { text } => {
                         final_response.push_str(&text);
+                    }
+                    AgentEvent::ToolCallStart {
+                        id, name, input, ..
+                    } => {
+                        // Track tool calls made by the subagent
+                        tool_count += 1;
+                        let context = extract_tool_context(&name, &input);
+                        pending_tools.insert(id, (name, context));
+                    }
+                    AgentEvent::ToolCallEnd { id, name, result } => {
+                        // Create log entry when tool completes
+                        let context = pending_tools
+                            .remove(&id)
+                            .map(|(_, ctx)| ctx)
+                            .unwrap_or_default();
+                        let result_summary = summarize_tool_result(&name, &result);
+                        tool_logs.push(ToolCallLog {
+                            name,
+                            context,
+                            result: result_summary,
+                            success: result.success,
+                            duration_ms: result.duration_ms,
+                        });
                     }
                     AgentEvent::TurnComplete { turn, usage, .. } => {
                         total_turns = turn;
@@ -298,10 +345,102 @@ where
             name: self.config.name.clone(),
             final_response,
             total_turns,
+            tool_count,
+            tool_logs,
             usage: total_usage,
             success,
             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
+    }
+}
+
+/// Extracts context information from tool input for display.
+fn extract_tool_context(name: &str, input: &Value) -> String {
+    match name {
+        "read" => input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "write" | "edit" => input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "bash" => {
+            let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
+            // Truncate long commands
+            if cmd.len() > 60 {
+                format!("{}...", &cmd[..57])
+            } else {
+                cmd.to_string()
+            }
+        }
+        "glob" | "grep" => input
+            .get("pattern")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "web_search" => input
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Summarizes tool result for logging.
+fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
+    if !result.success {
+        let first_line = result.output.lines().next().unwrap_or("Error");
+        return if first_line.len() > 50 {
+            format!("{}...", &first_line[..47])
+        } else {
+            first_line.to_string()
+        };
+    }
+
+    match name {
+        "read" => {
+            let line_count = result.output.lines().count();
+            format!("{line_count} lines")
+        }
+        "write" => "wrote file".to_string(),
+        "edit" => "edited".to_string(),
+        "bash" => {
+            let lines: Vec<&str> = result.output.lines().collect();
+            if lines.is_empty() {
+                "done".to_string()
+            } else if lines.len() == 1 {
+                let line = lines[0];
+                if line.len() > 50 {
+                    format!("{}...", &line[..47])
+                } else {
+                    line.to_string()
+                }
+            } else {
+                format!("{} lines", lines.len())
+            }
+        }
+        "glob" => {
+            let count = result.output.lines().count();
+            format!("{count} files")
+        }
+        "grep" => {
+            let count = result.output.lines().count();
+            format!("{count} matches")
+        }
+        _ => {
+            let line_count = result.output.lines().count();
+            if line_count == 0 {
+                "done".to_string()
+            } else {
+                format!("{line_count} lines")
+            }
+        }
     }
 }
 
@@ -396,6 +535,23 @@ mod tests {
             name: "test".to_string(),
             final_response: "Done".to_string(),
             total_turns: 3,
+            tool_count: 5,
+            tool_logs: vec![
+                ToolCallLog {
+                    name: "read".to_string(),
+                    context: "/tmp/test.rs".to_string(),
+                    result: "50 lines".to_string(),
+                    success: true,
+                    duration_ms: Some(10),
+                },
+                ToolCallLog {
+                    name: "grep".to_string(),
+                    context: "TODO".to_string(),
+                    result: "3 matches".to_string(),
+                    success: true,
+                    duration_ms: Some(5),
+                },
+            ],
             usage: TokenUsage::default(),
             success: true,
             duration_ms: 1000,
@@ -404,5 +560,8 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("test"));
         assert!(json.contains("Done"));
+        assert!(json.contains("tool_count"));
+        assert!(json.contains("tool_logs"));
+        assert!(json.contains("/tmp/test.rs"));
     }
 }
