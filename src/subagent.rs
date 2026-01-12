@@ -648,34 +648,34 @@ mod tests {
         let value = serde_json::to_value(&result).expect("serialize to value");
 
         // Test tool_count extraction (as_u64 should work for u32)
-        let tool_count = value.get("tool_count").and_then(|v| v.as_u64());
+        let tool_count = value.get("tool_count").and_then(Value::as_u64);
         assert_eq!(tool_count, Some(5));
 
         // Test usage extraction
         let usage = value.get("usage").expect("usage field");
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
-        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
+        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+        let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
         assert_eq!(input_tokens, Some(1500));
         assert_eq!(output_tokens, Some(500));
 
         // Test tool_logs extraction
-        let tool_logs = value.get("tool_logs").and_then(|v| v.as_array());
+        let tool_logs = value.get("tool_logs").and_then(Value::as_array);
         assert!(tool_logs.is_some());
         let logs = tool_logs.unwrap();
         assert_eq!(logs.len(), 1);
 
         let first_log = &logs[0];
-        assert_eq!(first_log.get("name").and_then(|v| v.as_str()), Some("glob"));
+        assert_eq!(first_log.get("name").and_then(Value::as_str), Some("glob"));
         assert_eq!(
-            first_log.get("context").and_then(|v| v.as_str()),
+            first_log.get("context").and_then(Value::as_str),
             Some("**/*.toml")
         );
         assert_eq!(
-            first_log.get("result").and_then(|v| v.as_str()),
+            first_log.get("result").and_then(Value::as_str),
             Some("3 files")
         );
         assert_eq!(
-            first_log.get("success").and_then(|v| v.as_bool()),
+            first_log.get("success").and_then(Value::as_bool),
             Some(true)
         );
     }
