@@ -54,6 +54,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// Model identifier
     pub model: String,
+    /// Retry configuration for transient errors
+    pub retry: RetryConfig,
 }
 
 impl Default for AgentConfig {
@@ -63,6 +65,50 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-20250514"),
+            retry: RetryConfig::default(),
+        }
+    }
+}
+
+/// Configuration for retry behavior on transient errors.
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff
+    pub base_delay_ms: u64,
+    /// Maximum delay cap in milliseconds
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            base_delay_ms: 1000,
+            max_delay_ms: 120_000,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Create a retry config with no retries (for testing)
+    #[must_use]
+    pub const fn no_retry() -> Self {
+        Self {
+            max_retries: 0,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        }
+    }
+
+    /// Create a retry config with fast retries (for testing)
+    #[must_use]
+    pub const fn fast() -> Self {
+        Self {
+            max_retries: 5,
+            base_delay_ms: 10,
+            max_delay_ms: 100,
         }
     }
 }
