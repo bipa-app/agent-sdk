@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 /// Configuration for a subagent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,8 +230,16 @@ where
     }
 
     /// Run the subagent with a task.
+    ///
+    /// If `parent_tx` is provided, the subagent will emit `SubagentProgress` events
+    /// to the parent's event channel, allowing the UI to show live progress.
     #[allow(clippy::too_many_lines)]
-    async fn run_subagent(&self, task: &str) -> Result<SubagentResult> {
+    async fn run_subagent(
+        &self,
+        task: &str,
+        subagent_id: String,
+        parent_tx: Option<mpsc::Sender<AgentEvent>>,
+    ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
         let start = Instant::now();
@@ -298,7 +307,24 @@ where
                         // Track tool calls made by the subagent
                         tool_count += 1;
                         let context = extract_tool_context(&name, &input);
-                        pending_tools.insert(id, (name, context));
+                        pending_tools.insert(id, (name.clone(), context.clone()));
+
+                        // Emit progress event to parent
+                        if let Some(ref tx) = parent_tx {
+                            let _ = tx
+                                .send(AgentEvent::SubagentProgress {
+                                    subagent_id: subagent_id.clone(),
+                                    subagent_name: self.config.name.clone(),
+                                    tool_name: name,
+                                    tool_context: context,
+                                    completed: false,
+                                    success: false,
+                                    tool_count,
+                                    total_tokens: u64::from(total_usage.input_tokens)
+                                        + u64::from(total_usage.output_tokens),
+                                })
+                                .await;
+                        }
                     }
                     AgentEvent::ToolCallEnd { id, name, result } => {
                         // Create log entry when tool completes
@@ -307,13 +333,31 @@ where
                             .map(|(_, ctx)| ctx)
                             .unwrap_or_default();
                         let result_summary = summarize_tool_result(&name, &result);
+                        let tool_success = result.success;
                         tool_logs.push(ToolCallLog {
-                            name,
-                            context,
+                            name: name.clone(),
+                            context: context.clone(),
                             result: result_summary,
-                            success: result.success,
+                            success: tool_success,
                             duration_ms: result.duration_ms,
                         });
+
+                        // Emit progress event to parent
+                        if let Some(ref tx) = parent_tx {
+                            let _ = tx
+                                .send(AgentEvent::SubagentProgress {
+                                    subagent_id: subagent_id.clone(),
+                                    subagent_name: self.config.name.clone(),
+                                    tool_name: name,
+                                    tool_context: context,
+                                    completed: true,
+                                    success: tool_success,
+                                    tool_count,
+                                    total_tokens: u64::from(total_usage.input_tokens)
+                                        + u64::from(total_usage.output_tokens),
+                                })
+                                .await;
+                        }
                     }
                     AgentEvent::TurnComplete { turn, usage, .. } => {
                         total_turns = turn;
@@ -485,13 +529,26 @@ where
         ToolTier::Confirm
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
         let task = input
             .get("task")
             .and_then(Value::as_str)
             .context("Missing 'task' parameter")?;
 
-        let result = self.run_subagent(task).await?;
+        // Get event channel from context for progress updates
+        let parent_tx = ctx.event_tx();
+
+        // Generate a unique ID for this subagent execution
+        let subagent_id = format!(
+            "{}_{:x}",
+            self.config.name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let result = self.run_subagent(task, subagent_id, parent_tx).await?;
 
         Ok(ToolResult {
             success: result.success,
@@ -563,5 +620,63 @@ mod tests {
         assert!(json.contains("tool_count"));
         assert!(json.contains("tool_logs"));
         assert!(json.contains("/tmp/test.rs"));
+    }
+
+    #[test]
+    fn test_subagent_result_field_extraction() {
+        // Test that verifies the exact JSON structure expected by bip's tui_session.rs
+        let result = SubagentResult {
+            name: "explore".to_string(),
+            final_response: "Found 3 config files".to_string(),
+            total_turns: 2,
+            tool_count: 5,
+            tool_logs: vec![ToolCallLog {
+                name: "glob".to_string(),
+                context: "**/*.toml".to_string(),
+                result: "3 files".to_string(),
+                success: true,
+                duration_ms: Some(15),
+            }],
+            usage: TokenUsage {
+                input_tokens: 1500,
+                output_tokens: 500,
+            },
+            success: true,
+            duration_ms: 2500,
+        };
+
+        let value = serde_json::to_value(&result).expect("serialize to value");
+
+        // Test tool_count extraction (as_u64 should work for u32)
+        let tool_count = value.get("tool_count").and_then(Value::as_u64);
+        assert_eq!(tool_count, Some(5));
+
+        // Test usage extraction
+        let usage = value.get("usage").expect("usage field");
+        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+        let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+        assert_eq!(input_tokens, Some(1500));
+        assert_eq!(output_tokens, Some(500));
+
+        // Test tool_logs extraction
+        let tool_logs = value.get("tool_logs").and_then(Value::as_array);
+        assert!(tool_logs.is_some());
+        let logs = tool_logs.unwrap();
+        assert_eq!(logs.len(), 1);
+
+        let first_log = &logs[0];
+        assert_eq!(first_log.get("name").and_then(Value::as_str), Some("glob"));
+        assert_eq!(
+            first_log.get("context").and_then(Value::as_str),
+            Some("**/*.toml")
+        );
+        assert_eq!(
+            first_log.get("result").and_then(Value::as_str),
+            Some("3 files")
+        );
+        assert_eq!(
+            first_log.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }

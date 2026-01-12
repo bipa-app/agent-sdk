@@ -89,6 +89,26 @@ pub enum AgentEvent {
         /// Estimated tokens after compaction
         new_tokens: usize,
     },
+
+    /// Progress update from a running subagent
+    SubagentProgress {
+        /// ID of the parent tool call that spawned this subagent
+        subagent_id: String,
+        /// Name of the subagent (e.g., "explore", "plan")
+        subagent_name: String,
+        /// Tool name that just started or completed
+        tool_name: String,
+        /// Brief context for the tool (e.g., file path, pattern)
+        tool_context: String,
+        /// Whether the tool completed (false = started, true = ended)
+        completed: bool,
+        /// Whether the tool succeeded (only meaningful if completed)
+        success: bool,
+        /// Current total tool count for this subagent
+        tool_count: u32,
+        /// Current total tokens used by this subagent
+        total_tokens: u64,
+    },
 }
 
 impl AgentEvent {
