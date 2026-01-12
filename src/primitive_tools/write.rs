@@ -23,7 +23,8 @@ impl<E: Environment> WriteTool<E> {
 
 #[derive(Debug, Deserialize)]
 struct WriteInput {
-    /// Path to the file to write
+    /// Path to the file to write (also accepts `file_path` for compatibility)
+    #[serde(alias = "file_path")]
     path: String,
     /// Content to write to the file
     content: String,

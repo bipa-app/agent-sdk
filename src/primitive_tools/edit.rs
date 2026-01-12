@@ -23,7 +23,8 @@ impl<E: Environment> EditTool<E> {
 
 #[derive(Debug, Deserialize)]
 struct EditInput {
-    /// Path to the file to edit
+    /// Path to the file to edit (also accepts `file_path` for compatibility)
+    #[serde(alias = "file_path")]
     path: String,
     /// String to find and replace
     old_string: String,

@@ -23,7 +23,8 @@ impl<E: Environment> ReadTool<E> {
 
 #[derive(Debug, Deserialize)]
 struct ReadInput {
-    /// Path to the file to read
+    /// Path to the file to read (also accepts `file_path` for compatibility)
+    #[serde(alias = "file_path")]
     path: String,
     /// Optional line offset to start from (1-based)
     #[serde(default)]
