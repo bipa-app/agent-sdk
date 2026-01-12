@@ -80,12 +80,14 @@ pub trait AgentHooks: Send + Sync {
 }
 
 /// Default hooks implementation that uses tier-based decisions
+#[derive(Clone, Copy, Default)]
 pub struct DefaultHooks;
 
 #[async_trait]
 impl AgentHooks for DefaultHooks {}
 
 /// Hooks that allow all tools without confirmation
+#[derive(Clone, Copy, Default)]
 pub struct AllowAllHooks;
 
 #[async_trait]
@@ -101,6 +103,7 @@ impl AgentHooks for AllowAllHooks {
 }
 
 /// Hooks that log all events (useful for debugging)
+#[derive(Clone, Copy, Default)]
 pub struct LoggingHooks;
 
 #[async_trait]
