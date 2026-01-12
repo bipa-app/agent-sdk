@@ -85,5 +85,5 @@ pub use llm::LlmProvider;
 pub use stores::{InMemoryStore, MessageStore, StateStore};
 pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use types::{
-    AgentConfig, AgentState, PendingAction, ThreadId, TokenUsage, ToolResult, ToolTier,
+    AgentConfig, AgentState, PendingAction, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier,
 };

@@ -37,11 +37,12 @@ use crate::llm::{
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentState, ThreadId, TokenUsage, ToolResult};
+use crate::types::{AgentConfig, AgentState, RetryConfig, ThreadId, TokenUsage, ToolResult};
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 /// Builder for constructing an `AgentLoop`.
@@ -581,27 +582,77 @@ where
             max_tokens: config.max_tokens,
         };
 
-        // Call LLM
+        // Call LLM with retry logic for transient errors
         debug!(turn, "Calling LLM");
-        let response = match provider.chat(request).await? {
-            ChatOutcome::Success(response) => response,
-            ChatOutcome::RateLimited => {
-                error!("Rate limited by LLM provider");
-                tx.send(AgentEvent::error("Rate limited", true)).await?;
-                break;
+        let max_retries = config.retry.max_retries;
+        let response = {
+            let mut attempt = 0u32;
+            loop {
+                let outcome = provider.chat(request.clone()).await?;
+                match outcome {
+                    ChatOutcome::Success(response) => break Some(response),
+                    ChatOutcome::RateLimited => {
+                        attempt += 1;
+                        if attempt > max_retries {
+                            error!("Rate limited by LLM provider after {max_retries} retries");
+                            tx.send(AgentEvent::error(
+                                format!("Rate limited after {max_retries} retries"),
+                                true,
+                            ))
+                            .await?;
+                            break None;
+                        }
+                        let delay = calculate_backoff_delay(attempt, &config.retry);
+                        warn!(
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            "Rate limited, retrying after backoff"
+                        );
+                        tx.send(AgentEvent::text(format!(
+                            "\n[Rate limited, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
+                            delay.as_secs_f64()
+                        )))
+                        .await?;
+                        sleep(delay).await;
+                    }
+                    ChatOutcome::InvalidRequest(msg) => {
+                        error!(msg, "Invalid request to LLM");
+                        tx.send(AgentEvent::error(format!("Invalid request: {msg}"), false))
+                            .await?;
+                        break None;
+                    }
+                    ChatOutcome::ServerError(msg) => {
+                        attempt += 1;
+                        if attempt > max_retries {
+                            error!(msg, "LLM server error after {max_retries} retries");
+                            tx.send(AgentEvent::error(
+                                format!("Server error after {max_retries} retries: {msg}"),
+                                true,
+                            ))
+                            .await?;
+                            break None;
+                        }
+                        let delay = calculate_backoff_delay(attempt, &config.retry);
+                        warn!(
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            error = msg,
+                            "Server error, retrying after backoff"
+                        );
+                        tx.send(AgentEvent::text(format!(
+                            "\n[Server error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
+                            delay.as_secs_f64()
+                        )))
+                        .await?;
+                        sleep(delay).await;
+                    }
+                }
             }
-            ChatOutcome::InvalidRequest(msg) => {
-                error!(msg, "Invalid request to LLM");
-                tx.send(AgentEvent::error(format!("Invalid request: {msg}"), false))
-                    .await?;
-                break;
-            }
-            ChatOutcome::ServerError(msg) => {
-                error!(msg, "LLM server error");
-                tx.send(AgentEvent::error(format!("Server error: {msg}"), true))
-                    .await?;
-                break;
-            }
+        };
+
+        // If we failed to get a response after retries, exit the loop
+        let Some(response) = response else {
+            break;
         };
 
         // Track usage
@@ -759,6 +810,33 @@ const fn millis_to_u64(millis: u128) -> u64 {
     } else {
         millis as u64
     }
+}
+
+/// Calculate exponential backoff delay with jitter.
+///
+/// Uses exponential backoff with the formula: `base * 2^(attempt-1) + jitter`,
+/// capped at the maximum delay. Jitter (0-1000ms) helps avoid thundering herd.
+fn calculate_backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
+    // Exponential backoff: base, base*2, base*4, base*8, ...
+    let base_delay = config
+        .base_delay_ms
+        .saturating_mul(1u64 << (attempt.saturating_sub(1)));
+
+    // Add jitter (0-1000ms or 10% of base, whichever is smaller) to avoid thundering herd
+    let max_jitter = config.base_delay_ms.min(1000);
+    let jitter = if max_jitter > 0 {
+        u64::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ) % max_jitter
+    } else {
+        0
+    };
+
+    let delay_ms = base_delay.saturating_add(jitter).min(config.max_delay_ms);
+    Duration::from_millis(delay_ms)
 }
 
 fn extract_content(
@@ -980,6 +1058,7 @@ mod tests {
             max_tokens: 2048,
             system_prompt: "Custom prompt".to_string(),
             model: "custom-model".to_string(),
+            ..Default::default()
         };
 
         let agent = builder::<()>().provider(provider).config(config).build();
@@ -1161,9 +1240,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_handling() -> anyhow::Result<()> {
-        let provider = MockProvider::new(vec![ChatOutcome::RateLimited]);
+        // Provide enough RateLimited responses to exhaust all retries (max_retries + 1)
+        let provider = MockProvider::new(vec![
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited, // 6th attempt exceeds max_retries (5)
+        ]);
 
-        let agent = builder::<()>().provider(provider).build();
+        // Use fast retry config for faster tests
+        let config = AgentConfig {
+            retry: crate::types::RetryConfig::fast(),
+            ..Default::default()
+        };
+
+        let agent = builder::<()>().provider(provider).config(config).build();
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
@@ -1174,20 +1267,78 @@ mod tests {
             events.push(event);
         }
 
-        // Should have rate limit error
+        // Should have rate limit error after exhausting retries
         assert!(events.iter().any(|e| {
             matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
         }));
+
+        // Should have retry text events
+        assert!(
+            events
+                .iter()
+                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_recovery() -> anyhow::Result<()> {
+        // Rate limited once, then succeeds
+        let provider = MockProvider::new(vec![
+            ChatOutcome::RateLimited,
+            MockProvider::text_response("Recovered after rate limit"),
+        ]);
+
+        // Use fast retry config for faster tests
+        let config = AgentConfig {
+            retry: crate::types::RetryConfig::fast(),
+            ..Default::default()
+        };
+
+        let agent = builder::<()>().provider(provider).config(config).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have successful completion after retry
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+
+        // Should have retry text event
+        assert!(
+            events
+                .iter()
+                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
+        );
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_server_error_handling() -> anyhow::Result<()> {
-        let provider =
-            MockProvider::new(vec![ChatOutcome::ServerError("Internal error".to_string())]);
+        // Provide enough ServerError responses to exhaust all retries (max_retries + 1)
+        let provider = MockProvider::new(vec![
+            ChatOutcome::ServerError("Internal error".to_string()),
+            ChatOutcome::ServerError("Internal error".to_string()),
+            ChatOutcome::ServerError("Internal error".to_string()),
+            ChatOutcome::ServerError("Internal error".to_string()),
+            ChatOutcome::ServerError("Internal error".to_string()),
+            ChatOutcome::ServerError("Internal error".to_string()), // 6th attempt exceeds max_retries
+        ]);
 
-        let agent = builder::<()>().provider(provider).build();
+        // Use fast retry config for faster tests
+        let config = AgentConfig {
+            retry: crate::types::RetryConfig::fast(),
+            ..Default::default()
+        };
+
+        let agent = builder::<()>().provider(provider).config(config).build();
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
@@ -1198,10 +1349,55 @@ mod tests {
             events.push(event);
         }
 
-        // Should have server error
+        // Should have server error after exhausting retries
         assert!(events.iter().any(|e| {
             matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
         }));
+
+        // Should have retry text events
+        assert!(
+            events
+                .iter()
+                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_error_recovery() -> anyhow::Result<()> {
+        // Server error once, then succeeds
+        let provider = MockProvider::new(vec![
+            ChatOutcome::ServerError("Temporary error".to_string()),
+            MockProvider::text_response("Recovered after server error"),
+        ]);
+
+        // Use fast retry config for faster tests
+        let config = AgentConfig {
+            retry: crate::types::RetryConfig::fast(),
+            ..Default::default()
+        };
+
+        let agent = builder::<()>().provider(provider).config(config).build();
+
+        let thread_id = ThreadId::new();
+        let tool_ctx = ToolContext::new(());
+        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have successful completion after retry
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+
+        // Should have retry text event
+        assert!(
+            events
+                .iter()
+                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
+        );
 
         Ok(())
     }
