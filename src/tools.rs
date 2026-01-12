@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+use crate::events::AgentEvent;
 use crate::llm;
 use crate::types::{ToolResult, ToolTier};
 use anyhow::Result;
@@ -33,6 +34,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Context passed to tool execution
 pub struct ToolContext<Ctx> {
@@ -40,6 +42,8 @@ pub struct ToolContext<Ctx> {
     pub app: Ctx,
     /// Tool-specific metadata
     pub metadata: HashMap<String, Value>,
+    /// Optional channel for tools to emit events (e.g., subagent progress)
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -48,6 +52,7 @@ impl<Ctx> ToolContext<Ctx> {
         Self {
             app,
             metadata: HashMap::new(),
+            event_tx: None,
         }
     }
 
@@ -55,6 +60,32 @@ impl<Ctx> ToolContext<Ctx> {
     pub fn with_metadata(mut self, key: impl Into<String>, value: Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
+    }
+
+    /// Set the event channel for tools that need to emit events during execution.
+    #[must_use]
+    pub fn with_event_tx(mut self, tx: mpsc::Sender<AgentEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Emit an event through the event channel (if set).
+    ///
+    /// This uses `try_send` to avoid blocking and to ensure the future is `Send`.
+    /// The event is silently dropped if the channel is full.
+    pub fn emit_event(&self, event: AgentEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    /// Get a clone of the event channel sender (if set).
+    ///
+    /// This is useful for tools that spawn subprocesses (like subagents)
+    /// and need to forward events to the parent's event stream.
+    #[must_use]
+    pub fn event_tx(&self) -> Option<mpsc::Sender<AgentEvent>> {
+        self.event_tx.clone()
     }
 }
 

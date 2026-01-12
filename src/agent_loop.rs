@@ -484,6 +484,9 @@ where
     M: MessageStore,
     S: StateStore,
 {
+    // Add event channel to tool context so tools can emit events
+    let tool_context = tool_context.with_event_tx(tx.clone());
+
     let start_time = Instant::now();
     let mut turn = 0;
     let mut total_usage = TokenUsage::default();
