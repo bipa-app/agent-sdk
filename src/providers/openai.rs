@@ -14,7 +14,17 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-// o-series reasoning models (latest)
+// GPT-5.2 series (latest flagship, Dec 2025)
+pub const MODEL_GPT52_INSTANT: &str = "gpt-5.2-instant";
+pub const MODEL_GPT52_THINKING: &str = "gpt-5.2-thinking";
+pub const MODEL_GPT52_PRO: &str = "gpt-5.2-pro";
+
+// GPT-5 series (400k context)
+pub const MODEL_GPT5: &str = "gpt-5";
+pub const MODEL_GPT5_MINI: &str = "gpt-5-mini";
+pub const MODEL_GPT5_NANO: &str = "gpt-5-nano";
+
+// o-series reasoning models
 pub const MODEL_O3: &str = "o3";
 pub const MODEL_O3_MINI: &str = "o3-mini";
 pub const MODEL_O4_MINI: &str = "o4-mini";
@@ -63,6 +73,42 @@ impl OpenAIProvider {
             model,
             base_url,
         }
+    }
+
+    /// Create a provider using GPT-5.2 Instant (speed-optimized for routine queries).
+    #[must_use]
+    pub fn gpt52_instant(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT52_INSTANT.to_owned())
+    }
+
+    /// Create a provider using GPT-5.2 Thinking (complex reasoning, coding, analysis).
+    #[must_use]
+    pub fn gpt52_thinking(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT52_THINKING.to_owned())
+    }
+
+    /// Create a provider using GPT-5.2 Pro (maximum accuracy for difficult problems).
+    #[must_use]
+    pub fn gpt52_pro(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT52_PRO.to_owned())
+    }
+
+    /// Create a provider using GPT-5 (400k context, coding and reasoning).
+    #[must_use]
+    pub fn gpt5(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT5.to_owned())
+    }
+
+    /// Create a provider using GPT-5-mini (faster, cost-efficient GPT-5).
+    #[must_use]
+    pub fn gpt5_mini(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT5_MINI.to_owned())
+    }
+
+    /// Create a provider using GPT-5-nano (fastest, cheapest GPT-5 variant).
+    #[must_use]
+    pub fn gpt5_nano(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT5_NANO.to_owned())
     }
 
     /// Create a provider using o3 (most intelligent reasoning model).
@@ -510,6 +556,30 @@ mod tests {
     }
 
     #[test]
+    fn test_gpt52_thinking_factory_creates_provider() {
+        let provider = OpenAIProvider::gpt52_thinking("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT52_THINKING);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_gpt5_factory_creates_gpt5_provider() {
+        let provider = OpenAIProvider::gpt5("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT5);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_gpt5_mini_factory_creates_provider() {
+        let provider = OpenAIProvider::gpt5_mini("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT5_MINI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
     fn test_o3_factory_creates_o3_provider() {
         let provider = OpenAIProvider::o3("test-api-key".to_string());
 
@@ -547,6 +617,14 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
+        // GPT-5.2 series
+        assert_eq!(MODEL_GPT52_INSTANT, "gpt-5.2-instant");
+        assert_eq!(MODEL_GPT52_THINKING, "gpt-5.2-thinking");
+        assert_eq!(MODEL_GPT52_PRO, "gpt-5.2-pro");
+        // GPT-5 series
+        assert_eq!(MODEL_GPT5, "gpt-5");
+        assert_eq!(MODEL_GPT5_MINI, "gpt-5-mini");
+        assert_eq!(MODEL_GPT5_NANO, "gpt-5-nano");
         // o-series
         assert_eq!(MODEL_O3, "o3");
         assert_eq!(MODEL_O3_MINI, "o3-mini");
