@@ -14,11 +14,21 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-pub const MODEL_GPT4O: &str = "gpt-4o";
-pub const MODEL_GPT4O_MINI: &str = "gpt-4o-mini";
-pub const MODEL_GPT4_TURBO: &str = "gpt-4-turbo";
+// o-series reasoning models (latest)
+pub const MODEL_O3: &str = "o3";
+pub const MODEL_O3_MINI: &str = "o3-mini";
+pub const MODEL_O4_MINI: &str = "o4-mini";
 pub const MODEL_O1: &str = "o1";
 pub const MODEL_O1_MINI: &str = "o1-mini";
+
+// GPT-4.1 series (improved instruction following, 1M context)
+pub const MODEL_GPT41: &str = "gpt-4.1";
+pub const MODEL_GPT41_MINI: &str = "gpt-4.1-mini";
+pub const MODEL_GPT41_NANO: &str = "gpt-4.1-nano";
+
+// GPT-4o series
+pub const MODEL_GPT4O: &str = "gpt-4o";
+pub const MODEL_GPT4O_MINI: &str = "gpt-4o-mini";
 
 /// `OpenAI` LLM provider using the Chat Completions API.
 ///
@@ -55,22 +65,22 @@ impl OpenAIProvider {
         }
     }
 
-    /// Create a provider using GPT-4o.
+    /// Create a provider using o3 (most intelligent reasoning model).
     #[must_use]
-    pub fn gpt4o(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GPT4O.to_owned())
+    pub fn o3(api_key: String) -> Self {
+        Self::new(api_key, MODEL_O3.to_owned())
     }
 
-    /// Create a provider using GPT-4o-mini (fast and cost-effective).
+    /// Create a provider using o3-mini (smaller o3 variant).
     #[must_use]
-    pub fn gpt4o_mini(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GPT4O_MINI.to_owned())
+    pub fn o3_mini(api_key: String) -> Self {
+        Self::new(api_key, MODEL_O3_MINI.to_owned())
     }
 
-    /// Create a provider using GPT-4 Turbo.
+    /// Create a provider using o4-mini (fast, cost-efficient reasoning).
     #[must_use]
-    pub fn gpt4_turbo(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GPT4_TURBO.to_owned())
+    pub fn o4_mini(api_key: String) -> Self {
+        Self::new(api_key, MODEL_O4_MINI.to_owned())
     }
 
     /// Create a provider using o1 (reasoning model).
@@ -83,6 +93,30 @@ impl OpenAIProvider {
     #[must_use]
     pub fn o1_mini(api_key: String) -> Self {
         Self::new(api_key, MODEL_O1_MINI.to_owned())
+    }
+
+    /// Create a provider using GPT-4.1 (improved instruction following, 1M context).
+    #[must_use]
+    pub fn gpt41(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT41.to_owned())
+    }
+
+    /// Create a provider using GPT-4.1-mini (smaller, faster GPT-4.1).
+    #[must_use]
+    pub fn gpt41_mini(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT41_MINI.to_owned())
+    }
+
+    /// Create a provider using GPT-4o.
+    #[must_use]
+    pub fn gpt4o(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT4O.to_owned())
+    }
+
+    /// Create a provider using GPT-4o-mini (fast and cost-effective).
+    #[must_use]
+    pub fn gpt4o_mini(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT4O_MINI.to_owned())
     }
 }
 
@@ -476,10 +510,34 @@ mod tests {
     }
 
     #[test]
+    fn test_o3_factory_creates_o3_provider() {
+        let provider = OpenAIProvider::o3("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_O3);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_o4_mini_factory_creates_o4_mini_provider() {
+        let provider = OpenAIProvider::o4_mini("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_O4_MINI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
     fn test_o1_factory_creates_o1_provider() {
         let provider = OpenAIProvider::o1("test-api-key".to_string());
 
         assert_eq!(provider.model(), MODEL_O1);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_gpt41_factory_creates_gpt41_provider() {
+        let provider = OpenAIProvider::gpt41("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT41);
         assert_eq!(provider.provider(), "openai");
     }
 
@@ -489,11 +547,19 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
-        assert_eq!(MODEL_GPT4O, "gpt-4o");
-        assert_eq!(MODEL_GPT4O_MINI, "gpt-4o-mini");
-        assert_eq!(MODEL_GPT4_TURBO, "gpt-4-turbo");
+        // o-series
+        assert_eq!(MODEL_O3, "o3");
+        assert_eq!(MODEL_O3_MINI, "o3-mini");
+        assert_eq!(MODEL_O4_MINI, "o4-mini");
         assert_eq!(MODEL_O1, "o1");
         assert_eq!(MODEL_O1_MINI, "o1-mini");
+        // GPT-4.1 series
+        assert_eq!(MODEL_GPT41, "gpt-4.1");
+        assert_eq!(MODEL_GPT41_MINI, "gpt-4.1-mini");
+        assert_eq!(MODEL_GPT41_NANO, "gpt-4.1-nano");
+        // GPT-4o series
+        assert_eq!(MODEL_GPT4O, "gpt-4o");
+        assert_eq!(MODEL_GPT4O_MINI, "gpt-4o-mini");
     }
 
     // ===================
