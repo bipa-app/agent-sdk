@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use super::PrimitiveToolContext;
 
+/// Maximum tokens allowed per file read (approximately 4 chars per token)
+const MAX_TOKENS: usize = 25_000;
+const CHARS_PER_TOKEN: usize = 4;
+
 /// Tool for reading file contents
 pub struct ReadTool<E: Environment> {
     ctx: PrimitiveToolContext<E>,
@@ -121,7 +125,32 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
         let total_lines = lines.len();
 
         let offset = input.offset.unwrap_or(1).saturating_sub(1); // Convert to 0-based
-        let limit = input.limit.unwrap_or(lines.len());
+
+        // Calculate the content that would be returned
+        let selected_lines: Vec<&str> = lines.iter().copied().skip(offset).collect();
+
+        // Check if user specified a limit, otherwise we need to check token limit
+        let limit = if let Some(user_limit) = input.limit {
+            user_limit
+        } else {
+            // Estimate tokens for the selected content
+            let selected_content_len: usize =
+                selected_lines.iter().map(|line| line.len() + 1).sum(); // +1 for newline
+            let estimated_tokens = selected_content_len / CHARS_PER_TOKEN;
+
+            if estimated_tokens > MAX_TOKENS {
+                // File exceeds token limit, return helpful message
+                let suggested_limit = estimate_lines_for_tokens(&selected_lines, MAX_TOKENS);
+                return Ok(ToolResult::success(format!(
+                    "File too large to read at once (~{estimated_tokens} tokens, max {MAX_TOKENS}).\n\
+                     Total lines: {total_lines}\n\n\
+                     Use 'offset' and 'limit' parameters to read specific portions.\n\
+                     Suggested: Start with offset=1, limit={suggested_limit} to read the first ~{MAX_TOKENS} tokens.\n\n\
+                     Example: {{\"path\": \"{path}\", \"offset\": 1, \"limit\": {suggested_limit}}}"
+                )));
+            }
+            selected_lines.len()
+        };
 
         let selected_lines: Vec<String> = lines
             .into_iter()
@@ -149,6 +178,25 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
 
         Ok(ToolResult::success(output))
     }
+}
+
+/// Estimate how many lines can fit within a token budget
+fn estimate_lines_for_tokens(lines: &[&str], max_tokens: usize) -> usize {
+    let max_chars = max_tokens * CHARS_PER_TOKEN;
+    let mut total_chars = 0;
+    let mut line_count = 0;
+
+    for line in lines {
+        let line_chars = line.len() + 1; // +1 for newline
+        if total_chars + line_chars > max_chars {
+            break;
+        }
+        total_chars += line_chars;
+        line_count += 1;
+    }
+
+    // Return at least 1 to avoid suggesting limit=0
+    line_count.max(1)
 }
 
 #[cfg(test)]
@@ -472,5 +520,76 @@ mod tests {
 
         assert!(result.is_err());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_large_file_exceeds_token_limit() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        // Create a file that exceeds 25k tokens (~100k chars)
+        // Each line is ~100 chars, need ~1000 lines to exceed limit
+        let line = "x".repeat(100);
+        let content: String = (1..=1500)
+            .map(|i| format!("{i}: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs.write_file("huge.txt", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/huge.txt"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("File too large to read at once"));
+        assert!(result.output.contains("Total lines: 1500"));
+        assert!(result.output.contains("offset"));
+        assert!(result.output.contains("limit"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_large_file_with_explicit_limit_bypasses_check() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+
+        // Create a large file
+        let line = "x".repeat(100);
+        let content: String = (1..=1500)
+            .map(|i| format!("{i}: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs.write_file("huge.txt", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        // With explicit limit, should return the requested lines
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/huge.txt", "offset": 1, "limit": 10}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 1-10 of 1500 total"));
+        assert!(!result.output.contains("File too large"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_estimate_lines_for_tokens() {
+        let lines: Vec<&str> = vec![
+            "short line",           // 11 chars
+            "another short line",   // 19 chars
+            "x".repeat(100).leak(), // 100 chars
+        ];
+
+        // With 10 tokens (40 chars), should fit first 2 lines (11 + 19 = 30 chars)
+        let count = estimate_lines_for_tokens(&lines, 10);
+        assert_eq!(count, 2);
+
+        // With 1 token (4 chars), should return at least 1
+        let count = estimate_lines_for_tokens(&lines, 1);
+        assert_eq!(count, 1);
     }
 }
