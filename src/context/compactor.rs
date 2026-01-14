@@ -112,9 +112,10 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
                                 } else {
                                     "success"
                                 };
-                                // Truncate long tool results
-                                let truncated = if content.len() > 500 {
-                                    format!("{}... (truncated)", &content[..500])
+                                // Truncate long tool results (Unicode-safe; avoid slicing mid-codepoint)
+                                let truncated = if content.chars().count() > 500 {
+                                    let prefix: String = content.chars().take(500).collect();
+                                    format!("{prefix}... (truncated)")
                                 } else {
                                     content.clone()
                                 };
@@ -432,5 +433,23 @@ mod tests {
 
         assert!(formatted.contains("User: Hello"));
         assert!(formatted.contains("Assistant: Hi there!"));
+    }
+
+    #[test]
+    fn test_format_messages_for_summary_truncates_tool_results_unicode_safely() {
+        let long_unicode = "é".repeat(600);
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: long_unicode,
+                is_error: Some(false),
+            }]),
+        }];
+
+        let formatted = LlmContextCompactor::<MockProvider>::format_messages_for_summary(&messages);
+
+        assert!(formatted.contains("... (truncated)"));
     }
 }
