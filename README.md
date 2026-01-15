@@ -38,9 +38,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = { git = "https://github.com/bipa-app/agent-sdk", branch = "main" }
+agent-sdk = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
+```
+
+Or to install the latest development version from git:
+
+```toml
+[dependencies]
+agent-sdk = { git = "https://github.com/bipa-app/agent-sdk", branch = "main" }
 ```
 
 ## Quick Start
