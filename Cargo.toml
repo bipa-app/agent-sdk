@@ -3,7 +3,7 @@ name = "agent-sdk"
 version = "0.1.0"
 edition = "2024"
 description = "Rust Agent SDK for building LLM agents"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/bipa-app/agent-sdk"
 
 [dependencies]
