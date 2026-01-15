@@ -7,6 +7,8 @@
 
 A Rust SDK for building LLM-powered agents with tool execution, streaming events, and lifecycle hooks.
 
+> **⚠️ Early Development**: This library is in active development (v0.1.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+
 ## Features
 
 - **Agent Loop** - Core orchestration for LLM conversations with tool calling

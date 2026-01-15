@@ -5,6 +5,9 @@ edition = "2024"
 description = "Rust Agent SDK for building LLM agents"
 license = "Apache-2.0"
 repository = "https://github.com/bipa-app/agent-sdk"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "anthropic", "tools"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1.40", features = ["sync", "fs", "process", "time"] }
