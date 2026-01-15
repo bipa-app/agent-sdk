@@ -16,3 +16,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Local tooling config
+.bip/
+.claude/
