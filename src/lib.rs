@@ -279,6 +279,7 @@ mod stores;
 pub mod subagent;
 mod tools;
 mod types;
+pub mod user_interaction;
 pub mod web;
 
 pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
@@ -293,3 +294,12 @@ pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use types::{
     AgentConfig, AgentState, PendingAction, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier,
 };
+
+// Re-export user interaction types for convenience
+pub use user_interaction::{
+    AskUserQuestionTool, ConfirmationRequest, ConfirmationResponse, QuestionOption,
+    QuestionRequest, QuestionResponse,
+};
+
+// Re-export subagent types for convenience
+pub use subagent::{SubagentConfig, SubagentFactory, SubagentTool};
