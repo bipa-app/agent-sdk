@@ -1,3 +1,4 @@
+use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -127,11 +128,16 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         // Include exit code in output
         let _ = write!(output, "\n\nExit code: {}", result.exit_code);
 
-        if result.success() {
-            Ok(ToolResult::success(output))
+        let mut tool_result = if result.success() {
+            ToolResult::success(output)
         } else {
-            Ok(ToolResult::error(output))
-        }
+            ToolResult::error(output)
+        };
+
+        // Add verification reminder
+        append_reminder(&mut tool_result, builtin::BASH_VERIFICATION_REMINDER);
+
+        Ok(tool_result)
     }
 }
 

@@ -276,6 +276,25 @@
 //! | [`user_interaction`] | User question/confirmation tools ([`AskUserQuestionTool`]) |
 //! | [`web`] | Web search and fetch tools |
 //! | [`skills`] | Custom skill/command loading |
+//! | [`reminders`] | System reminder infrastructure for agent guidance |
+//!
+//! ## System Reminders
+//!
+//! The SDK includes a reminder system that provides contextual guidance to the AI agent
+//! using the `<system-reminder>` XML tag pattern. Claude is trained to recognize these
+//! tags and follow the instructions without mentioning them to users.
+//!
+//! ```
+//! use agent_sdk::reminders::{wrap_reminder, ReminderConfig, ReminderTracker};
+//!
+//! // Wrap guidance in system-reminder tags
+//! let reminder = wrap_reminder("Verify the output before proceeding.");
+//!
+//! // Configure reminder behavior
+//! let config = ReminderConfig::new()
+//!     .with_todo_reminder_turns(5)
+//!     .with_repeated_action_threshold(3);
+//! ```
 //!
 //! ## Feature Flags
 //!
@@ -294,6 +313,7 @@ pub mod llm;
 pub mod mcp;
 pub mod primitive_tools;
 pub mod providers;
+pub mod reminders;
 pub mod skills;
 mod stores;
 pub mod subagent;
@@ -327,3 +347,8 @@ pub use subagent::{SubagentConfig, SubagentFactory, SubagentTool};
 
 // Re-export todo types for convenience
 pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};
+
+// Re-export reminder types for convenience
+pub use reminders::{
+    ReminderConfig, ReminderTracker, ReminderTrigger, ToolReminder, append_reminder, wrap_reminder,
+};
