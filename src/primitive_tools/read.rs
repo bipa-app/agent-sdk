@@ -1,3 +1,4 @@
+use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -160,7 +161,8 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
             .map(|(i, line)| format!("{:>6}\t{}", offset + i + 1, line))
             .collect();
 
-        let output = if selected_lines.is_empty() {
+        let is_empty = selected_lines.is_empty();
+        let output = if is_empty {
             "(empty file)".to_string()
         } else {
             let header = if input.offset.is_some() || input.limit.is_some() {
@@ -176,7 +178,17 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
             format!("{header}{}", selected_lines.join("\n"))
         };
 
-        Ok(ToolResult::success(output))
+        let mut result = ToolResult::success(output);
+
+        // Add empty file reminder if applicable
+        if is_empty {
+            append_reminder(&mut result, builtin::READ_EMPTY_FILE_REMINDER);
+        }
+
+        // Always add security reminder when reading files
+        append_reminder(&mut result, builtin::READ_SECURITY_REMINDER);
+
+        Ok(result)
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -153,9 +154,14 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
             .context("Failed to write file")?;
 
         let replacements = if input.replace_all { count } else { 1 };
-        Ok(ToolResult::success(format!(
+        let mut result = ToolResult::success(format!(
             "Successfully replaced {replacements} occurrence(s) in '{path}'"
-        )))
+        ));
+
+        // Add verification reminder
+        append_reminder(&mut result, builtin::EDIT_VERIFICATION_REMINDER);
+
+        Ok(result)
     }
 }
 
