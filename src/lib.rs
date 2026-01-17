@@ -212,6 +212,22 @@
 //! | [`AgentEvent::Done`] | Agent completed successfully |
 //! | [`AgentEvent::Error`] | An error occurred |
 //!
+//! ### Task Tracking
+//!
+//! Use [`TodoWriteTool`] and [`TodoReadTool`] to track task progress:
+//!
+//! ```no_run
+//! use agent_sdk::todo::{TodoState, TodoWriteTool, TodoReadTool};
+//! use std::sync::Arc;
+//! use tokio::sync::RwLock;
+//!
+//! let state = Arc::new(RwLock::new(TodoState::new()));
+//! let write_tool = TodoWriteTool::new(Arc::clone(&state));
+//! let read_tool = TodoReadTool::new(state);
+//! ```
+//!
+//! Task states: `Pending` (○), `InProgress` (⚡), `Completed` (✓)
+//!
 //! ### Custom Context
 //!
 //! Pass application-specific data to tools via the generic type parameter:
@@ -254,8 +270,12 @@
 //! | [`providers`] | LLM provider implementations |
 //! | [`primitive_tools`] | Built-in file operation tools (Read, Write, Edit, Glob, Grep, Bash) |
 //! | [`llm`] | LLM abstraction layer |
-//! | [`subagent`] | Nested agent execution |
+//! | [`subagent`] | Nested agent execution with [`SubagentFactory`] |
 //! | [`mcp`] | Model Context Protocol support |
+//! | [`todo`] | Task tracking tools ([`TodoWriteTool`], [`TodoReadTool`]) |
+//! | [`user_interaction`] | User question/confirmation tools ([`AskUserQuestionTool`]) |
+//! | [`web`] | Web search and fetch tools |
+//! | [`skills`] | Custom skill/command loading |
 //!
 //! ## Feature Flags
 //!
@@ -277,8 +297,10 @@ pub mod providers;
 pub mod skills;
 mod stores;
 pub mod subagent;
+pub mod todo;
 mod tools;
 mod types;
+pub mod user_interaction;
 pub mod web;
 
 pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
@@ -293,3 +315,15 @@ pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use types::{
     AgentConfig, AgentState, PendingAction, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier,
 };
+
+// Re-export user interaction types for convenience
+pub use user_interaction::{
+    AskUserQuestionTool, ConfirmationRequest, ConfirmationResponse, QuestionOption,
+    QuestionRequest, QuestionResponse,
+};
+
+// Re-export subagent types for convenience
+pub use subagent::{SubagentConfig, SubagentFactory, SubagentTool};
+
+// Re-export todo types for convenience
+pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};

@@ -32,6 +32,10 @@
 //! 3. Only the final text response is returned to the parent
 //! 4. The parent does not see the subagent's intermediate tool calls
 
+mod factory;
+
+pub use factory::SubagentFactory;
+
 use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
