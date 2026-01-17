@@ -14,10 +14,12 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Check if version changed
         id: version
@@ -64,14 +66,48 @@ jobs:
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Create and push tag
+      - name: Get previous tag
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
+        id: prev_tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "Previous tag: $PREV_TAG"
+
+      - name: Generate changelog
+        if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
+        id: changelog
         run: |
           TAG="v${{ steps.version.outputs.current }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
+          PREV_TAG="${{ steps.prev_tag.outputs.tag }}"
+
+          echo "## What's Changed" > /tmp/changelog.md
+          echo "" >> /tmp/changelog.md
+
+          if [ -n "$PREV_TAG" ]; then
+            # Get commits since last tag, format as changelog
+            git log --pretty=format:"* %s (%h)" "$PREV_TAG"..HEAD >> /tmp/changelog.md
+          else
+            # First release - get recent commits
+            git log --pretty=format:"* %s (%h)" -20 >> /tmp/changelog.md
+          fi
+
+          echo "" >> /tmp/changelog.md
+          echo "" >> /tmp/changelog.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG:-initial}...$TAG" >> /tmp/changelog.md
+
+          cat /tmp/changelog.md
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.current }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/changelog.md \
+            --target ${{ github.sha }}
 
       - name: Publish to crates.io
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
