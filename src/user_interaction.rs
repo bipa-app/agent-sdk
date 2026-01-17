@@ -41,7 +41,7 @@ use crate::{Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 /// Request for user confirmation of a tool execution.
@@ -409,7 +409,8 @@ mod tests {
 
     #[test]
     fn test_confirmation_request_new() {
-        let req = ConfirmationRequest::new("write", "Write to file: foo.txt", "{}", ToolTier::Confirm);
+        let req =
+            ConfirmationRequest::new("write", "Write to file: foo.txt", "{}", ToolTier::Confirm);
         assert_eq!(req.tool_name, "write");
         assert!(req.context.is_none());
     }

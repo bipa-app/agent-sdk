@@ -24,7 +24,7 @@ use crate::{Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 /// Status of a TODO item.
@@ -209,7 +209,9 @@ impl TodoState {
 
         let mut output = format!("TODO ({completed}/{total})");
 
-        if in_progress > 0 && let Some(current) = self.current_task() {
+        if in_progress > 0
+            && let Some(current) = self.current_task()
+        {
             let _ = write!(output, " - {}", current.active_form);
         }
 
@@ -414,7 +416,11 @@ mod tests {
     #[test]
     fn test_todo_state_count_by_status() {
         let mut state = TodoState::new();
-        state.add(TodoItem::with_status("Task 1", "Task 1", TodoStatus::Pending));
+        state.add(TodoItem::with_status(
+            "Task 1",
+            "Task 1",
+            TodoStatus::Pending,
+        ));
         state.add(TodoItem::with_status(
             "Task 2",
             "Task 2",
@@ -440,7 +446,11 @@ mod tests {
     #[test]
     fn test_todo_state_current_task() {
         let mut state = TodoState::new();
-        state.add(TodoItem::with_status("Task 1", "Task 1", TodoStatus::Pending));
+        state.add(TodoItem::with_status(
+            "Task 1",
+            "Task 1",
+            TodoStatus::Pending,
+        ));
         assert!(state.current_task().is_none());
 
         state.add(TodoItem::with_status(
