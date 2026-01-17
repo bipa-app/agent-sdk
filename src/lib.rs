@@ -277,6 +277,7 @@ pub mod providers;
 pub mod skills;
 mod stores;
 pub mod subagent;
+pub mod todo;
 mod tools;
 mod types;
 pub mod user_interaction;
@@ -303,3 +304,6 @@ pub use user_interaction::{
 
 // Re-export subagent types for convenience
 pub use subagent::{SubagentConfig, SubagentFactory, SubagentTool};
+
+// Re-export todo types for convenience
+pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};
