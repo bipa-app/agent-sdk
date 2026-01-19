@@ -1,3 +1,4 @@
+use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -107,9 +108,14 @@ impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
         let lines = input.content.lines().count();
         let bytes = input.content.len();
 
-        Ok(ToolResult::success(format!(
+        let mut result = ToolResult::success(format!(
             "Successfully wrote {lines} lines ({bytes} bytes) to '{path}'"
-        )))
+        ));
+
+        // Add verification reminder
+        append_reminder(&mut result, builtin::WRITE_VERIFICATION_REMINDER);
+
+        Ok(result)
     }
 }
 
