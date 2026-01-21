@@ -77,6 +77,7 @@ impl LlmProvider for GeminiProvider {
                 role: None,
                 parts: vec![ApiPart::Text {
                     text: request.system.clone(),
+                    thought_signature: None,
                 }],
             })
         };
@@ -148,6 +149,11 @@ impl LlmProvider for GeminiProvider {
 
         let content = build_content_blocks(&candidate.content);
 
+        // Warn if parts were returned but no content blocks were built (possible unknown part types)
+        if content.is_empty() && !candidate.content.parts.is_empty() {
+            tracing::warn!(raw_parts = ?candidate.content.parts, "Gemini parts not converted to content blocks");
+        }
+
         // Gemini returns STOP for both natural endings and function calls.
         // We need to check if there are tool calls and override to ToolUse.
         let has_tool_calls = content
@@ -190,7 +196,7 @@ impl LlmProvider for GeminiProvider {
             let system_instruction = if request.system.is_empty() {
                 None
             } else {
-                Some(ApiContent { role: None, parts: vec![ApiPart::Text { text: request.system.clone() }] })
+                Some(ApiContent { role: None, parts: vec![ApiPart::Text { text: request.system.clone(), thought_signature: None }] })
             };
 
             let api_request = ApiGenerateContentRequest {
@@ -265,7 +271,7 @@ impl LlmProvider for GeminiProvider {
                         // Emit deltas for new content
                         for (i, part) in candidate.content.parts.iter().enumerate() {
                             match part {
-                                ApiPart::Text { text } => {
+                                ApiPart::Text { text, .. } => {
                                     if text.len() > prev_text_len {
                                         let delta = &text[prev_text_len..];
                                         yield Ok(StreamDelta::TextDelta { delta: delta.to_string(), block_index: 0 });
@@ -328,13 +334,13 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
         };
 
         let parts = match &msg.content {
-            Content::Text(text) => vec![ApiPart::Text { text: text.clone() }],
+            Content::Text(text) => vec![ApiPart::Text { text: text.clone(), thought_signature: None }],
             Content::Blocks(blocks) => {
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(ApiPart::Text { text: text.clone() });
+                            parts.push(ApiPart::Text { text: text.clone(), thought_signature: None });
                         }
                         ContentBlock::ToolUse {
                             id: _,
@@ -405,7 +411,7 @@ fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
 
     for part in &content.parts {
         match part {
-            ApiPart::Text { text } => {
+            ApiPart::Text { text, .. } => {
                 if !text.is_empty() {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
@@ -425,6 +431,9 @@ fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
             }
             ApiPart::FunctionResponse { .. } => {
                 // Function responses in the response are unusual, skip them
+            }
+            ApiPart::Unknown(value) => {
+                tracing::warn!(part = ?value, "Unknown API part type in Gemini response, skipping");
             }
         }
     }
@@ -465,11 +474,14 @@ struct ApiContent {
     parts: Vec<ApiPart>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 enum ApiPart {
     Text {
         text: String,
+        /// Thought signature may appear with text in Gemini 3 models
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionCall {
         #[serde(rename = "functionCall")]
@@ -482,15 +494,17 @@ enum ApiPart {
         #[serde(rename = "functionResponse")]
         function_response: ApiFunctionResponse,
     },
+    /// Catch-all for unknown part types to prevent parse failures
+    Unknown(serde_json::Value),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ApiFunctionCall {
     name: String,
     args: serde_json::Value,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ApiFunctionResponse {
     name: String,
     response: serde_json::Value,
@@ -628,6 +642,7 @@ mod tests {
             role: Some("user".to_string()),
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
+                thought_signature: None,
             }],
         };
 
@@ -640,6 +655,7 @@ mod tests {
     fn test_api_part_text_serialization() {
         let part = ApiPart::Text {
             text: "Hello, world!".to_string(),
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&part).unwrap();
@@ -818,6 +834,7 @@ mod tests {
             role: Some("model".to_string()),
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
+                thought_signature: None,
             }],
         };
 
@@ -875,7 +892,7 @@ mod tests {
         let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.candidates.len(), 1);
         match &response.candidates[0].content.parts[0] {
-            ApiPart::Text { text } => assert_eq!(text, "Hello"),
+            ApiPart::Text { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("Expected Text part"),
         }
     }
