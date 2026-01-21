@@ -379,10 +379,7 @@ fn parse_sse_event(
                     }
                     SseDelta::InputJsonDelta { partial_json } => {
                         // Look up the tool ID from the content_block_start event
-                        let id = tool_ids
-                            .get(&event.index)
-                            .cloned()
-                            .unwrap_or_default();
+                        let id = tool_ids.get(&event.index).cloned().unwrap_or_default();
                         return Some(StreamDelta::ToolInputDelta {
                             id,
                             delta: partial_json,
