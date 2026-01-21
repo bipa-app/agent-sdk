@@ -397,13 +397,24 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
 }
 
 fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
-    // The Responses API with strict: true requires additionalProperties: false
+    // The Responses API with strict: true requires:
+    // 1. additionalProperties: false
+    // 2. All properties must be in the required array
     let mut schema = tool.input_schema;
     if let serde_json::Value::Object(ref mut obj) = schema {
         obj.insert(
             "additionalProperties".to_owned(),
             serde_json::Value::Bool(false),
         );
+
+        // Ensure all properties are marked as required
+        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
+            let all_keys: Vec<serde_json::Value> = props
+                .keys()
+                .map(|k| serde_json::Value::String(k.clone()))
+                .collect();
+            obj.insert("required".to_owned(), serde_json::Value::Array(all_keys));
+        }
     }
 
     ApiTool {
