@@ -1,13 +1,16 @@
 //! Anthropic API provider implementation.
 //!
 //! This module provides an implementation of `LlmProvider` for the Anthropic
-//! Messages API using reqwest for HTTP calls.
+//! Messages API using reqwest for HTTP calls. Supports both streaming and
+//! non-streaming responses.
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
+    StreamBox, StreamDelta, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -55,13 +58,10 @@ impl AnthropicProvider {
     pub fn opus(api_key: String) -> Self {
         Self::new(api_key, MODEL_OPUS_4.to_owned())
     }
-}
 
-#[async_trait]
-#[allow(clippy::too_many_lines)]
-impl LlmProvider for AnthropicProvider {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-        let messages: Vec<ApiMessage> = request
+    /// Build API messages from the chat request.
+    fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
+        request
             .messages
             .iter()
             .map(|m| ApiMessage {
@@ -99,9 +99,12 @@ impl LlmProvider for AnthropicProvider {
                     ),
                 },
             })
-            .collect();
+            .collect()
+    }
 
-        let tools: Option<Vec<ApiTool>> = request.tools.map(|ts| {
+    /// Build API tools from the chat request.
+    fn build_api_tools(request: &ChatRequest) -> Option<Vec<ApiTool>> {
+        request.tools.clone().map(|ts| {
             ts.into_iter()
                 .map(|t| ApiTool {
                     name: t.name,
@@ -109,7 +112,16 @@ impl LlmProvider for AnthropicProvider {
                     input_schema: t.input_schema,
                 })
                 .collect()
-        });
+        })
+    }
+}
+
+#[async_trait]
+#[allow(clippy::too_many_lines)]
+impl LlmProvider for AnthropicProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let messages = Self::build_api_messages(&request);
+        let tools = Self::build_api_tools(&request);
 
         let api_request = ApiMessagesRequest {
             model: &self.model,
@@ -117,6 +129,7 @@ impl LlmProvider for AnthropicProvider {
             system: &request.system,
             messages: &messages,
             tools: tools.as_deref(),
+            stream: false,
         };
 
         tracing::debug!(
@@ -197,12 +210,197 @@ impl LlmProvider for AnthropicProvider {
         }))
     }
 
+    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            let messages = Self::build_api_messages(&request);
+            let tools = Self::build_api_tools(&request);
+
+            let api_request = ApiMessagesRequest {
+                model: &self.model,
+                max_tokens: request.max_tokens,
+                system: &request.system,
+                messages: &messages,
+                tools: tools.as_deref(),
+                stream: true,
+            };
+
+            tracing::debug!(
+                model = %self.model,
+                max_tokens = request.max_tokens,
+                "Anthropic streaming LLM request"
+            );
+
+            let response = match self
+                .client
+                .post(format!("{API_BASE_URL}/v1/messages"))
+                .header("Content-Type", "application/json")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .json(&api_request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(anyhow::anyhow!("request failed: {e}"));
+                    return;
+                }
+            };
+
+            let status = response.status();
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                yield Ok(StreamDelta::Error {
+                    message: "Rate limited".to_string(),
+                    recoverable: true,
+                });
+                return;
+            }
+
+            if status.is_server_error() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(status = %status, body = %body, "Anthropic server error");
+                yield Ok(StreamDelta::Error {
+                    message: body,
+                    recoverable: true,
+                });
+                return;
+            }
+
+            if status.is_client_error() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(status = %status, body = %body, "Anthropic client error");
+                yield Ok(StreamDelta::Error {
+                    message: body,
+                    recoverable: false,
+                });
+                return;
+            }
+
+            // Process SSE stream
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut input_tokens: u32 = 0;
+            let mut output_tokens: u32 = 0;
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(anyhow::anyhow!("stream error: {e}"));
+                        return;
+                    }
+                };
+
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process complete SSE events (separated by double newlines)
+                while let Some(pos) = buffer.find("\n\n") {
+                    let event_block = buffer[..pos].to_string();
+                    buffer = buffer[pos + 2..].to_string();
+
+                    // Parse SSE event
+                    if let Some(delta) = parse_sse_event(&event_block, &mut input_tokens, &mut output_tokens) {
+                        yield Ok(delta);
+                    }
+                }
+            }
+        })
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
 
     fn provider(&self) -> &'static str {
         "anthropic"
+    }
+}
+
+/// Parse an SSE event block and return the corresponding `StreamDelta`.
+fn parse_sse_event(
+    event_block: &str,
+    input_tokens: &mut u32,
+    output_tokens: &mut u32,
+) -> Option<StreamDelta> {
+    let mut event_type = None;
+    let mut data = None;
+
+    for line in event_block.lines() {
+        if let Some(value) = line.strip_prefix("event: ") {
+            event_type = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data: ") {
+            data = Some(value);
+        }
+    }
+
+    let data = data?;
+
+    match event_type {
+        Some("message_start") => {
+            // Extract input tokens from message_start
+            if let Ok(event) = serde_json::from_str::<SseMessageStart>(data) {
+                *input_tokens = event.message.usage.input_tokens;
+            }
+            None
+        }
+        Some("content_block_start") => {
+            // Handle tool_use block start
+            if let Ok(event) = serde_json::from_str::<SseContentBlockStart>(data)
+                && let SseContentBlock::ToolUse { id, name } = event.content_block
+            {
+                return Some(StreamDelta::ToolUseStart {
+                    id,
+                    name,
+                    block_index: event.index,
+                });
+            }
+            None
+        }
+        Some("content_block_delta") => {
+            if let Ok(event) = serde_json::from_str::<SseContentBlockDelta>(data) {
+                match event.delta {
+                    SseDelta::TextDelta { text } => {
+                        return Some(StreamDelta::TextDelta {
+                            delta: text,
+                            block_index: event.index,
+                        });
+                    }
+                    SseDelta::InputJsonDelta { partial_json } => {
+                        // We need the tool ID from the content_block_start event
+                        // For now, use a placeholder - the accumulator tracks by block_index
+                        return Some(StreamDelta::ToolInputDelta {
+                            id: String::new(), // Will be filled by accumulator via block_index
+                            delta: partial_json,
+                            block_index: event.index,
+                        });
+                    }
+                }
+            }
+            None
+        }
+        Some("message_delta") => {
+            if let Ok(event) = serde_json::from_str::<SseMessageDelta>(data) {
+                *output_tokens = event.usage.output_tokens;
+                let stop_reason = event.delta.stop_reason.map(|r| match r {
+                    ApiStopReason::EndTurn => StopReason::EndTurn,
+                    ApiStopReason::ToolUse => StopReason::ToolUse,
+                    ApiStopReason::MaxTokens => StopReason::MaxTokens,
+                    ApiStopReason::StopSequence => StopReason::StopSequence,
+                });
+                // Emit usage and done
+                return Some(StreamDelta::Done { stop_reason });
+            }
+            None
+        }
+        Some("message_stop") => {
+            // Final event - emit usage
+            Some(StreamDelta::Usage(Usage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -218,6 +416,7 @@ struct ApiMessagesRequest<'a> {
     messages: &'a [ApiMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -268,7 +467,7 @@ enum ApiRole {
 }
 
 // ============================================================================
-// API Response Types
+// API Response Types (non-streaming)
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -305,6 +504,71 @@ enum ApiStopReason {
 #[derive(Deserialize)]
 struct ApiUsage {
     input_tokens: u32,
+    output_tokens: u32,
+}
+
+// ============================================================================
+// SSE Streaming Types
+// ============================================================================
+
+#[derive(Deserialize)]
+struct SseMessageStart {
+    message: SseMessageStartMessage,
+}
+
+#[derive(Deserialize)]
+struct SseMessageStartMessage {
+    usage: SseMessageStartUsage,
+}
+
+#[derive(Deserialize)]
+struct SseMessageStartUsage {
+    input_tokens: u32,
+}
+
+#[derive(Deserialize)]
+struct SseContentBlockStart {
+    index: usize,
+    content_block: SseContentBlock,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum SseContentBlock {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+}
+
+#[derive(Deserialize)]
+struct SseContentBlockDelta {
+    index: usize,
+    delta: SseDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum SseDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+}
+
+#[derive(Deserialize)]
+struct SseMessageDelta {
+    delta: SseMessageDeltaData,
+    usage: SseMessageDeltaUsage,
+}
+
+#[derive(Deserialize)]
+struct SseMessageDeltaData {
+    stop_reason: Option<ApiStopReason>,
+}
+
+#[derive(Deserialize)]
+struct SseMessageDeltaUsage {
     output_tokens: u32,
 }
 
@@ -462,6 +726,22 @@ mod tests {
         assert!(json.contains("input_schema"));
     }
 
+    #[test]
+    fn test_api_request_with_stream() {
+        let messages = vec![];
+        let request = ApiMessagesRequest {
+            model: "claude-3-5-sonnet",
+            max_tokens: 1024,
+            system: "You are helpful.",
+            messages: &messages,
+            tools: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
     // ===================
     // API Type Deserialization Tests
     // ===================
@@ -551,6 +831,129 @@ mod tests {
         );
         assert!(
             matches!(&response.content[1], ApiResponseContentBlock::ToolUse { name, .. } if name == "write_file")
+        );
+    }
+
+    // ===================
+    // SSE Parsing Tests
+    // ===================
+
+    #[test]
+    fn test_sse_text_delta_parsing() {
+        let event = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::TextDelta { delta, block_index }) if delta == "Hello" && block_index == 0
+        ));
+    }
+
+    #[test]
+    fn test_sse_tool_use_start_parsing() {
+        let event = r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"read_file"}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::ToolUseStart { id, name, block_index })
+            if id == "toolu_123" && name == "read_file" && block_index == 1
+        ));
+    }
+
+    #[test]
+    fn test_sse_input_json_delta_parsing() {
+        let event = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::ToolInputDelta { delta, block_index, .. })
+            if delta == "{\"path\":" && block_index == 1
+        ));
+    }
+
+    #[test]
+    fn test_sse_message_start_captures_input_tokens() {
+        let event = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":150}}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(delta.is_none());
+        assert_eq!(input_tokens, 150);
+    }
+
+    #[test]
+    fn test_sse_message_delta_parsing() {
+        let event = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn)
+            })
+        ));
+        assert_eq!(output_tokens, 42);
+    }
+
+    #[test]
+    fn test_sse_message_stop_emits_usage() {
+        let event = r#"event: message_stop
+data: {"type":"message_stop"}"#;
+
+        let mut input_tokens = 100;
+        let mut output_tokens = 50;
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::Usage(Usage {
+                input_tokens: 100,
+                output_tokens: 50
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_sse_content_block_types_deserialization() {
+        let text_block: SseContentBlock = serde_json::from_str(r#"{"type":"text"}"#).unwrap();
+        assert!(matches!(text_block, SseContentBlock::Text));
+
+        let tool_block: SseContentBlock =
+            serde_json::from_str(r#"{"type":"tool_use","id":"123","name":"test"}"#).unwrap();
+        assert!(matches!(tool_block, SseContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn test_sse_delta_types_deserialization() {
+        let text_delta: SseDelta =
+            serde_json::from_str(r#"{"type":"text_delta","text":"Hello"}"#).unwrap();
+        assert!(matches!(text_delta, SseDelta::TextDelta { text } if text == "Hello"));
+
+        let json_delta: SseDelta =
+            serde_json::from_str(r#"{"type":"input_json_delta","partial_json":"{}"}"#).unwrap();
+        assert!(
+            matches!(json_delta, SseDelta::InputJsonDelta { partial_json } if partial_json == "{}")
         );
     }
 }
