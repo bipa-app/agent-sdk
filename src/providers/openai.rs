@@ -192,7 +192,8 @@ impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
-            let responses_provider = OpenAIResponsesProvider::new(self.api_key.clone(), self.model.clone());
+            let responses_provider =
+                OpenAIResponsesProvider::new(self.api_key.clone(), self.model.clone());
             return responses_provider.chat(request).await;
         }
 
@@ -562,7 +563,9 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.clone());
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(ApiToolCall {
                                 id: id.clone(),
                                 r#type: "function".to_owned(),

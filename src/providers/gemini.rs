@@ -167,7 +167,9 @@ impl LlmProvider for GeminiProvider {
                 match r {
                     ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
                     ApiFinishReason::MaxTokens => StopReason::MaxTokens,
-                    ApiFinishReason::Safety | ApiFinishReason::Recitation => StopReason::StopSequence,
+                    ApiFinishReason::Safety | ApiFinishReason::Recitation => {
+                        StopReason::StopSequence
+                    }
                 }
             }
         });
@@ -314,7 +316,8 @@ impl LlmProvider for GeminiProvider {
 
 fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
     // First, build a mapping of tool_use_id -> function_name from all messages
-    let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for msg in messages {
         if let Content::Blocks(blocks) = &msg.content {
             for block in blocks {
@@ -334,13 +337,19 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
         };
 
         let parts = match &msg.content {
-            Content::Text(text) => vec![ApiPart::Text { text: text.clone(), thought_signature: None }],
+            Content::Text(text) => vec![ApiPart::Text {
+                text: text.clone(),
+                thought_signature: None,
+            }],
             Content::Blocks(blocks) => {
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(ApiPart::Text { text: text.clone(), thought_signature: None });
+                            parts.push(ApiPart::Text {
+                                text: text.clone(),
+                                thought_signature: None,
+                            });
                         }
                         ContentBlock::ToolUse {
                             id: _,

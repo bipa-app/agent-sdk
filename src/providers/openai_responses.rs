@@ -367,7 +367,9 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                                 content: ApiMessageContent::Text(text.clone()),
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             // Tool use from assistant becomes a function_call in output history
                             items.push(ApiInputItem::FunctionCall(ApiFunctionCall::new(
                                 id.clone(),
@@ -381,10 +383,9 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                             ..
                         } => {
                             // Tool result becomes function_call_output
-                            items.push(ApiInputItem::FunctionCallOutput(ApiFunctionCallOutput::new(
-                                tool_use_id.clone(),
-                                content.clone(),
-                            )));
+                            items.push(ApiInputItem::FunctionCallOutput(
+                                ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
+                            ));
                         }
                     }
                 }

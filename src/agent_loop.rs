@@ -853,7 +853,9 @@ fn extract_content(
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
             }
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {
