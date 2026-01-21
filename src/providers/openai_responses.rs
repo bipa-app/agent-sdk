@@ -396,12 +396,20 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
     items
 }
 
-fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
-    // The Responses API with strict: true requires:
-    // 1. additionalProperties: false
-    // 2. All properties must be in the required array
-    let mut schema = tool.input_schema;
-    if let serde_json::Value::Object(ref mut obj) = schema {
+/// Recursively fix a JSON schema for `OpenAI` strict mode.
+/// Adds `additionalProperties: false` and ensures all properties are required.
+fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    // Check if this is an object type schema
+    let is_object_type = obj
+        .get("type")
+        .is_some_and(|t| t.as_str() == Some("object"));
+
+    if is_object_type {
+        // Add additionalProperties: false
         obj.insert(
             "additionalProperties".to_owned(),
             serde_json::Value::Bool(false),
@@ -416,6 +424,40 @@ fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
             obj.insert("required".to_owned(), serde_json::Value::Array(all_keys));
         }
     }
+
+    // Recursively process nested schemas
+    if let Some(props) = obj.get_mut("properties")
+        && let Some(props_obj) = props.as_object_mut()
+    {
+        for prop_schema in props_obj.values_mut() {
+            fix_schema_for_strict_mode(prop_schema);
+        }
+    }
+
+    // Process array items
+    if let Some(items) = obj.get_mut("items") {
+        fix_schema_for_strict_mode(items);
+    }
+
+    // Process anyOf/oneOf/allOf
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(arr) = obj.get_mut(key)
+            && let Some(arr_items) = arr.as_array_mut()
+        {
+            for item in arr_items {
+                fix_schema_for_strict_mode(item);
+            }
+        }
+    }
+}
+
+fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
+    // The Responses API with strict: true requires:
+    // 1. additionalProperties: false on all object schemas
+    // 2. All properties must be in the required array
+    // These requirements apply recursively to nested schemas
+    let mut schema = tool.input_schema;
+    fix_schema_for_strict_mode(&mut schema);
 
     ApiTool {
         r#type: "function".to_owned(),
