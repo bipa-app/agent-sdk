@@ -5,10 +5,12 @@
 //! via the `with_base_url` constructor.
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
+    StreamBox, StreamDelta, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -255,6 +257,91 @@ impl LlmProvider for OpenAIProvider {
         }))
     }
 
+    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            let messages = build_api_messages(&request);
+            let tools: Option<Vec<ApiTool>> = request
+                .tools
+                .map(|ts| ts.into_iter().map(convert_tool).collect());
+
+            let api_request = ApiChatRequestStreaming { model: &self.model, messages: &messages, max_completion_tokens: Some(request.max_tokens), tools: tools.as_deref(), stream: true };
+
+            tracing::debug!(model = %self.model, max_tokens = request.max_tokens, "OpenAI streaming LLM request");
+
+            let Ok(response) = self.client
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&api_request)
+                .send()
+                .await
+            else {
+                yield Err(anyhow::anyhow!("request failed"));
+                return;
+            };
+
+            let status = response.status();
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let (recoverable, level) = if status == StatusCode::TOO_MANY_REQUESTS {
+                    (true, "rate_limit")
+                } else if status.is_server_error() {
+                    (true, "server_error")
+                } else {
+                    (false, "client_error")
+                };
+                tracing::warn!(status = %status, body = %body, kind = level, "OpenAI error");
+                yield Ok(StreamDelta::Error { message: body, recoverable });
+                return;
+            }
+
+            // Track tool call state across deltas
+            let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
+                std::collections::HashMap::new();
+            let mut usage: Option<Usage> = None;
+            let mut buffer = String::new();
+            let mut stream = response.bytes_stream();
+
+            while let Some(chunk_result) = stream.next().await {
+                let Ok(chunk) = chunk_result else {
+                    yield Err(anyhow::anyhow!("stream error: {}", chunk_result.unwrap_err()));
+                    return;
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if line.is_empty() { continue; }
+                    let Some(data) = line.strip_prefix("data: ") else { continue; };
+
+                    for result in process_sse_data(data) {
+                        match result {
+                            SseProcessResult::TextDelta(c) => yield Ok(StreamDelta::TextDelta { delta: c, block_index: 0 }),
+                            SseProcessResult::ToolCallUpdate { index, id, name, arguments } => apply_tool_call_update(&mut tool_calls, index, id, name, arguments),
+                            SseProcessResult::Usage(u) => usage = Some(u),
+                            SseProcessResult::Done(sr) => {
+                                for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
+                                return;
+                            }
+                            SseProcessResult::Sentinel => {
+                                let sr = if tool_calls.is_empty() { StopReason::EndTurn } else { StopReason::ToolUse };
+                                for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stream ended without [DONE] - emit what we have
+            for delta in build_stream_end_deltas(&tool_calls, usage, StopReason::EndTurn) {
+                yield Ok(delta);
+            }
+        })
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -262,6 +349,142 @@ impl LlmProvider for OpenAIProvider {
     fn provider(&self) -> &'static str {
         "openai"
     }
+}
+
+/// Apply a tool call update to the accumulator.
+fn apply_tool_call_update(
+    tool_calls: &mut std::collections::HashMap<usize, ToolCallAccumulator>,
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+) {
+    let entry = tool_calls
+        .entry(index)
+        .or_insert_with(|| ToolCallAccumulator {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+    if let Some(id) = id {
+        entry.id = id;
+    }
+    if let Some(name) = name {
+        entry.name = name;
+    }
+    if let Some(args) = arguments {
+        entry.arguments.push_str(&args);
+    }
+}
+
+/// Helper to emit tool call deltas and done event.
+fn build_stream_end_deltas(
+    tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
+    usage: Option<Usage>,
+    stop_reason: StopReason,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+
+    // Emit tool calls
+    for (idx, tool) in tool_calls {
+        deltas.push(StreamDelta::ToolUseStart {
+            id: tool.id.clone(),
+            name: tool.name.clone(),
+            block_index: *idx + 1,
+        });
+        deltas.push(StreamDelta::ToolInputDelta {
+            id: tool.id.clone(),
+            delta: tool.arguments.clone(),
+            block_index: *idx + 1,
+        });
+    }
+
+    // Emit usage
+    if let Some(u) = usage {
+        deltas.push(StreamDelta::Usage(u));
+    }
+
+    // Emit done
+    deltas.push(StreamDelta::Done {
+        stop_reason: Some(stop_reason),
+    });
+
+    deltas
+}
+
+/// Result of processing an SSE chunk.
+enum SseProcessResult {
+    /// Emit a text delta.
+    TextDelta(String),
+    /// Update tool call accumulator (index, optional id, optional name, optional args).
+    ToolCallUpdate {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    },
+    /// Usage information.
+    Usage(Usage),
+    /// Stream is done with a stop reason.
+    Done(StopReason),
+    /// Stream sentinel [DONE] was received.
+    Sentinel,
+}
+
+/// Process an SSE data line and return results to apply.
+fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
+    if data == "[DONE]" {
+        return vec![SseProcessResult::Sentinel];
+    }
+
+    let Ok(chunk) = serde_json::from_str::<SseChunk>(data) else {
+        return vec![];
+    };
+
+    let mut results = Vec::new();
+
+    // Extract usage if present
+    if let Some(u) = chunk.usage {
+        results.push(SseProcessResult::Usage(Usage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        }));
+    }
+
+    // Process choices
+    if let Some(choice) = chunk.choices.into_iter().next() {
+        // Handle text content delta
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            results.push(SseProcessResult::TextDelta(content));
+        }
+
+        // Handle tool call deltas
+        if let Some(tc_deltas) = choice.delta.tool_calls {
+            for tc in tc_deltas {
+                results.push(SseProcessResult::ToolCallUpdate {
+                    index: tc.index,
+                    id: tc.id,
+                    name: tc.function.as_ref().and_then(|f| f.name.clone()),
+                    arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
+                });
+            }
+        }
+
+        // Check for finish reason
+        if let Some(finish_reason) = choice.finish_reason {
+            let stop_reason = match finish_reason {
+                SseFinishReason::Stop => StopReason::EndTurn,
+                SseFinishReason::ToolCalls => StopReason::ToolUse,
+                SseFinishReason::Length => StopReason::MaxTokens,
+                SseFinishReason::ContentFilter => StopReason::StopSequence,
+            };
+            results.push(SseProcessResult::Done(stop_reason));
+        }
+    }
+
+    results
 }
 
 fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
@@ -414,6 +637,17 @@ struct ApiChatRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct ApiChatRequestStreaming<'a> {
+    model: &'a str,
+    messages: &'a [ApiMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ApiTool]>,
+    stream: bool,
+}
+
+#[derive(Serialize)]
 struct ApiMessage {
     role: ApiRole,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,6 +740,65 @@ enum ApiFinishReason {
 
 #[derive(Deserialize)]
 struct ApiUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+// ============================================================================
+// SSE Streaming Types
+// ============================================================================
+
+/// Accumulator for tool call state across stream deltas.
+struct ToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// A single chunk in `OpenAI`'s SSE stream.
+#[derive(Deserialize)]
+struct SseChunk {
+    choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<SseUsage>,
+}
+
+#[derive(Deserialize)]
+struct SseChoice {
+    delta: SseDelta,
+    finish_reason: Option<SseFinishReason>,
+}
+
+#[derive(Deserialize)]
+struct SseDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<SseToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct SseToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<SseFunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct SseFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SseFinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+}
+
+#[derive(Deserialize)]
+struct SseUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -920,5 +1213,150 @@ mod tests {
         assert!(
             matches!(&blocks[1], ContentBlock::ToolUse { id, name, .. } if id == "call_123" && name == "read_file")
         );
+    }
+
+    // ===================
+    // SSE Streaming Type Tests
+    // ===================
+
+    #[test]
+    fn test_sse_chunk_text_delta_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "content": "Hello"
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].delta.content, Some("Hello".to_string()));
+        assert!(chunk.choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn test_sse_chunk_tool_call_delta_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_abc",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": ""
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        let tool_calls = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].index, 0);
+        assert_eq!(tool_calls[0].id, Some("call_abc".to_string()));
+        assert_eq!(
+            tool_calls[0].function.as_ref().unwrap().name,
+            Some("read_file".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sse_chunk_tool_call_arguments_delta_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "{\"path\":"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        let tool_calls = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].id, None);
+        assert_eq!(
+            tool_calls[0].function.as_ref().unwrap().arguments,
+            Some("{\"path\":".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sse_chunk_with_finish_reason_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            chunk.choices[0].finish_reason,
+            Some(SseFinishReason::Stop)
+        ));
+    }
+
+    #[test]
+    fn test_sse_chunk_with_usage_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50
+            }
+        }"#;
+
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+    }
+
+    #[test]
+    fn test_sse_finish_reason_deserialization() {
+        let stop: SseFinishReason = serde_json::from_str("\"stop\"").unwrap();
+        let tool_calls: SseFinishReason = serde_json::from_str("\"tool_calls\"").unwrap();
+        let length: SseFinishReason = serde_json::from_str("\"length\"").unwrap();
+        let content_filter: SseFinishReason = serde_json::from_str("\"content_filter\"").unwrap();
+
+        assert!(matches!(stop, SseFinishReason::Stop));
+        assert!(matches!(tool_calls, SseFinishReason::ToolCalls));
+        assert!(matches!(length, SseFinishReason::Length));
+        assert!(matches!(content_filter, SseFinishReason::ContentFilter));
+    }
+
+    #[test]
+    fn test_streaming_request_serialization() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequestStreaming {
+            model: "gpt-4o",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            tools: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"stream\":true"));
+        assert!(json.contains("\"model\":\"gpt-4o\""));
     }
 }
