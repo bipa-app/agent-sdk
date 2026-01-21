@@ -272,7 +272,7 @@ impl LlmProvider for GeminiProvider {
                                         prev_text_len = text.len();
                                     }
                                 }
-                                ApiPart::FunctionCall { function_call } if i >= prev_func_count => {
+                                ApiPart::FunctionCall { function_call, .. } if i >= prev_func_count => {
                                     let id = format!("call_{}", uuid_simple());
                                     yield Ok(StreamDelta::ToolUseStart { id: id.clone(), name: function_call.name.clone(), block_index: i + 1 });
                                     yield Ok(StreamDelta::ToolInputDelta { id, delta: serde_json::to_string(&function_call.args).unwrap_or_default(), block_index: i + 1 });
@@ -336,12 +336,18 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                         ContentBlock::Text { text } => {
                             parts.push(ApiPart::Text { text: text.clone() });
                         }
-                        ContentBlock::ToolUse { id: _, name, input } => {
+                        ContentBlock::ToolUse {
+                            id: _,
+                            name,
+                            input,
+                            thought_signature,
+                        } => {
                             parts.push(ApiPart::FunctionCall {
                                 function_call: ApiFunctionCall {
                                     name: name.clone(),
                                     args: input.clone(),
                                 },
+                                thought_signature: thought_signature.clone(),
                             });
                         }
                         ContentBlock::ToolResult {
@@ -404,13 +410,17 @@ fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
             }
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
                 // Generate a unique ID for the tool call
                 let id = format!("call_{}", uuid_simple());
                 blocks.push(ContentBlock::ToolUse {
                     id,
                     name: function_call.name.clone(),
                     input: function_call.args.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
             ApiPart::FunctionResponse { .. } => {
@@ -462,6 +472,9 @@ enum ApiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: ApiFunctionCall,
+        /// Thought signature for Gemini 3 models - preserves reasoning context
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -638,6 +651,7 @@ mod tests {
                 name: "read_file".to_string(),
                 args: serde_json::json!({"path": "/test.txt"}),
             },
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&part).unwrap();
@@ -742,7 +756,7 @@ mod tests {
         let content = &response.candidates[0].content;
         assert_eq!(content.parts.len(), 1);
         match &content.parts[0] {
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "read_file");
             }
             _ => panic!("Expected FunctionCall part"),
@@ -819,6 +833,7 @@ mod tests {
                     name: "read_file".to_string(),
                     args: serde_json::json!({"path": "test.txt"}),
                 },
+                thought_signature: None,
             }],
         };
 
@@ -911,7 +926,7 @@ mod tests {
 
         let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
         match &response.candidates[0].content.parts[0] {
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "get_weather");
                 assert_eq!(function_call.args["location"], "NYC");
             }

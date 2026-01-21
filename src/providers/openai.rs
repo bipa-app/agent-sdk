@@ -524,7 +524,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.clone());
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse { id, name, input, .. } => {
                             tool_calls.push(ApiToolCall {
                                 id: id.clone(),
                                 r#type: "function".to_owned(),
@@ -615,6 +615,7 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 input,
+                thought_signature: None,
             });
         }
     }

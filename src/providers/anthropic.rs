@@ -78,7 +78,7 @@ impl AnthropicProvider {
                                 ContentBlock::Text { text } => {
                                     ApiContentBlockInput::Text { text: text.clone() }
                                 }
-                                ContentBlock::ToolUse { id, name, input } => {
+                                ContentBlock::ToolUse { id, name, input, .. } => {
                                     ApiContentBlockInput::ToolUse {
                                         id: id.clone(),
                                         name: name.clone(),
@@ -186,7 +186,12 @@ impl LlmProvider for AnthropicProvider {
             .map(|b| match b {
                 ApiResponseContentBlock::Text { text } => ContentBlock::Text { text },
                 ApiResponseContentBlock::ToolUse { id, name, input } => {
-                    ContentBlock::ToolUse { id, name, input }
+                    ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    }
                 }
             })
             .collect();

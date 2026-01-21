@@ -172,6 +172,7 @@ impl StreamAccumulator {
                     id: tool.id,
                     name: tool.name,
                     input,
+                    thought_signature: None, // Streaming doesn't provide thought signatures
                 },
             ));
         }
@@ -257,7 +258,7 @@ mod tests {
         let blocks = acc.into_content_blocks();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "call_123");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "test.txt");

@@ -46,6 +46,7 @@ impl Message {
             id: id.into(),
             name: name.into(),
             input,
+            thought_signature: None,
         });
         Self {
             role: Role::Assistant,
@@ -108,6 +109,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Gemini thought signature for preserving reasoning context.
+        /// Required for Gemini 3 models when sending function calls back.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
 
     #[serde(rename = "tool_result")]
@@ -146,7 +151,7 @@ impl ChatResponse {
 
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &serde_json::Value)> {
         self.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+            ContentBlock::ToolUse { id, name, input, .. } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         })
     }
