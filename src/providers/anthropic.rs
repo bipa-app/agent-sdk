@@ -282,6 +282,9 @@ impl LlmProvider for AnthropicProvider {
             let mut buffer = String::new();
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            // Track tool IDs by block index for correlating input deltas
+            let mut tool_ids: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
 
             while let Some(chunk_result) = stream.next().await {
                 let chunk = match chunk_result {
@@ -300,7 +303,12 @@ impl LlmProvider for AnthropicProvider {
                     buffer = buffer[pos + 2..].to_string();
 
                     // Parse SSE event
-                    if let Some(delta) = parse_sse_event(&event_block, &mut input_tokens, &mut output_tokens) {
+                    if let Some(delta) = parse_sse_event(
+                        &event_block,
+                        &mut input_tokens,
+                        &mut output_tokens,
+                        &mut tool_ids,
+                    ) {
                         yield Ok(delta);
                     }
                 }
@@ -322,6 +330,7 @@ fn parse_sse_event(
     event_block: &str,
     input_tokens: &mut u32,
     output_tokens: &mut u32,
+    tool_ids: &mut std::collections::HashMap<usize, String>,
 ) -> Option<StreamDelta> {
     let mut event_type = None;
     let mut data = None;
@@ -349,6 +358,8 @@ fn parse_sse_event(
             if let Ok(event) = serde_json::from_str::<SseContentBlockStart>(data)
                 && let SseContentBlock::ToolUse { id, name } = event.content_block
             {
+                // Store the tool ID for later input deltas
+                tool_ids.insert(event.index, id.clone());
                 return Some(StreamDelta::ToolUseStart {
                     id,
                     name,
@@ -367,10 +378,13 @@ fn parse_sse_event(
                         });
                     }
                     SseDelta::InputJsonDelta { partial_json } => {
-                        // We need the tool ID from the content_block_start event
-                        // For now, use a placeholder - the accumulator tracks by block_index
+                        // Look up the tool ID from the content_block_start event
+                        let id = tool_ids
+                            .get(&event.index)
+                            .cloned()
+                            .unwrap_or_default();
                         return Some(StreamDelta::ToolInputDelta {
-                            id: String::new(), // Will be filled by accumulator via block_index
+                            id,
                             delta: partial_json,
                             block_index: event.index,
                         });
@@ -845,7 +859,8 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
 
         assert!(matches!(
             delta,
@@ -860,13 +875,16 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
 
         assert!(matches!(
             delta,
             Some(StreamDelta::ToolUseStart { id, name, block_index })
             if id == "toolu_123" && name == "read_file" && block_index == 1
         ));
+        // Verify tool ID is stored for later input deltas
+        assert_eq!(tool_ids.get(&1), Some(&"toolu_123".to_string()));
     }
 
     #[test]
@@ -876,12 +894,17 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        // Pre-populate tool_ids as if we received the tool_use_start event
+        let mut tool_ids = std::collections::HashMap::new();
+        tool_ids.insert(1, "toolu_123".to_string());
 
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+
+        // Verify the tool ID is correctly looked up
         assert!(matches!(
             delta,
-            Some(StreamDelta::ToolInputDelta { delta, block_index, .. })
-            if delta == "{\"path\":" && block_index == 1
+            Some(StreamDelta::ToolInputDelta { id, delta, block_index })
+            if id == "toolu_123" && delta == "{\"path\":" && block_index == 1
         ));
     }
 
@@ -892,7 +915,8 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
 
         assert!(delta.is_none());
         assert_eq!(input_tokens, 150);
@@ -905,7 +929,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
 
         assert!(matches!(
             delta,
@@ -923,7 +948,8 @@ data: {"type":"message_stop"}"#;
 
         let mut input_tokens = 100;
         let mut output_tokens = 50;
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens);
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
 
         assert!(matches!(
             delta,
