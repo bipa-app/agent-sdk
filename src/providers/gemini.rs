@@ -4,10 +4,12 @@
 //! API (`generativelanguage.googleapis.com`).
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
+    StreamBox, StreamDelta, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +169,114 @@ impl LlmProvider for GeminiProvider {
                 output_tokens: usage.candidates_token_count,
             },
         }))
+    }
+
+    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        Box::pin(async_stream::stream! {
+            let contents = build_api_contents(&request.messages);
+            let tools = request.tools.map(convert_tools_to_config);
+            let system_instruction = if request.system.is_empty() {
+                None
+            } else {
+                Some(ApiContent { role: None, parts: vec![ApiPart::Text { text: request.system.clone() }] })
+            };
+
+            let api_request = ApiGenerateContentRequest {
+                contents: &contents,
+                system_instruction: system_instruction.as_ref(),
+                tools: tools.as_ref().map(std::slice::from_ref),
+                generation_config: Some(ApiGenerationConfig { max_output_tokens: Some(request.max_tokens) }),
+            };
+
+            tracing::debug!(model = %self.model, max_tokens = request.max_tokens, "Gemini streaming LLM request");
+
+            let Ok(response) = self.client
+                .post(format!("{API_BASE_URL}/models/{}:streamGenerateContent", self.model))
+                .header("Content-Type", "application/json")
+                .query(&[("key", &self.api_key), ("alt", &"sse".to_string())])
+                .json(&api_request)
+                .send()
+                .await
+            else {
+                yield Err(anyhow::anyhow!("request failed"));
+                return;
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                tracing::warn!(status = %status, body = %body, "Gemini error");
+                yield Ok(StreamDelta::Error { message: body, recoverable });
+                return;
+            }
+
+            let mut prev_text_len = 0usize;
+            let mut prev_func_count = 0usize;
+            let mut usage: Option<Usage> = None;
+            let mut stop_reason: Option<StopReason> = None;
+            let mut buffer = String::new();
+            let mut stream = response.bytes_stream();
+
+            while let Some(chunk_result) = stream.next().await {
+                let Ok(chunk) = chunk_result else {
+                    yield Err(anyhow::anyhow!("stream error"));
+                    return;
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if line.is_empty() { continue; }
+
+                    // Gemini SSE format: "data: {...}"
+                    let Some(data) = line.strip_prefix("data: ") else { continue; };
+                    let Ok(resp) = serde_json::from_str::<ApiGenerateContentResponse>(data) else { continue; };
+
+                    // Extract usage
+                    if let Some(u) = resp.usage_metadata {
+                        usage = Some(Usage { input_tokens: u.prompt_token_count, output_tokens: u.candidates_token_count });
+                    }
+
+                    // Process candidates
+                    if let Some(candidate) = resp.candidates.into_iter().next() {
+                        // Check finish reason
+                        if let Some(reason) = candidate.finish_reason {
+                            stop_reason = Some(match reason {
+                                ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
+                                ApiFinishReason::MaxTokens => StopReason::MaxTokens,
+                                ApiFinishReason::Safety | ApiFinishReason::Recitation => StopReason::StopSequence,
+                            });
+                        }
+
+                        // Emit deltas for new content
+                        for (i, part) in candidate.content.parts.iter().enumerate() {
+                            match part {
+                                ApiPart::Text { text } => {
+                                    if text.len() > prev_text_len {
+                                        let delta = &text[prev_text_len..];
+                                        yield Ok(StreamDelta::TextDelta { delta: delta.to_string(), block_index: 0 });
+                                        prev_text_len = text.len();
+                                    }
+                                }
+                                ApiPart::FunctionCall { function_call } if i >= prev_func_count => {
+                                    let id = format!("call_{}", uuid_simple());
+                                    yield Ok(StreamDelta::ToolUseStart { id: id.clone(), name: function_call.name.clone(), block_index: i + 1 });
+                                    yield Ok(StreamDelta::ToolInputDelta { id, delta: serde_json::to_string(&function_call.args).unwrap_or_default(), block_index: i + 1 });
+                                    prev_func_count = i + 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit final events
+            if let Some(u) = usage { yield Ok(StreamDelta::Usage(u)); }
+            yield Ok(StreamDelta::Done { stop_reason });
+        })
     }
 
     fn model(&self) -> &str {
@@ -695,5 +805,86 @@ mod tests {
         // IDs should be non-empty
         assert!(!id1.is_empty());
         assert!(!id2.is_empty());
+    }
+
+    // ===================
+    // Streaming Response Tests
+    // ===================
+
+    #[test]
+    fn test_streaming_response_text_deserialization() {
+        let json = r#"{
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Hello"}]
+                    }
+                }
+            ]
+        }"#;
+
+        let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.candidates.len(), 1);
+        match &response.candidates[0].content.parts[0] {
+            ApiPart::Text { text } => assert_eq!(text, "Hello"),
+            _ => panic!("Expected Text part"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_response_with_usage_deserialization() {
+        let json = r#"{
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Hello"}]
+                    },
+                    "finishReason": "STOP"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        }"#;
+
+        let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
+        let usage = response.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, 10);
+        assert_eq!(usage.candidates_token_count, 5);
+        assert!(matches!(
+            response.candidates[0].finish_reason,
+            Some(ApiFinishReason::Stop)
+        ));
+    }
+
+    #[test]
+    fn test_streaming_response_function_call_deserialization() {
+        let json = r#"{
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": {"location": "NYC"}
+                            }
+                        }]
+                    }
+                }
+            ]
+        }"#;
+
+        let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
+        match &response.candidates[0].content.parts[0] {
+            ApiPart::FunctionCall { function_call } => {
+                assert_eq!(function_call.name, "get_weather");
+                assert_eq!(function_call.args["location"], "NYC");
+            }
+            _ => panic!("Expected FunctionCall part"),
+        }
     }
 }
