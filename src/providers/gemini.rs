@@ -148,10 +148,22 @@ impl LlmProvider for GeminiProvider {
 
         let content = build_content_blocks(&candidate.content);
 
-        let stop_reason = candidate.finish_reason.map(|r| match r {
-            ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
-            ApiFinishReason::MaxTokens => StopReason::MaxTokens,
-            ApiFinishReason::Safety | ApiFinishReason::Recitation => StopReason::StopSequence,
+        // Gemini returns STOP for both natural endings and function calls.
+        // We need to check if there are tool calls and override to ToolUse.
+        let has_tool_calls = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+        let stop_reason = candidate.finish_reason.map(|r| {
+            if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                match r {
+                    ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
+                    ApiFinishReason::MaxTokens => StopReason::MaxTokens,
+                    ApiFinishReason::Safety | ApiFinishReason::Recitation => StopReason::StopSequence,
+                }
+            }
         });
 
         let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
@@ -241,7 +253,7 @@ impl LlmProvider for GeminiProvider {
 
                     // Process candidates
                     if let Some(candidate) = resp.candidates.into_iter().next() {
-                        // Check finish reason
+                        // Check finish reason (we'll adjust for tool calls after processing content)
                         if let Some(reason) = candidate.finish_reason {
                             stop_reason = Some(match reason {
                                 ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
@@ -271,6 +283,12 @@ impl LlmProvider for GeminiProvider {
                         }
                     }
                 }
+            }
+
+            // Gemini returns STOP for both natural endings and function calls.
+            // Override to ToolUse if we saw any function calls during the stream.
+            if prev_func_count > 0 {
+                stop_reason = Some(StopReason::ToolUse);
             }
 
             // Emit final events
