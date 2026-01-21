@@ -397,11 +397,20 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
 }
 
 fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
+    // The Responses API with strict: true requires additionalProperties: false
+    let mut schema = tool.input_schema;
+    if let serde_json::Value::Object(ref mut obj) = schema {
+        obj.insert(
+            "additionalProperties".to_owned(),
+            serde_json::Value::Bool(false),
+        );
+    }
+
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
-        parameters: Some(tool.input_schema),
+        parameters: Some(schema),
         strict: Some(true),
     }
 }

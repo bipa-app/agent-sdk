@@ -66,6 +66,7 @@ impl GeminiProvider {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl LlmProvider for GeminiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let contents = build_api_contents(&request.messages);
