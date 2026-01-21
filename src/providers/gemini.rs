@@ -460,6 +460,8 @@ struct ApiGenerateContentRequest<'a> {
 struct ApiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
+    /// Parts can be missing in some edge cases (e.g., empty responses, safety blocks)
+    #[serde(default)]
     parts: Vec<ApiPart>,
 }
 
