@@ -307,6 +307,18 @@ impl LlmProvider for GeminiProvider {
 }
 
 fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
+    // First, build a mapping of tool_use_id -> function_name from all messages
+    let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for msg in messages {
+        if let Content::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    tool_names.insert(id.clone(), name.clone());
+                }
+            }
+        }
+    }
+
     let mut contents = Vec::new();
 
     for msg in messages {
@@ -333,14 +345,15 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                             });
                         }
                         ContentBlock::ToolResult {
-                            tool_use_id: _,
+                            tool_use_id,
                             content,
                             is_error,
                         } => {
-                            // For Gemini, we need to get the function name from the previous
-                            // assistant message. Since we don't have that context here,
-                            // we'll use a placeholder. In practice, the agent loop should
-                            // track function names.
+                            // Look up the function name from our mapping
+                            let func_name = tool_names
+                                .get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_else(|| "unknown_function".to_owned());
                             let response = if is_error.unwrap_or(false) {
                                 serde_json::json!({ "error": content })
                             } else {
@@ -348,7 +361,7 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                             };
                             parts.push(ApiPart::FunctionResponse {
                                 function_response: ApiFunctionResponse {
-                                    name: "function".to_owned(), // Placeholder
+                                    name: func_name,
                                     response,
                                 },
                             });
