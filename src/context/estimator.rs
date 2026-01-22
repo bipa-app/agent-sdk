@@ -115,6 +115,7 @@ mod tests {
                     id: "tool_123".to_string(),
                     name: "read".to_string(),            // 4 chars = 1 token
                     input: json!({"path": "/test.txt"}), // ~20 chars = 5 tokens
+                    thought_signature: None,
                 },
             ]),
         };

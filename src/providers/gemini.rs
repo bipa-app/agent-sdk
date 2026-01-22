@@ -66,6 +66,7 @@ impl GeminiProvider {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl LlmProvider for GeminiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let contents = build_api_contents(&request.messages);
@@ -77,6 +78,7 @@ impl LlmProvider for GeminiProvider {
                 role: None,
                 parts: vec![ApiPart::Text {
                     text: request.system.clone(),
+                    thought_signature: None,
                 }],
             })
         };
@@ -148,10 +150,29 @@ impl LlmProvider for GeminiProvider {
 
         let content = build_content_blocks(&candidate.content);
 
-        let stop_reason = candidate.finish_reason.map(|r| match r {
-            ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
-            ApiFinishReason::MaxTokens => StopReason::MaxTokens,
-            ApiFinishReason::Safety | ApiFinishReason::Recitation => StopReason::StopSequence,
+        // Warn if parts were returned but no content blocks were built (possible unknown part types)
+        if content.is_empty() && !candidate.content.parts.is_empty() {
+            tracing::warn!(raw_parts = ?candidate.content.parts, "Gemini parts not converted to content blocks");
+        }
+
+        // Gemini returns STOP for both natural endings and function calls.
+        // We need to check if there are tool calls and override to ToolUse.
+        let has_tool_calls = content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+        let stop_reason = candidate.finish_reason.map(|r| {
+            if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                match r {
+                    ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
+                    ApiFinishReason::MaxTokens => StopReason::MaxTokens,
+                    ApiFinishReason::Safety | ApiFinishReason::Recitation => {
+                        StopReason::StopSequence
+                    }
+                }
+            }
         });
 
         let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
@@ -178,7 +199,7 @@ impl LlmProvider for GeminiProvider {
             let system_instruction = if request.system.is_empty() {
                 None
             } else {
-                Some(ApiContent { role: None, parts: vec![ApiPart::Text { text: request.system.clone() }] })
+                Some(ApiContent { role: None, parts: vec![ApiPart::Text { text: request.system.clone(), thought_signature: None }] })
             };
 
             let api_request = ApiGenerateContentRequest {
@@ -241,7 +262,7 @@ impl LlmProvider for GeminiProvider {
 
                     // Process candidates
                     if let Some(candidate) = resp.candidates.into_iter().next() {
-                        // Check finish reason
+                        // Check finish reason (we'll adjust for tool calls after processing content)
                         if let Some(reason) = candidate.finish_reason {
                             stop_reason = Some(match reason {
                                 ApiFinishReason::Stop | ApiFinishReason::Other => StopReason::EndTurn,
@@ -253,14 +274,14 @@ impl LlmProvider for GeminiProvider {
                         // Emit deltas for new content
                         for (i, part) in candidate.content.parts.iter().enumerate() {
                             match part {
-                                ApiPart::Text { text } => {
+                                ApiPart::Text { text, .. } => {
                                     if text.len() > prev_text_len {
                                         let delta = &text[prev_text_len..];
                                         yield Ok(StreamDelta::TextDelta { delta: delta.to_string(), block_index: 0 });
                                         prev_text_len = text.len();
                                     }
                                 }
-                                ApiPart::FunctionCall { function_call } if i >= prev_func_count => {
+                                ApiPart::FunctionCall { function_call, .. } if i >= prev_func_count => {
                                     let id = format!("call_{}", uuid_simple());
                                     yield Ok(StreamDelta::ToolUseStart { id: id.clone(), name: function_call.name.clone(), block_index: i + 1 });
                                     yield Ok(StreamDelta::ToolInputDelta { id, delta: serde_json::to_string(&function_call.args).unwrap_or_default(), block_index: i + 1 });
@@ -271,6 +292,12 @@ impl LlmProvider for GeminiProvider {
                         }
                     }
                 }
+            }
+
+            // Gemini returns STOP for both natural endings and function calls.
+            // Override to ToolUse if we saw any function calls during the stream.
+            if prev_func_count > 0 {
+                stop_reason = Some(StopReason::ToolUse);
             }
 
             // Emit final events
@@ -289,6 +316,19 @@ impl LlmProvider for GeminiProvider {
 }
 
 fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
+    // First, build a mapping of tool_use_id -> function_name from all messages
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if let Content::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    tool_names.insert(id.clone(), name.clone());
+                }
+            }
+        }
+    }
+
     let mut contents = Vec::new();
 
     for msg in messages {
@@ -298,31 +338,44 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
         };
 
         let parts = match &msg.content {
-            Content::Text(text) => vec![ApiPart::Text { text: text.clone() }],
+            Content::Text(text) => vec![ApiPart::Text {
+                text: text.clone(),
+                thought_signature: None,
+            }],
             Content::Blocks(blocks) => {
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(ApiPart::Text { text: text.clone() });
+                            parts.push(ApiPart::Text {
+                                text: text.clone(),
+                                thought_signature: None,
+                            });
                         }
-                        ContentBlock::ToolUse { id: _, name, input } => {
+                        ContentBlock::ToolUse {
+                            id: _,
+                            name,
+                            input,
+                            thought_signature,
+                        } => {
                             parts.push(ApiPart::FunctionCall {
                                 function_call: ApiFunctionCall {
                                     name: name.clone(),
                                     args: input.clone(),
                                 },
+                                thought_signature: thought_signature.clone(),
                             });
                         }
                         ContentBlock::ToolResult {
-                            tool_use_id: _,
+                            tool_use_id,
                             content,
                             is_error,
                         } => {
-                            // For Gemini, we need to get the function name from the previous
-                            // assistant message. Since we don't have that context here,
-                            // we'll use a placeholder. In practice, the agent loop should
-                            // track function names.
+                            // Look up the function name from our mapping
+                            let func_name = tool_names
+                                .get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_else(|| "unknown_function".to_owned());
                             let response = if is_error.unwrap_or(false) {
                                 serde_json::json!({ "error": content })
                             } else {
@@ -330,7 +383,7 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                             };
                             parts.push(ApiPart::FunctionResponse {
                                 function_response: ApiFunctionResponse {
-                                    name: "function".to_owned(), // Placeholder
+                                    name: func_name,
                                     response,
                                 },
                             });
@@ -368,22 +421,29 @@ fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
 
     for part in &content.parts {
         match part {
-            ApiPart::Text { text } => {
+            ApiPart::Text { text, .. } => {
                 if !text.is_empty() {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
             }
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
                 // Generate a unique ID for the tool call
                 let id = format!("call_{}", uuid_simple());
                 blocks.push(ContentBlock::ToolUse {
                     id,
                     name: function_call.name.clone(),
                     input: function_call.args.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
             ApiPart::FunctionResponse { .. } => {
                 // Function responses in the response are unusual, skip them
+            }
+            ApiPart::Unknown(value) => {
+                tracing::warn!(part = ?value, "Unknown API part type in Gemini response, skipping");
             }
         }
     }
@@ -419,32 +479,42 @@ struct ApiGenerateContentRequest<'a> {
 struct ApiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
+    /// Parts can be missing in some edge cases (e.g., empty responses, safety blocks)
+    #[serde(default)]
     parts: Vec<ApiPart>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 enum ApiPart {
     Text {
         text: String,
+        /// Thought signature may appear with text in Gemini 3 models
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: ApiFunctionCall,
+        /// Thought signature for Gemini 3 models - preserves reasoning context
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
         function_response: ApiFunctionResponse,
     },
+    /// Catch-all for unknown part types to prevent parse failures
+    Unknown(serde_json::Value),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ApiFunctionCall {
     name: String,
     args: serde_json::Value,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ApiFunctionResponse {
     name: String,
     response: serde_json::Value,
@@ -582,6 +652,7 @@ mod tests {
             role: Some("user".to_string()),
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
+                thought_signature: None,
             }],
         };
 
@@ -594,6 +665,7 @@ mod tests {
     fn test_api_part_text_serialization() {
         let part = ApiPart::Text {
             text: "Hello, world!".to_string(),
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&part).unwrap();
@@ -607,6 +679,7 @@ mod tests {
                 name: "read_file".to_string(),
                 args: serde_json::json!({"path": "/test.txt"}),
             },
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&part).unwrap();
@@ -711,7 +784,7 @@ mod tests {
         let content = &response.candidates[0].content;
         assert_eq!(content.parts.len(), 1);
         match &content.parts[0] {
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "read_file");
             }
             _ => panic!("Expected FunctionCall part"),
@@ -771,6 +844,7 @@ mod tests {
             role: Some("model".to_string()),
             parts: vec![ApiPart::Text {
                 text: "Hello!".to_string(),
+                thought_signature: None,
             }],
         };
 
@@ -788,6 +862,7 @@ mod tests {
                     name: "read_file".to_string(),
                     args: serde_json::json!({"path": "test.txt"}),
                 },
+                thought_signature: None,
             }],
         };
 
@@ -827,7 +902,7 @@ mod tests {
         let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.candidates.len(), 1);
         match &response.candidates[0].content.parts[0] {
-            ApiPart::Text { text } => assert_eq!(text, "Hello"),
+            ApiPart::Text { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("Expected Text part"),
         }
     }
@@ -880,7 +955,7 @@ mod tests {
 
         let response: ApiGenerateContentResponse = serde_json::from_str(json).unwrap();
         match &response.candidates[0].content.parts[0] {
-            ApiPart::FunctionCall { function_call } => {
+            ApiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "get_weather");
                 assert_eq!(function_call.args["location"], "NYC");
             }

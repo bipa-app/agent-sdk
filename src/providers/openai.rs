@@ -3,6 +3,9 @@
 //! This module provides an implementation of `LlmProvider` for the `OpenAI`
 //! Chat Completions API. It also supports `OpenAI`-compatible APIs (Ollama, vLLM, etc.)
 //! via the `with_base_url` constructor.
+//!
+//! Models that require the Responses API (like `gpt-5.2-codex`) are automatically
+//! routed to the correct endpoint.
 
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
@@ -14,12 +17,20 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use super::openai_responses::OpenAIResponsesProvider;
+
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Check if a model requires the Responses API instead of Chat Completions.
+fn requires_responses_api(model: &str) -> bool {
+    model.contains("codex")
+}
 
 // GPT-5.2 series (latest flagship, Dec 2025)
 pub const MODEL_GPT52_INSTANT: &str = "gpt-5.2-instant";
 pub const MODEL_GPT52_THINKING: &str = "gpt-5.2-thinking";
 pub const MODEL_GPT52_PRO: &str = "gpt-5.2-pro";
+pub const MODEL_GPT52_CODEX: &str = "gpt-5.2-codex";
 
 // GPT-5 series (400k context)
 pub const MODEL_GPT5: &str = "gpt-5";
@@ -93,6 +104,14 @@ impl OpenAIProvider {
     #[must_use]
     pub fn gpt52_pro(api_key: String) -> Self {
         Self::new(api_key, MODEL_GPT52_PRO.to_owned())
+    }
+
+    /// Create a provider using GPT-5.2 Codex (optimized for agentic coding).
+    ///
+    /// Note: This model uses the Responses API internally.
+    #[must_use]
+    pub fn codex(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT52_CODEX.to_owned())
     }
 
     /// Create a provider using GPT-5 (400k context, coding and reasoning).
@@ -171,6 +190,13 @@ impl OpenAIProvider {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
+        if requires_responses_api(&self.model) {
+            let responses_provider =
+                OpenAIResponsesProvider::new(self.api_key.clone(), self.model.clone());
+            return responses_provider.chat(request).await;
+        }
+
         let messages = build_api_messages(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -258,6 +284,19 @@ impl LlmProvider for OpenAIProvider {
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
+        if requires_responses_api(&self.model) {
+            let api_key = self.api_key.clone();
+            let model = self.model.clone();
+            return Box::pin(async_stream::stream! {
+                let responses_provider = OpenAIResponsesProvider::new(api_key, model);
+                let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
+                while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                    yield item;
+                }
+            });
+        }
+
         Box::pin(async_stream::stream! {
             let messages = build_api_messages(&request);
             let tools: Option<Vec<ApiTool>> = request
@@ -524,7 +563,9 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.clone());
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(ApiToolCall {
                                 id: id.clone(),
                                 r#type: "function".to_owned(),
@@ -615,6 +656,7 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 input,
+                thought_signature: None,
             });
         }
     }

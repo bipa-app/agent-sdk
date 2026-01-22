@@ -853,7 +853,9 @@ fn extract_content(
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {
@@ -879,11 +881,17 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::Text { text } => {
                 blocks.push(ContentBlock::Text { text: text.clone() });
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 blocks.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
             ContentBlock::ToolResult { .. } => {}
@@ -952,6 +960,7 @@ mod tests {
                     id: tool_id.to_string(),
                     name: tool_name.to_string(),
                     input,
+                    thought_signature: None,
                 }],
                 model: "mock-model".to_string(),
                 stop_reason: Some(StopReason::ToolUse),
@@ -1437,6 +1446,7 @@ mod tests {
                 id: "tool_1".to_string(),
                 name: "test_tool".to_string(),
                 input: json!({"key": "value"}),
+                thought_signature: None,
             }],
             model: "test".to_string(),
             stop_reason: None,
@@ -1464,6 +1474,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "helper".to_string(),
                     input: json!({}),
+                    thought_signature: None,
                 },
             ],
             model: "test".to_string(),
@@ -1499,6 +1510,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "echo".to_string(),
                     input: json!({"message": "test"}),
+                    thought_signature: None,
                 },
             ],
             model: "test".to_string(),

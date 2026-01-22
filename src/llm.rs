@@ -35,7 +35,7 @@ pub trait LlmProvider: Send + Sync {
                                         block_index: idx,
                                     });
                                 }
-                                ContentBlock::ToolUse { id, name, input } => {
+                                ContentBlock::ToolUse { id, name, input, .. } => {
                                     yield Ok(StreamDelta::ToolUseStart {
                                         id: id.clone(),
                                         name: name.clone(),
