@@ -20,9 +20,8 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -266,10 +265,15 @@ struct TodoWriteInput {
     todos: Vec<TodoItemInput>,
 }
 
-#[async_trait]
 impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
-    fn name(&self) -> &'static str {
-        "todo_write"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::TodoWrite
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Update Tasks"
     }
 
     fn description(&self) -> &'static str {
@@ -363,10 +367,15 @@ impl TodoReadTool {
     }
 }
 
-#[async_trait]
 impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoReadTool {
-    fn name(&self) -> &'static str {
-        "todo_read"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::TodoRead
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Read Tasks"
     }
 
     fn description(&self) -> &'static str {

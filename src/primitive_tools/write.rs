@@ -1,7 +1,6 @@
 use crate::reminders::{append_reminder, builtin};
-use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -31,10 +30,15 @@ struct WriteInput {
     content: String,
 }
 
-#[async_trait]
 impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
-    fn name(&self) -> &'static str {
-        "write"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::Write
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Write File"
     }
 
     fn description(&self) -> &'static str {
@@ -373,7 +377,7 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), "write");
+        assert_eq!(tool.name(), PrimitiveToolName::Write);
         assert_eq!(tool.tier(), ToolTier::Confirm);
         assert!(tool.description().contains("Write"));
 

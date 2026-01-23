@@ -1,9 +1,8 @@
 //! Bridge MCP tools to SDK Tool trait.
 
-use crate::tools::{Tool, ToolContext, ToolRegistry};
+use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
 use crate::types::{ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde_json::Value;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -67,9 +66,14 @@ impl<T: McpTransport> McpToolBridge<T> {
     }
 }
 
-#[async_trait]
 impl<T: McpTransport + 'static> Tool<()> for McpToolBridge<T> {
-    fn name(&self) -> &'static str {
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new(&self.definition.name)
+    }
+
+    fn display_name(&self) -> &'static str {
         // We need to leak the string to get a 'static lifetime
         // This is acceptable since tool definitions are typically long-lived
         Box::leak(self.definition.name.clone().into_boxed_str())

@@ -1,9 +1,8 @@
 //! Link fetch tool implementation.
 
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{PrimitiveToolName, Tool, ToolContext};
 use crate::types::{ToolResult, ToolTier};
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -181,13 +180,18 @@ fn convert_html(html: &str, format: FetchFormat) -> String {
     result.unwrap_or_else(|_| html.to_string())
 }
 
-#[async_trait]
 impl<Ctx> Tool<Ctx> for LinkFetchTool
 where
     Ctx: Send + Sync + 'static,
 {
-    fn name(&self) -> &'static str {
-        "link_fetch"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::LinkFetch
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Fetch URL"
     }
 
     fn description(&self) -> &'static str {
@@ -263,7 +267,7 @@ mod tests {
     fn test_link_fetch_tool_metadata() {
         let tool = LinkFetchTool::new();
 
-        assert_eq!(Tool::<()>::name(&tool), "link_fetch");
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::LinkFetch);
         assert!(Tool::<()>::description(&tool).contains("Fetch"));
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
     }

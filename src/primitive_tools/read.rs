@@ -1,7 +1,6 @@
 use crate::reminders::{append_reminder, builtin};
-use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -39,10 +38,15 @@ struct ReadInput {
     limit: Option<usize>,
 }
 
-#[async_trait]
 impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
-    fn name(&self) -> &'static str {
-        "read"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::Read
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Read File"
     }
 
     fn description(&self) -> &'static str {
@@ -513,7 +517,7 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), "read");
+        assert_eq!(tool.name(), PrimitiveToolName::Read);
         assert_eq!(tool.tier(), ToolTier::Observe);
         assert!(tool.description().contains("Read"));
 

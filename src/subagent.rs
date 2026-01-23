@@ -40,10 +40,9 @@ use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
-use crate::tools::{Tool, ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, ThreadId, TokenUsage, ToolResult, ToolTier};
+use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
+use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -274,7 +273,8 @@ where
         let tool_ctx = ToolContext::new(());
 
         // Run with optional timeout
-        let mut rx = agent.run(thread_id, task.to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text(task.to_string()), tool_ctx);
 
         let mut final_response = String::new();
         let mut total_turns = 0;
@@ -492,7 +492,6 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
     }
 }
 
-#[async_trait]
 impl<P, H, M, S> Tool<()> for SubagentTool<P, H, M, S>
 where
     P: LlmProvider + Clone + 'static,
@@ -500,9 +499,15 @@ where
     M: MessageStore + 'static,
     S: StateStore + 'static,
 {
-    fn name(&self) -> &'static str {
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new(format!("subagent_{}", self.config.name))
+    }
+
+    fn display_name(&self) -> &'static str {
         // Leak the name to get 'static lifetime (acceptable for long-lived tools)
-        Box::leak(format!("subagent_{}", self.config.name).into_boxed_str())
+        Box::leak(format!("Subagent: {}", self.config.name).into_boxed_str())
     }
 
     fn description(&self) -> &'static str {
