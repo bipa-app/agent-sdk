@@ -9,8 +9,9 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentHooks, InMemoryStore, ThreadId, Tool, ToolContext, ToolDecision, ToolRegistry,
-    ToolResult, ToolTier, builder, providers::AnthropicProvider,
+    AgentEvent, AgentHooks, AgentInput, DynamicToolName, InMemoryStore, ThreadId, Tool,
+    ToolContext, ToolDecision, ToolRegistry, ToolResult, ToolTier, builder,
+    providers::AnthropicProvider,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,10 +21,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A simple tool that simulates sending an email.
 struct SendEmailTool;
 
-#[async_trait]
+// No #[async_trait] needed for Tool impls - Rust 1.75+ supports native async traits
 impl Tool<()> for SendEmailTool {
-    fn name(&self) -> &'static str {
-        "send_email"
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("send_email")
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Send Email"
     }
 
     fn description(&self) -> &'static str {
@@ -122,10 +129,6 @@ impl AgentHooks for CustomHooks {
                 println!("[Hooks] AUTO-APPROVED: Confirm tier tool (input: {input})");
                 ToolDecision::Allow
             }
-            ToolTier::RequiresPin => {
-                println!("[Hooks] BLOCKED: PIN required for this tool");
-                ToolDecision::RequiresPin("This action requires PIN verification".to_string())
-            }
         }
     }
 
@@ -185,9 +188,9 @@ async fn main() -> anyhow::Result<()> {
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent to send an email
-    let mut events = agent.run(
+    let (mut events, _final_state) = agent.run(
         thread_id,
-        "Please send an email to test@example.com with subject 'Hello' and body 'This is a test message.'".to_string(),
+        AgentInput::Text("Please send an email to test@example.com with subject 'Hello' and body 'This is a test message.'".to_string()),
         tool_ctx,
     );
 

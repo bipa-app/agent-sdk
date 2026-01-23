@@ -9,20 +9,25 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, ThreadId, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier, builder,
-    providers::AnthropicProvider,
+    AgentEvent, AgentInput, DynamicToolName, ThreadId, Tool, ToolContext, ToolRegistry, ToolResult,
+    ToolTier, builder, providers::AnthropicProvider,
 };
 use anyhow::Result;
-use async_trait::async_trait;
 use serde_json::{Value, json};
 
 /// A simple calculator tool that can add two numbers.
 struct CalculatorTool;
 
-#[async_trait]
+// No #[async_trait] needed - Rust 1.75+ supports native async traits
 impl Tool<()> for CalculatorTool {
-    fn name(&self) -> &'static str {
-        "calculator"
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("calculator")
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Calculator"
     }
 
     fn description(&self) -> &'static str {
@@ -71,10 +76,15 @@ impl Tool<()> for CalculatorTool {
 /// A tool that gets the current time.
 struct CurrentTimeTool;
 
-#[async_trait]
 impl Tool<()> for CurrentTimeTool {
-    fn name(&self) -> &'static str {
-        "current_time"
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("current_time")
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Current Time"
     }
 
     fn description(&self) -> &'static str {
@@ -118,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Registered {} tools:", tools.len());
     for tool in tools.all() {
-        println!("  - {}: {}", tool.name(), tool.description());
+        println!("  - {}: {}", tool.name_str(), tool.description());
     }
     println!();
 
@@ -132,9 +142,9 @@ async fn main() -> anyhow::Result<()> {
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent something that requires using our tools
-    let mut events = agent.run(
+    let (mut events, _final_state) = agent.run(
         thread_id,
-        "What is 42 + 17? Also, what time is it right now?".to_string(),
+        AgentInput::Text("What is 42 + 17? Also, what time is it right now?".to_string()),
         tool_ctx,
     );
 

@@ -10,8 +10,8 @@
 //! ```
 
 use agent_sdk::{
-    AgentCapabilities, AgentConfig, AgentEvent, AllowAllHooks, Environment, InMemoryFileSystem,
-    InMemoryStore, ThreadId, ToolContext, ToolRegistry, builder,
+    AgentCapabilities, AgentConfig, AgentEvent, AgentInput, AllowAllHooks, Environment,
+    InMemoryFileSystem, InMemoryStore, ThreadId, ToolContext, ToolRegistry, builder,
     primitive_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool},
     providers::AnthropicProvider,
 };
@@ -94,9 +94,9 @@ async fn main() -> anyhow::Result<()> {
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent to explore and modify files
-    let mut events = agent.run(
+    let (mut events, _final_state) = agent.run(
         thread_id,
-        "List all .rs files in the workspace, then add a simple test to src/lib.rs that tests the greet function.".to_string(),
+        AgentInput::Text("List all .rs files in the workspace, then add a simple test to src/lib.rs that tests the greet function.".to_string()),
         tool_ctx,
     );
 
