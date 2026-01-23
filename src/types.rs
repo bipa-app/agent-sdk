@@ -268,38 +268,46 @@ pub enum AgentRunState {
         input: serde_json::Value,
         /// Description of what confirmation is needed
         description: String,
-        /// Opaque continuation state for resuming
-        continuation: AgentContinuation,
+        /// Continuation state for resuming (boxed for enum size efficiency)
+        continuation: Box<AgentContinuation>,
     },
 }
 
-/// Opaque continuation state that allows resuming the agent loop.
+/// Information about a pending tool call that was extracted from the LLM response.
+#[derive(Clone, Debug)]
+pub struct PendingToolCallInfo {
+    /// Unique ID for this tool call (from LLM)
+    pub id: String,
+    /// Tool name string (for LLM protocol)
+    pub name: String,
+    /// Human-readable display name
+    pub display_name: String,
+    /// Tool input parameters
+    pub input: serde_json::Value,
+}
+
+/// Continuation state that allows resuming the agent loop.
 ///
 /// This contains all the internal state needed to continue execution
-/// after receiving a confirmation decision. Applications should not
-/// inspect internals - just pass back to resume.
+/// after receiving a confirmation decision. Pass this back when resuming.
+#[derive(Clone, Debug)]
 pub struct AgentContinuation {
-    pub(crate) inner: Box<dyn std::any::Any + Send + Sync>,
-}
-
-impl AgentContinuation {
-    /// Create a new continuation from internal state.
-    pub(crate) fn new<T: Send + Sync + 'static>(state: T) -> Self {
-        Self {
-            inner: Box::new(state),
-        }
-    }
-
-    /// Downcast the continuation to its internal type.
-    pub(crate) fn downcast<T: 'static>(self) -> Option<T> {
-        self.inner.downcast::<T>().ok().map(|b| *b)
-    }
-}
-
-impl std::fmt::Debug for AgentContinuation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentContinuation").finish_non_exhaustive()
-    }
+    /// Thread ID (used for validation on resume)
+    pub thread_id: ThreadId,
+    /// Current turn number
+    pub turn: usize,
+    /// Total token usage so far
+    pub total_usage: TokenUsage,
+    /// Token usage for this specific turn (from the LLM call that generated tool calls)
+    pub turn_usage: TokenUsage,
+    /// All pending tool calls from this turn
+    pub pending_tool_calls: Vec<PendingToolCallInfo>,
+    /// Index of the tool call awaiting confirmation
+    pub awaiting_index: usize,
+    /// Tool results already collected (for tools before the awaiting one)
+    pub completed_results: Vec<(String, ToolResult)>,
+    /// Agent state snapshot
+    pub state: AgentState,
 }
 
 /// Input to start or resume an agent run.
@@ -310,8 +318,8 @@ pub enum AgentInput {
 
     /// Resume after a confirmation decision.
     Resume {
-        /// The continuation state from `AwaitingConfirmation`.
-        continuation: AgentContinuation,
+        /// The continuation state from `AwaitingConfirmation` (boxed for enum size efficiency).
+        continuation: Box<AgentContinuation>,
         /// ID of the tool call being confirmed/rejected.
         tool_call_id: String,
         /// Whether the user confirmed the action.
@@ -370,8 +378,8 @@ pub enum TurnOutcome {
         input: serde_json::Value,
         /// Description of what confirmation is needed
         description: String,
-        /// Opaque continuation state for resuming
-        continuation: AgentContinuation,
+        /// Continuation state for resuming (boxed for enum size efficiency)
+        continuation: Box<AgentContinuation>,
     },
 
     /// An error occurred.

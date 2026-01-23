@@ -346,8 +346,8 @@ pub use tools::{
     tool_name_from_str, tool_name_to_string,
 };
 pub use types::{
-    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, RetryConfig,
-    ThreadId, TokenUsage, ToolResult, ToolTier, TurnOutcome,
+    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
+    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier, TurnOutcome,
 };
 
 // Re-export user interaction types for convenience

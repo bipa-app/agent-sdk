@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Input is now wrapped in `AgentInput`** - Use `AgentInput::Text(...)` instead of passing a plain string.
 
+- **`AgentContinuation` is now a concrete type** - Previously used `Box<dyn Any>` for encapsulation. Now exposes all fields publicly. The continuation is boxed in enum variants for efficiency (`Box<AgentContinuation>`).
+
+- **New `PendingToolCallInfo` struct** - Public type representing pending tool calls, used within `AgentContinuation`.
+
 ### Added
 
 - **Typed tool names** - Tool names are now strongly typed via the `ToolName` trait and associated type:
@@ -47,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`AgentRunState` enum** - New return type indicating agent completion status: `Done`, `Error`, or `AwaitingConfirmation`.
 
-- **`AgentContinuation`** - Opaque state for resuming agent execution after yielding.
+- **`AgentContinuation`** - Concrete state for resuming agent execution after yielding. Contains fields like `thread_id`, `turn`, `turn_usage`, `pending_tool_calls`, etc.
 
 - **Streaming support** - LLM providers now support streaming responses via `stream_chat_completion`.
 

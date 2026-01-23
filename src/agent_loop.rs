@@ -38,8 +38,8 @@ use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
-    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, RetryConfig,
-    ThreadId, TokenUsage, ToolResult, TurnOutcome,
+    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
+    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolResult, TurnOutcome,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,37 +47,6 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-/// Internal state captured when yielding for confirmation.
-///
-/// This is stored inside `AgentContinuation` and used to resume the agent loop.
-#[derive(Clone)]
-struct ContinuationState {
-    /// Thread ID for resuming (used for validation)
-    thread_id: ThreadId,
-    /// Current turn number
-    turn: usize,
-    /// Total token usage so far
-    total_usage: TokenUsage,
-    /// Token usage for this specific turn (from the LLM call that generated tool calls)
-    turn_usage: TokenUsage,
-    /// All pending tool calls from this turn
-    pending_tool_calls: Vec<PendingToolCall>,
-    /// Index of the tool call awaiting confirmation
-    awaiting_index: usize,
-    /// Tool results already collected (for tools before the awaiting one)
-    completed_results: Vec<(String, ToolResult)>,
-    /// Agent state
-    state: AgentState,
-}
-
-/// A pending tool call that was extracted from the LLM response.
-#[derive(Clone, Debug)]
-struct PendingToolCall {
-    id: String,
-    name: String,
-    display_name: String,
-    input: serde_json::Value,
-}
 
 /// Internal result of executing a single turn.
 ///
@@ -94,7 +63,7 @@ enum InternalTurnResult {
         display_name: String,
         input: serde_json::Value,
         description: String,
-        continuation: AgentContinuation,
+        continuation: Box<AgentContinuation>,
     },
     /// Error
     Error(AgentError),
@@ -113,7 +82,7 @@ struct TurnContext {
 
 /// Data extracted from `AgentInput::Resume` after validation.
 struct ResumeData {
-    cont_state: ContinuationState,
+    continuation: Box<AgentContinuation>,
     tool_call_id: String,
     confirmed: bool,
     rejection_reason: Option<String>,
@@ -765,28 +734,23 @@ where
             confirmed,
             rejection_reason,
         } => {
-            // Restore state from continuation
-            let Some(cont_state) = continuation.downcast::<ContinuationState>() else {
-                return Err(AgentError::new("Invalid continuation state", false));
-            };
-
             // Validate thread_id matches
-            if cont_state.thread_id != *thread_id {
+            if continuation.thread_id != *thread_id {
                 return Err(AgentError::new(
                     format!(
                         "Thread ID mismatch: continuation is for {}, but resuming on {}",
-                        cont_state.thread_id, thread_id
+                        continuation.thread_id, thread_id
                     ),
                     false,
                 ));
             }
 
             Ok(InitializedState {
-                turn: cont_state.turn,
-                total_usage: cont_state.total_usage.clone(),
-                state: cont_state.state.clone(),
+                turn: continuation.turn,
+                total_usage: continuation.total_usage.clone(),
+                state: continuation.state.clone(),
                 resume_data: Some(ResumeData {
-                    cont_state,
+                    continuation,
                     tool_call_id,
                     confirmed,
                     rejection_reason,
@@ -825,7 +789,7 @@ where
 /// - `Completed`: Tool ran (or was blocked), result captured
 /// - `RequiresConfirmation`: Hook requires user confirmation
 async fn execute_tool_call<Ctx, H>(
-    pending: &PendingToolCall,
+    pending: &PendingToolCallInfo,
     tool_context: &ToolContext<Ctx>,
     tools: &ToolRegistry<Ctx>,
     hooks: &Arc<H>,
@@ -926,7 +890,7 @@ where
 ///
 /// This is called when resuming after a tool required confirmation.
 async fn execute_confirmed_tool<Ctx, H>(
-    awaiting_tool: &PendingToolCall,
+    awaiting_tool: &PendingToolCallInfo,
     confirmed: bool,
     rejection_reason: Option<String>,
     tool_context: &ToolContext<Ctx>,
@@ -1124,13 +1088,13 @@ where
     // Handle resume case - complete the pending tool calls
     if let Some(resume) = resume_data {
         let ResumeData {
-            cont_state,
+            continuation: cont,
             tool_call_id,
             confirmed,
             rejection_reason,
         } = resume;
-        let mut tool_results = cont_state.completed_results.clone();
-        let awaiting_tool = &cont_state.pending_tool_calls[cont_state.awaiting_index];
+        let mut tool_results = cont.completed_results.clone();
+        let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
         // Validate tool_call_id matches
         if awaiting_tool.id != tool_call_id {
@@ -1157,11 +1121,7 @@ where
         tool_results.push((awaiting_tool.id.clone(), result));
 
         // Process remaining tool calls after the confirmed one
-        for pending in cont_state
-            .pending_tool_calls
-            .iter()
-            .skip(cont_state.awaiting_index + 1)
-        {
+        for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
             match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
                 ToolExecutionOutcome::Completed { tool_id, result } => {
                     tool_results.push((tool_id, result));
@@ -1173,18 +1133,18 @@ where
                     input,
                     description,
                 } => {
-                    let pending_idx = cont_state
+                    let pending_idx = cont
                         .pending_tool_calls
                         .iter()
                         .position(|p| p.id == tool_id)
                         .unwrap_or(0);
 
-                    let new_continuation = ContinuationState {
+                    let new_continuation = AgentContinuation {
                         thread_id: thread_id.clone(),
                         turn,
                         total_usage: total_usage.clone(),
-                        turn_usage: cont_state.turn_usage.clone(),
-                        pending_tool_calls: cont_state.pending_tool_calls.clone(),
+                        turn_usage: cont.turn_usage.clone(),
+                        pending_tool_calls: cont.pending_tool_calls.clone(),
                         awaiting_index: pending_idx,
                         completed_results: tool_results,
                         state: state.clone(),
@@ -1196,7 +1156,7 @@ where
                         display_name,
                         input,
                         description,
-                        continuation: AgentContinuation::new(new_continuation),
+                        continuation: Box::new(new_continuation),
                     };
                 }
             }
@@ -1211,7 +1171,7 @@ where
         let _ = tx
             .send(AgentEvent::TurnComplete {
                 turn,
-                usage: cont_state.turn_usage.clone(),
+                usage: cont.turn_usage.clone(),
             })
             .await;
     }
@@ -1343,13 +1303,13 @@ where
     // Handle resume case - complete the pending tool calls
     if let Some(resume) = resume_data {
         let ResumeData {
-            cont_state,
+            continuation: cont,
             tool_call_id,
             confirmed,
             rejection_reason,
         } = resume;
-        let mut tool_results = cont_state.completed_results.clone();
-        let awaiting_tool = &cont_state.pending_tool_calls[cont_state.awaiting_index];
+        let mut tool_results = cont.completed_results.clone();
+        let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
         // Validate tool_call_id matches
         if awaiting_tool.id != tool_call_id {
@@ -1376,11 +1336,7 @@ where
         tool_results.push((awaiting_tool.id.clone(), result));
 
         // Process remaining tool calls after the confirmed one
-        for pending in cont_state
-            .pending_tool_calls
-            .iter()
-            .skip(cont_state.awaiting_index + 1)
-        {
+        for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
             match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
                 ToolExecutionOutcome::Completed { tool_id, result } => {
                     tool_results.push((tool_id, result));
@@ -1392,18 +1348,18 @@ where
                     input,
                     description,
                 } => {
-                    let pending_idx = cont_state
+                    let pending_idx = cont
                         .pending_tool_calls
                         .iter()
                         .position(|p| p.id == tool_id)
                         .unwrap_or(0);
 
-                    let new_continuation = ContinuationState {
+                    let new_continuation = AgentContinuation {
                         thread_id: thread_id.clone(),
                         turn,
                         total_usage: total_usage.clone(),
-                        turn_usage: cont_state.turn_usage.clone(),
-                        pending_tool_calls: cont_state.pending_tool_calls.clone(),
+                        turn_usage: cont.turn_usage.clone(),
+                        pending_tool_calls: cont.pending_tool_calls.clone(),
                         awaiting_index: pending_idx,
                         completed_results: tool_results,
                         state: state.clone(),
@@ -1415,7 +1371,7 @@ where
                         display_name,
                         input,
                         description,
-                        continuation: AgentContinuation::new(new_continuation),
+                        continuation: Box::new(new_continuation),
                     };
                 }
             }
@@ -1430,7 +1386,7 @@ where
         let _ = tx
             .send(AgentEvent::TurnComplete {
                 turn,
-                usage: cont_state.turn_usage.clone(),
+                usage: cont.turn_usage.clone(),
             })
             .await;
 
@@ -1444,7 +1400,7 @@ where
         // Return NeedsMoreTurns since we completed tool execution but need another LLM call
         return TurnOutcome::NeedsMoreTurns {
             turn,
-            turn_usage: cont_state.turn_usage.clone(),
+            turn_usage: cont.turn_usage.clone(),
             total_usage,
         };
     }
@@ -1685,14 +1641,14 @@ where
     }
 
     // Build pending tool calls
-    let pending_tool_calls: Vec<PendingToolCall> = tool_uses
+    let pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
         .iter()
         .map(|(id, name, input)| {
             let display_name = tools
                 .get(name)
                 .map(|t| t.display_name().to_string())
                 .unwrap_or_default();
-            PendingToolCall {
+            PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 display_name,
@@ -1773,7 +1729,7 @@ where
                     })
                     .await;
 
-                let continuation = ContinuationState {
+                let continuation = AgentContinuation {
                     thread_id: ctx.thread_id.clone(),
                     turn: ctx.turn,
                     total_usage: ctx.total_usage.clone(),
@@ -1790,7 +1746,7 @@ where
                     display_name: pending.display_name.clone(),
                     input: pending.input.clone(),
                     description,
-                    continuation: AgentContinuation::new(continuation),
+                    continuation: Box::new(continuation),
                 };
             }
         }
