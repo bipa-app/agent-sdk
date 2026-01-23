@@ -26,10 +26,8 @@ pub enum ToolDecision {
     Allow,
     /// Block the tool execution with a message
     Block(String),
-    /// Tool requires user confirmation
+    /// Tool requires user confirmation.
     RequiresConfirmation(String),
-    /// Tool requires PIN verification
-    RequiresPin(String),
 }
 
 /// Lifecycle hooks for the agent loop.
@@ -39,16 +37,13 @@ pub trait AgentHooks: Send + Sync {
     /// Called before a tool is executed.
     /// Return `ToolDecision::Allow` to proceed, or block/require confirmation.
     async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
-        // Default: allow Observe tier, require confirmation for others
+        // Default: allow Observe tier, require confirmation for Confirm tier
         // input is available for implementors but not used in default
         let _ = input;
         match tier {
             ToolTier::Observe => ToolDecision::Allow,
             ToolTier::Confirm => {
                 ToolDecision::RequiresConfirmation(format!("Confirm {tool_name}?"))
-            }
-            ToolTier::RequiresPin => {
-                ToolDecision::RequiresPin(format!("{tool_name} requires PIN verification"))
             }
         }
     }

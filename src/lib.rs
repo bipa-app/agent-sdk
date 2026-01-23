@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! use agent_sdk::{
-//!     builder, AgentEvent, ThreadId, ToolContext,
+//!     builder, AgentEvent, AgentInput, ThreadId, ToolContext,
 //!     providers::AnthropicProvider,
 //! };
 //!
@@ -29,7 +29,11 @@
 //! // 3. Run a conversation
 //! let thread_id = ThreadId::new();
 //! let ctx = ToolContext::new(());
-//! let mut events = agent.run(thread_id, "Hello!".into(), ctx);
+//! let (mut events, _final_state) = agent.run(
+//!     thread_id,
+//!     AgentInput::Text("Hello!".to_string()),
+//!     ctx,
+//! );
 //!
 //! // 4. Process streaming events
 //! while let Some(event) = events.recv().await {
@@ -78,17 +82,21 @@
 //! Tools let the LLM interact with external systems. Implement the [`Tool`] trait:
 //!
 //! ```
-//! use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier};
-//! use async_trait::async_trait;
+//! use agent_sdk::{DynamicToolName, Tool, ToolContext, ToolResult, ToolTier};
 //! use serde_json::{json, Value};
+//! use std::future::Future;
 //!
 //! struct WeatherTool;
 //!
-//! #[async_trait]
+//! // No #[async_trait] needed - Rust 1.75+ supports native async traits
 //! impl Tool<()> for WeatherTool {
-//!     fn name(&self) -> &str { "get_weather" }
+//!     type Name = DynamicToolName;
 //!
-//!     fn description(&self) -> &str {
+//!     fn name(&self) -> DynamicToolName { DynamicToolName::new("get_weather") }
+//!
+//!     fn display_name(&self) -> &'static str { "Weather" }
+//!
+//!     fn description(&self) -> &'static str {
 //!         "Get current weather for a city"
 //!     }
 //!
@@ -104,13 +112,15 @@
 //!
 //!     fn tier(&self) -> ToolTier { ToolTier::Observe }
 //!
-//!     async fn execute(
+//!     fn execute(
 //!         &self,
 //!         _ctx: &ToolContext<()>,
 //!         input: Value,
-//!     ) -> anyhow::Result<ToolResult> {
-//!         let city = input["city"].as_str().unwrap_or("Unknown");
-//!         Ok(ToolResult::success(format!("Weather in {city}: Sunny, 72°F")))
+//!     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+//!         async move {
+//!             let city = input["city"].as_str().unwrap_or("Unknown");
+//!             Ok(ToolResult::success(format!("Weather in {city}: Sunny, 72°F")))
+//!         }
 //!     }
 //! }
 //! ```
@@ -118,18 +128,19 @@
 //! Register tools with [`ToolRegistry`]:
 //!
 //! ```no_run
-//! use agent_sdk::{builder, ToolRegistry, providers::AnthropicProvider};
+//! use agent_sdk::{builder, DynamicToolName, ToolRegistry, providers::AnthropicProvider};
 //! # use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier};
-//! # use async_trait::async_trait;
 //! # use serde_json::Value;
+//! # use std::future::Future;
 //! # struct WeatherTool;
-//! # #[async_trait]
 //! # impl Tool<()> for WeatherTool {
-//! #     fn name(&self) -> &str { "weather" }
-//! #     fn description(&self) -> &str { "" }
+//! #     type Name = DynamicToolName;
+//! #     fn name(&self) -> DynamicToolName { DynamicToolName::new("weather") }
+//! #     fn display_name(&self) -> &'static str { "" }
+//! #     fn description(&self) -> &'static str { "" }
 //! #     fn input_schema(&self) -> Value { Value::Null }
-//! #     async fn execute(&self, _: &ToolContext<()>, _: Value) -> anyhow::Result<ToolResult> {
-//! #         Ok(ToolResult::success(""))
+//! #     fn execute(&self, _: &ToolContext<()>, _: Value) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+//! #         async { Ok(ToolResult::success("")) }
 //! #     }
 //! # }
 //!
@@ -152,8 +163,7 @@
 //! | Tier | Description | Example |
 //! |------|-------------|---------|
 //! | [`ToolTier::Observe`] | Read-only, always allowed | Get balance, read file |
-//! | [`ToolTier::Confirm`] | Requires user confirmation | Send email, write file |
-//! | [`ToolTier::RequiresPin`] | Requires PIN verification | Transfer funds |
+//! | [`ToolTier::Confirm`] | Requires user confirmation | Send email, transfer funds |
 //!
 //! ### Lifecycle Hooks
 //!
@@ -179,9 +189,6 @@
 //!             ToolTier::Observe => ToolDecision::Allow,
 //!             ToolTier::Confirm => ToolDecision::RequiresConfirmation(
 //!                 "Please confirm this action".into()
-//!             ),
-//!             ToolTier::RequiresPin => ToolDecision::RequiresPin(
-//!                 "Enter PIN to continue".into()
 //!             ),
 //!         }
 //!     }
@@ -233,9 +240,9 @@
 //! Pass application-specific data to tools via the generic type parameter:
 //!
 //! ```
-//! use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier};
-//! use async_trait::async_trait;
+//! use agent_sdk::{DynamicToolName, Tool, ToolContext, ToolResult, ToolTier};
 //! use serde_json::Value;
+//! use std::future::Future;
 //!
 //! // Your application context
 //! struct AppContext {
@@ -245,20 +252,23 @@
 //!
 //! struct UserInfoTool;
 //!
-//! #[async_trait]
 //! impl Tool<AppContext> for UserInfoTool {
-//!     fn name(&self) -> &str { "get_user_info" }
-//!     fn description(&self) -> &str { "Get info about current user" }
+//!     type Name = DynamicToolName;
+//!
+//!     fn name(&self) -> DynamicToolName { DynamicToolName::new("get_user_info") }
+//!     fn display_name(&self) -> &'static str { "User Info" }
+//!     fn description(&self) -> &'static str { "Get info about current user" }
 //!     fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
 //!
-//!     async fn execute(
+//!     fn execute(
 //!         &self,
 //!         ctx: &ToolContext<AppContext>,
 //!         _input: Value,
-//!     ) -> anyhow::Result<ToolResult> {
-//!         // Access your context
-//!         let user_id = &ctx.app.user_id;
-//!         Ok(ToolResult::success(format!("User: {user_id}")))
+//!     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+//!         let user_id = ctx.app.user_id.clone();
+//!         async move {
+//!             Ok(ToolResult::success(format!("User: {user_id}")))
+//!         }
 //!     }
 //! }
 //! ```
@@ -331,9 +341,13 @@ pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::LlmProvider;
 pub use stores::{InMemoryStore, MessageStore, StateStore};
-pub use tools::{Tool, ToolContext, ToolRegistry};
+pub use tools::{
+    DynamicToolName, ErasedTool, PrimitiveToolName, Tool, ToolContext, ToolName, ToolRegistry,
+    tool_name_from_str, tool_name_to_string,
+};
 pub use types::{
-    AgentConfig, AgentState, PendingAction, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier,
+    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, RetryConfig,
+    ThreadId, TokenUsage, ToolResult, ToolTier, TurnOutcome,
 };
 
 // Re-export user interaction types for convenience

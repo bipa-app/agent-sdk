@@ -7,7 +7,10 @@
 //! - [`TokenUsage`]: Token consumption statistics
 //! - [`ToolResult`]: Result returned from tool execution
 //! - [`ToolTier`]: Permission tiers for tools
-//! - [`PendingAction`]: Actions awaiting user confirmation
+//! - [`AgentRunState`]: Outcome of running the agent loop (looping mode)
+//! - [`TurnOutcome`]: Outcome of running a single turn (single-turn mode)
+//! - [`AgentInput`]: Input to start or resume an agent run
+//! - [`AgentContinuation`]: Opaque state for resuming after confirmation
 //! - [`AgentState`]: Checkpointable agent state
 
 use serde::{Deserialize, Serialize};
@@ -181,25 +184,11 @@ impl ToolResult {
 /// Permission tier for tools
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolTier {
-    /// Tier 0: Read-only, always allowed (e.g., `get_balance`)
+    /// Read-only, always allowed (e.g., `get_balance`)
     Observe,
-    /// Tier 1: Requires confirmation before execution
+    /// Requires confirmation before execution.
+    /// The application determines the confirmation type (normal, PIN, biometric).
     Confirm,
-    /// Tier 3: Requires PIN verification (e.g., `send_pix`, `buy_btc`)
-    RequiresPin,
-}
-
-/// State of a pending action that requires confirmation or PIN
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PendingAction {
-    pub id: String,
-    pub tool_name: String,
-    pub tool_input: serde_json::Value,
-    pub tier: ToolTier,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
 }
 
 /// Snapshot of agent state for checkpointing
@@ -224,4 +213,167 @@ impl AgentState {
             created_at: OffsetDateTime::now_utc(),
         }
     }
+}
+
+/// Error from the agent loop.
+#[derive(Debug, Clone)]
+pub struct AgentError {
+    /// Error message
+    pub message: String,
+    /// Whether the error is potentially recoverable
+    pub recoverable: bool,
+}
+
+impl AgentError {
+    #[must_use]
+    pub fn new(message: impl Into<String>, recoverable: bool) -> Self {
+        Self {
+            message: message.into(),
+            recoverable,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AgentError {}
+
+/// Outcome of running the agent loop.
+#[derive(Debug)]
+pub enum AgentRunState {
+    /// Agent completed successfully.
+    Done {
+        total_turns: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+
+    /// Agent encountered an error.
+    Error(AgentError),
+
+    /// Agent is awaiting confirmation for a tool call.
+    /// The application should present this to the user and call resume.
+    AwaitingConfirmation {
+        /// ID of the pending tool call (from LLM)
+        tool_call_id: String,
+        /// Tool name string (for LLM protocol)
+        tool_name: String,
+        /// Human-readable display name
+        display_name: String,
+        /// Tool input parameters
+        input: serde_json::Value,
+        /// Description of what confirmation is needed
+        description: String,
+        /// Opaque continuation state for resuming
+        continuation: AgentContinuation,
+    },
+}
+
+/// Opaque continuation state that allows resuming the agent loop.
+///
+/// This contains all the internal state needed to continue execution
+/// after receiving a confirmation decision. Applications should not
+/// inspect internals - just pass back to resume.
+pub struct AgentContinuation {
+    pub(crate) inner: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl AgentContinuation {
+    /// Create a new continuation from internal state.
+    pub(crate) fn new<T: Send + Sync + 'static>(state: T) -> Self {
+        Self {
+            inner: Box::new(state),
+        }
+    }
+
+    /// Downcast the continuation to its internal type.
+    pub(crate) fn downcast<T: 'static>(self) -> Option<T> {
+        self.inner.downcast::<T>().ok().map(|b| *b)
+    }
+}
+
+impl std::fmt::Debug for AgentContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContinuation").finish_non_exhaustive()
+    }
+}
+
+/// Input to start or resume an agent run.
+#[derive(Debug)]
+pub enum AgentInput {
+    /// Start a new conversation with user text.
+    Text(String),
+
+    /// Resume after a confirmation decision.
+    Resume {
+        /// The continuation state from `AwaitingConfirmation`.
+        continuation: AgentContinuation,
+        /// ID of the tool call being confirmed/rejected.
+        tool_call_id: String,
+        /// Whether the user confirmed the action.
+        confirmed: bool,
+        /// Optional reason if rejected.
+        rejection_reason: Option<String>,
+    },
+
+    /// Continue to the next turn (for single-turn mode).
+    ///
+    /// Use this after `TurnOutcome::NeedsMoreTurns` to execute the next turn.
+    /// The message history already contains tool results from the previous turn.
+    Continue,
+}
+
+/// Outcome of running a single turn.
+///
+/// This is returned by `run_turn` to indicate what happened and what to do next.
+#[derive(Debug)]
+pub enum TurnOutcome {
+    /// Turn completed successfully, but more turns are needed.
+    ///
+    /// Tools were executed and their results are stored in the message history.
+    /// Call `run_turn` again with `AgentInput::Continue` to proceed.
+    NeedsMoreTurns {
+        /// The turn number that just completed
+        turn: usize,
+        /// Token usage for this turn
+        turn_usage: TokenUsage,
+        /// Cumulative token usage so far
+        total_usage: TokenUsage,
+    },
+
+    /// Agent completed successfully (no more tool calls).
+    Done {
+        /// Total turns executed
+        total_turns: u32,
+        /// Total input tokens consumed
+        input_tokens: u64,
+        /// Total output tokens consumed
+        output_tokens: u64,
+    },
+
+    /// A tool requires user confirmation.
+    ///
+    /// Present this to the user and call `run_turn` with `AgentInput::Resume`
+    /// to continue.
+    AwaitingConfirmation {
+        /// ID of the pending tool call (from LLM)
+        tool_call_id: String,
+        /// Tool name string (for LLM protocol)
+        tool_name: String,
+        /// Human-readable display name
+        display_name: String,
+        /// Tool input parameters
+        input: serde_json::Value,
+        /// Description of what confirmation is needed
+        description: String,
+        /// Opaque continuation state for resuming
+        continuation: AgentContinuation,
+    },
+
+    /// An error occurred.
+    Error(AgentError),
 }
