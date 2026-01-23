@@ -7,7 +7,7 @@
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **⚠️ Early Development**: This library is in active development (v0.1.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+> **⚠️ Early Development**: This library is in active development (v0.3.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
 
 ## What is an Agent?
 
@@ -22,11 +22,13 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 - **Agent Loop** - Core orchestration that handles the LLM conversation and tool execution cycle
 - **Provider Agnostic** - Built-in support for Anthropic (Claude), OpenAI, and Google Gemini, plus a trait for custom providers
-- **Tool System** - Define tools with JSON schema validation; the LLM decides when to use them
+- **Tool System** - Define tools with JSON schema validation and typed tool names; the LLM decides when to use them
 - **Lifecycle Hooks** - Intercept tool calls for logging, user confirmation, rate limiting, or security checks
 - **Streaming Events** - Real-time event stream for building responsive UIs
 - **Primitive Tools** - Ready-to-use tools for file operations (Read, Write, Edit, Glob, Grep, Bash)
-- **Security Model** - Capability-based permissions and tool tiers (Observe, Confirm, RequiresPin)
+- **Security Model** - Capability-based permissions and tool tiers (Observe, Confirm)
+- **Yield/Resume Pattern** - Pause agent execution for tool confirmation and resume with user decision
+- **Single-Turn Execution** - Run one turn at a time for external orchestration (e.g., message queues)
 - **Persistence** - Trait-based storage for conversation history and agent state
 
 ## Requirements
@@ -55,7 +57,7 @@ agent-sdk = { git = "https://github.com/bipa-app/agent-sdk", branch = "main" }
 ## Quick Start
 
 ```rust
-use agent_sdk::{builder, ThreadId, ToolContext, AgentEvent, providers::AnthropicProvider};
+use agent_sdk::{builder, ThreadId, ToolContext, AgentEvent, AgentInput, providers::AnthropicProvider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,10 +76,10 @@ async fn main() -> anyhow::Result<()> {
     // ToolContext can carry custom data to your tools (empty here)
     let tool_ctx = ToolContext::new(());
 
-    // Run the agent and get a stream of events
-    let mut events = agent.run(
+    // Run the agent and get a stream of events plus final state
+    let (mut events, _final_state) = agent.run(
         thread_id,
-        "What is the capital of France?".to_string(),
+        AgentInput::Text("What is the capital of France?".to_string()),
         tool_ctx,
     );
 
@@ -121,17 +123,23 @@ ANTHROPIC_API_KEY=your_key cargo run --example with_primitive_tools
 Tools let your agent interact with external systems. Implement the `Tool` trait:
 
 ```rust
-use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier, ToolRegistry};
-use async_trait::async_trait;
+use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier, ToolRegistry, DynamicToolName};
 use serde_json::{Value, json};
 
 /// A tool that fetches the current weather for a city
 struct WeatherTool;
 
-#[async_trait]
 impl Tool<()> for WeatherTool {
-    fn name(&self) -> &'static str {
-        "get_weather"
+    // Tool names are now typed - DynamicToolName for runtime names
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("get_weather")
+    }
+
+    // Optional: human-readable display name for UIs
+    fn display_name(&self) -> &'static str {
+        "Get Weather"
     }
 
     fn description(&self) -> &'static str {
@@ -153,8 +161,7 @@ impl Tool<()> for WeatherTool {
 
     fn tier(&self) -> ToolTier {
         // Observe = no confirmation needed
-        // Confirm = requires user approval
-        // RequiresPin = requires PIN verification
+        // Confirm = requires user approval (triggers yield/resume)
         ToolTier::Observe
     }
 
@@ -205,10 +212,8 @@ impl AgentHooks for MyHooks {
             ToolTier::Observe => ToolDecision::Allow,
             ToolTier::Confirm => {
                 // In a real app, prompt the user here
+                // The agent can yield and resume after user confirmation
                 ToolDecision::Allow
-            }
-            ToolTier::RequiresPin => {
-                ToolDecision::Block("PIN verification not implemented".to_string())
             }
         }
     }
@@ -242,8 +247,15 @@ struct MyContext {
 }
 
 // Implement tools with access to context
-#[async_trait]
 impl Tool<MyContext> for MyTool {
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("my_tool")
+    }
+
+    // ... other trait methods ...
+
     async fn execute(&self, ctx: &ToolContext<MyContext>, input: Value) -> anyhow::Result<ToolResult> {
         // Access your context
         let user = &ctx.data.user_id;
