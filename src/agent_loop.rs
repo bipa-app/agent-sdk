@@ -37,13 +37,77 @@ use crate::llm::{
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentState, RetryConfig, ThreadId, TokenUsage, ToolResult};
-use anyhow::Result;
+use crate::types::{
+    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
+    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolResult, TurnOutcome,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+/// Internal result of executing a single turn.
+///
+/// This is used internally by both `run_loop` and `run_single_turn`.
+enum InternalTurnResult {
+    /// Turn completed, more turns needed (tools were executed)
+    Continue { turn_usage: TokenUsage },
+    /// Done - no more tool calls
+    Done,
+    /// Awaiting confirmation (yields)
+    AwaitingConfirmation {
+        tool_call_id: String,
+        tool_name: String,
+        display_name: String,
+        input: serde_json::Value,
+        description: String,
+        continuation: Box<AgentContinuation>,
+    },
+    /// Error
+    Error(AgentError),
+}
+
+/// Mutable context for turn execution.
+///
+/// This holds all the state that's modified during execution.
+struct TurnContext {
+    thread_id: ThreadId,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    start_time: Instant,
+}
+
+/// Data extracted from `AgentInput::Resume` after validation.
+struct ResumeData {
+    continuation: Box<AgentContinuation>,
+    tool_call_id: String,
+    confirmed: bool,
+    rejection_reason: Option<String>,
+}
+
+/// Result of initializing state from agent input.
+struct InitializedState {
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    resume_data: Option<ResumeData>,
+}
+
+/// Outcome of executing a single tool call.
+enum ToolExecutionOutcome {
+    /// Tool executed successfully (or failed), result captured
+    Completed { tool_id: String, result: ToolResult },
+    /// Tool requires user confirmation before execution
+    RequiresConfirmation {
+        tool_id: String,
+        tool_name: String,
+        display_name: String,
+        input: serde_json::Value,
+        description: String,
+    },
+}
 
 /// Builder for constructing an `AgentLoop`.
 ///
@@ -335,7 +399,11 @@ where
 /// # Running the Agent
 ///
 /// ```ignore
-/// let mut events = agent.run(thread_id, "Hello!".to_string(), tool_ctx);
+/// let (mut events, final_state) = agent.run(
+///     thread_id,
+///     AgentInput::Text("Hello!".to_string()),
+///     tool_ctx,
+/// );
 /// while let Some(event) = events.recv().await {
 ///     match event {
 ///         AgentEvent::Text { text } => println!("{}", text),
@@ -417,18 +485,69 @@ where
         }
     }
 
-    /// Run the agent loop for a single user message.
-    /// Returns a channel receiver that yields `AgentEvents`.
+    /// Run the agent loop.
+    ///
+    /// This method allows the agent to pause when a tool requires confirmation,
+    /// returning an `AgentRunState::AwaitingConfirmation` that contains the
+    /// state needed to resume.
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The thread identifier for this conversation
+    /// * `input` - Either a new text message or a resume with confirmation decision
+    /// * `tool_context` - Context passed to tools
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `mpsc::Receiver<AgentEvent>` - Channel for streaming events
+    /// - `oneshot::Receiver<AgentRunState>` - Channel for the final state
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (events, final_state) = agent.run(
+    ///     thread_id,
+    ///     AgentInput::Text("Hello".to_string()),
+    ///     tool_ctx,
+    /// );
+    ///
+    /// while let Some(event) = events.recv().await {
+    ///     // Handle events...
+    /// }
+    ///
+    /// match final_state.await.unwrap() {
+    ///     AgentRunState::Done { .. } => { /* completed */ }
+    ///     AgentRunState::AwaitingConfirmation { continuation, .. } => {
+    ///         // Get user decision, then resume:
+    ///         let (events2, state2) = agent.run(
+    ///             thread_id,
+    ///             AgentInput::Resume {
+    ///                 continuation,
+    ///                 tool_call_id: id,
+    ///                 confirmed: true,
+    ///                 rejection_reason: None,
+    ///             },
+    ///             tool_ctx,
+    ///         );
+    ///     }
+    ///     AgentRunState::Error(e) => { /* handle error */ }
+    /// }
+    /// ```
     pub fn run(
         &self,
         thread_id: ThreadId,
-        user_message: String,
+        input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> mpsc::Receiver<AgentEvent>
+    ) -> (
+        mpsc::Receiver<AgentEvent>,
+        tokio::sync::oneshot::Receiver<AgentRunState>,
+    )
     where
         Ctx: Clone,
     {
-        let (tx, rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let (state_tx, state_rx) = tokio::sync::oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -440,9 +559,9 @@ where
 
         tokio::spawn(async move {
             let result = run_loop(
-                tx.clone(),
+                event_tx,
                 thread_id,
-                user_message,
+                input,
                 tool_context,
                 provider,
                 tools,
@@ -454,20 +573,483 @@ where
             )
             .await;
 
-            if let Err(e) = result {
-                let _ = tx.send(AgentEvent::error(e.to_string(), false)).await;
-            }
+            let _ = state_tx.send(result);
         });
 
-        rx
+        (event_rx, state_rx)
+    }
+
+    /// Run a single turn of the agent loop.
+    ///
+    /// Unlike `run()`, this method executes exactly one turn and returns control
+    /// to the caller. This enables external orchestration where each turn can be
+    /// dispatched as a separate message (e.g., via Artemis or another message queue).
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The thread identifier for this conversation
+    /// * `input` - Text to start, Resume after confirmation, or Continue after a turn
+    /// * `tool_context` - Context passed to tools
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `mpsc::Receiver<AgentEvent>` - Channel for streaming events from this turn
+    /// - `oneshot::Receiver<TurnOutcome>` - Channel for the turn's outcome
+    ///
+    /// # Turn Outcomes
+    ///
+    /// - `NeedsMoreTurns` - Turn completed, call again with `AgentInput::Continue`
+    /// - `Done` - Agent completed successfully
+    /// - `AwaitingConfirmation` - Tool needs confirmation, call again with `AgentInput::Resume`
+    /// - `Error` - An error occurred
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Start conversation
+    /// let (events, outcome) = agent.run_turn(
+    ///     thread_id.clone(),
+    ///     AgentInput::Text("What is 2+2?".to_string()),
+    ///     tool_ctx.clone(),
+    /// );
+    ///
+    /// // Process events...
+    /// while let Some(event) = events.recv().await { /* ... */ }
+    ///
+    /// // Check outcome
+    /// match outcome.await.unwrap() {
+    ///     TurnOutcome::NeedsMoreTurns { turn, .. } => {
+    ///         // Dispatch another message to continue
+    ///         // (e.g., schedule an Artemis message)
+    ///     }
+    ///     TurnOutcome::Done { .. } => {
+    ///         // Conversation complete
+    ///     }
+    ///     TurnOutcome::AwaitingConfirmation { continuation, .. } => {
+    ///         // Get user confirmation, then resume
+    ///     }
+    ///     TurnOutcome::Error(e) => {
+    ///         // Handle error
+    ///     }
+    /// }
+    /// ```
+    pub fn run_turn(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+    ) -> (
+        mpsc::Receiver<AgentEvent>,
+        tokio::sync::oneshot::Receiver<TurnOutcome>,
+    )
+    where
+        Ctx: Clone,
+    {
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+        let provider = Arc::clone(&self.provider);
+        let tools = Arc::clone(&self.tools);
+        let hooks = Arc::clone(&self.hooks);
+        let message_store = Arc::clone(&self.message_store);
+        let state_store = Arc::clone(&self.state_store);
+        let config = self.config.clone();
+        let compaction_config = self.compaction_config.clone();
+
+        tokio::spawn(async move {
+            let result = run_single_turn(
+                event_tx,
+                thread_id,
+                input,
+                tool_context,
+                provider,
+                tools,
+                hooks,
+                message_store,
+                state_store,
+                config,
+                compaction_config,
+            )
+            .await;
+
+            let _ = outcome_tx.send(result);
+        });
+
+        (event_rx, outcome_rx)
     }
 }
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Initialize agent state from the given input.
+///
+/// Handles the three input variants:
+/// - `Text`: Creates/loads state, appends user message
+/// - `Resume`: Restores from continuation state
+/// - `Continue`: Loads existing state to continue execution
+async fn initialize_from_input<M, S>(
+    input: AgentInput,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+    state_store: &Arc<S>,
+) -> Result<InitializedState, AgentError>
+where
+    M: MessageStore,
+    S: StateStore,
+{
+    match input {
+        AgentInput::Text(user_message) => {
+            // Load or create state
+            let state = match state_store.load(thread_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => AgentState::new(thread_id.clone()),
+                Err(e) => {
+                    return Err(AgentError::new(format!("Failed to load state: {e}"), false));
+                }
+            };
+
+            // Add user message to history
+            let user_msg = Message::user(&user_message);
+            if let Err(e) = message_store.append(thread_id, user_msg).await {
+                return Err(AgentError::new(
+                    format!("Failed to append message: {e}"),
+                    false,
+                ));
+            }
+
+            Ok(InitializedState {
+                turn: 0,
+                total_usage: TokenUsage::default(),
+                state,
+                resume_data: None,
+            })
+        }
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed,
+            rejection_reason,
+        } => {
+            // Validate thread_id matches
+            if continuation.thread_id != *thread_id {
+                return Err(AgentError::new(
+                    format!(
+                        "Thread ID mismatch: continuation is for {}, but resuming on {}",
+                        continuation.thread_id, thread_id
+                    ),
+                    false,
+                ));
+            }
+
+            Ok(InitializedState {
+                turn: continuation.turn,
+                total_usage: continuation.total_usage.clone(),
+                state: continuation.state.clone(),
+                resume_data: Some(ResumeData {
+                    continuation,
+                    tool_call_id,
+                    confirmed,
+                    rejection_reason,
+                }),
+            })
+        }
+        AgentInput::Continue => {
+            // Load existing state to continue execution
+            let state = match state_store.load(thread_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Err(AgentError::new(
+                        "Cannot continue: no state found for thread",
+                        false,
+                    ));
+                }
+                Err(e) => {
+                    return Err(AgentError::new(format!("Failed to load state: {e}"), false));
+                }
+            };
+
+            // Continue from where we left off
+            Ok(InitializedState {
+                turn: state.turn_count,
+                total_usage: state.total_usage.clone(),
+                state,
+                resume_data: None,
+            })
+        }
+    }
+}
+
+/// Execute a single tool call with hook checks.
+///
+/// Returns the outcome of the tool execution, which may be:
+/// - `Completed`: Tool ran (or was blocked), result captured
+/// - `RequiresConfirmation`: Hook requires user confirmation
+async fn execute_tool_call<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    tool_context: &ToolContext<Ctx>,
+    tools: &ToolRegistry<Ctx>,
+    hooks: &Arc<H>,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let Some(tool) = tools.get(&pending.name) else {
+        let result = ToolResult::error(format!("Unknown tool: {}", pending.name));
+        return ToolExecutionOutcome::Completed {
+            tool_id: pending.id.clone(),
+            result,
+        };
+    };
+
+    let tier = tool.tier();
+
+    // Emit tool call start
+    let _ = tx
+        .send(AgentEvent::tool_call_start(
+            &pending.id,
+            &pending.name,
+            pending.input.clone(),
+            tier,
+        ))
+        .await;
+
+    // Check hooks for permission
+    let decision = hooks
+        .pre_tool_use(&pending.name, &pending.input, tier)
+        .await;
+
+    match decision {
+        ToolDecision::Allow => {
+            let tool_start = Instant::now();
+            let result = match tool.execute(tool_context, pending.input.clone()).await {
+                Ok(mut r) => {
+                    r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                    r
+                }
+                Err(e) => ToolResult::error(format!("Tool error: {e}"))
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+            };
+
+            hooks.post_tool_use(&pending.name, &result).await;
+
+            let _ = tx
+                .send(AgentEvent::tool_call_end(
+                    &pending.id,
+                    &pending.name,
+                    result.clone(),
+                ))
+                .await;
+
+            ToolExecutionOutcome::Completed {
+                tool_id: pending.id.clone(),
+                result,
+            }
+        }
+        ToolDecision::Block(reason) => {
+            let result = ToolResult::error(format!("Blocked: {reason}"));
+            let _ = tx
+                .send(AgentEvent::tool_call_end(
+                    &pending.id,
+                    &pending.name,
+                    result.clone(),
+                ))
+                .await;
+            ToolExecutionOutcome::Completed {
+                tool_id: pending.id.clone(),
+                result,
+            }
+        }
+        ToolDecision::RequiresConfirmation(description) => {
+            let _ = tx
+                .send(AgentEvent::ToolRequiresConfirmation {
+                    id: pending.id.clone(),
+                    name: pending.name.clone(),
+                    input: pending.input.clone(),
+                    description: description.clone(),
+                })
+                .await;
+
+            ToolExecutionOutcome::RequiresConfirmation {
+                tool_id: pending.id.clone(),
+                tool_name: pending.name.clone(),
+                display_name: pending.display_name.clone(),
+                input: pending.input.clone(),
+                description,
+            }
+        }
+    }
+}
+
+/// Execute the confirmed tool call from a resume operation.
+///
+/// This is called when resuming after a tool required confirmation.
+async fn execute_confirmed_tool<Ctx, H>(
+    awaiting_tool: &PendingToolCallInfo,
+    confirmed: bool,
+    rejection_reason: Option<String>,
+    tool_context: &ToolContext<Ctx>,
+    tools: &ToolRegistry<Ctx>,
+    hooks: &Arc<H>,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> ToolResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    if confirmed {
+        if let Some(tool) = tools.get(&awaiting_tool.name) {
+            let tool_start = Instant::now();
+            let result = match tool
+                .execute(tool_context, awaiting_tool.input.clone())
+                .await
+            {
+                Ok(mut r) => {
+                    r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                    r
+                }
+                Err(e) => ToolResult::error(format!("Tool error: {e}"))
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+            };
+
+            hooks.post_tool_use(&awaiting_tool.name, &result).await;
+
+            let _ = tx
+                .send(AgentEvent::tool_call_end(
+                    &awaiting_tool.id,
+                    &awaiting_tool.name,
+                    result.clone(),
+                ))
+                .await;
+
+            result
+        } else {
+            ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
+        }
+    } else {
+        let reason = rejection_reason.unwrap_or_else(|| "User rejected".to_string());
+        let result = ToolResult::error(format!("Rejected: {reason}"));
+        let _ = tx
+            .send(AgentEvent::tool_call_end(
+                &awaiting_tool.id,
+                &awaiting_tool.name,
+                result.clone(),
+            ))
+            .await;
+        result
+    }
+}
+
+/// Append tool results to message history.
+async fn append_tool_results<M>(
+    tool_results: &[(String, ToolResult)],
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+) -> Result<(), AgentError>
+where
+    M: MessageStore,
+{
+    for (tool_id, result) in tool_results {
+        let tool_result_msg = Message::tool_result(tool_id, &result.output, !result.success);
+        if let Err(e) = message_store.append(thread_id, tool_result_msg).await {
+            return Err(AgentError::new(
+                format!("Failed to append tool result: {e}"),
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Call the LLM with retry logic for rate limits and server errors.
+async fn call_llm_with_retry<P>(
+    provider: &Arc<P>,
+    request: ChatRequest,
+    config: &AgentConfig,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> Result<ChatResponse, AgentError>
+where
+    P: LlmProvider,
+{
+    let max_retries = config.retry.max_retries;
+    let mut attempt = 0u32;
+
+    loop {
+        let outcome = match provider.chat(request.clone()).await {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(AgentError::new(format!("LLM error: {e}"), false));
+            }
+        };
+
+        match outcome {
+            ChatOutcome::Success(response) => return Ok(response),
+            ChatOutcome::RateLimited => {
+                attempt += 1;
+                if attempt > max_retries {
+                    error!("Rate limited by LLM provider after {max_retries} retries");
+                    let error_msg = format!("Rate limited after {max_retries} retries");
+                    let _ = tx.send(AgentEvent::error(&error_msg, true)).await;
+                    return Err(AgentError::new(error_msg, true));
+                }
+                let delay = calculate_backoff_delay(attempt, &config.retry);
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "Rate limited, retrying after backoff"
+                );
+                let _ = tx
+                    .send(AgentEvent::text(format!(
+                        "\n[Rate limited, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
+                        delay.as_secs_f64()
+                    )))
+                    .await;
+                sleep(delay).await;
+            }
+            ChatOutcome::InvalidRequest(msg) => {
+                error!(msg, "Invalid request to LLM");
+                return Err(AgentError::new(format!("Invalid request: {msg}"), false));
+            }
+            ChatOutcome::ServerError(msg) => {
+                attempt += 1;
+                if attempt > max_retries {
+                    error!(msg, "LLM server error after {max_retries} retries");
+                    let error_msg = format!("Server error after {max_retries} retries: {msg}");
+                    let _ = tx.send(AgentEvent::error(&error_msg, true)).await;
+                    return Err(AgentError::new(error_msg, true));
+                }
+                let delay = calculate_backoff_delay(attempt, &config.retry);
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    error = msg,
+                    "Server error, retrying after backoff"
+                );
+                let _ = tx
+                    .send(AgentEvent::text(format!(
+                        "\n[Server error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
+                        delay.as_secs_f64()
+                    )))
+                    .await;
+                sleep(delay).await;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Main Loop Functions
+// =============================================================================
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_loop<Ctx, P, H, M, S>(
     tx: mpsc::Sender<AgentEvent>,
     thread_id: ThreadId,
-    user_message: String,
+    input: AgentInput,
     tool_context: ToolContext<Ctx>,
     provider: Arc<P>,
     tools: Arc<ToolRegistry<Ctx>>,
@@ -476,7 +1058,7 @@ async fn run_loop<Ctx, P, H, M, S>(
     state_store: Arc<S>,
     config: AgentConfig,
     compaction_config: Option<CompactionConfig>,
-) -> Result<()>
+) -> AgentRunState
 where
     Ctx: Send + Sync + Clone + 'static,
     P: LlmProvider,
@@ -486,70 +1068,505 @@ where
 {
     // Add event channel to tool context so tools can emit events
     let tool_context = tool_context.with_event_tx(tx.clone());
-
     let start_time = Instant::now();
-    let mut turn = 0;
-    let mut total_usage = TokenUsage::default();
 
-    // Load or create state
-    let mut state = state_store
-        .load(&thread_id)
-        .await?
-        .unwrap_or_else(|| AgentState::new(thread_id.clone()));
+    // Initialize state from input
+    let init_state =
+        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
+            Ok(s) => s,
+            Err(e) => return AgentRunState::Error(e),
+        };
 
-    // Add user message to history
-    let user_msg = Message::user(&user_message);
-    message_store.append(&thread_id, user_msg).await?;
+    let InitializedState {
+        turn,
+        total_usage,
+        state,
+        resume_data,
+    } = init_state;
 
-    // Main agent loop
+    // Handle resume case - complete the pending tool calls
+    if let Some(resume) = resume_data {
+        let ResumeData {
+            continuation: cont,
+            tool_call_id,
+            confirmed,
+            rejection_reason,
+        } = resume;
+        let mut tool_results = cont.completed_results.clone();
+        let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
+
+        // Validate tool_call_id matches
+        if awaiting_tool.id != tool_call_id {
+            return AgentRunState::Error(AgentError::new(
+                format!(
+                    "Tool call ID mismatch: expected {}, got {}",
+                    awaiting_tool.id, tool_call_id
+                ),
+                false,
+            ));
+        }
+
+        // Execute the confirmed/rejected tool
+        let result = execute_confirmed_tool(
+            awaiting_tool,
+            confirmed,
+            rejection_reason,
+            &tool_context,
+            &tools,
+            &hooks,
+            &tx,
+        )
+        .await;
+        tool_results.push((awaiting_tool.id.clone(), result));
+
+        // Process remaining tool calls after the confirmed one
+        for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
+            match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
+                ToolExecutionOutcome::Completed { tool_id, result } => {
+                    tool_results.push((tool_id, result));
+                }
+                ToolExecutionOutcome::RequiresConfirmation {
+                    tool_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                } => {
+                    let pending_idx = cont
+                        .pending_tool_calls
+                        .iter()
+                        .position(|p| p.id == tool_id)
+                        .unwrap_or(0);
+
+                    let new_continuation = AgentContinuation {
+                        thread_id: thread_id.clone(),
+                        turn,
+                        total_usage: total_usage.clone(),
+                        turn_usage: cont.turn_usage.clone(),
+                        pending_tool_calls: cont.pending_tool_calls.clone(),
+                        awaiting_index: pending_idx,
+                        completed_results: tool_results,
+                        state: state.clone(),
+                    };
+
+                    return AgentRunState::AwaitingConfirmation {
+                        tool_call_id: tool_id,
+                        tool_name,
+                        display_name,
+                        input,
+                        description,
+                        continuation: Box::new(new_continuation),
+                    };
+                }
+            }
+        }
+
+        // Append tool results to message history
+        if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
+            return AgentRunState::Error(e);
+        }
+
+        // Emit turn complete
+        let _ = tx
+            .send(AgentEvent::TurnComplete {
+                turn,
+                usage: cont.turn_usage.clone(),
+            })
+            .await;
+    }
+
+    // Create turn context for execution
+    let mut ctx = TurnContext {
+        thread_id: thread_id.clone(),
+        turn,
+        total_usage,
+        state,
+        start_time,
+    };
+
+    // Main agent loop - calls execute_turn repeatedly
     loop {
-        turn += 1;
-        state.turn_count = turn;
+        let result = execute_turn(
+            &tx,
+            &mut ctx,
+            &tool_context,
+            &provider,
+            &tools,
+            &hooks,
+            &message_store,
+            &config,
+            compaction_config.as_ref(),
+        )
+        .await;
 
-        if turn > config.max_turns {
-            warn!(turn, max = config.max_turns, "Max turns reached");
-            tx.send(AgentEvent::error(
+        match result {
+            InternalTurnResult::Continue { .. } => {
+                // Save state checkpoint and continue
+                if let Err(e) = state_store.save(&ctx.state).await {
+                    warn!(error = %e, "Failed to save state checkpoint");
+                }
+            }
+            InternalTurnResult::Done => {
+                break;
+            }
+            InternalTurnResult::AwaitingConfirmation {
+                tool_call_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+                continuation,
+            } => {
+                return AgentRunState::AwaitingConfirmation {
+                    tool_call_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                    continuation,
+                };
+            }
+            InternalTurnResult::Error(e) => {
+                return AgentRunState::Error(e);
+            }
+        }
+    }
+
+    // Final state save
+    if let Err(e) = state_store.save(&ctx.state).await {
+        warn!(error = %e, "Failed to save final state");
+    }
+
+    // Emit done
+    let duration = ctx.start_time.elapsed();
+    let _ = tx
+        .send(AgentEvent::done(
+            thread_id,
+            ctx.turn,
+            ctx.total_usage.clone(),
+            duration,
+        ))
+        .await;
+
+    AgentRunState::Done {
+        total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
+        input_tokens: u64::from(ctx.total_usage.input_tokens),
+        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    }
+}
+
+/// Run a single turn of the agent loop.
+///
+/// This is similar to `run_loop` but only executes one turn and returns.
+/// The caller is responsible for continuing execution by calling again with
+/// `AgentInput::Continue`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_single_turn<Ctx, P, H, M, S>(
+    tx: mpsc::Sender<AgentEvent>,
+    thread_id: ThreadId,
+    input: AgentInput,
+    tool_context: ToolContext<Ctx>,
+    provider: Arc<P>,
+    tools: Arc<ToolRegistry<Ctx>>,
+    hooks: Arc<H>,
+    message_store: Arc<M>,
+    state_store: Arc<S>,
+    config: AgentConfig,
+    compaction_config: Option<CompactionConfig>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    // Add event channel to tool context so tools can emit events
+    let tool_context = tool_context.with_event_tx(tx.clone());
+    let start_time = Instant::now();
+
+    // Initialize state from input
+    let init_state =
+        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
+            Ok(s) => s,
+            Err(e) => return TurnOutcome::Error(e),
+        };
+
+    let InitializedState {
+        turn,
+        total_usage,
+        state,
+        resume_data,
+    } = init_state;
+
+    // Handle resume case - complete the pending tool calls
+    if let Some(resume) = resume_data {
+        let ResumeData {
+            continuation: cont,
+            tool_call_id,
+            confirmed,
+            rejection_reason,
+        } = resume;
+        let mut tool_results = cont.completed_results.clone();
+        let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
+
+        // Validate tool_call_id matches
+        if awaiting_tool.id != tool_call_id {
+            return TurnOutcome::Error(AgentError::new(
+                format!(
+                    "Tool call ID mismatch: expected {}, got {}",
+                    awaiting_tool.id, tool_call_id
+                ),
+                false,
+            ));
+        }
+
+        // Execute the confirmed/rejected tool
+        let result = execute_confirmed_tool(
+            awaiting_tool,
+            confirmed,
+            rejection_reason,
+            &tool_context,
+            &tools,
+            &hooks,
+            &tx,
+        )
+        .await;
+        tool_results.push((awaiting_tool.id.clone(), result));
+
+        // Process remaining tool calls after the confirmed one
+        for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
+            match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
+                ToolExecutionOutcome::Completed { tool_id, result } => {
+                    tool_results.push((tool_id, result));
+                }
+                ToolExecutionOutcome::RequiresConfirmation {
+                    tool_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                } => {
+                    let pending_idx = cont
+                        .pending_tool_calls
+                        .iter()
+                        .position(|p| p.id == tool_id)
+                        .unwrap_or(0);
+
+                    let new_continuation = AgentContinuation {
+                        thread_id: thread_id.clone(),
+                        turn,
+                        total_usage: total_usage.clone(),
+                        turn_usage: cont.turn_usage.clone(),
+                        pending_tool_calls: cont.pending_tool_calls.clone(),
+                        awaiting_index: pending_idx,
+                        completed_results: tool_results,
+                        state: state.clone(),
+                    };
+
+                    return TurnOutcome::AwaitingConfirmation {
+                        tool_call_id: tool_id,
+                        tool_name,
+                        display_name,
+                        input,
+                        description,
+                        continuation: Box::new(new_continuation),
+                    };
+                }
+            }
+        }
+
+        // Append tool results to message history
+        if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
+            return TurnOutcome::Error(e);
+        }
+
+        // Emit turn complete
+        let _ = tx
+            .send(AgentEvent::TurnComplete {
+                turn,
+                usage: cont.turn_usage.clone(),
+            })
+            .await;
+
+        // Save state after completing the resume
+        let mut updated_state = state;
+        updated_state.turn_count = turn;
+        if let Err(e) = state_store.save(&updated_state).await {
+            warn!(error = %e, "Failed to save state checkpoint");
+        }
+
+        // Return NeedsMoreTurns since we completed tool execution but need another LLM call
+        return TurnOutcome::NeedsMoreTurns {
+            turn,
+            turn_usage: cont.turn_usage.clone(),
+            total_usage,
+        };
+    }
+
+    // Create turn context for execution
+    let mut ctx = TurnContext {
+        thread_id: thread_id.clone(),
+        turn,
+        total_usage,
+        state,
+        start_time,
+    };
+
+    // Execute a single turn
+    let result = execute_turn(
+        &tx,
+        &mut ctx,
+        &tool_context,
+        &provider,
+        &tools,
+        &hooks,
+        &message_store,
+        &config,
+        compaction_config.as_ref(),
+    )
+    .await;
+
+    // Convert InternalTurnResult to TurnOutcome
+    match result {
+        InternalTurnResult::Continue { turn_usage } => {
+            // Save state checkpoint
+            if let Err(e) = state_store.save(&ctx.state).await {
+                warn!(error = %e, "Failed to save state checkpoint");
+            }
+
+            TurnOutcome::NeedsMoreTurns {
+                turn: ctx.turn,
+                turn_usage,
+                total_usage: ctx.total_usage,
+            }
+        }
+        InternalTurnResult::Done => {
+            // Final state save
+            if let Err(e) = state_store.save(&ctx.state).await {
+                warn!(error = %e, "Failed to save final state");
+            }
+
+            // Emit done
+            let duration = ctx.start_time.elapsed();
+            let _ = tx
+                .send(AgentEvent::done(
+                    thread_id,
+                    ctx.turn,
+                    ctx.total_usage.clone(),
+                    duration,
+                ))
+                .await;
+
+            TurnOutcome::Done {
+                total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
+                input_tokens: u64::from(ctx.total_usage.input_tokens),
+                output_tokens: u64::from(ctx.total_usage.output_tokens),
+            }
+        }
+        InternalTurnResult::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        } => TurnOutcome::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        },
+        InternalTurnResult::Error(e) => TurnOutcome::Error(e),
+    }
+}
+
+/// Execute a single turn of the agent loop.
+///
+/// This is the core turn execution logic shared by both `run_loop` (looping mode)
+/// and `run_single_turn` (single-turn mode).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_turn<Ctx, P, H, M>(
+    tx: &mpsc::Sender<AgentEvent>,
+    ctx: &mut TurnContext,
+    tool_context: &ToolContext<Ctx>,
+    provider: &Arc<P>,
+    tools: &Arc<ToolRegistry<Ctx>>,
+    hooks: &Arc<H>,
+    message_store: &Arc<M>,
+    config: &AgentConfig,
+    compaction_config: Option<&CompactionConfig>,
+) -> InternalTurnResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    ctx.turn += 1;
+    ctx.state.turn_count = ctx.turn;
+
+    if ctx.turn > config.max_turns {
+        warn!(turn = ctx.turn, max = config.max_turns, "Max turns reached");
+        let _ = tx
+            .send(AgentEvent::error(
                 format!("Maximum turns ({}) reached", config.max_turns),
                 true,
             ))
-            .await?;
-            break;
-        }
-
-        // Emit start event
-        tx.send(AgentEvent::start(thread_id.clone(), turn)).await?;
-        hooks
-            .on_event(&AgentEvent::start(thread_id.clone(), turn))
             .await;
+        return InternalTurnResult::Error(AgentError::new(
+            format!("Maximum turns ({}) reached", config.max_turns),
+            true,
+        ));
+    }
 
-        // Get message history
-        let mut messages = message_store.get_history(&thread_id).await?;
+    // Emit start event
+    let _ = tx
+        .send(AgentEvent::start(ctx.thread_id.clone(), ctx.turn))
+        .await;
+    hooks
+        .on_event(&AgentEvent::start(ctx.thread_id.clone(), ctx.turn))
+        .await;
 
-        // Check if compaction is needed
-        if let Some(ref compact_config) = compaction_config {
-            let compactor = LlmContextCompactor::new(Arc::clone(&provider), compact_config.clone());
-            if compactor.needs_compaction(&messages) {
-                debug!(
-                    turn,
-                    message_count = messages.len(),
-                    "Context compaction triggered"
-                );
+    // Get message history
+    let mut messages = match message_store.get_history(&ctx.thread_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            return InternalTurnResult::Error(AgentError::new(
+                format!("Failed to get history: {e}"),
+                false,
+            ));
+        }
+    };
 
-                match compactor.compact_history(messages).await {
-                    Ok(result) => {
-                        // Replace history in store
-                        message_store
-                            .replace_history(&thread_id, result.messages.clone())
-                            .await?;
+    // Check if compaction is needed
+    if let Some(compact_config) = compaction_config {
+        let compactor = LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+        if compactor.needs_compaction(&messages) {
+            debug!(
+                turn = ctx.turn,
+                message_count = messages.len(),
+                "Context compaction triggered"
+            );
 
-                        // Emit compaction event
-                        tx.send(AgentEvent::context_compacted(
-                            result.original_count,
-                            result.new_count,
-                            result.original_tokens,
-                            result.new_tokens,
-                        ))
-                        .await?;
+            match compactor.compact_history(messages.clone()).await {
+                Ok(result) => {
+                    if let Err(e) = message_store
+                        .replace_history(&ctx.thread_id, result.messages.clone())
+                        .await
+                    {
+                        warn!(error = %e, "Failed to replace history after compaction");
+                    } else {
+                        let _ = tx
+                            .send(AgentEvent::context_compacted(
+                                result.original_count,
+                                result.new_count,
+                                result.original_tokens,
+                                result.new_tokens,
+                            ))
+                            .await;
 
                         info!(
                             original_count = result.original_count,
@@ -559,250 +1576,201 @@ where
                             "Context compacted successfully"
                         );
 
-                        // Use the compacted messages
                         messages = result.messages;
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Context compaction failed, continuing with full history");
-                        // Continue with original messages on failure
-                        messages = message_store.get_history(&thread_id).await?;
-                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Context compaction failed, continuing with full history");
                 }
             }
         }
-
-        // Build chat request
-        let llm_tools = if tools.is_empty() {
-            None
-        } else {
-            Some(tools.to_llm_tools())
-        };
-
-        let request = ChatRequest {
-            system: config.system_prompt.clone(),
-            messages,
-            tools: llm_tools,
-            max_tokens: config.max_tokens,
-        };
-
-        // Call LLM with retry logic for transient errors
-        debug!(turn, "Calling LLM");
-        let max_retries = config.retry.max_retries;
-        let response = {
-            let mut attempt = 0u32;
-            loop {
-                let outcome = provider.chat(request.clone()).await?;
-                match outcome {
-                    ChatOutcome::Success(response) => break Some(response),
-                    ChatOutcome::RateLimited => {
-                        attempt += 1;
-                        if attempt > max_retries {
-                            error!("Rate limited by LLM provider after {max_retries} retries");
-                            tx.send(AgentEvent::error(
-                                format!("Rate limited after {max_retries} retries"),
-                                true,
-                            ))
-                            .await?;
-                            break None;
-                        }
-                        let delay = calculate_backoff_delay(attempt, &config.retry);
-                        warn!(
-                            attempt,
-                            delay_ms = delay.as_millis(),
-                            "Rate limited, retrying after backoff"
-                        );
-                        tx.send(AgentEvent::text(format!(
-                            "\n[Rate limited, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
-                            delay.as_secs_f64()
-                        )))
-                        .await?;
-                        sleep(delay).await;
-                    }
-                    ChatOutcome::InvalidRequest(msg) => {
-                        error!(msg, "Invalid request to LLM");
-                        tx.send(AgentEvent::error(format!("Invalid request: {msg}"), false))
-                            .await?;
-                        break None;
-                    }
-                    ChatOutcome::ServerError(msg) => {
-                        attempt += 1;
-                        if attempt > max_retries {
-                            error!(msg, "LLM server error after {max_retries} retries");
-                            tx.send(AgentEvent::error(
-                                format!("Server error after {max_retries} retries: {msg}"),
-                                true,
-                            ))
-                            .await?;
-                            break None;
-                        }
-                        let delay = calculate_backoff_delay(attempt, &config.retry);
-                        warn!(
-                            attempt,
-                            delay_ms = delay.as_millis(),
-                            error = msg,
-                            "Server error, retrying after backoff"
-                        );
-                        tx.send(AgentEvent::text(format!(
-                            "\n[Server error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
-                            delay.as_secs_f64()
-                        )))
-                        .await?;
-                        sleep(delay).await;
-                    }
-                }
-            }
-        };
-
-        // If we failed to get a response after retries, exit the loop
-        let Some(response) = response else {
-            break;
-        };
-
-        // Track usage
-        let turn_usage = TokenUsage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-        };
-        total_usage.add(&turn_usage);
-        state.total_usage = total_usage.clone();
-
-        // Process response content
-        let (text_content, tool_uses) = extract_content(&response);
-
-        // Emit text if present
-        if let Some(text) = &text_content {
-            tx.send(AgentEvent::text(text.clone())).await?;
-            hooks.on_event(&AgentEvent::text(text.clone())).await;
-        }
-
-        // If no tool uses, we're done
-        if tool_uses.is_empty() {
-            info!(turn, "Agent completed (no tool use)");
-            break;
-        }
-
-        // Store assistant message with tool uses
-        let assistant_msg = build_assistant_message(&response);
-        message_store.append(&thread_id, assistant_msg).await?;
-
-        // Execute tools
-        let mut tool_results = Vec::new();
-        for (tool_id, tool_name, tool_input) in &tool_uses {
-            let Some(tool) = tools.get(tool_name) else {
-                let result = ToolResult::error(format!("Unknown tool: {tool_name}"));
-                tool_results.push((tool_id.clone(), result));
-                continue;
-            };
-
-            let tier = tool.tier();
-
-            // Emit tool call start
-            tx.send(AgentEvent::tool_call_start(
-                tool_id,
-                tool_name,
-                tool_input.clone(),
-                tier,
-            ))
-            .await?;
-
-            // Check hooks for permission
-            let decision = hooks.pre_tool_use(tool_name, tool_input, tier).await;
-
-            match decision {
-                ToolDecision::Allow => {
-                    // Execute tool
-                    let tool_start = Instant::now();
-                    let result = match tool.execute(&tool_context, tool_input.clone()).await {
-                        Ok(mut r) => {
-                            r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                            r
-                        }
-                        Err(e) => ToolResult::error(format!("Tool error: {e}"))
-                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                    };
-
-                    // Post-tool hook
-                    hooks.post_tool_use(tool_name, &result).await;
-
-                    // Emit tool call end
-                    tx.send(AgentEvent::tool_call_end(
-                        tool_id,
-                        tool_name,
-                        result.clone(),
-                    ))
-                    .await?;
-
-                    tool_results.push((tool_id.clone(), result));
-                }
-                ToolDecision::Block(reason) => {
-                    let result = ToolResult::error(format!("Blocked: {reason}"));
-                    tx.send(AgentEvent::tool_call_end(
-                        tool_id,
-                        tool_name,
-                        result.clone(),
-                    ))
-                    .await?;
-                    tool_results.push((tool_id.clone(), result));
-                }
-                ToolDecision::RequiresConfirmation(description) => {
-                    tx.send(AgentEvent::ToolRequiresConfirmation {
-                        id: tool_id.clone(),
-                        name: tool_name.clone(),
-                        input: tool_input.clone(),
-                        description,
-                    })
-                    .await?;
-                    // For now, treat as blocked - caller should handle confirmation flow
-                    let result = ToolResult::error("Awaiting user confirmation");
-                    tool_results.push((tool_id.clone(), result));
-                }
-                ToolDecision::RequiresPin(description) => {
-                    tx.send(AgentEvent::ToolRequiresPin {
-                        id: tool_id.clone(),
-                        name: tool_name.clone(),
-                        input: tool_input.clone(),
-                        description,
-                    })
-                    .await?;
-                    // For now, treat as blocked - caller should handle PIN flow
-                    let result = ToolResult::error("Awaiting PIN verification");
-                    tool_results.push((tool_id.clone(), result));
-                }
-            }
-        }
-
-        // Add tool results to message history
-        for (tool_id, result) in &tool_results {
-            let tool_result_msg = Message::tool_result(tool_id, &result.output, !result.success);
-            message_store.append(&thread_id, tool_result_msg).await?;
-        }
-
-        // Emit turn complete
-        tx.send(AgentEvent::TurnComplete {
-            turn,
-            usage: turn_usage,
-        })
-        .await?;
-
-        // Check stop reason
-        if response.stop_reason == Some(StopReason::EndTurn) {
-            info!(turn, "Agent completed (end_turn)");
-            break;
-        }
-
-        // Save state checkpoint
-        state_store.save(&state).await?;
     }
 
-    // Final state save
-    state_store.save(&state).await?;
+    // Build chat request
+    let llm_tools = if tools.is_empty() {
+        None
+    } else {
+        Some(tools.to_llm_tools())
+    };
 
-    // Emit done
-    let duration = start_time.elapsed();
-    tx.send(AgentEvent::done(thread_id, turn, total_usage, duration))
-        .await?;
+    let request = ChatRequest {
+        system: config.system_prompt.clone(),
+        messages,
+        tools: llm_tools,
+        max_tokens: config.max_tokens,
+    };
 
-    Ok(())
+    // Call LLM with retry logic
+    debug!(turn = ctx.turn, "Calling LLM");
+    let response = match call_llm_with_retry(provider, request, config, tx).await {
+        Ok(r) => r,
+        Err(e) => return InternalTurnResult::Error(e),
+    };
+
+    // Track usage
+    let turn_usage = TokenUsage {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+    };
+    ctx.total_usage.add(&turn_usage);
+    ctx.state.total_usage = ctx.total_usage.clone();
+
+    // Process response content
+    let (text_content, tool_uses) = extract_content(&response);
+
+    // Emit text if present
+    if let Some(text) = &text_content {
+        let _ = tx.send(AgentEvent::text(text.clone())).await;
+        hooks.on_event(&AgentEvent::text(text.clone())).await;
+    }
+
+    // If no tool uses, we're done
+    if tool_uses.is_empty() {
+        info!(turn = ctx.turn, "Agent completed (no tool use)");
+        return InternalTurnResult::Done;
+    }
+
+    // Store assistant message with tool uses
+    let assistant_msg = build_assistant_message(&response);
+    if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
+        return InternalTurnResult::Error(AgentError::new(
+            format!("Failed to append assistant message: {e}"),
+            false,
+        ));
+    }
+
+    // Build pending tool calls
+    let pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
+        .iter()
+        .map(|(id, name, input)| {
+            let display_name = tools
+                .get(name)
+                .map(|t| t.display_name().to_string())
+                .unwrap_or_default();
+            PendingToolCallInfo {
+                id: id.clone(),
+                name: name.clone(),
+                display_name,
+                input: input.clone(),
+            }
+        })
+        .collect();
+
+    // Execute tools
+    let mut tool_results = Vec::new();
+    for (idx, pending) in pending_tool_calls.iter().enumerate() {
+        let Some(tool) = tools.get(&pending.name) else {
+            let result = ToolResult::error(format!("Unknown tool: {}", pending.name));
+            tool_results.push((pending.id.clone(), result));
+            continue;
+        };
+
+        let tier = tool.tier();
+
+        // Emit tool call start
+        let _ = tx
+            .send(AgentEvent::tool_call_start(
+                &pending.id,
+                &pending.name,
+                pending.input.clone(),
+                tier,
+            ))
+            .await;
+
+        // Check hooks for permission
+        let decision = hooks
+            .pre_tool_use(&pending.name, &pending.input, tier)
+            .await;
+
+        match decision {
+            ToolDecision::Allow => {
+                let tool_start = Instant::now();
+                let result = match tool.execute(tool_context, pending.input.clone()).await {
+                    Ok(mut r) => {
+                        r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        r
+                    }
+                    Err(e) => ToolResult::error(format!("Tool error: {e}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                };
+
+                hooks.post_tool_use(&pending.name, &result).await;
+
+                let _ = tx
+                    .send(AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        result.clone(),
+                    ))
+                    .await;
+
+                tool_results.push((pending.id.clone(), result));
+            }
+            ToolDecision::Block(reason) => {
+                let result = ToolResult::error(format!("Blocked: {reason}"));
+                let _ = tx
+                    .send(AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        result.clone(),
+                    ))
+                    .await;
+                tool_results.push((pending.id.clone(), result));
+            }
+            ToolDecision::RequiresConfirmation(description) => {
+                // Emit event and yield
+                let _ = tx
+                    .send(AgentEvent::ToolRequiresConfirmation {
+                        id: pending.id.clone(),
+                        name: pending.name.clone(),
+                        input: pending.input.clone(),
+                        description: description.clone(),
+                    })
+                    .await;
+
+                let continuation = AgentContinuation {
+                    thread_id: ctx.thread_id.clone(),
+                    turn: ctx.turn,
+                    total_usage: ctx.total_usage.clone(),
+                    turn_usage: turn_usage.clone(),
+                    pending_tool_calls: pending_tool_calls.clone(),
+                    awaiting_index: idx,
+                    completed_results: tool_results,
+                    state: ctx.state.clone(),
+                };
+
+                return InternalTurnResult::AwaitingConfirmation {
+                    tool_call_id: pending.id.clone(),
+                    tool_name: pending.name.clone(),
+                    display_name: pending.display_name.clone(),
+                    input: pending.input.clone(),
+                    description,
+                    continuation: Box::new(continuation),
+                };
+            }
+        }
+    }
+
+    // Add tool results to message history
+    if let Err(e) = append_tool_results(&tool_results, &ctx.thread_id, message_store).await {
+        return InternalTurnResult::Error(e);
+    }
+
+    // Emit turn complete
+    let _ = tx
+        .send(AgentEvent::TurnComplete {
+            turn: ctx.turn,
+            usage: turn_usage.clone(),
+        })
+        .await;
+
+    // Check stop reason
+    if response.stop_reason == Some(StopReason::EndTurn) {
+        info!(turn = ctx.turn, "Agent completed (end_turn)");
+        return InternalTurnResult::Done;
+    }
+
+    InternalTurnResult::Continue { turn_usage }
 }
 
 /// Convert u128 milliseconds to u64, capping at `u64::MAX`
@@ -911,7 +1879,8 @@ mod tests {
     use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
     use crate::stores::InMemoryStore;
     use crate::tools::{Tool, ToolContext, ToolRegistry};
-    use crate::types::{AgentConfig, ToolResult, ToolTier};
+    use crate::types::{AgentConfig, AgentInput, ToolResult, ToolTier};
+    use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::RwLock;
@@ -1012,10 +1981,24 @@ mod tests {
 
     struct EchoTool;
 
-    #[async_trait]
+    // Test tool name enum for tests
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum TestToolName {
+        Echo,
+    }
+
+    impl crate::tools::ToolName for TestToolName {}
+
     impl Tool<()> for EchoTool {
-        fn name(&self) -> &'static str {
-            "echo"
+        type Name = TestToolName;
+
+        fn name(&self) -> TestToolName {
+            TestToolName::Echo
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Echo"
         }
 
         fn description(&self) -> &'static str {
@@ -1120,7 +2103,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1150,7 +2134,11 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Run echo".to_string(), tool_ctx);
+        let (mut rx, _final_state) = agent.run(
+            thread_id,
+            AgentInput::Text("Run echo".to_string()),
+            tool_ctx,
+        );
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1198,7 +2186,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Loop".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Loop".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1229,7 +2218,11 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Call unknown".to_string(), tool_ctx);
+        let (mut rx, _final_state) = agent.run(
+            thread_id,
+            AgentInput::Text("Call unknown".to_string()),
+            tool_ctx,
+        );
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1272,7 +2265,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1312,7 +2306,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1354,7 +2349,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1394,7 +2390,8 @@ mod tests {
 
         let thread_id = ThreadId::new();
         let tool_ctx = ToolContext::new(());
-        let mut rx = agent.run(thread_id, "Hi".to_string(), tool_ctx);
+        let (mut rx, _final_state) =
+            agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
 
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {

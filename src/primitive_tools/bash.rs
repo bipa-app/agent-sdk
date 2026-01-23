@@ -1,7 +1,6 @@
 use crate::reminders::{append_reminder, builtin};
-use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -36,10 +35,15 @@ const fn default_timeout() -> u64 {
     120_000 // 2 minutes
 }
 
-#[async_trait]
 impl<E: Environment + 'static> Tool<()> for BashTool<E> {
-    fn name(&self) -> &'static str {
-        "bash"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::Bash
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Run Command"
     }
 
     fn description(&self) -> &'static str {
@@ -154,6 +158,7 @@ mod tests {
     use super::*;
     use crate::AgentCapabilities;
     use crate::environment::ExecResult;
+    use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -458,7 +463,7 @@ mod tests {
         let env = Arc::new(MockBashEnvironment::new());
         let tool = create_test_tool(env, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), "bash");
+        assert_eq!(tool.name(), PrimitiveToolName::Bash);
         assert_eq!(tool.tier(), ToolTier::Confirm);
         assert!(tool.description().contains("Execute"));
 

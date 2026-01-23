@@ -1,6 +1,5 @@
-use crate::{Environment, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -30,10 +29,15 @@ struct GlobInput {
     path: Option<String>,
 }
 
-#[async_trait]
 impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
-    fn name(&self) -> &'static str {
-        "glob"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::Glob
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Find Files"
     }
 
     fn description(&self) -> &'static str {
@@ -328,7 +332,7 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), "glob");
+        assert_eq!(tool.name(), PrimitiveToolName::Glob);
         assert_eq!(tool.tier(), ToolTier::Observe);
         assert!(tool.description().contains("glob"));
 

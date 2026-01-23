@@ -48,16 +48,9 @@ pub enum AgentEvent {
         result: ToolResult,
     },
 
-    /// Tool requires confirmation before execution
+    /// Tool requires confirmation before execution.
+    /// The application determines the confirmation type (normal, PIN, biometric).
     ToolRequiresConfirmation {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-        description: String,
-    },
-
-    /// Tool requires PIN verification
-    ToolRequiresPin {
         id: String,
         name: String,
         input: serde_json::Value,

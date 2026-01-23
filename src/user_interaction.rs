@@ -37,9 +37,8 @@
 //! // The UI handles requests and responses through the channels
 //! ```
 
-use crate::{Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -298,10 +297,15 @@ struct OptionInput {
     description: Option<String>,
 }
 
-#[async_trait]
 impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
-    fn name(&self) -> &'static str {
-        "ask_user"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::AskUser
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Ask User"
     }
 
     fn description(&self) -> &'static str {
@@ -479,7 +483,7 @@ mod tests {
         let (tool, _rx, _tx) = AskUserQuestionTool::with_channels(10);
 
         // Use Tool<()> explicitly to satisfy type inference
-        assert_eq!(Tool::<()>::name(&tool), "ask_user");
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::AskUser);
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
     }
 

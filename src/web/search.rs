@@ -1,9 +1,8 @@
 //! Web search tool implementation.
 
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{PrimitiveToolName, Tool, ToolContext};
 use crate::types::{ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -81,14 +80,19 @@ fn format_search_results(query: &str, results: &[super::provider::SearchResult])
     output
 }
 
-#[async_trait]
 impl<Ctx, P> Tool<Ctx> for WebSearchTool<P>
 where
     Ctx: Send + Sync + 'static,
     P: SearchProvider + 'static,
 {
-    fn name(&self) -> &'static str {
-        "web_search"
+    type Name = PrimitiveToolName;
+
+    fn name(&self) -> PrimitiveToolName {
+        PrimitiveToolName::WebSearch
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Web Search"
     }
 
     fn description(&self) -> &'static str {
@@ -151,6 +155,7 @@ mod tests {
     use super::*;
     use crate::tools::Tool;
     use crate::web::provider::{SearchResponse, SearchResult};
+    use async_trait::async_trait;
 
     // Mock provider for testing
     struct MockSearchProvider {
@@ -183,7 +188,7 @@ mod tests {
         let provider = MockSearchProvider::new(vec![]);
         let tool: WebSearchTool<MockSearchProvider> = WebSearchTool::new(provider);
 
-        assert_eq!(Tool::<()>::name(&tool), "web_search");
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::WebSearch);
         assert!(Tool::<()>::description(&tool).contains("Search the web"));
         assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
     }

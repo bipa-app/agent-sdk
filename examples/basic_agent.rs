@@ -8,7 +8,9 @@
 //! ANTHROPIC_API_KEY=your_key cargo run --example basic_agent
 //! ```
 
-use agent_sdk::{AgentEvent, ThreadId, ToolContext, builder, providers::AnthropicProvider};
+use agent_sdk::{
+    AgentEvent, AgentInput, ThreadId, ToolContext, builder, providers::AnthropicProvider,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,9 +33,9 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting conversation (thread: {thread_id})\n");
 
     // Run the agent with a simple prompt
-    let mut events = agent.run(
+    let (mut events, _final_state) = agent.run(
         thread_id,
-        "What is the capital of France? Answer in one sentence.".to_string(),
+        AgentInput::Text("What is the capital of France? Answer in one sentence.".to_string()),
         tool_ctx,
     );
 
