@@ -47,7 +47,6 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-
 /// Internal result of executing a single turn.
 ///
 /// This is used internally by both `run_loop` and `run_single_turn`.
