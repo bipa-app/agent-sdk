@@ -1076,7 +1076,6 @@ where
         resume_data,
     } = init_state;
 
-    // Handle resume case - complete the pending tool calls
     if let Some(resume) = resume_data {
         let ResumeData {
             continuation: cont,
@@ -1087,7 +1086,6 @@ where
         let mut tool_results = cont.completed_results.clone();
         let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
-        // Validate tool_call_id matches
         if awaiting_tool.id != tool_call_id {
             return AgentRunState::Error(AgentError::new(
                 format!(
@@ -1098,7 +1096,6 @@ where
             ));
         }
 
-        // Execute the confirmed/rejected tool
         let result = execute_confirmed_tool(
             awaiting_tool,
             confirmed,
@@ -1111,7 +1108,6 @@ where
         .await;
         tool_results.push((awaiting_tool.id.clone(), result));
 
-        // Process remaining tool calls after the confirmed one
         for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
             match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
                 ToolExecutionOutcome::Completed { tool_id, result } => {
@@ -1153,12 +1149,10 @@ where
             }
         }
 
-        // Append tool results to message history
         if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
             return AgentRunState::Error(e);
         }
 
-        // Emit turn complete
         let _ = tx
             .send(AgentEvent::TurnComplete {
                 turn,
@@ -1167,7 +1161,6 @@ where
             .await;
     }
 
-    // Create turn context for execution
     let mut ctx = TurnContext {
         thread_id: thread_id.clone(),
         turn,
@@ -1176,7 +1169,6 @@ where
         start_time,
     };
 
-    // Main agent loop - calls execute_turn repeatedly
     loop {
         let result = execute_turn(
             &tx,
@@ -1193,7 +1185,6 @@ where
 
         match result {
             InternalTurnResult::Continue { .. } => {
-                // Save state checkpoint and continue
                 if let Err(e) = state_store.save(&ctx.state).await {
                     warn!(error = %e, "Failed to save state checkpoint");
                 }
@@ -1224,12 +1215,10 @@ where
         }
     }
 
-    // Final state save
     if let Err(e) = state_store.save(&ctx.state).await {
         warn!(error = %e, "Failed to save final state");
     }
 
-    // Emit done
     let duration = ctx.start_time.elapsed();
     let _ = tx
         .send(AgentEvent::done(
@@ -1288,11 +1277,9 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    // Add event channel to tool context so tools can emit events
     let tool_context = tool_context.with_event_tx(tx.clone());
     let start_time = Instant::now();
 
-    // Initialize state from input
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
             Ok(s) => s,
@@ -1306,112 +1293,23 @@ where
         resume_data,
     } = init_state;
 
-    // Handle resume case - complete the pending tool calls
-    if let Some(ResumeData {
-        continuation: cont,
-        tool_call_id,
-        confirmed,
-        rejection_reason,
-    }) = resume_data
-    {
-        let mut tool_results = cont.completed_results.clone();
-        let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
-
-        // Validate tool_call_id matches
-        if awaiting_tool.id != tool_call_id {
-            return TurnOutcome::Error(AgentError::new(
-                format!(
-                    "Tool call ID mismatch: expected {}, got {}",
-                    awaiting_tool.id, tool_call_id
-                ),
-                false,
-            ));
-        }
-
-        // Execute the confirmed/rejected tool
-        let result = execute_confirmed_tool(
-            awaiting_tool,
-            confirmed,
-            rejection_reason,
-            &tool_context,
-            &tools,
-            &hooks,
-            &tx,
-        )
-        .await;
-        tool_results.push((awaiting_tool.id.clone(), result));
-
-        // Process remaining tool calls after the confirmed one
-        for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
-            match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
-                ToolExecutionOutcome::Completed { tool_id, result } => {
-                    tool_results.push((tool_id, result));
-                }
-                ToolExecutionOutcome::RequiresConfirmation {
-                    tool_id,
-                    tool_name,
-                    display_name,
-                    input,
-                    description,
-                } => {
-                    let pending_idx = cont
-                        .pending_tool_calls
-                        .iter()
-                        .position(|p| p.id == tool_id)
-                        .unwrap_or(0);
-
-                    let new_continuation = AgentContinuation {
-                        thread_id: thread_id.clone(),
-                        turn,
-                        total_usage: total_usage.clone(),
-                        turn_usage: cont.turn_usage.clone(),
-                        pending_tool_calls: cont.pending_tool_calls.clone(),
-                        awaiting_index: pending_idx,
-                        completed_results: tool_results,
-                        state: state.clone(),
-                    };
-
-                    return TurnOutcome::AwaitingConfirmation {
-                        tool_call_id: tool_id,
-                        tool_name,
-                        display_name,
-                        input,
-                        description,
-                        continuation: Box::new(new_continuation),
-                    };
-                }
-            }
-        }
-
-        // Append tool results to message history
-        if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
-            return TurnOutcome::Error(e);
-        }
-
-        // Emit turn complete
-        let _ = tx
-            .send(AgentEvent::TurnComplete {
-                turn,
-                usage: cont.turn_usage.clone(),
-            })
-            .await;
-
-        // Save state after completing the resume
-        let mut updated_state = state;
-        updated_state.turn_count = turn;
-        if let Err(e) = state_store.save(&updated_state).await {
-            warn!(error = %e, "Failed to save state checkpoint");
-        }
-
-        // Return NeedsMoreTurns since we completed tool execution but need another LLM call
-        return TurnOutcome::NeedsMoreTurns {
+    if let Some(resume_data_val) = resume_data {
+        return handle_resume_case(ResumeCaseParameters {
+            resume_data: resume_data_val,
             turn,
-            turn_usage: cont.turn_usage.clone(),
             total_usage,
-        };
+            state,
+            thread_id,
+            tool_context,
+            tools,
+            hooks,
+            tx,
+            message_store,
+            state_store,
+        })
+        .await;
     }
 
-    // Create turn context for execution
     let mut ctx = TurnContext {
         thread_id: thread_id.clone(),
         turn,
@@ -1420,7 +1318,6 @@ where
         start_time,
     };
 
-    // Execute a single turn
     let result = execute_turn(
         &tx,
         &mut ctx,
@@ -1487,6 +1384,139 @@ where
             continuation,
         },
         InternalTurnResult::Error(e) => TurnOutcome::Error(e),
+    }
+}
+
+struct ResumeCaseParameters<Ctx, H, M, S> {
+    resume_data: ResumeData,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    thread_id: ThreadId,
+    tool_context: ToolContext<Ctx>,
+    tools: Arc<ToolRegistry<Ctx>>,
+    hooks: Arc<H>,
+    tx: mpsc::Sender<AgentEvent>,
+    message_store: Arc<M>,
+    state_store: Arc<S>,
+}
+
+async fn handle_resume_case<Ctx, H, M, S>(
+    ResumeCaseParameters {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        message_store,
+        state_store,
+    }: ResumeCaseParameters<Ctx, H, M, S>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    let ResumeData {
+        continuation: cont,
+        tool_call_id,
+        confirmed,
+        rejection_reason,
+    } = resume_data;
+    // Handle resume case - complete the pending tool calls
+    let mut tool_results = cont.completed_results.clone();
+    let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
+
+    // Validate tool_call_id matches
+    if awaiting_tool.id != tool_call_id {
+        return TurnOutcome::Error(AgentError::new(
+            format!(
+                "Tool call ID mismatch: expected {}, got {}",
+                awaiting_tool.id, tool_call_id
+            ),
+            false,
+        ));
+    }
+
+    let result = execute_confirmed_tool(
+        awaiting_tool,
+        confirmed,
+        rejection_reason,
+        &tool_context,
+        &tools,
+        &hooks,
+        &tx,
+    )
+    .await;
+    tool_results.push((awaiting_tool.id.clone(), result));
+
+    for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
+        match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
+            ToolExecutionOutcome::Completed { tool_id, result } => {
+                tool_results.push((tool_id, result));
+            }
+            ToolExecutionOutcome::RequiresConfirmation {
+                tool_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+            } => {
+                let pending_idx = cont
+                    .pending_tool_calls
+                    .iter()
+                    .position(|p| p.id == tool_id)
+                    .unwrap_or(0);
+
+                let new_continuation = AgentContinuation {
+                    thread_id: thread_id.clone(),
+                    turn,
+                    total_usage: total_usage.clone(),
+                    turn_usage: cont.turn_usage.clone(),
+                    pending_tool_calls: cont.pending_tool_calls.clone(),
+                    awaiting_index: pending_idx,
+                    completed_results: tool_results,
+                    state: state.clone(),
+                };
+
+                return TurnOutcome::AwaitingConfirmation {
+                    tool_call_id: tool_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                    continuation: Box::new(new_continuation),
+                };
+            }
+        }
+    }
+
+    if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
+        return TurnOutcome::Error(e);
+    }
+
+    let _ = tx
+        .send(AgentEvent::TurnComplete {
+            turn,
+            usage: cont.turn_usage.clone(),
+        })
+        .await;
+
+    let mut updated_state = state;
+    updated_state.turn_count = turn;
+    if let Err(e) = state_store.save(&updated_state).await {
+        warn!(error = %e, "Failed to save state checkpoint");
+    }
+
+    TurnOutcome::NeedsMoreTurns {
+        turn,
+        turn_usage: cont.turn_usage.clone(),
+        total_usage,
     }
 }
 
