@@ -595,7 +595,7 @@ where
     ///
     /// A tuple of:
     /// - `mpsc::Receiver<AgentEvent>` - Channel for streaming events from this turn
-    /// - `oneshot::Receiver<TurnOutcome>` - Channel for the turn's outcome
+    /// - `TurnOutcome` - The turn's outcome
     ///
     /// # Turn Outcomes
     ///
@@ -612,13 +612,13 @@ where
     ///     thread_id.clone(),
     ///     AgentInput::Text("What is 2+2?".to_string()),
     ///     tool_ctx.clone(),
-    /// );
+    /// ).await;
     ///
     /// // Process events...
     /// while let Some(event) = events.recv().await { /* ... */ }
     ///
     /// // Check outcome
-    /// match outcome.await.unwrap() {
+    /// match outcome {
     ///     TurnOutcome::NeedsMoreTurns { turn, .. } => {
     ///         // Dispatch another message to continue
     ///         // (e.g., schedule an Artemis message)
@@ -634,20 +634,16 @@ where
     ///     }
     /// }
     /// ```
-    pub fn run_turn(
+    pub async fn run_turn(
         &self,
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (
-        mpsc::Receiver<AgentEvent>,
-        tokio::sync::oneshot::Receiver<TurnOutcome>,
-    )
+    ) -> (mpsc::Receiver<AgentEvent>, TurnOutcome)
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -657,26 +653,22 @@ where
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
 
-        tokio::spawn(async move {
-            let result = run_single_turn(
-                event_tx,
-                thread_id,
-                input,
-                tool_context,
-                provider,
-                tools,
-                hooks,
-                message_store,
-                state_store,
-                config,
-                compaction_config,
-            )
-            .await;
+        let result = run_single_turn(TurnParameters {
+            tx: event_tx,
+            thread_id,
+            input,
+            tool_context,
+            provider,
+            tools,
+            hooks,
+            message_store,
+            state_store,
+            config,
+            compaction_config,
+        })
+        .await;
 
-            let _ = outcome_tx.send(result);
-        });
-
-        (event_rx, outcome_rx)
+        (event_rx, result)
     }
 }
 
@@ -1255,13 +1247,7 @@ where
     }
 }
 
-/// Run a single turn of the agent loop.
-///
-/// This is similar to `run_loop` but only executes one turn and returns.
-/// The caller is responsible for continuing execution by calling again with
-/// `AgentInput::Continue`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_single_turn<Ctx, P, H, M, S>(
+struct TurnParameters<Ctx, P, H, M, S> {
     tx: mpsc::Sender<AgentEvent>,
     thread_id: ThreadId,
     input: AgentInput,
@@ -1273,6 +1259,27 @@ async fn run_single_turn<Ctx, P, H, M, S>(
     state_store: Arc<S>,
     config: AgentConfig,
     compaction_config: Option<CompactionConfig>,
+}
+
+/// Run a single turn of the agent loop.
+///
+/// This is similar to `run_loop` but only executes one turn and returns.
+/// The caller is responsible for continuing execution by calling again with
+/// `AgentInput::Continue`.
+async fn run_single_turn<Ctx, P, H, M, S>(
+    TurnParameters {
+        tx,
+        thread_id,
+        input,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        config,
+        compaction_config,
+    }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1300,13 +1307,13 @@ where
     } = init_state;
 
     // Handle resume case - complete the pending tool calls
-    if let Some(resume) = resume_data {
-        let ResumeData {
-            continuation: cont,
-            tool_call_id,
-            confirmed,
-            rejection_reason,
-        } = resume;
+    if let Some(ResumeData {
+        continuation: cont,
+        tool_call_id,
+        confirmed,
+        rejection_reason,
+    }) = resume_data
+    {
         let mut tool_results = cont.completed_results.clone();
         let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
