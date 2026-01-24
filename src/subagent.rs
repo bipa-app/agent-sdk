@@ -101,6 +101,8 @@ impl SubagentConfig {
 pub struct ToolCallLog {
     /// Tool name.
     pub name: String,
+    /// Tool display name.
+    pub display_name: String,
     /// Brief context/args (e.g., file path, command).
     pub context: String,
     /// Brief result summary.
@@ -330,7 +332,12 @@ where
                                 .await;
                         }
                     }
-                    AgentEvent::ToolCallEnd { id, name, result } => {
+                    AgentEvent::ToolCallEnd {
+                        id,
+                        name,
+                        display_name,
+                        result,
+                    } => {
                         // Create log entry when tool completes
                         let context = pending_tools
                             .remove(&id)
@@ -340,6 +347,7 @@ where
                         let tool_success = result.success;
                         tool_logs.push(ToolCallLog {
                             name: name.clone(),
+                            display_name: display_name.clone(),
                             context: context.clone(),
                             result: result_summary,
                             success: tool_success,
@@ -605,6 +613,7 @@ mod tests {
             tool_logs: vec![
                 ToolCallLog {
                     name: "read".to_string(),
+                    display_name: "Read file".to_string(),
                     context: "/tmp/test.rs".to_string(),
                     result: "50 lines".to_string(),
                     success: true,
@@ -612,6 +621,7 @@ mod tests {
                 },
                 ToolCallLog {
                     name: "grep".to_string(),
+                    display_name: "Grep TODO".to_string(),
                     context: "TODO".to_string(),
                     result: "3 matches".to_string(),
                     success: true,
@@ -641,6 +651,7 @@ mod tests {
             tool_count: 5,
             tool_logs: vec![ToolCallLog {
                 name: "glob".to_string(),
+                display_name: "Glob config files".to_string(),
                 context: "**/*.toml".to_string(),
                 result: "3 files".to_string(),
                 success: true,

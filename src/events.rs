@@ -37,6 +37,7 @@ pub enum AgentEvent {
     ToolCallStart {
         id: String,
         name: String,
+        display_name: String,
         input: serde_json::Value,
         tier: ToolTier,
     },
@@ -45,6 +46,7 @@ pub enum AgentEvent {
     ToolCallEnd {
         id: String,
         name: String,
+        display_name: String,
         result: ToolResult,
     },
 
@@ -131,12 +133,14 @@ impl AgentEvent {
     pub fn tool_call_start(
         id: impl Into<String>,
         name: impl Into<String>,
+        display_name: impl Into<String>,
         input: serde_json::Value,
         tier: ToolTier,
     ) -> Self {
         Self::ToolCallStart {
             id: id.into(),
             name: name.into(),
+            display_name: display_name.into(),
             input,
             tier,
         }
@@ -146,11 +150,13 @@ impl AgentEvent {
     pub fn tool_call_end(
         id: impl Into<String>,
         name: impl Into<String>,
+        display_name: impl Into<String>,
         result: ToolResult,
     ) -> Self {
         Self::ToolCallEnd {
             id: id.into(),
             name: name.into(),
+            display_name: display_name.into(),
             result,
         }
     }

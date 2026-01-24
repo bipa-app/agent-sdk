@@ -805,6 +805,7 @@ where
         .send(AgentEvent::tool_call_start(
             &pending.id,
             &pending.name,
+            &pending.display_name,
             pending.input.clone(),
             tier,
         ))
@@ -833,6 +834,7 @@ where
                 .send(AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
+                    &pending.display_name,
                     result.clone(),
                 ))
                 .await;
@@ -848,6 +850,7 @@ where
                 .send(AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
+                    &pending.display_name,
                     result.clone(),
                 ))
                 .await;
@@ -914,6 +917,7 @@ where
                 .send(AgentEvent::tool_call_end(
                     &awaiting_tool.id,
                     &awaiting_tool.name,
+                    &awaiting_tool.display_name,
                     result.clone(),
                 ))
                 .await;
@@ -929,6 +933,7 @@ where
             .send(AgentEvent::tool_call_end(
                 &awaiting_tool.id,
                 &awaiting_tool.name,
+                &awaiting_tool.display_name,
                 result.clone(),
             ))
             .await;
@@ -1709,6 +1714,7 @@ where
             .send(AgentEvent::tool_call_start(
                 &pending.id,
                 &pending.name,
+                &pending.display_name,
                 pending.input.clone(),
                 tier,
             ))
@@ -1737,6 +1743,7 @@ where
                     .send(AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
+                        &pending.display_name,
                         result.clone(),
                     ))
                     .await;
@@ -1749,6 +1756,7 @@ where
                     .send(AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
+                        &pending.display_name,
                         result.clone(),
                     ))
                     .await;
