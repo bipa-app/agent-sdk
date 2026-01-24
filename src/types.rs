@@ -274,7 +274,7 @@ pub enum AgentRunState {
 }
 
 /// Information about a pending tool call that was extracted from the LLM response.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingToolCallInfo {
     /// Unique ID for this tool call (from LLM)
     pub id: String,
@@ -290,7 +290,7 @@ pub struct PendingToolCallInfo {
 ///
 /// This contains all the internal state needed to continue execution
 /// after receiving a confirmation decision. Pass this back when resuming.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentContinuation {
     /// Thread ID (used for validation on resume)
     pub thread_id: ThreadId,
