@@ -1576,6 +1576,12 @@ where
     let mut messages = match message_store.get_history(&ctx.thread_id).await {
         Ok(m) => m,
         Err(e) => {
+            let _ = tx
+                .send(AgentEvent::error(
+                    format!("Failed to get history: {e}"),
+                    false,
+                ))
+                .await;
             return InternalTurnResult::Error(AgentError::new(
                 format!("Failed to get history: {e}"),
                 false,
@@ -1675,6 +1681,12 @@ where
     // Store assistant message with tool uses
     let assistant_msg = build_assistant_message(&response);
     if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
+        let _ = tx
+            .send(AgentEvent::error(
+                format!("Failed to append assistant message: {e}"),
+                false,
+            ))
+            .await;
         return InternalTurnResult::Error(AgentError::new(
             format!("Failed to append assistant message: {e}"),
             false,
@@ -1798,6 +1810,12 @@ where
 
     // Add tool results to message history
     if let Err(e) = append_tool_results(&tool_results, &ctx.thread_id, message_store).await {
+        let _ = tx
+            .send(AgentEvent::error(
+                format!("Failed to append tool results: {e}"),
+                false,
+            ))
+            .await;
         return InternalTurnResult::Error(e);
     }
 
