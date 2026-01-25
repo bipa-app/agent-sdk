@@ -13,6 +13,7 @@
 //! - [`AgentContinuation`]: Opaque state for resuming after confirmation
 //! - [`AgentState`]: Checkpointable agent state
 
+use crate::llm::ThinkingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -59,6 +60,8 @@ pub struct AgentConfig {
     pub model: String,
     /// Retry configuration for transient errors
     pub retry: RetryConfig,
+    /// Optional extended thinking configuration
+    pub thinking: Option<ThinkingConfig>,
 }
 
 impl Default for AgentConfig {
@@ -69,6 +72,7 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-20250514"),
             retry: RetryConfig::default(),
+            thinking: None,
         }
     }
 }

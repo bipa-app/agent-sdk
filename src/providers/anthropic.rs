@@ -74,26 +74,30 @@ impl AnthropicProvider {
                     Content::Blocks(blocks) => ApiMessageContent::Blocks(
                         blocks
                             .iter()
-                            .map(|b| match b {
+                            .filter_map(|b| match b {
                                 ContentBlock::Text { text } => {
-                                    ApiContentBlockInput::Text { text: text.clone() }
+                                    Some(ApiContentBlockInput::Text { text: text.clone() })
+                                }
+                                ContentBlock::Thinking { .. } => {
+                                    // Thinking blocks are ephemeral - not sent back to API
+                                    None
                                 }
                                 ContentBlock::ToolUse {
                                     id, name, input, ..
-                                } => ApiContentBlockInput::ToolUse {
+                                } => Some(ApiContentBlockInput::ToolUse {
                                     id: id.clone(),
                                     name: name.clone(),
                                     input: input.clone(),
-                                },
+                                }),
                                 ContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
                                     is_error,
-                                } => ApiContentBlockInput::ToolResult {
+                                } => Some(ApiContentBlockInput::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
                                     content: content.clone(),
                                     is_error: *is_error,
-                                },
+                                }),
                             })
                             .collect(),
                     ),
@@ -122,6 +126,10 @@ impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let messages = Self::build_api_messages(&request);
         let tools = Self::build_api_tools(&request);
+        let thinking = request
+            .thinking
+            .as_ref()
+            .map(ApiThinkingConfig::from_thinking_config);
 
         let api_request = ApiMessagesRequest {
             model: &self.model,
@@ -130,6 +138,7 @@ impl LlmProvider for AnthropicProvider {
             messages: &messages,
             tools: tools.as_deref(),
             stream: false,
+            thinking,
         };
 
         tracing::debug!(
@@ -185,6 +194,9 @@ impl LlmProvider for AnthropicProvider {
             .into_iter()
             .map(|b| match b {
                 ApiResponseContentBlock::Text { text } => ContentBlock::Text { text },
+                ApiResponseContentBlock::Thinking { thinking } => {
+                    ContentBlock::Thinking { thinking }
+                }
                 ApiResponseContentBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
                     id,
                     name,
@@ -217,6 +229,10 @@ impl LlmProvider for AnthropicProvider {
         Box::pin(async_stream::stream! {
             let messages = Self::build_api_messages(&request);
             let tools = Self::build_api_tools(&request);
+            let thinking = request
+                .thinking
+                .as_ref()
+                .map(ApiThinkingConfig::from_thinking_config);
 
             let api_request = ApiMessagesRequest {
                 model: &self.model,
@@ -225,6 +241,7 @@ impl LlmProvider for AnthropicProvider {
                 messages: &messages,
                 tools: tools.as_deref(),
                 stream: true,
+                thinking,
             };
 
             tracing::debug!(
@@ -374,13 +391,19 @@ fn parse_sse_event(
         Some("content_block_delta") => {
             if let Ok(event) = serde_json::from_str::<SseContentBlockDelta>(data) {
                 match event.delta {
-                    SseDelta::TextDelta { text } => {
+                    SseDelta::Text { text } => {
                         return Some(StreamDelta::TextDelta {
                             delta: text,
                             block_index: event.index,
                         });
                     }
-                    SseDelta::InputJsonDelta { partial_json } => {
+                    SseDelta::Thinking { thinking } => {
+                        return Some(StreamDelta::ThinkingDelta {
+                            delta: thinking,
+                            block_index: event.index,
+                        });
+                    }
+                    SseDelta::InputJson { partial_json } => {
                         // Look up the tool ID from the content_block_start event
                         let id = tool_ids.get(&event.index).cloned().unwrap_or_default();
                         return Some(StreamDelta::ToolInputDelta {
@@ -431,6 +454,25 @@ struct ApiMessagesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ApiThinkingConfig>,
+}
+
+/// Configuration for extended thinking in the API request.
+#[derive(Serialize)]
+struct ApiThinkingConfig {
+    #[serde(rename = "type")]
+    config_type: &'static str,
+    budget_tokens: u32,
+}
+
+impl ApiThinkingConfig {
+    const fn from_thinking_config(config: &crate::llm::ThinkingConfig) -> Self {
+        Self {
+            config_type: "enabled",
+            budget_tokens: config.budget_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -498,6 +540,8 @@ struct ApiResponse {
 enum ApiResponseContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -551,6 +595,8 @@ struct SseContentBlockStart {
 enum SseContentBlock {
     #[serde(rename = "text")]
     Text,
+    #[serde(rename = "thinking")]
+    Thinking,
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
 }
@@ -565,9 +611,11 @@ struct SseContentBlockDelta {
 #[serde(tag = "type")]
 enum SseDelta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    InputJson { partial_json: String },
 }
 
 #[derive(Deserialize)]
@@ -750,6 +798,7 @@ mod tests {
             messages: &messages,
             tools: None,
             stream: true,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -805,7 +854,9 @@ mod tests {
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "test.txt");
             }
-            ApiResponseContentBlock::Text { .. } => panic!("Expected ToolUse content block"),
+            ApiResponseContentBlock::Text { .. } | ApiResponseContentBlock::Thinking { .. } => {
+                panic!("Expected ToolUse content block")
+            }
         }
     }
 
@@ -974,12 +1025,10 @@ data: {"type":"message_stop"}"#;
     fn test_sse_delta_types_deserialization() {
         let text_delta: SseDelta =
             serde_json::from_str(r#"{"type":"text_delta","text":"Hello"}"#).unwrap();
-        assert!(matches!(text_delta, SseDelta::TextDelta { text } if text == "Hello"));
+        assert!(matches!(text_delta, SseDelta::Text { text } if text == "Hello"));
 
         let json_delta: SseDelta =
             serde_json::from_str(r#"{"type":"input_json_delta","partial_json":"{}"}"#).unwrap();
-        assert!(
-            matches!(json_delta, SseDelta::InputJsonDelta { partial_json } if partial_json == "{}")
-        );
+        assert!(matches!(json_delta, SseDelta::InputJson { partial_json } if partial_json == "{}"));
     }
 }

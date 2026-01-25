@@ -1646,6 +1646,7 @@ where
         messages,
         tools: llm_tools,
         max_tokens: config.max_tokens,
+        thinking: config.thinking.clone(),
     };
 
     // Call LLM with retry logic
@@ -1664,7 +1665,15 @@ where
     ctx.state.total_usage = ctx.total_usage.clone();
 
     // Process response content
-    let (text_content, tool_uses) = extract_content(&response);
+    let (thinking_content, text_content, tool_uses) = extract_content(&response);
+
+    // Emit thinking if present (before text)
+    if let Some(thinking) = &thinking_content {
+        let _ = tx.send(AgentEvent::thinking(thinking.clone())).await;
+        hooks
+            .on_event(&AgentEvent::thinking(thinking.clone()))
+            .await;
+    }
 
     // Emit text if present
     if let Some(text) = &text_content {
@@ -1873,9 +1882,16 @@ fn calculate_backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
     Duration::from_millis(delay_ms)
 }
 
-fn extract_content(
-    response: &ChatResponse,
-) -> (Option<String>, Vec<(String, String, serde_json::Value)>) {
+/// Extracted content from an LLM response: (thinking, text, `tool_uses`).
+type ExtractedContent = (
+    Option<String>,
+    Option<String>,
+    Vec<(String, String, serde_json::Value)>,
+);
+
+/// Extract content from an LLM response.
+fn extract_content(response: &ChatResponse) -> ExtractedContent {
+    let mut thinking_parts = Vec::new();
     let mut text_parts = Vec::new();
     let mut tool_uses = Vec::new();
 
@@ -1883,6 +1899,9 @@ fn extract_content(
         match block {
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
+            }
+            ContentBlock::Thinking { thinking } => {
+                thinking_parts.push(thinking.clone());
             }
             ContentBlock::ToolUse {
                 id, name, input, ..
@@ -1895,13 +1914,19 @@ fn extract_content(
         }
     }
 
+    let thinking = if thinking_parts.is_empty() {
+        None
+    } else {
+        Some(thinking_parts.join("\n"))
+    };
+
     let text = if text_parts.is_empty() {
         None
     } else {
         Some(text_parts.join("\n"))
     };
 
-    (text, tool_uses)
+    (thinking, text, tool_uses)
 }
 
 fn build_assistant_message(response: &ChatResponse) -> Message {
@@ -1911,6 +1936,10 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
         match block {
             ContentBlock::Text { text } => {
                 blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } => {
+                // Thinking blocks are ephemeral - not stored in conversation history
+                // ToolResult shouldn't appear in response, but ignore if it does
             }
             ContentBlock::ToolUse {
                 id,
@@ -1925,7 +1954,6 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
                     thought_signature: thought_signature.clone(),
                 });
             }
-            ContentBlock::ToolResult { .. } => {}
         }
     }
 
@@ -2493,7 +2521,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert_eq!(text, Some("Hello".to_string()));
         assert!(tool_uses.is_empty());
     }
@@ -2516,7 +2545,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert!(text.is_none());
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].1, "test_tool");
@@ -2545,7 +2575,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert_eq!(text, Some("Let me help".to_string()));
         assert_eq!(tool_uses.len(), 1);
     }

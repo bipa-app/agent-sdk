@@ -22,6 +22,14 @@ pub enum StreamDelta {
         block_index: usize,
     },
 
+    /// A thinking delta for streaming thinking/reasoning content.
+    ThinkingDelta {
+        /// The thinking fragment to append
+        delta: String,
+        /// Index of the content block being streamed
+        block_index: usize,
+    },
+
     /// Start of a tool use block (name and id are known).
     ToolUseStart {
         /// Unique identifier for this tool call
@@ -71,6 +79,8 @@ pub type StreamBox<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<StreamDelta>> 
 pub struct StreamAccumulator {
     /// Accumulated text for each block index
     text_blocks: Vec<String>,
+    /// Accumulated thinking blocks for each block index
+    thinking_blocks: Vec<String>,
     /// Accumulated tool use calls
     tool_uses: Vec<ToolUseAccumulator>,
     /// Usage information from the stream
@@ -107,6 +117,12 @@ impl StreamAccumulator {
                     self.text_blocks.push(String::new());
                 }
                 self.text_blocks[*block_index].push_str(delta);
+            }
+            StreamDelta::ThinkingDelta { delta, block_index } => {
+                while self.thinking_blocks.len() <= *block_index {
+                    self.thinking_blocks.push(String::new());
+                }
+                self.thinking_blocks[*block_index].push_str(delta);
             }
             StreamDelta::ToolUseStart {
                 id,
@@ -154,6 +170,13 @@ impl StreamAccumulator {
     #[must_use]
     pub fn into_content_blocks(self) -> Vec<ContentBlock> {
         let mut blocks: Vec<(usize, ContentBlock)> = Vec::new();
+
+        // Add thinking blocks with their indices
+        for (idx, thinking) in self.thinking_blocks.into_iter().enumerate() {
+            if !thinking.is_empty() {
+                blocks.push((idx, ContentBlock::Thinking { thinking }));
+            }
+        }
 
         // Add text blocks with their indices
         for (idx, text) in self.text_blocks.into_iter().enumerate() {

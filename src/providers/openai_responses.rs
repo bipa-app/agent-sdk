@@ -367,6 +367,9 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                                 content: ApiMessageContent::Text(text.clone()),
                             }));
                         }
+                        ContentBlock::Thinking { .. } => {
+                            // Thinking blocks are ephemeral - not sent back to API
+                        }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {

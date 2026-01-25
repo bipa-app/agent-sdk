@@ -563,6 +563,9 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.clone());
                         }
+                        ContentBlock::Thinking { .. } => {
+                            // Thinking blocks are ephemeral - not sent back to API
+                        }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
@@ -1183,6 +1186,7 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            thinking: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -1203,6 +1207,7 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            thinking: None,
         };
 
         let api_messages = build_api_messages(&request);

@@ -61,6 +61,7 @@ where
             messages: vec![Message::user(classification_prompt)],
             tools: None,
             max_tokens: 50,
+            thinking: None,
         };
 
         match self.classifier.chat(classification_request).await? {
