@@ -97,6 +97,10 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
                             ContentBlock::Text { text } => {
                                 let _ = writeln!(output, "{text}");
                             }
+                            ContentBlock::Thinking { thinking } => {
+                                // Include thinking in summaries for context
+                                let _ = writeln!(output, "[Thinking: {thinking}]");
+                            }
                             ContentBlock::ToolUse { name, input, .. } => {
                                 let _ = writeln!(
                                     output,
@@ -161,6 +165,7 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
             messages: vec![Message::user(prompt)],
             tools: None,
             max_tokens: 2000,
+            thinking: None,
         };
 
         let outcome = self

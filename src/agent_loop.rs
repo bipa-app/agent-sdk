@@ -830,14 +830,17 @@ where
 
             hooks.post_tool_use(&pending.name, &result).await;
 
-            let _ = tx
-                .send(AgentEvent::tool_call_end(
+            send_event(
+                tx,
+                hooks,
+                AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
                     &pending.display_name,
                     result.clone(),
-                ))
-                .await;
+                ),
+            )
+            .await;
 
             ToolExecutionOutcome::Completed {
                 tool_id: pending.id.clone(),
@@ -846,28 +849,34 @@ where
         }
         ToolDecision::Block(reason) => {
             let result = ToolResult::error(format!("Blocked: {reason}"));
-            let _ = tx
-                .send(AgentEvent::tool_call_end(
+            send_event(
+                tx,
+                hooks,
+                AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
                     &pending.display_name,
                     result.clone(),
-                ))
-                .await;
+                ),
+            )
+            .await;
             ToolExecutionOutcome::Completed {
                 tool_id: pending.id.clone(),
                 result,
             }
         }
         ToolDecision::RequiresConfirmation(description) => {
-            let _ = tx
-                .send(AgentEvent::ToolRequiresConfirmation {
+            send_event(
+                tx,
+                hooks,
+                AgentEvent::ToolRequiresConfirmation {
                     id: pending.id.clone(),
                     name: pending.name.clone(),
                     input: pending.input.clone(),
                     description: description.clone(),
-                })
-                .await;
+                },
+            )
+            .await;
 
             ToolExecutionOutcome::RequiresConfirmation {
                 tool_id: pending.id.clone(),
@@ -929,14 +938,17 @@ where
     } else {
         let reason = rejection_reason.unwrap_or_else(|| "User rejected".to_string());
         let result = ToolResult::error(format!("Rejected: {reason}"));
-        let _ = tx
-            .send(AgentEvent::tool_call_end(
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::tool_call_end(
                 &awaiting_tool.id,
                 &awaiting_tool.name,
                 &awaiting_tool.display_name,
                 result.clone(),
-            ))
-            .await;
+            ),
+        )
+        .await;
         result
     }
 }
@@ -963,14 +975,16 @@ where
 }
 
 /// Call the LLM with retry logic for rate limits and server errors.
-async fn call_llm_with_retry<P>(
+async fn call_llm_with_retry<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
     config: &AgentConfig,
     tx: &mpsc::Sender<AgentEvent>,
+    hooks: &Arc<H>,
 ) -> Result<ChatResponse, AgentError>
 where
     P: LlmProvider,
+    H: AgentHooks,
 {
     let max_retries = config.retry.max_retries;
     let mut attempt = 0u32;
@@ -990,7 +1004,7 @@ where
                 if attempt > max_retries {
                     error!("Rate limited by LLM provider after {max_retries} retries");
                     let error_msg = format!("Rate limited after {max_retries} retries");
-                    let _ = tx.send(AgentEvent::error(&error_msg, true)).await;
+                    send_event(tx, hooks, AgentEvent::error(&error_msg, true)).await;
                     return Err(AgentError::new(error_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
@@ -1016,7 +1030,7 @@ where
                 if attempt > max_retries {
                     error!(msg, "LLM server error after {max_retries} retries");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
-                    let _ = tx.send(AgentEvent::error(&error_msg, true)).await;
+                    send_event(tx, hooks, AgentEvent::error(&error_msg, true)).await;
                     return Err(AgentError::new(error_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
@@ -1026,12 +1040,15 @@ where
                     error = msg,
                     "Server error, retrying after backoff"
                 );
-                let _ = tx
-                    .send(AgentEvent::text(format!(
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::text(format!(
                         "\n[Server error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
                         delay.as_secs_f64()
-                    )))
-                    .await;
+                    )),
+                )
+                .await;
                 sleep(delay).await;
             }
         }
@@ -1092,13 +1109,13 @@ where
         let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
         if awaiting_tool.id != tool_call_id {
-            return AgentRunState::Error(AgentError::new(
-                format!(
-                    "Tool call ID mismatch: expected {}, got {}",
-                    awaiting_tool.id, tool_call_id
-                ),
-                false,
-            ));
+            let message = format!(
+                "Tool call ID mismatch: expected {}, got {}",
+                awaiting_tool.id, tool_call_id
+            );
+            let recoverable = false;
+            send_event(&tx, &hooks, AgentEvent::error(&message, recoverable)).await;
+            return AgentRunState::Error(AgentError::new(&message, recoverable));
         }
 
         let result = execute_confirmed_tool(
@@ -1155,15 +1172,27 @@ where
         }
 
         if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
+            send_event(
+                &tx,
+                &hooks,
+                AgentEvent::Error {
+                    message: e.message.clone(),
+                    recoverable: e.recoverable,
+                },
+            )
+            .await;
             return AgentRunState::Error(e);
         }
 
-        let _ = tx
-            .send(AgentEvent::TurnComplete {
+        send_event(
+            &tx,
+            &hooks,
+            AgentEvent::TurnComplete {
                 turn,
                 usage: cont.turn_usage.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let mut ctx = TurnContext {
@@ -1225,14 +1254,12 @@ where
     }
 
     let duration = ctx.start_time.elapsed();
-    let _ = tx
-        .send(AgentEvent::done(
-            thread_id,
-            ctx.turn,
-            ctx.total_usage.clone(),
-            duration,
-        ))
-        .await;
+    send_event(
+        &tx,
+        &hooks,
+        AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
+    )
+    .await;
 
     AgentRunState::Done {
         total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
@@ -1288,7 +1315,10 @@ where
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
             Ok(s) => s,
-            Err(e) => return TurnOutcome::Error(e),
+            Err(e) => {
+                send_event(&tx, &hooks, AgentEvent::error(&e.message, e.recoverable)).await;
+                return TurnOutcome::Error(e);
+            }
         };
 
     let InitializedState {
@@ -1358,14 +1388,12 @@ where
 
             // Emit done
             let duration = ctx.start_time.elapsed();
-            let _ = tx
-                .send(AgentEvent::done(
-                    thread_id,
-                    ctx.turn,
-                    ctx.total_usage.clone(),
-                    duration,
-                ))
-                .await;
+            send_event(
+                &tx,
+                &hooks,
+                AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
+            )
+            .await;
 
             TurnOutcome::Done {
                 total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
@@ -1439,13 +1467,13 @@ where
 
     // Validate tool_call_id matches
     if awaiting_tool.id != tool_call_id {
-        return TurnOutcome::Error(AgentError::new(
-            format!(
-                "Tool call ID mismatch: expected {}, got {}",
-                awaiting_tool.id, tool_call_id
-            ),
-            false,
-        ));
+        let message = format!(
+            "Tool call ID mismatch: expected {}, got {}",
+            awaiting_tool.id, tool_call_id
+        );
+        let recoverable = false;
+        send_event(&tx, &hooks, AgentEvent::error(&message, recoverable)).await;
+        return TurnOutcome::Error(AgentError::new(&message, recoverable));
     }
 
     let result = execute_confirmed_tool(
@@ -1502,15 +1530,19 @@ where
     }
 
     if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
+        send_event(&tx, &hooks, AgentEvent::error(&e.message, e.recoverable)).await;
         return TurnOutcome::Error(e);
     }
 
-    let _ = tx
-        .send(AgentEvent::TurnComplete {
+    send_event(
+        &tx,
+        &hooks,
+        AgentEvent::TurnComplete {
             turn,
             usage: cont.turn_usage.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut updated_state = state;
     updated_state.turn_count = turn;
@@ -1552,12 +1584,15 @@ where
 
     if ctx.turn > config.max_turns {
         warn!(turn = ctx.turn, max = config.max_turns, "Max turns reached");
-        let _ = tx
-            .send(AgentEvent::error(
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::error(
                 format!("Maximum turns ({}) reached", config.max_turns),
                 true,
-            ))
-            .await;
+            ),
+        )
+        .await;
         return InternalTurnResult::Error(AgentError::new(
             format!("Maximum turns ({}) reached", config.max_turns),
             true,
@@ -1565,23 +1600,23 @@ where
     }
 
     // Emit start event
-    let _ = tx
-        .send(AgentEvent::start(ctx.thread_id.clone(), ctx.turn))
-        .await;
-    hooks
-        .on_event(&AgentEvent::start(ctx.thread_id.clone(), ctx.turn))
-        .await;
+    send_event(
+        tx,
+        hooks,
+        AgentEvent::start(ctx.thread_id.clone(), ctx.turn),
+    )
+    .await;
 
     // Get message history
     let mut messages = match message_store.get_history(&ctx.thread_id).await {
         Ok(m) => m,
         Err(e) => {
-            let _ = tx
-                .send(AgentEvent::error(
-                    format!("Failed to get history: {e}"),
-                    false,
-                ))
-                .await;
+            send_event(
+                tx,
+                hooks,
+                AgentEvent::error(format!("Failed to get history: {e}"), false),
+            )
+            .await;
             return InternalTurnResult::Error(AgentError::new(
                 format!("Failed to get history: {e}"),
                 false,
@@ -1607,14 +1642,17 @@ where
                     {
                         warn!(error = %e, "Failed to replace history after compaction");
                     } else {
-                        let _ = tx
-                            .send(AgentEvent::context_compacted(
+                        send_event(
+                            tx,
+                            hooks,
+                            AgentEvent::context_compacted(
                                 result.original_count,
                                 result.new_count,
                                 result.original_tokens,
                                 result.new_tokens,
-                            ))
-                            .await;
+                            ),
+                        )
+                        .await;
 
                         info!(
                             original_count = result.original_count,
@@ -1646,13 +1684,16 @@ where
         messages,
         tools: llm_tools,
         max_tokens: config.max_tokens,
+        thinking: config.thinking.clone(),
     };
 
     // Call LLM with retry logic
     debug!(turn = ctx.turn, "Calling LLM");
-    let response = match call_llm_with_retry(provider, request, config, tx).await {
+    let response = match call_llm_with_retry(provider, request, config, tx, hooks).await {
         Ok(r) => r,
-        Err(e) => return InternalTurnResult::Error(e),
+        Err(e) => {
+            return InternalTurnResult::Error(e);
+        }
     };
 
     // Track usage
@@ -1664,12 +1705,16 @@ where
     ctx.state.total_usage = ctx.total_usage.clone();
 
     // Process response content
-    let (text_content, tool_uses) = extract_content(&response);
+    let (thinking_content, text_content, tool_uses) = extract_content(&response);
+
+    // Emit thinking if present (before text)
+    if let Some(thinking) = &thinking_content {
+        send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
+    }
 
     // Emit text if present
     if let Some(text) = &text_content {
-        let _ = tx.send(AgentEvent::text(text.clone())).await;
-        hooks.on_event(&AgentEvent::text(text.clone())).await;
+        send_event(tx, hooks, AgentEvent::text(text.clone())).await;
     }
 
     // If no tool uses, we're done
@@ -1681,12 +1726,12 @@ where
     // Store assistant message with tool uses
     let assistant_msg = build_assistant_message(&response);
     if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
-        let _ = tx
-            .send(AgentEvent::error(
-                format!("Failed to append assistant message: {e}"),
-                false,
-            ))
-            .await;
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::error(format!("Failed to append assistant message: {e}"), false),
+        )
+        .await;
         return InternalTurnResult::Error(AgentError::new(
             format!("Failed to append assistant message: {e}"),
             false,
@@ -1722,15 +1767,18 @@ where
         let tier = tool.tier();
 
         // Emit tool call start
-        let _ = tx
-            .send(AgentEvent::tool_call_start(
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::tool_call_start(
                 &pending.id,
                 &pending.name,
                 &pending.display_name,
                 pending.input.clone(),
                 tier,
-            ))
-            .await;
+            ),
+        )
+        .await;
 
         // Check hooks for permission
         let decision = hooks
@@ -1751,39 +1799,48 @@ where
 
                 hooks.post_tool_use(&pending.name, &result).await;
 
-                let _ = tx
-                    .send(AgentEvent::tool_call_end(
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
                         &pending.display_name,
                         result.clone(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
 
                 tool_results.push((pending.id.clone(), result));
             }
             ToolDecision::Block(reason) => {
                 let result = ToolResult::error(format!("Blocked: {reason}"));
-                let _ = tx
-                    .send(AgentEvent::tool_call_end(
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
                         &pending.display_name,
                         result.clone(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
                 tool_results.push((pending.id.clone(), result));
             }
             ToolDecision::RequiresConfirmation(description) => {
                 // Emit event and yield
-                let _ = tx
-                    .send(AgentEvent::ToolRequiresConfirmation {
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::ToolRequiresConfirmation {
                         id: pending.id.clone(),
                         name: pending.name.clone(),
                         input: pending.input.clone(),
                         description: description.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
                 let continuation = AgentContinuation {
                     thread_id: ctx.thread_id.clone(),
@@ -1810,22 +1867,25 @@ where
 
     // Add tool results to message history
     if let Err(e) = append_tool_results(&tool_results, &ctx.thread_id, message_store).await {
-        let _ = tx
-            .send(AgentEvent::error(
-                format!("Failed to append tool results: {e}"),
-                false,
-            ))
-            .await;
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::error(format!("Failed to append tool results: {e}"), false),
+        )
+        .await;
         return InternalTurnResult::Error(e);
     }
 
     // Emit turn complete
-    let _ = tx
-        .send(AgentEvent::TurnComplete {
+    send_event(
+        tx,
+        hooks,
+        AgentEvent::TurnComplete {
             turn: ctx.turn,
             usage: turn_usage.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Check stop reason
     if response.stop_reason == Some(StopReason::EndTurn) {
@@ -1873,9 +1933,16 @@ fn calculate_backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
     Duration::from_millis(delay_ms)
 }
 
-fn extract_content(
-    response: &ChatResponse,
-) -> (Option<String>, Vec<(String, String, serde_json::Value)>) {
+/// Extracted content from an LLM response: (thinking, text, `tool_uses`).
+type ExtractedContent = (
+    Option<String>,
+    Option<String>,
+    Vec<(String, String, serde_json::Value)>,
+);
+
+/// Extract content from an LLM response.
+fn extract_content(response: &ChatResponse) -> ExtractedContent {
+    let mut thinking_parts = Vec::new();
     let mut text_parts = Vec::new();
     let mut tool_uses = Vec::new();
 
@@ -1883,6 +1950,9 @@ fn extract_content(
         match block {
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
+            }
+            ContentBlock::Thinking { thinking } => {
+                thinking_parts.push(thinking.clone());
             }
             ContentBlock::ToolUse {
                 id, name, input, ..
@@ -1895,13 +1965,27 @@ fn extract_content(
         }
     }
 
+    let thinking = if thinking_parts.is_empty() {
+        None
+    } else {
+        Some(thinking_parts.join("\n"))
+    };
+
     let text = if text_parts.is_empty() {
         None
     } else {
         Some(text_parts.join("\n"))
     };
 
-    (text, tool_uses)
+    (thinking, text, tool_uses)
+}
+
+async fn send_event<H>(tx: &mpsc::Sender<AgentEvent>, hooks: &Arc<H>, event: AgentEvent)
+where
+    H: AgentHooks,
+{
+    hooks.on_event(&event).await;
+    let _ = tx.send(event).await;
 }
 
 fn build_assistant_message(response: &ChatResponse) -> Message {
@@ -1911,6 +1995,10 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
         match block {
             ContentBlock::Text { text } => {
                 blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } => {
+                // Thinking blocks are ephemeral - not stored in conversation history
+                // ToolResult shouldn't appear in response, but ignore if it does
             }
             ContentBlock::ToolUse {
                 id,
@@ -1925,7 +2013,6 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
                     thought_signature: thought_signature.clone(),
                 });
             }
-            ContentBlock::ToolResult { .. } => {}
         }
     }
 
@@ -2493,7 +2580,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert_eq!(text, Some("Hello".to_string()));
         assert!(tool_uses.is_empty());
     }
@@ -2516,7 +2604,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert!(text.is_none());
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].1, "test_tool");
@@ -2545,7 +2634,8 @@ mod tests {
             },
         };
 
-        let (text, tool_uses) = extract_content(&response);
+        let (thinking, text, tool_uses) = extract_content(&response);
+        assert!(thinking.is_none());
         assert_eq!(text, Some("Let me help".to_string()));
         assert_eq!(tool_uses.len(), 1);
     }

@@ -48,6 +48,7 @@ impl TokenEstimator {
     pub fn estimate_block(block: &ContentBlock) -> usize {
         match block {
             ContentBlock::Text { text } => Self::estimate_text(text),
+            ContentBlock::Thinking { thinking } => Self::estimate_text(thinking),
             ContentBlock::ToolUse { name, input, .. } => {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
                 Self::estimate_text(name)

@@ -1,11 +1,48 @@
 use serde::{Deserialize, Serialize};
 
+/// Configuration for extended thinking.
+///
+/// When enabled, the model will show its reasoning process before
+/// generating the final response.
+#[derive(Debug, Clone)]
+pub struct ThinkingConfig {
+    /// Maximum tokens the model can use for thinking.
+    /// Default is 10,000 tokens.
+    pub budget_tokens: u32,
+}
+
+impl ThinkingConfig {
+    /// Default budget: 10,000 tokens.
+    ///
+    /// This provides enough capacity for meaningful reasoning on most tasks
+    /// while keeping costs reasonable. Increase for complex multi-step problems.
+    pub const DEFAULT_BUDGET_TOKENS: u32 = 10_000;
+
+    /// Minimum budget required by the Anthropic API.
+    pub const MIN_BUDGET_TOKENS: u32 = 1_024;
+
+    #[must_use]
+    pub const fn new(budget_tokens: u32) -> Self {
+        Self { budget_tokens }
+    }
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self {
+            budget_tokens: Self::DEFAULT_BUDGET_TOKENS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Option<Vec<Tool>>,
     pub max_tokens: u32,
+    /// Optional extended thinking configuration.
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +141,9 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
 
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
+
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -145,6 +185,14 @@ impl ChatResponse {
     pub fn first_text(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
             ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn first_thinking(&self) -> Option<&str> {
+        self.content.iter().find_map(|b| match b {
+            ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
             _ => None,
         })
     }

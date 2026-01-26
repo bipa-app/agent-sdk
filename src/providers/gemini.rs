@@ -352,6 +352,9 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                                 thought_signature: None,
                             });
                         }
+                        ContentBlock::Thinking { .. } => {
+                            // Thinking blocks are ephemeral - not sent back to API
+                        }
                         ContentBlock::ToolUse {
                             id: _,
                             name,

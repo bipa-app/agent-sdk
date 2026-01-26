@@ -339,7 +339,7 @@ pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnviron
 pub use events::AgentEvent;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
-pub use llm::LlmProvider;
+pub use llm::{LlmProvider, ThinkingConfig};
 pub use stores::{InMemoryStore, MessageStore, StateStore};
 pub use tools::{
     DynamicToolName, ErasedTool, PrimitiveToolName, Tool, ToolContext, ToolName, ToolRegistry,
