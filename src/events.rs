@@ -50,6 +50,22 @@ pub enum AgentEvent {
         result: ToolResult,
     },
 
+    /// Progress update from an async tool operation
+    ToolProgress {
+        /// Tool call ID
+        id: String,
+        /// Tool name
+        name: String,
+        /// Human-readable display name
+        display_name: String,
+        /// Progress stage
+        stage: String,
+        /// Human-readable progress message
+        message: String,
+        /// Optional tool-specific data
+        data: Option<serde_json::Value>,
+    },
+
     /// Tool requires confirmation before execution.
     /// The application determines the confirmation type (normal, PIN, biometric).
     ToolRequiresConfirmation {
@@ -158,6 +174,25 @@ impl AgentEvent {
             name: name.into(),
             display_name: display_name.into(),
             result,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_progress(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        display_name: impl Into<String>,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Self::ToolProgress {
+            id: id.into(),
+            name: name.into(),
+            display_name: display_name.into(),
+            stage: stage.into(),
+            message: message.into(),
+            data,
         }
     }
 
