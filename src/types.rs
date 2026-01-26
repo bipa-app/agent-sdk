@@ -339,6 +339,50 @@ pub enum AgentInput {
     Continue,
 }
 
+/// Result of tool execution - may indicate async operation in progress.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ToolOutcome {
+    /// Tool completed synchronously with success
+    Success(ToolResult),
+
+    /// Tool completed synchronously with failure
+    Failed(ToolResult),
+
+    /// Tool started an async operation - must stream status to completion
+    InProgress {
+        /// Identifier for the operation (to query status)
+        operation_id: String,
+        /// Initial message for the user
+        message: String,
+    },
+}
+
+impl ToolOutcome {
+    #[must_use]
+    pub fn success(output: impl Into<String>) -> Self {
+        Self::Success(ToolResult::success(output))
+    }
+
+    #[must_use]
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed(ToolResult::error(message))
+    }
+
+    #[must_use]
+    pub fn in_progress(operation_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::InProgress {
+            operation_id: operation_id.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Returns true if operation is still in progress
+    #[must_use]
+    pub const fn is_in_progress(&self) -> bool {
+        matches!(self, Self::InProgress { .. })
+    }
+}
+
 /// Outcome of running a single turn.
 ///
 /// This is returned by `run_turn` to indicate what happened and what to do next.

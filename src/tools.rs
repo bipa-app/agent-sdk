@@ -34,14 +34,16 @@
 
 use crate::events::AgentEvent;
 use crate::llm;
-use crate::types::{ToolResult, ToolTier};
+use crate::types::{ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::Stream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -132,6 +134,94 @@ impl DynamicToolName {
 }
 
 impl ToolName for DynamicToolName {}
+
+// ============================================================================
+// Progress Stage Types (for AsyncTool)
+// ============================================================================
+
+/// Marker trait for tool progress stages (type-safe, like [`ToolName`]).
+///
+/// Progress stages are used by async tools to indicate the current phase
+/// of a long-running operation. They must be serializable for event streaming.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Clone, Debug, Serialize, Deserialize)]
+/// #[serde(rename_all = "snake_case")]
+/// pub enum PixTransferStage {
+///     Initiated,
+///     Processing,
+///     SentToBank,
+/// }
+///
+/// impl ProgressStage for PixTransferStage {}
+/// ```
+pub trait ProgressStage: Clone + Send + Sync + Serialize + DeserializeOwned + 'static {}
+
+/// Helper to get string representation of a progress stage via serde.
+///
+/// # Panics
+///
+/// Panics if the stage cannot be serialized to a string. This should
+/// never happen with properly implemented `ProgressStage` types.
+#[must_use]
+pub fn stage_to_string<S: ProgressStage>(stage: &S) -> String {
+    serde_json::to_string(stage)
+        .expect("ProgressStage must serialize to string")
+        .trim_matches('"')
+        .to_string()
+}
+
+/// Status update from an async tool operation.
+#[derive(Clone, Debug, Serialize)]
+pub enum ToolStatus<S: ProgressStage> {
+    /// Operation is making progress
+    Progress {
+        stage: S,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+
+    /// Operation completed successfully
+    Completed(ToolResult),
+
+    /// Operation failed
+    Failed(ToolResult),
+}
+
+/// Type-erased status for the agent loop.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ErasedToolStatus {
+    /// Operation is making progress
+    Progress {
+        stage: String,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// Operation completed successfully
+    Completed(ToolResult),
+    /// Operation failed
+    Failed(ToolResult),
+}
+
+impl<S: ProgressStage> From<ToolStatus<S>> for ErasedToolStatus {
+    fn from(status: ToolStatus<S>) -> Self {
+        match status {
+            ToolStatus::Progress {
+                stage,
+                message,
+                data,
+            } => Self::Progress {
+                stage: stage_to_string(&stage),
+                message,
+                data,
+            },
+            ToolStatus::Completed(r) => Self::Completed(r),
+            ToolStatus::Failed(r) => Self::Failed(r),
+        }
+    }
+}
 
 /// Context passed to tool execution
 pub struct ToolContext<Ctx> {
@@ -234,6 +324,98 @@ pub trait Tool<Ctx>: Send + Sync {
 }
 
 // ============================================================================
+// AsyncTool Trait
+// ============================================================================
+
+/// A tool that performs long-running async operations.
+///
+/// `AsyncTool`s have two phases:
+/// 1. `execute()` - Start the operation (lightweight, returns quickly)
+/// 2. `check_status()` - Stream progress until completion
+///
+/// The actual work should happen externally (background task, external service)
+/// and persist results to a durable store. The tool is just an orchestrator.
+///
+/// # Example
+///
+/// ```ignore
+/// impl AsyncTool<MyCtx> for ExecutePixTransferTool {
+///     type Name = PixToolName;
+///     type Stage = PixTransferStage;
+///
+///     async fn execute(&self, ctx: &ToolContext<MyCtx>, input: Value) -> Result<ToolOutcome> {
+///         let params = parse_input(&input)?;
+///         let operation_id = ctx.app.pix_service.start_transfer(params).await?;
+///         Ok(ToolOutcome::in_progress(
+///             operation_id,
+///             format!("PIX transfer of {} initiated", params.amount),
+///         ))
+///     }
+///
+///     fn check_status(&self, ctx: &ToolContext<MyCtx>, operation_id: &str)
+///         -> impl Stream<Item = ToolStatus<PixTransferStage>> + Send
+///     {
+///         async_stream::stream! {
+///             loop {
+///                 let status = ctx.app.pix_service.get_status(operation_id).await;
+///                 match status {
+///                     PixStatus::Success { id } => {
+///                         yield ToolStatus::Completed(ToolResult::success(id));
+///                         break;
+///                     }
+///                     _ => yield ToolStatus::Progress { ... };
+///                 }
+///                 tokio::time::sleep(Duration::from_millis(500)).await;
+///             }
+///         }
+///     }
+/// }
+/// ```
+pub trait AsyncTool<Ctx>: Send + Sync {
+    /// The type of name for this tool.
+    type Name: ToolName;
+    /// The type of progress stages for this tool.
+    type Stage: ProgressStage;
+
+    /// Returns the tool's strongly-typed name.
+    fn name(&self) -> Self::Name;
+
+    /// Human-readable display name for UI.
+    fn display_name(&self) -> &'static str;
+
+    /// Human-readable description of what the tool does.
+    fn description(&self) -> &'static str;
+
+    /// JSON schema for the tool's input parameters.
+    fn input_schema(&self) -> Value;
+
+    /// Permission tier for this tool.
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    /// Execute the tool. Returns immediately with one of:
+    /// - Success/Failed: Operation completed synchronously
+    /// - `InProgress`: Operation started, use `check_status()` to stream updates
+    ///
+    /// # Errors
+    /// Returns an error if tool execution fails.
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Value,
+    ) -> impl Future<Output = Result<ToolOutcome>> + Send;
+
+    /// Stream status updates for an in-progress operation.
+    /// Must yield until Completed or Failed.
+    fn check_status(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+    ) -> impl Stream<Item = ToolStatus<Self::Stage>> + Send;
+}
+
+// ============================================================================
 // Type-Erased Tool (for Registry)
 // ============================================================================
 
@@ -321,6 +503,101 @@ where
 }
 
 // ============================================================================
+// Type-Erased AsyncTool (for Registry)
+// ============================================================================
+
+/// Type-erased async tool trait for registry storage.
+///
+/// This allows async tools with different `Name` and `Stage` associated types
+/// to be stored in the same registry by erasing the type information.
+#[async_trait]
+pub trait ErasedAsyncTool<Ctx>: Send + Sync {
+    /// Get the tool name as a string.
+    fn name_str(&self) -> &str;
+    /// Get a human-friendly display name for the tool.
+    fn display_name(&self) -> &'static str;
+    /// Get the tool description.
+    fn description(&self) -> &'static str;
+    /// Get the JSON schema for tool inputs.
+    fn input_schema(&self) -> Value;
+    /// Get the tool's permission tier.
+    fn tier(&self) -> ToolTier;
+    /// Execute the tool with the given input.
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome>;
+    /// Stream status updates for an in-progress operation (type-erased).
+    fn check_status_stream<'a>(
+        &'a self,
+        ctx: &'a ToolContext<Ctx>,
+        operation_id: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = ErasedToolStatus> + Send + 'a>>;
+}
+
+/// Wrapper that erases the Name and Stage associated types from an [`AsyncTool`].
+struct AsyncToolWrapper<T, Ctx>
+where
+    T: AsyncTool<Ctx>,
+{
+    inner: T,
+    name_cache: String,
+    _marker: PhantomData<Ctx>,
+}
+
+impl<T, Ctx> AsyncToolWrapper<T, Ctx>
+where
+    T: AsyncTool<Ctx>,
+{
+    fn new(tool: T) -> Self {
+        let name_cache = tool_name_to_string(&tool.name());
+        Self {
+            inner: tool,
+            name_cache,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<T, Ctx> ErasedAsyncTool<Ctx> for AsyncToolWrapper<T, Ctx>
+where
+    T: AsyncTool<Ctx> + 'static,
+    Ctx: Send + Sync + 'static,
+{
+    fn name_str(&self) -> &str {
+        &self.name_cache
+    }
+
+    fn display_name(&self) -> &'static str {
+        self.inner.display_name()
+    }
+
+    fn description(&self) -> &'static str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.inner.tier()
+    }
+
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome> {
+        self.inner.execute(ctx, input).await
+    }
+
+    fn check_status_stream<'a>(
+        &'a self,
+        ctx: &'a ToolContext<Ctx>,
+        operation_id: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = ErasedToolStatus> + Send + 'a>> {
+        use futures::StreamExt;
+        let stream = self.inner.check_status(ctx, operation_id);
+        Box::pin(stream.map(ErasedToolStatus::from))
+    }
+}
+
+// ============================================================================
 // Tool Registry
 // ============================================================================
 
@@ -329,14 +606,18 @@ where
 /// Tools are stored with their names erased to allow different `Name` types
 /// in the same registry. The registry uses string-based lookup for LLM
 /// compatibility.
+///
+/// Supports both synchronous [`Tool`]s and asynchronous [`AsyncTool`]s.
 pub struct ToolRegistry<Ctx> {
     tools: HashMap<String, Arc<dyn ErasedTool<Ctx>>>,
+    async_tools: HashMap<String, Arc<dyn ErasedAsyncTool<Ctx>>>,
 }
 
 impl<Ctx> Clone for ToolRegistry<Ctx> {
     fn clone(&self) -> Self {
         Self {
             tools: self.tools.clone(),
+            async_tools: self.async_tools.clone(),
         }
     }
 }
@@ -352,10 +633,11 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            async_tools: HashMap::new(),
         }
     }
 
-    /// Register a tool in the registry.
+    /// Register a synchronous tool in the registry.
     ///
     /// The tool's name is converted to a string via serde serialization
     /// and used as the lookup key.
@@ -369,33 +651,65 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self
     }
 
-    /// Get a tool by name.
+    /// Register an async tool in the registry.
+    ///
+    /// Async tools have two phases: execute (lightweight, starts operation)
+    /// and `check_status` (streams progress until completion).
+    pub fn register_async<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: AsyncTool<Ctx> + 'static,
+    {
+        let wrapper = AsyncToolWrapper::new(tool);
+        let name = wrapper.name_str().to_string();
+        self.async_tools.insert(name, Arc::new(wrapper));
+        self
+    }
+
+    /// Get a synchronous tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ErasedTool<Ctx>>> {
         self.tools.get(name)
     }
 
-    /// Get all registered tools.
+    /// Get an async tool by name.
+    #[must_use]
+    pub fn get_async(&self, name: &str) -> Option<&Arc<dyn ErasedAsyncTool<Ctx>>> {
+        self.async_tools.get(name)
+    }
+
+    /// Check if a tool name refers to an async tool.
+    #[must_use]
+    pub fn is_async(&self, name: &str) -> bool {
+        self.async_tools.contains_key(name)
+    }
+
+    /// Get all registered synchronous tools.
     pub fn all(&self) -> impl Iterator<Item = &Arc<dyn ErasedTool<Ctx>>> {
         self.tools.values()
     }
 
-    /// Get the number of registered tools.
+    /// Get all registered async tools.
+    pub fn all_async(&self) -> impl Iterator<Item = &Arc<dyn ErasedAsyncTool<Ctx>>> {
+        self.async_tools.values()
+    }
+
+    /// Get the number of registered tools (sync + async).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools.len() + self.async_tools.len()
     }
 
     /// Check if the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools.is_empty() && self.async_tools.is_empty()
     }
 
     /// Filter tools by a predicate.
     ///
     /// Removes tools for which the predicate returns false.
     /// The predicate receives the tool name.
+    /// Applies to both sync and async tools.
     ///
     /// # Example
     ///
@@ -407,19 +721,29 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         F: Fn(&str) -> bool,
     {
         self.tools.retain(|name, _| predicate(name));
+        self.async_tools.retain(|name, _| predicate(name));
     }
 
-    /// Convert tools to LLM tool definitions.
+    /// Convert all tools (sync + async) to LLM tool definitions.
     #[must_use]
     pub fn to_llm_tools(&self) -> Vec<llm::Tool> {
-        self.tools
+        let mut tools: Vec<_> = self
+            .tools
             .values()
             .map(|tool| llm::Tool {
                 name: tool.name_str().to_string(),
                 description: tool.description().to_string(),
                 input_schema: tool.input_schema(),
             })
-            .collect()
+            .collect();
+
+        tools.extend(self.async_tools.values().map(|tool| llm::Tool {
+            name: tool.name_str().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        }));
+
+        tools
     }
 }
 

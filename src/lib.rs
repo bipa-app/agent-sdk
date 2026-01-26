@@ -342,12 +342,14 @@ pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecis
 pub use llm::{LlmProvider, ThinkingConfig};
 pub use stores::{InMemoryStore, MessageStore, StateStore};
 pub use tools::{
-    DynamicToolName, ErasedTool, PrimitiveToolName, Tool, ToolContext, ToolName, ToolRegistry,
+    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedTool, ErasedToolStatus, PrimitiveToolName,
+    ProgressStage, Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string,
     tool_name_from_str, tool_name_to_string,
 };
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolResult, ToolTier, TurnOutcome,
+    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolOutcome, ToolResult, ToolTier,
+    TurnOutcome,
 };
 
 // Re-export user interaction types for convenience

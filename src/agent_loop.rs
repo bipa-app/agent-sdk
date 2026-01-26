@@ -36,11 +36,12 @@ use crate::llm::{
 };
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::tools::{ErasedAsyncTool, ErasedToolStatus, ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolResult, TurnOutcome,
+    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolOutcome, ToolResult, TurnOutcome,
 };
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -779,6 +780,10 @@ where
 /// Returns the outcome of the tool execution, which may be:
 /// - `Completed`: Tool ran (or was blocked), result captured
 /// - `RequiresConfirmation`: Hook requires user confirmation
+///
+/// Supports both synchronous and asynchronous tools. Async tools are detected
+/// automatically and their progress is streamed via events.
+#[allow(clippy::too_many_lines)]
 async fn execute_tool_call<Ctx, H>(
     pending: &PendingToolCallInfo,
     tool_context: &ToolContext<Ctx>,
@@ -790,6 +795,92 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    // Check for async tool first
+    if let Some(async_tool) = tools.get_async(&pending.name) {
+        let tier = async_tool.tier();
+
+        // Emit tool call start
+        let _ = tx
+            .send(AgentEvent::tool_call_start(
+                &pending.id,
+                &pending.name,
+                &pending.display_name,
+                pending.input.clone(),
+                tier,
+            ))
+            .await;
+
+        // Check hooks for permission
+        let decision = hooks
+            .pre_tool_use(&pending.name, &pending.input, tier)
+            .await;
+
+        return match decision {
+            ToolDecision::Allow => {
+                let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
+
+                hooks.post_tool_use(&pending.name, &result).await;
+
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::Block(reason) => {
+                let result = ToolResult::error(format!("Blocked: {reason}"));
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::RequiresConfirmation(description) => {
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::ToolRequiresConfirmation {
+                        id: pending.id.clone(),
+                        name: pending.name.clone(),
+                        input: pending.input.clone(),
+                        description: description.clone(),
+                    },
+                )
+                .await;
+
+                ToolExecutionOutcome::RequiresConfirmation {
+                    tool_id: pending.id.clone(),
+                    tool_name: pending.name.clone(),
+                    display_name: pending.display_name.clone(),
+                    input: pending.input.clone(),
+                    description,
+                }
+            }
+        };
+    }
+
+    // Fall back to sync tool
     let Some(tool) = tools.get(&pending.name) else {
         let result = ToolResult::error(format!("Unknown tool: {}", pending.name));
         return ToolExecutionOutcome::Completed {
@@ -889,9 +980,95 @@ where
     }
 }
 
+/// Execute an async tool call and stream progress until completion.
+///
+/// This function handles the two-phase execution of async tools:
+/// 1. Execute the tool (returns immediately with Success/Failed/`InProgress`)
+/// 2. If `InProgress`, stream status updates until completion
+async fn execute_async_tool<Ctx>(
+    pending: &PendingToolCallInfo,
+    tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
+    tool_context: &ToolContext<Ctx>,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> ToolResult
+where
+    Ctx: Send + Sync + Clone,
+{
+    let tool_start = Instant::now();
+
+    // Step 1: Execute (lightweight, returns quickly)
+    let outcome = match tool.execute(tool_context, pending.input.clone()).await {
+        Ok(o) => o,
+        Err(e) => {
+            return ToolResult::error(format!("Tool error: {e}"))
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+        }
+    };
+
+    match outcome {
+        // Synchronous completion - return immediately
+        ToolOutcome::Success(mut result) | ToolOutcome::Failed(mut result) => {
+            result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+            result
+        }
+
+        // Async operation - stream status until completion
+        ToolOutcome::InProgress {
+            operation_id,
+            message,
+        } => {
+            // Emit initial progress
+            let _ = tx
+                .send(AgentEvent::tool_progress(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    "started",
+                    &message,
+                    None,
+                ))
+                .await;
+
+            // Stream status updates
+            let mut stream = tool.check_status_stream(tool_context, &operation_id);
+
+            while let Some(status) = stream.next().await {
+                match status {
+                    ErasedToolStatus::Progress {
+                        stage,
+                        message,
+                        data,
+                    } => {
+                        let _ = tx
+                            .send(AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                stage,
+                                message,
+                                data,
+                            ))
+                            .await;
+                    }
+                    ErasedToolStatus::Completed(mut result)
+                    | ErasedToolStatus::Failed(mut result) => {
+                        result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        return result;
+                    }
+                }
+            }
+
+            // Stream ended without completion (shouldn't happen)
+            ToolResult::error("Async tool stream ended without completion")
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis()))
+        }
+    }
+}
+
 /// Execute the confirmed tool call from a resume operation.
 ///
 /// This is called when resuming after a tool required confirmation.
+/// Supports both sync and async tools.
 async fn execute_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     confirmed: bool,
@@ -906,6 +1083,25 @@ where
     H: AgentHooks,
 {
     if confirmed {
+        // Check for async tool first
+        if let Some(async_tool) = tools.get_async(&awaiting_tool.name) {
+            let result = execute_async_tool(awaiting_tool, async_tool, tool_context, tx).await;
+
+            hooks.post_tool_use(&awaiting_tool.name, &result).await;
+
+            let _ = tx
+                .send(AgentEvent::tool_call_end(
+                    &awaiting_tool.id,
+                    &awaiting_tool.name,
+                    &awaiting_tool.display_name,
+                    result.clone(),
+                ))
+                .await;
+
+            return result;
+        }
+
+        // Fall back to sync tool
         if let Some(tool) = tools.get(&awaiting_tool.name) {
             let tool_start = Instant::now();
             let result = match tool
@@ -1738,13 +1934,14 @@ where
         ));
     }
 
-    // Build pending tool calls
+    // Build pending tool calls (check both sync and async tools for display_name)
     let pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
         .iter()
         .map(|(id, name, input)| {
             let display_name = tools
                 .get(name)
                 .map(|t| t.display_name().to_string())
+                .or_else(|| tools.get_async(name).map(|t| t.display_name().to_string()))
                 .unwrap_or_default();
             PendingToolCallInfo {
                 id: id.clone(),
@@ -1755,9 +1952,106 @@ where
         })
         .collect();
 
-    // Execute tools
+    // Execute tools (supports both sync and async tools)
     let mut tool_results = Vec::new();
     for (idx, pending) in pending_tool_calls.iter().enumerate() {
+        // Check for async tool first
+        if let Some(async_tool) = tools.get_async(&pending.name) {
+            let tier = async_tool.tier();
+
+            // Emit tool call start
+            send_event(
+                tx,
+                hooks,
+                AgentEvent::tool_call_start(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    pending.input.clone(),
+                    tier,
+                ),
+            )
+            .await;
+
+            // Check hooks for permission
+            let decision = hooks
+                .pre_tool_use(&pending.name, &pending.input, tier)
+                .await;
+
+            match decision {
+                ToolDecision::Allow => {
+                    let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
+
+                    hooks.post_tool_use(&pending.name, &result).await;
+
+                    send_event(
+                        tx,
+                        hooks,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::Block(reason) => {
+                    let result = ToolResult::error(format!("Blocked: {reason}"));
+                    send_event(
+                        tx,
+                        hooks,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::RequiresConfirmation(description) => {
+                    // Emit event and yield
+                    send_event(
+                        tx,
+                        hooks,
+                        AgentEvent::ToolRequiresConfirmation {
+                            id: pending.id.clone(),
+                            name: pending.name.clone(),
+                            input: pending.input.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .await;
+
+                    let continuation = AgentContinuation {
+                        thread_id: ctx.thread_id.clone(),
+                        turn: ctx.turn,
+                        total_usage: ctx.total_usage.clone(),
+                        turn_usage: turn_usage.clone(),
+                        pending_tool_calls: pending_tool_calls.clone(),
+                        awaiting_index: idx,
+                        completed_results: tool_results,
+                        state: ctx.state.clone(),
+                    };
+
+                    return InternalTurnResult::AwaitingConfirmation {
+                        tool_call_id: pending.id.clone(),
+                        tool_name: pending.name.clone(),
+                        display_name: pending.display_name.clone(),
+                        input: pending.input.clone(),
+                        description,
+                        continuation: Box::new(continuation),
+                    };
+                }
+            }
+            continue;
+        }
+
+        // Fall back to sync tool
         let Some(tool) = tools.get(&pending.name) else {
             let result = ToolResult::error(format!("Unknown tool: {}", pending.name));
             tool_results.push((pending.id.clone(), result));
