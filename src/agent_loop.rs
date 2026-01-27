@@ -1832,6 +1832,7 @@ async fn record_execution_start(
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     pending: &PendingToolCallInfo,
     thread_id: &ThreadId,
+    started_at: time::OffsetDateTime,
 ) {
     if let Some(store) = execution_store {
         let execution = ToolExecution::new_in_flight(
@@ -1839,6 +1840,7 @@ async fn record_execution_start(
             thread_id.clone(),
             &pending.name,
             pending.input.clone(),
+            started_at,
         );
         if let Err(e) = store.record_execution(execution).await {
             warn!(
@@ -1856,6 +1858,7 @@ async fn record_execution_complete(
     pending: &PendingToolCallInfo,
     thread_id: &ThreadId,
     result: &ToolResult,
+    started_at: time::OffsetDateTime,
 ) {
     if let Some(store) = execution_store {
         let mut execution = ToolExecution::new_in_flight(
@@ -1863,6 +1866,7 @@ async fn record_execution_complete(
             thread_id.clone(),
             &pending.name,
             pending.input.clone(),
+            started_at,
         );
         execution.complete(result.clone());
         if let Err(e) = store.update_execution(execution).await {
@@ -2115,13 +2119,21 @@ where
             match decision {
                 ToolDecision::Allow => {
                     // IDEMPOTENCY: Record execution start (write-ahead)
-                    record_execution_start(execution_store, pending, &ctx.thread_id).await;
+                    let started_at = time::OffsetDateTime::now_utc();
+                    record_execution_start(execution_store, pending, &ctx.thread_id, started_at)
+                        .await;
 
                     let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
 
                     // IDEMPOTENCY: Record execution completion
-                    record_execution_complete(execution_store, pending, &ctx.thread_id, &result)
-                        .await;
+                    record_execution_complete(
+                        execution_store,
+                        pending,
+                        &ctx.thread_id,
+                        &result,
+                        started_at,
+                    )
+                    .await;
 
                     hooks.post_tool_use(&pending.name, &result).await;
 
@@ -2223,7 +2235,8 @@ where
         match decision {
             ToolDecision::Allow => {
                 // IDEMPOTENCY: Record execution start (write-ahead)
-                record_execution_start(execution_store, pending, &ctx.thread_id).await;
+                let started_at = time::OffsetDateTime::now_utc();
+                record_execution_start(execution_store, pending, &ctx.thread_id, started_at).await;
 
                 let tool_start = Instant::now();
                 let result = match tool.execute(tool_context, pending.input.clone()).await {
@@ -2236,7 +2249,14 @@ where
                 };
 
                 // IDEMPOTENCY: Record execution completion
-                record_execution_complete(execution_store, pending, &ctx.thread_id, &result).await;
+                record_execution_complete(
+                    execution_store,
+                    pending,
+                    &ctx.thread_id,
+                    &result,
+                    started_at,
+                )
+                .await;
 
                 hooks.post_tool_use(&pending.name, &result).await;
 

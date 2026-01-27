@@ -434,6 +434,7 @@ impl ToolExecution {
         thread_id: ThreadId,
         tool_name: impl Into<String>,
         input: serde_json::Value,
+        started_at: OffsetDateTime,
     ) -> Self {
         Self {
             tool_call_id: tool_call_id.into(),
@@ -443,7 +444,7 @@ impl ToolExecution {
             status: ExecutionStatus::InFlight,
             result: None,
             operation_id: None,
-            started_at: OffsetDateTime::now_utc(),
+            started_at,
             completed_at: None,
         }
     }
