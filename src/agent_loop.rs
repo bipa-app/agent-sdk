@@ -32,7 +32,7 @@ use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role,
-    StopReason,
+    StopReason, StreamAccumulator, StreamDelta, Usage,
 };
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
@@ -1290,6 +1290,132 @@ where
     }
 }
 
+/// Call the LLM with streaming, emitting deltas as they arrive.
+///
+/// This function handles streaming responses from the LLM, emitting `TextDelta`
+/// and `Thinking` events in real-time as content arrives. It includes retry logic
+/// for recoverable errors (rate limits, server errors).
+async fn call_llm_streaming<P, H>(
+    provider: &Arc<P>,
+    request: ChatRequest,
+    config: &AgentConfig,
+    tx: &mpsc::Sender<AgentEvent>,
+    hooks: &Arc<H>,
+) -> Result<ChatResponse, AgentError>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    let max_retries = config.retry.max_retries;
+    let mut attempt = 0u32;
+
+    loop {
+        let result = process_stream(provider, &request, tx, hooks).await;
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(StreamError::Recoverable(msg)) => {
+                attempt += 1;
+                if attempt > max_retries {
+                    error!("Streaming error after {max_retries} retries: {msg}");
+                    let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
+                    send_event(tx, hooks, AgentEvent::error(&err_msg, true)).await;
+                    return Err(AgentError::new(err_msg, true));
+                }
+                let delay = calculate_backoff_delay(attempt, &config.retry);
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    error = msg,
+                    "Streaming error, retrying"
+                );
+                send_event(
+                    tx,
+                    hooks,
+                    AgentEvent::text(format!(
+                        "\n[Streaming error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
+                        delay.as_secs_f64()
+                    )),
+                )
+                .await;
+                sleep(delay).await;
+            }
+            Err(StreamError::Fatal(msg)) => {
+                error!("Streaming error (non-recoverable): {msg}");
+                return Err(AgentError::new(format!("Streaming error: {msg}"), false));
+            }
+        }
+    }
+}
+
+/// Error type for stream processing.
+enum StreamError {
+    Recoverable(String),
+    Fatal(String),
+}
+
+/// Process a single streaming attempt and return the response or error.
+async fn process_stream<P, H>(
+    provider: &Arc<P>,
+    request: &ChatRequest,
+    tx: &mpsc::Sender<AgentEvent>,
+    hooks: &Arc<H>,
+) -> Result<ChatResponse, StreamError>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    let mut stream = std::pin::pin!(provider.chat_stream(request.clone()));
+    let mut accumulator = StreamAccumulator::new();
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(delta) => {
+                accumulator.apply(&delta);
+                match &delta {
+                    StreamDelta::TextDelta { delta, .. } => {
+                        send_event(tx, hooks, AgentEvent::text_delta(delta.clone())).await;
+                    }
+                    StreamDelta::ThinkingDelta { delta, .. } => {
+                        send_event(tx, hooks, AgentEvent::thinking(delta.clone())).await;
+                    }
+                    StreamDelta::Error {
+                        message,
+                        recoverable,
+                    } => {
+                        return if *recoverable {
+                            Err(StreamError::Recoverable(message.clone()))
+                        } else {
+                            Err(StreamError::Fatal(message.clone()))
+                        };
+                    }
+                    // These are handled by the accumulator or not needed as events
+                    StreamDelta::Done { .. }
+                    | StreamDelta::Usage(_)
+                    | StreamDelta::ToolUseStart { .. }
+                    | StreamDelta::ToolInputDelta { .. } => {}
+                }
+            }
+            Err(e) => return Err(StreamError::Recoverable(format!("Stream error: {e}"))),
+        }
+    }
+
+    let usage = accumulator.usage().cloned().unwrap_or(Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    let stop_reason = accumulator.stop_reason().copied();
+    let content_blocks = accumulator.into_content_blocks();
+
+    Ok(ChatResponse {
+        id: String::new(),
+        content: content_blocks,
+        model: provider.model().to_string(),
+        stop_reason,
+        usage,
+    })
+}
+
 // =============================================================================
 // Main Loop Functions
 // =============================================================================
@@ -2012,12 +2138,23 @@ where
         thinking: config.thinking.clone(),
     };
 
-    // Call LLM with retry logic
-    debug!(turn = ctx.turn, "Calling LLM");
-    let response = match call_llm_with_retry(provider, request, config, tx, hooks).await {
-        Ok(r) => r,
-        Err(e) => {
-            return InternalTurnResult::Error(e);
+    // Call LLM with retry logic (streaming or non-streaming based on config)
+    debug!(turn = ctx.turn, streaming = config.streaming, "Calling LLM");
+    let response = if config.streaming {
+        // Streaming mode: events are emitted as content arrives
+        match call_llm_streaming(provider, request, config, tx, hooks).await {
+            Ok(r) => r,
+            Err(e) => {
+                return InternalTurnResult::Error(e);
+            }
+        }
+    } else {
+        // Non-streaming mode: wait for full response
+        match call_llm_with_retry(provider, request, config, tx, hooks).await {
+            Ok(r) => r,
+            Err(e) => {
+                return InternalTurnResult::Error(e);
+            }
         }
     };
 
@@ -2032,14 +2169,17 @@ where
     // Process response content
     let (thinking_content, text_content, tool_uses) = extract_content(&response);
 
-    // Emit thinking if present (before text)
-    if let Some(thinking) = &thinking_content {
-        send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
-    }
+    // Emit events only in non-streaming mode (streaming already emitted deltas)
+    if !config.streaming {
+        // Emit thinking if present (before text)
+        if let Some(thinking) = &thinking_content {
+            send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
+        }
 
-    // Emit text if present
-    if let Some(text) = &text_content {
-        send_event(tx, hooks, AgentEvent::text(text.clone())).await;
+        // Emit text if present
+        if let Some(text) = &text_content {
+            send_event(tx, hooks, AgentEvent::text(text.clone())).await;
+        }
     }
 
     // If no tool uses, we're done
