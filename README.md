@@ -7,7 +7,7 @@
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **⚠️ Early Development**: This library is in active development (v0.3.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+> **⚠️ Early Development**: This library is in active development (v0.4.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
 
 ## What is an Agent?
 
@@ -23,13 +23,21 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 - **Agent Loop** - Core orchestration that handles the LLM conversation and tool execution cycle
 - **Provider Agnostic** - Built-in support for Anthropic (Claude), OpenAI, and Google Gemini, plus a trait for custom providers
 - **Tool System** - Define tools with JSON schema validation and typed tool names; the LLM decides when to use them
+- **Async Tools** - Long-running operations with progress streaming via `AsyncTool` trait
 - **Lifecycle Hooks** - Intercept tool calls for logging, user confirmation, rate limiting, or security checks
 - **Streaming Events** - Real-time event stream for building responsive UIs
-- **Primitive Tools** - Ready-to-use tools for file operations (Read, Write, Edit, Glob, Grep, Bash)
+- **Extended Thinking** - Support for Anthropic's extended thinking feature via `ThinkingConfig`
+- **Primitive Tools** - Ready-to-use tools for file operations (Read, Write, Edit, Glob, Grep, Bash, Notebooks)
+- **Web Tools** - Web search and URL fetching with SSRF protection
+- **Subagents** - Spawn isolated child agents for complex subtasks
+- **MCP Support** - Model Context Protocol integration for external tool servers
+- **Task Tracking** - Built-in todo system for tracking multi-step tasks
+- **User Interaction** - Tools for asking questions and requesting confirmations
 - **Security Model** - Capability-based permissions and tool tiers (Observe, Confirm)
 - **Yield/Resume Pattern** - Pause agent execution for tool confirmation and resume with user decision
 - **Single-Turn Execution** - Run one turn at a time for external orchestration (e.g., message queues)
-- **Persistence** - Trait-based storage for conversation history and agent state
+- **Persistence** - Trait-based storage for conversation history, agent state, and tool execution tracking
+- **Context Compaction** - Automatic token management to handle long conversations
 
 ## Requirements
 
@@ -42,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = "0.1"
+agent-sdk = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -185,6 +193,89 @@ let agent = builder::<()>()
     .build();
 ```
 
+## Async Tools (Long-Running Operations)
+
+For operations that take time (API calls, file processing, etc.), implement `AsyncTool`:
+
+```rust
+use agent_sdk::{AsyncTool, ToolContext, ToolTier, ToolOutcome, DynamicToolName, ProgressStage, ToolStatus, ToolResult};
+use serde::{Serialize, Deserialize};
+use serde_json::{Value, json};
+use futures::Stream;
+
+// Define progress stages for your operation
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStage {
+    Initiated,
+    Processing,
+    Completed,
+}
+
+impl ProgressStage for TransferStage {}
+
+struct TransferTool;
+
+impl AsyncTool<()> for TransferTool {
+    type Name = DynamicToolName;
+    type Stage = TransferStage;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("transfer_funds")
+    }
+
+    fn display_name(&self) -> &'static str { "Transfer Funds" }
+    fn description(&self) -> &'static str { "Transfer funds between accounts" }
+    fn input_schema(&self) -> Value { json!({"type": "object"}) }
+    fn tier(&self) -> ToolTier { ToolTier::Confirm }
+
+    // Start the operation - returns quickly
+    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> anyhow::Result<ToolOutcome> {
+        let operation_id = "op_123"; // Start your operation, get an ID
+        Ok(ToolOutcome::in_progress(operation_id, "Transfer initiated"))
+    }
+
+    // Stream progress updates until completion
+    fn check_status(&self, _ctx: &ToolContext<()>, operation_id: &str)
+        -> impl Stream<Item = ToolStatus<TransferStage>> + Send
+    {
+        async_stream::stream! {
+            yield ToolStatus::Progress {
+                stage: TransferStage::Processing,
+                message: "Processing transfer...".into(),
+                data: None,
+            };
+            // Poll your service, yield progress...
+            yield ToolStatus::Completed(ToolResult::success("Transfer complete"));
+        }
+    }
+}
+
+// Register async tools separately
+let mut tools = ToolRegistry::new();
+tools.register_async(TransferTool);
+```
+
+## Extended Thinking
+
+Enable Anthropic's extended thinking for complex reasoning:
+
+```rust
+use agent_sdk::{builder, AgentConfig, ThinkingConfig, providers::AnthropicProvider};
+
+let agent = builder::<()>()
+    .provider(AnthropicProvider::sonnet(api_key))
+    .config(AgentConfig {
+        thinking: Some(ThinkingConfig {
+            budget_tokens: 10000, // Token budget for thinking
+        }),
+        ..Default::default()
+    })
+    .build();
+```
+
+When enabled, the agent emits `AgentEvent::Thinking` events with the model's reasoning process.
+
 ## Lifecycle Hooks
 
 Hooks let you intercept and control agent behavior:
@@ -258,8 +349,8 @@ impl Tool<MyContext> for MyTool {
 
     async fn execute(&self, ctx: &ToolContext<MyContext>, input: Value) -> anyhow::Result<ToolResult> {
         // Access your context
-        let user = &ctx.data.user_id;
-        let db = &ctx.data.database;
+        let user = &ctx.app.user_id;
+        let db = &ctx.app.database;
         // ...
     }
 }
@@ -281,20 +372,78 @@ agent.run(thread_id, prompt, tool_ctx);
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Agent Loop                           │
-│  Orchestrates: prompt → LLM → tool calls → results → LLM   │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ LlmProvider │  │    Tools    │  │       Hooks         │ │
-│  │  (trait)    │  │  Registry   │  │  (pre/post tool)    │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │MessageStore │  │ StateStore  │  │    Environment      │ │
-│  │  (trait)    │  │  (trait)    │  │  (file/exec ops)    │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                              Agent Loop                                   │
+│      Orchestrates: prompt → LLM → tool calls → results → LLM            │
+├──────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ LlmProvider  │  │    Tools     │  │    Hooks     │  │   Events     │ │
+│  │  (trait)     │  │   Registry   │  │ (pre/post)   │  │  (stream)    │ │
+│  │              │  │              │  │              │  │              │ │
+│  │ - Anthropic  │  │ - Tool       │  │ - Default    │  │ - Text       │ │
+│  │ - OpenAI     │  │ - AsyncTool  │  │ - AllowAll   │  │ - ToolCall   │ │
+│  │ - Gemini     │  │ - MCP Bridge │  │ - Logging    │  │ - Progress   │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+├──────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ MessageStore │  │  StateStore  │  │  ToolExec    │  │ Environment  │ │
+│  │  (trait)     │  │   (trait)    │  │   Store      │  │  (trait)     │ │
+│  │              │  │              │  │  (trait)     │  │              │ │
+│  │ Conversation │  │ Agent state  │  │ Idempotency  │  │ File + exec  │ │
+│  │   history    │  │ checkpoints  │  │  tracking    │  │  operations  │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+├──────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │  Subagents   │  │     MCP      │  │  Web Tools   │  │    Todo      │ │
+│  │              │  │              │  │              │  │   System     │ │
+│  │ Nested agent │  │ External     │  │ Search +     │  │              │ │
+│  │  execution   │  │ tool servers │  │ fetch URLs   │  │ Task track   │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Streaming Events
+
+The agent emits events during execution for real-time UI updates:
+
+| Event | Description |
+|-------|-------------|
+| `Start` | Agent begins processing a turn |
+| `Thinking` | Extended thinking output (when enabled) |
+| `TextDelta` | Streaming text chunk from LLM |
+| `Text` | Complete text block from LLM |
+| `ToolCallStart` | Tool execution starting |
+| `ToolCallEnd` | Tool execution completed |
+| `ToolProgress` | Progress update from async tool |
+| `ToolRequiresConfirmation` | Tool needs user approval |
+| `TurnComplete` | One LLM round-trip finished |
+| `ContextCompacted` | Conversation was summarized to save tokens |
+| `SubagentProgress` | Progress from nested subagent |
+| `Done` | Agent completed successfully |
+| `Error` | An error occurred |
+
+```rust
+while let Some(event) = events.recv().await {
+    match event {
+        AgentEvent::Start { thread_id, turn } => {
+            println!("Starting turn {turn}");
+        }
+        AgentEvent::TextDelta { delta } => {
+            print!("{delta}"); // Stream to UI
+        }
+        AgentEvent::ToolCallStart { name, .. } => {
+            println!("Calling tool: {name}");
+        }
+        AgentEvent::ToolProgress { stage, message, .. } => {
+            println!("Progress: {stage} - {message}");
+        }
+        AgentEvent::Done { total_turns, total_usage, .. } => {
+            println!("Completed in {total_turns} turns, {} tokens", total_usage.total());
+            break;
+        }
+        _ => {}
+    }
+}
 ```
 
 ## Built-in Providers
@@ -319,8 +468,119 @@ For agents that need file system access:
 | `GlobTool` | Find files matching patterns |
 | `GrepTool` | Search file contents with regex |
 | `BashTool` | Execute shell commands |
+| `NotebookReadTool` | Read Jupyter notebook contents |
+| `NotebookEditTool` | Edit Jupyter notebook cells |
 
 These require an `Environment` (use `InMemoryFileSystem` for sandboxed testing or `LocalFileSystem` for real file access).
+
+## Web Tools
+
+For agents that need internet access:
+
+| Tool | Description |
+|------|-------------|
+| `WebSearchTool` | Search the web via pluggable providers |
+| `LinkFetchTool` | Fetch URL content with SSRF protection |
+
+```rust
+use agent_sdk::web::{WebSearchTool, LinkFetchTool, BraveSearchProvider};
+
+// Web search with Brave
+let search_provider = BraveSearchProvider::new(brave_api_key);
+let search_tool = WebSearchTool::new(search_provider);
+
+// URL fetching
+let fetch_tool = LinkFetchTool::new();
+```
+
+## Task Tracking
+
+Built-in todo system for tracking multi-step tasks:
+
+```rust
+use agent_sdk::todo::{TodoState, TodoWriteTool, TodoReadTool};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+let state = Arc::new(RwLock::new(TodoState::new()));
+let write_tool = TodoWriteTool::new(Arc::clone(&state));
+let read_tool = TodoReadTool::new(state);
+```
+
+Task statuses: `Pending` (○), `InProgress` (⚡), `Completed` (✓)
+
+## Subagents
+
+Spawn isolated child agents for complex subtasks:
+
+```rust
+use agent_sdk::{SubagentFactory, SubagentConfig, SubagentTool};
+
+let factory = SubagentFactory::new(provider, subagent_tools);
+let config = SubagentConfig {
+    system_prompt: "You are a research assistant.".into(),
+    max_turns: 10,
+    ..Default::default()
+};
+let subagent_tool = SubagentTool::new(factory, config);
+```
+
+Subagents run in isolated threads with their own context and stream progress events back to the parent.
+
+## MCP Support
+
+Integrate external tools via the Model Context Protocol:
+
+```rust
+use agent_sdk::mcp::{McpClient, StdioTransport, register_mcp_tools};
+
+// Connect to an MCP server
+let transport = StdioTransport::spawn("mcp-server", &["--stdio"])?;
+let client = McpClient::new(transport);
+
+// Register all tools from the MCP server
+register_mcp_tools(&mut registry, &client).await?;
+```
+
+## User Interaction
+
+Tools for agent-initiated questions and confirmations:
+
+```rust
+use agent_sdk::user_interaction::AskUserQuestionTool;
+
+let question_tool = AskUserQuestionTool::new(question_tx, response_rx);
+```
+
+## Persistence
+
+The SDK provides trait-based storage for production deployments:
+
+| Store | Purpose |
+|-------|---------|
+| `MessageStore` | Conversation history per thread |
+| `StateStore` | Agent state checkpoints for recovery |
+| `ToolExecutionStore` | Write-ahead tool execution tracking (idempotency) |
+
+`InMemoryStore` and `InMemoryExecutionStore` are provided for testing. For production, implement the traits with your database (Postgres, Redis, etc.):
+
+```rust
+use agent_sdk::{MessageStore, StateStore, ToolExecutionStore, InMemoryStore, InMemoryExecutionStore};
+
+// Use in-memory stores for development
+let message_store = InMemoryStore::new();
+let state_store = InMemoryStore::new();
+let exec_store = InMemoryExecutionStore::new();
+
+let agent = builder::<()>()
+    .provider(provider)
+    .message_store(message_store)
+    .state_store(state_store)
+    .execution_store(exec_store)
+    .build();
+```
+
+The `ToolExecutionStore` enables crash recovery by recording tool calls before execution, ensuring idempotency on retry.
 
 ## Security Considerations
 
