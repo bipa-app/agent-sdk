@@ -35,11 +35,12 @@ use crate::llm::{
     StopReason,
 };
 use crate::skills::Skill;
-use crate::stores::{InMemoryStore, MessageStore, StateStore};
+use crate::stores::{InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ErasedAsyncTool, ErasedToolStatus, ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolOutcome, ToolResult, TurnOutcome,
+    ExecutionStatus, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
+    ToolOutcome, ToolResult, TurnOutcome,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -129,12 +130,13 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     state_store: Option<S>,
     config: Option<AgentConfig>,
     compaction_config: Option<CompactionConfig>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
 impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
     /// Create a new builder with no components set.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             provider: None,
             tools: None,
@@ -143,6 +145,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             state_store: None,
             config: None,
             compaction_config: None,
+            execution_store: None,
         }
     }
 }
@@ -165,6 +168,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
     }
 
@@ -186,6 +190,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
     }
 
@@ -203,6 +208,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
     }
 
@@ -220,7 +226,31 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: Some(state_store),
             config: self.config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
+    }
+
+    /// Set the execution store for tool idempotency.
+    ///
+    /// When set, tool executions will be tracked using a write-ahead pattern:
+    /// 1. Record execution intent BEFORE calling the tool
+    /// 2. Update with result AFTER completion
+    /// 3. On retry, return cached result if execution already completed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use agent_sdk::{builder, stores::InMemoryExecutionStore};
+    ///
+    /// let agent = builder()
+    ///     .provider(my_provider)
+    ///     .execution_store(InMemoryExecutionStore::new())
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn execution_store(mut self, store: impl ToolExecutionStore + 'static) -> Self {
+        self.execution_store = Some(Arc::new(store));
+        self
     }
 
     /// Set the agent configuration.
@@ -332,6 +362,7 @@ where
             state_store: Arc::new(InMemoryStore::new()),
             config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
     }
 }
@@ -376,6 +407,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: self.compaction_config,
+            execution_store: self.execution_store,
         }
     }
 }
@@ -427,11 +459,12 @@ where
     state_store: Arc<S>,
     config: AgentConfig,
     compaction_config: Option<CompactionConfig>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
 /// Create a new builder for constructing an `AgentLoop`.
 #[must_use]
-pub const fn builder<Ctx>() -> AgentLoopBuilder<Ctx, (), (), (), ()> {
+pub fn builder<Ctx>() -> AgentLoopBuilder<Ctx, (), (), (), ()> {
     AgentLoopBuilder::new()
 }
 
@@ -461,6 +494,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: None,
+            execution_store: None,
         }
     }
 
@@ -483,6 +517,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: Some(compaction_config),
+            execution_store: None,
         }
     }
 
@@ -557,6 +592,7 @@ where
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
+        let execution_store = self.execution_store.clone();
 
         tokio::spawn(async move {
             let result = run_loop(
@@ -571,6 +607,7 @@ where
                 state_store,
                 config,
                 compaction_config,
+                execution_store,
             )
             .await;
 
@@ -653,6 +690,7 @@ where
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
+        let execution_store = self.execution_store.clone();
 
         let result = run_single_turn(TurnParameters {
             tx: event_tx,
@@ -666,6 +704,7 @@ where
             state_store,
             config,
             compaction_config,
+            execution_store,
         })
         .await;
 
@@ -1268,6 +1307,7 @@ async fn run_loop<Ctx, P, H, M, S>(
     state_store: Arc<S>,
     config: AgentConfig,
     compaction_config: Option<CompactionConfig>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
 ) -> AgentRunState
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1410,6 +1450,7 @@ where
             &message_store,
             &config,
             compaction_config.as_ref(),
+            execution_store.as_ref(),
         )
         .await;
 
@@ -1476,6 +1517,7 @@ struct TurnParameters<Ctx, P, H, M, S> {
     state_store: Arc<S>,
     config: AgentConfig,
     compaction_config: Option<CompactionConfig>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
 /// Run a single turn of the agent loop.
@@ -1496,6 +1538,7 @@ async fn run_single_turn<Ctx, P, H, M, S>(
         state_store,
         config,
         compaction_config,
+        execution_store,
     }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
 where
@@ -1559,6 +1602,7 @@ where
         &message_store,
         &config,
         compaction_config.as_ref(),
+        execution_store.as_ref(),
     )
     .await;
 
@@ -1753,6 +1797,84 @@ where
     }
 }
 
+// =============================================================================
+// Tool Execution Idempotency Helpers
+// =============================================================================
+
+/// Check for an existing completed execution and return cached result.
+///
+/// Returns `Some(result)` if the execution was completed, `None` if not found
+/// or still in-flight.
+async fn try_get_cached_result(
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    tool_call_id: &str,
+) -> Option<ToolResult> {
+    let store = execution_store?;
+    let execution = store.get_execution(tool_call_id).await.ok()??;
+
+    match execution.status {
+        ExecutionStatus::Completed => execution.result,
+        ExecutionStatus::InFlight => {
+            // Log warning that we found an in-flight execution
+            // This means a previous attempt crashed mid-execution
+            warn!(
+                tool_call_id = tool_call_id,
+                tool_name = execution.tool_name,
+                "Found in-flight execution from previous attempt, re-executing"
+            );
+            None
+        }
+    }
+}
+
+/// Record that we're about to start executing a tool (write-ahead).
+async fn record_execution_start(
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    pending: &PendingToolCallInfo,
+    thread_id: &ThreadId,
+) {
+    if let Some(store) = execution_store {
+        let execution = ToolExecution::new_in_flight(
+            &pending.id,
+            thread_id.clone(),
+            &pending.name,
+            pending.input.clone(),
+        );
+        if let Err(e) = store.record_execution(execution).await {
+            warn!(
+                tool_call_id = pending.id,
+                error = %e,
+                "Failed to record execution start"
+            );
+        }
+    }
+}
+
+/// Record that tool execution completed.
+async fn record_execution_complete(
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    pending: &PendingToolCallInfo,
+    thread_id: &ThreadId,
+    result: &ToolResult,
+) {
+    if let Some(store) = execution_store {
+        let mut execution = ToolExecution::new_in_flight(
+            &pending.id,
+            thread_id.clone(),
+            &pending.name,
+            pending.input.clone(),
+        );
+        execution.complete(result.clone());
+        if let Err(e) = store.update_execution(execution).await {
+            warn!(
+                tool_call_id = pending.id,
+                error = %e,
+                "Failed to record execution completion"
+            );
+        }
+    }
+}
+
 /// Execute a single turn of the agent loop.
 ///
 /// This is the core turn execution logic shared by both `run_loop` (looping mode)
@@ -1768,6 +1890,7 @@ async fn execute_turn<Ctx, P, H, M>(
     message_store: &Arc<M>,
     config: &AgentConfig,
     compaction_config: Option<&CompactionConfig>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
 ) -> InternalTurnResult
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1955,6 +2078,17 @@ where
     // Execute tools (supports both sync and async tools)
     let mut tool_results = Vec::new();
     for (idx, pending) in pending_tool_calls.iter().enumerate() {
+        // IDEMPOTENCY: Check for cached result from a previous execution attempt
+        if let Some(cached_result) = try_get_cached_result(execution_store, &pending.id).await {
+            debug!(
+                tool_call_id = pending.id,
+                tool_name = pending.name,
+                "Using cached result from previous execution"
+            );
+            tool_results.push((pending.id.clone(), cached_result));
+            continue;
+        }
+
         // Check for async tool first
         if let Some(async_tool) = tools.get_async(&pending.name) {
             let tier = async_tool.tier();
@@ -1980,7 +2114,14 @@ where
 
             match decision {
                 ToolDecision::Allow => {
+                    // IDEMPOTENCY: Record execution start (write-ahead)
+                    record_execution_start(execution_store, pending, &ctx.thread_id).await;
+
                     let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
+
+                    // IDEMPOTENCY: Record execution completion
+                    record_execution_complete(execution_store, pending, &ctx.thread_id, &result)
+                        .await;
 
                     hooks.post_tool_use(&pending.name, &result).await;
 
@@ -2081,6 +2222,9 @@ where
 
         match decision {
             ToolDecision::Allow => {
+                // IDEMPOTENCY: Record execution start (write-ahead)
+                record_execution_start(execution_store, pending, &ctx.thread_id).await;
+
                 let tool_start = Instant::now();
                 let result = match tool.execute(tool_context, pending.input.clone()).await {
                     Ok(mut r) => {
@@ -2090,6 +2234,9 @@ where
                     Err(e) => ToolResult::error(format!("Tool error: {e}"))
                         .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                 };
+
+                // IDEMPOTENCY: Record execution completion
+                record_execution_complete(execution_store, pending, &ctx.thread_id, &result).await;
 
                 hooks.post_tool_use(&pending.name, &result).await;
 
