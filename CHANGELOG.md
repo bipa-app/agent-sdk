@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-01-27
+
+### Added
+
+- **`AsyncTool` trait** - New trait for long-running operations with progress streaming. Async tools have two phases: `execute()` starts the operation and returns immediately, `check_status()` streams progress updates until completion. Includes typed progress stages via `ProgressStage` trait.
+
+- **`ToolExecutionStore` trait** - Write-ahead logging for tool execution tracking. Enables idempotency and crash recovery by persisting tool execution state before running tools. Includes `InMemoryExecutionStore` default implementation.
+
+- **Extended thinking support** - `ThinkingConfig` for configuring Anthropic's extended thinking feature. Set `budget_tokens` to enable the model to think through complex problems before responding.
+
+- **`ToolProgress` event** - New event type for async tool progress updates, containing stage, message, and optional data.
+
+- **`ErasedToolStatus`** - Type-erased version of `ToolStatus` for use in the agent loop.
+
+- **`ToolOutcome` enum** - Result type for async tools with `Success`, `Failed`, and `InProgress` variants.
+
+### Fixed
+
+- **Store timestamp handling** - Fixed timestamp serialization/deserialization issues in message stores.
+
+### Changed
+
+- **`ToolRegistry` now supports async tools** - New `register_async()` method and `get_async()`, `all_async()`, `is_async()` accessors for async tool management.
+
 ## [0.3.0] - 2025-01-23
 
 ### Breaking Changes
