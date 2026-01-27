@@ -410,6 +410,8 @@ pub struct ToolExecution {
     pub thread_id: ThreadId,
     /// Tool name
     pub tool_name: String,
+    /// Display name
+    pub display_name: String,
     /// Input parameters (for verification)
     pub input: serde_json::Value,
     /// Current status
@@ -433,6 +435,7 @@ impl ToolExecution {
         tool_call_id: impl Into<String>,
         thread_id: ThreadId,
         tool_name: impl Into<String>,
+        display_name: impl Into<String>,
         input: serde_json::Value,
         started_at: OffsetDateTime,
     ) -> Self {
@@ -440,6 +443,7 @@ impl ToolExecution {
             tool_call_id: tool_call_id.into(),
             thread_id,
             tool_name: tool_name.into(),
+            display_name: display_name.into(),
             input,
             status: ExecutionStatus::InFlight,
             result: None,

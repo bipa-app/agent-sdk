@@ -1839,6 +1839,7 @@ async fn record_execution_start(
             &pending.id,
             thread_id.clone(),
             &pending.name,
+            &pending.display_name,
             pending.input.clone(),
             started_at,
         );
@@ -1865,6 +1866,7 @@ async fn record_execution_complete(
             &pending.id,
             thread_id.clone(),
             &pending.name,
+            &pending.display_name,
             pending.input.clone(),
             started_at,
         );
