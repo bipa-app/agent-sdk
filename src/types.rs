@@ -62,6 +62,12 @@ pub struct AgentConfig {
     pub retry: RetryConfig,
     /// Optional extended thinking configuration
     pub thinking: Option<ThinkingConfig>,
+    /// Enable streaming responses from the LLM.
+    ///
+    /// When `true`, emits `TextDelta` and `Thinking` events as text arrives
+    /// in real-time. When `false` (default), waits for the complete response
+    /// before emitting `Text` and `Thinking` events.
+    pub streaming: bool,
 }
 
 impl Default for AgentConfig {
@@ -73,6 +79,7 @@ impl Default for AgentConfig {
             model: String::from("claude-sonnet-4-20250514"),
             retry: RetryConfig::default(),
             thinking: None,
+            streaming: false,
         }
     }
 }
