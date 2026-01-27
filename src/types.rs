@@ -383,6 +383,96 @@ impl ToolOutcome {
     }
 }
 
+// ============================================================================
+// Tool Execution Idempotency Types
+// ============================================================================
+
+/// Status of a tool execution for idempotency tracking.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionStatus {
+    /// Execution started but not yet completed
+    InFlight,
+    /// Execution completed (success or failure)
+    Completed,
+}
+
+/// Record of a tool execution for idempotency.
+///
+/// This struct tracks tool executions to prevent duplicate execution when
+/// the agent loop retries after a failure. The write-ahead pattern ensures
+/// that execution intent is recorded BEFORE calling the tool, and updated
+/// with results AFTER completion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolExecution {
+    /// The tool call ID from the LLM (unique per invocation)
+    pub tool_call_id: String,
+    /// Thread this execution belongs to
+    pub thread_id: ThreadId,
+    /// Tool name
+    pub tool_name: String,
+    /// Input parameters (for verification)
+    pub input: serde_json::Value,
+    /// Current status
+    pub status: ExecutionStatus,
+    /// Result if completed
+    pub result: Option<ToolResult>,
+    /// For async tools: the operation ID returned by `execute()`
+    pub operation_id: Option<String>,
+    /// Timestamp when execution started
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    /// Timestamp when execution completed
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+}
+
+impl ToolExecution {
+    /// Create a new in-flight execution record.
+    #[must_use]
+    pub fn new_in_flight(
+        tool_call_id: impl Into<String>,
+        thread_id: ThreadId,
+        tool_name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            thread_id,
+            tool_name: tool_name.into(),
+            input,
+            status: ExecutionStatus::InFlight,
+            result: None,
+            operation_id: None,
+            started_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+        }
+    }
+
+    /// Mark this execution as completed with a result.
+    pub fn complete(&mut self, result: ToolResult) {
+        self.status = ExecutionStatus::Completed;
+        self.result = Some(result);
+        self.completed_at = Some(OffsetDateTime::now_utc());
+    }
+
+    /// Set the operation ID for async tool tracking.
+    pub fn set_operation_id(&mut self, operation_id: impl Into<String>) {
+        self.operation_id = Some(operation_id.into());
+    }
+
+    /// Returns true if this execution is still in flight.
+    #[must_use]
+    pub fn is_in_flight(&self) -> bool {
+        self.status == ExecutionStatus::InFlight
+    }
+
+    /// Returns true if this execution has completed.
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        self.status == ExecutionStatus::Completed
+    }
+}
+
 /// Outcome of running a single turn.
 ///
 /// This is returned by `run_turn` to indicate what happened and what to do next.

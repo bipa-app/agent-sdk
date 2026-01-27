@@ -340,7 +340,9 @@ pub use events::AgentEvent;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::{LlmProvider, ThinkingConfig};
-pub use stores::{InMemoryStore, MessageStore, StateStore};
+pub use stores::{
+    InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
+};
 pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedTool, ErasedToolStatus, PrimitiveToolName,
     ProgressStage, Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string,
@@ -348,8 +350,8 @@ pub use tools::{
 };
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolOutcome, ToolResult, ToolTier,
-    TurnOutcome,
+    ExecutionStatus, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
+    ToolOutcome, ToolResult, ToolTier, TurnOutcome,
 };
 
 // Re-export user interaction types for convenience
