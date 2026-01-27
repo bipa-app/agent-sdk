@@ -388,7 +388,9 @@ mod tests {
             "tool_call_123",
             thread_id.clone(),
             "my_tool",
+            "My Tool",
             serde_json::json!({"param": "value"}),
+            time::OffsetDateTime::now_utc(),
         );
         store.record_execution(execution).await?;
 
@@ -413,7 +415,9 @@ mod tests {
             "tool_call_456",
             thread_id.clone(),
             "my_tool",
+            "My Tool",
             serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
         );
         store.record_execution(execution.clone()).await?;
 
@@ -441,7 +445,9 @@ mod tests {
             "tool_call_789",
             thread_id.clone(),
             "async_tool",
+            "Async Tool",
             serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
         );
         execution.set_operation_id("op_abc123");
         store.record_execution(execution.clone()).await?;
