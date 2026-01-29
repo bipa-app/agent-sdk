@@ -45,7 +45,7 @@ use crate::types::{
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -575,15 +575,12 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (
-        mpsc::Receiver<AgentEvent>,
-        tokio::sync::oneshot::Receiver<AgentRunState>,
-    )
+    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<AgentRunState>)
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let (state_tx, state_rx) = tokio::sync::oneshot::channel();
+        let (state_tx, state_rx) = oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -677,11 +674,12 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (mpsc::Receiver<AgentEvent>, TurnOutcome)
+    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<TurnOutcome>)
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -692,6 +690,7 @@ where
         let compaction_config = self.compaction_config.clone();
         let execution_store = self.execution_store.clone();
 
+        tokio::spawn(async move {
         let result = run_single_turn(TurnParameters {
             tx: event_tx,
             thread_id,
@@ -708,7 +707,10 @@ where
         })
         .await;
 
-        (event_rx, result)
+            let _ = outcome_tx.send(result);
+        });
+
+        (event_rx, outcome_rx)
     }
 }
 
