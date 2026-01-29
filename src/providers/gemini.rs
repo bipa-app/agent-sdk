@@ -92,10 +92,10 @@ impl LlmProvider for GeminiProvider {
             }),
         };
 
-        tracing::debug!(
-            model = %self.model,
-            max_tokens = request.max_tokens,
-            "Gemini LLM request"
+        log::debug!(
+            "Gemini LLM request model={} max_tokens={}",
+            self.model,
+            request.max_tokens
         );
 
         let response = self
@@ -117,10 +117,10 @@ impl LlmProvider for GeminiProvider {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
 
-        tracing::debug!(
-            status = %status,
-            body_len = bytes.len(),
-            "Gemini LLM response"
+        log::debug!(
+            "Gemini LLM response status={} body_len={}",
+            status,
+            bytes.len()
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -129,13 +129,13 @@ impl LlmProvider for GeminiProvider {
 
         if status.is_server_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::error!(status = %status, body = %body, "Gemini server error");
+            log::error!("Gemini server error status={status} body={body}");
             return Ok(ChatOutcome::ServerError(body.into_owned()));
         }
 
         if status.is_client_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::warn!(status = %status, body = %body, "Gemini client error");
+            log::warn!("Gemini client error status={status} body={body}");
             return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
         }
 
@@ -152,7 +152,10 @@ impl LlmProvider for GeminiProvider {
 
         // Warn if parts were returned but no content blocks were built (possible unknown part types)
         if content.is_empty() && !candidate.content.parts.is_empty() {
-            tracing::warn!(raw_parts = ?candidate.content.parts, "Gemini parts not converted to content blocks");
+            log::warn!(
+                "Gemini parts not converted to content blocks raw_parts={:?}",
+                candidate.content.parts
+            );
         }
 
         // Gemini returns STOP for both natural endings and function calls.
@@ -209,7 +212,7 @@ impl LlmProvider for GeminiProvider {
                 generation_config: Some(ApiGenerationConfig { max_output_tokens: Some(request.max_tokens) }),
             };
 
-            tracing::debug!(model = %self.model, max_tokens = request.max_tokens, "Gemini streaming LLM request");
+            log::debug!("Gemini streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
             let Ok(response) = self.client
                 .post(format!("{API_BASE_URL}/models/{}:streamGenerateContent", self.model))
@@ -227,7 +230,7 @@ impl LlmProvider for GeminiProvider {
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-                tracing::warn!(status = %status, body = %body, "Gemini error");
+                log::warn!("Gemini error status={status} body={body}");
                 yield Ok(StreamDelta::Error { message: body, recoverable });
                 return;
             }
@@ -446,7 +449,7 @@ fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
                 // Function responses in the response are unusual, skip them
             }
             ApiPart::Unknown(value) => {
-                tracing::warn!(part = ?value, "Unknown API part type in Gemini response, skipping");
+                log::warn!("Unknown API part type in Gemini response, skipping part={value:?}");
             }
         }
     }

@@ -209,10 +209,10 @@ impl LlmProvider for OpenAIProvider {
             tools: tools.as_deref(),
         };
 
-        tracing::debug!(
-            model = %self.model,
-            max_tokens = request.max_tokens,
-            "OpenAI LLM request"
+        log::debug!(
+            "OpenAI LLM request model={} max_tokens={}",
+            self.model,
+            request.max_tokens
         );
 
         let response = self
@@ -231,10 +231,10 @@ impl LlmProvider for OpenAIProvider {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
 
-        tracing::debug!(
-            status = %status,
-            body_len = bytes.len(),
-            "OpenAI LLM response"
+        log::debug!(
+            "OpenAI LLM response status={} body_len={}",
+            status,
+            bytes.len()
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -243,13 +243,13 @@ impl LlmProvider for OpenAIProvider {
 
         if status.is_server_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::error!(status = %status, body = %body, "OpenAI server error");
+            log::error!("OpenAI server error status={status} body={body}");
             return Ok(ChatOutcome::ServerError(body.into_owned()));
         }
 
         if status.is_client_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::warn!(status = %status, body = %body, "OpenAI client error");
+            log::warn!("OpenAI client error status={status} body={body}");
             return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
         }
 
@@ -305,7 +305,7 @@ impl LlmProvider for OpenAIProvider {
 
             let api_request = ApiChatRequestStreaming { model: &self.model, messages: &messages, max_completion_tokens: Some(request.max_tokens), tools: tools.as_deref(), stream: true };
 
-            tracing::debug!(model = %self.model, max_tokens = request.max_tokens, "OpenAI streaming LLM request");
+            log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
             let Ok(response) = self.client
                 .post(format!("{}/chat/completions", self.base_url))
@@ -330,7 +330,7 @@ impl LlmProvider for OpenAIProvider {
                 } else {
                     (false, "client_error")
                 };
-                tracing::warn!(status = %status, body = %body, kind = level, "OpenAI error");
+                log::warn!("OpenAI error status={status} body={body} kind={level}");
                 yield Ok(StreamDelta::Error { message: body, recoverable });
                 return;
             }

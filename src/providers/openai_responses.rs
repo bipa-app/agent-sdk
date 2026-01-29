@@ -100,10 +100,10 @@ impl LlmProvider for OpenAIResponsesProvider {
             reasoning: self.reasoning_effort.map(|e| ApiReasoning { effort: e }),
         };
 
-        tracing::debug!(
-            model = %self.model,
-            max_tokens = request.max_tokens,
-            "OpenAI Responses API request"
+        log::debug!(
+            "OpenAI Responses API request model={} max_tokens={}",
+            self.model,
+            request.max_tokens
         );
 
         let response = self
@@ -122,10 +122,10 @@ impl LlmProvider for OpenAIResponsesProvider {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
 
-        tracing::debug!(
-            status = %status,
-            body_len = bytes.len(),
-            "OpenAI Responses API response"
+        log::debug!(
+            "OpenAI Responses API response status={} body_len={}",
+            status,
+            bytes.len()
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -134,13 +134,13 @@ impl LlmProvider for OpenAIResponsesProvider {
 
         if status.is_server_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::error!(status = %status, body = %body, "OpenAI Responses server error");
+            log::error!("OpenAI Responses server error status={status} body={body}");
             return Ok(ChatOutcome::ServerError(body.into_owned()));
         }
 
         if status.is_client_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::warn!(status = %status, body = %body, "OpenAI Responses client error");
+            log::warn!("OpenAI Responses client error status={status} body={body}");
             return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
         }
 
@@ -199,11 +199,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                 stream: true,
             };
 
-            tracing::debug!(
-                model = %self.model,
-                max_tokens = request.max_tokens,
-                "OpenAI Responses API streaming request"
-            );
+            log::debug!("OpenAI Responses API streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
             let Ok(response) = self.client
                 .post(format!("{}/responses", self.base_url))
@@ -222,7 +218,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-                tracing::warn!(status = %status, body = %body, "OpenAI Responses error");
+                log::warn!("OpenAI Responses error status={status} body={body}");
                 yield Ok(StreamDelta::Error { message: body, recoverable });
                 return;
             }

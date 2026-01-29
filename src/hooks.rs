@@ -104,25 +104,24 @@ pub struct LoggingHooks;
 #[async_trait]
 impl AgentHooks for LoggingHooks {
     async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
-        tracing::debug!(tool = tool_name, ?input, ?tier, "Pre-tool use");
+        log::debug!("Pre-tool use tool={tool_name} input={input:?} tier={tier:?}");
         DefaultHooks.pre_tool_use(tool_name, input, tier).await
     }
 
     async fn post_tool_use(&self, tool_name: &str, result: &ToolResult) {
-        tracing::debug!(
-            tool = tool_name,
-            success = result.success,
-            duration_ms = result.duration_ms,
-            "Post-tool use"
+        log::debug!(
+            "Post-tool use tool={tool_name} success={} duration_ms={:?}",
+            result.success,
+            result.duration_ms
         );
     }
 
     async fn on_event(&self, event: &AgentEvent) {
-        tracing::debug!(?event, "Agent event");
+        log::debug!("Agent event {event:?}");
     }
 
     async fn on_error(&self, error: &anyhow::Error) -> bool {
-        tracing::error!(?error, "Agent error");
+        log::error!("Agent error {error:?}");
         false
     }
 }
