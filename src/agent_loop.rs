@@ -669,7 +669,7 @@ where
     ///     }
     /// }
     /// ```
-    pub async fn run_turn(
+    pub fn run_turn(
         &self,
         thread_id: ThreadId,
         input: AgentInput,
