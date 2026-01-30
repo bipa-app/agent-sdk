@@ -2618,6 +2618,11 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
+                let input = if input.is_null() {
+                    serde_json::json!({})
+                } else {
+                    input.clone()
+                };
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {
