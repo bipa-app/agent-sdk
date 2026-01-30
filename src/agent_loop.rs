@@ -429,6 +429,18 @@ where
 /// - `M`: The message store implementation
 /// - `S`: The state store implementation
 ///
+/// # Event Channel Behavior
+///
+/// The agent uses a bounded channel (capacity 100) for events. Events are sent
+/// using non-blocking sends:
+///
+/// - If the channel has space, events are sent immediately
+/// - If the channel is full, the agent waits up to 30 seconds before timing out
+/// - If the receiver is dropped, the agent continues processing without blocking
+///
+/// This design ensures that slow consumers don't stall the LLM stream, but events
+/// may be dropped if the consumer is too slow or disconnects.
+///
 /// # Running the Agent
 ///
 /// ```ignore
@@ -2629,6 +2641,19 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
     (thinking, text, tool_uses)
 }
 
+/// Send an event to the consumer channel with non-blocking behavior.
+///
+/// This function first calls the hook's `on_event` method, then attempts to send
+/// the event to the consumer channel. The sending behavior is designed to be
+/// resilient to slow or disconnected consumers:
+///
+/// 1. First attempts a non-blocking send via `try_send`
+/// 2. If the channel is full, waits up to 30 seconds for space
+/// 3. If the channel is closed, logs and continues without blocking
+/// 4. On timeout, logs an error and continues
+///
+/// This ensures that the agent loop doesn't block indefinitely if the consumer
+/// is slow or has disconnected.
 async fn send_event<H>(tx: &mpsc::Sender<AgentEvent>, hooks: &Arc<H>, event: AgentEvent)
 where
     H: AgentHooks,

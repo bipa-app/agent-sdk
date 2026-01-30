@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Non-blocking event channel** - The agent loop now uses non-blocking sends for events. If the event channel is full, it logs a warning and waits up to 30 seconds before timing out. If the channel is closed (consumer disconnected), the agent continues processing without blocking. This prevents slow consumers from stalling the LLM stream.
+
+- **Improved stream resilience** - The streaming implementation now detects when the event channel is closed and continues processing the LLM response. This allows the agent to complete even if the consumer disconnects mid-stream.
+
+- **Switched from `tracing` to `log` crate** - The SDK now uses the standard `log` crate instead of `tracing` for logging, making it compatible with any logging framework that implements `log` (e.g., `env_logger`, `simple_logger`, `fern`).
+
+### Added
+
+- **Stream progress logging** - Added periodic debug logging during stream processing to help diagnose issues:
+  - `SSE chunk progress` every 10 chunks from the HTTP stream
+  - `Stream progress` every 50 deltas processed
+  - Warnings when the event channel is full or closed
+
+- **Stream drop detection** - Added a drop guard that logs (to both `log::error!` and `stderr`) when the SSE stream is dropped before completion, helping diagnose task cancellation issues.
+
 ## [0.4.0] - 2025-01-27
 
 ### Added
