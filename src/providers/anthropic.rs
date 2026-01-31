@@ -34,8 +34,18 @@ impl AnthropicProvider {
     /// Create a new Anthropic provider with the specified API key and model.
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
+        // Configure client with appropriate timeouts for streaming
+        // - No overall timeout (streaming can take a long time)
+        // - 30 second connect timeout
+        // - TCP keepalive to prevent connection drops
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             model,
         }
@@ -141,10 +151,10 @@ impl LlmProvider for AnthropicProvider {
             thinking,
         };
 
-        tracing::debug!(
-            model = %self.model,
-            max_tokens = request.max_tokens,
-            "Anthropic LLM request"
+        log::debug!(
+            "Anthropic LLM request model={} max_tokens={}",
+            self.model,
+            request.max_tokens
         );
 
         let response = self
@@ -164,10 +174,10 @@ impl LlmProvider for AnthropicProvider {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
 
-        tracing::debug!(
-            status = %status,
-            body_len = bytes.len(),
-            "Anthropic LLM response"
+        log::debug!(
+            "Anthropic LLM response status={} body_len={}",
+            status,
+            bytes.len()
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -176,13 +186,13 @@ impl LlmProvider for AnthropicProvider {
 
         if status.is_server_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::error!(status = %status, body = %body, "Anthropic server error");
+            log::error!("Anthropic server error status={status} body={body}");
             return Ok(ChatOutcome::ServerError(body.into_owned()));
         }
 
         if status.is_client_error() {
             let body = String::from_utf8_lossy(&bytes);
-            tracing::warn!(status = %status, body = %body, "Anthropic client error");
+            log::warn!("Anthropic client error status={status} body={body}");
             return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
         }
 
@@ -244,11 +254,7 @@ impl LlmProvider for AnthropicProvider {
                 thinking,
             };
 
-            tracing::debug!(
-                model = %self.model,
-                max_tokens = request.max_tokens,
-                "Anthropic streaming LLM request"
-            );
+            log::debug!("Anthropic streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
             let response = match self
                 .client
@@ -279,7 +285,7 @@ impl LlmProvider for AnthropicProvider {
 
             if status.is_server_error() {
                 let body = response.text().await.unwrap_or_default();
-                tracing::error!(status = %status, body = %body, "Anthropic server error");
+                log::error!("Anthropic server error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
                     recoverable: true,
@@ -289,7 +295,7 @@ impl LlmProvider for AnthropicProvider {
 
             if status.is_client_error() {
                 let body = response.text().await.unwrap_or_default();
-                tracing::warn!(status = %status, body = %body, "Anthropic client error");
+                log::warn!("Anthropic client error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
                     recoverable: false,
@@ -306,21 +312,64 @@ impl LlmProvider for AnthropicProvider {
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
 
+            let mut received_message_stop = false;
+            let mut chunk_count: u64 = 0;
+            let mut total_bytes: u64 = 0;
+
+            // Drop guard to detect if the stream is dropped before completion
+            struct StreamDropGuard {
+                completed: bool,
+                chunk_count: u64,
+            }
+            impl Drop for StreamDropGuard {
+                fn drop(&mut self) {
+                    if !self.completed {
+                        // Use eprintln as a last resort since log might not be available during task cancellation
+                        eprintln!(
+                            "[agent-sdk] CRITICAL: SSE stream DROPPED at chunk_count={} - task was cancelled!",
+                            self.chunk_count
+                        );
+                        log::error!(
+                            "SSE stream was DROPPED before completion at chunk_count={} - the consuming task was likely cancelled",
+                            self.chunk_count
+                        );
+                    }
+                }
+            }
+            let mut drop_guard = StreamDropGuard { completed: false, chunk_count: 0 };
+
+            log::debug!("Starting SSE stream processing");
+
             while let Some(chunk_result) = stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
+                        log::error!("Stream error while reading chunk error={e} chunk_count={chunk_count} total_bytes={total_bytes}");
                         yield Err(anyhow::anyhow!("stream error: {e}"));
                         return;
                     }
                 };
 
+                chunk_count += 1;
+                total_bytes += chunk.len() as u64;
+                drop_guard.chunk_count = chunk_count;
+
+                // Log progress every 10 chunks to show HTTP stream is alive
+                if chunk_count.is_multiple_of(10) {
+                    log::debug!("SSE chunk progress: chunk_count={chunk_count} total_bytes={total_bytes}");
+                }
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 // Process complete SSE events (separated by double newlines)
                 while let Some(pos) = buffer.find("\n\n") {
                     let event_block = buffer[..pos].to_string();
                     buffer = buffer[pos + 2..].to_string();
+
+                    // Track if we received message_stop
+                    if event_block.contains("event: message_stop") {
+                        log::debug!("Received message_stop event chunk_count={chunk_count} total_bytes={total_bytes}");
+                        received_message_stop = true;
+                    }
 
                     // Parse SSE event
                     if let Some(delta) = parse_sse_event(
@@ -332,6 +381,49 @@ impl LlmProvider for AnthropicProvider {
                         yield Ok(delta);
                     }
                 }
+            }
+
+            log::debug!(
+                "SSE stream ended chunk_count={chunk_count} total_bytes={total_bytes} buffer_remaining={} received_message_stop={received_message_stop}",
+                buffer.len()
+            );
+
+            // Process any remaining buffer content (handles incomplete final chunk)
+            let remaining = buffer.trim();
+            if !remaining.is_empty() {
+                log::debug!(
+                    "Processing remaining buffer content remaining_len={} remaining_preview={}",
+                    remaining.len(),
+                    remaining.chars().take(100).collect::<String>()
+                );
+
+                // Track if remaining buffer contains message_stop
+                if remaining.contains("event: message_stop") {
+                    received_message_stop = true;
+                }
+
+                if let Some(delta) = parse_sse_event(
+                    remaining,
+                    &mut input_tokens,
+                    &mut output_tokens,
+                    &mut tool_ids,
+                ) {
+                    yield Ok(delta);
+                }
+            }
+
+            // Mark stream as properly completed
+            drop_guard.completed = true;
+
+            // If stream ended without message_stop, emit a recoverable error
+            if !received_message_stop {
+                log::warn!(
+                    "SSE stream ended without message_stop event - stream may have been interrupted chunk_count={chunk_count} total_bytes={total_bytes}"
+                );
+                yield Ok(StreamDelta::Error {
+                    message: "Stream ended unexpectedly without completion".to_string(),
+                    recoverable: true,
+                });
             }
         })
     }

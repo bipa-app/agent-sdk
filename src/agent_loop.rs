@@ -43,11 +43,11 @@ use crate::types::{
     ToolOutcome, ToolResult, TurnOutcome,
 };
 use futures::StreamExt;
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
 
 /// Internal result of executing a single turn.
 ///
@@ -429,6 +429,18 @@ where
 /// - `M`: The message store implementation
 /// - `S`: The state store implementation
 ///
+/// # Event Channel Behavior
+///
+/// The agent uses a bounded channel (capacity 100) for events. Events are sent
+/// using non-blocking sends:
+///
+/// - If the channel has space, events are sent immediately
+/// - If the channel is full, the agent waits up to 30 seconds before timing out
+/// - If the receiver is dropped, the agent continues processing without blocking
+///
+/// This design ensures that slow consumers don't stall the LLM stream, but events
+/// may be dropped if the consumer is too slow or disconnects.
+///
 /// # Running the Agent
 ///
 /// ```ignore
@@ -575,15 +587,12 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (
-        mpsc::Receiver<AgentEvent>,
-        tokio::sync::oneshot::Receiver<AgentRunState>,
-    )
+    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<AgentRunState>)
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let (state_tx, state_rx) = tokio::sync::oneshot::channel();
+        let (state_tx, state_rx) = oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -672,16 +681,17 @@ where
     ///     }
     /// }
     /// ```
-    pub async fn run_turn(
+    pub fn run_turn(
         &self,
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (mpsc::Receiver<AgentEvent>, TurnOutcome)
+    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<TurnOutcome>)
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -692,23 +702,27 @@ where
         let compaction_config = self.compaction_config.clone();
         let execution_store = self.execution_store.clone();
 
-        let result = run_single_turn(TurnParameters {
-            tx: event_tx,
-            thread_id,
-            input,
-            tool_context,
-            provider,
-            tools,
-            hooks,
-            message_store,
-            state_store,
-            config,
-            compaction_config,
-            execution_store,
-        })
-        .await;
+        tokio::spawn(async move {
+            let result = run_single_turn(TurnParameters {
+                tx: event_tx,
+                thread_id,
+                input,
+                tool_context,
+                provider,
+                tools,
+                hooks,
+                message_store,
+                state_store,
+                config,
+                compaction_config,
+                execution_store,
+            })
+            .await;
 
-        (event_rx, result)
+            let _ = outcome_tx.send(result);
+        });
+
+        (event_rx, outcome_rx)
     }
 }
 
@@ -1244,9 +1258,9 @@ where
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
+                    "Rate limited, retrying after backoff (attempt={}, delay_ms={})",
                     attempt,
-                    delay_ms = delay.as_millis(),
-                    "Rate limited, retrying after backoff"
+                    delay.as_millis()
                 );
                 let _ = tx
                     .send(AgentEvent::text(format!(
@@ -1257,23 +1271,21 @@ where
                 sleep(delay).await;
             }
             ChatOutcome::InvalidRequest(msg) => {
-                error!(msg, "Invalid request to LLM");
+                error!("Invalid request to LLM: {msg}");
                 return Err(AgentError::new(format!("Invalid request: {msg}"), false));
             }
             ChatOutcome::ServerError(msg) => {
                 attempt += 1;
                 if attempt > max_retries {
-                    error!(msg, "LLM server error after {max_retries} retries");
+                    error!("LLM server error after {max_retries} retries: {msg}");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
                     send_event(tx, hooks, AgentEvent::error(&error_msg, true)).await;
                     return Err(AgentError::new(error_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
-                    attempt,
-                    delay_ms = delay.as_millis(),
-                    error = msg,
-                    "Server error, retrying after backoff"
+                    "Server error, retrying after backoff (attempt={attempt}, delay_ms={}, error={msg})",
+                    delay.as_millis()
                 );
                 send_event(
                     tx,
@@ -1324,10 +1336,8 @@ where
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
-                    attempt,
-                    delay_ms = delay.as_millis(),
-                    error = msg,
-                    "Streaming error, retrying"
+                    "Streaming error, retrying (attempt={attempt}, delay_ms={}, error={msg})",
+                    delay.as_millis()
                 );
                 send_event(
                     tx,
@@ -1367,22 +1377,56 @@ where
 {
     let mut stream = std::pin::pin!(provider.chat_stream(request.clone()));
     let mut accumulator = StreamAccumulator::new();
+    let mut delta_count: u64 = 0;
+
+    log::debug!("Starting to consume LLM stream");
+
+    // Track channel health
+    let mut channel_closed = false;
 
     while let Some(result) = stream.next().await {
+        // Log progress every 50 deltas to show stream is alive
+        if delta_count > 0 && delta_count.is_multiple_of(50) {
+            log::debug!("Stream progress: delta_count={delta_count}");
+        }
+
         match result {
             Ok(delta) => {
+                delta_count += 1;
                 accumulator.apply(&delta);
                 match &delta {
                     StreamDelta::TextDelta { delta, .. } => {
-                        send_event(tx, hooks, AgentEvent::text_delta(delta.clone())).await;
+                        // Check if channel is still open before sending
+                        if !channel_closed {
+                            if tx.is_closed() {
+                                log::warn!(
+                                    "Event channel closed by receiver at delta_count={delta_count} - consumer may have disconnected"
+                                );
+                                channel_closed = true;
+                            } else {
+                                send_event(tx, hooks, AgentEvent::text_delta(delta.clone())).await;
+                            }
+                        }
                     }
                     StreamDelta::ThinkingDelta { delta, .. } => {
-                        send_event(tx, hooks, AgentEvent::thinking(delta.clone())).await;
+                        if !channel_closed {
+                            if tx.is_closed() {
+                                log::warn!(
+                                    "Event channel closed by receiver at delta_count={delta_count}"
+                                );
+                                channel_closed = true;
+                            } else {
+                                send_event(tx, hooks, AgentEvent::thinking(delta.clone())).await;
+                            }
+                        }
                     }
                     StreamDelta::Error {
                         message,
                         recoverable,
                     } => {
+                        log::warn!(
+                            "Stream error received delta_count={delta_count} message={message} recoverable={recoverable}"
+                        );
                         return if *recoverable {
                             Err(StreamError::Recoverable(message.clone()))
                         } else {
@@ -1396,9 +1440,14 @@ where
                     | StreamDelta::ToolInputDelta { .. } => {}
                 }
             }
-            Err(e) => return Err(StreamError::Recoverable(format!("Stream error: {e}"))),
+            Err(e) => {
+                log::error!("Stream iteration error delta_count={delta_count} error={e}");
+                return Err(StreamError::Recoverable(format!("Stream error: {e}")));
+            }
         }
     }
+
+    log::debug!("Stream while loop exited normally at delta_count={delta_count}");
 
     let usage = accumulator.usage().cloned().unwrap_or(Usage {
         input_tokens: 0,
@@ -1406,6 +1455,13 @@ where
     });
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();
+
+    log::debug!(
+        "LLM stream completed successfully delta_count={delta_count} stop_reason={stop_reason:?} content_block_count={} input_tokens={} output_tokens={}",
+        content_blocks.len(),
+        usage.input_tokens,
+        usage.output_tokens
+    );
 
     Ok(ChatResponse {
         id: String::new(),
@@ -1583,7 +1639,7 @@ where
         match result {
             InternalTurnResult::Continue { .. } => {
                 if let Err(e) = state_store.save(&ctx.state).await {
-                    warn!(error = %e, "Failed to save state checkpoint");
+                    warn!("Failed to save state checkpoint: {e}");
                 }
             }
             InternalTurnResult::Done => {
@@ -1613,7 +1669,7 @@ where
     }
 
     if let Err(e) = state_store.save(&ctx.state).await {
-        warn!(error = %e, "Failed to save final state");
+        warn!("Failed to save final state: {e}");
     }
 
     let duration = ctx.start_time.elapsed();
@@ -1737,7 +1793,7 @@ where
         InternalTurnResult::Continue { turn_usage } => {
             // Save state checkpoint
             if let Err(e) = state_store.save(&ctx.state).await {
-                warn!(error = %e, "Failed to save state checkpoint");
+                warn!("Failed to save state checkpoint: {e}");
             }
 
             TurnOutcome::NeedsMoreTurns {
@@ -1749,7 +1805,7 @@ where
         InternalTurnResult::Done => {
             // Final state save
             if let Err(e) = state_store.save(&ctx.state).await {
-                warn!(error = %e, "Failed to save final state");
+                warn!("Failed to save final state: {e}");
             }
 
             // Emit done
@@ -1913,7 +1969,7 @@ where
     let mut updated_state = state;
     updated_state.turn_count = turn;
     if let Err(e) = state_store.save(&updated_state).await {
-        warn!(error = %e, "Failed to save state checkpoint");
+        warn!("Failed to save state checkpoint: {e}");
     }
 
     TurnOutcome::NeedsMoreTurns {
@@ -1944,9 +2000,8 @@ async fn try_get_cached_result(
             // Log warning that we found an in-flight execution
             // This means a previous attempt crashed mid-execution
             warn!(
-                tool_call_id = tool_call_id,
-                tool_name = execution.tool_name,
-                "Found in-flight execution from previous attempt, re-executing"
+                "Found in-flight execution from previous attempt, re-executing (tool_call_id={}, tool_name={})",
+                tool_call_id, execution.tool_name
             );
             None
         }
@@ -1971,9 +2026,8 @@ async fn record_execution_start(
         );
         if let Err(e) = store.record_execution(execution).await {
             warn!(
-                tool_call_id = pending.id,
-                error = %e,
-                "Failed to record execution start"
+                "Failed to record execution start (tool_call_id={}, error={})",
+                pending.id, e
             );
         }
     }
@@ -1999,9 +2053,8 @@ async fn record_execution_complete(
         execution.complete(result.clone());
         if let Err(e) = store.update_execution(execution).await {
             warn!(
-                tool_call_id = pending.id,
-                error = %e,
-                "Failed to record execution completion"
+                "Failed to record execution completion (tool_call_id={}, error={})",
+                pending.id, e
             );
         }
     }
@@ -2034,7 +2087,10 @@ where
     ctx.state.turn_count = ctx.turn;
 
     if ctx.turn > config.max_turns {
-        warn!(turn = ctx.turn, max = config.max_turns, "Max turns reached");
+        warn!(
+            "Max turns reached (turn={}, max={})",
+            ctx.turn, config.max_turns
+        );
         send_event(
             tx,
             hooks,
@@ -2080,9 +2136,9 @@ where
         let compactor = LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
         if compactor.needs_compaction(&messages) {
             debug!(
-                turn = ctx.turn,
-                message_count = messages.len(),
-                "Context compaction triggered"
+                "Context compaction triggered (turn={}, message_count={})",
+                ctx.turn,
+                messages.len()
             );
 
             match compactor.compact_history(messages.clone()).await {
@@ -2091,7 +2147,7 @@ where
                         .replace_history(&ctx.thread_id, result.messages.clone())
                         .await
                     {
-                        warn!(error = %e, "Failed to replace history after compaction");
+                        warn!("Failed to replace history after compaction: {e}");
                     } else {
                         send_event(
                             tx,
@@ -2106,18 +2162,18 @@ where
                         .await;
 
                         info!(
-                            original_count = result.original_count,
-                            new_count = result.new_count,
-                            original_tokens = result.original_tokens,
-                            new_tokens = result.new_tokens,
-                            "Context compacted successfully"
+                            "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
+                            result.original_count,
+                            result.new_count,
+                            result.original_tokens,
+                            result.new_tokens
                         );
 
                         messages = result.messages;
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Context compaction failed, continuing with full history");
+                    warn!("Context compaction failed, continuing with full history: {e}");
                 }
             }
         }
@@ -2139,7 +2195,10 @@ where
     };
 
     // Call LLM with retry logic (streaming or non-streaming based on config)
-    debug!(turn = ctx.turn, streaming = config.streaming, "Calling LLM");
+    debug!(
+        "Calling LLM (turn={}, streaming={})",
+        ctx.turn, config.streaming
+    );
     let response = if config.streaming {
         // Streaming mode: events are emitted as content arrives
         match call_llm_streaming(provider, request, config, tx, hooks).await {
@@ -2169,22 +2228,22 @@ where
     // Process response content
     let (thinking_content, text_content, tool_uses) = extract_content(&response);
 
-    // Emit events only in non-streaming mode (streaming already emitted deltas)
-    if !config.streaming {
-        // Emit thinking if present (before text)
-        if let Some(thinking) = &thinking_content {
-            send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
-        }
+    // In non-streaming mode, emit thinking event now (streaming already emitted deltas)
+    if !config.streaming
+        && let Some(thinking) = &thinking_content
+    {
+        send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
+    }
 
-        // Emit text if present
-        if let Some(text) = &text_content {
-            send_event(tx, hooks, AgentEvent::text(text.clone())).await;
-        }
+    // Always emit the final complete Text event so consumers know the full response is ready
+    // (in streaming mode this comes after all TextDelta events)
+    if let Some(text) = &text_content {
+        send_event(tx, hooks, AgentEvent::text(text.clone())).await;
     }
 
     // If no tool uses, we're done
     if tool_uses.is_empty() {
-        info!(turn = ctx.turn, "Agent completed (no tool use)");
+        info!("Agent completed (no tool use) (turn={})", ctx.turn);
         return InternalTurnResult::Done;
     }
 
@@ -2227,9 +2286,8 @@ where
         // IDEMPOTENCY: Check for cached result from a previous execution attempt
         if let Some(cached_result) = try_get_cached_result(execution_store, &pending.id).await {
             debug!(
-                tool_call_id = pending.id,
-                tool_name = pending.name,
-                "Using cached result from previous execution"
+                "Using cached result from previous execution (tool_call_id={}, tool_name={})",
+                pending.id, pending.name
             );
             tool_results.push((pending.id.clone(), cached_result));
             continue;
@@ -2492,7 +2550,7 @@ where
 
     // Check stop reason
     if response.stop_reason == Some(StopReason::EndTurn) {
-        info!(turn = ctx.turn, "Agent completed (end_turn)");
+        info!("Agent completed (end_turn) (turn={})", ctx.turn);
         return InternalTurnResult::Done;
     }
 
@@ -2560,6 +2618,11 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
+                let input = if input.is_null() {
+                    serde_json::json!({})
+                } else {
+                    input.clone()
+                };
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
             ContentBlock::ToolResult { .. } => {
@@ -2583,12 +2646,46 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
     (thinking, text, tool_uses)
 }
 
+/// Send an event to the consumer channel with non-blocking behavior.
+///
+/// This function first calls the hook's `on_event` method, then attempts to send
+/// the event to the consumer channel. The sending behavior is designed to be
+/// resilient to slow or disconnected consumers:
+///
+/// 1. First attempts a non-blocking send via `try_send`
+/// 2. If the channel is full, waits up to 30 seconds for space
+/// 3. If the channel is closed, logs and continues without blocking
+/// 4. On timeout, logs an error and continues
+///
+/// This ensures that the agent loop doesn't block indefinitely if the consumer
+/// is slow or has disconnected.
 async fn send_event<H>(tx: &mpsc::Sender<AgentEvent>, hooks: &Arc<H>, event: AgentEvent)
 where
     H: AgentHooks,
 {
     hooks.on_event(&event).await;
-    let _ = tx.send(event).await;
+
+    // Try non-blocking send first to detect backpressure
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            // Channel is full - consumer is slow or blocked
+            log::debug!("Event channel full, waiting for consumer...");
+            // Fall back to blocking send with timeout
+            match tokio::time::timeout(std::time::Duration::from_secs(30), tx.send(event)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    log::warn!("Event channel closed while sending - consumer disconnected");
+                }
+                Err(_) => {
+                    log::error!("Timeout waiting to send event - consumer may be deadlocked");
+                }
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            log::debug!("Event channel closed - consumer disconnected");
+        }
+    }
 }
 
 fn build_assistant_message(response: &ChatResponse) -> Message {

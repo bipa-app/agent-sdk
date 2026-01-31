@@ -341,7 +341,7 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
 
             // Save to storage if configured
             if let Err(e) = state.save() {
-                tracing::warn!("Failed to save todos: {e}");
+                log::warn!("Failed to save todos: {e}");
             }
 
             state.format_display()

@@ -87,7 +87,7 @@ impl SkillLoader for FileSkillLoader {
 
         // Verify the parsed name matches the filename
         if skill.name != name {
-            tracing::warn!(
+            log::warn!(
                 "Skill name '{}' in file doesn't match filename '{}'",
                 skill.name,
                 name

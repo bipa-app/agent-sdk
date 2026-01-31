@@ -8,6 +8,11 @@
 //! ```bash
 //! ANTHROPIC_API_KEY=your_key cargo run --example with_primitive_tools
 //! ```
+//!
+//! To see debug logs from the SDK:
+//! ```bash
+//! RUST_LOG=agent_sdk=debug ANTHROPIC_API_KEY=your_key cargo run --example with_primitive_tools
+//! ```
 
 use agent_sdk::{
     AgentCapabilities, AgentConfig, AgentEvent, AgentInput, AllowAllHooks, Environment,
@@ -19,7 +24,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    env_logger::init();
 
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .expect("ANTHROPIC_API_KEY environment variable must be set");

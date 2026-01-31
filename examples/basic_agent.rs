@@ -7,6 +7,11 @@
 //! ```bash
 //! ANTHROPIC_API_KEY=your_key cargo run --example basic_agent
 //! ```
+//!
+//! To see debug logs from the SDK:
+//! ```bash
+//! RUST_LOG=agent_sdk=debug ANTHROPIC_API_KEY=your_key cargo run --example basic_agent
+//! ```
 
 use agent_sdk::{
     AgentEvent, AgentInput, ThreadId, ToolContext, builder, providers::AnthropicProvider,
@@ -14,8 +19,8 @@ use agent_sdk::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing for debug output
-    tracing_subscriber::fmt::init();
+    // Initialize logging for debug output (SDK uses the `log` crate)
+    env_logger::init();
 
     // Get API key from environment
     let api_key = std::env::var("ANTHROPIC_API_KEY")

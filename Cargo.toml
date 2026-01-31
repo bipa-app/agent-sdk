@@ -21,7 +21,6 @@ anyhow = "1"
 thiserror = "2"
 regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl"] }
 glob = { version = "0.3", default-features = false }
-tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
 reqwest = { version = "0.13.1", features = ["gzip", "json", "query", "default-tls", "stream", "http2"], default-features = false }
@@ -33,7 +32,7 @@ html2text = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
-tracing-subscriber = "0.3"
+env_logger = "0.11"
 tempfile = "3"
 
 [[example]]

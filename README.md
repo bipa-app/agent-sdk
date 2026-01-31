@@ -404,7 +404,48 @@ agent.run(thread_id, prompt, tool_ctx);
 
 ## Streaming Events
 
-The agent emits events during execution for real-time UI updates:
+The agent emits events during execution for real-time UI updates.
+
+### Event Channel Behavior
+
+The agent uses a bounded channel (capacity 100) for events. The SDK is designed to be resilient to slow consumers:
+
+- **Non-blocking sends**: Events are sent using `try_send` first. If the channel is full, the SDK waits up to 30 seconds before timing out.
+- **Consumer disconnection**: If the event receiver is dropped, the agent continues processing the LLM response without blocking.
+- **Backpressure handling**: If your consumer is slow, you'll see warnings like `Event channel full, waiting for consumer...` in the logs.
+
+**Best practices for consuming events:**
+
+```rust
+// GOOD: Process events quickly, offload heavy work
+while let Some(event) = events.recv().await {
+    match event {
+        AgentEvent::TextDelta { delta } => {
+            // Quick: just buffer or forward
+            buffer.push_str(&delta);
+        }
+        AgentEvent::Done { .. } => break,
+        _ => {}
+    }
+}
+
+// GOOD: Spawn heavy processing to avoid blocking
+while let Some(event) = events.recv().await {
+    let event = event.clone();
+    tokio::spawn(async move {
+        // Heavy processing in background
+        save_to_database(&event).await;
+    });
+}
+
+// BAD: Blocking I/O in the event loop
+while let Some(event) = events.recv().await {
+    // This blocks the consumer, causing backpressure
+    std::thread::sleep(Duration::from_secs(1));
+}
+```
+
+### Event Types
 
 | Event | Description |
 |-------|-------------|
