@@ -653,8 +653,8 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
     // Add tool calls if present
     if let Some(tool_calls) = &message.tool_calls {
         for tc in tool_calls {
-            let input: serde_json::Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+            let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
             blocks.push(ContentBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
