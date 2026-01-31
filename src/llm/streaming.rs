@@ -188,7 +188,7 @@ impl StreamAccumulator {
         // Add tool uses with their indices
         for tool in self.tool_uses {
             let input: serde_json::Value =
-                serde_json::from_str(&tool.input_json).unwrap_or(serde_json::Value::Null);
+                serde_json::from_str(&tool.input_json).unwrap_or_else(|_| serde_json::json!({}));
             blocks.push((
                 tool.block_index,
                 ContentBlock::ToolUse {
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             ContentBlock::ToolUse { input, .. } => {
-                assert!(input.is_null());
+                assert!(input.is_object());
             }
             _ => panic!("Expected ToolUse block"),
         }

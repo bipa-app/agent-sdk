@@ -487,7 +487,8 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
                 arguments,
                 ..
             } => {
-                let input = serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+                let input =
+                    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
                 blocks.push(ContentBlock::ToolUse {
                     id: call_id.clone(),
                     name: name.clone(),
