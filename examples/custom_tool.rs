@@ -161,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
             AgentEvent::ToolCallEnd { name, result, .. } => {
                 println!("[Tool] {name} returned: {}", result.output);
             }
-            AgentEvent::Text { text } => {
+            AgentEvent::Text {
+                message_id: _,
+                text,
+            } => {
                 println!("\nAgent: {text}");
             }
             AgentEvent::Done { total_turns, .. } => {

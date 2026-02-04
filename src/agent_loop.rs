@@ -1262,12 +1262,7 @@ where
                     attempt,
                     delay.as_millis()
                 );
-                let _ = tx
-                    .send(AgentEvent::text(format!(
-                        "\n[Rate limited, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
-                        delay.as_secs_f64()
-                    )))
-                    .await;
+
                 sleep(delay).await;
             }
             ChatOutcome::InvalidRequest(msg) => {
@@ -1287,15 +1282,7 @@ where
                     "Server error, retrying after backoff (attempt={attempt}, delay_ms={}, error={msg})",
                     delay.as_millis()
                 );
-                send_event(
-                    tx,
-                    hooks,
-                    AgentEvent::text(format!(
-                        "\n[Server error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
-                        delay.as_secs_f64()
-                    )),
-                )
-                .await;
+
                 sleep(delay).await;
             }
         }
@@ -1313,6 +1300,8 @@ async fn call_llm_streaming<P, H>(
     config: &AgentConfig,
     tx: &mpsc::Sender<AgentEvent>,
     hooks: &Arc<H>,
+    message_id: &str,
+    thinking_id: &str,
 ) -> Result<ChatResponse, AgentError>
 where
     P: LlmProvider,
@@ -1322,7 +1311,7 @@ where
     let mut attempt = 0u32;
 
     loop {
-        let result = process_stream(provider, &request, tx, hooks).await;
+        let result = process_stream(provider, &request, tx, hooks, message_id, thinking_id).await;
 
         match result {
             Ok(response) => return Ok(response),
@@ -1339,15 +1328,7 @@ where
                     "Streaming error, retrying (attempt={attempt}, delay_ms={}, error={msg})",
                     delay.as_millis()
                 );
-                send_event(
-                    tx,
-                    hooks,
-                    AgentEvent::text(format!(
-                        "\n[Streaming error: {msg}, retrying in {:.1}s... (attempt {attempt}/{max_retries})]\n",
-                        delay.as_secs_f64()
-                    )),
-                )
-                .await;
+
                 sleep(delay).await;
             }
             Err(StreamError::Fatal(msg)) => {
@@ -1370,6 +1351,8 @@ async fn process_stream<P, H>(
     request: &ChatRequest,
     tx: &mpsc::Sender<AgentEvent>,
     hooks: &Arc<H>,
+    message_id: &str,
+    thinking_id: &str,
 ) -> Result<ChatResponse, StreamError>
 where
     P: LlmProvider,
@@ -1404,7 +1387,12 @@ where
                                 );
                                 channel_closed = true;
                             } else {
-                                send_event(tx, hooks, AgentEvent::text_delta(delta.clone())).await;
+                                send_event(
+                                    tx,
+                                    hooks,
+                                    AgentEvent::text_delta(message_id, delta.clone()),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1416,7 +1404,12 @@ where
                                 );
                                 channel_closed = true;
                             } else {
-                                send_event(tx, hooks, AgentEvent::thinking(delta.clone())).await;
+                                send_event(
+                                    tx,
+                                    hooks,
+                                    AgentEvent::thinking(thinking_id, delta.clone()),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -2199,9 +2192,21 @@ where
         "Calling LLM (turn={}, streaming={})",
         ctx.turn, config.streaming
     );
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let thinking_id = uuid::Uuid::new_v4().to_string();
     let response = if config.streaming {
         // Streaming mode: events are emitted as content arrives
-        match call_llm_streaming(provider, request, config, tx, hooks).await {
+        match call_llm_streaming(
+            provider,
+            request,
+            config,
+            tx,
+            hooks,
+            &message_id,
+            &thinking_id,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return InternalTurnResult::Error(e);
@@ -2232,13 +2237,18 @@ where
     if !config.streaming
         && let Some(thinking) = &thinking_content
     {
-        send_event(tx, hooks, AgentEvent::thinking(thinking.clone())).await;
+        send_event(
+            tx,
+            hooks,
+            AgentEvent::thinking(thinking_id, thinking.clone()),
+        )
+        .await;
     }
 
     // Always emit the final complete Text event so consumers know the full response is ready
     // (in streaming mode this comes after all TextDelta events)
     if let Some(text) = &text_content {
-        send_event(tx, hooks, AgentEvent::text(text.clone())).await;
+        send_event(tx, hooks, AgentEvent::text(message_id, text.clone())).await;
     }
 
     // If no tool uses, we're done
@@ -3084,11 +3094,9 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
 
         // The LLM's response about the missing tool should be in the events
-        assert!(
-            events.iter().any(|e| {
-                matches!(e, AgentEvent::Text { text } if text.contains("couldn't find"))
-            })
-        );
+        assert!(events.iter().any(|e| {
+            matches!(e, AgentEvent::Text { message_id, text } if text.contains("couldn't find"))
+        }));
 
         Ok(())
     }
@@ -3128,13 +3136,6 @@ mod tests {
             matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
         }));
 
-        // Should have retry text events
-        assert!(
-            events
-                .iter()
-                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
-        );
-
         Ok(())
     }
 
@@ -3166,13 +3167,6 @@ mod tests {
 
         // Should have successful completion after retry
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
-
-        // Should have retry text event
-        assert!(
-            events
-                .iter()
-                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
-        );
 
         Ok(())
     }
@@ -3212,13 +3206,6 @@ mod tests {
             matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
         }));
 
-        // Should have retry text events
-        assert!(
-            events
-                .iter()
-                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
-        );
-
         Ok(())
     }
 
@@ -3250,13 +3237,6 @@ mod tests {
 
         // Should have successful completion after retry
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
-
-        // Should have retry text event
-        assert!(
-            events
-                .iter()
-                .any(|e| { matches!(e, AgentEvent::Text { text } if text.contains("retrying")) })
-        );
 
         Ok(())
     }

@@ -304,7 +304,10 @@ where
 
             match recv_result {
                 Ok(Some(event)) => match event {
-                    AgentEvent::Text { text } => {
+                    AgentEvent::Text {
+                        message_id: _,
+                        text,
+                    } => {
                         final_response.push_str(&text);
                     }
                     AgentEvent::ToolCallStart {

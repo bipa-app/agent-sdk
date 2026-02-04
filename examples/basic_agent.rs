@@ -47,7 +47,10 @@ async fn main() -> anyhow::Result<()> {
     // Process events as they stream in
     while let Some(event) = events.recv().await {
         match event {
-            AgentEvent::Text { text } => {
+            AgentEvent::Text {
+                message_id: _,
+                text,
+            } => {
                 println!("Agent: {text}");
             }
             AgentEvent::Done {

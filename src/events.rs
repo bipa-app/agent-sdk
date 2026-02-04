@@ -25,13 +25,13 @@ pub enum AgentEvent {
     Start { thread_id: ThreadId, turn: usize },
 
     /// Agent is "thinking" - streaming text that may be shown as typing indicator
-    Thinking { text: String },
+    Thinking { message_id: String, text: String },
 
     /// A text delta for streaming responses
-    TextDelta { delta: String },
+    TextDelta { message_id: String, delta: String },
 
     /// Complete text block from the agent
-    Text { text: String },
+    Text { message_id: String, text: String },
 
     /// Agent is about to call a tool
     ToolCallStart {
@@ -129,20 +129,27 @@ impl AgentEvent {
     }
 
     #[must_use]
-    pub fn thinking(text: impl Into<String>) -> Self {
-        Self::Thinking { text: text.into() }
+    pub fn thinking(message_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Thinking {
+            message_id: message_id.into(),
+            text: text.into(),
+        }
     }
 
     #[must_use]
-    pub fn text_delta(delta: impl Into<String>) -> Self {
+    pub fn text_delta(message_id: impl Into<String>, delta: impl Into<String>) -> Self {
         Self::TextDelta {
+            message_id: message_id.into(),
             delta: delta.into(),
         }
     }
 
     #[must_use]
-    pub fn text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+    pub fn text(message_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Text {
+            message_id: message_id.into(),
+            text: text.into(),
+        }
     }
 
     #[must_use]

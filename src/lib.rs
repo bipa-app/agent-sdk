@@ -38,7 +38,7 @@
 //! // 4. Process streaming events
 //! while let Some(event) = events.recv().await {
 //!     match event {
-//!         AgentEvent::Text { text } => print!("{text}"),
+//!         AgentEvent::Text { message_id: _, text } => print!("{text}"),
 //!         AgentEvent::Done { .. } => break,
 //!         _ => {}
 //!     }
