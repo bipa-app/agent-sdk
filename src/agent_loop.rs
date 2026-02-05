@@ -2187,6 +2187,63 @@ where
         thinking: config.thinking.clone(),
     };
 
+    // Log the request messages for debugging context issues
+    debug!(
+        "ChatRequest built: system_prompt_len={} num_messages={} num_tools={} max_tokens={}",
+        request.system.len(),
+        request.messages.len(),
+        request.tools.as_ref().map_or(0, Vec::len),
+        request.max_tokens
+    );
+    for (i, msg) in request.messages.iter().enumerate() {
+        match &msg.content {
+            Content::Text(text) => {
+                debug!(
+                    "  message[{}]: role={:?} content=Text(len={})",
+                    i,
+                    msg.role,
+                    text.len()
+                );
+            }
+            Content::Blocks(blocks) => {
+                debug!(
+                    "  message[{}]: role={:?} content=Blocks(count={})",
+                    i,
+                    msg.role,
+                    blocks.len()
+                );
+                for (j, block) in blocks.iter().enumerate() {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            debug!("    block[{}]: Text(len={})", j, text.len());
+                        }
+                        ContentBlock::Thinking { thinking } => {
+                            debug!("    block[{}]: Thinking(len={})", j, thinking.len());
+                        }
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            debug!("    block[{j}]: ToolUse(id={id}, name={name}, input={input})");
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            debug!(
+                                "    block[{}]: ToolResult(tool_use_id={}, is_error={:?}, content_len={})",
+                                j,
+                                tool_use_id,
+                                is_error,
+                                content.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Call LLM with retry logic (streaming or non-streaming based on config)
     debug!(
         "Calling LLM (turn={}, streaming={})",
@@ -2251,13 +2308,7 @@ where
         send_event(tx, hooks, AgentEvent::text(message_id, text.clone())).await;
     }
 
-    // If no tool uses, we're done
-    if tool_uses.is_empty() {
-        info!("Agent completed (no tool use) (turn={})", ctx.turn);
-        return InternalTurnResult::Done;
-    }
-
-    // Store assistant message with tool uses
+    // Store assistant message in conversation history (includes text and tool uses)
     let assistant_msg = build_assistant_message(&response);
     if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
         send_event(

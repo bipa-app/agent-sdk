@@ -157,6 +157,14 @@ impl LlmProvider for AnthropicProvider {
             request.max_tokens
         );
 
+        // Log full request payload for debugging
+        if log::log_enabled!(log::Level::Debug) {
+            match serde_json::to_string_pretty(&api_request) {
+                Ok(json) => log::debug!("Anthropic API request payload:\n{json}"),
+                Err(e) => log::debug!("Failed to serialize request for logging: {e}"),
+            }
+        }
+
         let response = self
             .client
             .post(format!("{API_BASE_URL}/v1/messages"))
@@ -198,6 +206,17 @@ impl LlmProvider for AnthropicProvider {
 
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
+
+        // Log the full response for debugging
+        log::debug!(
+            "Anthropic API response: id={} model={} stop_reason={:?} usage={{input_tokens={}, output_tokens={}}} content_blocks={}",
+            api_response.id,
+            api_response.model,
+            api_response.stop_reason,
+            api_response.usage.input_tokens,
+            api_response.usage.output_tokens,
+            api_response.content.len()
+        );
 
         let content: Vec<ContentBlock> = api_response
             .content
@@ -255,6 +274,14 @@ impl LlmProvider for AnthropicProvider {
             };
 
             log::debug!("Anthropic streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
+
+            // Log full request payload for debugging
+            if log::log_enabled!(log::Level::Debug) {
+                match serde_json::to_string_pretty(&api_request) {
+                    Ok(json) => log::debug!("Anthropic streaming API request payload:\n{json}"),
+                    Err(e) => log::debug!("Failed to serialize streaming request for logging: {e}"),
+                }
+            }
 
             let response = match self
                 .client
@@ -642,7 +669,7 @@ enum ApiResponseContentBlock {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ApiStopReason {
     EndTurn,

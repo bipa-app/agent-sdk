@@ -139,6 +139,44 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
     let stop_reason = accumulator.take_stop_reason();
     let content = accumulator.into_content_blocks();
 
+    // Log accumulated response for debugging
+    log::debug!(
+        "Collected stream response: model={} stop_reason={:?} usage={{input_tokens={}, output_tokens={}}} content_blocks={}",
+        model,
+        stop_reason,
+        usage.input_tokens,
+        usage.output_tokens,
+        content.len()
+    );
+    for (i, block) in content.iter().enumerate() {
+        match block {
+            ContentBlock::Text { text } => {
+                log::debug!("  content_block[{}]: Text (len={})", i, text.len());
+            }
+            ContentBlock::Thinking { thinking } => {
+                log::debug!("  content_block[{}]: Thinking (len={})", i, thinking.len());
+            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                log::debug!("  content_block[{i}]: ToolUse id={id} name={name} input={input}");
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: result_content,
+                is_error,
+            } => {
+                log::debug!(
+                    "  content_block[{}]: ToolResult tool_use_id={} is_error={:?} content_len={}",
+                    i,
+                    tool_use_id,
+                    is_error,
+                    result_content.len()
+                );
+            }
+        }
+    }
+
     Ok(ChatOutcome::Success(ChatResponse {
         id: String::new(),
         content,
