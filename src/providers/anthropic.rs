@@ -22,6 +22,10 @@ pub const MODEL_SONNET_35: &str = "claude-3-5-sonnet-20241022";
 pub const MODEL_SONNET_4: &str = "claude-sonnet-4-20250514";
 pub const MODEL_OPUS_4: &str = "claude-opus-4-20250514";
 
+pub const MODEL_HAIKU_45: &str = "claude-haiku-4-5-20251001";
+pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
+pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
+
 /// Anthropic LLM provider using the Messages API.
 #[derive(Clone)]
 pub struct AnthropicProvider {
@@ -51,22 +55,22 @@ impl AnthropicProvider {
         }
     }
 
-    /// Create a provider using Claude 3.5 Haiku.
+    /// Create a provider using Claude Haiku 4.5.
     #[must_use]
     pub fn haiku(api_key: String) -> Self {
-        Self::new(api_key, MODEL_HAIKU_35.to_owned())
+        Self::new(api_key, MODEL_HAIKU_45.to_owned())
     }
 
-    /// Create a provider using Claude Sonnet 4.
+    /// Create a provider using Claude Sonnet 4.5.
     #[must_use]
     pub fn sonnet(api_key: String) -> Self {
-        Self::new(api_key, MODEL_SONNET_4.to_owned())
+        Self::new(api_key, MODEL_SONNET_45.to_owned())
     }
 
-    /// Create a provider using Claude Opus 4.
+    /// Create a provider using Claude Opus 4.6.
     #[must_use]
     pub fn opus(api_key: String) -> Self {
-        Self::new(api_key, MODEL_OPUS_4.to_owned())
+        Self::new(api_key, MODEL_OPUS_46.to_owned())
     }
 
     /// Build API messages from the chat request.
@@ -84,30 +88,37 @@ impl AnthropicProvider {
                     Content::Blocks(blocks) => ApiMessageContent::Blocks(
                         blocks
                             .iter()
-                            .filter_map(|b| match b {
+                            .map(|b| match b {
                                 ContentBlock::Text { text } => {
-                                    Some(ApiContentBlockInput::Text { text: text.clone() })
+                                    ApiContentBlockInput::Text { text: text.clone() }
                                 }
-                                ContentBlock::Thinking { .. } => {
-                                    // Thinking blocks are ephemeral - not sent back to API
-                                    None
+                                ContentBlock::Thinking {
+                                    thinking,
+                                    signature,
+                                    ..
+                                } => ApiContentBlockInput::Thinking {
+                                    thinking: thinking.clone(),
+                                    signature: signature.clone(),
+                                },
+                                ContentBlock::RedactedThinking { data } => {
+                                    ApiContentBlockInput::RedactedThinking { data: data.clone() }
                                 }
                                 ContentBlock::ToolUse {
                                     id, name, input, ..
-                                } => Some(ApiContentBlockInput::ToolUse {
+                                } => ApiContentBlockInput::ToolUse {
                                     id: id.clone(),
                                     name: name.clone(),
                                     input: input.clone(),
-                                }),
+                                },
                                 ContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
                                     is_error,
-                                } => Some(ApiContentBlockInput::ToolResult {
+                                } => ApiContentBlockInput::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
                                     content: content.clone(),
                                     is_error: *is_error,
-                                }),
+                                },
                             })
                             .collect(),
                     ),
@@ -140,6 +151,11 @@ impl LlmProvider for AnthropicProvider {
             .thinking
             .as_ref()
             .map(ApiThinkingConfig::from_thinking_config);
+        let output_config = request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.effort)
+            .map(|e| ApiOutputConfig { effort: e.as_str() });
 
         let api_request = ApiMessagesRequest {
             model: &self.model,
@@ -149,6 +165,7 @@ impl LlmProvider for AnthropicProvider {
             tools: tools.as_deref(),
             stream: false,
             thinking,
+            output_config,
         };
 
         log::debug!(
@@ -223,8 +240,15 @@ impl LlmProvider for AnthropicProvider {
             .into_iter()
             .map(|b| match b {
                 ApiResponseContentBlock::Text { text } => ContentBlock::Text { text },
-                ApiResponseContentBlock::Thinking { thinking } => {
-                    ContentBlock::Thinking { thinking }
+                ApiResponseContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                },
+                ApiResponseContentBlock::RedactedThinking { data } => {
+                    ContentBlock::RedactedThinking { data }
                 }
                 ApiResponseContentBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
                     id,
@@ -240,6 +264,8 @@ impl LlmProvider for AnthropicProvider {
             ApiStopReason::ToolUse => StopReason::ToolUse,
             ApiStopReason::MaxTokens => StopReason::MaxTokens,
             ApiStopReason::StopSequence => StopReason::StopSequence,
+            ApiStopReason::Refusal => StopReason::Refusal,
+            ApiStopReason::ModelContextWindowExceeded => StopReason::ModelContextWindowExceeded,
         });
 
         Ok(ChatOutcome::Success(ChatResponse {
@@ -262,6 +288,11 @@ impl LlmProvider for AnthropicProvider {
                 .thinking
                 .as_ref()
                 .map(ApiThinkingConfig::from_thinking_config);
+            let output_config = request
+                .thinking
+                .as_ref()
+                .and_then(|t| t.effort)
+                .map(|e| ApiOutputConfig { effort: e.as_str() });
 
             let api_request = ApiMessagesRequest {
                 model: &self.model,
@@ -271,6 +302,7 @@ impl LlmProvider for AnthropicProvider {
                 tools: tools.as_deref(),
                 stream: true,
                 thinking,
+                output_config,
             };
 
             log::debug!("Anthropic streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
@@ -493,17 +525,25 @@ fn parse_sse_event(
             None
         }
         Some("content_block_start") => {
-            // Handle tool_use block start
-            if let Ok(event) = serde_json::from_str::<SseContentBlockStart>(data)
-                && let SseContentBlock::ToolUse { id, name } = event.content_block
-            {
-                // Store the tool ID for later input deltas
-                tool_ids.insert(event.index, id.clone());
-                return Some(StreamDelta::ToolUseStart {
-                    id,
-                    name,
-                    block_index: event.index,
-                });
+            if let Ok(event) = serde_json::from_str::<SseContentBlockStart>(data) {
+                match event.content_block {
+                    SseContentBlock::ToolUse { id, name } => {
+                        // Store the tool ID for later input deltas
+                        tool_ids.insert(event.index, id.clone());
+                        return Some(StreamDelta::ToolUseStart {
+                            id,
+                            name,
+                            block_index: event.index,
+                        });
+                    }
+                    SseContentBlock::RedactedThinking { data } => {
+                        return Some(StreamDelta::RedactedThinking {
+                            data,
+                            block_index: event.index,
+                        });
+                    }
+                    SseContentBlock::Text | SseContentBlock::Thinking => {}
+                }
             }
             None
         }
@@ -519,6 +559,12 @@ fn parse_sse_event(
                     SseDelta::Thinking { thinking } => {
                         return Some(StreamDelta::ThinkingDelta {
                             delta: thinking,
+                            block_index: event.index,
+                        });
+                    }
+                    SseDelta::Signature { signature } => {
+                        return Some(StreamDelta::SignatureDelta {
+                            delta: signature,
                             block_index: event.index,
                         });
                     }
@@ -543,6 +589,10 @@ fn parse_sse_event(
                     ApiStopReason::ToolUse => StopReason::ToolUse,
                     ApiStopReason::MaxTokens => StopReason::MaxTokens,
                     ApiStopReason::StopSequence => StopReason::StopSequence,
+                    ApiStopReason::Refusal => StopReason::Refusal,
+                    ApiStopReason::ModelContextWindowExceeded => {
+                        StopReason::ModelContextWindowExceeded
+                    }
                 });
                 // Emit usage and done
                 return Some(StreamDelta::Done { stop_reason });
@@ -575,23 +625,43 @@ struct ApiMessagesRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ApiThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<ApiOutputConfig>,
 }
 
 /// Configuration for extended thinking in the API request.
 #[derive(Serialize)]
-struct ApiThinkingConfig {
-    #[serde(rename = "type")]
-    config_type: &'static str,
-    budget_tokens: u32,
+#[serde(untagged)]
+enum ApiThinkingConfig {
+    Enabled {
+        #[serde(rename = "type")]
+        config_type: &'static str,
+        budget_tokens: u32,
+    },
+    Adaptive {
+        #[serde(rename = "type")]
+        config_type: &'static str,
+    },
 }
 
 impl ApiThinkingConfig {
     const fn from_thinking_config(config: &crate::llm::ThinkingConfig) -> Self {
-        Self {
-            config_type: "enabled",
-            budget_tokens: config.budget_tokens,
+        match &config.mode {
+            crate::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
+                config_type: "enabled",
+                budget_tokens: *budget_tokens,
+            },
+            crate::llm::ThinkingMode::Adaptive => Self::Adaptive {
+                config_type: "adaptive",
+            },
         }
     }
+}
+
+/// Output configuration for effort level.
+#[derive(Serialize)]
+struct ApiOutputConfig {
+    effort: &'static str,
 }
 
 #[derive(Serialize)]
@@ -619,6 +689,14 @@ enum ApiMessageContent {
 enum ApiContentBlockInput {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -660,7 +738,13 @@ enum ApiResponseContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -676,6 +760,8 @@ enum ApiStopReason {
     ToolUse,
     MaxTokens,
     StopSequence,
+    Refusal,
+    ModelContextWindowExceeded,
 }
 
 #[derive(Deserialize)]
@@ -716,6 +802,8 @@ enum SseContentBlock {
     Text,
     #[serde(rename = "thinking")]
     Thinking,
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
 }
@@ -733,6 +821,8 @@ enum SseDelta {
     Text { text: String },
     #[serde(rename = "thinking_delta")]
     Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
 }
@@ -774,7 +864,7 @@ mod tests {
     fn test_haiku_factory_creates_haiku_provider() {
         let provider = AnthropicProvider::haiku("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_HAIKU_35);
+        assert_eq!(provider.model(), MODEL_HAIKU_45);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -782,7 +872,7 @@ mod tests {
     fn test_sonnet_factory_creates_sonnet_provider() {
         let provider = AnthropicProvider::sonnet("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_SONNET_4);
+        assert_eq!(provider.model(), MODEL_SONNET_45);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -790,7 +880,7 @@ mod tests {
     fn test_opus_factory_creates_opus_provider() {
         let provider = AnthropicProvider::opus("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_OPUS_4);
+        assert_eq!(provider.model(), MODEL_OPUS_46);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -918,6 +1008,7 @@ mod tests {
             tools: None,
             stream: true,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -973,7 +1064,7 @@ mod tests {
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "test.txt");
             }
-            ApiResponseContentBlock::Text { .. } | ApiResponseContentBlock::Thinking { .. } => {
+            _ => {
                 panic!("Expected ToolUse content block")
             }
         }
@@ -985,11 +1076,19 @@ mod tests {
         let tool_use: ApiStopReason = serde_json::from_str("\"tool_use\"").unwrap();
         let max_tokens: ApiStopReason = serde_json::from_str("\"max_tokens\"").unwrap();
         let stop_sequence: ApiStopReason = serde_json::from_str("\"stop_sequence\"").unwrap();
+        let refusal: ApiStopReason = serde_json::from_str("\"refusal\"").unwrap();
+        let ctx_exceeded: ApiStopReason =
+            serde_json::from_str("\"model_context_window_exceeded\"").unwrap();
 
         assert!(matches!(end_turn, ApiStopReason::EndTurn));
         assert!(matches!(tool_use, ApiStopReason::ToolUse));
         assert!(matches!(max_tokens, ApiStopReason::MaxTokens));
         assert!(matches!(stop_sequence, ApiStopReason::StopSequence));
+        assert!(matches!(refusal, ApiStopReason::Refusal));
+        assert!(matches!(
+            ctx_exceeded,
+            ApiStopReason::ModelContextWindowExceeded
+        ));
     }
 
     #[test]
