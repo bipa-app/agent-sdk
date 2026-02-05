@@ -563,8 +563,8 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.clone());
                         }
-                        ContentBlock::Thinking { .. } => {
-                            // Thinking blocks are ephemeral - not sent back to API
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                            // Thinking blocks are not sent to the OpenAI API
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..

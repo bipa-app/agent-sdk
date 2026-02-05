@@ -35,11 +35,15 @@ pub trait LlmProvider: Send + Sync {
                                         block_index: idx,
                                     });
                                 }
-                                ContentBlock::Thinking { thinking } => {
+                                ContentBlock::Thinking { thinking, .. } => {
                                     yield Ok(StreamDelta::ThinkingDelta {
                                         delta: thinking.clone(),
                                         block_index: idx,
                                     });
+                                }
+                                ContentBlock::RedactedThinking { .. }
+                                | ContentBlock::ToolResult { .. } => {
+                                    // Not streamed in the default implementation
                                 }
                                 ContentBlock::ToolUse { id, name, input, .. } => {
                                     yield Ok(StreamDelta::ToolUseStart {
@@ -52,9 +56,6 @@ pub trait LlmProvider: Send + Sync {
                                         delta: serde_json::to_string(input).unwrap_or_default(),
                                         block_index: idx,
                                     });
-                                }
-                                ContentBlock::ToolResult { .. } => {
-                                    // Tool results are not emitted in streaming responses
                                 }
                             }
                         }
@@ -153,8 +154,11 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
             ContentBlock::Text { text } => {
                 log::debug!("  content_block[{}]: Text (len={})", i, text.len());
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 log::debug!("  content_block[{}]: Thinking (len={})", i, thinking.len());
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                log::debug!("  content_block[{i}]: RedactedThinking");
             }
             ContentBlock::ToolUse {
                 id, name, input, ..

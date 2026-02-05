@@ -97,9 +97,12 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
                             ContentBlock::Text { text } => {
                                 let _ = writeln!(output, "{text}");
                             }
-                            ContentBlock::Thinking { thinking } => {
+                            ContentBlock::Thinking { thinking, .. } => {
                                 // Include thinking in summaries for context
                                 let _ = writeln!(output, "[Thinking: {thinking}]");
+                            }
+                            ContentBlock::RedactedThinking { .. } => {
+                                let _ = writeln!(output, "[Redacted thinking]");
                             }
                             ContentBlock::ToolUse { name, input, .. } => {
                                 let _ = writeln!(
