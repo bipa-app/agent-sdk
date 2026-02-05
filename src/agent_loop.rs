@@ -2308,13 +2308,7 @@ where
         send_event(tx, hooks, AgentEvent::text(message_id, text.clone())).await;
     }
 
-    // If no tool uses, we're done
-    if tool_uses.is_empty() {
-        info!("Agent completed (no tool use) (turn={})", ctx.turn);
-        return InternalTurnResult::Done;
-    }
-
-    // Store assistant message with tool uses
+    // Store assistant message in conversation history (includes text and tool uses)
     let assistant_msg = build_assistant_message(&response);
     if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
         send_event(
