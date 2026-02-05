@@ -24,8 +24,11 @@ pub enum AgentEvent {
     /// Agent loop has started
     Start { thread_id: ThreadId, turn: usize },
 
-    /// Agent is "thinking" - streaming text that may be shown as typing indicator
+    /// Agent is "thinking" - complete thinking text after stream ends
     Thinking { message_id: String, text: String },
+
+    /// A thinking delta for streaming thinking content
+    ThinkingDelta { message_id: String, delta: String },
 
     /// A text delta for streaming responses
     TextDelta { message_id: String, delta: String },
@@ -89,6 +92,12 @@ pub enum AgentEvent {
     /// An error occurred during execution
     Error { message: String, recoverable: bool },
 
+    /// The model refused the request (safety/policy).
+    Refusal {
+        message_id: String,
+        text: Option<String>,
+    },
+
     /// Context was compacted to reduce size
     ContextCompacted {
         /// Number of messages before compaction
@@ -133,6 +142,14 @@ impl AgentEvent {
         Self::Thinking {
             message_id: message_id.into(),
             text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn thinking_delta(message_id: impl Into<String>, delta: impl Into<String>) -> Self {
+        Self::ThinkingDelta {
+            message_id: message_id.into(),
+            delta: delta.into(),
         }
     }
 
@@ -223,6 +240,14 @@ impl AgentEvent {
         Self::Error {
             message: message.into(),
             recoverable,
+        }
+    }
+
+    #[must_use]
+    pub fn refusal(message_id: impl Into<String>, text: Option<String>) -> Self {
+        Self::Refusal {
+            message_id: message_id.into(),
+            text,
         }
     }
 
