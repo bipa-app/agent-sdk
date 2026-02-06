@@ -10,25 +10,13 @@ pub enum ThinkingMode {
 }
 
 /// Effort level for adaptive thinking via `output_config`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
     High,
     Max,
-}
-
-impl Effort {
-    /// Wire value expected by the Anthropic API.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "max",
-        }
-    }
 }
 
 /// Configuration for extended thinking.

@@ -155,7 +155,7 @@ impl LlmProvider for AnthropicProvider {
             .thinking
             .as_ref()
             .and_then(|t| t.effort)
-            .map(|e| ApiOutputConfig { effort: e.as_str() });
+            .map(|effort| ApiOutputConfig { effort });
 
         let api_request = ApiMessagesRequest {
             model: &self.model,
@@ -292,7 +292,7 @@ impl LlmProvider for AnthropicProvider {
                 .thinking
                 .as_ref()
                 .and_then(|t| t.effort)
-                .map(|e| ApiOutputConfig { effort: e.as_str() });
+                .map(|effort| ApiOutputConfig { effort });
 
             let api_request = ApiMessagesRequest {
                 model: &self.model,
@@ -661,7 +661,7 @@ impl ApiThinkingConfig {
 /// Output configuration for effort level.
 #[derive(Serialize)]
 struct ApiOutputConfig {
-    effort: &'static str,
+    effort: crate::llm::Effort,
 }
 
 #[derive(Serialize)]

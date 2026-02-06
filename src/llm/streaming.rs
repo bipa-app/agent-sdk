@@ -6,6 +6,7 @@
 
 use crate::llm::{ContentBlock, StopReason, Usage};
 use futures::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
 
 /// Events yielded during streaming LLM responses.
@@ -98,7 +99,7 @@ pub struct StreamAccumulator {
     /// Accumulated thinking blocks for each block index
     thinking_blocks: Vec<String>,
     /// Accumulated signatures keyed by block index
-    thinking_signatures: Vec<String>,
+    thinking_signatures: HashMap<usize, String>,
     /// Redacted thinking blocks: (`block_index`, data)
     redacted_thinking_blocks: Vec<(usize, String)>,
     /// Accumulated tool use calls
@@ -162,10 +163,10 @@ impl StreamAccumulator {
                 }
             }
             StreamDelta::SignatureDelta { delta, block_index } => {
-                while self.thinking_signatures.len() <= *block_index {
-                    self.thinking_signatures.push(String::new());
-                }
-                self.thinking_signatures[*block_index].push_str(delta);
+                self.thinking_signatures
+                    .entry(*block_index)
+                    .or_default()
+                    .push_str(delta);
             }
             StreamDelta::RedactedThinking { data, block_index } => {
                 self.redacted_thinking_blocks
@@ -202,13 +203,10 @@ impl StreamAccumulator {
         let mut blocks: Vec<(usize, ContentBlock)> = Vec::new();
 
         // Add thinking blocks with their indices, attaching signatures
+        let mut signatures = self.thinking_signatures;
         for (idx, thinking) in self.thinking_blocks.into_iter().enumerate() {
             if !thinking.is_empty() {
-                let signature = self
-                    .thinking_signatures
-                    .get(idx)
-                    .filter(|s| !s.is_empty())
-                    .cloned();
+                let signature = signatures.remove(&idx).filter(|s| !s.is_empty());
                 blocks.push((
                     idx,
                     ContentBlock::Thinking {
