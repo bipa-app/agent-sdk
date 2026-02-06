@@ -36,8 +36,8 @@
 //! );
 //!
 //! // 4. Process streaming events
-//! while let Some(event) = events.recv().await {
-//!     match event {
+//! while let Some(envelope) = events.recv().await {
+//!     match envelope.event {
 //!         AgentEvent::Text { message_id: _, text } => print!("{text}"),
 //!         AgentEvent::Done { .. } => break,
 //!         _ => {}
@@ -336,7 +336,7 @@ pub mod web;
 pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
-pub use events::AgentEvent;
+pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::{LlmProvider, ThinkingConfig};

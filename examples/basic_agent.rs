@@ -45,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Process events as they stream in
-    while let Some(event) = events.recv().await {
-        match event {
+    while let Some(envelope) = events.recv().await {
+        match envelope.event {
             AgentEvent::Text {
                 message_id: _,
                 text,

@@ -153,8 +153,8 @@ async fn main() -> anyhow::Result<()> {
         tool_ctx,
     );
 
-    while let Some(event) = events.recv().await {
-        match event {
+    while let Some(envelope) = events.recv().await {
+        match envelope.event {
             AgentEvent::ToolCallStart { name, input, .. } => {
                 println!("[Tool] Calling {name} with {input}");
             }

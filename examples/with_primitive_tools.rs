@@ -107,8 +107,8 @@ async fn main() -> anyhow::Result<()> {
 
     println!("--- Agent Working ---\n");
 
-    while let Some(event) = events.recv().await {
-        match event {
+    while let Some(envelope) = events.recv().await {
+        match envelope.event {
             AgentEvent::ToolCallStart { name, .. } => {
                 println!("[Using tool: {name}]");
             }
