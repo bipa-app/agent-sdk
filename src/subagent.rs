@@ -36,7 +36,7 @@ mod factory;
 
 pub use factory::SubagentFactory;
 
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
@@ -243,7 +243,8 @@ where
         &self,
         task: &str,
         subagent_id: String,
-        parent_tx: Option<mpsc::Sender<AgentEvent>>,
+        parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
+        parent_seq: Option<SequenceCounter>,
     ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
@@ -303,7 +304,7 @@ where
             };
 
             match recv_result {
-                Ok(Some(event)) => match event {
+                Ok(Some(envelope)) => match envelope.event {
                     AgentEvent::Text {
                         message_id: _,
                         text,
@@ -319,20 +320,19 @@ where
                         pending_tools.insert(id, (name.clone(), context.clone()));
 
                         // Emit progress event to parent
-                        if let Some(ref tx) = parent_tx {
-                            let _ = tx
-                                .send(AgentEvent::SubagentProgress {
-                                    subagent_id: subagent_id.clone(),
-                                    subagent_name: self.config.name.clone(),
-                                    tool_name: name,
-                                    tool_context: context,
-                                    completed: false,
-                                    success: false,
-                                    tool_count,
-                                    total_tokens: u64::from(total_usage.input_tokens)
-                                        + u64::from(total_usage.output_tokens),
-                                })
-                                .await;
+                        if let (Some(tx), Some(seq)) = (&parent_tx, &parent_seq) {
+                            let event = AgentEvent::SubagentProgress {
+                                subagent_id: subagent_id.clone(),
+                                subagent_name: self.config.name.clone(),
+                                tool_name: name,
+                                tool_context: context,
+                                completed: false,
+                                success: false,
+                                tool_count,
+                                total_tokens: u64::from(total_usage.input_tokens)
+                                    + u64::from(total_usage.output_tokens),
+                            };
+                            let _ = tx.send(AgentEventEnvelope::wrap(event, seq)).await;
                         }
                     }
                     AgentEvent::ToolCallEnd {
@@ -358,20 +358,19 @@ where
                         });
 
                         // Emit progress event to parent
-                        if let Some(ref tx) = parent_tx {
-                            let _ = tx
-                                .send(AgentEvent::SubagentProgress {
-                                    subagent_id: subagent_id.clone(),
-                                    subagent_name: self.config.name.clone(),
-                                    tool_name: name,
-                                    tool_context: context,
-                                    completed: true,
-                                    success: tool_success,
-                                    tool_count,
-                                    total_tokens: u64::from(total_usage.input_tokens)
-                                        + u64::from(total_usage.output_tokens),
-                                })
-                                .await;
+                        if let (Some(tx), Some(seq)) = (&parent_tx, &parent_seq) {
+                            let event = AgentEvent::SubagentProgress {
+                                subagent_id: subagent_id.clone(),
+                                subagent_name: self.config.name.clone(),
+                                tool_name: name,
+                                tool_context: context,
+                                completed: true,
+                                success: tool_success,
+                                tool_count,
+                                total_tokens: u64::from(total_usage.input_tokens)
+                                    + u64::from(total_usage.output_tokens),
+                            };
+                            let _ = tx.send(AgentEventEnvelope::wrap(event, seq)).await;
                         }
                     }
                     AgentEvent::TurnComplete { turn, usage, .. } => {
@@ -555,8 +554,9 @@ where
             .and_then(Value::as_str)
             .context("Missing 'task' parameter")?;
 
-        // Get event channel from context for progress updates
+        // Get event channel and sequence counter from context for progress updates
         let parent_tx = ctx.event_tx();
+        let parent_seq = ctx.event_seq();
 
         // Generate a unique ID for this subagent execution
         let subagent_id = format!(
@@ -568,7 +568,9 @@ where
                 .as_nanos()
         );
 
-        let result = self.run_subagent(task, subagent_id, parent_tx).await?;
+        let result = self
+            .run_subagent(task, subagent_id, parent_tx, parent_seq)
+            .await?;
 
         Ok(ToolResult {
             success: result.success,

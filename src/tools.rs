@@ -32,7 +32,7 @@
 //! }
 //! ```
 
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::llm;
 use crate::types::{ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
@@ -230,7 +230,9 @@ pub struct ToolContext<Ctx> {
     /// Tool-specific metadata
     pub metadata: HashMap<String, Value>,
     /// Optional channel for tools to emit events (e.g., subagent progress)
-    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    event_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
+    /// Optional sequence counter for wrapping events in envelopes
+    event_seq: Option<SequenceCounter>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -240,6 +242,7 @@ impl<Ctx> ToolContext<Ctx> {
             app,
             metadata: HashMap::new(),
             event_tx: None,
+            event_seq: None,
         }
     }
 
@@ -249,20 +252,30 @@ impl<Ctx> ToolContext<Ctx> {
         self
     }
 
-    /// Set the event channel for tools that need to emit events during execution.
+    /// Set the event channel and sequence counter for tools that need to emit
+    /// events during execution.
     #[must_use]
-    pub fn with_event_tx(mut self, tx: mpsc::Sender<AgentEvent>) -> Self {
+    pub fn with_event_tx(
+        mut self,
+        tx: mpsc::Sender<AgentEventEnvelope>,
+        seq: SequenceCounter,
+    ) -> Self {
         self.event_tx = Some(tx);
+        self.event_seq = Some(seq);
         self
     }
 
     /// Emit an event through the event channel (if set).
     ///
+    /// The event is wrapped in an [`AgentEventEnvelope`] with a unique ID,
+    /// sequence number, and timestamp before sending.
+    ///
     /// This uses `try_send` to avoid blocking and to ensure the future is `Send`.
     /// The event is silently dropped if the channel is full.
     pub fn emit_event(&self, event: AgentEvent) {
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.try_send(event);
+        if let Some((tx, seq)) = self.event_tx.as_ref().zip(self.event_seq.as_ref()) {
+            let envelope = AgentEventEnvelope::wrap(event, seq);
+            let _ = tx.try_send(envelope);
         }
     }
 
@@ -271,8 +284,17 @@ impl<Ctx> ToolContext<Ctx> {
     /// This is useful for tools that spawn subprocesses (like subagents)
     /// and need to forward events to the parent's event stream.
     #[must_use]
-    pub fn event_tx(&self) -> Option<mpsc::Sender<AgentEvent>> {
+    pub fn event_tx(&self) -> Option<mpsc::Sender<AgentEventEnvelope>> {
         self.event_tx.clone()
+    }
+
+    /// Get a clone of the sequence counter (if set).
+    ///
+    /// This is useful for tools that spawn subprocesses (like subagents)
+    /// and need to assign sequence numbers to events sent to the parent's stream.
+    #[must_use]
+    pub fn event_seq(&self) -> Option<SequenceCounter> {
+        self.event_seq.clone()
     }
 }
 

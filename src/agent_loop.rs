@@ -28,7 +28,7 @@
 //! ```
 
 use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, DefaultHooks, ToolDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role,
@@ -589,12 +589,16 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<AgentRunState>)
+    ) -> (
+        mpsc::Receiver<AgentEventEnvelope>,
+        oneshot::Receiver<AgentRunState>,
+    )
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = oneshot::channel();
+        let seq = SequenceCounter::new();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -608,6 +612,7 @@ where
         tokio::spawn(async move {
             let result = run_loop(
                 event_tx,
+                seq,
                 thread_id,
                 input,
                 tool_context,
@@ -688,12 +693,16 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
-    ) -> (mpsc::Receiver<AgentEvent>, oneshot::Receiver<TurnOutcome>)
+    ) -> (
+        mpsc::Receiver<AgentEventEnvelope>,
+        oneshot::Receiver<TurnOutcome>,
+    )
     where
         Ctx: Clone,
     {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (outcome_tx, outcome_rx) = oneshot::channel();
+        let seq = SequenceCounter::new();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -707,6 +716,7 @@ where
         tokio::spawn(async move {
             let result = run_single_turn(TurnParameters {
                 tx: event_tx,
+                seq,
                 thread_id,
                 input,
                 tool_context,
@@ -844,7 +854,8 @@ async fn execute_tool_call<Ctx, H>(
     tool_context: &ToolContext<Ctx>,
     tools: &ToolRegistry<Ctx>,
     hooks: &Arc<H>,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
 ) -> ToolExecutionOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -855,15 +866,18 @@ where
         let tier = async_tool.tier();
 
         // Emit tool call start
-        let _ = tx
-            .send(AgentEvent::tool_call_start(
+        wrap_and_send(
+            tx,
+            AgentEvent::tool_call_start(
                 &pending.id,
                 &pending.name,
                 &pending.display_name,
                 pending.input.clone(),
                 tier,
-            ))
-            .await;
+            ),
+            seq,
+        )
+        .await;
 
         // Check hooks for permission
         let decision = hooks
@@ -872,13 +886,14 @@ where
 
         return match decision {
             ToolDecision::Allow => {
-                let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
+                let result = execute_async_tool(pending, async_tool, tool_context, tx, seq).await;
 
                 hooks.post_tool_use(&pending.name, &result).await;
 
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
@@ -898,6 +913,7 @@ where
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
@@ -915,6 +931,7 @@ where
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::ToolRequiresConfirmation {
                         id: pending.id.clone(),
                         name: pending.name.clone(),
@@ -947,15 +964,18 @@ where
     let tier = tool.tier();
 
     // Emit tool call start
-    let _ = tx
-        .send(AgentEvent::tool_call_start(
+    wrap_and_send(
+        tx,
+        AgentEvent::tool_call_start(
             &pending.id,
             &pending.name,
             &pending.display_name,
             pending.input.clone(),
             tier,
-        ))
-        .await;
+        ),
+        seq,
+    )
+    .await;
 
     // Check hooks for permission
     let decision = hooks
@@ -979,6 +999,7 @@ where
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
@@ -998,6 +1019,7 @@ where
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::tool_call_end(
                     &pending.id,
                     &pending.name,
@@ -1015,6 +1037,7 @@ where
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::ToolRequiresConfirmation {
                     id: pending.id.clone(),
                     name: pending.name.clone(),
@@ -1044,7 +1067,8 @@ async fn execute_async_tool<Ctx>(
     pending: &PendingToolCallInfo,
     tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
     tool_context: &ToolContext<Ctx>,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
 ) -> ToolResult
 where
     Ctx: Send + Sync + Clone,
@@ -1073,16 +1097,19 @@ where
             message,
         } => {
             // Emit initial progress
-            let _ = tx
-                .send(AgentEvent::tool_progress(
+            wrap_and_send(
+                tx,
+                AgentEvent::tool_progress(
                     &pending.id,
                     &pending.name,
                     &pending.display_name,
                     "started",
                     &message,
                     None,
-                ))
-                .await;
+                ),
+                seq,
+            )
+            .await;
 
             // Stream status updates
             let mut stream = tool.check_status_stream(tool_context, &operation_id);
@@ -1094,16 +1121,19 @@ where
                         message,
                         data,
                     } => {
-                        let _ = tx
-                            .send(AgentEvent::tool_progress(
+                        wrap_and_send(
+                            tx,
+                            AgentEvent::tool_progress(
                                 &pending.id,
                                 &pending.name,
                                 &pending.display_name,
                                 stage,
                                 message,
                                 data,
-                            ))
-                            .await;
+                            ),
+                            seq,
+                        )
+                        .await;
                     }
                     ErasedToolStatus::Completed(mut result)
                     | ErasedToolStatus::Failed(mut result) => {
@@ -1126,32 +1156,35 @@ where
 /// Supports both sync and async tools.
 async fn execute_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
-    confirmed: bool,
     rejection_reason: Option<String>,
     tool_context: &ToolContext<Ctx>,
     tools: &ToolRegistry<Ctx>,
     hooks: &Arc<H>,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
 ) -> ToolResult
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
-    if confirmed {
+    if rejection_reason.is_none() {
         // Check for async tool first
         if let Some(async_tool) = tools.get_async(&awaiting_tool.name) {
-            let result = execute_async_tool(awaiting_tool, async_tool, tool_context, tx).await;
+            let result = execute_async_tool(awaiting_tool, async_tool, tool_context, tx, seq).await;
 
             hooks.post_tool_use(&awaiting_tool.name, &result).await;
 
-            let _ = tx
-                .send(AgentEvent::tool_call_end(
+            wrap_and_send(
+                tx,
+                AgentEvent::tool_call_end(
                     &awaiting_tool.id,
                     &awaiting_tool.name,
                     &awaiting_tool.display_name,
                     result.clone(),
-                ))
-                .await;
+                ),
+                seq,
+            )
+            .await;
 
             return result;
         }
@@ -1173,25 +1206,29 @@ where
 
             hooks.post_tool_use(&awaiting_tool.name, &result).await;
 
-            let _ = tx
-                .send(AgentEvent::tool_call_end(
+            wrap_and_send(
+                tx,
+                AgentEvent::tool_call_end(
                     &awaiting_tool.id,
                     &awaiting_tool.name,
                     &awaiting_tool.display_name,
                     result.clone(),
-                ))
-                .await;
+                ),
+                seq,
+            )
+            .await;
 
             result
         } else {
             ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
         }
     } else {
-        let reason = rejection_reason.unwrap_or_else(|| "User rejected".to_string());
+        let reason = rejection_reason.unwrap_or_default();
         let result = ToolResult::error(format!("Rejected: {reason}"));
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::tool_call_end(
                 &awaiting_tool.id,
                 &awaiting_tool.name,
@@ -1230,8 +1267,9 @@ async fn call_llm_with_retry<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
     config: &AgentConfig,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
+    seq: &SequenceCounter,
 ) -> Result<ChatResponse, AgentError>
 where
     P: LlmProvider,
@@ -1255,7 +1293,7 @@ where
                 if attempt > max_retries {
                     error!("Rate limited by LLM provider after {max_retries} retries");
                     let error_msg = format!("Rate limited after {max_retries} retries");
-                    send_event(tx, hooks, AgentEvent::error(&error_msg, true)).await;
+                    send_event(tx, hooks, seq, AgentEvent::error(&error_msg, true)).await;
                     return Err(AgentError::new(error_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
@@ -1276,7 +1314,7 @@ where
                 if attempt > max_retries {
                     error!("LLM server error after {max_retries} retries: {msg}");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
-                    send_event(tx, hooks, AgentEvent::error(&error_msg, true)).await;
+                    send_event(tx, hooks, seq, AgentEvent::error(&error_msg, true)).await;
                     return Err(AgentError::new(error_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
@@ -1300,20 +1338,22 @@ async fn call_llm_streaming<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
     config: &AgentConfig,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
-    message_id: &str,
-    thinking_id: &str,
+    seq: &SequenceCounter,
+    ids: (&str, &str),
 ) -> Result<ChatResponse, AgentError>
 where
     P: LlmProvider,
     H: AgentHooks,
 {
+    let (message_id, thinking_id) = ids;
     let max_retries = config.retry.max_retries;
     let mut attempt = 0u32;
 
     loop {
-        let result = process_stream(provider, &request, tx, hooks, message_id, thinking_id).await;
+        let result =
+            process_stream(provider, &request, tx, hooks, seq, message_id, thinking_id).await;
 
         match result {
             Ok(response) => return Ok(response),
@@ -1322,7 +1362,7 @@ where
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
                     let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
-                    send_event(tx, hooks, AgentEvent::error(&err_msg, true)).await;
+                    send_event(tx, hooks, seq, AgentEvent::error(&err_msg, true)).await;
                     return Err(AgentError::new(err_msg, true));
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
@@ -1351,8 +1391,9 @@ enum StreamError {
 async fn process_stream<P, H>(
     provider: &Arc<P>,
     request: &ChatRequest,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
+    seq: &SequenceCounter,
     message_id: &str,
     thinking_id: &str,
 ) -> Result<ChatResponse, StreamError>
@@ -1392,6 +1433,7 @@ where
                                 send_event(
                                     tx,
                                     hooks,
+                                    seq,
                                     AgentEvent::text_delta(message_id, delta.clone()),
                                 )
                                 .await;
@@ -1409,6 +1451,7 @@ where
                                 send_event(
                                     tx,
                                     hooks,
+                                    seq,
                                     AgentEvent::thinking_delta(thinking_id, delta.clone()),
                                 )
                                 .await;
@@ -1475,7 +1518,8 @@ where
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_loop<Ctx, P, H, M, S>(
-    tx: mpsc::Sender<AgentEvent>,
+    tx: mpsc::Sender<AgentEventEnvelope>,
+    seq: SequenceCounter,
     thread_id: ThreadId,
     input: AgentInput,
     tool_context: ToolContext<Ctx>,
@@ -1496,7 +1540,7 @@ where
     S: StateStore,
 {
     // Add event channel to tool context so tools can emit events
-    let tool_context = tool_context.with_event_tx(tx.clone());
+    let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
     let start_time = Instant::now();
 
     // Initialize state from input
@@ -1529,24 +1573,26 @@ where
                 awaiting_tool.id, tool_call_id
             );
             let recoverable = false;
-            send_event(&tx, &hooks, AgentEvent::error(&message, recoverable)).await;
+            send_event(&tx, &hooks, &seq, AgentEvent::error(&message, recoverable)).await;
             return AgentRunState::Error(AgentError::new(&message, recoverable));
         }
 
+        let rejection =
+            (!confirmed).then(|| rejection_reason.unwrap_or_else(|| "User rejected".to_string()));
         let result = execute_confirmed_tool(
             awaiting_tool,
-            confirmed,
-            rejection_reason,
+            rejection,
             &tool_context,
             &tools,
             &hooks,
             &tx,
+            &seq,
         )
         .await;
         tool_results.push((awaiting_tool.id.clone(), result));
 
         for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
-            match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
+            match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx, &seq).await {
                 ToolExecutionOutcome::Completed { tool_id, result } => {
                     tool_results.push((tool_id, result));
                 }
@@ -1590,6 +1636,7 @@ where
             send_event(
                 &tx,
                 &hooks,
+                &seq,
                 AgentEvent::Error {
                     message: e.message.clone(),
                     recoverable: e.recoverable,
@@ -1602,6 +1649,7 @@ where
         send_event(
             &tx,
             &hooks,
+            &seq,
             AgentEvent::TurnComplete {
                 turn,
                 usage: cont.turn_usage.clone(),
@@ -1621,6 +1669,7 @@ where
     loop {
         let result = execute_turn(
             &tx,
+            &seq,
             &mut ctx,
             &tool_context,
             &provider,
@@ -1680,6 +1729,7 @@ where
     send_event(
         &tx,
         &hooks,
+        &seq,
         AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
     )
     .await;
@@ -1692,7 +1742,8 @@ where
 }
 
 struct TurnParameters<Ctx, P, H, M, S> {
-    tx: mpsc::Sender<AgentEvent>,
+    tx: mpsc::Sender<AgentEventEnvelope>,
+    seq: SequenceCounter,
     thread_id: ThreadId,
     input: AgentInput,
     tool_context: ToolContext<Ctx>,
@@ -1714,6 +1765,7 @@ struct TurnParameters<Ctx, P, H, M, S> {
 async fn run_single_turn<Ctx, P, H, M, S>(
     TurnParameters {
         tx,
+        seq,
         thread_id,
         input,
         tool_context,
@@ -1734,14 +1786,20 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    let tool_context = tool_context.with_event_tx(tx.clone());
+    let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
     let start_time = Instant::now();
 
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
             Ok(s) => s,
             Err(e) => {
-                send_event(&tx, &hooks, AgentEvent::error(&e.message, e.recoverable)).await;
+                send_event(
+                    &tx,
+                    &hooks,
+                    &seq,
+                    AgentEvent::error(&e.message, e.recoverable),
+                )
+                .await;
                 return TurnOutcome::Error(e);
             }
         };
@@ -1764,6 +1822,7 @@ where
             tools,
             hooks,
             tx,
+            seq,
             message_store,
             state_store,
         })
@@ -1780,6 +1839,7 @@ where
 
     let result = execute_turn(
         &tx,
+        &seq,
         &mut ctx,
         &tool_context,
         &provider,
@@ -1792,14 +1852,15 @@ where
     )
     .await;
 
-    convert_turn_result(result, ctx, &tx, &hooks, thread_id, &state_store).await
+    convert_turn_result(result, ctx, &tx, &hooks, &seq, thread_id, &state_store).await
 }
 
 async fn convert_turn_result<H: AgentHooks, S: StateStore>(
     result: InternalTurnResult,
     ctx: TurnContext,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
+    seq: &SequenceCounter,
     thread_id: ThreadId,
     state_store: &Arc<S>,
 ) -> TurnOutcome {
@@ -1822,6 +1883,7 @@ async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
             )
             .await;
@@ -1864,7 +1926,8 @@ struct ResumeCaseParameters<Ctx, H, M, S> {
     tool_context: ToolContext<Ctx>,
     tools: Arc<ToolRegistry<Ctx>>,
     hooks: Arc<H>,
-    tx: mpsc::Sender<AgentEvent>,
+    tx: mpsc::Sender<AgentEventEnvelope>,
+    seq: SequenceCounter,
     message_store: Arc<M>,
     state_store: Arc<S>,
 }
@@ -1880,6 +1943,7 @@ async fn handle_resume_case<Ctx, H, M, S>(
         tools,
         hooks,
         tx,
+        seq,
         message_store,
         state_store,
     }: ResumeCaseParameters<Ctx, H, M, S>,
@@ -1896,35 +1960,34 @@ where
         confirmed,
         rejection_reason,
     } = resume_data;
-    // Handle resume case - complete the pending tool calls
     let mut tool_results = cont.completed_results.clone();
     let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
-    // Validate tool_call_id matches
     if awaiting_tool.id != tool_call_id {
-        let message = format!(
+        let msg = format!(
             "Tool call ID mismatch: expected {}, got {}",
             awaiting_tool.id, tool_call_id
         );
-        let recoverable = false;
-        send_event(&tx, &hooks, AgentEvent::error(&message, recoverable)).await;
-        return TurnOutcome::Error(AgentError::new(&message, recoverable));
+        send_event(&tx, &hooks, &seq, AgentEvent::error(&msg, false)).await;
+        return TurnOutcome::Error(AgentError::new(&msg, false));
     }
 
+    let rejection =
+        (!confirmed).then(|| rejection_reason.unwrap_or_else(|| "User rejected".to_string()));
     let result = execute_confirmed_tool(
         awaiting_tool,
-        confirmed,
-        rejection_reason,
+        rejection,
         &tool_context,
         &tools,
         &hooks,
         &tx,
+        &seq,
     )
     .await;
     tool_results.push((awaiting_tool.id.clone(), result));
 
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
-        match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx).await {
+        match execute_tool_call(pending, &tool_context, &tools, &hooks, &tx, &seq).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
                 tool_results.push((tool_id, result));
             }
@@ -1965,13 +2028,20 @@ where
     }
 
     if let Err(e) = append_tool_results(&tool_results, &thread_id, &message_store).await {
-        send_event(&tx, &hooks, AgentEvent::error(&e.message, e.recoverable)).await;
+        send_event(
+            &tx,
+            &hooks,
+            &seq,
+            AgentEvent::error(&e.message, e.recoverable),
+        )
+        .await;
         return TurnOutcome::Error(e);
     }
 
     send_event(
         &tx,
         &hooks,
+        &seq,
         AgentEvent::TurnComplete {
             turn,
             usage: cont.turn_usage.clone(),
@@ -2079,7 +2149,8 @@ async fn record_execution_complete(
 /// and `run_single_turn` (single-turn mode).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_turn<Ctx, P, H, M>(
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
     ctx: &mut TurnContext,
     tool_context: &ToolContext<Ctx>,
     provider: &Arc<P>,
@@ -2107,6 +2178,7 @@ where
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::error(
                 format!("Maximum turns ({}) reached", config.max_turns),
                 true,
@@ -2123,6 +2195,7 @@ where
     send_event(
         tx,
         hooks,
+        seq,
         AgentEvent::start(ctx.thread_id.clone(), ctx.turn),
     )
     .await;
@@ -2134,6 +2207,7 @@ where
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::error(format!("Failed to get history: {e}"), false),
             )
             .await;
@@ -2165,6 +2239,7 @@ where
                         send_event(
                             tx,
                             hooks,
+                            seq,
                             AgentEvent::context_compacted(
                                 result.original_count,
                                 result.new_count,
@@ -2282,8 +2357,8 @@ where
             config,
             tx,
             hooks,
-            &message_id,
-            &thinking_id,
+            seq,
+            (&message_id, &thinking_id),
         )
         .await
         {
@@ -2294,7 +2369,7 @@ where
         }
     } else {
         // Non-streaming mode: wait for full response
-        match call_llm_with_retry(provider, request, config, tx, hooks).await {
+        match call_llm_with_retry(provider, request, config, tx, hooks, seq).await {
             Ok(r) => r,
             Err(e) => {
                 return InternalTurnResult::Error(e);
@@ -2320,6 +2395,7 @@ where
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::thinking(thinking_id, thinking.clone()),
         )
         .await;
@@ -2328,7 +2404,7 @@ where
     // Always emit the final complete Text event so consumers know the full response is ready
     // (in streaming mode this comes after all TextDelta events)
     if let Some(text) = &text_content {
-        send_event(tx, hooks, AgentEvent::text(&message_id, text.clone())).await;
+        send_event(tx, hooks, seq, AgentEvent::text(&message_id, text.clone())).await;
     }
 
     // Store assistant message in conversation history (includes text and tool uses)
@@ -2337,6 +2413,7 @@ where
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::error(format!("Failed to append assistant message: {e}"), false),
         )
         .await;
@@ -2385,6 +2462,7 @@ where
             send_event(
                 tx,
                 hooks,
+                seq,
                 AgentEvent::tool_call_start(
                     &pending.id,
                     &pending.name,
@@ -2407,7 +2485,8 @@ where
                     record_execution_start(execution_store, pending, &ctx.thread_id, started_at)
                         .await;
 
-                    let result = execute_async_tool(pending, async_tool, tool_context, tx).await;
+                    let result =
+                        execute_async_tool(pending, async_tool, tool_context, tx, seq).await;
 
                     // IDEMPOTENCY: Record execution completion
                     record_execution_complete(
@@ -2424,6 +2503,7 @@ where
                     send_event(
                         tx,
                         hooks,
+                        seq,
                         AgentEvent::tool_call_end(
                             &pending.id,
                             &pending.name,
@@ -2440,6 +2520,7 @@ where
                     send_event(
                         tx,
                         hooks,
+                        seq,
                         AgentEvent::tool_call_end(
                             &pending.id,
                             &pending.name,
@@ -2455,6 +2536,7 @@ where
                     send_event(
                         tx,
                         hooks,
+                        seq,
                         AgentEvent::ToolRequiresConfirmation {
                             id: pending.id.clone(),
                             name: pending.name.clone(),
@@ -2501,6 +2583,7 @@ where
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::tool_call_start(
                 &pending.id,
                 &pending.name,
@@ -2547,6 +2630,7 @@ where
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
@@ -2563,6 +2647,7 @@ where
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::tool_call_end(
                         &pending.id,
                         &pending.name,
@@ -2578,6 +2663,7 @@ where
                 send_event(
                     tx,
                     hooks,
+                    seq,
                     AgentEvent::ToolRequiresConfirmation {
                         id: pending.id.clone(),
                         name: pending.name.clone(),
@@ -2615,6 +2701,7 @@ where
         send_event(
             tx,
             hooks,
+            seq,
             AgentEvent::error(format!("Failed to append tool results: {e}"), false),
         )
         .await;
@@ -2625,6 +2712,7 @@ where
     send_event(
         tx,
         hooks,
+        seq,
         AgentEvent::TurnComplete {
             turn: ctx.turn,
             usage: turn_usage.clone(),
@@ -2643,7 +2731,13 @@ where
                 "Model refused request (turn={}): {:?}",
                 ctx.turn, text_content
             );
-            send_event(tx, hooks, AgentEvent::refusal(message_id, text_content)).await;
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::refusal(message_id, text_content),
+            )
+            .await;
             return InternalTurnResult::Refusal;
         }
         Some(StopReason::ModelContextWindowExceeded) => {
@@ -2812,20 +2906,27 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
 ///
 /// This ensures that the agent loop doesn't block indefinitely if the consumer
 /// is slow or has disconnected.
-async fn send_event<H>(tx: &mpsc::Sender<AgentEvent>, hooks: &Arc<H>, event: AgentEvent)
-where
+async fn send_event<H>(
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+    event: AgentEvent,
+) where
     H: AgentHooks,
 {
     hooks.on_event(&event).await;
 
+    let envelope = AgentEventEnvelope::wrap(event, seq);
+
     // Try non-blocking send first to detect backpressure
-    match tx.try_send(event) {
+    match tx.try_send(envelope) {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => {
+        Err(mpsc::error::TrySendError::Full(envelope)) => {
             // Channel is full - consumer is slow or blocked
             log::debug!("Event channel full, waiting for consumer...");
             // Fall back to blocking send with timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(30), tx.send(event)).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), tx.send(envelope)).await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     log::warn!("Event channel closed while sending - consumer disconnected");
@@ -2839,6 +2940,18 @@ where
             log::debug!("Event channel closed - consumer disconnected");
         }
     }
+}
+
+/// Send an event directly to the channel without going through hooks.
+///
+/// Used by async tool execution for progress events that bypass the hook system.
+async fn wrap_and_send(
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event: AgentEvent,
+    seq: &SequenceCounter,
+) {
+    let envelope = AgentEventEnvelope::wrap(event, seq);
+    let _ = tx.send(envelope).await;
 }
 
 fn build_assistant_message(response: &ChatResponse) -> Message {
@@ -3126,8 +3239,16 @@ mod tests {
         }
 
         // Should have: Start, Text, Done
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Text { .. })));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::Text { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::Done { .. }))
+        );
 
         Ok(())
     }
@@ -3163,12 +3284,12 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::ToolCallStart { .. }))
+                .any(|e| matches!(e.event, AgentEvent::ToolCallStart { .. }))
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::ToolCallEnd { .. }))
+                .any(|e| matches!(e.event, AgentEvent::ToolCallEnd { .. }))
         );
 
         Ok(())
@@ -3210,7 +3331,7 @@ mod tests {
 
         // Should have an error about max turns
         assert!(events.iter().any(|e| {
-            matches!(e, AgentEvent::Error { message, .. } if message.contains("Maximum turns"))
+            matches!(&e.event, AgentEvent::Error { message, .. } if message.contains("Maximum turns"))
         }));
 
         Ok(())
@@ -3245,11 +3366,15 @@ mod tests {
 
         // Unknown tool errors are returned to the LLM (not emitted as ToolCallEnd)
         // The conversation should complete successfully with a Done event
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::Done { .. }))
+        );
 
         // The LLM's response about the missing tool should be in the events
         assert!(events.iter().any(|e| {
-            matches!(e, AgentEvent::Text { message_id, text } if text.contains("couldn't find"))
+            matches!(&e.event, AgentEvent::Text { text, .. } if text.contains("couldn't find"))
         }));
 
         Ok(())
@@ -3287,7 +3412,7 @@ mod tests {
 
         // Should have rate limit error after exhausting retries
         assert!(events.iter().any(|e| {
-            matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
+            matches!(&e.event, AgentEvent::Error { message, recoverable: true } if message.contains("Rate limited"))
         }));
 
         Ok(())
@@ -3320,7 +3445,11 @@ mod tests {
         }
 
         // Should have successful completion after retry
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::Done { .. }))
+        );
 
         Ok(())
     }
@@ -3357,7 +3486,7 @@ mod tests {
 
         // Should have server error after exhausting retries
         assert!(events.iter().any(|e| {
-            matches!(e, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
+            matches!(&e.event, AgentEvent::Error { message, recoverable: true } if message.contains("Server error"))
         }));
 
         Ok(())
@@ -3390,7 +3519,249 @@ mod tests {
         }
 
         // Should have successful completion after retry
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::Done { .. }))
+        );
+
+        Ok(())
+    }
+
+    // ================================
+    // Event Envelope Idempotency Tests
+    // ================================
+
+    #[tokio::test]
+    async fn test_envelope_event_ids_are_unique() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+        let agent = builder::<()>().provider(provider).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        let mut ids = std::collections::HashSet::new();
+        while let Some(envelope) = rx.recv().await {
+            assert!(
+                ids.insert(envelope.event_id),
+                "duplicate event_id: {}",
+                envelope.event_id
+            );
+        }
+        assert!(ids.len() >= 3, "expected at least Start+Text+Done events");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_sequences_are_strictly_increasing() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+        let agent = builder::<()>().provider(provider).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Some(envelope) = rx.recv().await {
+            envelopes.push(envelope);
+        }
+
+        for pair in envelopes.windows(2) {
+            assert!(
+                pair[1].sequence > pair[0].sequence,
+                "sequence not strictly increasing: {} -> {}",
+                pair[0].sequence,
+                pair[1].sequence,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_sequences_start_at_zero() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+        let agent = builder::<()>().provider(provider).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        let first = rx.recv().await.expect("should have at least one event");
+        assert_eq!(first.sequence, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_sequences_have_no_gaps() -> anyhow::Result<()> {
+        // Use a tool call to generate more events (Start, ToolCallStart, ToolCallEnd, Text, TurnComplete, Done, etc.)
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("t1", "echo", json!({"message": "test"})),
+            MockProvider::text_response("Done"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Go".into()),
+            ToolContext::new(()),
+        );
+
+        let mut sequences = Vec::new();
+        while let Some(envelope) = rx.recv().await {
+            sequences.push(envelope.sequence);
+        }
+
+        let expected: Vec<u64> = (0..sequences.len() as u64).collect();
+        assert_eq!(
+            sequences, expected,
+            "sequences should be 0, 1, 2, ... with no gaps"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_timestamps_are_non_decreasing() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+        let agent = builder::<()>().provider(provider).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Some(envelope) = rx.recv().await {
+            envelopes.push(envelope);
+        }
+
+        for pair in envelopes.windows(2) {
+            assert!(
+                pair[1].timestamp >= pair[0].timestamp,
+                "timestamp went backwards: {:?} -> {:?}",
+                pair[0].timestamp,
+                pair[1].timestamp,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_separate_runs_have_independent_sequences() -> anyhow::Result<()> {
+        let provider_a = MockProvider::new(vec![MockProvider::text_response("A")]);
+        let provider_b = MockProvider::new(vec![MockProvider::text_response("B")]);
+
+        let agent_a = builder::<()>().provider(provider_a).build();
+        let agent_b = builder::<()>().provider(provider_b).build();
+
+        let (mut rx_a, _) = agent_a.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+        let (mut rx_b, _) = agent_b.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        let first_a = rx_a.recv().await.expect("run A should emit events");
+        let first_b = rx_b.recv().await.expect("run B should emit events");
+
+        // Both runs start at sequence 0
+        assert_eq!(first_a.sequence, 0);
+        assert_eq!(first_b.sequence, 0);
+
+        // But event_ids are different
+        assert_ne!(first_a.event_id, first_b.event_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_event_ids_are_valid_uuid_v4() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![MockProvider::text_response("Hi")]);
+        let agent = builder::<()>().provider(provider).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".into()),
+            ToolContext::new(()),
+        );
+
+        while let Some(envelope) = rx.recv().await {
+            assert_eq!(
+                envelope.event_id.get_version(),
+                Some(uuid::Version::Random),
+                "event_id should be UUID v4"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_envelope_with_tool_calls_maintains_invariants() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("t1", "echo", json!({"message": "a"})),
+            MockProvider::tool_use_response("t2", "echo", json!({"message": "b"})),
+            MockProvider::text_response("All done"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+
+        let (mut rx, _) = agent.run(
+            ThreadId::new(),
+            AgentInput::Text("Go".into()),
+            ToolContext::new(()),
+        );
+
+        let mut envelopes = Vec::new();
+        while let Some(envelope) = rx.recv().await {
+            envelopes.push(envelope);
+        }
+
+        // All event_ids unique
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            envelopes.iter().map(|e| e.event_id).collect();
+        assert_eq!(ids.len(), envelopes.len(), "all event_ids must be unique");
+
+        // Sequences: 0, 1, 2, ... no gaps
+        let expected: Vec<u64> = (0..envelopes.len() as u64).collect();
+        let actual: Vec<u64> = envelopes.iter().map(|e| e.sequence).collect();
+        assert_eq!(actual, expected, "sequences must be contiguous from 0");
+
+        // Timestamps non-decreasing
+        for pair in envelopes.windows(2) {
+            assert!(pair[1].timestamp >= pair[0].timestamp);
+        }
+
+        // Should contain tool call events wrapped in envelopes
+        assert!(
+            envelopes
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::ToolCallStart { .. }))
+        );
+        assert!(
+            envelopes
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::ToolCallEnd { .. }))
+        );
 
         Ok(())
     }
