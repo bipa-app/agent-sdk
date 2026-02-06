@@ -76,7 +76,7 @@ impl Default for AgentConfig {
             max_turns: 10,
             max_tokens: 4096,
             system_prompt: String::new(),
-            model: String::from("claude-sonnet-4-20250514"),
+            model: String::from("claude-sonnet-4-5-20250929"),
             retry: RetryConfig::default(),
             thinking: None,
             streaming: false,
@@ -258,6 +258,13 @@ impl std::error::Error for AgentError {}
 pub enum AgentRunState {
     /// Agent completed successfully.
     Done {
+        total_turns: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+
+    /// Agent was refused by the model (safety/policy).
+    Refusal {
         total_turns: u32,
         input_tokens: u64,
         output_tokens: u64,
@@ -530,6 +537,16 @@ pub enum TurnOutcome {
         description: String,
         /// Continuation state for resuming (boxed for enum size efficiency)
         continuation: Box<AgentContinuation>,
+    },
+
+    /// Model refused the request (safety/policy).
+    Refusal {
+        /// Total turns executed
+        total_turns: u32,
+        /// Total input tokens consumed
+        input_tokens: u64,
+        /// Total output tokens consumed
+        output_tokens: u64,
     },
 
     /// An error occurred.

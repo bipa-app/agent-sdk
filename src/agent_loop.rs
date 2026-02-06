@@ -57,6 +57,8 @@ enum InternalTurnResult {
     Continue { turn_usage: TokenUsage },
     /// Done - no more tool calls
     Done,
+    /// Model refused the request (safety/policy)
+    Refusal,
     /// Awaiting confirmation (yields)
     AwaitingConfirmation {
         tool_call_id: String,
@@ -1407,7 +1409,7 @@ where
                                 send_event(
                                     tx,
                                     hooks,
-                                    AgentEvent::thinking(thinking_id, delta.clone()),
+                                    AgentEvent::thinking_delta(thinking_id, delta.clone()),
                                 )
                                 .await;
                             }
@@ -1430,7 +1432,9 @@ where
                     StreamDelta::Done { .. }
                     | StreamDelta::Usage(_)
                     | StreamDelta::ToolUseStart { .. }
-                    | StreamDelta::ToolInputDelta { .. } => {}
+                    | StreamDelta::ToolInputDelta { .. }
+                    | StreamDelta::SignatureDelta { .. }
+                    | StreamDelta::RedactedThinking { .. } => {}
                 }
             }
             Err(e) => {
@@ -1638,6 +1642,13 @@ where
             InternalTurnResult::Done => {
                 break;
             }
+            InternalTurnResult::Refusal => {
+                return AgentRunState::Refusal {
+                    total_turns: turns_to_u32(ctx.turn),
+                    input_tokens: u64::from(ctx.total_usage.input_tokens),
+                    output_tokens: u64::from(ctx.total_usage.output_tokens),
+                };
+            }
             InternalTurnResult::AwaitingConfirmation {
                 tool_call_id,
                 tool_name,
@@ -1674,7 +1685,7 @@ where
     .await;
 
     AgentRunState::Done {
-        total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
+        total_turns: turns_to_u32(ctx.turn),
         input_tokens: u64::from(ctx.total_usage.input_tokens),
         output_tokens: u64::from(ctx.total_usage.output_tokens),
     }
@@ -1781,14 +1792,22 @@ where
     )
     .await;
 
-    // Convert InternalTurnResult to TurnOutcome
+    convert_turn_result(result, ctx, &tx, &hooks, thread_id, &state_store).await
+}
+
+async fn convert_turn_result<H: AgentHooks, S: StateStore>(
+    result: InternalTurnResult,
+    ctx: TurnContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    hooks: &Arc<H>,
+    thread_id: ThreadId,
+    state_store: &Arc<S>,
+) -> TurnOutcome {
     match result {
         InternalTurnResult::Continue { turn_usage } => {
-            // Save state checkpoint
             if let Err(e) = state_store.save(&ctx.state).await {
                 warn!("Failed to save state checkpoint: {e}");
             }
-
             TurnOutcome::NeedsMoreTurns {
                 turn: ctx.turn,
                 turn_usage,
@@ -1796,26 +1815,27 @@ where
             }
         }
         InternalTurnResult::Done => {
-            // Final state save
             if let Err(e) = state_store.save(&ctx.state).await {
                 warn!("Failed to save final state: {e}");
             }
-
-            // Emit done
             let duration = ctx.start_time.elapsed();
             send_event(
-                &tx,
-                &hooks,
+                tx,
+                hooks,
                 AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
             )
             .await;
-
             TurnOutcome::Done {
-                total_turns: u32::try_from(ctx.turn).unwrap_or(u32::MAX),
+                total_turns: turns_to_u32(ctx.turn),
                 input_tokens: u64::from(ctx.total_usage.input_tokens),
                 output_tokens: u64::from(ctx.total_usage.output_tokens),
             }
         }
+        InternalTurnResult::Refusal => TurnOutcome::Refusal {
+            total_turns: turns_to_u32(ctx.turn),
+            input_tokens: u64::from(ctx.total_usage.input_tokens),
+            output_tokens: u64::from(ctx.total_usage.output_tokens),
+        },
         InternalTurnResult::AwaitingConfirmation {
             tool_call_id,
             tool_name,
@@ -2217,8 +2237,11 @@ where
                         ContentBlock::Text { text } => {
                             debug!("    block[{}]: Text(len={})", j, text.len());
                         }
-                        ContentBlock::Thinking { thinking } => {
+                        ContentBlock::Thinking { thinking, .. } => {
                             debug!("    block[{}]: Thinking(len={})", j, thinking.len());
+                        }
+                        ContentBlock::RedactedThinking { .. } => {
+                            debug!("    block[{j}]: RedactedThinking");
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -2290,10 +2313,10 @@ where
     // Process response content
     let (thinking_content, text_content, tool_uses) = extract_content(&response);
 
-    // In non-streaming mode, emit thinking event now (streaming already emitted deltas)
-    if !config.streaming
-        && let Some(thinking) = &thinking_content
-    {
+    // Emit the complete Thinking event.
+    // In non-streaming mode this is the only thinking event.
+    // In streaming mode this comes after all ThinkingDelta events.
+    if let Some(thinking) = &thinking_content {
         send_event(
             tx,
             hooks,
@@ -2305,7 +2328,7 @@ where
     // Always emit the final complete Text event so consumers know the full response is ready
     // (in streaming mode this comes after all TextDelta events)
     if let Some(text) = &text_content {
-        send_event(tx, hooks, AgentEvent::text(message_id, text.clone())).await;
+        send_event(tx, hooks, AgentEvent::text(&message_id, text.clone())).await;
     }
 
     // Store assistant message in conversation history (includes text and tool uses)
@@ -2610,12 +2633,81 @@ where
     .await;
 
     // Check stop reason
-    if response.stop_reason == Some(StopReason::EndTurn) {
-        info!("Agent completed (end_turn) (turn={})", ctx.turn);
-        return InternalTurnResult::Done;
+    match response.stop_reason {
+        Some(StopReason::EndTurn) => {
+            info!("Agent completed (end_turn) (turn={})", ctx.turn);
+            return InternalTurnResult::Done;
+        }
+        Some(StopReason::Refusal) => {
+            warn!(
+                "Model refused request (turn={}): {:?}",
+                ctx.turn, text_content
+            );
+            send_event(tx, hooks, AgentEvent::refusal(message_id, text_content)).await;
+            return InternalTurnResult::Refusal;
+        }
+        Some(StopReason::ModelContextWindowExceeded) => {
+            warn!("Model context window exceeded (turn={})", ctx.turn);
+            if let Some(compact_config) = compaction_config {
+                let compactor =
+                    LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+                let history = match message_store.get_history(&ctx.thread_id).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return InternalTurnResult::Error(AgentError::new(
+                            format!(
+                                "Failed to get history for compaction after context overflow: {e}"
+                            ),
+                            false,
+                        ));
+                    }
+                };
+                match compactor.compact_history(history).await {
+                    Ok(result) => {
+                        if let Err(e) = message_store
+                            .replace_history(&ctx.thread_id, result.messages)
+                            .await
+                        {
+                            return InternalTurnResult::Error(AgentError::new(
+                                format!("Failed to replace history after overflow compaction: {e}"),
+                                false,
+                            ));
+                        }
+                        info!(
+                            "Context compacted after overflow (original_tokens={}, new_tokens={})",
+                            result.original_tokens, result.new_tokens
+                        );
+                        // Decrement turn so the retry doesn't count as a new turn
+                        ctx.turn -= 1;
+                        return InternalTurnResult::Continue { turn_usage };
+                    }
+                    Err(e) => {
+                        return InternalTurnResult::Error(AgentError::new(
+                            format!("Context compaction failed after overflow: {e}"),
+                            false,
+                        ));
+                    }
+                }
+            }
+            return InternalTurnResult::Error(AgentError::new(
+                "Model context window exceeded and no compaction configured".to_string(),
+                false,
+            ));
+        }
+        _ => {}
     }
 
     InternalTurnResult::Continue { turn_usage }
+}
+
+/// Saturating conversion from usize to u32.
+#[allow(clippy::cast_possible_truncation)]
+const fn turns_to_u32(turns: usize) -> u32 {
+    if turns > u32::MAX as usize {
+        u32::MAX
+    } else {
+        turns as u32
+    }
 }
 
 /// Convert u128 milliseconds to u64, capping at `u64::MAX`
@@ -2673,8 +2765,11 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 thinking_parts.push(thinking.clone());
+            }
+            ContentBlock::RedactedThinking { .. } | ContentBlock::ToolResult { .. } => {
+                // Redacted thinking is opaque; ToolResult shouldn't appear in response
             }
             ContentBlock::ToolUse {
                 id, name, input, ..
@@ -2685,9 +2780,6 @@ fn extract_content(response: &ChatResponse) -> ExtractedContent {
                     input.clone()
                 };
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
-            }
-            ContentBlock::ToolResult { .. } => {
-                // Shouldn't appear in response, but ignore if it does
             }
         }
     }
@@ -2757,8 +2849,19 @@ fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::Text { text } => {
                 blocks.push(ContentBlock::Text { text: text.clone() });
             }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } => {
-                // Thinking blocks are ephemeral - not stored in conversation history
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                blocks.push(ContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                });
+            }
+            ContentBlock::RedactedThinking { data } => {
+                blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
+            }
+            ContentBlock::ToolResult { .. } => {
                 // ToolResult shouldn't appear in response, but ignore if it does
             }
             ContentBlock::ToolUse {

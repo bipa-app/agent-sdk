@@ -6,6 +6,7 @@
 
 use crate::llm::{ContentBlock, StopReason, Usage};
 use futures::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
 
 /// Events yielded during streaming LLM responses.
@@ -59,6 +60,22 @@ pub enum StreamDelta {
         stop_reason: Option<StopReason>,
     },
 
+    /// A signature delta for a thinking block.
+    SignatureDelta {
+        /// The signature fragment to append
+        delta: String,
+        /// Index of the content block being streamed
+        block_index: usize,
+    },
+
+    /// A redacted thinking block received at `content_block_start`.
+    RedactedThinking {
+        /// Opaque data payload
+        data: String,
+        /// Index of the content block
+        block_index: usize,
+    },
+
     /// Error during streaming.
     Error {
         /// Error message
@@ -81,6 +98,10 @@ pub struct StreamAccumulator {
     text_blocks: Vec<String>,
     /// Accumulated thinking blocks for each block index
     thinking_blocks: Vec<String>,
+    /// Accumulated signatures keyed by block index
+    thinking_signatures: HashMap<usize, String>,
+    /// Redacted thinking blocks: (`block_index`, data)
+    redacted_thinking_blocks: Vec<(usize, String)>,
     /// Accumulated tool use calls
     tool_uses: Vec<ToolUseAccumulator>,
     /// Usage information from the stream
@@ -141,6 +162,16 @@ impl StreamAccumulator {
                     tool.input_json.push_str(delta);
                 }
             }
+            StreamDelta::SignatureDelta { delta, block_index } => {
+                self.thinking_signatures
+                    .entry(*block_index)
+                    .or_default()
+                    .push_str(delta);
+            }
+            StreamDelta::RedactedThinking { data, block_index } => {
+                self.redacted_thinking_blocks
+                    .push((*block_index, data.clone()));
+            }
             StreamDelta::Usage(u) => {
                 self.usage = Some(u.clone());
             }
@@ -171,11 +202,24 @@ impl StreamAccumulator {
     pub fn into_content_blocks(self) -> Vec<ContentBlock> {
         let mut blocks: Vec<(usize, ContentBlock)> = Vec::new();
 
-        // Add thinking blocks with their indices
+        // Add thinking blocks with their indices, attaching signatures
+        let mut signatures = self.thinking_signatures;
         for (idx, thinking) in self.thinking_blocks.into_iter().enumerate() {
             if !thinking.is_empty() {
-                blocks.push((idx, ContentBlock::Thinking { thinking }));
+                let signature = signatures.remove(&idx).filter(|s| !s.is_empty());
+                blocks.push((
+                    idx,
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    },
+                ));
             }
+        }
+
+        // Add redacted thinking blocks
+        for (idx, data) in self.redacted_thinking_blocks {
+            blocks.push((idx, ContentBlock::RedactedThinking { data }));
         }
 
         // Add text blocks with their indices

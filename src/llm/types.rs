@@ -1,14 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+/// The mode of extended thinking.
+#[derive(Debug, Clone)]
+pub enum ThinkingMode {
+    /// Explicitly enabled with a token budget.
+    Enabled { budget_tokens: u32 },
+    /// Adaptive thinking — the model decides how much to think.
+    Adaptive,
+}
+
+/// Effort level for adaptive thinking via `output_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
 /// Configuration for extended thinking.
 ///
 /// When enabled, the model will show its reasoning process before
 /// generating the final response.
 #[derive(Debug, Clone)]
 pub struct ThinkingConfig {
-    /// Maximum tokens the model can use for thinking.
-    /// Default is 10,000 tokens.
-    pub budget_tokens: u32,
+    /// Which thinking mode to use.
+    pub mode: ThinkingMode,
+    /// Optional effort level (sent via `output_config`).
+    pub effort: Option<Effort>,
 }
 
 impl ThinkingConfig {
@@ -21,17 +41,44 @@ impl ThinkingConfig {
     /// Minimum budget required by the Anthropic API.
     pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
+    /// Create a config with an explicit token budget (Enabled mode).
     #[must_use]
     pub const fn new(budget_tokens: u32) -> Self {
-        Self { budget_tokens }
+        Self {
+            mode: ThinkingMode::Enabled { budget_tokens },
+            effort: None,
+        }
+    }
+
+    /// Create an adaptive thinking config.
+    #[must_use]
+    pub const fn adaptive() -> Self {
+        Self {
+            mode: ThinkingMode::Adaptive,
+            effort: None,
+        }
+    }
+
+    /// Create an adaptive thinking config with an effort level.
+    #[must_use]
+    pub const fn adaptive_with_effort(effort: Effort) -> Self {
+        Self {
+            mode: ThinkingMode::Adaptive,
+            effort: Some(effort),
+        }
+    }
+
+    /// Set the effort level on an existing config.
+    #[must_use]
+    pub const fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = Some(effort);
+        self
     }
 }
 
 impl Default for ThinkingConfig {
     fn default() -> Self {
-        Self {
-            budget_tokens: Self::DEFAULT_BUDGET_TOKENS,
-        }
+        Self::new(Self::DEFAULT_BUDGET_TOKENS)
     }
 }
 
@@ -142,7 +189,15 @@ pub enum ContentBlock {
     Text { text: String },
 
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        /// Opaque signature for round-tripping thinking blocks back to the API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -192,7 +247,7 @@ impl ChatResponse {
     #[must_use]
     pub fn first_thinking(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
-            ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
             _ => None,
         })
     }
@@ -221,6 +276,8 @@ pub enum StopReason {
     ToolUse,
     MaxTokens,
     StopSequence,
+    Refusal,
+    ModelContextWindowExceeded,
 }
 
 #[derive(Debug, Clone, Deserialize)]
