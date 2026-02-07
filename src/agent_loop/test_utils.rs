@@ -62,9 +62,7 @@ impl MockProvider {
         })
     }
 
-    pub fn tool_uses_response(
-        tool_uses: Vec<(&str, &str, serde_json::Value)>,
-    ) -> ChatOutcome {
+    pub fn tool_uses_response(tool_uses: Vec<(&str, &str, serde_json::Value)>) -> ChatOutcome {
         let content = tool_uses
             .into_iter()
             .map(|(id, name, input)| ContentBlock::ToolUse {
