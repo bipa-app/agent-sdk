@@ -5,8 +5,8 @@
 //! non-streaming responses.
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
-    StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, LlmProvider,
+    StopReason, StreamBox, StreamDelta, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -119,6 +119,14 @@ impl AnthropicProvider {
                                     content: content.clone(),
                                     is_error: *is_error,
                                 },
+                                ContentBlock::Image { source } => ApiContentBlockInput::Image {
+                                    source: ApiSource::from_content_source(source),
+                                },
+                                ContentBlock::Document { source } => {
+                                    ApiContentBlockInput::Document {
+                                        source: ApiSource::from_content_source(source),
+                                    }
+                                }
                             })
                             .collect(),
                     ),
@@ -685,6 +693,24 @@ enum ApiMessageContent {
 }
 
 #[derive(Serialize)]
+struct ApiSource {
+    #[serde(rename = "type")]
+    source_type: &'static str,
+    media_type: String,
+    data: String,
+}
+
+impl ApiSource {
+    fn from_content_source(source: &ContentSource) -> Self {
+        Self {
+            source_type: "base64",
+            media_type: source.media_type.clone(),
+            data: source.data.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type")]
 enum ApiContentBlockInput {
     #[serde(rename = "text")]
@@ -710,6 +736,10 @@ enum ApiContentBlockInput {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    #[serde(rename = "image")]
+    Image { source: ApiSource },
+    #[serde(rename = "document")]
+    Document { source: ApiSource },
 }
 
 #[derive(Serialize)]

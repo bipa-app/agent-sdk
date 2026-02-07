@@ -355,8 +355,11 @@ fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                                 thought_signature: None,
                             });
                         }
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            // Thinking blocks are not sent to the Gemini API
+                        ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Image { .. }
+                        | ContentBlock::Document { .. } => {
+                            // These blocks are not sent to the Gemini API
                         }
                         ContentBlock::ToolUse {
                             id: _,

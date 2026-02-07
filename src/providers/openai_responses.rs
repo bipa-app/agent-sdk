@@ -363,8 +363,11 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                                 content: ApiMessageContent::Text(text.clone()),
                             }));
                         }
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            // Thinking blocks are not sent to the OpenAI API
+                        ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Image { .. }
+                        | ContentBlock::Document { .. } => {
+                            // These blocks are not sent to the OpenAI API
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..

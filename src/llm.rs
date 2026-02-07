@@ -42,7 +42,9 @@ pub trait LlmProvider: Send + Sync {
                                     });
                                 }
                                 ContentBlock::RedactedThinking { .. }
-                                | ContentBlock::ToolResult { .. } => {
+                                | ContentBlock::ToolResult { .. }
+                                | ContentBlock::Image { .. }
+                                | ContentBlock::Document { .. } => {
                                     // Not streamed in the default implementation
                                 }
                                 ContentBlock::ToolUse { id, name, input, .. } => {
@@ -176,6 +178,18 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
                     tool_use_id,
                     is_error,
                     result_content.len()
+                );
+            }
+            ContentBlock::Image { source } => {
+                log::debug!(
+                    "  content_block[{i}]: Image media_type={}",
+                    source.media_type
+                );
+            }
+            ContentBlock::Document { source } => {
+                log::debug!(
+                    "  content_block[{i}]: Document media_type={}",
+                    source.media_type
                 );
             }
         }

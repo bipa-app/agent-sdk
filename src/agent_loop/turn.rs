@@ -214,6 +214,18 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                                 content.len()
                             );
                         }
+                        ContentBlock::Image { source } => {
+                            debug!(
+                                "    block[{block_idx}]: Image(media_type={})",
+                                source.media_type
+                            );
+                        }
+                        ContentBlock::Document { source } => {
+                            debug!(
+                                "    block[{block_idx}]: Document(media_type={})",
+                                source.media_type
+                            );
+                        }
                     }
                 }
             }

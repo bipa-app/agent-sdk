@@ -64,6 +64,30 @@ where
                 resume_data: None,
             })
         }
+        AgentInput::Message(blocks) => {
+            let state = match state_store.load(thread_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => AgentState::new(thread_id.clone()),
+                Err(e) => {
+                    return Err(AgentError::new(format!("Failed to load state: {e}"), false));
+                }
+            };
+
+            let user_msg = Message::user_with_content(blocks);
+            if let Err(e) = message_store.append(thread_id, user_msg).await {
+                return Err(AgentError::new(
+                    format!("Failed to append message: {e}"),
+                    false,
+                ));
+            }
+
+            Ok(InitializedState {
+                turn: 0,
+                total_usage: TokenUsage::default(),
+                state,
+                resume_data: None,
+            })
+        }
         AgentInput::Resume {
             continuation,
             tool_call_id,
