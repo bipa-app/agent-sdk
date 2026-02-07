@@ -311,17 +311,18 @@ pub struct PendingToolCallInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListenExecutionContext {
     /// Opaque operation identifier used to execute/cancel.
-    ///
-    /// `session_id` is accepted as a legacy alias for backward compatibility.
-    #[serde(alias = "session_id")]
     pub operation_id: String,
     /// Revision used for optimistic concurrency checks.
     pub revision: u64,
     /// Snapshot shown to the user during confirmation.
     pub snapshot: serde_json::Value,
     /// Optional expiration timestamp (RFC3339).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Continuation state that allows resuming the agent loop.

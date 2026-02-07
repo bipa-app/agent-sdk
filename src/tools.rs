@@ -46,6 +46,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -223,7 +224,8 @@ pub enum ListenToolUpdate {
         /// Optional current snapshot for UI rendering.
         snapshot: Option<serde_json::Value>,
         /// Optional expiration timestamp (RFC3339).
-        expires_at: Option<String>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        expires_at: Option<OffsetDateTime>,
     },
 
     /// Preparation is complete and execution can be confirmed.
@@ -237,7 +239,8 @@ pub enum ListenToolUpdate {
         /// Snapshot shown in confirmation UI.
         snapshot: serde_json::Value,
         /// Optional expiration timestamp (RFC3339).
-        expires_at: Option<String>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        expires_at: Option<OffsetDateTime>,
     },
 
     /// Operation is no longer valid.
@@ -506,6 +509,10 @@ pub trait AsyncTool<Ctx>: Send + Sync {
 ///
 /// This abstraction is useful when runtime state can expire or evolve before
 /// execution (quotes, challenge windows, leases, approvals).
+///
+/// Ordering note: the agent loop consumes `listen()` updates before
+/// `AgentHooks::pre_tool_use()` runs. Hooks can therefore block `execute()`, but
+/// any side effects done during `listen()` have already happened.
 pub trait ListenExecuteTool<Ctx>: Send + Sync {
     /// The type of name for this tool.
     type Name: ToolName;
