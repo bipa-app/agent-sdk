@@ -59,6 +59,10 @@ impl TokenEstimator {
             ContentBlock::ToolResult { content, .. } => {
                 Self::estimate_text(content) + Self::TOOL_RESULT_OVERHEAD
             }
+            ContentBlock::Image { source } | ContentBlock::Document { source } => {
+                // Rough estimate: base64 data is ~4/3 of original, 1 token per 4 chars
+                source.data.len() / 4 + Self::MESSAGE_OVERHEAD
+            }
         }
     }
 

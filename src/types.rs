@@ -13,7 +13,7 @@
 //! - [`AgentContinuation`]: Opaque state for resuming after confirmation
 //! - [`AgentState`]: Checkpointable agent state
 
-use crate::llm::ThinkingConfig;
+use crate::llm::{ContentBlock, ThinkingConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -354,6 +354,9 @@ pub struct AgentContinuation {
 pub enum AgentInput {
     /// Start a new conversation with user text.
     Text(String),
+
+    /// Start a new conversation with rich content (text, images, documents).
+    Message(Vec<ContentBlock>),
 
     /// Resume after a confirmation decision.
     Resume {

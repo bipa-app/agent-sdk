@@ -78,8 +78,11 @@ pub(super) fn extract_content(response: &ChatResponse) -> ExtractedContent {
             ContentBlock::Thinking { thinking, .. } => {
                 thinking_parts.push(thinking.clone());
             }
-            ContentBlock::RedactedThinking { .. } | ContentBlock::ToolResult { .. } => {
-                // Redacted thinking is opaque; ToolResult shouldn't appear in response
+            ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => {
+                // These blocks don't produce extractable content
             }
             ContentBlock::ToolUse {
                 id, name, input, ..
@@ -190,8 +193,10 @@ pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::RedactedThinking { data } => {
                 blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
             }
-            ContentBlock::ToolResult { .. } => {
-                // ToolResult shouldn't appear in response, but ignore if it does
+            ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => {
+                // These blocks shouldn't appear in assistant responses
             }
             ContentBlock::ToolUse {
                 id,

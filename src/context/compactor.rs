@@ -128,6 +128,12 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
                                 };
                                 let _ = writeln!(output, "[Tool result ({status}): {truncated}]");
                             }
+                            ContentBlock::Image { source } => {
+                                let _ = writeln!(output, "[Image: {}]", source.media_type);
+                            }
+                            ContentBlock::Document { source } => {
+                                let _ = writeln!(output, "[Document: {}]", source.media_type);
+                            }
                         }
                     }
                 }

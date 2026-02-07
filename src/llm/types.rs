@@ -108,6 +108,14 @@ impl Message {
     }
 
     #[must_use]
+    pub const fn user_with_content(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: Content::Blocks(blocks),
+        }
+    }
+
+    #[must_use]
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -182,6 +190,23 @@ impl Content {
     }
 }
 
+/// Source data for image and document content blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentSource {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ContentSource {
+    #[must_use]
+    pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
@@ -217,6 +242,12 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+
+    #[serde(rename = "image")]
+    Image { source: ContentSource },
+
+    #[serde(rename = "document")]
+    Document { source: ContentSource },
 }
 
 #[derive(Debug, Clone, Serialize)]
