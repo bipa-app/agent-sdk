@@ -36,11 +36,14 @@ use crate::llm::{
 };
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
-use crate::tools::{ErasedAsyncTool, ErasedToolStatus, ToolContext, ToolRegistry};
+use crate::tools::{
+    DeferredToolState, ErasedAsyncTool, ErasedDeferredTool, ErasedListenTool, ErasedToolStatus,
+    ListenStopReason, ListenToolUpdate, ToolContext, ToolRegistry,
+};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ExecutionStatus, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
-    ToolOutcome, ToolResult, TurnOutcome,
+    ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
+    TokenUsage, ToolExecution, ToolOutcome, ToolResult, TurnOutcome,
 };
 use futures::StreamExt;
 use log::{debug, error, info, warn};
@@ -110,6 +113,7 @@ enum ToolExecutionOutcome {
         display_name: String,
         input: serde_json::Value,
         description: String,
+        listen_context: Option<ListenExecutionContext>,
     },
 }
 
@@ -861,6 +865,596 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    const MAX_LISTEN_UPDATES: usize = 240;
+    const MAX_DEFERRED_POLLS: usize = 240;
+    const MIN_DEFERRED_POLL_MS: u64 = 50;
+    const MAX_DEFERRED_POLL_MS: u64 = 30_000;
+
+    struct ListenReady {
+        operation_id: String,
+        revision: u64,
+        snapshot: serde_json::Value,
+        expires_at: Option<String>,
+    }
+
+    fn build_listen_confirmation_input(
+        original_input: &serde_json::Value,
+        ready: &ListenReady,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "requested_input": original_input,
+            "prepared_snapshot": ready.snapshot,
+            "operation_id": ready.operation_id,
+            "revision": ready.revision,
+            "expires_at": ready.expires_at,
+        })
+    }
+
+    async fn wait_for_listen_ready<Ctx>(
+        pending: &PendingToolCallInfo,
+        tool: &Arc<dyn ErasedListenTool<Ctx>>,
+        tool_context: &ToolContext<Ctx>,
+        tx: &mpsc::Sender<AgentEventEnvelope>,
+        seq: &SequenceCounter,
+    ) -> Result<ListenReady, ToolResult>
+    where
+        Ctx: Send + Sync + Clone + 'static,
+    {
+        let mut updates = tool.listen_stream(tool_context, pending.input.clone());
+        let mut update_count = 0usize;
+        let mut last_operation_id: Option<String> = None;
+
+        while let Some(update) = updates.next().await {
+            update_count += 1;
+
+            match update {
+                ListenToolUpdate::Listening {
+                    operation_id,
+                    revision,
+                    message,
+                    snapshot,
+                    expires_at,
+                } => {
+                    last_operation_id = Some(operation_id.clone());
+
+                    let data = Some(serde_json::json!({
+                        "operation_id": operation_id,
+                        "revision": revision,
+                        "snapshot": snapshot,
+                        "expires_at": expires_at,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "listen_update",
+                            message,
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+                }
+                ListenToolUpdate::Ready {
+                    operation_id,
+                    revision,
+                    message,
+                    snapshot,
+                    expires_at,
+                } => {
+                    let data = Some(serde_json::json!({
+                        "operation_id": operation_id,
+                        "revision": revision,
+                        "snapshot": snapshot,
+                        "expires_at": expires_at,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "listen_ready",
+                            message,
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+
+                    return Ok(ListenReady {
+                        operation_id,
+                        revision,
+                        snapshot,
+                        expires_at,
+                    });
+                }
+                ListenToolUpdate::Invalidated {
+                    operation_id,
+                    message,
+                    recoverable,
+                } => {
+                    let data = Some(serde_json::json!({
+                        "operation_id": operation_id,
+                        "recoverable": recoverable,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "listen_invalidated",
+                            message.clone(),
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+
+                    let prefix = if recoverable {
+                        "Listen operation invalidated (recoverable)"
+                    } else {
+                        "Listen operation invalidated"
+                    };
+                    return Err(ToolResult::error(format!("{prefix}: {message}")));
+                }
+            }
+
+            if tx.is_closed() {
+                if let Some(operation_id) = last_operation_id.as_deref() {
+                    let _ = tool
+                        .cancel(
+                            tool_context,
+                            operation_id,
+                            ListenStopReason::StreamDisconnected,
+                        )
+                        .await;
+                }
+                return Err(ToolResult::error(
+                    "Listen stream disconnected before operation became ready",
+                ));
+            }
+
+            if update_count >= MAX_LISTEN_UPDATES {
+                if let Some(operation_id) = last_operation_id.as_deref() {
+                    let _ = tool
+                        .cancel(tool_context, operation_id, ListenStopReason::StreamEnded)
+                        .await;
+                }
+                return Err(ToolResult::error(format!(
+                    "Listen tool exceeded max updates ({MAX_LISTEN_UPDATES})"
+                )));
+            }
+        }
+
+        if let Some(operation_id) = last_operation_id.as_deref() {
+            let _ = tool
+                .cancel(tool_context, operation_id, ListenStopReason::StreamEnded)
+                .await;
+        }
+
+        Err(ToolResult::error(
+            "Listen stream ended before operation became ready",
+        ))
+    }
+
+    struct DeferredReady {
+        session_id: String,
+        revision: u64,
+        snapshot: serde_json::Value,
+        expires_at: Option<String>,
+    }
+
+    fn build_deferred_confirmation_input(
+        original_input: &serde_json::Value,
+        ready: &DeferredReady,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "requested_input": original_input,
+            "prepared_snapshot": ready.snapshot,
+            "session_id": ready.session_id,
+            "revision": ready.revision,
+            "expires_at": ready.expires_at,
+        })
+    }
+
+    async fn wait_for_deferred_ready<Ctx>(
+        pending: &PendingToolCallInfo,
+        tool: &Arc<dyn ErasedDeferredTool<Ctx>>,
+        tool_context: &ToolContext<Ctx>,
+        tx: &mpsc::Sender<AgentEventEnvelope>,
+        seq: &SequenceCounter,
+    ) -> Result<DeferredReady, ToolResult>
+    where
+        Ctx: Send + Sync + Clone + 'static,
+    {
+        let mut state = match tool.open(tool_context, pending.input.clone()).await {
+            Ok(state) => state,
+            Err(e) => return Err(ToolResult::error(format!("Deferred open error: {e}"))),
+        };
+
+        for _ in 0..MAX_DEFERRED_POLLS {
+            match state {
+                DeferredToolState::Pending {
+                    session_id,
+                    revision,
+                    message,
+                    snapshot,
+                    poll_after_ms,
+                } => {
+                    let data = Some(serde_json::json!({
+                        "session_id": session_id,
+                        "revision": revision,
+                        "snapshot": snapshot,
+                        "poll_after_ms": poll_after_ms,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "deferred_pending",
+                            message,
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+
+                    let delay_ms = poll_after_ms
+                        .max(MIN_DEFERRED_POLL_MS)
+                        .min(MAX_DEFERRED_POLL_MS);
+                    sleep(Duration::from_millis(delay_ms)).await;
+
+                    state = match tool.poll(tool_context, &session_id).await {
+                        Ok(next) => next,
+                        Err(e) => {
+                            return Err(ToolResult::error(format!("Deferred poll error: {e}")));
+                        }
+                    };
+                }
+                DeferredToolState::Ready {
+                    session_id,
+                    revision,
+                    message,
+                    snapshot,
+                    expires_at,
+                } => {
+                    let data = Some(serde_json::json!({
+                        "session_id": session_id,
+                        "revision": revision,
+                        "snapshot": snapshot,
+                        "expires_at": expires_at,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "deferred_ready",
+                            message,
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+
+                    return Ok(DeferredReady {
+                        session_id,
+                        revision,
+                        snapshot,
+                        expires_at,
+                    });
+                }
+                DeferredToolState::Invalidated {
+                    session_id,
+                    message,
+                    recoverable,
+                } => {
+                    let data = Some(serde_json::json!({
+                        "session_id": session_id,
+                        "recoverable": recoverable,
+                    }));
+                    wrap_and_send(
+                        tx,
+                        AgentEvent::tool_progress(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            "deferred_invalidated",
+                            message.clone(),
+                            data,
+                        ),
+                        seq,
+                    )
+                    .await;
+
+                    let prefix = if recoverable {
+                        "Deferred session invalidated (recoverable)"
+                    } else {
+                        "Deferred session invalidated"
+                    };
+                    return Err(ToolResult::error(format!("{prefix}: {message}")));
+                }
+            }
+        }
+
+        Err(ToolResult::error(format!(
+            "Deferred tool exceeded max polling attempts ({MAX_DEFERRED_POLLS})"
+        )))
+    }
+
+    // Check for listen/execute tool first
+    if let Some(listen_tool) = tools.get_listen(&pending.name) {
+        let tier = listen_tool.tier();
+
+        // Emit tool call start
+        wrap_and_send(
+            tx,
+            AgentEvent::tool_call_start(
+                &pending.id,
+                &pending.name,
+                &pending.display_name,
+                pending.input.clone(),
+                tier,
+            ),
+            seq,
+        )
+        .await;
+
+        let tool_start = Instant::now();
+        let ready = match wait_for_listen_ready(pending, listen_tool, tool_context, tx, seq).await {
+            Ok(ready) => ready,
+            Err(mut result) => {
+                result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                hooks.post_tool_use(&pending.name, &result).await;
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                return ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                };
+            }
+        };
+
+        let decision = hooks
+            .pre_tool_use(&pending.name, &pending.input, tier)
+            .await;
+
+        return match decision {
+            ToolDecision::Allow => {
+                let result = match listen_tool
+                    .execute(tool_context, &ready.operation_id, ready.revision)
+                    .await
+                {
+                    Ok(mut r) => {
+                        r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        r
+                    }
+                    Err(e) => ToolResult::error(format!("Listen execute error: {e}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                };
+
+                hooks.post_tool_use(&pending.name, &result).await;
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::Block(reason) => {
+                let _ = listen_tool
+                    .cancel(tool_context, &ready.operation_id, ListenStopReason::Blocked)
+                    .await;
+                let result = ToolResult::error(format!("Blocked: {reason}"));
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::RequiresConfirmation(description) => {
+                let input = build_listen_confirmation_input(&pending.input, &ready);
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::ToolRequiresConfirmation {
+                        id: pending.id.clone(),
+                        name: pending.name.clone(),
+                        input: input.clone(),
+                        description: description.clone(),
+                    },
+                )
+                .await;
+
+                ToolExecutionOutcome::RequiresConfirmation {
+                    tool_id: pending.id.clone(),
+                    tool_name: pending.name.clone(),
+                    display_name: pending.display_name.clone(),
+                    input,
+                    description,
+                    listen_context: Some(ListenExecutionContext {
+                        operation_id: ready.operation_id,
+                        revision: ready.revision,
+                        snapshot: ready.snapshot,
+                        expires_at: ready.expires_at,
+                    }),
+                }
+            }
+        };
+    }
+
+    // Check for deferred tool first
+    if let Some(deferred_tool) = tools.get_deferred(&pending.name) {
+        let tier = deferred_tool.tier();
+
+        // Emit tool call start
+        wrap_and_send(
+            tx,
+            AgentEvent::tool_call_start(
+                &pending.id,
+                &pending.name,
+                &pending.display_name,
+                pending.input.clone(),
+                tier,
+            ),
+            seq,
+        )
+        .await;
+
+        let tool_start = Instant::now();
+        let ready =
+            match wait_for_deferred_ready(pending, deferred_tool, tool_context, tx, seq).await {
+                Ok(ready) => ready,
+                Err(mut result) => {
+                    result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                    hooks.post_tool_use(&pending.name, &result).await;
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    return ToolExecutionOutcome::Completed {
+                        tool_id: pending.id.clone(),
+                        result,
+                    };
+                }
+            };
+
+        let decision = hooks
+            .pre_tool_use(&pending.name, &pending.input, tier)
+            .await;
+
+        return match decision {
+            ToolDecision::Allow => {
+                let result = match deferred_tool
+                    .commit(tool_context, &ready.session_id, ready.revision)
+                    .await
+                {
+                    Ok(mut r) => {
+                        r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        r
+                    }
+                    Err(e) => ToolResult::error(format!("Deferred commit error: {e}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                };
+
+                hooks.post_tool_use(&pending.name, &result).await;
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::Block(reason) => {
+                let result = ToolResult::error(format!("Blocked: {reason}"));
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                ToolExecutionOutcome::Completed {
+                    tool_id: pending.id.clone(),
+                    result,
+                }
+            }
+            ToolDecision::RequiresConfirmation(description) => {
+                let input = build_deferred_confirmation_input(&pending.input, &ready);
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::ToolRequiresConfirmation {
+                        id: pending.id.clone(),
+                        name: pending.name.clone(),
+                        input: input.clone(),
+                        description: description.clone(),
+                    },
+                )
+                .await;
+
+                ToolExecutionOutcome::RequiresConfirmation {
+                    tool_id: pending.id.clone(),
+                    tool_name: pending.name.clone(),
+                    display_name: pending.display_name.clone(),
+                    input,
+                    description,
+                    listen_context: Some(ListenExecutionContext {
+                        operation_id: ready.session_id,
+                        revision: ready.revision,
+                        snapshot: ready.snapshot,
+                        expires_at: ready.expires_at,
+                    }),
+                }
+            }
+        };
+    }
+
     // Check for async tool first
     if let Some(async_tool) = tools.get_async(&pending.name) {
         let tier = async_tool.tier();
@@ -947,6 +1541,7 @@ where
                     display_name: pending.display_name.clone(),
                     input: pending.input.clone(),
                     description,
+                    listen_context: None,
                 }
             }
         };
@@ -1053,6 +1648,7 @@ where
                 display_name: pending.display_name.clone(),
                 input: pending.input.clone(),
                 description,
+                listen_context: None,
             }
         }
     }
@@ -1168,6 +1764,83 @@ where
     H: AgentHooks,
 {
     if rejection_reason.is_none() {
+        // Check for listen/execute tool first
+        if let Some(listen_tool) = tools.get_listen(&awaiting_tool.name) {
+            let Some(listen) = awaiting_tool.listen_context.as_ref() else {
+                return ToolResult::error(format!(
+                    "Listen context missing for tool: {}",
+                    awaiting_tool.name
+                ));
+            };
+
+            let tool_start = Instant::now();
+            let result = match listen_tool
+                .execute(tool_context, &listen.operation_id, listen.revision)
+                .await
+            {
+                Ok(mut r) => {
+                    r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                    r
+                }
+                Err(e) => ToolResult::error(format!("Listen execute error: {e}"))
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+            };
+
+            hooks.post_tool_use(&awaiting_tool.name, &result).await;
+
+            wrap_and_send(
+                tx,
+                AgentEvent::tool_call_end(
+                    &awaiting_tool.id,
+                    &awaiting_tool.name,
+                    &awaiting_tool.display_name,
+                    result.clone(),
+                ),
+                seq,
+            )
+            .await;
+
+            return result;
+        }
+
+        // Check for deferred tool first
+        if let Some(deferred_tool) = tools.get_deferred(&awaiting_tool.name) {
+            let Some(deferred) = awaiting_tool.listen_context.as_ref() else {
+                return ToolResult::error(format!(
+                    "Deferred context missing for tool: {}",
+                    awaiting_tool.name
+                ));
+            };
+
+            let tool_start = Instant::now();
+            let result = match deferred_tool
+                .commit(tool_context, &deferred.operation_id, deferred.revision)
+                .await
+            {
+                Ok(mut r) => {
+                    r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                    r
+                }
+                Err(e) => ToolResult::error(format!("Deferred commit error: {e}"))
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+            };
+
+            hooks.post_tool_use(&awaiting_tool.name, &result).await;
+
+            wrap_and_send(
+                tx,
+                AgentEvent::tool_call_end(
+                    &awaiting_tool.id,
+                    &awaiting_tool.name,
+                    &awaiting_tool.display_name,
+                    result.clone(),
+                ),
+                seq,
+            )
+            .await;
+
+            return result;
+        }
         // Check for async tool first
         if let Some(async_tool) = tools.get_async(&awaiting_tool.name) {
             let result = execute_async_tool(awaiting_tool, async_tool, tool_context, tx, seq).await;
@@ -1223,7 +1896,25 @@ where
             ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
         }
     } else {
-        let reason = rejection_reason.unwrap_or_default();
+        if let Some(listen_tool) = tools.get_listen(&awaiting_tool.name) {
+            if let Some(listen) = awaiting_tool.listen_context.as_ref() {
+                let _ = listen_tool
+                    .cancel(
+                        tool_context,
+                        &listen.operation_id,
+                        ListenStopReason::UserRejected,
+                    )
+                    .await;
+            }
+        } else if let Some(deferred_tool) = tools.get_deferred(&awaiting_tool.name) {
+            if let Some(deferred) = awaiting_tool.listen_context.as_ref() {
+                let _ = deferred_tool
+                    .cancel(tool_context, &deferred.operation_id)
+                    .await;
+            }
+        }
+
+        let reason = rejection_reason.unwrap_or_else(|| "User rejected".to_string());
         let result = ToolResult::error(format!("Rejected: {reason}"));
         send_event(
             tx,
@@ -1602,6 +2293,7 @@ where
                     display_name,
                     input,
                     description,
+                    listen_context,
                 } => {
                     let pending_idx = cont
                         .pending_tool_calls
@@ -1609,12 +2301,19 @@ where
                         .position(|p| p.id == tool_id)
                         .unwrap_or(0);
 
+                    let mut pending_tool_calls = cont.pending_tool_calls.clone();
+                    if let Some(context) = listen_context {
+                        if let Some(item) = pending_tool_calls.get_mut(pending_idx) {
+                            item.listen_context = Some(context);
+                        }
+                    }
+
                     let new_continuation = AgentContinuation {
                         thread_id: thread_id.clone(),
                         turn,
                         total_usage: total_usage.clone(),
                         turn_usage: cont.turn_usage.clone(),
-                        pending_tool_calls: cont.pending_tool_calls.clone(),
+                        pending_tool_calls,
                         awaiting_index: pending_idx,
                         completed_results: tool_results,
                         state: state.clone(),
@@ -1997,6 +2696,7 @@ where
                 display_name,
                 input,
                 description,
+                listen_context,
             } => {
                 let pending_idx = cont
                     .pending_tool_calls
@@ -2004,12 +2704,19 @@ where
                     .position(|p| p.id == tool_id)
                     .unwrap_or(0);
 
+                let mut pending_tool_calls = cont.pending_tool_calls.clone();
+                if let Some(context) = listen_context {
+                    if let Some(item) = pending_tool_calls.get_mut(pending_idx) {
+                        item.listen_context = Some(context);
+                    }
+                }
+
                 let new_continuation = AgentContinuation {
                     thread_id: thread_id.clone(),
                     turn,
                     total_usage: total_usage.clone(),
                     turn_usage: cont.turn_usage.clone(),
-                    pending_tool_calls: cont.pending_tool_calls.clone(),
+                    pending_tool_calls,
                     awaiting_index: pending_idx,
                     completed_results: tool_results,
                     state: state.clone(),
@@ -2424,26 +3131,34 @@ where
     }
 
     // Build pending tool calls (check both sync and async tools for display_name)
-    let pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
+    let mut pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
         .iter()
         .map(|(id, name, input)| {
             let display_name = tools
                 .get(name)
                 .map(|t| t.display_name().to_string())
                 .or_else(|| tools.get_async(name).map(|t| t.display_name().to_string()))
+                .or_else(|| tools.get_listen(name).map(|t| t.display_name().to_string()))
+                .or_else(|| {
+                    tools
+                        .get_deferred(name)
+                        .map(|t| t.display_name().to_string())
+                })
                 .unwrap_or_default();
             PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 display_name,
                 input: input.clone(),
+                listen_context: None,
             }
         })
         .collect();
 
     // Execute tools (supports both sync and async tools)
     let mut tool_results = Vec::new();
-    for (idx, pending) in pending_tool_calls.iter().enumerate() {
+    for idx in 0..pending_tool_calls.len() {
+        let pending = pending_tool_calls[idx].clone();
         // IDEMPOTENCY: Check for cached result from a previous execution attempt
         if let Some(cached_result) = try_get_cached_result(execution_store, &pending.id).await {
             debug!(
@@ -2451,6 +3166,702 @@ where
                 pending.id, pending.name
             );
             tool_results.push((pending.id.clone(), cached_result));
+            continue;
+        }
+
+        // Check for listen/execute tool first
+        if let Some(listen_tool) = tools.get_listen(&pending.name) {
+            let tier = listen_tool.tier();
+
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::tool_call_start(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    pending.input.clone(),
+                    tier,
+                ),
+            )
+            .await;
+
+            const MAX_LISTEN_UPDATES: usize = 240;
+
+            let tool_start = Instant::now();
+            let mut updates = listen_tool.listen_stream(tool_context, pending.input.clone());
+            let mut update_count = 0usize;
+            let mut last_operation_id: Option<String> = None;
+            let mut ready_context: Option<ListenExecutionContext> = None;
+            let mut confirmation_input: Option<serde_json::Value> = None;
+            let mut terminal_result: Option<ToolResult> = None;
+
+            while let Some(update) = updates.next().await {
+                update_count += 1;
+
+                match update {
+                    ListenToolUpdate::Listening {
+                        operation_id,
+                        revision,
+                        message,
+                        snapshot,
+                        expires_at,
+                    } => {
+                        last_operation_id = Some(operation_id.clone());
+                        let data = Some(serde_json::json!({
+                            "operation_id": operation_id,
+                            "revision": revision,
+                            "snapshot": snapshot,
+                            "expires_at": expires_at,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "listen_update",
+                                message,
+                                data,
+                            ),
+                        )
+                        .await;
+                    }
+                    ListenToolUpdate::Ready {
+                        operation_id,
+                        revision,
+                        message,
+                        snapshot,
+                        expires_at,
+                    } => {
+                        let data = Some(serde_json::json!({
+                            "operation_id": operation_id,
+                            "revision": revision,
+                            "snapshot": snapshot,
+                            "expires_at": expires_at,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "listen_ready",
+                                message,
+                                data,
+                            ),
+                        )
+                        .await;
+
+                        ready_context = Some(ListenExecutionContext {
+                            operation_id: operation_id.clone(),
+                            revision,
+                            snapshot: snapshot.clone(),
+                            expires_at: expires_at.clone(),
+                        });
+                        confirmation_input = Some(serde_json::json!({
+                            "requested_input": pending.input.clone(),
+                            "prepared_snapshot": snapshot,
+                            "operation_id": operation_id,
+                            "revision": revision,
+                            "expires_at": expires_at,
+                        }));
+                        break;
+                    }
+                    ListenToolUpdate::Invalidated {
+                        operation_id,
+                        message,
+                        recoverable,
+                    } => {
+                        let data = Some(serde_json::json!({
+                            "operation_id": operation_id,
+                            "recoverable": recoverable,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "listen_invalidated",
+                                message.clone(),
+                                data,
+                            ),
+                        )
+                        .await;
+
+                        let result = if recoverable {
+                            ToolResult::error(format!(
+                                "Listen operation invalidated (recoverable): {message}"
+                            ))
+                        } else {
+                            ToolResult::error(format!("Listen operation invalidated: {message}"))
+                        }
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_call_end(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                result.clone(),
+                            ),
+                        )
+                        .await;
+                        terminal_result = Some(result);
+                        break;
+                    }
+                }
+
+                if tx.is_closed() {
+                    if let Some(operation_id) = last_operation_id.as_deref() {
+                        let _ = listen_tool
+                            .cancel(
+                                tool_context,
+                                operation_id,
+                                ListenStopReason::StreamDisconnected,
+                            )
+                            .await;
+                    }
+                    let result = ToolResult::error(
+                        "Listen stream disconnected before operation became ready",
+                    )
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                    terminal_result = Some(result);
+                    break;
+                }
+
+                if update_count >= MAX_LISTEN_UPDATES {
+                    if let Some(operation_id) = last_operation_id.as_deref() {
+                        let _ = listen_tool
+                            .cancel(tool_context, operation_id, ListenStopReason::StreamEnded)
+                            .await;
+                    }
+                    let result = ToolResult::error(format!(
+                        "Listen tool exceeded max updates ({MAX_LISTEN_UPDATES})"
+                    ))
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    terminal_result = Some(result);
+                    break;
+                }
+            }
+
+            if let Some(result) = terminal_result {
+                tool_results.push((pending.id.clone(), result));
+                continue;
+            }
+
+            let Some(listen_context) = ready_context else {
+                if let Some(operation_id) = last_operation_id.as_deref() {
+                    let _ = listen_tool
+                        .cancel(tool_context, operation_id, ListenStopReason::StreamEnded)
+                        .await;
+                }
+                let result = ToolResult::error("Listen stream ended before operation became ready")
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                tool_results.push((pending.id.clone(), result));
+                continue;
+            };
+
+            let decision = hooks
+                .pre_tool_use(&pending.name, &pending.input, tier)
+                .await;
+
+            match decision {
+                ToolDecision::Allow => {
+                    // IDEMPOTENCY: Record execution start (write-ahead)
+                    let started_at = time::OffsetDateTime::now_utc();
+                    record_execution_start(execution_store, &pending, &ctx.thread_id, started_at)
+                        .await;
+
+                    let result = match listen_tool
+                        .execute(
+                            tool_context,
+                            &listen_context.operation_id,
+                            listen_context.revision,
+                        )
+                        .await
+                    {
+                        Ok(mut r) => {
+                            r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                            r
+                        }
+                        Err(e) => ToolResult::error(format!("Listen execute error: {e}"))
+                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                    };
+
+                    // IDEMPOTENCY: Record execution completion
+                    record_execution_complete(
+                        execution_store,
+                        &pending,
+                        &ctx.thread_id,
+                        &result,
+                        started_at,
+                    )
+                    .await;
+
+                    hooks.post_tool_use(&pending.name, &result).await;
+
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::Block(reason) => {
+                    let _ = listen_tool
+                        .cancel(
+                            tool_context,
+                            &listen_context.operation_id,
+                            ListenStopReason::Blocked,
+                        )
+                        .await;
+                    let result = ToolResult::error(format!("Blocked: {reason}"));
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::RequiresConfirmation(description) => {
+                    if let Some(item) = pending_tool_calls.get_mut(idx) {
+                        item.listen_context = Some(listen_context.clone());
+                    }
+                    let input = confirmation_input.unwrap_or_else(|| pending.input.clone());
+
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::ToolRequiresConfirmation {
+                            id: pending.id.clone(),
+                            name: pending.name.clone(),
+                            input: input.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .await;
+
+                    let continuation = AgentContinuation {
+                        thread_id: ctx.thread_id.clone(),
+                        turn: ctx.turn,
+                        total_usage: ctx.total_usage.clone(),
+                        turn_usage: turn_usage.clone(),
+                        pending_tool_calls: pending_tool_calls.clone(),
+                        awaiting_index: idx,
+                        completed_results: tool_results,
+                        state: ctx.state.clone(),
+                    };
+
+                    return InternalTurnResult::AwaitingConfirmation {
+                        tool_call_id: pending.id.clone(),
+                        tool_name: pending.name.clone(),
+                        display_name: pending.display_name.clone(),
+                        input,
+                        description,
+                        continuation: Box::new(continuation),
+                    };
+                }
+            }
+            continue;
+        }
+
+        // Check for deferred tool first
+        if let Some(deferred_tool) = tools.get_deferred(&pending.name) {
+            let tier = deferred_tool.tier();
+
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::tool_call_start(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    pending.input.clone(),
+                    tier,
+                ),
+            )
+            .await;
+
+            let tool_start = Instant::now();
+            const MAX_DEFERRED_POLLS: usize = 240;
+            const MIN_DEFERRED_POLL_MS: u64 = 50;
+            const MAX_DEFERRED_POLL_MS: u64 = 30_000;
+
+            let mut deferred_state = match deferred_tool
+                .open(tool_context, pending.input.clone())
+                .await
+            {
+                Ok(state) => state,
+                Err(e) => {
+                    let result = ToolResult::error(format!("Deferred open error: {e}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    tool_results.push((pending.id.clone(), result));
+                    continue;
+                }
+            };
+
+            let mut ready_context: Option<ListenExecutionContext> = None;
+            let mut confirmation_input: Option<serde_json::Value> = None;
+            let mut terminal_result: Option<ToolResult> = None;
+
+            for _ in 0..MAX_DEFERRED_POLLS {
+                match deferred_state {
+                    DeferredToolState::Pending {
+                        session_id,
+                        revision,
+                        message,
+                        snapshot,
+                        poll_after_ms,
+                    } => {
+                        let data = Some(serde_json::json!({
+                            "session_id": session_id,
+                            "revision": revision,
+                            "snapshot": snapshot,
+                            "poll_after_ms": poll_after_ms,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "deferred_pending",
+                                message,
+                                data,
+                            ),
+                        )
+                        .await;
+
+                        let delay_ms = poll_after_ms
+                            .max(MIN_DEFERRED_POLL_MS)
+                            .min(MAX_DEFERRED_POLL_MS);
+                        sleep(Duration::from_millis(delay_ms)).await;
+
+                        deferred_state = match deferred_tool.poll(tool_context, &session_id).await {
+                            Ok(next) => next,
+                            Err(e) => {
+                                let result = ToolResult::error(format!("Deferred poll error: {e}"))
+                                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                                send_event(
+                                    tx,
+                                    hooks,
+                                    seq,
+                                    AgentEvent::tool_call_end(
+                                        &pending.id,
+                                        &pending.name,
+                                        &pending.display_name,
+                                        result.clone(),
+                                    ),
+                                )
+                                .await;
+                                terminal_result = Some(result);
+                                break;
+                            }
+                        };
+                    }
+                    DeferredToolState::Ready {
+                        session_id,
+                        revision,
+                        message,
+                        snapshot,
+                        expires_at,
+                    } => {
+                        let data = Some(serde_json::json!({
+                            "session_id": session_id,
+                            "revision": revision,
+                            "snapshot": snapshot,
+                            "expires_at": expires_at,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "deferred_ready",
+                                message,
+                                data,
+                            ),
+                        )
+                        .await;
+
+                        ready_context = Some(ListenExecutionContext {
+                            operation_id: session_id.clone(),
+                            revision,
+                            snapshot: snapshot.clone(),
+                            expires_at: expires_at.clone(),
+                        });
+                        confirmation_input = Some(serde_json::json!({
+                            "requested_input": pending.input.clone(),
+                            "prepared_snapshot": snapshot,
+                            "session_id": session_id,
+                            "revision": revision,
+                            "expires_at": expires_at,
+                        }));
+                        break;
+                    }
+                    DeferredToolState::Invalidated {
+                        session_id,
+                        message,
+                        recoverable,
+                    } => {
+                        let result = if recoverable {
+                            ToolResult::error(format!(
+                                "Deferred session invalidated (recoverable): {message}"
+                            ))
+                        } else {
+                            ToolResult::error(format!("Deferred session invalidated: {message}"))
+                        }
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+
+                        let data = Some(serde_json::json!({
+                            "session_id": session_id,
+                            "recoverable": recoverable,
+                        }));
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_progress(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                "deferred_invalidated",
+                                message,
+                                data,
+                            ),
+                        )
+                        .await;
+
+                        send_event(
+                            tx,
+                            hooks,
+                            seq,
+                            AgentEvent::tool_call_end(
+                                &pending.id,
+                                &pending.name,
+                                &pending.display_name,
+                                result.clone(),
+                            ),
+                        )
+                        .await;
+                        terminal_result = Some(result);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(result) = terminal_result {
+                tool_results.push((pending.id.clone(), result));
+                continue;
+            }
+
+            let Some(listen_context) = ready_context else {
+                let result = ToolResult::error(format!(
+                    "Deferred tool exceeded max polling attempts ({MAX_DEFERRED_POLLS})"
+                ))
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::tool_call_end(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
+                        result.clone(),
+                    ),
+                )
+                .await;
+                tool_results.push((pending.id.clone(), result));
+                continue;
+            };
+
+            let decision = hooks
+                .pre_tool_use(&pending.name, &pending.input, tier)
+                .await;
+
+            match decision {
+                ToolDecision::Allow => {
+                    // IDEMPOTENCY: Record execution start (write-ahead)
+                    let started_at = time::OffsetDateTime::now_utc();
+                    record_execution_start(execution_store, &pending, &ctx.thread_id, started_at)
+                        .await;
+
+                    let result = match deferred_tool
+                        .commit(
+                            tool_context,
+                            &listen_context.operation_id,
+                            listen_context.revision,
+                        )
+                        .await
+                    {
+                        Ok(mut r) => {
+                            r.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                            r
+                        }
+                        Err(e) => ToolResult::error(format!("Deferred commit error: {e}"))
+                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                    };
+
+                    // IDEMPOTENCY: Record execution completion
+                    record_execution_complete(
+                        execution_store,
+                        &pending,
+                        &ctx.thread_id,
+                        &result,
+                        started_at,
+                    )
+                    .await;
+
+                    hooks.post_tool_use(&pending.name, &result).await;
+
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::Block(reason) => {
+                    let result = ToolResult::error(format!("Blocked: {reason}"));
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::tool_call_end(
+                            &pending.id,
+                            &pending.name,
+                            &pending.display_name,
+                            result.clone(),
+                        ),
+                    )
+                    .await;
+                    tool_results.push((pending.id.clone(), result));
+                }
+                ToolDecision::RequiresConfirmation(description) => {
+                    if let Some(item) = pending_tool_calls.get_mut(idx) {
+                        item.listen_context = Some(listen_context.clone());
+                    }
+                    let input = confirmation_input.unwrap_or_else(|| pending.input.clone());
+
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::ToolRequiresConfirmation {
+                            id: pending.id.clone(),
+                            name: pending.name.clone(),
+                            input: input.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .await;
+
+                    let continuation = AgentContinuation {
+                        thread_id: ctx.thread_id.clone(),
+                        turn: ctx.turn,
+                        total_usage: ctx.total_usage.clone(),
+                        turn_usage: turn_usage.clone(),
+                        pending_tool_calls: pending_tool_calls.clone(),
+                        awaiting_index: idx,
+                        completed_results: tool_results,
+                        state: ctx.state.clone(),
+                    };
+
+                    return InternalTurnResult::AwaitingConfirmation {
+                        tool_call_id: pending.id.clone(),
+                        tool_name: pending.name.clone(),
+                        display_name: pending.display_name.clone(),
+                        input,
+                        description,
+                        continuation: Box::new(continuation),
+                    };
+                }
+            }
             continue;
         }
 
@@ -2482,16 +3893,16 @@ where
                 ToolDecision::Allow => {
                     // IDEMPOTENCY: Record execution start (write-ahead)
                     let started_at = time::OffsetDateTime::now_utc();
-                    record_execution_start(execution_store, pending, &ctx.thread_id, started_at)
+                    record_execution_start(execution_store, &pending, &ctx.thread_id, started_at)
                         .await;
 
                     let result =
-                        execute_async_tool(pending, async_tool, tool_context, tx, seq).await;
+                        execute_async_tool(&pending, async_tool, tool_context, tx, seq).await;
 
                     // IDEMPOTENCY: Record execution completion
                     record_execution_complete(
                         execution_store,
-                        pending,
+                        &pending,
                         &ctx.thread_id,
                         &result,
                         started_at,
@@ -2603,7 +4014,7 @@ where
             ToolDecision::Allow => {
                 // IDEMPOTENCY: Record execution start (write-ahead)
                 let started_at = time::OffsetDateTime::now_utc();
-                record_execution_start(execution_store, pending, &ctx.thread_id, started_at).await;
+                record_execution_start(execution_store, &pending, &ctx.thread_id, started_at).await;
 
                 let tool_start = Instant::now();
                 let result = match tool.execute(tool_context, pending.input.clone()).await {
@@ -2618,7 +4029,7 @@ where
                 // IDEMPOTENCY: Record execution completion
                 record_execution_complete(
                     execution_store,
-                    pending,
+                    &pending,
                     &ctx.thread_id,
                     &result,
                     started_at,
@@ -3005,13 +4416,16 @@ mod tests {
     use crate::hooks::AllowAllHooks;
     use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
     use crate::stores::InMemoryStore;
-    use crate::tools::{Tool, ToolContext, ToolRegistry};
-    use crate::types::{AgentConfig, AgentInput, ToolResult, ToolTier};
+    use crate::tools::{
+        DeferredTool, DeferredToolState, ListenExecuteTool, ListenStopReason, ListenToolUpdate,
+        Tool, ToolContext, ToolRegistry,
+    };
+    use crate::types::{AgentConfig, AgentInput, ToolResult, ToolTier, TurnOutcome};
     use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, RwLock};
 
     // ===================
     // Mock LLM Provider
@@ -3113,6 +4527,8 @@ mod tests {
     #[serde(rename_all = "snake_case")]
     enum TestToolName {
         Echo,
+        DeferredEcho,
+        ListenEcho,
     }
 
     impl crate::tools::ToolName for TestToolName {}
@@ -3156,6 +4572,143 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("no message");
             Ok(ToolResult::success(format!("Echo: {message}")))
+        }
+    }
+
+    struct DeferredEchoTool;
+
+    impl DeferredTool<()> for DeferredEchoTool {
+        type Name = TestToolName;
+
+        fn name(&self) -> TestToolName {
+            TestToolName::DeferredEcho
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Deferred Echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Deferred tool used for confirmation flow tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            })
+        }
+
+        async fn open(
+            &self,
+            _ctx: &ToolContext<()>,
+            _input: serde_json::Value,
+        ) -> Result<DeferredToolState> {
+            Ok(DeferredToolState::Pending {
+                session_id: "deferred-session-1".to_string(),
+                revision: 1,
+                message: "Waiting for deferred readiness".to_string(),
+                snapshot: None,
+                poll_after_ms: 1,
+            })
+        }
+
+        async fn poll(
+            &self,
+            _ctx: &ToolContext<()>,
+            session_id: &str,
+        ) -> Result<DeferredToolState> {
+            Ok(DeferredToolState::Ready {
+                session_id: session_id.to_string(),
+                revision: 2,
+                message: "Ready to commit".to_string(),
+                snapshot: json!({ "preview": "v2" }),
+                expires_at: None,
+            })
+        }
+
+        async fn commit(
+            &self,
+            _ctx: &ToolContext<()>,
+            _session_id: &str,
+            _expected_revision: u64,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success("Deferred commit complete"))
+        }
+    }
+
+    struct ListenEchoTool {
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    impl ListenExecuteTool<()> for ListenEchoTool {
+        type Name = TestToolName;
+
+        fn name(&self) -> TestToolName {
+            TestToolName::ListenEcho
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Listen Echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Listen/execute tool used for confirmation flow tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            })
+        }
+
+        fn listen(
+            &self,
+            _ctx: &ToolContext<()>,
+            _input: serde_json::Value,
+        ) -> impl futures::Stream<Item = ListenToolUpdate> + Send {
+            futures::stream::iter(vec![
+                ListenToolUpdate::Listening {
+                    operation_id: "listen-op-1".to_string(),
+                    revision: 1,
+                    message: "Preparing operation".to_string(),
+                    snapshot: Some(json!({ "preview": "v1" })),
+                    expires_at: None,
+                },
+                ListenToolUpdate::Ready {
+                    operation_id: "listen-op-1".to_string(),
+                    revision: 2,
+                    message: "Ready to execute".to_string(),
+                    snapshot: json!({ "preview": "v2" }),
+                    expires_at: None,
+                },
+            ])
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            _operation_id: &str,
+            _expected_revision: u64,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success("Listen execute complete"))
+        }
+
+        async fn cancel(
+            &self,
+            _ctx: &ToolContext<()>,
+            _operation_id: &str,
+            _reason: ListenStopReason,
+        ) -> Result<()> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -3763,6 +5316,164 @@ mod tests {
                 .any(|e| matches!(e.event, AgentEvent::ToolCallEnd { .. }))
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deferred_tool_confirmation_flow() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("tool_1", "deferred_echo", json!({"message": "test"})),
+            MockProvider::text_response("Deferred flow complete"),
+        ]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register_deferred(DeferredEchoTool);
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+        let thread_id = ThreadId::new();
+
+        // Turn 1: reaches awaiting confirmation after deferred pre-runtime
+        let (_events_1, outcome_rx_1) = agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Text("Run deferred".to_string()),
+            ToolContext::new(()),
+        );
+        let outcome_1 = outcome_rx_1.await?;
+
+        let (continuation, tool_call_id) = match outcome_1 {
+            TurnOutcome::AwaitingConfirmation {
+                continuation,
+                tool_call_id,
+                ..
+            } => (continuation, tool_call_id),
+            other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+        };
+
+        // Turn 2: confirm and execute commit
+        let (_events_2, outcome_rx_2) = agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Resume {
+                continuation,
+                tool_call_id,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+        );
+        let outcome_2 = outcome_rx_2.await?;
+        assert!(matches!(outcome_2, TurnOutcome::NeedsMoreTurns { .. }));
+
+        // Turn 3: continue and finish
+        let (_events_3, outcome_rx_3) =
+            agent.run_turn(thread_id, AgentInput::Continue, ToolContext::new(()));
+        let outcome_3 = outcome_rx_3.await?;
+        assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_listen_tool_confirmation_flow() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("tool_1", "listen_echo", json!({"message": "test"})),
+            MockProvider::text_response("Listen flow complete"),
+        ]);
+
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register_listen(ListenEchoTool {
+            cancel_calls: cancel_calls.clone(),
+        });
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+        let thread_id = ThreadId::new();
+
+        // Turn 1: reaches awaiting confirmation after listen pre-runtime
+        let (_events_1, outcome_rx_1) = agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Text("Run listen tool".to_string()),
+            ToolContext::new(()),
+        );
+        let outcome_1 = outcome_rx_1.await?;
+
+        let (continuation, tool_call_id) = match outcome_1 {
+            TurnOutcome::AwaitingConfirmation {
+                continuation,
+                tool_call_id,
+                ..
+            } => (continuation, tool_call_id),
+            other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+        };
+
+        // Turn 2: confirm and execute
+        let (_events_2, outcome_rx_2) = agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Resume {
+                continuation,
+                tool_call_id,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+        );
+        let outcome_2 = outcome_rx_2.await?;
+        assert!(matches!(outcome_2, TurnOutcome::NeedsMoreTurns { .. }));
+
+        // Turn 3: continue and finish
+        let (_events_3, outcome_rx_3) =
+            agent.run_turn(thread_id, AgentInput::Continue, ToolContext::new(()));
+        let outcome_3 = outcome_rx_3.await?;
+        assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_listen_tool_rejection_cancels_operation() -> anyhow::Result<()> {
+        let provider = MockProvider::new(vec![
+            MockProvider::tool_use_response("tool_1", "listen_echo", json!({"message": "test"})),
+            MockProvider::text_response("Rejected flow complete"),
+        ]);
+
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register_listen(ListenEchoTool {
+            cancel_calls: cancel_calls.clone(),
+        });
+
+        let agent = builder::<()>().provider(provider).tools(tools).build();
+        let thread_id = ThreadId::new();
+
+        let (_events_1, outcome_rx_1) = agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Text("Run listen tool".to_string()),
+            ToolContext::new(()),
+        );
+        let outcome_1 = outcome_rx_1.await?;
+
+        let (continuation, tool_call_id) = match outcome_1 {
+            TurnOutcome::AwaitingConfirmation {
+                continuation,
+                tool_call_id,
+                ..
+            } => (continuation, tool_call_id),
+            other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+        };
+
+        let (_events_2, outcome_rx_2) = agent.run_turn(
+            thread_id,
+            AgentInput::Resume {
+                continuation,
+                tool_call_id,
+                confirmed: false,
+                rejection_reason: Some("nope".to_string()),
+            },
+            ToolContext::new(()),
+        );
+        let _ = outcome_rx_2.await?;
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
