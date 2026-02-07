@@ -1105,9 +1105,7 @@ where
                     )
                     .await;
 
-                    let delay_ms = poll_after_ms
-                        .max(MIN_DEFERRED_POLL_MS)
-                        .min(MAX_DEFERRED_POLL_MS);
+                    let delay_ms = poll_after_ms.clamp(MIN_DEFERRED_POLL_MS, MAX_DEFERRED_POLL_MS);
                     sleep(Duration::from_millis(delay_ms)).await;
 
                     state = match tool.poll(tool_context, &session_id).await {
@@ -1750,6 +1748,7 @@ where
 ///
 /// This is called when resuming after a tool required confirmation.
 /// Supports both sync and async tools.
+#[allow(clippy::too_many_lines)]
 async fn execute_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     rejection_reason: Option<String>,
@@ -1906,12 +1905,12 @@ where
                     )
                     .await;
             }
-        } else if let Some(deferred_tool) = tools.get_deferred(&awaiting_tool.name) {
-            if let Some(deferred) = awaiting_tool.listen_context.as_ref() {
-                let _ = deferred_tool
-                    .cancel(tool_context, &deferred.operation_id)
-                    .await;
-            }
+        } else if let Some(deferred_tool) = tools.get_deferred(&awaiting_tool.name)
+            && let Some(deferred) = awaiting_tool.listen_context.as_ref()
+        {
+            let _ = deferred_tool
+                .cancel(tool_context, &deferred.operation_id)
+                .await;
         }
 
         let reason = rejection_reason.unwrap_or_else(|| "User rejected".to_string());
@@ -2302,10 +2301,10 @@ where
                         .unwrap_or(0);
 
                     let mut pending_tool_calls = cont.pending_tool_calls.clone();
-                    if let Some(context) = listen_context {
-                        if let Some(item) = pending_tool_calls.get_mut(pending_idx) {
-                            item.listen_context = Some(context);
-                        }
+                    if let Some(context) = listen_context
+                        && let Some(item) = pending_tool_calls.get_mut(pending_idx)
+                    {
+                        item.listen_context = Some(context);
                     }
 
                     let new_continuation = AgentContinuation {
@@ -2631,6 +2630,7 @@ struct ResumeCaseParameters<Ctx, H, M, S> {
     state_store: Arc<S>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_resume_case<Ctx, H, M, S>(
     ResumeCaseParameters {
         resume_data,
@@ -2705,10 +2705,10 @@ where
                     .unwrap_or(0);
 
                 let mut pending_tool_calls = cont.pending_tool_calls.clone();
-                if let Some(context) = listen_context {
-                    if let Some(item) = pending_tool_calls.get_mut(pending_idx) {
-                        item.listen_context = Some(context);
-                    }
+                if let Some(context) = listen_context
+                    && let Some(item) = pending_tool_calls.get_mut(pending_idx)
+                {
+                    item.listen_context = Some(context);
                 }
 
                 let new_continuation = AgentContinuation {
@@ -3187,7 +3187,7 @@ where
             )
             .await;
 
-            const MAX_LISTEN_UPDATES: usize = 240;
+            let max_listen_updates: usize = 240;
 
             let tool_start = Instant::now();
             let mut updates = listen_tool.listen_stream(tool_context, pending.input.clone());
@@ -3344,14 +3344,14 @@ where
                     break;
                 }
 
-                if update_count >= MAX_LISTEN_UPDATES {
+                if update_count >= max_listen_updates {
                     if let Some(operation_id) = last_operation_id.as_deref() {
                         let _ = listen_tool
                             .cancel(tool_context, operation_id, ListenStopReason::StreamEnded)
                             .await;
                     }
                     let result = ToolResult::error(format!(
-                        "Listen tool exceeded max updates ({MAX_LISTEN_UPDATES})"
+                        "Listen tool exceeded max updates ({max_listen_updates})"
                     ))
                     .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
                     send_event(
@@ -3539,9 +3539,9 @@ where
             .await;
 
             let tool_start = Instant::now();
-            const MAX_DEFERRED_POLLS: usize = 240;
-            const MIN_DEFERRED_POLL_MS: u64 = 50;
-            const MAX_DEFERRED_POLL_MS: u64 = 30_000;
+            let max_deferred_polls: usize = 240;
+            let min_deferred_poll_ms: u64 = 50;
+            let max_deferred_poll_ms: u64 = 30_000;
 
             let mut deferred_state = match deferred_tool
                 .open(tool_context, pending.input.clone())
@@ -3572,7 +3572,7 @@ where
             let mut confirmation_input: Option<serde_json::Value> = None;
             let mut terminal_result: Option<ToolResult> = None;
 
-            for _ in 0..MAX_DEFERRED_POLLS {
+            for _ in 0..max_deferred_polls {
                 match deferred_state {
                     DeferredToolState::Pending {
                         session_id,
@@ -3603,9 +3603,8 @@ where
                         )
                         .await;
 
-                        let delay_ms = poll_after_ms
-                            .max(MIN_DEFERRED_POLL_MS)
-                            .min(MAX_DEFERRED_POLL_MS);
+                        let delay_ms =
+                            poll_after_ms.clamp(min_deferred_poll_ms, max_deferred_poll_ms);
                         sleep(Duration::from_millis(delay_ms)).await;
 
                         deferred_state = match deferred_tool.poll(tool_context, &session_id).await {
@@ -3733,7 +3732,7 @@ where
 
             let Some(listen_context) = ready_context else {
                 let result = ToolResult::error(format!(
-                    "Deferred tool exceeded max polling attempts ({MAX_DEFERRED_POLLS})"
+                    "Deferred tool exceeded max polling attempts ({max_deferred_polls})"
                 ))
                 .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
                 send_event(
