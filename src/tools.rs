@@ -9,7 +9,6 @@
 //! - [`ToolRegistry`] - Collection of available tools
 //! - [`ToolContext`] - Context passed to tool execution
 //! - [`ListenExecuteTool`] - Tools that listen for updates, then execute later
-//! - [`DeferredTool`] - Tools where side effects happen after an async pre-runtime phase
 //!
 //! # Implementing a Tool
 //!
@@ -263,53 +262,6 @@ pub enum ListenStopReason {
     StreamDisconnected,
     /// Listen stream ended unexpectedly before terminal state.
     StreamEnded,
-}
-
-/// Status update from a deferred tool lifecycle.
-///
-/// Deferred tools are useful for workflows where irreversible execution should
-/// only happen after an asynchronous pre-runtime phase (for example, waiting
-/// for a challenge to complete or waiting for a lease-like resource to become
-/// ready).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DeferredToolState {
-    /// Pre-runtime is still pending. Runtime should poll again after delay.
-    Pending {
-        /// Opaque session identifier for follow-up polling/commit
-        session_id: String,
-        /// Monotonic revision number for optimistic concurrency
-        revision: u64,
-        /// Human-readable status message
-        message: String,
-        /// Optional snapshot of current state
-        snapshot: Option<serde_json::Value>,
-        /// Suggested delay before next poll
-        poll_after_ms: u64,
-    },
-
-    /// Pre-runtime is complete; tool can be confirmed and committed.
-    Ready {
-        /// Opaque session identifier for commit
-        session_id: String,
-        /// Monotonic revision number for optimistic concurrency
-        revision: u64,
-        /// Human-readable status message
-        message: String,
-        /// Snapshot shown to the user for confirmation
-        snapshot: serde_json::Value,
-        /// Optional expiration timestamp (RFC3339)
-        expires_at: Option<String>,
-    },
-
-    /// Session is no longer valid.
-    Invalidated {
-        /// Opaque session identifier
-        session_id: String,
-        /// Human-readable reason
-        message: String,
-        /// Whether the caller may recover by starting a new session
-        recoverable: bool,
-    },
 }
 
 impl<S: ProgressStage> From<ToolStatus<S>> for ErasedToolStatus {
@@ -602,84 +554,6 @@ pub trait ListenExecuteTool<Ctx>: Send + Sync {
         _ctx: &ToolContext<Ctx>,
         _operation_id: &str,
         _reason: ListenStopReason,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
-}
-
-// ============================================================================
-// DeferredTool Trait
-// ============================================================================
-
-/// A tool whose irreversible execution happens after an async pre-runtime phase.
-///
-/// `DeferredTool`s have three phases:
-/// 1. `open()` - start a deferred session
-/// 2. `poll()` - advance/refresh session until `Ready`
-/// 3. `commit()` - perform final side-effectful execution after confirmation
-///
-/// This models workflows where state changes over time before execution is
-/// allowed or safe.
-pub trait DeferredTool<Ctx>: Send + Sync {
-    /// The type of name for this tool.
-    type Name: ToolName;
-
-    /// Returns the tool's strongly-typed name.
-    fn name(&self) -> Self::Name;
-
-    /// Human-readable display name for UI.
-    fn display_name(&self) -> &'static str;
-
-    /// Human-readable description of what the tool does.
-    fn description(&self) -> &'static str;
-
-    /// JSON schema for the tool's input parameters.
-    fn input_schema(&self) -> Value;
-
-    /// Permission tier for this tool.
-    fn tier(&self) -> ToolTier {
-        ToolTier::Confirm
-    }
-
-    /// Start a deferred session.
-    ///
-    /// # Errors
-    /// Returns an error if session creation fails.
-    fn open(
-        &self,
-        ctx: &ToolContext<Ctx>,
-        input: Value,
-    ) -> impl Future<Output = Result<DeferredToolState>> + Send;
-
-    /// Poll/refresh an existing deferred session.
-    ///
-    /// # Errors
-    /// Returns an error if session refresh fails.
-    fn poll(
-        &self,
-        ctx: &ToolContext<Ctx>,
-        session_id: &str,
-    ) -> impl Future<Output = Result<DeferredToolState>> + Send;
-
-    /// Commit the deferred session with optimistic concurrency control.
-    ///
-    /// # Errors
-    /// Returns an error if commit fails or revision is stale.
-    fn commit(
-        &self,
-        ctx: &ToolContext<Ctx>,
-        session_id: &str,
-        expected_revision: u64,
-    ) -> impl Future<Output = Result<ToolResult>> + Send;
-
-    /// Cancel a deferred session (best effort).
-    ///
-    /// # Errors
-    /// Returns an error if cancellation fails.
-    fn cancel(
-        &self,
-        _ctx: &ToolContext<Ctx>,
-        _session_id: &str,
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
@@ -986,114 +860,6 @@ where
     }
 }
 
-// ============================================================================
-// Type-Erased DeferredTool (for Registry)
-// ============================================================================
-
-/// Type-erased deferred tool trait for registry storage.
-#[async_trait]
-pub trait ErasedDeferredTool<Ctx>: Send + Sync {
-    /// Get the tool name as a string.
-    fn name_str(&self) -> &str;
-    /// Get a human-friendly display name for the tool.
-    fn display_name(&self) -> &'static str;
-    /// Get the tool description.
-    fn description(&self) -> &'static str;
-    /// Get the JSON schema for tool inputs.
-    fn input_schema(&self) -> Value;
-    /// Get the tool's permission tier.
-    fn tier(&self) -> ToolTier;
-    /// Start a deferred session.
-    async fn open(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<DeferredToolState>;
-    /// Poll/refresh session state.
-    async fn poll(&self, ctx: &ToolContext<Ctx>, session_id: &str) -> Result<DeferredToolState>;
-    /// Commit the deferred session.
-    async fn commit(
-        &self,
-        ctx: &ToolContext<Ctx>,
-        session_id: &str,
-        expected_revision: u64,
-    ) -> Result<ToolResult>;
-    /// Cancel the deferred session.
-    async fn cancel(&self, ctx: &ToolContext<Ctx>, session_id: &str) -> Result<()>;
-}
-
-/// Wrapper that erases the Name associated type from a [`DeferredTool`].
-struct DeferredToolWrapper<T, Ctx>
-where
-    T: DeferredTool<Ctx>,
-{
-    inner: T,
-    name_cache: String,
-    _marker: PhantomData<Ctx>,
-}
-
-impl<T, Ctx> DeferredToolWrapper<T, Ctx>
-where
-    T: DeferredTool<Ctx>,
-{
-    fn new(tool: T) -> Self {
-        let name_cache = tool_name_to_string(&tool.name());
-        Self {
-            inner: tool,
-            name_cache,
-            _marker: PhantomData,
-        }
-    }
-}
-
-#[async_trait]
-impl<T, Ctx> ErasedDeferredTool<Ctx> for DeferredToolWrapper<T, Ctx>
-where
-    T: DeferredTool<Ctx> + 'static,
-    Ctx: Send + Sync + 'static,
-{
-    fn name_str(&self) -> &str {
-        &self.name_cache
-    }
-
-    fn display_name(&self) -> &'static str {
-        self.inner.display_name()
-    }
-
-    fn description(&self) -> &'static str {
-        self.inner.description()
-    }
-
-    fn input_schema(&self) -> Value {
-        self.inner.input_schema()
-    }
-
-    fn tier(&self) -> ToolTier {
-        self.inner.tier()
-    }
-
-    async fn open(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<DeferredToolState> {
-        self.inner.open(ctx, input).await
-    }
-
-    async fn poll(&self, ctx: &ToolContext<Ctx>, session_id: &str) -> Result<DeferredToolState> {
-        self.inner.poll(ctx, session_id).await
-    }
-
-    async fn commit(
-        &self,
-        ctx: &ToolContext<Ctx>,
-        session_id: &str,
-        expected_revision: u64,
-    ) -> Result<ToolResult> {
-        self.inner.commit(ctx, session_id, expected_revision).await
-    }
-
-    async fn cancel(&self, ctx: &ToolContext<Ctx>, session_id: &str) -> Result<()> {
-        self.inner.cancel(ctx, session_id).await
-    }
-}
-
-// ============================================================================
-// Tool Registry
-// ============================================================================
-
 /// Registry of available tools.
 ///
 /// Tools are stored with their names erased to allow different `Name` types
@@ -1105,7 +871,6 @@ pub struct ToolRegistry<Ctx> {
     tools: HashMap<String, Arc<dyn ErasedTool<Ctx>>>,
     async_tools: HashMap<String, Arc<dyn ErasedAsyncTool<Ctx>>>,
     listen_tools: HashMap<String, Arc<dyn ErasedListenTool<Ctx>>>,
-    deferred_tools: HashMap<String, Arc<dyn ErasedDeferredTool<Ctx>>>,
 }
 
 impl<Ctx> Clone for ToolRegistry<Ctx> {
@@ -1114,7 +879,6 @@ impl<Ctx> Clone for ToolRegistry<Ctx> {
             tools: self.tools.clone(),
             async_tools: self.async_tools.clone(),
             listen_tools: self.listen_tools.clone(),
-            deferred_tools: self.deferred_tools.clone(),
         }
     }
 }
@@ -1132,7 +896,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             tools: HashMap::new(),
             async_tools: HashMap::new(),
             listen_tools: HashMap::new(),
-            deferred_tools: HashMap::new(),
         }
     }
 
@@ -1178,20 +941,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self
     }
 
-    /// Register a deferred tool in the registry.
-    ///
-    /// Deferred tools are for workflows where side effects happen after an
-    /// asynchronous pre-runtime phase.
-    pub fn register_deferred<T>(&mut self, tool: T) -> &mut Self
-    where
-        T: DeferredTool<Ctx> + 'static,
-    {
-        let wrapper = DeferredToolWrapper::new(tool);
-        let name = wrapper.name_str().to_string();
-        self.deferred_tools.insert(name, Arc::new(wrapper));
-        self
-    }
-
     /// Get a synchronous tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ErasedTool<Ctx>>> {
@@ -1210,12 +959,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.listen_tools.get(name)
     }
 
-    /// Get a deferred tool by name.
-    #[must_use]
-    pub fn get_deferred(&self, name: &str) -> Option<&Arc<dyn ErasedDeferredTool<Ctx>>> {
-        self.deferred_tools.get(name)
-    }
-
     /// Check if a tool name refers to an async tool.
     #[must_use]
     pub fn is_async(&self, name: &str) -> bool {
@@ -1226,12 +969,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     #[must_use]
     pub fn is_listen(&self, name: &str) -> bool {
         self.listen_tools.contains_key(name)
-    }
-
-    /// Check if a tool name refers to a deferred tool.
-    #[must_use]
-    pub fn is_deferred(&self, name: &str) -> bool {
-        self.deferred_tools.contains_key(name)
     }
 
     /// Get all registered synchronous tools.
@@ -1249,27 +986,16 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.listen_tools.values()
     }
 
-    /// Get all registered deferred tools.
-    pub fn all_deferred(&self) -> impl Iterator<Item = &Arc<dyn ErasedDeferredTool<Ctx>>> {
-        self.deferred_tools.values()
-    }
-
     /// Get the number of registered tools (sync + async).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tools.len()
-            + self.async_tools.len()
-            + self.listen_tools.len()
-            + self.deferred_tools.len()
+        self.tools.len() + self.async_tools.len() + self.listen_tools.len()
     }
 
     /// Check if the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-            && self.async_tools.is_empty()
-            && self.listen_tools.is_empty()
-            && self.deferred_tools.is_empty()
+        self.tools.is_empty() && self.async_tools.is_empty() && self.listen_tools.is_empty()
     }
 
     /// Filter tools by a predicate.
@@ -1290,7 +1016,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.tools.retain(|name, _| predicate(name));
         self.async_tools.retain(|name, _| predicate(name));
         self.listen_tools.retain(|name, _| predicate(name));
-        self.deferred_tools.retain(|name, _| predicate(name));
     }
 
     /// Convert all tools (sync + async) to LLM tool definitions.
@@ -1313,12 +1038,6 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         }));
 
         tools.extend(self.listen_tools.values().map(|tool| llm::Tool {
-            name: tool.name_str().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
-        }));
-
-        tools.extend(self.deferred_tools.values().map(|tool| llm::Tool {
             name: tool.name_str().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
@@ -1484,71 +1203,6 @@ mod tests {
 
         let tool = registry.get("mock_tool").unwrap();
         assert_eq!(tool.display_name(), "Mock Tool");
-    }
-
-    struct DeferredMockTool;
-
-    impl DeferredTool<()> for DeferredMockTool {
-        type Name = TestToolName;
-
-        fn name(&self) -> TestToolName {
-            TestToolName::AnotherTool
-        }
-
-        fn display_name(&self) -> &'static str {
-            "Deferred Mock Tool"
-        }
-
-        fn description(&self) -> &'static str {
-            "A deferred mock tool for testing"
-        }
-
-        fn input_schema(&self) -> Value {
-            serde_json::json!({ "type": "object" })
-        }
-
-        async fn open(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<DeferredToolState> {
-            Ok(DeferredToolState::Ready {
-                session_id: "session_1".to_string(),
-                revision: 1,
-                message: "ready".to_string(),
-                snapshot: serde_json::json!({"ok": true}),
-                expires_at: None,
-            })
-        }
-
-        async fn poll(
-            &self,
-            _ctx: &ToolContext<()>,
-            _session_id: &str,
-        ) -> Result<DeferredToolState> {
-            Ok(DeferredToolState::Ready {
-                session_id: "session_1".to_string(),
-                revision: 1,
-                message: "ready".to_string(),
-                snapshot: serde_json::json!({"ok": true}),
-                expires_at: None,
-            })
-        }
-
-        async fn commit(
-            &self,
-            _ctx: &ToolContext<()>,
-            _session_id: &str,
-            _expected_revision: u64,
-        ) -> Result<ToolResult> {
-            Ok(ToolResult::success("Committed"))
-        }
-    }
-
-    #[test]
-    fn test_deferred_tool_registry() {
-        let mut registry = ToolRegistry::new();
-        registry.register_deferred(DeferredMockTool);
-
-        assert_eq!(registry.len(), 1);
-        assert!(registry.get_deferred("another_tool").is_some());
-        assert!(registry.is_deferred("another_tool"));
     }
 
     struct ListenMockTool;

@@ -344,16 +344,15 @@ pub use stores::{
     InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
 };
 pub use tools::{
-    AsyncTool, DeferredTool, DeferredToolState, DynamicToolName, ErasedAsyncTool,
-    ErasedDeferredTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenExecuteTool,
-    ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool, ToolContext,
-    ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str, tool_name_to_string,
+    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
+    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
+    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
+    tool_name_to_string,
 };
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    DeferredExecutionContext, ExecutionStatus, ListenExecutionContext, PendingToolCallInfo,
-    RetryConfig, ThreadId, TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolTier,
-    TurnOutcome,
+    ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
+    TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolTier, TurnOutcome,
 };
 
 // Re-export user interaction types for convenience

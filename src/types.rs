@@ -303,13 +303,7 @@ pub struct PendingToolCallInfo {
     /// Tool input parameters
     pub input: serde_json::Value,
     /// Optional context for tools that prepare asynchronously and execute later.
-    ///
-    /// `deferred_context` is accepted as a legacy alias for backward compatibility.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "deferred_context"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_context: Option<ListenExecutionContext>,
 }
 
@@ -329,9 +323,6 @@ pub struct ListenExecutionContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
-
-/// Backward-compatible alias for pre-listen naming.
-pub type DeferredExecutionContext = ListenExecutionContext;
 
 /// Continuation state that allows resuming the agent loop.
 ///
