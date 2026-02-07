@@ -180,6 +180,143 @@ async fn cancel_listen_with_warning<Ctx>(
     }
 }
 
+async fn cancel_last_listen_operation<Ctx>(
+    tool: &Arc<dyn ErasedListenTool<Ctx>>,
+    tool_context: &ToolContext<Ctx>,
+    pending: &PendingToolCallInfo,
+    last_operation_id: Option<&str>,
+    reason: ListenStopReason,
+) where
+    Ctx: Send + Sync + Clone + 'static,
+{
+    if let Some(operation_id) = last_operation_id {
+        cancel_listen_with_warning(
+            tool,
+            tool_context,
+            operation_id,
+            reason,
+            &pending.id,
+            &pending.name,
+        )
+        .await;
+    }
+}
+
+enum ListenUpdateHandling {
+    Continue,
+    Ready(ListenReady),
+}
+
+async fn handle_listen_update<H>(
+    pending: &PendingToolCallInfo,
+    hooks: &Arc<H>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
+    update: ListenToolUpdate,
+    last_operation_id: &mut Option<String>,
+) -> Result<ListenUpdateHandling, ToolResult>
+where
+    H: AgentHooks,
+{
+    match update {
+        ListenToolUpdate::Listening {
+            operation_id,
+            revision,
+            message,
+            snapshot,
+            expires_at,
+        } => {
+            *last_operation_id = Some(operation_id.clone());
+            let data = Some(build_listen_progress_data(
+                &operation_id,
+                revision,
+                snapshot.as_ref(),
+                expires_at,
+            ));
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::tool_progress(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    "listen_update",
+                    message,
+                    data,
+                ),
+            )
+            .await;
+            Ok(ListenUpdateHandling::Continue)
+        }
+        ListenToolUpdate::Ready {
+            operation_id,
+            revision,
+            message,
+            snapshot,
+            expires_at,
+        } => {
+            let data = Some(build_listen_progress_data(
+                &operation_id,
+                revision,
+                Some(&snapshot),
+                expires_at,
+            ));
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::tool_progress(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    "listen_ready",
+                    message,
+                    data,
+                ),
+            )
+            .await;
+            Ok(ListenUpdateHandling::Ready(ListenReady {
+                operation_id,
+                revision,
+                snapshot,
+                expires_at,
+            }))
+        }
+        ListenToolUpdate::Invalidated {
+            operation_id,
+            message,
+            recoverable,
+        } => {
+            let data = Some(serde_json::json!({
+                "operation_id": operation_id,
+                "recoverable": recoverable,
+            }));
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::tool_progress(
+                    &pending.id,
+                    &pending.name,
+                    &pending.display_name,
+                    "listen_invalidated",
+                    message.clone(),
+                    data,
+                ),
+            )
+            .await;
+
+            let prefix = if recoverable {
+                "Listen operation invalidated (recoverable)"
+            } else {
+                "Listen operation invalidated"
+            };
+            Err(ToolResult::error(format!("{prefix}: {message}")))
+        }
+    }
+}
+
 async fn wait_for_listen_ready<Ctx, H>(
     pending: &PendingToolCallInfo,
     tool: &Arc<dyn ErasedListenTool<Ctx>>,
@@ -199,188 +336,81 @@ where
 
     loop {
         if listen_started_at.elapsed() >= LISTEN_TOTAL_TIMEOUT {
-            if let Some(operation_id) = last_operation_id.as_deref() {
-                cancel_listen_with_warning(
-                    tool,
-                    tool_context,
-                    operation_id,
-                    ListenStopReason::StreamEnded,
-                    &pending.id,
-                    &pending.name,
-                )
-                .await;
-            }
+            cancel_last_listen_operation(
+                tool,
+                tool_context,
+                pending,
+                last_operation_id.as_deref(),
+                ListenStopReason::StreamEnded,
+            )
+            .await;
             return Err(ToolResult::error(format!(
                 "Listen tool exceeded wall-clock timeout ({}s)",
                 LISTEN_TOTAL_TIMEOUT.as_secs()
             )));
         }
 
-        let next_update = match timeout(LISTEN_UPDATE_TIMEOUT, updates.next()).await {
-            Ok(update) => update,
-            Err(_) => {
-                if let Some(operation_id) = last_operation_id.as_deref() {
-                    cancel_listen_with_warning(
-                        tool,
-                        tool_context,
-                        operation_id,
-                        ListenStopReason::StreamEnded,
-                        &pending.id,
-                        &pending.name,
-                    )
-                    .await;
-                }
-                return Err(ToolResult::error(format!(
-                    "Listen stream timed out after {}s waiting for updates",
-                    LISTEN_UPDATE_TIMEOUT.as_secs()
-                )));
-            }
+        let Ok(next_update) = timeout(LISTEN_UPDATE_TIMEOUT, updates.next()).await else {
+            cancel_last_listen_operation(
+                tool,
+                tool_context,
+                pending,
+                last_operation_id.as_deref(),
+                ListenStopReason::StreamEnded,
+            )
+            .await;
+            return Err(ToolResult::error(format!(
+                "Listen stream timed out after {}s waiting for updates",
+                LISTEN_UPDATE_TIMEOUT.as_secs()
+            )));
         };
 
         let Some(update) = next_update else {
-            if let Some(operation_id) = last_operation_id.as_deref() {
-                cancel_listen_with_warning(
-                    tool,
-                    tool_context,
-                    operation_id,
-                    ListenStopReason::StreamEnded,
-                    &pending.id,
-                    &pending.name,
-                )
-                .await;
-            }
+            cancel_last_listen_operation(
+                tool,
+                tool_context,
+                pending,
+                last_operation_id.as_deref(),
+                ListenStopReason::StreamEnded,
+            )
+            .await;
             return Err(ToolResult::error(
                 "Listen stream ended before operation became ready",
             ));
         };
 
         update_count += 1;
-        match update {
-            ListenToolUpdate::Listening {
-                operation_id,
-                revision,
-                message,
-                snapshot,
-                expires_at,
-            } => {
-                last_operation_id = Some(operation_id.clone());
-                let data = Some(build_listen_progress_data(
-                    &operation_id,
-                    revision,
-                    snapshot.as_ref(),
-                    expires_at,
-                ));
-                send_event(
-                    tx,
-                    hooks,
-                    seq,
-                    AgentEvent::tool_progress(
-                        &pending.id,
-                        &pending.name,
-                        &pending.display_name,
-                        "listen_update",
-                        message,
-                        data,
-                    ),
-                )
-                .await;
-            }
-            ListenToolUpdate::Ready {
-                operation_id,
-                revision,
-                message,
-                snapshot,
-                expires_at,
-            } => {
-                let data = Some(build_listen_progress_data(
-                    &operation_id,
-                    revision,
-                    Some(&snapshot),
-                    expires_at,
-                ));
-                send_event(
-                    tx,
-                    hooks,
-                    seq,
-                    AgentEvent::tool_progress(
-                        &pending.id,
-                        &pending.name,
-                        &pending.display_name,
-                        "listen_ready",
-                        message,
-                        data,
-                    ),
-                )
-                .await;
-                return Ok(ListenReady {
-                    operation_id,
-                    revision,
-                    snapshot,
-                    expires_at,
-                });
-            }
-            ListenToolUpdate::Invalidated {
-                operation_id,
-                message,
-                recoverable,
-            } => {
-                let data = Some(serde_json::json!({
-                    "operation_id": operation_id,
-                    "recoverable": recoverable,
-                }));
-                send_event(
-                    tx,
-                    hooks,
-                    seq,
-                    AgentEvent::tool_progress(
-                        &pending.id,
-                        &pending.name,
-                        &pending.display_name,
-                        "listen_invalidated",
-                        message.clone(),
-                        data,
-                    ),
-                )
-                .await;
-
-                let prefix = if recoverable {
-                    "Listen operation invalidated (recoverable)"
-                } else {
-                    "Listen operation invalidated"
-                };
-                return Err(ToolResult::error(format!("{prefix}: {message}")));
-            }
+        match handle_listen_update::<H>(pending, hooks, tx, seq, update, &mut last_operation_id)
+            .await
+        {
+            Ok(ListenUpdateHandling::Continue) => {}
+            Ok(ListenUpdateHandling::Ready(ready)) => return Ok(ready),
+            Err(error) => return Err(error),
         }
 
         if tx.is_closed() {
-            if let Some(operation_id) = last_operation_id.as_deref() {
-                cancel_listen_with_warning(
-                    tool,
-                    tool_context,
-                    operation_id,
-                    ListenStopReason::StreamDisconnected,
-                    &pending.id,
-                    &pending.name,
-                )
-                .await;
-            }
+            cancel_last_listen_operation(
+                tool,
+                tool_context,
+                pending,
+                last_operation_id.as_deref(),
+                ListenStopReason::StreamDisconnected,
+            )
+            .await;
             return Err(ToolResult::error(
                 "Listen stream disconnected before operation became ready",
             ));
         }
 
         if update_count >= MAX_LISTEN_UPDATES {
-            if let Some(operation_id) = last_operation_id.as_deref() {
-                cancel_listen_with_warning(
-                    tool,
-                    tool_context,
-                    operation_id,
-                    ListenStopReason::StreamEnded,
-                    &pending.id,
-                    &pending.name,
-                )
-                .await;
-            }
+            cancel_last_listen_operation(
+                tool,
+                tool_context,
+                pending,
+                last_operation_id.as_deref(),
+                ListenStopReason::StreamEnded,
+            )
+            .await;
             return Err(ToolResult::error(format!(
                 "Listen tool exceeded max updates ({MAX_LISTEN_UPDATES})"
             )));
@@ -1238,26 +1268,7 @@ where
     .await
     {
         Ok(ready) => ready,
-        Err(mut result) => {
-            result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-            ctx.hooks.post_tool_use(&pending.name, &result).await;
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            return ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            };
-        }
+        Err(result) => return finish_listen_ready_failure(pending, ctx, tool_start, result).await,
     };
 
     match ctx
@@ -1266,97 +1277,165 @@ where
         .await
     {
         ToolDecision::Allow => {
-            let result =
-                execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-                    match listen_tool
-                        .execute(ctx.tool_context, &ready.operation_id, ready.revision)
-                        .await
-                    {
-                        Ok(mut value) => {
-                            value.duration_ms =
-                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                            value
-                        }
-                        Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                    }
-                })
-                .await;
-
-            ctx.hooks.post_tool_use(&pending.name, &result).await;
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
+            handle_listen_tool_allow(pending, listen_tool, ctx, &ready, tool_start).await
         }
         ToolDecision::Block(reason) => {
-            cancel_listen_with_warning(
-                listen_tool,
-                ctx.tool_context,
-                &ready.operation_id,
-                ListenStopReason::Blocked,
-                &pending.id,
-                &pending.name,
-            )
-            .await;
-            let result = ToolResult::error(format!("Blocked: {reason}"));
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
+            handle_listen_tool_block(pending, listen_tool, ctx, &ready, reason).await
         }
         ToolDecision::RequiresConfirmation(description) => {
-            let input = build_listen_confirmation_input(&pending.input, &ready);
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::ToolRequiresConfirmation {
-                    id: pending.id.clone(),
-                    name: pending.name.clone(),
-                    input: input.clone(),
-                    description: description.clone(),
-                },
-            )
-            .await;
-            ToolExecutionOutcome::RequiresConfirmation {
-                tool_id: pending.id.clone(),
-                tool_name: pending.name.clone(),
-                display_name: pending.display_name.clone(),
-                input,
-                description,
-                listen_context: Some(ListenExecutionContext {
-                    operation_id: ready.operation_id,
-                    revision: ready.revision,
-                    snapshot: ready.snapshot,
-                    expires_at: ready.expires_at,
-                }),
-            }
+            handle_listen_tool_confirmation(pending, ctx, ready, description).await
         }
+    }
+}
+
+async fn finish_listen_ready_failure<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    tool_start: Instant,
+    mut result: ToolResult,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+    ctx.hooks.post_tool_use(&pending.name, &result).await;
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            result.clone(),
+        ),
+    )
+    .await;
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+async fn handle_listen_tool_allow<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    listen_tool: &Arc<dyn ErasedListenTool<Ctx>>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    ready: &ListenReady,
+    tool_start: Instant,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let result = execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+        match listen_tool
+            .execute(ctx.tool_context, &ready.operation_id, ready.revision)
+            .await
+        {
+            Ok(mut value) => {
+                value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                value
+            }
+            Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+        }
+    })
+    .await;
+    ctx.hooks.post_tool_use(&pending.name, &result).await;
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            result.clone(),
+        ),
+    )
+    .await;
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+async fn handle_listen_tool_block<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    listen_tool: &Arc<dyn ErasedListenTool<Ctx>>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    ready: &ListenReady,
+    reason: String,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    cancel_listen_with_warning(
+        listen_tool,
+        ctx.tool_context,
+        &ready.operation_id,
+        ListenStopReason::Blocked,
+        &pending.id,
+        &pending.name,
+    )
+    .await;
+    let result = ToolResult::error(format!("Blocked: {reason}"));
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            result.clone(),
+        ),
+    )
+    .await;
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+async fn handle_listen_tool_confirmation<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    ready: ListenReady,
+    description: String,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let input = build_listen_confirmation_input(&pending.input, &ready);
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::ToolRequiresConfirmation {
+            id: pending.id.clone(),
+            name: pending.name.clone(),
+            input: input.clone(),
+            description: description.clone(),
+        },
+    )
+    .await;
+    ToolExecutionOutcome::RequiresConfirmation {
+        tool_id: pending.id.clone(),
+        tool_name: pending.name.clone(),
+        display_name: pending.display_name.clone(),
+        input,
+        description,
+        listen_context: Some(ListenExecutionContext {
+            operation_id: ready.operation_id,
+            revision: ready.revision,
+            snapshot: ready.snapshot,
+            expires_at: ready.expires_at,
+        }),
     }
 }
 
@@ -1669,57 +1748,66 @@ where
     H: AgentHooks,
 {
     if let Some(reason) = rejection_reason {
-        if let Some(listen_tool) = ctx.tools.get_listen(&awaiting_tool.name)
-            && let Some(listen) = awaiting_tool.listen_context.as_ref()
-        {
-            cancel_listen_with_warning(
-                listen_tool,
-                ctx.tool_context,
-                &listen.operation_id,
-                ListenStopReason::UserRejected,
-                &awaiting_tool.id,
-                &awaiting_tool.name,
-            )
-            .await;
-        }
-
-        let result = ToolResult::error(format!("Rejected: {reason}"));
-        send_event(
-            ctx.tx,
-            ctx.hooks,
-            ctx.seq,
-            AgentEvent::tool_call_end(
-                &awaiting_tool.id,
-                &awaiting_tool.name,
-                &awaiting_tool.display_name,
-                result.clone(),
-            ),
-        )
-        .await;
-        return result;
+        return handle_confirmed_tool_rejection(awaiting_tool, ctx, reason).await;
     }
 
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await
     {
-        ctx.hooks
-            .post_tool_use(&awaiting_tool.name, &cached_result)
-            .await;
-        send_event(
-            ctx.tx,
-            ctx.hooks,
-            ctx.seq,
-            AgentEvent::tool_call_end(
-                &awaiting_tool.id,
-                &awaiting_tool.name,
-                &awaiting_tool.display_name,
-                cached_result.clone(),
-            ),
-        )
-        .await;
-        return cached_result;
+        return finish_confirmed_tool(awaiting_tool, ctx, cached_result).await;
     }
 
-    let result = if let Some(listen_tool) = ctx.tools.get_listen(&awaiting_tool.name) {
+    let result = execute_confirmed_tool_inner(awaiting_tool, ctx).await;
+    finish_confirmed_tool(awaiting_tool, ctx, result).await
+}
+
+async fn handle_confirmed_tool_rejection<Ctx, H>(
+    awaiting_tool: &PendingToolCallInfo,
+    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    reason: String,
+) -> ToolResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    if let Some(listen_tool) = ctx.tools.get_listen(&awaiting_tool.name)
+        && let Some(listen) = awaiting_tool.listen_context.as_ref()
+    {
+        cancel_listen_with_warning(
+            listen_tool,
+            ctx.tool_context,
+            &listen.operation_id,
+            ListenStopReason::UserRejected,
+            &awaiting_tool.id,
+            &awaiting_tool.name,
+        )
+        .await;
+    }
+
+    let result = ToolResult::error(format!("Rejected: {reason}"));
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &awaiting_tool.id,
+            &awaiting_tool.name,
+            &awaiting_tool.display_name,
+            result.clone(),
+        ),
+    )
+    .await;
+    result
+}
+
+async fn execute_confirmed_tool_inner<Ctx, H>(
+    awaiting_tool: &PendingToolCallInfo,
+    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+) -> ToolResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    if let Some(listen_tool) = ctx.tools.get_listen(&awaiting_tool.name) {
         let Some(listen) = awaiting_tool.listen_context.as_ref() else {
             return ToolResult::error(format!(
                 "Listen context missing for tool: {}",
@@ -1727,45 +1815,75 @@ where
             ));
         };
         let tool_start = Instant::now();
-        execute_with_idempotency(ctx.execution_store, awaiting_tool, ctx.thread_id, async {
-            match listen_tool
-                .execute(ctx.tool_context, &listen.operation_id, listen.revision)
-                .await
-            {
-                Ok(mut value) => {
-                    value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                    value
+        return execute_with_idempotency(
+            ctx.execution_store,
+            awaiting_tool,
+            ctx.thread_id,
+            async {
+                match listen_tool
+                    .execute(ctx.tool_context, &listen.operation_id, listen.revision)
+                    .await
+                {
+                    Ok(mut value) => {
+                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        value
+                    }
+                    Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                 }
-                Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-            }
-        })
-        .await
-    } else if let Some(async_tool) = ctx.tools.get_async(&awaiting_tool.name) {
-        execute_with_idempotency(ctx.execution_store, awaiting_tool, ctx.thread_id, async {
-            execute_async_tool(awaiting_tool, async_tool, ctx.tool_context, ctx.tx, ctx.seq).await
-        })
-        .await
-    } else if let Some(tool) = ctx.tools.get(&awaiting_tool.name) {
-        let tool_start = Instant::now();
-        execute_with_idempotency(ctx.execution_store, awaiting_tool, ctx.thread_id, async {
-            match tool
-                .execute(ctx.tool_context, awaiting_tool.input.clone())
-                .await
-            {
-                Ok(mut value) => {
-                    value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                    value
-                }
-                Err(error) => ToolResult::error(format!("Tool error: {error}"))
-                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-            }
-        })
-        .await
-    } else {
-        ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
-    };
+            },
+        )
+        .await;
+    }
 
+    if let Some(async_tool) = ctx.tools.get_async(&awaiting_tool.name) {
+        return execute_with_idempotency(
+            ctx.execution_store,
+            awaiting_tool,
+            ctx.thread_id,
+            async {
+                execute_async_tool(awaiting_tool, async_tool, ctx.tool_context, ctx.tx, ctx.seq)
+                    .await
+            },
+        )
+        .await;
+    }
+
+    if let Some(tool) = ctx.tools.get(&awaiting_tool.name) {
+        let tool_start = Instant::now();
+        return execute_with_idempotency(
+            ctx.execution_store,
+            awaiting_tool,
+            ctx.thread_id,
+            async {
+                match tool
+                    .execute(ctx.tool_context, awaiting_tool.input.clone())
+                    .await
+                {
+                    Ok(mut value) => {
+                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        value
+                    }
+                    Err(error) => ToolResult::error(format!("Tool error: {error}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                }
+            },
+        )
+        .await;
+    }
+
+    ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
+}
+
+async fn finish_confirmed_tool<Ctx, H>(
+    awaiting_tool: &PendingToolCallInfo,
+    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    result: ToolResult,
+) -> ToolResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
     ctx.hooks.post_tool_use(&awaiting_tool.name, &result).await;
     send_event(
         ctx.tx,
@@ -2223,6 +2341,263 @@ where
     })
 }
 
+struct RunLoopResumeParams<'a, Ctx, H, M> {
+    resume_data: ResumeData,
+    turn: usize,
+    total_usage: &'a TokenUsage,
+    state: &'a AgentState,
+    thread_id: &'a ThreadId,
+    tool_context: &'a ToolContext<Ctx>,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    message_store: &'a Arc<M>,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+}
+
+async fn handle_run_loop_resume<Ctx, H, M>(
+    RunLoopResumeParams {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        execution_store,
+    }: RunLoopResumeParams<'_, Ctx, H, M>,
+) -> Result<Option<AgentRunState>, AgentError>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    match process_resume(ResumeProcessingParameters {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        execution_store,
+    })
+    .await?
+    {
+        ResumeProcessingResult::Completed { .. } => Ok(None),
+        ResumeProcessingResult::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        } => Ok(Some(AgentRunState::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        })),
+    }
+}
+
+struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
+    ctx: &'a mut TurnContext,
+    tool_context: &'a ToolContext<Ctx>,
+    provider: &'a Arc<P>,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    message_store: &'a Arc<M>,
+    state_store: &'a Arc<S>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    config: &'a AgentConfig,
+    compaction_config: Option<&'a CompactionConfig>,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+}
+
+async fn run_loop_turns<Ctx, P, H, M, S>(
+    RunLoopTurnsParams {
+        ctx,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        tx,
+        seq,
+        config,
+        compaction_config,
+        execution_store,
+    }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
+) -> Option<AgentRunState>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    loop {
+        let result = execute_turn(ExecuteTurnParameters {
+            tx,
+            seq,
+            ctx,
+            tool_context,
+            provider,
+            tools,
+            hooks,
+            message_store,
+            config,
+            compaction_config,
+            execution_store,
+        })
+        .await;
+
+        match result {
+            InternalTurnResult::Continue { .. } => {
+                if let Err(error) = state_store.save(&ctx.state).await {
+                    warn!("Failed to save state checkpoint: {error}");
+                }
+            }
+            InternalTurnResult::Done => return None,
+            InternalTurnResult::Refusal => {
+                return Some(AgentRunState::Refusal {
+                    total_turns: turns_to_u32(ctx.turn),
+                    input_tokens: u64::from(ctx.total_usage.input_tokens),
+                    output_tokens: u64::from(ctx.total_usage.output_tokens),
+                });
+            }
+            InternalTurnResult::AwaitingConfirmation {
+                tool_call_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+                continuation,
+            } => {
+                return Some(AgentRunState::AwaitingConfirmation {
+                    tool_call_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                    continuation,
+                });
+            }
+            InternalTurnResult::Error(error) => return Some(AgentRunState::Error(error)),
+        }
+    }
+}
+
+struct SingleTurnResumeParams<Ctx, H, M, S> {
+    resume_data: ResumeData,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    thread_id: ThreadId,
+    tool_context: ToolContext<Ctx>,
+    tools: Arc<ToolRegistry<Ctx>>,
+    hooks: Arc<H>,
+    tx: mpsc::Sender<AgentEventEnvelope>,
+    seq: SequenceCounter,
+    message_store: Arc<M>,
+    state_store: Arc<S>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
+}
+
+async fn handle_single_turn_resume<Ctx, H, M, S>(
+    SingleTurnResumeParams {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        state_store,
+        execution_store,
+    }: SingleTurnResumeParams<Ctx, H, M, S>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    let resume_result = process_resume(ResumeProcessingParameters {
+        resume_data,
+        turn,
+        total_usage: &total_usage,
+        state: &state,
+        thread_id: &thread_id,
+        tool_context: &tool_context,
+        tools: &tools,
+        hooks: &hooks,
+        tx: &tx,
+        seq: &seq,
+        message_store: &message_store,
+        execution_store: execution_store.as_ref(),
+    })
+    .await;
+
+    match resume_result {
+        Ok(ResumeProcessingResult::Completed { turn_usage }) => {
+            let mut updated_state = state;
+            updated_state.turn_count = turn;
+            if let Err(error) = state_store.save(&updated_state).await {
+                warn!("Failed to save state checkpoint: {error}");
+            }
+            TurnOutcome::NeedsMoreTurns {
+                turn,
+                turn_usage,
+                total_usage,
+            }
+        }
+        Ok(ResumeProcessingResult::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        }) => TurnOutcome::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        },
+        Err(error) => {
+            send_event(
+                &tx,
+                &hooks,
+                &seq,
+                AgentEvent::error(&error.message, error.recoverable),
+            )
+            .await;
+            TurnOutcome::Error(error)
+        }
+    }
+}
+
 async fn run_loop<Ctx, P, H, M, S>(
     RunLoopParameters {
         tx,
@@ -2247,15 +2622,12 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    // Add event channel to tool context so tools can emit events
     let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
     let start_time = Instant::now();
-
-    // Initialize state from input
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
-            Ok(s) => s,
-            Err(e) => return AgentRunState::Error(e),
+            Ok(state) => state,
+            Err(error) => return AgentRunState::Error(error),
         };
 
     let InitializedState {
@@ -2266,7 +2638,7 @@ where
     } = init_state;
 
     if let Some(resume_data) = resume_data {
-        let resume_result = process_resume(ResumeProcessingParameters {
+        let resume_result = handle_run_loop_resume(RunLoopResumeParams {
             resume_data,
             turn,
             total_usage: &total_usage,
@@ -2283,24 +2655,8 @@ where
         .await;
 
         match resume_result {
-            Ok(ResumeProcessingResult::Completed { .. }) => {}
-            Ok(ResumeProcessingResult::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation,
-            }) => {
-                return AgentRunState::AwaitingConfirmation {
-                    tool_call_id,
-                    tool_name,
-                    display_name,
-                    input,
-                    description,
-                    continuation,
-                };
-            }
+            Ok(Some(outcome)) => return outcome,
+            Ok(None) => {}
             Err(error) => {
                 send_event(
                     &tx,
@@ -2322,59 +2678,23 @@ where
         start_time,
     };
 
-    loop {
-        let result = execute_turn(ExecuteTurnParameters {
-            tx: &tx,
-            seq: &seq,
-            ctx: &mut ctx,
-            tool_context: &tool_context,
-            provider: &provider,
-            tools: &tools,
-            hooks: &hooks,
-            message_store: &message_store,
-            config: &config,
-            compaction_config: compaction_config.as_ref(),
-            execution_store: execution_store.as_ref(),
-        })
-        .await;
-
-        match result {
-            InternalTurnResult::Continue { .. } => {
-                if let Err(e) = state_store.save(&ctx.state).await {
-                    warn!("Failed to save state checkpoint: {e}");
-                }
-            }
-            InternalTurnResult::Done => {
-                break;
-            }
-            InternalTurnResult::Refusal => {
-                return AgentRunState::Refusal {
-                    total_turns: turns_to_u32(ctx.turn),
-                    input_tokens: u64::from(ctx.total_usage.input_tokens),
-                    output_tokens: u64::from(ctx.total_usage.output_tokens),
-                };
-            }
-            InternalTurnResult::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation,
-            } => {
-                return AgentRunState::AwaitingConfirmation {
-                    tool_call_id,
-                    tool_name,
-                    display_name,
-                    input,
-                    description,
-                    continuation,
-                };
-            }
-            InternalTurnResult::Error(e) => {
-                return AgentRunState::Error(e);
-            }
-        }
+    if let Some(outcome) = run_loop_turns(RunLoopTurnsParams {
+        ctx: &mut ctx,
+        tool_context: &tool_context,
+        provider: &provider,
+        tools: &tools,
+        hooks: &hooks,
+        message_store: &message_store,
+        state_store: &state_store,
+        tx: &tx,
+        seq: &seq,
+        config: &config,
+        compaction_config: compaction_config.as_ref(),
+        execution_store: execution_store.as_ref(),
+    })
+    .await
+    {
+        return outcome;
     }
 
     if let Err(e) = state_store.save(&ctx.state).await {
@@ -2444,19 +2764,18 @@ where
 {
     let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
     let start_time = Instant::now();
-
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(state) => state,
+            Err(error) => {
                 send_event(
                     &tx,
                     &hooks,
                     &seq,
-                    AgentEvent::error(&e.message, e.recoverable),
+                    AgentEvent::error(&error.message, error.recoverable),
                 )
                 .await;
-                return TurnOutcome::Error(e);
+                return TurnOutcome::Error(error);
             }
         };
 
@@ -2468,61 +2787,22 @@ where
     } = init_state;
 
     if let Some(resume_data) = resume_data {
-        let resume_result = process_resume(ResumeProcessingParameters {
+        return handle_single_turn_resume(SingleTurnResumeParams {
             resume_data,
             turn,
-            total_usage: &total_usage,
-            state: &state,
-            thread_id: &thread_id,
-            tool_context: &tool_context,
-            tools: &tools,
-            hooks: &hooks,
-            tx: &tx,
-            seq: &seq,
-            message_store: &message_store,
-            execution_store: execution_store.as_ref(),
+            total_usage,
+            state,
+            thread_id,
+            tool_context,
+            tools,
+            hooks,
+            tx,
+            seq,
+            message_store,
+            state_store,
+            execution_store,
         })
         .await;
-
-        return match resume_result {
-            Ok(ResumeProcessingResult::Completed { turn_usage }) => {
-                let mut updated_state = state;
-                updated_state.turn_count = turn;
-                if let Err(error) = state_store.save(&updated_state).await {
-                    warn!("Failed to save state checkpoint: {error}");
-                }
-                TurnOutcome::NeedsMoreTurns {
-                    turn,
-                    turn_usage,
-                    total_usage,
-                }
-            }
-            Ok(ResumeProcessingResult::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation,
-            }) => TurnOutcome::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation,
-            },
-            Err(error) => {
-                send_event(
-                    &tx,
-                    &hooks,
-                    &seq,
-                    AgentEvent::error(&error.message, error.recoverable),
-                )
-                .await;
-                TurnOutcome::Error(error)
-            }
-        };
     }
 
     let mut ctx = TurnContext {
@@ -2712,52 +2992,26 @@ struct ExecuteTurnParameters<'a, Ctx, P, H, M> {
     execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
 
-async fn execute_turn<Ctx, P, H, M>(
-    ExecuteTurnParameters {
-        tx,
-        seq,
-        ctx,
-        tool_context,
-        provider,
-        tools,
-        hooks,
-        message_store,
-        config,
-        compaction_config,
-        execution_store,
-    }: ExecuteTurnParameters<'_, Ctx, P, H, M>,
-) -> InternalTurnResult
+async fn begin_turn<H>(
+    ctx: &mut TurnContext,
+    max_turns: usize,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+) -> Result<(), AgentError>
 where
-    Ctx: Send + Sync + Clone + 'static,
-    P: LlmProvider,
     H: AgentHooks,
-    M: MessageStore,
 {
     ctx.turn += 1;
     ctx.state.turn_count = ctx.turn;
 
-    if ctx.turn > config.max_turns {
-        warn!(
-            "Max turns reached (turn={}, max={})",
-            ctx.turn, config.max_turns
-        );
-        send_event(
-            tx,
-            hooks,
-            seq,
-            AgentEvent::error(
-                format!("Maximum turns ({}) reached", config.max_turns),
-                true,
-            ),
-        )
-        .await;
-        return InternalTurnResult::Error(AgentError::new(
-            format!("Maximum turns ({}) reached", config.max_turns),
-            true,
-        ));
+    if ctx.turn > max_turns {
+        warn!("Max turns reached (turn={}, max={max_turns})", ctx.turn);
+        let message = format!("Maximum turns ({max_turns}) reached");
+        send_event(tx, hooks, seq, AgentEvent::error(message.clone(), true)).await;
+        return Err(AgentError::new(message, true));
     }
 
-    // Emit start event
     send_event(
         tx,
         hooks,
@@ -2765,42 +3019,70 @@ where
         AgentEvent::start(ctx.thread_id.clone(), ctx.turn),
     )
     .await;
+    Ok(())
+}
 
-    // Get message history
-    let mut messages = match message_store.get_history(&ctx.thread_id).await {
+struct TurnMessageLoadParams<'a, P, H, M> {
+    thread_id: &'a ThreadId,
+    turn: usize,
+    provider: &'a Arc<P>,
+    message_store: &'a Arc<M>,
+    compaction_config: Option<&'a CompactionConfig>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn load_turn_messages<P, H, M>(
+    TurnMessageLoadParams {
+        thread_id,
+        turn,
+        provider,
+        message_store,
+        compaction_config,
+        tx,
+        hooks,
+        seq,
+    }: TurnMessageLoadParams<'_, P, H, M>,
+) -> Result<Vec<Message>, AgentError>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let mut messages = match message_store.get_history(thread_id).await {
         Ok(m) => m,
-        Err(e) => {
+        Err(error) => {
             send_event(
                 tx,
                 hooks,
                 seq,
-                AgentEvent::error(format!("Failed to get history: {e}"), false),
+                AgentEvent::error(format!("Failed to get history: {error}"), false),
             )
             .await;
-            return InternalTurnResult::Error(AgentError::new(
-                format!("Failed to get history: {e}"),
+            return Err(AgentError::new(
+                format!("Failed to get history: {error}"),
                 false,
             ));
         }
     };
 
-    // Check if compaction is needed
     if let Some(compact_config) = compaction_config {
         let compactor = LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
         if compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
-                ctx.turn,
+                turn,
                 messages.len()
             );
 
             match compactor.compact_history(messages.clone()).await {
                 Ok(result) => {
-                    if let Err(e) = message_store
-                        .replace_history(&ctx.thread_id, result.messages.clone())
+                    if let Err(error) = message_store
+                        .replace_history(thread_id, result.messages.clone())
                         .await
                     {
-                        warn!("Failed to replace history after compaction: {e}");
+                        warn!("Failed to replace history after compaction: {error}");
                     } else {
                         send_event(
                             tx,
@@ -2822,33 +3104,43 @@ where
                             result.original_tokens,
                             result.new_tokens
                         );
-
                         messages = result.messages;
                     }
                 }
-                Err(e) => {
-                    warn!("Context compaction failed, continuing with full history: {e}");
+                Err(error) => {
+                    warn!("Context compaction failed, continuing with full history: {error}");
                 }
             }
         }
     }
 
-    // Build chat request
+    Ok(messages)
+}
+
+fn build_turn_request<Ctx>(
+    config: &AgentConfig,
+    messages: Vec<Message>,
+    tools: &Arc<ToolRegistry<Ctx>>,
+) -> ChatRequest
+where
+    Ctx: Send + Sync + 'static,
+{
     let llm_tools = if tools.is_empty() {
         None
     } else {
         Some(tools.to_llm_tools())
     };
 
-    let request = ChatRequest {
+    ChatRequest {
         system: config.system_prompt.clone(),
         messages,
         tools: llm_tools,
         max_tokens: config.max_tokens,
         thinking: config.thinking.clone(),
-    };
+    }
+}
 
-    // Log the request messages for debugging context issues
+fn log_chat_request(request: &ChatRequest) {
     debug!(
         "ChatRequest built: system_prompt_len={} num_messages={} num_tools={} max_tokens={}",
         request.system.len(),
@@ -2856,38 +3148,39 @@ where
         request.tools.as_ref().map_or(0, Vec::len),
         request.max_tokens
     );
-    for (i, msg) in request.messages.iter().enumerate() {
-        match &msg.content {
+
+    for (message_idx, message) in request.messages.iter().enumerate() {
+        match &message.content {
             Content::Text(text) => {
                 debug!(
-                    "  message[{}]: role={:?} content=Text(len={})",
-                    i,
-                    msg.role,
+                    "  message[{message_idx}]: role={:?} content=Text(len={})",
+                    message.role,
                     text.len()
                 );
             }
             Content::Blocks(blocks) => {
                 debug!(
-                    "  message[{}]: role={:?} content=Blocks(count={})",
-                    i,
-                    msg.role,
+                    "  message[{message_idx}]: role={:?} content=Blocks(count={})",
+                    message.role,
                     blocks.len()
                 );
-                for (j, block) in blocks.iter().enumerate() {
+                for (block_idx, block) in blocks.iter().enumerate() {
                     match block {
                         ContentBlock::Text { text } => {
-                            debug!("    block[{}]: Text(len={})", j, text.len());
+                            debug!("    block[{block_idx}]: Text(len={})", text.len());
                         }
                         ContentBlock::Thinking { thinking, .. } => {
-                            debug!("    block[{}]: Thinking(len={})", j, thinking.len());
+                            debug!("    block[{block_idx}]: Thinking(len={})", thinking.len());
                         }
                         ContentBlock::RedactedThinking { .. } => {
-                            debug!("    block[{j}]: RedactedThinking");
+                            debug!("    block[{block_idx}]: RedactedThinking");
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            debug!("    block[{j}]: ToolUse(id={id}, name={name}, input={input})");
+                            debug!(
+                                "    block[{block_idx}]: ToolUse(id={id}, name={name}, input={input})"
+                            );
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,
@@ -2895,10 +3188,7 @@ where
                             is_error,
                         } => {
                             debug!(
-                                "    block[{}]: ToolResult(tool_use_id={}, is_error={:?}, content_len={})",
-                                j,
-                                tool_use_id,
-                                is_error,
+                                "    block[{block_idx}]: ToolResult(tool_use_id={tool_use_id}, is_error={is_error:?}, content_len={})",
                                 content.len()
                             );
                         }
@@ -2907,56 +3197,104 @@ where
             }
         }
     }
+}
 
-    // Call LLM with retry logic (streaming or non-streaming based on config)
-    debug!(
-        "Calling LLM (turn={}, streaming={})",
-        ctx.turn, config.streaming
-    );
-    let message_id = uuid::Uuid::new_v4().to_string();
-    let thinking_id = uuid::Uuid::new_v4().to_string();
-    let response = if config.streaming {
-        // Streaming mode: events are emitted as content arrives
-        match call_llm_streaming(
+struct LlmCallParams<'a, P, H> {
+    provider: &'a Arc<P>,
+    request: ChatRequest,
+    config: &'a AgentConfig,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+    turn: usize,
+    message_id: &'a str,
+    thinking_id: &'a str,
+}
+
+async fn request_llm_response<P, H>(
+    LlmCallParams {
+        provider,
+        request,
+        config,
+        tx,
+        hooks,
+        seq,
+        turn,
+        message_id,
+        thinking_id,
+    }: LlmCallParams<'_, P, H>,
+) -> Result<ChatResponse, AgentError>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    debug!("Calling LLM (turn={turn}, streaming={})", config.streaming);
+
+    if config.streaming {
+        call_llm_streaming(
             provider,
             request,
             config,
             tx,
             hooks,
             seq,
-            (&message_id, &thinking_id),
+            (message_id, thinking_id),
         )
         .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return InternalTurnResult::Error(e);
-            }
-        }
     } else {
-        // Non-streaming mode: wait for full response
-        match call_llm_with_retry(provider, request, config, tx, hooks, seq).await {
-            Ok(r) => r,
-            Err(e) => {
-                return InternalTurnResult::Error(e);
-            }
-        }
-    };
+        call_llm_with_retry(provider, request, config, tx, hooks, seq).await
+    }
+}
 
-    // Track usage
+fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -> TokenUsage {
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
     };
     ctx.total_usage.add(&turn_usage);
     ctx.state.total_usage = ctx.total_usage.clone();
+    turn_usage
+}
 
-    // Process response content
+struct ProcessedTurnResponse {
+    stop_reason: Option<StopReason>,
+    text_content: Option<String>,
+    pending_tool_calls: Vec<PendingToolCallInfo>,
+}
+
+struct TurnResponseProcessingParams<'a, Ctx, H, M> {
+    response: ChatResponse,
+    message_id: &'a str,
+    thinking_id: &'a str,
+    thread_id: &'a ThreadId,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    message_store: &'a Arc<M>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn process_turn_response<Ctx, H, M>(
+    TurnResponseProcessingParams {
+        response,
+        message_id,
+        thinking_id,
+        thread_id,
+        tools,
+        message_store,
+        tx,
+        hooks,
+        seq,
+    }: TurnResponseProcessingParams<'_, Ctx, H, M>,
+) -> Result<ProcessedTurnResponse, AgentError>
+where
+    Ctx: Send + Sync + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let stop_reason = response.stop_reason;
     let (thinking_content, text_content, tool_uses) = extract_content(&response);
 
-    // Emit the complete Thinking event.
-    // In non-streaming mode this is the only thinking event.
-    // In streaming mode this comes after all ThinkingDelta events.
     if let Some(thinking) = &thinking_content {
         send_event(
             tx,
@@ -2967,38 +3305,60 @@ where
         .await;
     }
 
-    // Always emit the final complete Text event so consumers know the full response is ready
-    // (in streaming mode this comes after all TextDelta events)
     if let Some(text) = &text_content {
-        send_event(tx, hooks, seq, AgentEvent::text(&message_id, text.clone())).await;
+        send_event(tx, hooks, seq, AgentEvent::text(message_id, text.clone())).await;
     }
 
-    // Store assistant message in conversation history (includes text and tool uses)
     let assistant_msg = build_assistant_message(&response);
-    if let Err(e) = message_store.append(&ctx.thread_id, assistant_msg).await {
+    if let Err(error) = message_store.append(thread_id, assistant_msg).await {
         send_event(
             tx,
             hooks,
             seq,
-            AgentEvent::error(format!("Failed to append assistant message: {e}"), false),
+            AgentEvent::error(
+                format!("Failed to append assistant message: {error}"),
+                false,
+            ),
         )
         .await;
-        return InternalTurnResult::Error(AgentError::new(
-            format!("Failed to append assistant message: {e}"),
+        return Err(AgentError::new(
+            format!("Failed to append assistant message: {error}"),
             false,
         ));
     }
 
-    // Build pending tool calls (check both sync and async tools for display_name)
-    let mut pending_tool_calls: Vec<PendingToolCallInfo> = tool_uses
+    Ok(ProcessedTurnResponse {
+        stop_reason,
+        text_content,
+        pending_tool_calls: build_pending_tool_calls(tools, &tool_uses),
+    })
+}
+
+fn build_pending_tool_calls<Ctx>(
+    tools: &Arc<ToolRegistry<Ctx>>,
+    tool_uses: &[(String, String, serde_json::Value)],
+) -> Vec<PendingToolCallInfo>
+where
+    Ctx: Send + Sync + 'static,
+{
+    tool_uses
         .iter()
         .map(|(id, name, input)| {
             let display_name = tools
                 .get(name)
-                .map(|t| t.display_name().to_string())
-                .or_else(|| tools.get_async(name).map(|t| t.display_name().to_string()))
-                .or_else(|| tools.get_listen(name).map(|t| t.display_name().to_string()))
+                .map(|tool| tool.display_name().to_string())
+                .or_else(|| {
+                    tools
+                        .get_async(name)
+                        .map(|tool| tool.display_name().to_string())
+                })
+                .or_else(|| {
+                    tools
+                        .get_listen(name)
+                        .map(|tool| tool.display_name().to_string())
+                })
                 .unwrap_or_default();
+
             PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
@@ -3007,11 +3367,49 @@ where
                 listen_context: None,
             }
         })
-        .collect();
+        .collect()
+}
 
+struct ToolBatchExecutionParams<'a, Ctx, H> {
+    pending_tool_calls: Vec<PendingToolCallInfo>,
+    tool_context: &'a ToolContext<Ctx>,
+    thread_id: &'a ThreadId,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    turn: usize,
+    total_usage: &'a TokenUsage,
+    turn_usage: &'a TokenUsage,
+    state: &'a AgentState,
+}
+
+async fn execute_pending_tool_calls_for_turn<Ctx, H>(
+    ToolBatchExecutionParams {
+        pending_tool_calls,
+        tool_context,
+        thread_id,
+        tools,
+        hooks,
+        tx,
+        seq,
+        execution_store,
+        turn,
+        total_usage,
+        turn_usage,
+        state,
+    }: ToolBatchExecutionParams<'_, Ctx, H>,
+) -> Result<Vec<(String, ToolResult)>, InternalTurnResult>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let mut pending_tool_calls = pending_tool_calls;
+    let mut tool_results = Vec::new();
     let execution_ctx = ToolCallExecutionContext {
         tool_context,
-        thread_id: &ctx.thread_id,
+        thread_id,
         tools,
         hooks,
         tx,
@@ -3019,7 +3417,6 @@ where
         execution_store,
     };
 
-    let mut tool_results = Vec::new();
     for pending in pending_tool_calls.clone() {
         match execute_tool_call(&pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
@@ -3035,64 +3432,234 @@ where
             } => {
                 let pending_idx = match pending_tool_index(&pending_tool_calls, &tool_id) {
                     Ok(index) => index,
-                    Err(error) => return InternalTurnResult::Error(error),
+                    Err(error) => return Err(InternalTurnResult::Error(error)),
                 };
                 if let Some(context) = listen_context {
                     pending_tool_calls[pending_idx].listen_context = Some(context);
                 }
 
                 let continuation = AgentContinuation {
-                    thread_id: ctx.thread_id.clone(),
-                    turn: ctx.turn,
-                    total_usage: ctx.total_usage.clone(),
+                    thread_id: thread_id.clone(),
+                    turn,
+                    total_usage: total_usage.clone(),
                     turn_usage: turn_usage.clone(),
                     pending_tool_calls: pending_tool_calls.clone(),
                     awaiting_index: pending_idx,
                     completed_results: tool_results,
-                    state: ctx.state.clone(),
+                    state: state.clone(),
                 };
 
-                return InternalTurnResult::AwaitingConfirmation {
+                return Err(InternalTurnResult::AwaitingConfirmation {
                     tool_call_id: tool_id,
                     tool_name,
                     display_name,
                     input,
                     description,
                     continuation: Box::new(continuation),
-                };
+                });
             }
         }
     }
 
-    // Add tool results to message history
-    if let Err(e) = append_tool_results(&tool_results, &ctx.thread_id, message_store).await {
-        send_event(
-            tx,
-            hooks,
-            seq,
-            AgentEvent::error(format!("Failed to append tool results: {e}"), false),
-        )
-        .await;
-        return InternalTurnResult::Error(e);
-    }
+    Ok(tool_results)
+}
 
-    // Emit turn complete
+struct TurnCompletionParams<'a, H, M> {
+    tool_results: &'a [(String, ToolResult)],
+    thread_id: &'a ThreadId,
+    turn: usize,
+    turn_usage: &'a TokenUsage,
+    message_store: &'a Arc<M>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn append_tool_results_and_emit_turn_complete<H, M>(
+    TurnCompletionParams {
+        tool_results,
+        thread_id,
+        turn,
+        turn_usage,
+        message_store,
+        tx,
+        hooks,
+        seq,
+    }: TurnCompletionParams<'_, H, M>,
+) -> Result<(), AgentError>
+where
+    H: AgentHooks,
+    M: MessageStore,
+{
+    append_tool_results(tool_results, thread_id, message_store).await?;
     send_event(
         tx,
         hooks,
         seq,
         AgentEvent::TurnComplete {
-            turn: ctx.turn,
+            turn,
             usage: turn_usage.clone(),
         },
     )
     .await;
+    Ok(())
+}
 
-    // Check stop reason
-    match response.stop_reason {
+struct TurnToolPhaseParams<'a, Ctx, H, M> {
+    pending_tool_calls: Vec<PendingToolCallInfo>,
+    tool_context: &'a ToolContext<Ctx>,
+    thread_id: &'a ThreadId,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    turn: usize,
+    total_usage: &'a TokenUsage,
+    turn_usage: &'a TokenUsage,
+    state: &'a AgentState,
+    message_store: &'a Arc<M>,
+}
+
+async fn execute_turn_tool_phase<Ctx, H, M>(
+    TurnToolPhaseParams {
+        pending_tool_calls,
+        tool_context,
+        thread_id,
+        tools,
+        hooks,
+        tx,
+        seq,
+        execution_store,
+        turn,
+        total_usage,
+        turn_usage,
+        state,
+        message_store,
+    }: TurnToolPhaseParams<'_, Ctx, H, M>,
+) -> Result<(), InternalTurnResult>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let tool_results = execute_pending_tool_calls_for_turn(ToolBatchExecutionParams {
+        pending_tool_calls,
+        tool_context,
+        thread_id,
+        tools,
+        hooks,
+        tx,
+        seq,
+        execution_store,
+        turn,
+        total_usage,
+        turn_usage,
+        state,
+    })
+    .await?;
+
+    if let Err(error) = append_tool_results_and_emit_turn_complete(TurnCompletionParams {
+        tool_results: &tool_results,
+        thread_id,
+        turn,
+        turn_usage,
+        message_store,
+        tx,
+        hooks,
+        seq,
+    })
+    .await
+    {
+        return Err(InternalTurnResult::Error(error));
+    }
+
+    Ok(())
+}
+
+async fn compact_after_context_overflow<P, M>(
+    provider: &Arc<P>,
+    compaction_config: &CompactionConfig,
+    message_store: &Arc<M>,
+    thread_id: &ThreadId,
+) -> Result<(), AgentError>
+where
+    P: LlmProvider,
+    M: MessageStore,
+{
+    let compactor = LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
+    let history = message_store
+        .get_history(thread_id)
+        .await
+        .map_err(|error| {
+            AgentError::new(
+                format!("Failed to get history for compaction after context overflow: {error}"),
+                false,
+            )
+        })?;
+
+    let result = compactor.compact_history(history).await.map_err(|error| {
+        AgentError::new(
+            format!("Context compaction failed after overflow: {error}"),
+            false,
+        )
+    })?;
+
+    message_store
+        .replace_history(thread_id, result.messages)
+        .await
+        .map_err(|error| {
+            AgentError::new(
+                format!("Failed to replace history after overflow compaction: {error}"),
+                false,
+            )
+        })?;
+
+    info!(
+        "Context compacted after overflow (original_tokens={}, new_tokens={})",
+        result.original_tokens, result.new_tokens
+    );
+    Ok(())
+}
+
+struct TurnStopReasonParams<'a, P, H, M> {
+    stop_reason: Option<StopReason>,
+    text_content: Option<String>,
+    message_id: String,
+    turn_usage: TokenUsage,
+    ctx: &'a mut TurnContext,
+    provider: &'a Arc<P>,
+    message_store: &'a Arc<M>,
+    compaction_config: Option<&'a CompactionConfig>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn handle_turn_stop_reason<P, H, M>(
+    TurnStopReasonParams {
+        stop_reason,
+        text_content,
+        message_id,
+        turn_usage,
+        ctx,
+        provider,
+        message_store,
+        compaction_config,
+        tx,
+        hooks,
+        seq,
+    }: TurnStopReasonParams<'_, P, H, M>,
+) -> InternalTurnResult
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    match stop_reason {
         Some(StopReason::EndTurn) => {
             info!("Agent completed (end_turn) (turn={})", ctx.turn);
-            return InternalTurnResult::Done;
+            InternalTurnResult::Done
         }
         Some(StopReason::Refusal) => {
             warn!(
@@ -3106,60 +3673,153 @@ where
                 AgentEvent::refusal(message_id, text_content),
             )
             .await;
-            return InternalTurnResult::Refusal;
+            InternalTurnResult::Refusal
         }
         Some(StopReason::ModelContextWindowExceeded) => {
             warn!("Model context window exceeded (turn={})", ctx.turn);
             if let Some(compact_config) = compaction_config {
-                let compactor =
-                    LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
-                let history = match message_store.get_history(&ctx.thread_id).await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        return InternalTurnResult::Error(AgentError::new(
-                            format!(
-                                "Failed to get history for compaction after context overflow: {e}"
-                            ),
-                            false,
-                        ));
-                    }
-                };
-                match compactor.compact_history(history).await {
-                    Ok(result) => {
-                        if let Err(e) = message_store
-                            .replace_history(&ctx.thread_id, result.messages)
-                            .await
-                        {
-                            return InternalTurnResult::Error(AgentError::new(
-                                format!("Failed to replace history after overflow compaction: {e}"),
-                                false,
-                            ));
-                        }
-                        info!(
-                            "Context compacted after overflow (original_tokens={}, new_tokens={})",
-                            result.original_tokens, result.new_tokens
-                        );
-                        // Decrement turn so the retry doesn't count as a new turn
-                        ctx.turn -= 1;
-                        return InternalTurnResult::Continue { turn_usage };
-                    }
-                    Err(e) => {
-                        return InternalTurnResult::Error(AgentError::new(
-                            format!("Context compaction failed after overflow: {e}"),
-                            false,
-                        ));
-                    }
+                if let Err(error) = compact_after_context_overflow(
+                    provider,
+                    compact_config,
+                    message_store,
+                    &ctx.thread_id,
+                )
+                .await
+                {
+                    return InternalTurnResult::Error(error);
                 }
+                ctx.turn = ctx.turn.saturating_sub(1);
+                return InternalTurnResult::Continue { turn_usage };
             }
-            return InternalTurnResult::Error(AgentError::new(
+
+            InternalTurnResult::Error(AgentError::new(
                 "Model context window exceeded and no compaction configured".to_string(),
                 false,
-            ));
+            ))
         }
-        _ => {}
+        _ => InternalTurnResult::Continue { turn_usage },
+    }
+}
+
+async fn execute_turn<Ctx, P, H, M>(
+    ExecuteTurnParameters {
+        tx,
+        seq,
+        ctx,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        config,
+        compaction_config,
+        execution_store,
+    }: ExecuteTurnParameters<'_, Ctx, P, H, M>,
+) -> InternalTurnResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    if let Err(error) = begin_turn(ctx, config.max_turns, tx, hooks, seq).await {
+        return InternalTurnResult::Error(error);
     }
 
-    InternalTurnResult::Continue { turn_usage }
+    let messages = match load_turn_messages(TurnMessageLoadParams {
+        thread_id: &ctx.thread_id,
+        turn: ctx.turn,
+        provider,
+        message_store,
+        compaction_config,
+        tx,
+        hooks,
+        seq,
+    })
+    .await
+    {
+        Ok(messages) => messages,
+        Err(error) => return InternalTurnResult::Error(error),
+    };
+
+    let request = build_turn_request(config, messages, tools);
+    log_chat_request(&request);
+
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let thinking_id = uuid::Uuid::new_v4().to_string();
+    let response = match request_llm_response(LlmCallParams {
+        provider,
+        request,
+        config,
+        tx,
+        hooks,
+        seq,
+        turn: ctx.turn,
+        message_id: &message_id,
+        thinking_id: &thinking_id,
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => return InternalTurnResult::Error(error),
+    };
+
+    let turn_usage = apply_turn_usage(ctx, &response);
+    let ProcessedTurnResponse {
+        stop_reason,
+        text_content,
+        pending_tool_calls,
+    } = match process_turn_response(TurnResponseProcessingParams {
+        response,
+        message_id: &message_id,
+        thinking_id: &thinking_id,
+        thread_id: &ctx.thread_id,
+        tools,
+        message_store,
+        tx,
+        hooks,
+        seq,
+    })
+    .await
+    {
+        Ok(processed) => processed,
+        Err(error) => return InternalTurnResult::Error(error),
+    };
+
+    if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
+        pending_tool_calls,
+        tool_context,
+        thread_id: &ctx.thread_id,
+        tools,
+        hooks,
+        tx,
+        seq,
+        execution_store,
+        turn: ctx.turn,
+        total_usage: &ctx.total_usage,
+        turn_usage: &turn_usage,
+        state: &ctx.state,
+        message_store,
+    })
+    .await
+    {
+        return outcome;
+    }
+
+    handle_turn_stop_reason(TurnStopReasonParams {
+        stop_reason,
+        text_content,
+        message_id,
+        turn_usage,
+        ctx,
+        provider,
+        message_store,
+        compaction_config,
+        tx,
+        hooks,
+        seq,
+    })
+    .await
 }
 
 /// Saturating conversion from usize to u32.
