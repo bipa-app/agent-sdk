@@ -64,7 +64,7 @@ pub struct AgentConfig {
     pub thinking: Option<ThinkingConfig>,
     /// Enable streaming responses from the LLM.
     ///
-    /// When `true`, emits `TextDelta` and `Thinking` events as text arrives
+    /// When `true`, emits `TextDelta` and `ThinkingDelta` events as text arrives
     /// in real-time. When `false` (default), waits for the complete response
     /// before emitting `Text` and `Thinking` events.
     pub streaming: bool,
