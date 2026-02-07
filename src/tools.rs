@@ -8,6 +8,7 @@
 //! - [`DynamicToolName`] - Tool names created at runtime (MCP bridges)
 //! - [`ToolRegistry`] - Collection of available tools
 //! - [`ToolContext`] - Context passed to tool execution
+//! - [`ListenExecuteTool`] - Tools that listen for updates, then execute later
 //!
 //! # Implementing a Tool
 //!
@@ -45,6 +46,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -203,6 +205,66 @@ pub enum ErasedToolStatus {
     Completed(ToolResult),
     /// Operation failed
     Failed(ToolResult),
+}
+
+/// Update emitted from a `listen()` stream.
+///
+/// This models workflows where a runtime prepares an operation over time, and
+/// execution happens later using an operation identifier and revision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ListenToolUpdate {
+    /// Preparation is still running and should keep listening.
+    Listening {
+        /// Opaque operation identifier used for later execute/cancel calls.
+        operation_id: String,
+        /// Monotonic revision number for optimistic concurrency.
+        revision: u64,
+        /// Human-readable status message.
+        message: String,
+        /// Optional current snapshot for UI rendering.
+        snapshot: Option<serde_json::Value>,
+        /// Optional expiration timestamp (RFC3339).
+        #[serde(with = "time::serde::rfc3339::option")]
+        expires_at: Option<OffsetDateTime>,
+    },
+
+    /// Preparation is complete and execution can be confirmed.
+    Ready {
+        /// Opaque operation identifier used for later execute/cancel calls.
+        operation_id: String,
+        /// Monotonic revision number for optimistic concurrency.
+        revision: u64,
+        /// Human-readable status message.
+        message: String,
+        /// Snapshot shown in confirmation UI.
+        snapshot: serde_json::Value,
+        /// Optional expiration timestamp (RFC3339).
+        #[serde(with = "time::serde::rfc3339::option")]
+        expires_at: Option<OffsetDateTime>,
+    },
+
+    /// Operation is no longer valid.
+    Invalidated {
+        /// Opaque operation identifier.
+        operation_id: String,
+        /// Human-readable reason.
+        message: String,
+        /// Whether caller may recover by starting a new listen operation.
+        recoverable: bool,
+    },
+}
+
+/// Reason for stopping a listen session.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ListenStopReason {
+    /// User explicitly rejected confirmation.
+    UserRejected,
+    /// Agent policy/hook blocked execution before confirmation.
+    Blocked,
+    /// Consumer disconnected while listen stream was active.
+    StreamDisconnected,
+    /// Listen stream ended unexpectedly before terminal state.
+    StreamEnded,
 }
 
 impl<S: ProgressStage> From<ToolStatus<S>> for ErasedToolStatus {
@@ -438,6 +500,73 @@ pub trait AsyncTool<Ctx>: Send + Sync {
 }
 
 // ============================================================================
+// ListenExecuteTool Trait
+// ============================================================================
+
+/// A tool whose runtime has two phases:
+/// 1. `listen()` - starts preparation and streams updates
+/// 2. `execute()` - performs final execution after confirmation
+///
+/// This abstraction is useful when runtime state can expire or evolve before
+/// execution (quotes, challenge windows, leases, approvals).
+///
+/// Ordering note: the agent loop consumes `listen()` updates before
+/// `AgentHooks::pre_tool_use()` runs. Hooks can therefore block `execute()`, but
+/// any side effects done during `listen()` have already happened.
+pub trait ListenExecuteTool<Ctx>: Send + Sync {
+    /// The type of name for this tool.
+    type Name: ToolName;
+
+    /// Returns the tool's strongly-typed name.
+    fn name(&self) -> Self::Name;
+
+    /// Human-readable display name for UI.
+    fn display_name(&self) -> &'static str;
+
+    /// Human-readable description of what the tool does.
+    fn description(&self) -> &'static str;
+
+    /// JSON schema for the tool's input parameters.
+    fn input_schema(&self) -> Value;
+
+    /// Permission tier for this tool.
+    fn tier(&self) -> ToolTier {
+        ToolTier::Confirm
+    }
+
+    /// Start and stream runtime preparation updates.
+    fn listen(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Value,
+    ) -> impl Stream<Item = ListenToolUpdate> + Send;
+
+    /// Execute using operation ID and optimistic concurrency revision.
+    ///
+    /// # Errors
+    /// Returns an error if execution fails or revision is stale.
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> impl Future<Output = Result<ToolResult>> + Send;
+
+    /// Stop a listen operation (best effort).
+    ///
+    /// # Errors
+    /// Returns an error if cancellation fails.
+    fn cancel(
+        &self,
+        _ctx: &ToolContext<Ctx>,
+        _operation_id: &str,
+        _reason: ListenStopReason,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+}
+
+// ============================================================================
 // Type-Erased Tool (for Registry)
 // ============================================================================
 
@@ -620,8 +749,123 @@ where
 }
 
 // ============================================================================
-// Tool Registry
+// Type-Erased ListenExecuteTool (for Registry)
 // ============================================================================
+
+/// Type-erased listen/execute tool trait for registry storage.
+#[async_trait]
+pub trait ErasedListenTool<Ctx>: Send + Sync {
+    /// Get the tool name as a string.
+    fn name_str(&self) -> &str;
+    /// Get a human-friendly display name for the tool.
+    fn display_name(&self) -> &'static str;
+    /// Get the tool description.
+    fn description(&self) -> &'static str;
+    /// Get the JSON schema for tool inputs.
+    fn input_schema(&self) -> Value;
+    /// Get the tool's permission tier.
+    fn tier(&self) -> ToolTier;
+    /// Start listen stream.
+    fn listen_stream<'a>(
+        &'a self,
+        ctx: &'a ToolContext<Ctx>,
+        input: Value,
+    ) -> Pin<Box<dyn Stream<Item = ListenToolUpdate> + Send + 'a>>;
+    /// Execute using a prepared operation.
+    async fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> Result<ToolResult>;
+    /// Cancel operation.
+    async fn cancel(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+        reason: ListenStopReason,
+    ) -> Result<()>;
+}
+
+/// Wrapper that erases the Name associated type from a [`ListenExecuteTool`].
+struct ListenToolWrapper<T, Ctx>
+where
+    T: ListenExecuteTool<Ctx>,
+{
+    inner: T,
+    name_cache: String,
+    _marker: PhantomData<Ctx>,
+}
+
+impl<T, Ctx> ListenToolWrapper<T, Ctx>
+where
+    T: ListenExecuteTool<Ctx>,
+{
+    fn new(tool: T) -> Self {
+        let name_cache = tool_name_to_string(&tool.name());
+        Self {
+            inner: tool,
+            name_cache,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<T, Ctx> ErasedListenTool<Ctx> for ListenToolWrapper<T, Ctx>
+where
+    T: ListenExecuteTool<Ctx> + 'static,
+    Ctx: Send + Sync + 'static,
+{
+    fn name_str(&self) -> &str {
+        &self.name_cache
+    }
+
+    fn display_name(&self) -> &'static str {
+        self.inner.display_name()
+    }
+
+    fn description(&self) -> &'static str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.inner.tier()
+    }
+
+    fn listen_stream<'a>(
+        &'a self,
+        ctx: &'a ToolContext<Ctx>,
+        input: Value,
+    ) -> Pin<Box<dyn Stream<Item = ListenToolUpdate> + Send + 'a>> {
+        let stream = self.inner.listen(ctx, input);
+        Box::pin(stream)
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> Result<ToolResult> {
+        self.inner
+            .execute(ctx, operation_id, expected_revision)
+            .await
+    }
+
+    async fn cancel(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        operation_id: &str,
+        reason: ListenStopReason,
+    ) -> Result<()> {
+        self.inner.cancel(ctx, operation_id, reason).await
+    }
+}
 
 /// Registry of available tools.
 ///
@@ -633,6 +877,7 @@ where
 pub struct ToolRegistry<Ctx> {
     tools: HashMap<String, Arc<dyn ErasedTool<Ctx>>>,
     async_tools: HashMap<String, Arc<dyn ErasedAsyncTool<Ctx>>>,
+    listen_tools: HashMap<String, Arc<dyn ErasedListenTool<Ctx>>>,
 }
 
 impl<Ctx> Clone for ToolRegistry<Ctx> {
@@ -640,6 +885,7 @@ impl<Ctx> Clone for ToolRegistry<Ctx> {
         Self {
             tools: self.tools.clone(),
             async_tools: self.async_tools.clone(),
+            listen_tools: self.listen_tools.clone(),
         }
     }
 }
@@ -656,6 +902,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         Self {
             tools: HashMap::new(),
             async_tools: HashMap::new(),
+            listen_tools: HashMap::new(),
         }
     }
 
@@ -687,6 +934,20 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self
     }
 
+    /// Register a listen/execute tool in the registry.
+    ///
+    /// Listen/execute tools start by streaming updates via `listen()`, then run
+    /// final execution with `execute()` once confirmed.
+    pub fn register_listen<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: ListenExecuteTool<Ctx> + 'static,
+    {
+        let wrapper = ListenToolWrapper::new(tool);
+        let name = wrapper.name_str().to_string();
+        self.listen_tools.insert(name, Arc::new(wrapper));
+        self
+    }
+
     /// Get a synchronous tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ErasedTool<Ctx>>> {
@@ -699,10 +960,22 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.async_tools.get(name)
     }
 
+    /// Get a listen/execute tool by name.
+    #[must_use]
+    pub fn get_listen(&self, name: &str) -> Option<&Arc<dyn ErasedListenTool<Ctx>>> {
+        self.listen_tools.get(name)
+    }
+
     /// Check if a tool name refers to an async tool.
     #[must_use]
     pub fn is_async(&self, name: &str) -> bool {
         self.async_tools.contains_key(name)
+    }
+
+    /// Check if a tool name refers to a listen/execute tool.
+    #[must_use]
+    pub fn is_listen(&self, name: &str) -> bool {
+        self.listen_tools.contains_key(name)
     }
 
     /// Get all registered synchronous tools.
@@ -715,16 +988,21 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.async_tools.values()
     }
 
+    /// Get all registered listen/execute tools.
+    pub fn all_listen(&self) -> impl Iterator<Item = &Arc<dyn ErasedListenTool<Ctx>>> {
+        self.listen_tools.values()
+    }
+
     /// Get the number of registered tools (sync + async).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tools.len() + self.async_tools.len()
+        self.tools.len() + self.async_tools.len() + self.listen_tools.len()
     }
 
     /// Check if the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty() && self.async_tools.is_empty()
+        self.tools.is_empty() && self.async_tools.is_empty() && self.listen_tools.is_empty()
     }
 
     /// Filter tools by a predicate.
@@ -744,6 +1022,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     {
         self.tools.retain(|name, _| predicate(name));
         self.async_tools.retain(|name, _| predicate(name));
+        self.listen_tools.retain(|name, _| predicate(name));
     }
 
     /// Convert all tools (sync + async) to LLM tool definitions.
@@ -760,6 +1039,12 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             .collect();
 
         tools.extend(self.async_tools.values().map(|tool| llm::Tool {
+            name: tool.name_str().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        }));
+
+        tools.extend(self.listen_tools.values().map(|tool| llm::Tool {
             name: tool.name_str().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
@@ -925,5 +1210,60 @@ mod tests {
 
         let tool = registry.get("mock_tool").unwrap();
         assert_eq!(tool.display_name(), "Mock Tool");
+    }
+
+    struct ListenMockTool;
+
+    impl ListenExecuteTool<()> for ListenMockTool {
+        type Name = TestToolName;
+
+        fn name(&self) -> TestToolName {
+            TestToolName::MockTool
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Listen Mock Tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "A listen/execute mock tool for testing"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn listen(
+            &self,
+            _ctx: &ToolContext<()>,
+            _input: Value,
+        ) -> impl futures::Stream<Item = ListenToolUpdate> + Send {
+            futures::stream::iter(vec![ListenToolUpdate::Ready {
+                operation_id: "op_1".to_string(),
+                revision: 1,
+                message: "ready".to_string(),
+                snapshot: serde_json::json!({"ok": true}),
+                expires_at: None,
+            }])
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            _operation_id: &str,
+            _expected_revision: u64,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success("Executed"))
+        }
+    }
+
+    #[test]
+    fn test_listen_tool_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register_listen(ListenMockTool);
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get_listen("mock_tool").is_some());
+        assert!(registry.is_listen("mock_tool"));
     }
 }

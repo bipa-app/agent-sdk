@@ -64,7 +64,7 @@ pub struct AgentConfig {
     pub thinking: Option<ThinkingConfig>,
     /// Enable streaming responses from the LLM.
     ///
-    /// When `true`, emits `TextDelta` and `Thinking` events as text arrives
+    /// When `true`, emits `TextDelta` and `ThinkingDelta` events as text arrives
     /// in real-time. When `false` (default), waits for the complete response
     /// before emitting `Text` and `Thinking` events.
     pub streaming: bool,
@@ -302,6 +302,27 @@ pub struct PendingToolCallInfo {
     pub display_name: String,
     /// Tool input parameters
     pub input: serde_json::Value,
+    /// Optional context for tools that prepare asynchronously and execute later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_context: Option<ListenExecutionContext>,
+}
+
+/// Context captured for listen/execute tools while awaiting confirmation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListenExecutionContext {
+    /// Opaque operation identifier used to execute/cancel.
+    pub operation_id: String,
+    /// Revision used for optimistic concurrency checks.
+    pub revision: u64,
+    /// Snapshot shown to the user during confirmation.
+    pub snapshot: serde_json::Value,
+    /// Optional expiration timestamp (RFC3339).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Continuation state that allows resuming the agent loop.
