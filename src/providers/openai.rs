@@ -57,6 +57,7 @@ pub const MODEL_GPT4O_MINI: &str = "gpt-4o-mini";
 // OpenAI-compatible vendor defaults
 pub const BASE_URL_KIMI: &str = "https://api.moonshot.ai/v1";
 pub const BASE_URL_ZAI: &str = "https://api.z.ai/api/paas/v4";
+pub const MODEL_KIMI_K2_5: &str = "kimi-k2.5";
 pub const MODEL_KIMI_K2_THINKING: &str = "kimi-k2-thinking";
 pub const MODEL_ZAI_GLM5: &str = "glm-5";
 
@@ -101,7 +102,13 @@ impl OpenAIProvider {
         Self::with_base_url(api_key, model, BASE_URL_KIMI.to_owned())
     }
 
-    /// Create a provider using KIMI K2 Thinking (default KIMI agentic reasoning model).
+    /// Create a provider using KIMI K2.5 (default KIMI model).
+    #[must_use]
+    pub fn kimi_k2_5(api_key: String) -> Self {
+        Self::kimi(api_key, MODEL_KIMI_K2_5.to_owned())
+    }
+
+    /// Create a provider using KIMI K2 Thinking.
     #[must_use]
     pub fn kimi_k2_thinking(api_key: String) -> Self {
         Self::kimi(api_key, MODEL_KIMI_K2_THINKING.to_owned())
@@ -1065,6 +1072,15 @@ mod tests {
     }
 
     #[test]
+    fn test_kimi_k2_5_factory_creates_provider() {
+        let provider = OpenAIProvider::kimi_k2_5("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_KIMI_K2_5);
+        assert_eq!(provider.base_url, BASE_URL_KIMI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
     fn test_kimi_k2_thinking_factory_creates_provider() {
         let provider = OpenAIProvider::kimi_k2_thinking("test-api-key".to_string());
 
@@ -1119,6 +1135,7 @@ mod tests {
         assert_eq!(MODEL_GPT4O, "gpt-4o");
         assert_eq!(MODEL_GPT4O_MINI, "gpt-4o-mini");
         // OpenAI-compatible vendor defaults
+        assert_eq!(MODEL_KIMI_K2_5, "kimi-k2.5");
         assert_eq!(MODEL_KIMI_K2_THINKING, "kimi-k2-thinking");
         assert_eq!(MODEL_ZAI_GLM5, "glm-5");
         assert_eq!(BASE_URL_KIMI, "https://api.moonshot.ai/v1");

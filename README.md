@@ -508,13 +508,13 @@ let kimi_api_key = std::env::var("MOONSHOT_API_KEY")?;
 let zai_api_key = std::env::var("ZAI_API_KEY")?;
 
 // Default reasoning models
-let kimi = OpenAIProvider::kimi_k2_thinking(kimi_api_key);
+let kimi = OpenAIProvider::kimi_k2_5(kimi_api_key);
 let zai = OpenAIProvider::zai_glm5(zai_api_key);
 
 // Custom model overrides
 let kimi_custom = OpenAIProvider::kimi(
     std::env::var("MOONSHOT_API_KEY")?,
-    "kimi-k2-turbo-preview".to_string(),
+    "kimi-k2-thinking".to_string(),
 );
 let zai_custom = OpenAIProvider::zai(
     std::env::var("ZAI_API_KEY")?,
