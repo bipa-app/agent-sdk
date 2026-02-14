@@ -567,9 +567,8 @@ fn map_finish_reason(finish_reason: &str) -> StopReason {
         "stop" => StopReason::EndTurn,
         "tool_calls" => StopReason::ToolUse,
         "length" => StopReason::MaxTokens,
-        "content_filter" => StopReason::StopSequence,
+        "content_filter" | "network_error" => StopReason::StopSequence,
         "sensitive" => StopReason::Refusal,
-        "network_error" => StopReason::StopSequence,
         unknown => {
             log::debug!("Unknown finish_reason from OpenAI-compatible API: {unknown}");
             StopReason::StopSequence
@@ -941,7 +940,11 @@ where
             .map_err(|_| D::Error::custom(format!("token count out of range for u32: {v}"))),
         NumberLike::F64(v) => {
             if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
-                Ok(v as u32)
+                v.to_string().parse::<u32>().map_err(|e| {
+                    D::Error::custom(format!(
+                        "failed to convert integer-compatible token count {v} to u32: {e}"
+                    ))
+                })
             } else {
                 Err(D::Error::custom(format!(
                     "token count must be a non-negative integer-compatible number, got {v}"
