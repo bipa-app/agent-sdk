@@ -506,10 +506,12 @@ use agent_sdk::providers::OpenAIProvider;
 
 let kimi_api_key = std::env::var("MOONSHOT_API_KEY")?;
 let zai_api_key = std::env::var("ZAI_API_KEY")?;
+let minimax_api_key = std::env::var("MINIMAX_API_KEY")?;
 
 // Default reasoning models
 let kimi = OpenAIProvider::kimi_k2_5(kimi_api_key);
 let zai = OpenAIProvider::zai_glm5(zai_api_key);
+let minimax = OpenAIProvider::minimax_m2_5(minimax_api_key);
 
 // Custom model overrides
 let kimi_custom = OpenAIProvider::kimi(
@@ -519,6 +521,10 @@ let kimi_custom = OpenAIProvider::kimi(
 let zai_custom = OpenAIProvider::zai(
     std::env::var("ZAI_API_KEY")?,
     "glm-4.5".to_string(),
+);
+let minimax_custom = OpenAIProvider::minimax(
+    std::env::var("MINIMAX_API_KEY")?,
+    "MiniMax-M2.5".to_string(),
 );
 ```
 

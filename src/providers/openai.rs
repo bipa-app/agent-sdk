@@ -57,9 +57,11 @@ pub const MODEL_GPT4O_MINI: &str = "gpt-4o-mini";
 // OpenAI-compatible vendor defaults
 pub const BASE_URL_KIMI: &str = "https://api.moonshot.ai/v1";
 pub const BASE_URL_ZAI: &str = "https://api.z.ai/api/paas/v4";
+pub const BASE_URL_MINIMAX: &str = "https://api.minimax.io/v1";
 pub const MODEL_KIMI_K2_5: &str = "kimi-k2.5";
 pub const MODEL_KIMI_K2_THINKING: &str = "kimi-k2-thinking";
 pub const MODEL_ZAI_GLM5: &str = "glm-5";
+pub const MODEL_MINIMAX_M2_5: &str = "MiniMax-M2.5";
 
 /// `OpenAI` LLM provider using the Chat Completions API.
 ///
@@ -124,6 +126,18 @@ impl OpenAIProvider {
     #[must_use]
     pub fn zai_glm5(api_key: String) -> Self {
         Self::zai(api_key, MODEL_ZAI_GLM5.to_owned())
+    }
+
+    /// Create a provider using `MiniMax` via OpenAI-compatible Chat Completions.
+    #[must_use]
+    pub fn minimax(api_key: String, model: String) -> Self {
+        Self::with_base_url(api_key, model, BASE_URL_MINIMAX.to_owned())
+    }
+
+    /// Create a provider using `MiniMax` M2.5 (default `MiniMax` model).
+    #[must_use]
+    pub fn minimax_m2_5(api_key: String) -> Self {
+        Self::minimax(api_key, MODEL_MINIMAX_M2_5.to_owned())
     }
 
     /// Create a provider using GPT-5.2 Instant (speed-optimized for routine queries).
@@ -566,7 +580,9 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
 }
 
 fn use_max_tokens_alias(base_url: &str) -> bool {
-    base_url.contains("moonshot.ai") || base_url.contains("api.z.ai")
+    base_url.contains("moonshot.ai")
+        || base_url.contains("api.z.ai")
+        || base_url.contains("minimax.io")
 }
 
 fn map_finish_reason(finish_reason: &str) -> StopReason {
@@ -1107,6 +1123,25 @@ mod tests {
         assert_eq!(provider.provider(), "openai");
     }
 
+    #[test]
+    fn test_minimax_factory_creates_provider_with_minimax_base_url() {
+        let provider =
+            OpenAIProvider::minimax("test-api-key".to_string(), "minimax-custom".to_string());
+
+        assert_eq!(provider.model(), "minimax-custom");
+        assert_eq!(provider.base_url, BASE_URL_MINIMAX);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_minimax_m2_5_factory_creates_provider() {
+        let provider = OpenAIProvider::minimax_m2_5("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_MINIMAX_M2_5);
+        assert_eq!(provider.base_url, BASE_URL_MINIMAX);
+        assert_eq!(provider.provider(), "openai");
+    }
+
     // ===================
     // Model Constants Tests
     // ===================
@@ -1138,8 +1173,10 @@ mod tests {
         assert_eq!(MODEL_KIMI_K2_5, "kimi-k2.5");
         assert_eq!(MODEL_KIMI_K2_THINKING, "kimi-k2-thinking");
         assert_eq!(MODEL_ZAI_GLM5, "glm-5");
+        assert_eq!(MODEL_MINIMAX_M2_5, "MiniMax-M2.5");
         assert_eq!(BASE_URL_KIMI, "https://api.moonshot.ai/v1");
         assert_eq!(BASE_URL_ZAI, "https://api.z.ai/api/paas/v4");
+        assert_eq!(BASE_URL_MINIMAX, "https://api.minimax.io/v1");
     }
 
     // ===================
@@ -1614,6 +1651,7 @@ mod tests {
         assert!(!use_max_tokens_alias(DEFAULT_BASE_URL));
         assert!(use_max_tokens_alias(BASE_URL_KIMI));
         assert!(use_max_tokens_alias(BASE_URL_ZAI));
+        assert!(use_max_tokens_alias(BASE_URL_MINIMAX));
     }
 
     #[test]
