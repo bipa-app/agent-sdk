@@ -15,6 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::StatusCode;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use super::openai_responses::OpenAIResponsesProvider;
@@ -53,6 +54,12 @@ pub const MODEL_GPT41_NANO: &str = "gpt-4.1-nano";
 pub const MODEL_GPT4O: &str = "gpt-4o";
 pub const MODEL_GPT4O_MINI: &str = "gpt-4o-mini";
 
+// OpenAI-compatible vendor defaults
+pub const BASE_URL_KIMI: &str = "https://api.moonshot.ai/v1";
+pub const BASE_URL_ZAI: &str = "https://api.z.ai/api/paas/v4";
+pub const MODEL_KIMI_K2_THINKING: &str = "kimi-k2-thinking";
+pub const MODEL_ZAI_GLM5: &str = "glm-5";
+
 /// `OpenAI` LLM provider using the Chat Completions API.
 ///
 /// Also supports `OpenAI`-compatible APIs (Ollama, vLLM, Azure `OpenAI`, etc.)
@@ -86,6 +93,30 @@ impl OpenAIProvider {
             model,
             base_url,
         }
+    }
+
+    /// Create a provider using Moonshot KIMI via OpenAI-compatible Chat Completions.
+    #[must_use]
+    pub fn kimi(api_key: String, model: String) -> Self {
+        Self::with_base_url(api_key, model, BASE_URL_KIMI.to_owned())
+    }
+
+    /// Create a provider using KIMI K2 Thinking (default KIMI agentic reasoning model).
+    #[must_use]
+    pub fn kimi_k2_thinking(api_key: String) -> Self {
+        Self::kimi(api_key, MODEL_KIMI_K2_THINKING.to_owned())
+    }
+
+    /// Create a provider using z.ai via OpenAI-compatible Chat Completions.
+    #[must_use]
+    pub fn zai(api_key: String, model: String) -> Self {
+        Self::with_base_url(api_key, model, BASE_URL_ZAI.to_owned())
+    }
+
+    /// Create a provider using z.ai GLM-5 (default z.ai agentic reasoning model).
+    #[must_use]
+    pub fn zai_glm5(api_key: String) -> Self {
+        Self::zai(api_key, MODEL_ZAI_GLM5.to_owned())
     }
 
     /// Create a provider using GPT-5.2 Instant (speed-optimized for routine queries).
@@ -192,8 +223,11 @@ impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
-            let responses_provider =
-                OpenAIResponsesProvider::new(self.api_key.clone(), self.model.clone());
+            let responses_provider = OpenAIResponsesProvider::with_base_url(
+                self.api_key.clone(),
+                self.model.clone(),
+                self.base_url.clone(),
+            );
             return responses_provider.chat(request).await;
         }
 
@@ -202,12 +236,13 @@ impl LlmProvider for OpenAIProvider {
             .tools
             .map(|ts| ts.into_iter().map(convert_tool).collect());
 
-        let api_request = ApiChatRequest {
-            model: &self.model,
-            messages: &messages,
-            max_completion_tokens: Some(request.max_tokens),
-            tools: tools.as_deref(),
-        };
+        let api_request = build_api_chat_request(
+            &self.model,
+            &messages,
+            request.max_tokens,
+            tools.as_deref(),
+            use_max_tokens_alias(&self.base_url),
+        );
 
         log::debug!(
             "OpenAI LLM request model={} max_tokens={}",
@@ -264,12 +299,7 @@ impl LlmProvider for OpenAIProvider {
 
         let content = build_content_blocks(&choice.message);
 
-        let stop_reason = choice.finish_reason.map(|r| match r {
-            ApiFinishReason::Stop => StopReason::EndTurn,
-            ApiFinishReason::ToolCalls => StopReason::ToolUse,
-            ApiFinishReason::Length => StopReason::MaxTokens,
-            ApiFinishReason::ContentFilter => StopReason::StopSequence,
-        });
+        let stop_reason = choice.finish_reason.as_deref().map(map_finish_reason);
 
         Ok(ChatOutcome::Success(ChatResponse {
             id: api_response.id,
@@ -288,8 +318,10 @@ impl LlmProvider for OpenAIProvider {
         if requires_responses_api(&self.model) {
             let api_key = self.api_key.clone();
             let model = self.model.clone();
+            let base_url = self.base_url.clone();
             return Box::pin(async_stream::stream! {
-                let responses_provider = OpenAIResponsesProvider::new(api_key, model);
+                let responses_provider =
+                    OpenAIResponsesProvider::with_base_url(api_key, model, base_url);
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
                     yield item;
@@ -303,7 +335,13 @@ impl LlmProvider for OpenAIProvider {
                 .tools
                 .map(|ts| ts.into_iter().map(convert_tool).collect());
 
-            let api_request = ApiChatRequestStreaming { model: &self.model, messages: &messages, max_completion_tokens: Some(request.max_tokens), tools: tools.as_deref(), stream: true };
+            let api_request = build_api_chat_request_streaming(
+                &self.model,
+                &messages,
+                request.max_tokens,
+                tools.as_deref(),
+                use_max_tokens_alias(&self.base_url),
+            );
 
             log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
@@ -513,17 +551,63 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
 
         // Check for finish reason
         if let Some(finish_reason) = choice.finish_reason {
-            let stop_reason = match finish_reason {
-                SseFinishReason::Stop => StopReason::EndTurn,
-                SseFinishReason::ToolCalls => StopReason::ToolUse,
-                SseFinishReason::Length => StopReason::MaxTokens,
-                SseFinishReason::ContentFilter => StopReason::StopSequence,
-            };
-            results.push(SseProcessResult::Done(stop_reason));
+            results.push(SseProcessResult::Done(map_finish_reason(&finish_reason)));
         }
     }
 
     results
+}
+
+fn use_max_tokens_alias(base_url: &str) -> bool {
+    base_url.contains("moonshot.ai") || base_url.contains("api.z.ai")
+}
+
+fn map_finish_reason(finish_reason: &str) -> StopReason {
+    match finish_reason {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" => StopReason::ToolUse,
+        "length" => StopReason::MaxTokens,
+        "content_filter" => StopReason::StopSequence,
+        "sensitive" => StopReason::Refusal,
+        "network_error" => StopReason::StopSequence,
+        unknown => {
+            log::debug!("Unknown finish_reason from OpenAI-compatible API: {unknown}");
+            StopReason::StopSequence
+        }
+    }
+}
+
+fn build_api_chat_request<'a>(
+    model: &'a str,
+    messages: &'a [ApiMessage],
+    max_tokens: u32,
+    tools: Option<&'a [ApiTool]>,
+    include_max_tokens_alias: bool,
+) -> ApiChatRequest<'a> {
+    ApiChatRequest {
+        model,
+        messages,
+        max_completion_tokens: Some(max_tokens),
+        max_tokens: include_max_tokens_alias.then_some(max_tokens),
+        tools,
+    }
+}
+
+fn build_api_chat_request_streaming<'a>(
+    model: &'a str,
+    messages: &'a [ApiMessage],
+    max_tokens: u32,
+    tools: Option<&'a [ApiTool]>,
+    include_max_tokens_alias: bool,
+) -> ApiChatRequestStreaming<'a> {
+    ApiChatRequestStreaming {
+        model,
+        messages,
+        max_completion_tokens: Some(max_tokens),
+        max_tokens: include_max_tokens_alias.then_some(max_tokens),
+        tools,
+        stream: true,
+    }
 }
 
 fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
@@ -681,6 +765,8 @@ struct ApiChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
 }
 
@@ -690,6 +776,8 @@ struct ApiChatRequestStreaming<'a> {
     messages: &'a [ApiMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
     stream: bool,
@@ -756,7 +844,7 @@ struct ApiChatResponse {
 #[derive(Deserialize)]
 struct ApiChoice {
     message: ApiResponseMessage,
-    finish_reason: Option<ApiFinishReason>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -778,17 +866,10 @@ struct ApiResponseFunctionCall {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ApiFinishReason {
-    Stop,
-    ToolCalls,
-    Length,
-    ContentFilter,
-}
-
-#[derive(Deserialize)]
 struct ApiUsage {
+    #[serde(deserialize_with = "deserialize_u32_from_number")]
     prompt_tokens: u32,
+    #[serde(deserialize_with = "deserialize_u32_from_number")]
     completion_tokens: u32,
 }
 
@@ -814,7 +895,7 @@ struct SseChunk {
 #[derive(Deserialize)]
 struct SseChoice {
     delta: SseDelta,
-    finish_reason: Option<SseFinishReason>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -837,18 +918,37 @@ struct SseFunctionDelta {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SseFinishReason {
-    Stop,
-    ToolCalls,
-    Length,
-    ContentFilter,
+struct SseUsage {
+    #[serde(deserialize_with = "deserialize_u32_from_number")]
+    prompt_tokens: u32,
+    #[serde(deserialize_with = "deserialize_u32_from_number")]
+    completion_tokens: u32,
 }
 
-#[derive(Deserialize)]
-struct SseUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
+fn deserialize_u32_from_number<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumberLike {
+        U64(u64),
+        F64(f64),
+    }
+
+    match NumberLike::deserialize(deserializer)? {
+        NumberLike::U64(v) => u32::try_from(v)
+            .map_err(|_| D::Error::custom(format!("token count out of range for u32: {v}"))),
+        NumberLike::F64(v) => {
+            if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
+                Ok(v as u32)
+            } else {
+                Err(D::Error::custom(format!(
+                    "token count must be a non-negative integer-compatible number, got {v}"
+                )))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -952,6 +1052,42 @@ mod tests {
         assert_eq!(provider.provider(), "openai");
     }
 
+    #[test]
+    fn test_kimi_factory_creates_provider_with_kimi_base_url() {
+        let provider = OpenAIProvider::kimi("test-api-key".to_string(), "kimi-custom".to_string());
+
+        assert_eq!(provider.model(), "kimi-custom");
+        assert_eq!(provider.base_url, BASE_URL_KIMI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_kimi_k2_thinking_factory_creates_provider() {
+        let provider = OpenAIProvider::kimi_k2_thinking("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_KIMI_K2_THINKING);
+        assert_eq!(provider.base_url, BASE_URL_KIMI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_zai_factory_creates_provider_with_zai_base_url() {
+        let provider = OpenAIProvider::zai("test-api-key".to_string(), "glm-custom".to_string());
+
+        assert_eq!(provider.model(), "glm-custom");
+        assert_eq!(provider.base_url, BASE_URL_ZAI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_zai_glm5_factory_creates_provider() {
+        let provider = OpenAIProvider::zai_glm5("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_ZAI_GLM5);
+        assert_eq!(provider.base_url, BASE_URL_ZAI);
+        assert_eq!(provider.provider(), "openai");
+    }
+
     // ===================
     // Model Constants Tests
     // ===================
@@ -979,6 +1115,11 @@ mod tests {
         // GPT-4o series
         assert_eq!(MODEL_GPT4O, "gpt-4o");
         assert_eq!(MODEL_GPT4O_MINI, "gpt-4o-mini");
+        // OpenAI-compatible vendor defaults
+        assert_eq!(MODEL_KIMI_K2_THINKING, "kimi-k2-thinking");
+        assert_eq!(MODEL_ZAI_GLM5, "glm-5");
+        assert_eq!(BASE_URL_KIMI, "https://api.moonshot.ai/v1");
+        assert_eq!(BASE_URL_ZAI, "https://api.z.ai/api/paas/v4");
     }
 
     // ===================
@@ -1166,16 +1307,50 @@ mod tests {
     }
 
     #[test]
-    fn test_api_finish_reason_deserialization() {
-        let stop: ApiFinishReason = serde_json::from_str("\"stop\"").unwrap();
-        let tool_calls: ApiFinishReason = serde_json::from_str("\"tool_calls\"").unwrap();
-        let length: ApiFinishReason = serde_json::from_str("\"length\"").unwrap();
-        let content_filter: ApiFinishReason = serde_json::from_str("\"content_filter\"").unwrap();
+    fn test_api_response_with_unknown_finish_reason_deserialization() {
+        let json = r#"{
+            "id": "chatcmpl-789",
+            "choices": [
+                {
+                    "message": {
+                        "content": "ok"
+                    },
+                    "finish_reason": "vendor_custom_reason"
+                }
+            ],
+            "model": "glm-5",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        }"#;
 
-        assert!(matches!(stop, ApiFinishReason::Stop));
-        assert!(matches!(tool_calls, ApiFinishReason::ToolCalls));
-        assert!(matches!(length, ApiFinishReason::Length));
-        assert!(matches!(content_filter, ApiFinishReason::ContentFilter));
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("vendor_custom_reason")
+        );
+        assert_eq!(
+            map_finish_reason(response.choices[0].finish_reason.as_deref().unwrap()),
+            StopReason::StopSequence
+        );
+    }
+
+    #[test]
+    fn test_map_finish_reason_covers_vendor_specific_values() {
+        assert_eq!(map_finish_reason("stop"), StopReason::EndTurn);
+        assert_eq!(map_finish_reason("tool_calls"), StopReason::ToolUse);
+        assert_eq!(map_finish_reason("length"), StopReason::MaxTokens);
+        assert_eq!(
+            map_finish_reason("content_filter"),
+            StopReason::StopSequence
+        );
+        assert_eq!(map_finish_reason("sensitive"), StopReason::Refusal);
+        assert_eq!(map_finish_reason("network_error"), StopReason::StopSequence);
+        assert_eq!(
+            map_finish_reason("some_new_reason"),
+            StopReason::StopSequence
+        );
     }
 
     // ===================
@@ -1350,10 +1525,7 @@ mod tests {
         }"#;
 
         let chunk: SseChunk = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            chunk.choices[0].finish_reason,
-            Some(SseFinishReason::Stop)
-        ));
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -1376,20 +1548,100 @@ mod tests {
     }
 
     #[test]
-    fn test_sse_finish_reason_deserialization() {
-        let stop: SseFinishReason = serde_json::from_str("\"stop\"").unwrap();
-        let tool_calls: SseFinishReason = serde_json::from_str("\"tool_calls\"").unwrap();
-        let length: SseFinishReason = serde_json::from_str("\"length\"").unwrap();
-        let content_filter: SseFinishReason = serde_json::from_str("\"content_filter\"").unwrap();
+    fn test_sse_chunk_with_float_usage_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100.0,
+                "completion_tokens": 50.0
+            }
+        }"#;
 
-        assert!(matches!(stop, SseFinishReason::Stop));
-        assert!(matches!(tool_calls, SseFinishReason::ToolCalls));
-        assert!(matches!(length, SseFinishReason::Length));
-        assert!(matches!(content_filter, SseFinishReason::ContentFilter));
+        let chunk: SseChunk = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
     }
 
     #[test]
-    fn test_streaming_request_serialization() {
+    fn test_api_usage_deserializes_integer_compatible_numbers() {
+        let json = r#"{
+            "prompt_tokens": 42.0,
+            "completion_tokens": 7
+        }"#;
+
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
+    fn test_api_usage_rejects_fractional_numbers() {
+        let json = r#"{
+            "prompt_tokens": 42.5,
+            "completion_tokens": 7
+        }"#;
+
+        let usage: std::result::Result<ApiUsage, _> = serde_json::from_str(json);
+        assert!(usage.is_err());
+    }
+
+    #[test]
+    fn test_use_max_tokens_alias_for_vendor_urls() {
+        assert!(!use_max_tokens_alias(DEFAULT_BASE_URL));
+        assert!(use_max_tokens_alias(BASE_URL_KIMI));
+        assert!(use_max_tokens_alias(BASE_URL_ZAI));
+    }
+
+    #[test]
+    fn test_request_serialization_openai_uses_max_completion_tokens_only() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequest {
+            model: "gpt-4o",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"max_completion_tokens\":1024"));
+        assert!(!json.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn test_request_serialization_with_max_tokens_alias() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequest {
+            model: "glm-5",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: Some(1024),
+            tools: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"max_completion_tokens\":1024"));
+        assert!(json.contains("\"max_tokens\":1024"));
+    }
+
+    #[test]
+    fn test_streaming_request_serialization_openai_default() {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
@@ -1401,6 +1653,7 @@ mod tests {
             model: "gpt-4o",
             messages: &messages,
             max_completion_tokens: Some(1024),
+            max_tokens: None,
             tools: None,
             stream: true,
         };
@@ -1408,5 +1661,30 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"stream\":true"));
         assert!(json.contains("\"model\":\"gpt-4o\""));
+        assert!(json.contains("\"max_completion_tokens\":1024"));
+        assert!(!json.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn test_streaming_request_serialization_with_max_tokens_alias() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequestStreaming {
+            model: "kimi-k2-thinking",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: Some(1024),
+            tools: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"max_completion_tokens\":1024"));
+        assert!(json.contains("\"max_tokens\":1024"));
     }
 }
