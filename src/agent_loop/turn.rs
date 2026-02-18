@@ -12,7 +12,7 @@ use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::{
-    ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
+    ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role, StopReason,
 };
 use crate::stores::MessageStore;
 use crate::tools::ToolRegistry;
@@ -567,8 +567,18 @@ where
         )
     })?;
 
+    // Strip trailing assistant messages so the next turn's API call
+    // doesn't fail with "conversation must end with a user message".
+    let mut messages = result.messages;
+    while messages
+        .last()
+        .is_some_and(|m| matches!(m.role, Role::Assistant))
+    {
+        messages.pop();
+    }
+
     message_store
-        .replace_history(thread_id, result.messages)
+        .replace_history(thread_id, messages)
         .await
         .map_err(|error| {
             AgentError::new(
@@ -588,6 +598,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
     TurnStopReasonParams {
         stop_reason,
         text_content,
+        had_tool_calls,
         message_id,
         turn_usage,
         ctx,
@@ -645,7 +656,24 @@ where
                 false,
             ))
         }
-        _ => InternalTurnResult::Continue { turn_usage },
+        _ => {
+            // Only continue if tool results were appended in this turn.
+            // Tool results are user-role messages, so continuing is safe because
+            // the message history ends with a user message.
+            //
+            // If no tools were called (text-only response with MaxTokens/StopSequence/None),
+            // the last stored message is the assistant response. Continuing would cause
+            // the next API call to fail with "conversation must end with a user message".
+            if had_tool_calls {
+                InternalTurnResult::Continue { turn_usage }
+            } else {
+                info!(
+                    "Agent completed (stop_reason={:?}, no tool calls) (turn={})",
+                    stop_reason, ctx.turn
+                );
+                InternalTurnResult::Done
+            }
+        }
     }
 }
 
@@ -734,6 +762,8 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
+    let had_tool_calls = !pending_tool_calls.is_empty();
+
     if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
         pending_tool_calls,
         tool_context,
@@ -757,6 +787,7 @@ where
     handle_turn_stop_reason(TurnStopReasonParams {
         stop_reason,
         text_content,
+        had_tool_calls,
         message_id,
         turn_usage,
         ctx,
