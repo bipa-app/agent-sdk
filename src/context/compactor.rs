@@ -233,7 +233,24 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
         }
 
         // Split messages: old messages to summarize, recent messages to keep
-        let split_point = messages.len().saturating_sub(self.config.retain_recent);
+        let mut split_point = messages.len().saturating_sub(self.config.retain_recent);
+
+        // Adjust split_point backwards if it lands between an assistant message
+        // with tool_use and its following user message with tool_result. Breaking
+        // these pairs corrupts the conversation history for the Anthropic API.
+        while split_point > 0 {
+            if let Content::Blocks(blocks) = &messages[split_point].content {
+                let has_tool_result = blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                if has_tool_result && messages[split_point].role == Role::User {
+                    split_point -= 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
         let (to_summarize, to_keep) = messages.split_at(split_point);
 
         // Summarize old messages
@@ -465,5 +482,81 @@ mod tests {
         let formatted = LlmContextCompactor::<MockProvider>::format_messages_for_summary(&messages);
 
         assert!(formatted.contains("... (truncated)"));
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_preserves_tool_use_tool_result_pairs() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("Summary of earlier conversation."));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(3);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        // Build a history where the split_point (len - retain_recent = 5 - 2 = 3)
+        // would land exactly on the user tool_result message at index 3,
+        // which would orphan it from its assistant tool_use at index 2.
+        let messages = vec![
+            // index 0: user
+            Message::user("What files are in the project?"),
+            // index 1: assistant text
+            Message::assistant("Let me check that for you."),
+            // index 2: assistant with tool_use
+            Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "list_files".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+            },
+            // index 3: user with tool_result (naive split would land here)
+            Message {
+                role: Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_1".to_string(),
+                    content: "file1.rs\nfile2.rs".to_string(),
+                    is_error: None,
+                }]),
+            },
+            // index 4: assistant final response
+            Message::assistant("The project contains file1.rs and file2.rs."),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        // The split_point should have been adjusted back from 3 to 2,
+        // so to_keep includes: [assistant tool_use, user tool_result, assistant response]
+        // Plus summary + ack = 5 total
+        assert_eq!(result.new_count, 5);
+
+        // Verify the kept messages include the tool_use/tool_result pair
+        // After summary + ack, the third message should be the assistant with tool_use
+        let kept_assistant = &result.messages[2];
+        if let Content::Blocks(blocks) = &kept_assistant.content {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+                "Expected assistant tool_use in kept messages"
+            );
+        } else {
+            panic!("Expected Blocks content for assistant tool_use message");
+        }
+
+        // The fourth message should be the user tool_result
+        let kept_user = &result.messages[3];
+        if let Content::Blocks(blocks) = &kept_user.content {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+                "Expected user tool_result in kept messages"
+            );
+        } else {
+            panic!("Expected Blocks content for user tool_result message");
+        }
+
+        Ok(())
     }
 }

@@ -14,7 +14,7 @@ use super::types::{
 };
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, ToolDecision};
-use crate::llm::Message;
+use crate::llm::{Content, ContentBlock, Message, Role};
 use crate::stores::MessageStore;
 use crate::tools::{
     ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenStopReason, ToolContext,
@@ -733,6 +733,10 @@ where
 }
 
 /// Append tool results to message history.
+///
+/// All tool results from a single turn are batched into a single User message
+/// containing multiple `ToolResult` content blocks. The Anthropic API requires
+/// all `tool_results` from a batch to be in the same user message.
 pub(super) async fn append_tool_results<M>(
     tool_results: &[(String, ToolResult)],
     thread_id: &ThreadId,
@@ -741,14 +745,30 @@ pub(super) async fn append_tool_results<M>(
 where
     M: MessageStore,
 {
-    for (tool_id, result) in tool_results {
-        let tool_result_msg = Message::tool_result(tool_id, &result.output, !result.success);
-        if let Err(e) = message_store.append(thread_id, tool_result_msg).await {
-            return Err(AgentError::new(
-                format!("Failed to append tool result: {e}"),
-                false,
-            ));
-        }
+    if tool_results.is_empty() {
+        return Ok(());
     }
+
+    let blocks: Vec<ContentBlock> = tool_results
+        .iter()
+        .map(|(tool_id, result)| ContentBlock::ToolResult {
+            tool_use_id: tool_id.clone(),
+            content: result.output.clone(),
+            is_error: if result.success { None } else { Some(true) },
+        })
+        .collect();
+
+    let batch_msg = Message {
+        role: Role::User,
+        content: Content::Blocks(blocks),
+    };
+
+    if let Err(e) = message_store.append(thread_id, batch_msg).await {
+        return Err(AgentError::new(
+            format!("Failed to append tool results: {e}"),
+            false,
+        ));
+    }
+
     Ok(())
 }
