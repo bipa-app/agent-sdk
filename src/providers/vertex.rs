@@ -1,76 +1,86 @@
-//! Google Gemini API provider implementation.
+//! Google Vertex AI provider implementation.
 //!
-//! This module provides an implementation of `LlmProvider` for the Google Gemini
-//! API (`generativelanguage.googleapis.com`).
-
-pub(crate) mod data;
+//! This module provides an implementation of `LlmProvider` for the Google Vertex AI
+//! platform, which uses the same Gemini API format but with different URL construction
+//! and `OAuth2` Bearer authentication.
 
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, Usage,
 };
-use anyhow::Result;
-use async_trait::async_trait;
-use data::{
+use crate::providers::gemini::data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
-    map_finish_reason,
+    map_finish_reason, stream_gemini_response,
 };
+use anyhow::Result;
+use async_trait::async_trait;
 use reqwest::StatusCode;
 
-const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-
-// Gemini 3 series (latest, Dec 2025)
 pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3.0-flash";
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
-// Gemini 2.5 series
-pub const MODEL_GEMINI_25_FLASH: &str = "gemini-2.5-flash";
-pub const MODEL_GEMINI_25_PRO: &str = "gemini-2.5-pro";
-
-// Gemini 2.0 series
-pub const MODEL_GEMINI_2_FLASH: &str = "gemini-2.0-flash";
-pub const MODEL_GEMINI_2_FLASH_LITE: &str = "gemini-2.0-flash-lite";
-
-/// Google Gemini LLM provider.
+/// Google Vertex AI LLM provider.
+///
+/// Uses the same Gemini request/response format as `GeminiProvider` but
+/// authenticates via `OAuth2` Bearer tokens and routes through the Vertex AI
+/// regional endpoint.
 #[derive(Clone)]
-pub struct GeminiProvider {
+pub struct VertexProvider {
     client: reqwest::Client,
-    api_key: String,
+    access_token: String,
+    project_id: String,
+    region: String,
     model: String,
 }
 
-impl GeminiProvider {
-    /// Create a new Gemini provider with the specified API key and model.
+impl VertexProvider {
+    /// Create a new Vertex AI provider with full control over all parameters.
     #[must_use]
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(access_token: String, project_id: String, region: String, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
+            access_token,
+            project_id,
+            region,
             model,
         }
     }
 
-    /// Create a provider using Gemini 3.0 Flash (fast and capable, current default).
+    /// Create a provider using Gemini 3.0 Flash on Vertex AI.
     #[must_use]
-    pub fn flash(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_3_FLASH.to_owned())
+    pub fn flash(access_token: String, project_id: String, region: String) -> Self {
+        Self::new(
+            access_token,
+            project_id,
+            region,
+            MODEL_GEMINI_3_FLASH.to_owned(),
+        )
     }
 
-    /// Create a provider using Gemini 2.0 Flash Lite (fastest, most cost-effective).
+    /// Create a provider using Gemini 3.0 Pro on Vertex AI.
     #[must_use]
-    pub fn flash_lite(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_2_FLASH_LITE.to_owned())
+    pub fn pro(access_token: String, project_id: String, region: String) -> Self {
+        Self::new(
+            access_token,
+            project_id,
+            region,
+            MODEL_GEMINI_3_PRO.to_owned(),
+        )
     }
 
-    /// Create a provider using Gemini 3.0 Pro (most capable).
-    #[must_use]
-    pub fn pro(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_3_PRO.to_owned())
+    /// Build the base URL for this provider's model endpoint.
+    fn base_url(&self) -> String {
+        format!(
+            "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}",
+            region = self.region,
+            project = self.project_id,
+            model = self.model,
+        )
     }
 }
 
 #[async_trait]
-impl LlmProvider for GeminiProvider {
+impl LlmProvider for VertexProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
@@ -96,19 +106,18 @@ impl LlmProvider for GeminiProvider {
         };
 
         log::debug!(
-            "Gemini LLM request model={} max_tokens={}",
+            "Vertex AI LLM request model={} max_tokens={}",
             self.model,
             request.max_tokens
         );
 
+        let url = format!("{}:generateContent", self.base_url());
+
         let response = self
             .client
-            .post(format!(
-                "{API_BASE_URL}/models/{}:generateContent",
-                self.model
-            ))
+            .post(&url)
             .header("Content-Type", "application/json")
-            .query(&[("key", &self.api_key)])
+            .bearer_auth(&self.access_token)
             .json(&api_request)
             .send()
             .await
@@ -121,7 +130,7 @@ impl LlmProvider for GeminiProvider {
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
 
         log::debug!(
-            "Gemini LLM response status={} body_len={}",
+            "Vertex AI LLM response status={} body_len={}",
             status,
             bytes.len()
         );
@@ -132,13 +141,13 @@ impl LlmProvider for GeminiProvider {
 
         if status.is_server_error() {
             let body = String::from_utf8_lossy(&bytes);
-            log::error!("Gemini server error status={status} body={body}");
+            log::error!("Vertex AI server error status={status} body={body}");
             return Ok(ChatOutcome::ServerError(body.into_owned()));
         }
 
         if status.is_client_error() {
             let body = String::from_utf8_lossy(&bytes);
-            log::warn!("Gemini client error status={status} body={body}");
+            log::warn!("Vertex AI client error status={status} body={body}");
             return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
         }
 
@@ -155,7 +164,7 @@ impl LlmProvider for GeminiProvider {
 
         if content.is_empty() && !candidate.content.parts.is_empty() {
             log::warn!(
-                "Gemini parts not converted to content blocks raw_parts={:?}",
+                "Vertex AI parts not converted to content blocks raw_parts={:?}",
                 candidate.content.parts
             );
         }
@@ -212,19 +221,18 @@ impl LlmProvider for GeminiProvider {
             };
 
             log::debug!(
-                "Gemini streaming LLM request model={} max_tokens={}",
+                "Vertex AI streaming LLM request model={} max_tokens={}",
                 self.model,
                 request.max_tokens
             );
 
+            let url = format!("{}:streamGenerateContent?alt=sse", self.base_url());
+
             let Ok(response) = self
                 .client
-                .post(format!(
-                    "{API_BASE_URL}/models/{}:streamGenerateContent",
-                    self.model
-                ))
+                .post(&url)
                 .header("Content-Type", "application/json")
-                .query(&[("key", &self.api_key), ("alt", &"sse".to_string())])
+                .bearer_auth(&self.access_token)
                 .json(&api_request)
                 .send()
                 .await
@@ -238,7 +246,7 @@ impl LlmProvider for GeminiProvider {
                 let body = response.text().await.unwrap_or_default();
                 let recoverable =
                     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-                log::warn!("Gemini error status={status} body={body}");
+                log::warn!("Vertex AI error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
                     recoverable,
@@ -246,7 +254,7 @@ impl LlmProvider for GeminiProvider {
                 return;
             }
 
-            let mut inner = data::stream_gemini_response(response);
+            let mut inner = stream_gemini_response(response);
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
                 yield item;
             }
@@ -258,7 +266,7 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn provider(&self) -> &'static str {
-        "gemini"
+        "vertex"
     }
 }
 
@@ -267,53 +275,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_creates_provider_with_custom_model() {
-        let provider = GeminiProvider::new("test-api-key".to_string(), "custom-model".to_string());
+    fn test_new_creates_provider() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            "custom-model".to_string(),
+        );
 
         assert_eq!(provider.model(), "custom-model");
-        assert_eq!(provider.provider(), "gemini");
+        assert_eq!(provider.provider(), "vertex");
     }
 
     #[test]
-    fn test_flash_factory_creates_flash_provider() {
-        let provider = GeminiProvider::flash("test-api-key".to_string());
+    fn test_flash_factory() {
+        let provider = VertexProvider::flash(
+            "token".to_string(),
+            "my-project".to_string(),
+            "us-central1".to_string(),
+        );
 
         assert_eq!(provider.model(), MODEL_GEMINI_3_FLASH);
-        assert_eq!(provider.provider(), "gemini");
+        assert_eq!(provider.provider(), "vertex");
     }
 
     #[test]
-    fn test_flash_lite_factory_creates_flash_lite_provider() {
-        let provider = GeminiProvider::flash_lite("test-api-key".to_string());
-
-        assert_eq!(provider.model(), MODEL_GEMINI_2_FLASH_LITE);
-        assert_eq!(provider.provider(), "gemini");
-    }
-
-    #[test]
-    fn test_pro_factory_creates_pro_provider() {
-        let provider = GeminiProvider::pro("test-api-key".to_string());
+    fn test_pro_factory() {
+        let provider = VertexProvider::pro(
+            "token".to_string(),
+            "my-project".to_string(),
+            "us-central1".to_string(),
+        );
 
         assert_eq!(provider.model(), MODEL_GEMINI_3_PRO);
-        assert_eq!(provider.provider(), "gemini");
-    }
-
-    #[test]
-    fn test_model_constants_have_expected_values() {
-        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
-        assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
-        assert_eq!(MODEL_GEMINI_25_FLASH, "gemini-2.5-flash");
-        assert_eq!(MODEL_GEMINI_25_PRO, "gemini-2.5-pro");
-        assert_eq!(MODEL_GEMINI_2_FLASH, "gemini-2.0-flash");
-        assert_eq!(MODEL_GEMINI_2_FLASH_LITE, "gemini-2.0-flash-lite");
+        assert_eq!(provider.provider(), "vertex");
     }
 
     #[test]
     fn test_provider_is_cloneable() {
-        let provider = GeminiProvider::new("test-api-key".to_string(), "test-model".to_string());
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            "test-model".to_string(),
+        );
         let cloned = provider.clone();
 
         assert_eq!(provider.model(), cloned.model());
         assert_eq!(provider.provider(), cloned.provider());
+    }
+
+    #[test]
+    fn test_base_url_construction() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            "gemini-3.0-flash".to_string(),
+        );
+
+        let url = provider.base_url();
+        assert_eq!(
+            url,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3.0-flash"
+        );
+    }
+
+    #[test]
+    fn test_base_url_with_different_region() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "other-project".to_string(),
+            "europe-west4".to_string(),
+            "gemini-3.0-pro".to_string(),
+        );
+
+        let url = provider.base_url();
+        assert!(url.starts_with("https://europe-west4-aiplatform.googleapis.com/"));
+        assert!(url.contains("/projects/other-project/"));
+        assert!(url.contains("/locations/europe-west4/"));
+        assert!(url.ends_with("/models/gemini-3.0-pro"));
+    }
+
+    #[test]
+    fn test_model_constants() {
+        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
+        assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
     }
 }
