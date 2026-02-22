@@ -2,8 +2,9 @@ use super::test_utils::*;
 use super::*;
 use crate::events::AgentEvent;
 use crate::hooks::AllowAllHooks;
-use crate::llm::ChatOutcome;
+use crate::llm::{ChatOutcome, Content, ContentBlock};
 use crate::stores::InMemoryStore;
+use crate::stores::MessageStore;
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, TurnOutcome};
 use serde_json::json;
@@ -1007,5 +1008,84 @@ async fn test_mixed_listen_and_sync_tool_calls_in_one_turn() -> anyhow::Result<(
     let outcome_3 = outcome_rx_3.await?;
     assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        // First call: LLM requests two tools at once
+        MockProvider::tool_uses_response(vec![
+            ("tool_1", "echo", json!({"message": "first"})),
+            ("tool_2", "echo", json!({"message": "second"})),
+        ]),
+        // Second call: text response
+        MockProvider::text_response("Both tools done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let message_store = Arc::new(InMemoryStore::new());
+    let message_store_ref = Arc::clone(&message_store);
+
+    let agent = AgentLoop {
+        provider: Arc::new(provider),
+        tools: Arc::new(tools),
+        hooks: Arc::new(AllowAllHooks),
+        message_store,
+        state_store: Arc::new(InMemoryStore::new()),
+        config: AgentConfig::default(),
+        compaction_config: None,
+        execution_store: None,
+    };
+
+    let thread_id = ThreadId::new();
+    let (mut rx, _final_state) = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Run both tools".to_string()),
+        ToolContext::new(()),
+    );
+
+    while rx.recv().await.is_some() {}
+
+    let history = message_store_ref.get_history(&thread_id).await?;
+
+    // Find user messages that contain ToolResult blocks
+    let tool_result_messages: Vec<_> = history
+        .iter()
+        .filter(|msg| {
+            if let Content::Blocks(blocks) = &msg.content {
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    // There should be exactly ONE user message with tool results (batched)
+    assert_eq!(
+        tool_result_messages.len(),
+        1,
+        "Expected exactly 1 batched tool_result message, got {}",
+        tool_result_messages.len()
+    );
+
+    // That single message should contain both tool results
+    if let Content::Blocks(blocks) = &tool_result_messages[0].content {
+        let tool_result_count = blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            tool_result_count, 2,
+            "Expected 2 ToolResult blocks in the batched message, got {tool_result_count}"
+        );
+    } else {
+        panic!("Expected Blocks content in tool_result message");
+    }
+
     Ok(())
 }
