@@ -9,6 +9,27 @@ use std::sync::Arc;
 use super::config::CompactionConfig;
 use super::estimator::TokenEstimator;
 
+const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+const COMPACTION_SYSTEM_PROMPT: &str =
+    "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
+const COMPACTION_SUMMARY_PROMPT: &str = r#"Summarize this conversation concisely, preserving:
+- Key decisions and conclusions reached
+- Important file paths, code changes, and technical details
+- Current task context and what has been accomplished
+- Any pending items, errors encountered, or next steps
+
+Be specific about technical details (file names, function names, error messages) as these
+are critical for continuing the work.
+
+Conversation:
+{messages_text}
+
+Provide a concise summary (aim for 500-1000 words):"#;
+const COMPACT_EMPTY_SUMMARY: &str =
+    "No additional context was available to summarize; the previous messages were already compacted.";
+const MAX_RETAINED_TAIL_MESSAGE_TOKENS: usize = 20_000;
+const MAX_TOOL_RESULT_CHARS: usize = 500;
+
 /// Trait for context compaction strategies.
 ///
 /// Implement this trait to provide custom compaction logic.
@@ -75,6 +96,110 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
         &self.config
     }
 
+    /// Return true when a content object is a previously inserted compaction summary marker.
+    fn is_summary_message(content: &Content) -> bool {
+        match content {
+            Content::Text(text) => text.starts_with(SUMMARY_PREFIX),
+            Content::Blocks(blocks) => blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.starts_with(SUMMARY_PREFIX),
+                _ => false,
+            }),
+        }
+    }
+
+    /// Return true when a message contains a tool-use block.
+    fn has_tool_use(content: &Content) -> bool {
+        matches!(
+            content,
+            Content::Blocks(blocks)
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        )
+    }
+
+    /// Return true when a message contains a tool-result block.
+    fn has_tool_result(content: &Content) -> bool {
+        matches!(
+            content,
+            Content::Blocks(blocks)
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        )
+    }
+
+    /// Shift split point backwards until tool-use/result pairs are not split.
+    fn split_point_preserves_tool_pairs(messages: &[Message], mut split_point: usize) -> usize {
+        while split_point > 0 && split_point < messages.len() {
+            let prev = &messages[split_point - 1];
+            let next = &messages[split_point];
+
+            let crosses_tool_pair =
+                (prev.role == Role::Assistant
+                    && Self::has_tool_use(&prev.content)
+                    && next.role == Role::User
+                    && Self::has_tool_result(&next.content))
+                    || (prev.role == Role::User
+                        && Self::has_tool_result(&prev.content)
+                        && next.role == Role::Assistant
+                        && Self::has_tool_use(&next.content));
+
+            if crosses_tool_pair {
+                split_point -= 1;
+                continue;
+            }
+
+            break;
+        }
+
+        split_point
+    }
+
+    /// Shift split point to satisfy both pair safety and retained-tail token cap.
+    fn split_point_preserves_tool_pairs_with_cap(
+        messages: &[Message],
+        mut split_point: usize,
+        max_tokens: usize,
+    ) -> usize {
+        loop {
+            let candidate = Self::retain_tail_with_token_cap(messages, split_point, max_tokens);
+            let adjusted = Self::split_point_preserves_tool_pairs(messages, candidate);
+
+            if adjusted == split_point {
+                return candidate;
+            }
+
+            split_point = adjusted;
+        }
+    }
+
+    /// Keep most recent messages that fit within the retained-message token budget.
+    fn retain_tail_with_token_cap(messages: &[Message], start: usize, max_tokens: usize) -> usize {
+        if start >= messages.len() {
+            return messages.len();
+        }
+
+        if max_tokens == 0 {
+            return messages.len();
+        }
+
+        let mut used = 0usize;
+        let mut retained_start = messages.len();
+
+        for idx in (start..messages.len()).rev() {
+            let message_tokens = TokenEstimator::estimate_message(&messages[idx]);
+            if used + message_tokens > max_tokens {
+                break;
+            }
+
+            retained_start = idx;
+            used += message_tokens;
+        }
+
+        retained_start
+    }
+
     /// Format messages for summarization.
     fn format_messages_for_summary(messages: &[Message]) -> String {
         let mut output = String::new();
@@ -120,8 +245,9 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
                                     "success"
                                 };
                                 // Truncate long tool results (Unicode-safe; avoid slicing mid-codepoint)
-                                let truncated = if content.chars().count() > 500 {
-                                    let prefix: String = content.chars().take(500).collect();
+                                let truncated = if content.chars().count() > MAX_TOOL_RESULT_CHARS {
+                                    let prefix: String =
+                                        content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
                                     format!("{prefix}... (truncated)")
                                 } else {
                                     content.clone()
@@ -146,31 +272,28 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
 
     /// Build the summarization prompt.
     fn build_summary_prompt(messages_text: &str) -> String {
-        format!(
-            r"Summarize this conversation concisely, preserving:
-- Key decisions and conclusions reached
-- Important file paths, code changes, and technical details
-- Current task context and what has been accomplished
-- Any pending items, errors encountered, or next steps
-
-Be specific about technical details (file names, function names, error messages) as these are critical for continuing the work.
-
-Conversation:
-{messages_text}
-
-Provide a concise summary (aim for 500-1000 words):"
-        )
+        COMPACTION_SUMMARY_PROMPT.replace("{messages_text}", messages_text)
     }
 }
 
 #[async_trait]
 impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
     async fn compact(&self, messages: &[Message]) -> Result<String> {
-        let messages_text = Self::format_messages_for_summary(messages);
+        let messages_to_summarize: Vec<_> = messages
+            .iter()
+            .filter(|message| !Self::is_summary_message(&message.content))
+            .cloned()
+            .collect();
+
+        if messages_to_summarize.is_empty() {
+            return Ok(COMPACT_EMPTY_SUMMARY.to_string());
+        }
+
+        let messages_text = Self::format_messages_for_summary(&messages_to_summarize);
         let prompt = Self::build_summary_prompt(&messages_text);
 
         let request = ChatRequest {
-            system: "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details that would be needed to continue the work.".to_string(),
+            system: COMPACTION_SYSTEM_PROMPT.to_string(),
             messages: vec![Message::user(prompt)],
             tools: None,
             max_tokens: 2000,
@@ -234,22 +357,11 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
 
         // Split messages: old messages to summarize, recent messages to keep
         let mut split_point = messages.len().saturating_sub(self.config.retain_recent);
-
-        // Adjust split_point backwards if it lands between an assistant message
-        // with tool_use and its following user message with tool_result. Breaking
-        // these pairs corrupts the conversation history for the Anthropic API.
-        while split_point > 0 {
-            if let Content::Blocks(blocks) = &messages[split_point].content {
-                let has_tool_result = blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-                if has_tool_result && messages[split_point].role == Role::User {
-                    split_point -= 1;
-                    continue;
-                }
-            }
-            break;
-        }
+        split_point = Self::split_point_preserves_tool_pairs_with_cap(
+            &messages,
+            split_point,
+            MAX_RETAINED_TAIL_MESSAGE_TOKENS,
+        );
 
         let (to_summarize, to_keep) = messages.split_at(split_point);
 
@@ -260,9 +372,7 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
 
         // Add summary as a user message
-        new_messages.push(Message::user(format!(
-            "[Previous conversation summary]\n\n{summary}"
-        )));
+        new_messages.push(Message::user(format!("{SUMMARY_PREFIX}{summary}")));
 
         // Add acknowledgment from assistant
         new_messages.push(Message::assistant(
@@ -289,22 +399,57 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
 mod tests {
     use super::*;
     use crate::llm::{ChatResponse, StopReason, Usage};
+    use std::sync::Mutex;
 
     struct MockProvider {
         summary_response: String,
+        requests: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl MockProvider {
         fn new(summary: &str) -> Self {
             Self {
                 summary_response: summary.to_string(),
+                requests: None,
+            }
+        }
+
+        fn new_with_request_log(summary: &str, requests: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                summary_response: summary.to_string(),
+                requests: Some(requests),
             }
         }
     }
 
     #[async_trait]
     impl LlmProvider for MockProvider {
-        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            if let Some(requests) = &self.requests {
+                let mut entries = requests.lock().unwrap();
+                let user_prompt = request
+                    .messages
+                    .iter()
+                    .find_map(|message| match &message.content {
+                        Content::Text(text) => Some(text.clone()),
+                        Content::Blocks(blocks) => {
+                            let text = blocks
+                                .iter()
+                                .filter_map(|block| {
+                                    if let ContentBlock::Text { text } = block {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if text.is_empty() { None } else { Some(text) }
+                        }
+                    })
+                    .unwrap_or_default();
+                entries.push(user_prompt);
+            }
             Ok(ChatOutcome::Success(ChatResponse {
                 id: "test".to_string(),
                 content: vec![ContentBlock::Text {
@@ -485,6 +630,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compact_filters_summary_messages() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "Fresh summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default().with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::user(format!("{SUMMARY_PREFIX}already compacted context")),
+            Message::assistant("Continue with the next task using this context."),
+        ];
+
+        let summary = compactor.compact(&messages).await?;
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(summary, "Fresh summary");
+        assert!(recorded[0].contains("Continue with the next task using this context."));
+        assert!(!recorded[0].contains("already compacted context"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_ignores_prior_summary_in_candidate_payload() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "Fresh history summary",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::user(format!("{SUMMARY_PREFIX}already compacted context")),
+            Message::assistant("Current turn content from the latest exchange."),
+            Message::assistant("Recent message that should stay."),
+            Message::user("Newest note that should stay."),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains("Current turn content from the latest exchange."));
+        assert!(!recorded[0].contains("already compacted context"));
+        assert_eq!(result.new_count, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_is_no_op_when_candidate_window_has_only_summaries() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_with_request_log(
+            "This summary should not be used",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::user(format!("{SUMMARY_PREFIX}first prior compacted section")),
+            Message::assistant(format!("{SUMMARY_PREFIX}second prior compacted section")),
+            Message::user(format!("{SUMMARY_PREFIX}third prior compacted section")),
+            Message::assistant("final short note"),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        let recorded = requests.lock().unwrap();
+        assert!(recorded.is_empty());
+        assert_eq!(result.new_count, 4);
+        assert_eq!(result.messages.len(), 4);
+
+        if let Content::Text(text) = &result.messages[0].content {
+            assert!(text.contains(COMPACT_EMPTY_SUMMARY));
+        } else {
+            panic!("Expected summary text in first message");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_compact_history_preserves_tool_use_tool_result_pairs() -> Result<()> {
         let provider = Arc::new(MockProvider::new("Summary of earlier conversation."));
         let config = CompactionConfig::default()
@@ -556,6 +792,129 @@ mod tests {
         } else {
             panic!("Expected Blocks content for user tool_result message");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_preserves_tool_result_tool_use_pairs() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("Summary around tool pair."));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        // Build a history where split_point would land on tool-use tool-result crossing in the
+        // opposite direction:
+        // ... user tool_result | assistant tool_use ...
+        let messages = vec![
+            Message::user("Start a workflow"),
+            Message {
+                role: Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_odd".to_string(),
+                    content: "prior result".to_string(),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tool_odd".to_string(),
+                    name: "follow_up".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+            },
+            Message::assistant("Follow up done."),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        // Split-point starts at 2 and is adjusted back to 1, keeping the tool result and tool use.
+        assert_eq!(result.new_count, 5);
+
+        // tool_result should remain with the kept tail.
+        let kept_result = &result.messages[2];
+        if let Content::Blocks(blocks) = &kept_result.content {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+                "Expected kept user tool_result in retained tail"
+            );
+        } else {
+            panic!("Expected tool_result blocks in retained tail");
+        }
+
+        // tool_use should remain with the kept tail.
+        let kept_tool_use = &result.messages[3];
+        if let Content::Blocks(blocks) = &kept_tool_use.content {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+                "Expected kept assistant tool_use in retained tail"
+            );
+        } else {
+            panic!("Expected tool_use blocks in retained tail");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_retained_tail_is_token_capped() -> Result<()> {
+        let provider = Arc::new(MockProvider::new(
+            "Project summary with a long context and technical context.",
+        ));
+        let config = CompactionConfig::default()
+            .with_retain_recent(8)
+            .with_min_messages(1)
+            .with_threshold_tokens(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let mut messages = Vec::new();
+
+        // Older messages that will be summarized away.
+        messages.extend((0..6).map(|index| Message::user(format!("pre-compaction noise {index}"))));
+
+        // Newer long messages: intentionally large to force retained-tail truncation.
+        messages.extend((0..8).map(|index| Message::assistant(format!(
+            "kept-{index}: {}",
+            "x".repeat(12_000)
+        ))));
+
+        let result = compactor.compact_history(messages).await?;
+
+        // The retained tail should be token capped and therefore shorter than retain_recent.
+        let retained_tail = &result.messages[2..];
+        assert!(retained_tail.len() < 8);
+
+        let mut latest_index = -1i32;
+        let mut all_retained = true;
+        for message in retained_tail {
+            if let Content::Text(text) = &message.content {
+                if let Some(number) = text.split(':').next().and_then(|prefix| {
+                    prefix
+                        .strip_prefix("kept-")
+                        .and_then(|rest| rest.parse::<i32>().ok())
+                }) {
+                    if number >= 0 {
+                        latest_index = latest_index.max(number);
+                    }
+                } else {
+                    all_retained = false;
+                }
+            } else {
+                all_retained = false;
+            }
+        }
+
+        assert!(all_retained);
+        assert_eq!(latest_index, 7);
+        assert!(TokenEstimator::estimate_history(retained_tail) <= MAX_RETAINED_TAIL_MESSAGE_TOKENS);
+        assert!(compactor.needs_compaction(&result.messages));
 
         Ok(())
     }
