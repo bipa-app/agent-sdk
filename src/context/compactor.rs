@@ -10,23 +10,11 @@ use super::config::CompactionConfig;
 use super::estimator::TokenEstimator;
 
 const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
-const COMPACTION_SYSTEM_PROMPT: &str =
-    "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
-const COMPACTION_SUMMARY_PROMPT: &str = r#"Summarize this conversation concisely, preserving:
-- Key decisions and conclusions reached
-- Important file paths, code changes, and technical details
-- Current task context and what has been accomplished
-- Any pending items, errors encountered, or next steps
-
-Be specific about technical details (file names, function names, error messages) as these
-are critical for continuing the work.
-
-Conversation:
-{messages_text}
-
-Provide a concise summary (aim for 500-1000 words):"#;
-const COMPACT_EMPTY_SUMMARY: &str =
-    "No additional context was available to summarize; the previous messages were already compacted.";
+const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
+const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation concisely, preserving:\n- Key decisions and conclusions reached\n- Important file paths, code changes, and technical details\n- Current task context and what has been accomplished\n- Any pending items, errors encountered, or next steps\n\nBe specific about technical details (file names, function names, error messages) as these\nare critical for continuing the work.\n\nConversation:\n";
+const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
+    "Provide a concise summary (aim for 500-1000 words):";
+const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const MAX_RETAINED_TAIL_MESSAGE_TOKENS: usize = 20_000;
 const MAX_TOOL_RESULT_CHARS: usize = 500;
 
@@ -135,15 +123,14 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
             let prev = &messages[split_point - 1];
             let next = &messages[split_point];
 
-            let crosses_tool_pair =
-                (prev.role == Role::Assistant
-                    && Self::has_tool_use(&prev.content)
-                    && next.role == Role::User
-                    && Self::has_tool_result(&next.content))
-                    || (prev.role == Role::User
-                        && Self::has_tool_result(&prev.content)
-                        && next.role == Role::Assistant
-                        && Self::has_tool_use(&next.content));
+            let crosses_tool_pair = (prev.role == Role::Assistant
+                && Self::has_tool_use(&prev.content)
+                && next.role == Role::User
+                && Self::has_tool_result(&next.content))
+                || (prev.role == Role::User
+                    && Self::has_tool_result(&prev.content)
+                    && next.role == Role::Assistant
+                    && Self::has_tool_use(&next.content));
 
             if crosses_tool_pair {
                 split_point -= 1;
@@ -272,7 +259,9 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
 
     /// Build the summarization prompt.
     fn build_summary_prompt(messages_text: &str) -> String {
-        COMPACTION_SUMMARY_PROMPT.replace("{messages_text}", messages_text)
+        format!(
+            "{COMPACTION_SUMMARY_PROMPT_PREFIX}{messages_text}{COMPACTION_SUMMARY_PROMPT_SUFFIX}"
+        )
     }
 }
 
@@ -646,11 +635,14 @@ mod tests {
 
         let summary = compactor.compact(&messages).await?;
 
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(summary, "Fresh summary");
-        assert!(recorded[0].contains("Continue with the next task using this context."));
-        assert!(!recorded[0].contains("already compacted context"));
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(summary, "Fresh summary");
+            assert!(recorded[0].contains("Continue with the next task using this context."));
+            assert!(!recorded[0].contains("already compacted context"));
+            drop(recorded);
+        }
 
         Ok(())
     }
@@ -676,17 +668,21 @@ mod tests {
 
         let result = compactor.compact_history(messages).await?;
 
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert!(recorded[0].contains("Current turn content from the latest exchange."));
-        assert!(!recorded[0].contains("already compacted context"));
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].contains("Current turn content from the latest exchange."));
+            assert!(!recorded[0].contains("already compacted context"));
+            drop(recorded);
+        }
         assert_eq!(result.new_count, 4);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_compact_history_is_no_op_when_candidate_window_has_only_summaries() -> Result<()> {
+    async fn test_compact_history_is_no_op_when_candidate_window_has_only_summaries() -> Result<()>
+    {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(MockProvider::new_with_request_log(
             "This summary should not be used",
@@ -706,8 +702,11 @@ mod tests {
 
         let result = compactor.compact_history(messages).await?;
 
-        let recorded = requests.lock().unwrap();
-        assert!(recorded.is_empty());
+        {
+            let recorded = requests.lock().unwrap();
+            assert!(recorded.is_empty());
+            drop(recorded);
+        }
         assert_eq!(result.new_count, 4);
         assert_eq!(result.messages.len(), 4);
 
@@ -880,10 +879,9 @@ mod tests {
         messages.extend((0..6).map(|index| Message::user(format!("pre-compaction noise {index}"))));
 
         // Newer long messages: intentionally large to force retained-tail truncation.
-        messages.extend((0..8).map(|index| Message::assistant(format!(
-            "kept-{index}: {}",
-            "x".repeat(12_000)
-        ))));
+        messages.extend(
+            (0..8).map(|index| Message::assistant(format!("kept-{index}: {}", "x".repeat(12_000)))),
+        );
 
         let result = compactor.compact_history(messages).await?;
 
@@ -913,7 +911,9 @@ mod tests {
 
         assert!(all_retained);
         assert_eq!(latest_index, 7);
-        assert!(TokenEstimator::estimate_history(retained_tail) <= MAX_RETAINED_TAIL_MESSAGE_TOKENS);
+        assert!(
+            TokenEstimator::estimate_history(retained_tail) <= MAX_RETAINED_TAIL_MESSAGE_TOKENS
+        );
         assert!(compactor.needs_compaction(&result.messages));
 
         Ok(())
