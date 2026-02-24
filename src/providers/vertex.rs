@@ -69,9 +69,18 @@ impl VertexProvider {
     }
 
     /// Build the base URL for this provider's model endpoint.
+    ///
+    /// For the `global` location the domain is `aiplatform.googleapis.com`
+    /// (no region prefix). Regional locations use `{region}-aiplatform.googleapis.com`.
     fn base_url(&self) -> String {
+        let domain = if self.region == "global" {
+            "aiplatform.googleapis.com".to_owned()
+        } else {
+            format!("{}-aiplatform.googleapis.com", self.region)
+        };
         format!(
-            "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}",
+            "https://{domain}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}",
+            domain = domain,
             region = self.region,
             project = self.project_id,
             model = self.model,
@@ -355,6 +364,22 @@ mod tests {
         assert!(url.contains("/projects/other-project/"));
         assert!(url.contains("/locations/europe-west4/"));
         assert!(url.ends_with("/models/gemini-3.0-pro"));
+    }
+
+    #[test]
+    fn test_base_url_global_region_has_no_prefix() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "bipa-278720".to_string(),
+            "global".to_string(),
+            "gemini-3.1-pro-preview".to_string(),
+        );
+
+        let url = provider.base_url();
+        assert_eq!(
+            url,
+            "https://aiplatform.googleapis.com/v1/projects/bipa-278720/locations/global/publishers/google/models/gemini-3.1-pro-preview"
+        );
     }
 
     #[test]
