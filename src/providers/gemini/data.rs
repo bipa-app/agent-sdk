@@ -101,7 +101,7 @@ pub struct ApiThinkingConfig {
 }
 
 /// Map an agent-sdk `ThinkingConfig` to the Gemini API thinking level.
-pub fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingConfig {
+pub const fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingConfig {
     use crate::llm::ThinkingMode;
     let level = match &config.mode {
         // Adaptive → let the model decide (HIGH gives it the most room)
@@ -117,7 +117,9 @@ pub fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingCo
             }
         }
     };
-    ApiThinkingConfig { thinking_level: level }
+    ApiThinkingConfig {
+        thinking_level: level,
+    }
 }
 
 // ============================================================================
