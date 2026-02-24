@@ -588,6 +588,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
     TurnStopReasonParams {
         stop_reason,
         text_content,
+        had_tool_calls,
         message_id,
         turn_usage,
         ctx,
@@ -609,6 +610,10 @@ where
             info!("Agent completed (end_turn) (turn={})", ctx.turn);
             InternalTurnResult::Done
         }
+        Some(StopReason::ToolUse) => {
+            debug!("Tool use stop (turn={})", ctx.turn);
+            InternalTurnResult::Continue { turn_usage }
+        }
         Some(StopReason::Refusal) => {
             warn!(
                 "Model refused request (turn={}): {:?}",
@@ -622,6 +627,30 @@ where
             )
             .await;
             InternalTurnResult::Refusal
+        }
+        Some(StopReason::MaxTokens) => {
+            if had_tool_calls {
+                // Tool calls were executed and their results appended as a user
+                // message, so message alternation is preserved. Safe to continue.
+                warn!(
+                    "Max tokens reached with tool calls (turn={}), continuing",
+                    ctx.turn
+                );
+                InternalTurnResult::Continue { turn_usage }
+            } else {
+                // No tool calls means no user message was appended after the
+                // assistant message. Continuing would create consecutive assistant
+                // messages which violates the API's alternation requirement and
+                // corrupts thinking block history. Stop gracefully.
+                warn!(
+                    "Max tokens reached with no tool calls (turn={}, has_text={}). \
+                     Stopping to prevent consecutive assistant messages. \
+                     Consider increasing max_tokens.",
+                    ctx.turn,
+                    text_content.is_some(),
+                );
+                InternalTurnResult::Done
+            }
         }
         Some(StopReason::ModelContextWindowExceeded) => {
             warn!("Model context window exceeded (turn={})", ctx.turn);
@@ -645,7 +674,27 @@ where
                 false,
             ))
         }
-        _ => InternalTurnResult::Continue { turn_usage },
+        Some(StopReason::StopSequence) => {
+            info!("Stop sequence hit (turn={})", ctx.turn);
+            InternalTurnResult::Done
+        }
+        None => {
+            // Unknown/missing stop reason. Only continue if tool results were
+            // appended (preserving message alternation).
+            if had_tool_calls {
+                warn!(
+                    "No stop reason with tool calls (turn={}), continuing",
+                    ctx.turn
+                );
+                InternalTurnResult::Continue { turn_usage }
+            } else {
+                warn!(
+                    "No stop reason and no tool calls (turn={}), stopping",
+                    ctx.turn
+                );
+                InternalTurnResult::Done
+            }
+        }
     }
 }
 
@@ -734,6 +783,8 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
+    let had_tool_calls = !pending_tool_calls.is_empty();
+
     if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
         pending_tool_calls,
         tool_context,
@@ -757,6 +808,7 @@ where
     handle_turn_stop_reason(TurnStopReasonParams {
         stop_reason,
         text_content,
+        had_tool_calls,
         message_id,
         turn_usage,
         ctx,

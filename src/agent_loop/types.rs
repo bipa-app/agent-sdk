@@ -330,6 +330,7 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
 pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) stop_reason: Option<StopReason>,
     pub(super) text_content: Option<String>,
+    pub(super) had_tool_calls: bool,
     pub(super) message_id: String,
     pub(super) turn_usage: TokenUsage,
     pub(super) ctx: &'a mut TurnContext,
