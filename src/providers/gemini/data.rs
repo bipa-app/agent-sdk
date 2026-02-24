@@ -389,13 +389,14 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                                     block_index += 1;
                                 }
                             }
-                            ApiPart::FunctionCall { function_call, .. } => {
+                            ApiPart::FunctionCall { function_call, thought_signature } => {
                                 saw_function_call = true;
                                 let id = format!("call_{}", uuid_simple());
                                 yield Ok(StreamDelta::ToolUseStart {
                                     id: id.clone(),
                                     name: function_call.name.clone(),
                                     block_index,
+                                    thought_signature: thought_signature.clone(),
                                 });
                                 yield Ok(StreamDelta::ToolInputDelta {
                                     id,

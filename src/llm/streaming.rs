@@ -39,6 +39,8 @@ pub enum StreamDelta {
         name: String,
         /// Index of the content block
         block_index: usize,
+        /// Optional thought signature (used by Gemini 3.x models)
+        thought_signature: Option<String>,
     },
 
     /// Incremental JSON for tool input (partial/incomplete JSON).
@@ -121,6 +123,8 @@ pub struct ToolUseAccumulator {
     pub input_json: String,
     /// Block index for ordering
     pub block_index: usize,
+    /// Optional thought signature (used by Gemini 3.x models)
+    pub thought_signature: Option<String>,
 }
 
 impl StreamAccumulator {
@@ -149,12 +153,14 @@ impl StreamAccumulator {
                 id,
                 name,
                 block_index,
+                thought_signature,
             } => {
                 self.tool_uses.push(ToolUseAccumulator {
                     id: id.clone(),
                     name: name.clone(),
                     input_json: String::new(),
                     block_index: *block_index,
+                    thought_signature: thought_signature.clone(),
                 });
             }
             StreamDelta::ToolInputDelta { id, delta, .. } => {
@@ -239,7 +245,7 @@ impl StreamAccumulator {
                     id: tool.id,
                     name: tool.name,
                     input,
-                    thought_signature: None, // Streaming doesn't provide thought signatures
+                    thought_signature: tool.thought_signature,
                 },
             ));
         }
@@ -310,6 +316,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "read_file".to_string(),
             block_index: 0,
+            thought_signature: None,
         });
         acc.apply(&StreamDelta::ToolInputDelta {
             id: "call_123".to_string(),
@@ -348,6 +355,7 @@ mod tests {
             id: "call_456".to_string(),
             name: "read_file".to_string(),
             block_index: 1,
+            thought_signature: None,
         });
         acc.apply(&StreamDelta::ToolInputDelta {
             id: "call_456".to_string(),
@@ -380,6 +388,7 @@ mod tests {
             id: "call_789".to_string(),
             name: "test_tool".to_string(),
             block_index: 0,
+            thought_signature: None,
         });
         acc.apply(&StreamDelta::ToolInputDelta {
             id: "call_789".to_string(),

@@ -250,6 +250,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 id: acc.id.clone(),
                                 name: acc.name.clone(),
                                 block_index: 1,
+                                thought_signature: None,
                             });
                             yield Ok(StreamDelta::ToolInputDelta {
                                 id: acc.id.clone(),

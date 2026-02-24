@@ -47,11 +47,12 @@ pub trait LlmProvider: Send + Sync {
                                 | ContentBlock::Document { .. } => {
                                     // Not streamed in the default implementation
                                 }
-                                ContentBlock::ToolUse { id, name, input, .. } => {
+                                ContentBlock::ToolUse { id, name, input, thought_signature } => {
                                     yield Ok(StreamDelta::ToolUseStart {
                                         id: id.clone(),
                                         name: name.clone(),
                                         block_index: idx,
+                                        thought_signature: thought_signature.clone(),
                                     });
                                     yield Ok(StreamDelta::ToolInputDelta {
                                         id: id.clone(),

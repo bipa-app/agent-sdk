@@ -489,6 +489,7 @@ fn build_stream_end_deltas(
             id: tool.id.clone(),
             name: tool.name.clone(),
             block_index: *idx + 1,
+            thought_signature: None,
         });
         deltas.push(StreamDelta::ToolInputDelta {
             id: tool.id.clone(),

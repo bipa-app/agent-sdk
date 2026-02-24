@@ -542,6 +542,7 @@ fn parse_sse_event(
                             id,
                             name,
                             block_index: event.index,
+                            thought_signature: None,
                         });
                     }
                     SseContentBlock::RedactedThinking { data } => {
@@ -1179,7 +1180,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
 
         assert!(matches!(
             delta,
-            Some(StreamDelta::ToolUseStart { id, name, block_index })
+            Some(StreamDelta::ToolUseStart { id, name, block_index, thought_signature: None })
             if id == "toolu_123" && name == "read_file" && block_index == 1
         ));
         // Verify tool ID is stored for later input deltas
