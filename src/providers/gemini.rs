@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
-    map_finish_reason,
+    map_finish_reason, map_thinking_config,
 };
 use reqwest::StatusCode;
 
@@ -86,12 +86,15 @@ impl LlmProvider for GeminiProvider {
             })
         };
 
+        let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
             system_instruction: system_instruction.as_ref(),
             tools: tools.as_ref().map(std::slice::from_ref),
             generation_config: Some(ApiGenerationConfig {
                 max_output_tokens: Some(request.max_tokens),
+                thinking_config,
             }),
         };
 
@@ -202,12 +205,15 @@ impl LlmProvider for GeminiProvider {
                 })
             };
 
+            let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
                 system_instruction: system_instruction.as_ref(),
                 tools: tools.as_ref().map(std::slice::from_ref),
                 generation_config: Some(ApiGenerationConfig {
                     max_output_tokens: Some(request.max_tokens),
+                    thinking_config,
                 }),
             };
 

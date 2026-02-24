@@ -86,6 +86,40 @@ pub struct ApiFunctionDeclaration {
 pub struct ApiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ApiThinkingConfig>,
+}
+
+/// Gemini thinking configuration.
+///
+/// Gemini 3.x models use `thinking_level` (LOW / MEDIUM / HIGH).
+/// Thinking **cannot be disabled** on Gemini 3 Pro and 3.1 Pro.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiThinkingConfig {
+    pub thinking_level: &'static str,
+}
+
+/// Map an agent-sdk `ThinkingConfig` to the Gemini API thinking level.
+pub const fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingConfig {
+    use crate::llm::ThinkingMode;
+    let level = match &config.mode {
+        // Adaptive → let the model decide (HIGH gives it the most room)
+        ThinkingMode::Adaptive => "HIGH",
+        // Explicit budget: map to LOW / MEDIUM / HIGH based on token budget
+        ThinkingMode::Enabled { budget_tokens } => {
+            if *budget_tokens <= 4_096 {
+                "LOW"
+            } else if *budget_tokens <= 16_384 {
+                "MEDIUM"
+            } else {
+                "HIGH"
+            }
+        }
+    };
+    ApiThinkingConfig {
+        thinking_level: level,
+    }
 }
 
 // ============================================================================
@@ -480,10 +514,26 @@ mod tests {
     fn test_api_generation_config_serialization() {
         let config = ApiGenerationConfig {
             max_output_tokens: Some(1024),
+            thinking_config: None,
         };
 
         let json = serde_json::to_string(&config).unwrap_or_default();
         assert!(json.contains("\"maxOutputTokens\":1024"));
+        assert!(!json.contains("thinkingConfig"));
+    }
+
+    #[test]
+    fn test_api_generation_config_with_thinking() {
+        let config = ApiGenerationConfig {
+            max_output_tokens: Some(65536),
+            thinking_config: Some(ApiThinkingConfig {
+                thinking_level: "HIGH",
+            }),
+        };
+
+        let json = serde_json::to_string(&config).unwrap_or_default();
+        assert!(json.contains("\"thinkingConfig\""));
+        assert!(json.contains("\"thinkingLevel\":\"HIGH\""));
     }
 
     // ===================

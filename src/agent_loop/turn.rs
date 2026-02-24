@@ -14,8 +14,8 @@ use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
 };
-use crate::stores::MessageStore;
-use crate::tools::ToolRegistry;
+use crate::stores::{MessageStore, ToolExecutionStore};
+use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
     ToolResult,
@@ -698,6 +698,41 @@ where
     }
 }
 
+/// When the prompt exceeds the model's context window at the API level (returned as a 400 error
+/// rather than a `stop_reason`), attempt compaction and retry instead of failing immediately.
+async fn try_recover_prompt_too_long<P, M>(
+    error: &AgentError,
+    ctx: &mut TurnContext,
+    compaction_config: Option<&CompactionConfig>,
+    provider: &Arc<P>,
+    message_store: &Arc<M>,
+) -> Option<InternalTurnResult>
+where
+    P: LlmProvider,
+    M: MessageStore,
+{
+    if error.message.contains("prompt is too long")
+        && let Some(compact_config) = compaction_config
+    {
+        warn!(
+            "Prompt too long, attempting emergency context compaction (turn={})",
+            ctx.turn
+        );
+        if let Err(compact_err) =
+            compact_after_context_overflow(provider, compact_config, message_store, &ctx.thread_id)
+                .await
+        {
+            return Some(InternalTurnResult::Error(compact_err));
+        }
+        // Don't count the failed attempt as a turn
+        ctx.turn = ctx.turn.saturating_sub(1);
+        return Some(InternalTurnResult::Continue {
+            turn_usage: TokenUsage::default(),
+        });
+    }
+    None
+}
+
 pub(super) async fn execute_turn<Ctx, P, H, M>(
     ExecuteTurnParameters {
         tx,
@@ -758,9 +793,57 @@ where
     .await
     {
         Ok(response) => response,
-        Err(error) => return InternalTurnResult::Error(error),
+        Err(error) => {
+            if let Some(result) =
+                try_recover_prompt_too_long(&error, ctx, compaction_config, provider, message_store)
+                    .await
+            {
+                return result;
+            }
+            return InternalTurnResult::Error(error);
+        }
     };
 
+    process_response_and_run_tools(
+        response,
+        &message_id,
+        &thinking_id,
+        ctx,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        compaction_config,
+        execution_store,
+        tx,
+        seq,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn process_response_and_run_tools<Ctx, P, H, M>(
+    response: ChatResponse,
+    message_id: &str,
+    thinking_id: &str,
+    ctx: &mut TurnContext,
+    tool_context: &ToolContext<Ctx>,
+    provider: &Arc<P>,
+    tools: &Arc<ToolRegistry<Ctx>>,
+    hooks: &Arc<H>,
+    message_store: &Arc<M>,
+    compaction_config: Option<&CompactionConfig>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    seq: &SequenceCounter,
+) -> InternalTurnResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
     let turn_usage = apply_turn_usage(ctx, &response);
     let ProcessedTurnResponse {
         stop_reason,
@@ -768,8 +851,8 @@ where
         pending_tool_calls,
     } = match process_turn_response(TurnResponseProcessingParams {
         response,
-        message_id: &message_id,
-        thinking_id: &thinking_id,
+        message_id,
+        thinking_id,
         thread_id: &ctx.thread_id,
         tools,
         message_store,
@@ -809,7 +892,7 @@ where
         stop_reason,
         text_content,
         had_tool_calls,
-        message_id,
+        message_id: message_id.to_string(),
         turn_usage,
         ctx,
         provider,
