@@ -334,6 +334,7 @@ pub const fn map_finish_reason(reason: &ApiFinishReason, has_tool_calls: bool) -
 pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static> {
     Box::pin(async_stream::stream! {
         let mut block_index: usize = 0;
+        let mut in_text_block = false;
         let mut saw_function_call = false;
         let mut usage: Option<Usage> = None;
         let mut stop_reason: Option<StopReason> = None;
@@ -382,14 +383,25 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                         match part {
                             ApiPart::Text { text, .. } => {
                                 if !text.is_empty() {
+                                    // Gemini sends complete text parts per SSE event (not
+                                    // incremental deltas like Anthropic). Keep the same
+                                    // block_index for consecutive text parts so the
+                                    // StreamAccumulator appends them into one text block.
+                                    if !in_text_block {
+                                        in_text_block = true;
+                                    }
                                     yield Ok(StreamDelta::TextDelta {
                                         delta: text.clone(),
                                         block_index,
                                     });
-                                    block_index += 1;
                                 }
                             }
                             ApiPart::FunctionCall { function_call, thought_signature } => {
+                                // Switching away from text — advance the block index.
+                                if in_text_block {
+                                    in_text_block = false;
+                                    block_index += 1;
+                                }
                                 saw_function_call = true;
                                 let id = format!("call_{}", uuid_simple());
                                 yield Ok(StreamDelta::ToolUseStart {
