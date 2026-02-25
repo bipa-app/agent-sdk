@@ -136,10 +136,26 @@ pub struct ApiGenerateContentResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiCandidate {
+    /// Content can be absent when the response is blocked by safety filters.
+    #[serde(default = "ApiCandidate::empty_content")]
     pub content: ApiContent,
     pub finish_reason: Option<ApiFinishReason>,
 }
 
+impl ApiCandidate {
+    const fn empty_content() -> ApiContent {
+        ApiContent {
+            role: None,
+            parts: Vec::new(),
+        }
+    }
+}
+
+/// Gemini API finish reasons.
+///
+/// Unknown variants (e.g. `MALFORMED_FUNCTION_CALL`, `BLOCKLIST`,
+/// `PROHIBITED_CONTENT`, `SPII`) are mapped to `Other` via `#[serde(other)]`
+/// to prevent deserialization failures.
 #[derive(Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApiFinishReason {
@@ -147,13 +163,16 @@ pub enum ApiFinishReason {
     MaxTokens,
     Safety,
     Recitation,
+    #[serde(other)]
     Other,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiUsageMetadata {
+    #[serde(default)]
     pub prompt_token_count: u32,
+    #[serde(default)]
     pub candidates_token_count: u32,
 }
 
@@ -379,6 +398,7 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                         stop_reason = Some(map_finish_reason(reason, false));
                     }
 
+                    // content may be empty on safety-blocked responses
                     for part in &candidate.content.parts {
                         match part {
                             ApiPart::Text { text, .. } => {
@@ -628,6 +648,66 @@ mod tests {
         assert!(matches!(stop, ApiFinishReason::Stop));
         assert!(matches!(max_tokens, ApiFinishReason::MaxTokens));
         assert!(matches!(safety, ApiFinishReason::Safety));
+    }
+
+    #[test]
+    fn test_api_finish_reason_unknown_variants_map_to_other() {
+        let malformed: ApiFinishReason =
+            serde_json::from_str("\"MALFORMED_FUNCTION_CALL\"")
+                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let blocklist: ApiFinishReason =
+            serde_json::from_str("\"BLOCKLIST\"")
+                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let prohibited: ApiFinishReason =
+            serde_json::from_str("\"PROHIBITED_CONTENT\"")
+                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let spii: ApiFinishReason =
+            serde_json::from_str("\"SPII\"")
+                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+
+        assert!(matches!(malformed, ApiFinishReason::Other));
+        assert!(matches!(blocklist, ApiFinishReason::Other));
+        assert!(matches!(prohibited, ApiFinishReason::Other));
+        assert!(matches!(spii, ApiFinishReason::Other));
+    }
+
+    #[test]
+    fn test_api_candidate_missing_content_defaults_to_empty() {
+        let json = r#"{
+            "finishReason": "SAFETY"
+        }"#;
+
+        let candidate: ApiCandidate =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert!(candidate.content.parts.is_empty());
+        assert!(matches!(candidate.finish_reason, Some(ApiFinishReason::Safety)));
+    }
+
+    #[test]
+    fn test_api_response_with_unknown_finish_reason_parses() {
+        let json = r#"{
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "I could not call that function."}]
+                    },
+                    "finishReason": "MALFORMED_FUNCTION_CALL"
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 20
+            }
+        }"#;
+
+        let response: ApiGenerateContentResponse =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(response.candidates.len(), 1);
+        assert!(matches!(
+            response.candidates[0].finish_reason,
+            Some(ApiFinishReason::Other)
+        ));
     }
 
     // ===================
