@@ -652,18 +652,14 @@ mod tests {
 
     #[test]
     fn test_api_finish_reason_unknown_variants_map_to_other() {
-        let malformed: ApiFinishReason =
-            serde_json::from_str("\"MALFORMED_FUNCTION_CALL\"")
-                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let malformed: ApiFinishReason = serde_json::from_str("\"MALFORMED_FUNCTION_CALL\"")
+            .unwrap_or_else(|e| panic!("parse failed: {e}"));
         let blocklist: ApiFinishReason =
-            serde_json::from_str("\"BLOCKLIST\"")
-                .unwrap_or_else(|e| panic!("parse failed: {e}"));
-        let prohibited: ApiFinishReason =
-            serde_json::from_str("\"PROHIBITED_CONTENT\"")
-                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+            serde_json::from_str("\"BLOCKLIST\"").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let prohibited: ApiFinishReason = serde_json::from_str("\"PROHIBITED_CONTENT\"")
+            .unwrap_or_else(|e| panic!("parse failed: {e}"));
         let spii: ApiFinishReason =
-            serde_json::from_str("\"SPII\"")
-                .unwrap_or_else(|e| panic!("parse failed: {e}"));
+            serde_json::from_str("\"SPII\"").unwrap_or_else(|e| panic!("parse failed: {e}"));
 
         assert!(matches!(malformed, ApiFinishReason::Other));
         assert!(matches!(blocklist, ApiFinishReason::Other));
@@ -680,7 +676,10 @@ mod tests {
         let candidate: ApiCandidate =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
         assert!(candidate.content.parts.is_empty());
-        assert!(matches!(candidate.finish_reason, Some(ApiFinishReason::Safety)));
+        assert!(matches!(
+            candidate.finish_reason,
+            Some(ApiFinishReason::Safety)
+        ));
     }
 
     #[test]
