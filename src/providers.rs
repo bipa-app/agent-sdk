@@ -9,7 +9,7 @@ pub mod openai;
 pub mod openai_responses;
 pub mod vertex;
 
-pub use anthropic::AnthropicProvider;
+pub use anthropic::{AnthropicProvider, is_oauth_token};
 pub use gemini::GeminiProvider;
 pub use openai::OpenAIProvider;
 pub use openai_responses::OpenAIResponsesProvider;
