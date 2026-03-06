@@ -333,6 +333,7 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         seq,
         config,
         compaction_config,
+        compactor,
         execution_store,
     }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
 ) -> Option<AgentRunState>
@@ -355,6 +356,7 @@ where
             message_store,
             config,
             compaction_config,
+            compactor,
             execution_store,
         })
         .await;
@@ -489,6 +491,7 @@ pub(super) async fn run_loop<Ctx, P, H, M, S>(
         state_store,
         config,
         compaction_config,
+        compactor,
         execution_store,
     }: RunLoopParameters<Ctx, P, H, M, S>,
 ) -> AgentRunState
@@ -567,6 +570,7 @@ where
         seq: &seq,
         config: &config,
         compaction_config: compaction_config.as_ref(),
+        compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
     })
     .await
@@ -613,6 +617,7 @@ pub(super) async fn run_single_turn<Ctx, P, H, M, S>(
         state_store,
         config,
         compaction_config,
+        compactor,
         execution_store,
     }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
@@ -685,6 +690,7 @@ where
         message_store: &message_store,
         config: &config,
         compaction_config: compaction_config.as_ref(),
+        compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
     })
     .await;
