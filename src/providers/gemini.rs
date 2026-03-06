@@ -89,13 +89,14 @@ impl GeminiProvider {
 
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl LlmProvider for GeminiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {

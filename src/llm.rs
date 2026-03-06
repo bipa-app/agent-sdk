@@ -116,6 +116,11 @@ pub trait LlmProvider: Send + Sync {
     }
 
     /// Validate a thinking configuration against the provider/model capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested thinking mode is not supported by
+    /// the active provider/model capability set.
     fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
         let Some(thinking) = thinking else {
             return Ok(());
@@ -139,6 +144,11 @@ pub trait LlmProvider: Send + Sync {
     /// Resolve the effective thinking configuration for a request.
     ///
     /// Request-level thinking overrides provider-owned defaults when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resolved thinking configuration is not
+    /// supported by the active provider/model capability set.
     fn resolve_thinking_config(
         &self,
         request_thinking: Option<&ThinkingConfig>,

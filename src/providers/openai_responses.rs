@@ -2,7 +2,7 @@
 //!
 //! This module provides an implementation of `LlmProvider` for the `OpenAI`
 //! Responses API (`/v1/responses`). This provider supports the Codex model family
-//! and other agentic OpenAI models that expose the Responses surface.
+//! and other agentic `OpenAI` models that expose the Responses surface.
 
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
@@ -37,7 +37,7 @@ pub enum ReasoningEffort {
 
 /// `OpenAI` Responses API provider.
 ///
-/// This provider uses the `/v1/responses` endpoint for OpenAI models that expose
+/// This provider uses the `/v1/responses` endpoint for `OpenAI` models that expose
 /// agentic workflows over the Responses API.
 #[derive(Clone)]
 pub struct OpenAIResponsesProvider {
@@ -87,7 +87,7 @@ impl OpenAIResponsesProvider {
 
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
@@ -550,7 +550,7 @@ fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning
         .map(|effort| ApiReasoning { effort })
 }
 
-fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
+const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
     if let Some(effort) = config.effort {
         return Some(map_effort(effort));
     }

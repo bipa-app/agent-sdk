@@ -201,7 +201,7 @@ impl AnthropicProvider {
 
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }

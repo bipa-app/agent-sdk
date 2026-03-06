@@ -259,7 +259,7 @@ impl OpenAIProvider {
 
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
@@ -369,6 +369,7 @@ impl LlmProvider for OpenAIProvider {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
@@ -698,7 +699,7 @@ fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning
         .map(|effort| ApiReasoning { effort })
 }
 
-fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
+const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
     if let Some(effort) = config.effort {
         return Some(map_effort(effort));
     }
