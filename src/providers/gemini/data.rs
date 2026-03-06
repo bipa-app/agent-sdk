@@ -3,7 +3,9 @@
 //! Used by both the `GeminiProvider` (API key auth) and `VertexProvider` (`OAuth2` Bearer auth)
 //! since they share the same request/response format.
 
+use crate::llm::attachments::decode_attachment_bytes;
 use crate::llm::{Content, ContentBlock, StopReason, StreamBox, StreamDelta, Usage};
+use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +43,10 @@ pub enum ApiPart {
         #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
     },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: ApiBlob,
+    },
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: ApiFunctionCall,
@@ -54,6 +60,13 @@ pub enum ApiPart {
     },
     /// Catch-all for unknown part types to prevent parse failures
     Unknown(serde_json::Value),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiBlob {
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -217,11 +230,16 @@ pub fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                                 thought_signature: None,
                             });
                         }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. } => {
-                            // These blocks are not sent to the Gemini API
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                        ContentBlock::Image { source } | ContentBlock::Document { source } => {
+                            let bytes = decode_attachment_bytes(&source.data)
+                                .unwrap_or_else(|_| Vec::new());
+                            parts.push(ApiPart::InlineData {
+                                inline_data: ApiBlob {
+                                    mime_type: source.media_type.clone(),
+                                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                },
+                            });
                         }
                         ContentBlock::ToolUse {
                             id: _,
@@ -307,6 +325,9 @@ pub fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
                     input: function_call.args.clone(),
                     thought_signature: thought_signature.clone(),
                 });
+            }
+            ApiPart::InlineData { .. } => {
+                // Inline media parts are input-only for our current SDK flow.
             }
             ApiPart::FunctionResponse { .. } => {
                 // Function responses in the response are unusual, skip them

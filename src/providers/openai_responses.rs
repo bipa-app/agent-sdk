@@ -399,27 +399,34 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 }));
             }
             Content::Blocks(blocks) => {
+                let mut content_parts = Vec::new();
+
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            items.push(ApiInputItem::Message(ApiMessage {
-                                role: match msg.role {
-                                    crate::llm::Role::User => ApiRole::User,
-                                    crate::llm::Role::Assistant => ApiRole::Assistant,
-                                },
-                                content: ApiMessageContent::Text(text.clone()),
-                            }));
+                            content_parts.push(ApiInputContent::InputText { text: text.clone() });
                         }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. } => {
-                            // These blocks are not sent to the OpenAI API
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                        ContentBlock::Image { source } => {
+                            content_parts.push(ApiInputContent::InputImage {
+                                image_url: format!(
+                                    "data:{};base64,{}",
+                                    source.media_type, source.data
+                                ),
+                            });
+                        }
+                        ContentBlock::Document { source } => {
+                            content_parts.push(ApiInputContent::InputFile {
+                                filename: suggested_filename(&source.media_type),
+                                file_data: format!(
+                                    "data:{};base64,{}",
+                                    source.media_type, source.data
+                                ),
+                            });
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            // Tool use from assistant becomes a function_call in output history
                             items.push(ApiInputItem::FunctionCall(ApiFunctionCall::new(
                                 id.clone(),
                                 name.clone(),
@@ -431,12 +438,21 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                             content,
                             ..
                         } => {
-                            // Tool result becomes function_call_output
                             items.push(ApiInputItem::FunctionCallOutput(
                                 ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
                             ));
                         }
                     }
+                }
+
+                if !content_parts.is_empty() {
+                    items.push(ApiInputItem::Message(ApiMessage {
+                        role: match msg.role {
+                            crate::llm::Role::User => ApiRole::User,
+                            crate::llm::Role::Assistant => ApiRole::Assistant,
+                        },
+                        content: ApiMessageContent::Parts(content_parts),
+                    }));
                 }
             }
         }
@@ -514,6 +530,17 @@ fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
         description: Some(tool.description),
         parameters: Some(schema),
         strict: Some(true),
+    }
+}
+
+fn suggested_filename(media_type: &str) -> String {
+    match media_type {
+        "application/pdf" => "attachment.pdf".to_string(),
+        "image/png" => "image.png".to_string(),
+        "image/jpeg" => "image.jpg".to_string(),
+        "image/gif" => "image.gif".to_string(),
+        "image/webp" => "image.webp".to_string(),
+        _ => "attachment.bin".to_string(),
     }
 }
 
@@ -672,6 +699,15 @@ enum ApiRole {
 #[serde(untagged)]
 enum ApiMessageContent {
     Text(String),
+    Parts(Vec<ApiInputContent>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiInputContent {
+    InputText { text: String },
+    InputImage { image_url: String },
+    InputFile { filename: String, file_data: String },
 }
 
 #[derive(Serialize)]

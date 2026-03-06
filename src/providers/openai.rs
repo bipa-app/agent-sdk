@@ -7,7 +7,7 @@
 //! Legacy models that require the Responses API (like `gpt-5.2-codex`) are automatically
 //! routed to the correct endpoint.
 
-use crate::llm::attachments::validate_request_attachments;
+use crate::llm::attachments::{request_has_attachments, validate_request_attachments};
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
@@ -270,7 +270,8 @@ impl OpenAIProvider {
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
-        if requires_responses_api(&self.model) {
+        // or when the request includes native image/document attachments.
+        if requires_responses_api(&self.model) || request_has_attachments(&request) {
             let mut responses_provider = OpenAIResponsesProvider::with_base_url(
                 self.api_key.clone(),
                 self.model.clone(),
@@ -376,7 +377,8 @@ impl LlmProvider for OpenAIProvider {
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
-        if requires_responses_api(&self.model) {
+        // or when the request includes native image/document attachments.
+        if requires_responses_api(&self.model) || request_has_attachments(&request) {
             let api_key = self.api_key.clone();
             let model = self.model.clone();
             let base_url = self.base_url.clone();
