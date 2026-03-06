@@ -5,7 +5,8 @@
 //! request/response format.
 
 use crate::llm::{
-    ChatRequest, Content, ContentBlock, ContentSource, StopReason, StreamDelta, Usage,
+    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, StreamDelta,
+    Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -272,63 +273,105 @@ pub struct SseMessageDeltaUsage {
 // ============================================================================
 
 /// Build API messages from the chat request.
+///
+/// Anthropic requires every `thinking` block to include its opaque signature
+/// when that assistant content is sent back on a later turn. Older persisted
+/// threads or interrupted streaming turns may contain thinking text without the
+/// corresponding signature. In that case we drop the invalid thinking block
+/// instead of sending a request the API will reject.
 pub fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
     request
         .messages
         .iter()
-        .map(|m| ApiMessage {
-            role: match m.role {
-                crate::llm::Role::User => ApiRole::User,
-                crate::llm::Role::Assistant => ApiRole::Assistant,
-            },
-            content: match &m.content {
-                Content::Text(s) => ApiMessageContent::Text(s.clone()),
-                Content::Blocks(blocks) => ApiMessageContent::Blocks(
-                    blocks
-                        .iter()
-                        .map(|b| match b {
-                            ContentBlock::Text { text } => {
-                                ApiContentBlockInput::Text { text: text.clone() }
-                            }
-                            ContentBlock::Thinking {
-                                thinking,
-                                signature,
-                                ..
-                            } => ApiContentBlockInput::Thinking {
-                                thinking: thinking.clone(),
-                                signature: signature.clone(),
-                            },
-                            ContentBlock::RedactedThinking { data } => {
-                                ApiContentBlockInput::RedactedThinking { data: data.clone() }
-                            }
-                            ContentBlock::ToolUse {
-                                id, name, input, ..
-                            } => ApiContentBlockInput::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            },
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => ApiContentBlockInput::ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: content.clone(),
-                                is_error: *is_error,
-                            },
-                            ContentBlock::Image { source } => ApiContentBlockInput::Image {
-                                source: ApiSource::from_content_source(source),
-                            },
-                            ContentBlock::Document { source } => ApiContentBlockInput::Document {
-                                source: ApiSource::from_content_source(source),
-                            },
-                        })
-                        .collect(),
-                ),
-            },
-        })
+        .filter_map(build_api_message)
         .collect()
+}
+
+fn build_api_message(message: &Message) -> Option<ApiMessage> {
+    let role = map_api_role(message.role);
+    let content = build_api_message_content(&message.content, role_label(message.role))?;
+    Some(ApiMessage { role, content })
+}
+
+const fn map_api_role(role: Role) -> ApiRole {
+    match role {
+        Role::User => ApiRole::User,
+        Role::Assistant => ApiRole::Assistant,
+    }
+}
+
+const fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+fn build_api_message_content(content: &Content, role_label: &str) -> Option<ApiMessageContent> {
+    match content {
+        Content::Text(s) => Some(ApiMessageContent::Text(s.clone())),
+        Content::Blocks(blocks) => {
+            let api_blocks = blocks
+                .iter()
+                .filter_map(|block| build_api_content_block(block, role_label))
+                .collect::<Vec<_>>();
+
+            if api_blocks.is_empty() {
+                log::warn!(
+                    "Skipping Anthropic {role_label} message because all content blocks were removed"
+                );
+                None
+            } else {
+                Some(ApiMessageContent::Blocks(api_blocks))
+            }
+        }
+    }
+}
+
+fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<ApiContentBlockInput> {
+    match block {
+        ContentBlock::Text { text } => Some(ApiContentBlockInput::Text { text: text.clone() }),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            let signature = signature.clone().filter(|signature| !signature.is_empty());
+            if signature.is_none() {
+                log::warn!("Skipping Anthropic {role_label} thinking block without signature");
+                return None;
+            }
+
+            Some(ApiContentBlockInput::Thinking {
+                thinking: thinking.clone(),
+                signature,
+            })
+        }
+        ContentBlock::RedactedThinking { data } => {
+            Some(ApiContentBlockInput::RedactedThinking { data: data.clone() })
+        }
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Some(ApiContentBlockInput::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => Some(ApiContentBlockInput::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            is_error: *is_error,
+        }),
+        ContentBlock::Image { source } => Some(ApiContentBlockInput::Image {
+            source: ApiSource::from_content_source(source),
+        }),
+        ContentBlock::Document { source } => Some(ApiContentBlockInput::Document {
+            source: ApiSource::from_content_source(source),
+        }),
+    }
 }
 
 /// Build API tools from the chat request.
@@ -627,6 +670,96 @@ mod tests {
         assert!(json.contains("\"anthropic_version\":\"vertex-2023-10-16\""));
     }
 
+    #[test]
+    fn test_build_api_messages_preserves_signed_thinking_blocks() {
+        let request = ChatRequest {
+            system: "You are helpful.".to_string(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "Let me reason about this".to_string(),
+                        signature: Some("sig_123".to_string()),
+                    },
+                    ContentBlock::Text {
+                        text: "Done.".to_string(),
+                    },
+                ]),
+            }],
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        };
+
+        let messages = build_api_messages(&request);
+        let json = serde_json::to_value(&messages).unwrap();
+
+        assert_eq!(json[0]["content"][0]["type"], "thinking");
+        assert_eq!(
+            json[0]["content"][0]["thinking"],
+            "Let me reason about this"
+        );
+        assert_eq!(json[0]["content"][0]["signature"], "sig_123");
+        assert_eq!(json[0]["content"][1]["type"], "text");
+        assert_eq!(json[0]["content"][1]["text"], "Done.");
+    }
+
+    #[test]
+    fn test_build_api_messages_skips_unsigned_thinking_blocks() {
+        let request = ChatRequest {
+            system: "You are helpful.".to_string(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "Hidden reasoning".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Visible answer".to_string(),
+                    },
+                ]),
+            }],
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        };
+
+        let messages = build_api_messages(&request);
+        let json = serde_json::to_value(&messages).unwrap();
+
+        assert_eq!(json[0]["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json[0]["content"][0]["type"], "text");
+        assert_eq!(json[0]["content"][0]["text"], "Visible answer");
+    }
+
+    #[test]
+    fn test_build_api_messages_drops_message_with_only_unsigned_thinking() {
+        let request = ChatRequest {
+            system: "You are helpful.".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: Content::Blocks(vec![ContentBlock::Thinking {
+                        thinking: "Hidden reasoning".to_string(),
+                        signature: None,
+                    }]),
+                },
+                Message::user("Continue"),
+            ],
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        };
+
+        let messages = build_api_messages(&request);
+        let json = serde_json::to_value(&messages).unwrap();
+
+        assert_eq!(json.as_array().map(Vec::len), Some(1));
+        assert_eq!(json[0]["role"], "user");
+        assert_eq!(json[0]["content"], "Continue");
+    }
+
     // ===================
     // API Type Deserialization Tests
     // ===================
@@ -860,6 +993,23 @@ data: {"type":"message_stop"}"#;
         let json_delta: SseDelta =
             serde_json::from_str(r#"{"type":"input_json_delta","partial_json":"{}"}"#).unwrap();
         assert!(matches!(json_delta, SseDelta::InputJson { partial_json } if partial_json == "{}"));
+    }
+
+    #[test]
+    fn test_sse_signature_delta_parsing() {
+        let event = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_123"}}"#;
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::SignatureDelta { delta, block_index })
+            if delta == "sig_123" && block_index == 0
+        ));
     }
 
     #[test]

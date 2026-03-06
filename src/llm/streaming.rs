@@ -309,6 +309,28 @@ mod tests {
     }
 
     #[test]
+    fn test_accumulator_thinking_signature() {
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::ThinkingDelta {
+            delta: "Reasoning".to_string(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::SignatureDelta {
+            delta: "sig_123".to_string(),
+            block_index: 0,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { thinking, signature }
+            if thinking == "Reasoning" && signature.as_deref() == Some("sig_123")
+        ));
+    }
+
+    #[test]
     fn test_accumulator_tool_use() {
         let mut acc = StreamAccumulator::new();
 
