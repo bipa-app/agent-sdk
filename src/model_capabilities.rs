@@ -104,6 +104,8 @@ const ANTHROPIC_MODELS_URL: &str =
     "https://docs.anthropic.com/en/docs/about-claude/models/all-models";
 const OPENAI_MODELS_URL: &str = "https://developers.openai.com/api/docs/models";
 const OPENAI_PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing";
+const OPENAI_GPT54_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.4";
+const OPENAI_GPT53_CODEX_URL: &str = "https://developers.openai.com/api/docs/models/gpt-5.3-codex";
 const GOOGLE_MODELS_URL: &str = "https://ai.google.dev/gemini-api/docs/models";
 const GOOGLE_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 
@@ -206,6 +208,30 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         notes: None,
     },
     // OpenAI
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-5.4",
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat_with_cached(2.50, 15.0, 0.25)),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENAI_GPT54_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("OpenAI model docs list 1.05M context, 128K max output, and reasoning.effort support."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "gpt-5.3-codex",
+        context_window: Some(400_000),
+        max_output_tokens: Some(120_000),
+        pricing: Some(Pricing::flat_with_cached(1.50, 6.0, 0.375)),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENAI_GPT53_CODEX_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("OpenAI model docs list Chat Completions and Responses API support plus reasoning.effort levels."),
+    },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-5",
@@ -547,6 +573,24 @@ mod tests {
         let pricing = caps.pricing.unwrap();
         assert!((pricing.input.unwrap().usd_per_million_tokens - 1.25).abs() < f64::EPSILON);
         assert!((pricing.output.unwrap().usd_per_million_tokens - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_lookup_openai_gpt54() {
+        let caps = get_model_capabilities("openai", "gpt-5.4").unwrap();
+        assert_eq!(caps.context_window, Some(1_050_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+    }
+
+    #[test]
+    fn test_lookup_openai_gpt53_codex() {
+        let caps = get_model_capabilities("openai", "gpt-5.3-codex").unwrap();
+        assert_eq!(caps.context_window, Some(400_000));
+        assert_eq!(caps.max_output_tokens, Some(120_000));
+        assert!(caps.supports_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
     }
 
     #[test]
