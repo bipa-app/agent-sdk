@@ -17,9 +17,9 @@ const SUPPORTED_DOCUMENT_MEDIA_TYPES: &[&str] = &["application/pdf"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttachmentPolicy {
-    AnthropicInline,
-    GeminiInline,
-    OpenAIInline,
+    Anthropic,
+    Gemini,
+    OpenAI,
 }
 
 #[derive(Debug)]
@@ -86,11 +86,9 @@ pub(crate) fn validate_request_attachments(
     }
 
     match attachment_policy(provider, model) {
-        Some(AttachmentPolicy::AnthropicInline) => {
-            validate_anthropic_inline_attachments(&attachments)
-        }
-        Some(AttachmentPolicy::GeminiInline) => validate_gemini_inline_attachments(&attachments),
-        Some(AttachmentPolicy::OpenAIInline) => validate_openai_inline_attachments(&attachments),
+        Some(AttachmentPolicy::Anthropic) => validate_anthropic_inline_attachments(&attachments),
+        Some(AttachmentPolicy::Gemini) => validate_gemini_inline_attachments(&attachments),
+        Some(AttachmentPolicy::OpenAI) => validate_openai_inline_attachments(&attachments),
         None => bail!(
             "provider={provider} model={model} does not support image/document content blocks in this SDK yet"
         ),
@@ -99,11 +97,10 @@ pub(crate) fn validate_request_attachments(
 
 fn attachment_policy(provider: &str, model: &str) -> Option<AttachmentPolicy> {
     match provider {
-        "anthropic" => Some(AttachmentPolicy::AnthropicInline),
-        "openai" | "openai-responses" => Some(AttachmentPolicy::OpenAIInline),
-        "gemini" => Some(AttachmentPolicy::GeminiInline),
-        "vertex" if model.starts_with("claude-") => Some(AttachmentPolicy::AnthropicInline),
-        "vertex" => Some(AttachmentPolicy::GeminiInline),
+        "anthropic" => Some(AttachmentPolicy::Anthropic),
+        "openai" | "openai-responses" => Some(AttachmentPolicy::OpenAI),
+        "vertex" if model.starts_with("claude-") => Some(AttachmentPolicy::Anthropic),
+        "gemini" | "vertex" => Some(AttachmentPolicy::Gemini),
         _ => None,
     }
 }
@@ -154,25 +151,19 @@ fn validate_anthropic_inline_attachments(attachments: &[AttachmentRef<'_>]) -> R
 
     if image_count > ANTHROPIC_MAX_IMAGES_PER_REQUEST {
         bail!(
-            "too many image attachments for Anthropic/Vertex Claude: {} > {}",
-            image_count,
-            ANTHROPIC_MAX_IMAGES_PER_REQUEST
+            "too many image attachments for Anthropic/Vertex Claude: {image_count} > {ANTHROPIC_MAX_IMAGES_PER_REQUEST}"
         );
     }
 
     if document_count > ANTHROPIC_MAX_DOCUMENTS_PER_REQUEST {
         bail!(
-            "too many document attachments for Anthropic/Vertex Claude: {} > {}",
-            document_count,
-            ANTHROPIC_MAX_DOCUMENTS_PER_REQUEST
+            "too many document attachments for Anthropic/Vertex Claude: {document_count} > {ANTHROPIC_MAX_DOCUMENTS_PER_REQUEST}"
         );
     }
 
     if total_inline_bytes > ANTHROPIC_MAX_INLINE_ATTACHMENT_BYTES {
         bail!(
-            "total inline attachment payload exceeds Anthropic/Vertex Claude limit: {} bytes > {} bytes",
-            total_inline_bytes,
-            ANTHROPIC_MAX_INLINE_ATTACHMENT_BYTES
+            "total inline attachment payload exceeds Anthropic/Vertex Claude limit: {total_inline_bytes} bytes > {ANTHROPIC_MAX_INLINE_ATTACHMENT_BYTES} bytes"
         );
     }
 
@@ -194,9 +185,7 @@ fn validate_gemini_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Resu
 
     if total_inline_bytes > GEMINI_MAX_INLINE_ATTACHMENT_BYTES {
         bail!(
-            "total inline attachment payload exceeds Gemini/Vertex Gemini limit: {} bytes > {} bytes",
-            total_inline_bytes,
-            GEMINI_MAX_INLINE_ATTACHMENT_BYTES
+            "total inline attachment payload exceeds Gemini/Vertex Gemini limit: {total_inline_bytes} bytes > {GEMINI_MAX_INLINE_ATTACHMENT_BYTES} bytes"
         );
     }
 

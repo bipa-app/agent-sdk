@@ -404,11 +404,11 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            content_parts.push(ApiInputContent::InputText { text: text.clone() });
+                            content_parts.push(ApiInputContent::Text { text: text.clone() });
                         }
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Image { source } => {
-                            content_parts.push(ApiInputContent::InputImage {
+                            content_parts.push(ApiInputContent::Image {
                                 image_url: format!(
                                     "data:{};base64,{}",
                                     source.media_type, source.data
@@ -416,7 +416,7 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                             });
                         }
                         ContentBlock::Document { source } => {
-                            content_parts.push(ApiInputContent::InputFile {
+                            content_parts.push(ApiInputContent::File {
                                 filename: suggested_filename(&source.media_type),
                                 file_data: format!(
                                     "data:{};base64,{}",
@@ -705,9 +705,9 @@ enum ApiMessageContent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiInputContent {
-    InputText { text: String },
-    InputImage { image_url: String },
-    InputFile { filename: String, file_data: String },
+    Text { text: String },
+    Image { image_url: String },
+    File { filename: String, file_data: String },
 }
 
 #[derive(Serialize)]

@@ -326,11 +326,8 @@ pub fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
                     thought_signature: thought_signature.clone(),
                 });
             }
-            ApiPart::InlineData { .. } => {
-                // Inline media parts are input-only for our current SDK flow.
-            }
-            ApiPart::FunctionResponse { .. } => {
-                // Function responses in the response are unusual, skip them
+            ApiPart::InlineData { .. } | ApiPart::FunctionResponse { .. } => {
+                // Inline media parts and function responses are input-only in our current SDK flow.
             }
             ApiPart::Unknown(value) => {
                 log::warn!("Unknown API part type in Gemini response, skipping part={value:?}");
