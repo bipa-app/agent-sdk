@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod router;
 pub mod streaming;
 pub mod types;

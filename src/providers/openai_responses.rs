@@ -4,6 +4,7 @@
 //! Responses API (`/v1/responses`). This provider supports the Codex model family
 //! and other agentic `OpenAI` models that expose the Responses surface.
 
+use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
@@ -106,6 +107,9 @@ impl LlmProvider for OpenAIResponsesProvider {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
         let tools: Option<Vec<ApiTool>> = request
@@ -215,6 +219,13 @@ impl LlmProvider for OpenAIResponsesProvider {
                     return;
                 }
             };
+            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    recoverable: false,
+                });
+                return;
+            }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
             let tools: Option<Vec<ApiTool>> = request

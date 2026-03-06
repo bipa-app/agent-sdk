@@ -7,6 +7,7 @@
 //! Legacy models that require the Responses API (like `gpt-5.2-codex`) are automatically
 //! routed to the correct endpoint.
 
+use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
@@ -285,6 +286,9 @@ impl LlmProvider for OpenAIProvider {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let messages = build_api_messages(&request);
         let tools: Option<Vec<ApiTool>> = request
@@ -401,6 +405,13 @@ impl LlmProvider for OpenAIProvider {
                     return;
                 }
             };
+            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    recoverable: false,
+                });
+                return;
+            }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let messages = build_api_messages(&request);
             let tools: Option<Vec<ApiTool>> = request

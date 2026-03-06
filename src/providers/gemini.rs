@@ -5,6 +5,7 @@
 
 pub(crate) mod data;
 
+use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
     Usage,
@@ -103,6 +104,9 @@ impl LlmProvider for GeminiProvider {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
         let system_instruction = if request.system.is_empty() {
@@ -232,6 +236,13 @@ impl LlmProvider for GeminiProvider {
                     return;
                 }
             };
+            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    recoverable: false,
+                });
+                return;
+            }
             let contents = build_api_contents(&request.messages);
             let tools = request.tools.map(convert_tools_to_config);
             let system_instruction = if request.system.is_empty() {

@@ -6,6 +6,7 @@
 
 pub(crate) mod data;
 
+use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StreamBox, StreamDelta,
     ThinkingConfig, Usage,
@@ -215,6 +216,9 @@ impl LlmProvider for AnthropicProvider {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let messages = build_api_messages(&request);
         let tools = if self.is_oauth() {
             build_api_tools(&request).map(|tools| {
@@ -357,6 +361,14 @@ impl LlmProvider for AnthropicProvider {
                 .as_ref()
                 .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
                 .unwrap_or_default();
+
+            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    recoverable: false,
+                });
+                return;
+            }
 
             let messages = build_api_messages(&request);
             let tools = if is_oauth {
