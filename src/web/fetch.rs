@@ -239,12 +239,14 @@ where
                 success: true,
                 output: content,
                 data: Some(json!({ "url": url, "format": format_name(format) })),
+                documents: Vec::new(),
                 duration_ms: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: format!("Failed to fetch URL: {e}"),
                 data: Some(json!({ "url": url, "error": e.to_string() })),
+                documents: Vec::new(),
                 duration_ms: None,
             }),
         }

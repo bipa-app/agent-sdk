@@ -102,6 +102,7 @@ impl<T: McpTransport + 'static> Tool<()> for McpToolBridge<T> {
             success: !result.is_error,
             output,
             data: Some(serde_json::to_value(&result).unwrap_or_default()),
+            documents: Vec::new(),
             duration_ms: None,
         })
     }

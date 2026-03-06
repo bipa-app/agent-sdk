@@ -145,6 +145,7 @@ where
             success: true,
             output,
             data,
+            documents: Vec::new(),
             duration_ms: None,
         })
     }
@@ -340,7 +341,7 @@ mod tests {
         let ctx = ToolContext::new(());
         let input = json!({});
 
-        let result = tool.execute(&ctx, input).await;
+        let result: Result<ToolResult> = tool.execute(&ctx, input).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("query"));
