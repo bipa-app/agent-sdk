@@ -7,7 +7,8 @@
 pub(crate) mod data;
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StreamBox, StreamDelta,
+    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,6 +21,7 @@ use reqwest::StatusCode;
 
 const API_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
+const CLAUDE_CODE_VERSION: &str = "2.1.62";
 
 pub const MODEL_HAIKU_35: &str = "claude-3-5-haiku-20241022";
 pub const MODEL_SONNET_35: &str = "claude-3-5-sonnet-20241022";
@@ -31,18 +33,82 @@ pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
 pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 
+/// Claude Code tool name mappings for OAuth mode.
+///
+/// When using OAuth tokens, tool names must match Claude Code's exact casing.
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Maps a tool name to Claude Code's canonical casing (case-insensitive match).
+fn to_claude_code_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    for cc_name in CLAUDE_CODE_TOOLS {
+        if cc_name.to_lowercase() == lower {
+            return (*cc_name).to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Maps a Claude Code tool name back to the original tool name.
+fn from_claude_code_name(name: &str, original_names: &[String]) -> String {
+    let lower = name.to_lowercase();
+    for original in original_names {
+        if original.to_lowercase() == lower {
+            return original.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Returns true if the API key is an OAuth token (`sk-ant-oat-*`).
+#[must_use]
+pub fn is_oauth_token(api_key: &str) -> bool {
+    api_key.contains("sk-ant-oat")
+}
+
+/// Authentication mode for the Anthropic provider.
+#[derive(Clone, Debug)]
+enum AuthMode {
+    /// Standard API key authentication (x-api-key header).
+    ApiKey,
+    /// OAuth token authentication (Bearer header + Claude Code identity).
+    OAuth,
+}
+
 /// Anthropic LLM provider using the Messages API.
 #[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    auth_mode: AuthMode,
+    /// Original tool names for reverse mapping in OAuth mode (reserved for future use).
+    #[allow(dead_code)]
+    original_tool_names: Vec<String>,
 }
 
 impl AnthropicProvider {
     /// Create a new Anthropic provider with the specified API key and model.
+    ///
+    /// Automatically detects OAuth tokens (`sk-ant-oat-*`) and switches to
+    /// Bearer auth with Claude Code identity headers.
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
+        let auth_mode = if is_oauth_token(&api_key) {
+            AuthMode::OAuth
+        } else {
+            AuthMode::ApiKey
+        };
+
         // Configure client with appropriate timeouts for streaming
         // - No overall timeout (streaming can take a long time)
         // - 30 second connect timeout
@@ -57,6 +123,47 @@ impl AnthropicProvider {
             client,
             api_key,
             model,
+            auth_mode,
+            original_tool_names: Vec::new(),
+        }
+    }
+
+    /// Returns whether this provider is using OAuth authentication.
+    #[must_use]
+    pub const fn is_oauth(&self) -> bool {
+        matches!(self.auth_mode, AuthMode::OAuth)
+    }
+
+    /// Applies authentication headers to a request builder.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth_mode {
+            AuthMode::ApiKey => builder
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION),
+            AuthMode::OAuth => builder
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("anthropic-version", API_VERSION)
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+                )
+                .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                .header("x-app", "cli"),
+        }
+    }
+
+    /// Wraps the system prompt for OAuth mode (prepends Claude Code identity).
+    fn wrap_system_prompt<'a>(&self, system: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.auth_mode {
+            AuthMode::ApiKey => std::borrow::Cow::Borrowed(system),
+            AuthMode::OAuth => {
+                let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+                if system.is_empty() {
+                    std::borrow::Cow::Owned(identity.to_string())
+                } else {
+                    std::borrow::Cow::Owned(format!("{identity}\n\n{system}"))
+                }
+            }
         }
     }
 
@@ -96,7 +203,19 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         let messages = build_api_messages(&request);
-        let tools = build_api_tools(&request);
+        let tools = if self.is_oauth() {
+            build_api_tools(&request).map(|tools| {
+                tools
+                    .into_iter()
+                    .map(|mut t| {
+                        t.name = to_claude_code_name(&t.name);
+                        t
+                    })
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            build_api_tools(&request)
+        };
         let thinking = request
             .thinking
             .as_ref()
@@ -107,10 +226,12 @@ impl LlmProvider for AnthropicProvider {
             .and_then(|t| t.effort)
             .map(|effort| ApiOutputConfig { effort });
 
+        let system_prompt = self.wrap_system_prompt(&request.system);
+
         let api_request = ApiMessagesRequest {
             model: Some(&self.model),
             max_tokens: request.max_tokens,
-            system: &request.system,
+            system: &system_prompt,
             messages: &messages,
             tools: tools.as_deref(),
             stream: false,
@@ -120,9 +241,10 @@ impl LlmProvider for AnthropicProvider {
         };
 
         log::debug!(
-            "Anthropic LLM request model={} max_tokens={}",
+            "Anthropic LLM request model={} max_tokens={} oauth={}",
             self.model,
-            request.max_tokens
+            request.max_tokens,
+            self.is_oauth()
         );
 
         // Log full request payload for debugging
@@ -133,12 +255,12 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
-        let response = self
+        let builder = self
             .client
             .post(format!("{API_BASE_URL}/v1/messages"))
-            .header("Content-Type", "application/json")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_auth(builder)
             .json(&api_request)
             .send()
             .await
@@ -186,7 +308,22 @@ impl LlmProvider for AnthropicProvider {
             api_response.content.len()
         );
 
-        let content = map_content_blocks(api_response.content);
+        let mut content = map_content_blocks(api_response.content);
+
+        // Reverse-map tool names from Claude Code casing back to original names
+        if self.is_oauth() {
+            let original_names: Vec<String> = request
+                .tools
+                .as_ref()
+                .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default();
+            for block in &mut content {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    *name = from_claude_code_name(name, &original_names);
+                }
+            }
+        }
+
         let stop_reason = api_response.stop_reason.as_ref().map(map_stop_reason);
 
         Ok(ChatOutcome::Success(ChatResponse {
@@ -203,8 +340,27 @@ impl LlmProvider for AnthropicProvider {
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
+            let is_oauth = self.is_oauth();
+            let original_tool_names: Vec<String> = request
+                .tools
+                .as_ref()
+                .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default();
+
             let messages = build_api_messages(&request);
-            let tools = build_api_tools(&request);
+            let tools = if is_oauth {
+                build_api_tools(&request).map(|tools| {
+                    tools
+                        .into_iter()
+                        .map(|mut t| {
+                            t.name = to_claude_code_name(&t.name);
+                            t
+                        })
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                build_api_tools(&request)
+            };
             let thinking = request
                 .thinking
                 .as_ref()
@@ -215,10 +371,12 @@ impl LlmProvider for AnthropicProvider {
                 .and_then(|t| t.effort)
                 .map(|effort| ApiOutputConfig { effort });
 
+            let system_prompt = self.wrap_system_prompt(&request.system);
+
             let api_request = ApiMessagesRequest {
                 model: Some(&self.model),
                 max_tokens: request.max_tokens,
-                system: &request.system,
+                system: &system_prompt,
                 messages: &messages,
                 tools: tools.as_deref(),
                 stream: true,
@@ -227,7 +385,7 @@ impl LlmProvider for AnthropicProvider {
                 anthropic_version: None,
             };
 
-            log::debug!("Anthropic streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
+            log::debug!("Anthropic streaming LLM request model={} max_tokens={} oauth={}", self.model, request.max_tokens, is_oauth);
 
             // Log full request payload for debugging
             if log::log_enabled!(log::Level::Debug) {
@@ -237,12 +395,12 @@ impl LlmProvider for AnthropicProvider {
                 }
             }
 
-            let response = match self
+            let builder = self
                 .client
                 .post(format!("{API_BASE_URL}/v1/messages"))
-                .header("Content-Type", "application/json")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", API_VERSION)
+                .header("Content-Type", "application/json");
+            let response = match self
+                .apply_auth(builder)
                 .json(&api_request)
                 .send()
                 .await
@@ -353,12 +511,18 @@ impl LlmProvider for AnthropicProvider {
                     }
 
                     // Parse SSE event
-                    if let Some(delta) = parse_sse_event(
+                    if let Some(mut delta) = parse_sse_event(
                         &event_block,
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut tool_ids,
                     ) {
+                        // Reverse-map tool names from Claude Code casing
+                        if is_oauth
+                            && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
+                        {
+                            *name = from_claude_code_name(name, &original_tool_names);
+                        }
                         yield Ok(delta);
                     }
                 }
@@ -383,12 +547,17 @@ impl LlmProvider for AnthropicProvider {
                     received_message_stop = true;
                 }
 
-                if let Some(delta) = parse_sse_event(
+                if let Some(mut delta) = parse_sse_event(
                     remaining,
                     &mut input_tokens,
                     &mut output_tokens,
                     &mut tool_ids,
                 ) {
+                    if is_oauth
+                        && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
+                    {
+                        *name = from_claude_code_name(name, &original_tool_names);
+                    }
                     yield Ok(delta);
                 }
             }
