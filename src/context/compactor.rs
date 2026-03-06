@@ -10,10 +10,10 @@ use super::config::CompactionConfig;
 use super::estimator::TokenEstimator;
 
 const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
-const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
-const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation concisely, preserving:\n- Key decisions and conclusions reached\n- Important file paths, code changes, and technical details\n- Current task context and what has been accomplished\n- Any pending items, errors encountered, or next steps\n\nBe specific about technical details (file names, function names, error messages) as these\nare critical for continuing the work.\n\nConversation:\n";
+const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise technical summarizer. Summarize coding sessions so another agent can continue work immediately without rereading the full history. Preserve concrete technical details, decisions, constraints, current status, and next steps. Prefer structured summaries over prose.";
+const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this coding session using EXACTLY this structure:\n\n## Goal\n[What the user is trying to accomplish]\n\n## Constraints & Preferences\n- [Requirements, preferences, or constraints mentioned by the user]\n\n## Progress\n### Done\n- [x] [Completed work]\n\n### In Progress\n- [ ] [Work currently underway]\n\n### Blocked\n- [Issues, if any]\n\n## Key Decisions\n- **[Decision]**: [Rationale]\n\n## Next Steps\n1. [Most important next action]\n\n## Critical Context\n- [Technical facts needed to continue]\n\n<read-files>\npath/to/file\n</read-files>\n\n<modified-files>\npath/to/file\n</modified-files>\n\nRules:\n- Be concise but specific\n- Include file paths, function/type names, config values, errors, and commands when important\n- Capture what changed, what remains, and why\n- If a section is empty, include it with \"(none)\"\n- Deduplicate repeated details\n- For read-files and modified-files, include one path per line and use (none) if empty\n\nConversation:\n";
 const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
-    "Provide a concise summary (aim for 500-1000 words):";
+    "Return only the summary in the exact structure above.";
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const MAX_RETAINED_TAIL_MESSAGE_TOKENS: usize = 20_000;
 const MAX_TOOL_RESULT_CHARS: usize = 500;
