@@ -749,8 +749,8 @@ where
         return Ok(());
     }
 
-    // Build tool result blocks, followed by any documents the tool wants to
-    // pass back to the LLM as native content blocks (e.g. a decrypted PDF).
+    // Build tool result blocks, followed by any native binary attachments the
+    // tool wants to pass back to the LLM (e.g. PDFs or images).
     // All blocks for a single agent turn are batched into one user message so
     // the Anthropic API receives them together, as required.
     let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -761,9 +761,15 @@ where
             is_error: if result.success { None } else { Some(true) },
         });
         for doc in &result.documents {
-            blocks.push(ContentBlock::Document {
-                source: doc.clone(),
-            });
+            if doc.media_type.starts_with("image/") {
+                blocks.push(ContentBlock::Image {
+                    source: doc.clone(),
+                });
+            } else {
+                blocks.push(ContentBlock::Document {
+                    source: doc.clone(),
+                });
+            }
         }
     }
 
@@ -780,4 +786,54 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_tool_results;
+    use crate::llm::{Content, ContentBlock};
+    use crate::stores::{InMemoryStore, MessageStore};
+    use crate::types::{ThreadId, ToolResult};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_append_tool_results_uses_image_block_for_images() -> anyhow::Result<()> {
+        let store = Arc::new(InMemoryStore::new());
+        let thread_id = ThreadId::from_string("thread-1");
+        let result = ToolResult::success("attached image").with_documents(vec![
+            crate::llm::ContentSource::new("image/png", "ZmFrZQ=="),
+        ]);
+
+        append_tool_results(&[("tool_1".to_string(), result)], &thread_id, &store).await?;
+
+        let history = store.get_history(&thread_id).await?;
+        assert_eq!(history.len(), 1);
+
+        let Content::Blocks(blocks) = &history[0].content else {
+            anyhow::bail!("expected blocks")
+        };
+
+        assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_tool_results_uses_document_block_for_pdfs() -> anyhow::Result<()> {
+        let store = Arc::new(InMemoryStore::new());
+        let thread_id = ThreadId::from_string("thread-2");
+        let result = ToolResult::success("attached pdf").with_documents(vec![
+            crate::llm::ContentSource::new("application/pdf", "ZmFrZQ=="),
+        ]);
+
+        append_tool_results(&[("tool_1".to_string(), result)], &thread_id, &store).await?;
+
+        let history = store.get_history(&thread_id).await?;
+        let Content::Blocks(blocks) = &history[0].content else {
+            anyhow::bail!("expected blocks")
+        };
+
+        assert!(matches!(blocks[1], ContentBlock::Document { .. }));
+        Ok(())
+    }
 }

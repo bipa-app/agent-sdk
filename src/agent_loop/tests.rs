@@ -20,7 +20,7 @@ fn test_builder_creates_agent_loop() {
     let provider = MockProvider::new(vec![]);
     let agent = builder::<()>().provider(provider).build();
 
-    assert_eq!(agent.config.max_turns, Some(10));
+    assert_eq!(agent.config.max_turns, None);
     assert_eq!(agent.config.max_tokens, None);
 }
 
@@ -67,7 +67,7 @@ fn test_builder_with_custom_stores() {
         .build_with_stores();
 
     // Just verify it builds without panicking
-    assert_eq!(agent.config.max_turns, Some(10));
+    assert_eq!(agent.config.max_turns, None);
 }
 
 // ===================

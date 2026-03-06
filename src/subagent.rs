@@ -69,7 +69,7 @@ impl SubagentConfig {
         Self {
             name: name.into(),
             system_prompt: String::new(),
-            max_turns: Some(10),
+            max_turns: None,
             timeout_ms: None,
         }
     }
@@ -605,7 +605,7 @@ mod tests {
 
         assert_eq!(config.name, "default");
         assert!(config.system_prompt.is_empty());
-        assert_eq!(config.max_turns, Some(10));
+        assert_eq!(config.max_turns, None);
         assert_eq!(config.timeout_ms, None);
     }
 

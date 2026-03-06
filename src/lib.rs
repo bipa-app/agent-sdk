@@ -69,7 +69,7 @@
 //! let agent = builder::<()>()
 //!     .provider(AnthropicProvider::sonnet(api_key))
 //!     .config(AgentConfig {
-//!         max_turns: 20,
+//!         max_turns: Some(20),
 //!         system_prompt: "You are a helpful assistant.".into(),
 //!         ..Default::default()
 //!     })

@@ -29,6 +29,7 @@ bytes = "1"
 log = "0.4"
 url = "2"
 html2text = "0.14"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }

@@ -150,7 +150,7 @@ mod tests {
 
         assert_eq!(config.name, "test");
         assert_eq!(config.system_prompt, "You are a test agent");
-        assert_eq!(config.max_turns, 5);
+        assert_eq!(config.max_turns, Some(5));
         assert_eq!(config.timeout_ms, Some(30000));
     }
 }

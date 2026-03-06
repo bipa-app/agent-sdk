@@ -73,7 +73,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_turns: Some(10),
+            max_turns: None,
             max_tokens: None,
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-5-20250929"),

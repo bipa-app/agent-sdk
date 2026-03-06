@@ -609,7 +609,7 @@ use agent_sdk::{SubagentFactory, SubagentConfig, SubagentTool};
 let factory = SubagentFactory::new(provider, subagent_tools);
 let config = SubagentConfig {
     system_prompt: "You are a research assistant.".into(),
-    max_turns: 10,
+    max_turns: Some(10),
     ..Default::default()
 };
 let subagent_tool = SubagentTool::new(factory, config);
