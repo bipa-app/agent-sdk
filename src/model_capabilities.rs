@@ -545,8 +545,8 @@ mod tests {
     fn test_lookup_openai_pricing() {
         let caps = get_model_capabilities("openai", "gpt-4o").unwrap();
         let pricing = caps.pricing.unwrap();
-        assert_eq!(pricing.input.unwrap().usd_per_million_tokens, 1.25);
-        assert_eq!(pricing.output.unwrap().usd_per_million_tokens, 5.0);
+        assert!((pricing.input.unwrap().usd_per_million_tokens - 1.25).abs() < f64::EPSILON);
+        assert!((pricing.output.unwrap().usd_per_million_tokens - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]
