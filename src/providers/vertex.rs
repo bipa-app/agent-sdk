@@ -608,12 +608,9 @@ impl VertexProvider {
 
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                // Process complete SSE events (separated by double newlines)
-                while let Some(pos) = buffer.find("\n\n") {
-                    let event_block = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
-
-                    if event_block.contains("event: message_stop") {
+                // Process complete SSE events (terminated by a blank line)
+                while let Some(event_block) = anthropic_data::take_next_sse_event(&mut buffer) {
+                    if anthropic_data::is_message_stop_event(&event_block) {
                         received_message_stop = true;
                     }
 
@@ -631,7 +628,7 @@ impl VertexProvider {
             // Process remaining buffer
             let remaining = buffer.trim();
             if !remaining.is_empty() {
-                if remaining.contains("event: message_stop") {
+                if anthropic_data::is_message_stop_event(remaining) {
                     received_message_stop = true;
                 }
 

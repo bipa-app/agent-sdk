@@ -15,7 +15,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use data::{
     ApiMessagesRequest, ApiOutputConfig, ApiThinkingConfig, build_api_messages, build_api_tools,
-    map_content_blocks, map_stop_reason, parse_sse_event,
+    is_message_stop_event, map_content_blocks, map_stop_reason, parse_sse_event,
+    take_next_sse_event,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -530,13 +531,10 @@ impl LlmProvider for AnthropicProvider {
                 }
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                // Process complete SSE events (separated by double newlines)
-                while let Some(pos) = buffer.find("\n\n") {
-                    let event_block = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
-
+                // Process complete SSE events (terminated by a blank line)
+                while let Some(event_block) = take_next_sse_event(&mut buffer) {
                     // Track if we received message_stop
-                    if event_block.contains("event: message_stop") {
+                    if is_message_stop_event(&event_block) {
                         log::debug!("Received message_stop event chunk_count={chunk_count} total_bytes={total_bytes}");
                         received_message_stop = true;
                     }
@@ -574,7 +572,7 @@ impl LlmProvider for AnthropicProvider {
                 );
 
                 // Track if remaining buffer contains message_stop
-                if remaining.contains("event: message_stop") {
+                if is_message_stop_event(remaining) {
                     received_message_stop = true;
                 }
 

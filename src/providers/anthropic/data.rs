@@ -399,7 +399,7 @@ pub const fn map_stop_reason(reason: &ApiStopReason) -> StopReason {
     }
 }
 
-/// Map `ApiResponseContentBlock`s to `ContentBlock`s.
+/// Map `ApiResponseContentBlock`s to `ContentBlock`.
 pub fn map_content_blocks(blocks: Vec<ApiResponseContentBlock>) -> Vec<ContentBlock> {
     blocks
         .into_iter()
@@ -425,6 +425,77 @@ pub fn map_content_blocks(blocks: Vec<ApiResponseContentBlock>) -> Vec<ContentBl
         .collect()
 }
 
+#[derive(Deserialize)]
+struct SseTypeOnly {
+    #[serde(rename = "type")]
+    event_type: String,
+}
+
+fn preview_sse_data(data: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 200;
+    let mut preview = data.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if data.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview
+}
+
+fn log_sse_parse_error(event_type: &str, data: &str, error: &serde_json::Error) {
+    log::warn!(
+        "Failed to parse Anthropic SSE event type={event_type} error={error} data_preview={}",
+        preview_sse_data(data)
+    );
+}
+
+fn normalized_sse_event_block(event_block: &str) -> String {
+    event_block.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn parse_sse_fields(event_block: &str) -> (Option<String>, Option<String>) {
+    let normalized = normalized_sse_event_block(event_block);
+    let mut event_type = None;
+    let mut data_lines = Vec::new();
+
+    for line in normalized.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            event_type = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            data_lines.push(value.to_string());
+        }
+    }
+
+    let data = (!data_lines.is_empty()).then(|| data_lines.join("\n"));
+    let inferred_event_type = data.as_deref().and_then(|data| {
+        serde_json::from_str::<SseTypeOnly>(data)
+            .ok()
+            .map(|event| event.event_type)
+    });
+
+    (event_type.or(inferred_event_type), data)
+}
+
+pub fn take_next_sse_event(buffer: &mut String) -> Option<String> {
+    const SEPARATORS: [&str; 5] = ["\r\n\r\n", "\n\n", "\r\r", "\n\r\n", "\r\n\n"];
+
+    let (start, separator_len) = SEPARATORS
+        .into_iter()
+        .filter_map(|separator| buffer.find(separator).map(|idx| (idx, separator.len())))
+        .min_by_key(|(idx, _)| *idx)?;
+
+    let event_block = buffer[..start].to_string();
+    buffer.drain(..start + separator_len);
+    Some(event_block)
+}
+
+pub fn is_message_stop_event(event_block: &str) -> bool {
+    matches!(
+        parse_sse_fields(event_block).0.as_deref(),
+        Some("message_stop")
+    )
+}
+
 /// Parse an SSE event block and return the corresponding `StreamDelta`.
 pub fn parse_sse_event(
     event_block: &str,
@@ -432,95 +503,92 @@ pub fn parse_sse_event(
     output_tokens: &mut u32,
     tool_ids: &mut std::collections::HashMap<usize, String>,
 ) -> Option<StreamDelta> {
-    let mut event_type = None;
-    let mut data = None;
-
-    for line in event_block.lines() {
-        if let Some(value) = line.strip_prefix("event: ") {
-            event_type = Some(value.trim());
-        } else if let Some(value) = line.strip_prefix("data: ") {
-            data = Some(value);
-        }
-    }
-
+    let (event_type, data) = parse_sse_fields(event_block);
+    let event_type = event_type?;
     let data = data?;
 
-    match event_type {
-        Some("message_start") => {
+    match event_type.as_str() {
+        "message_start" => {
             // Extract input tokens from message_start
-            if let Ok(event) = serde_json::from_str::<SseMessageStart>(data) {
-                *input_tokens = event.message.usage.input_tokens;
+            match serde_json::from_str::<SseMessageStart>(&data) {
+                Ok(event) => {
+                    *input_tokens = event.message.usage.input_tokens;
+                }
+                Err(error) => log_sse_parse_error(&event_type, &data, &error),
             }
             None
         }
-        Some("content_block_start") => {
-            if let Ok(event) = serde_json::from_str::<SseContentBlockStart>(data) {
-                match event.content_block {
+        "content_block_start" => {
+            match serde_json::from_str::<SseContentBlockStart>(&data) {
+                Ok(event) => match event.content_block {
                     SseContentBlock::ToolUse { id, name } => {
                         // Store the tool ID for later input deltas
                         tool_ids.insert(event.index, id.clone());
-                        return Some(StreamDelta::ToolUseStart {
+                        Some(StreamDelta::ToolUseStart {
                             id,
                             name,
                             block_index: event.index,
                             thought_signature: None,
-                        });
+                        })
                     }
                     SseContentBlock::RedactedThinking { data } => {
-                        return Some(StreamDelta::RedactedThinking {
+                        Some(StreamDelta::RedactedThinking {
                             data,
                             block_index: event.index,
-                        });
+                        })
                     }
-                    SseContentBlock::Text | SseContentBlock::Thinking => {}
+                    SseContentBlock::Text | SseContentBlock::Thinking => None,
+                },
+                Err(error) => {
+                    log_sse_parse_error(&event_type, &data, &error);
+                    None
                 }
             }
-            None
         }
-        Some("content_block_delta") => {
-            if let Ok(event) = serde_json::from_str::<SseContentBlockDelta>(data) {
-                match event.delta {
-                    SseDelta::Text { text } => {
-                        return Some(StreamDelta::TextDelta {
-                            delta: text,
-                            block_index: event.index,
-                        });
-                    }
-                    SseDelta::Thinking { thinking } => {
-                        return Some(StreamDelta::ThinkingDelta {
-                            delta: thinking,
-                            block_index: event.index,
-                        });
-                    }
-                    SseDelta::Signature { signature } => {
-                        return Some(StreamDelta::SignatureDelta {
-                            delta: signature,
-                            block_index: event.index,
-                        });
-                    }
-                    SseDelta::InputJson { partial_json } => {
-                        // Look up the tool ID from the content_block_start event
-                        let id = tool_ids.get(&event.index).cloned().unwrap_or_default();
-                        return Some(StreamDelta::ToolInputDelta {
-                            id,
-                            delta: partial_json,
-                            block_index: event.index,
-                        });
-                    }
+        "content_block_delta" => match serde_json::from_str::<SseContentBlockDelta>(&data) {
+            Ok(event) => match event.delta {
+                SseDelta::Text { text } => Some(StreamDelta::TextDelta {
+                    delta: text,
+                    block_index: event.index,
+                }),
+                SseDelta::Thinking { thinking } => Some(StreamDelta::ThinkingDelta {
+                    delta: thinking,
+                    block_index: event.index,
+                }),
+                SseDelta::Signature { signature } => Some(StreamDelta::SignatureDelta {
+                    delta: signature,
+                    block_index: event.index,
+                }),
+                SseDelta::InputJson { partial_json } => {
+                    // Look up the tool ID from the content_block_start event
+                    let id = tool_ids.get(&event.index).cloned().unwrap_or_default();
+                    Some(StreamDelta::ToolInputDelta {
+                        id,
+                        delta: partial_json,
+                        block_index: event.index,
+                    })
+                }
+            },
+            Err(error) => {
+                log_sse_parse_error(&event_type, &data, &error);
+                None
+            }
+        },
+        "message_delta" => {
+            match serde_json::from_str::<SseMessageDelta>(&data) {
+                Ok(event) => {
+                    *output_tokens = event.usage.output_tokens;
+                    let stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
+                    // Emit final events
+                    Some(StreamDelta::Done { stop_reason })
+                }
+                Err(error) => {
+                    log_sse_parse_error(&event_type, &data, &error);
+                    None
                 }
             }
-            None
         }
-        Some("message_delta") => {
-            if let Ok(event) = serde_json::from_str::<SseMessageDelta>(data) {
-                *output_tokens = event.usage.output_tokens;
-                let stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
-                // Emit final events
-                return Some(StreamDelta::Done { stop_reason });
-            }
-            None
-        }
-        Some("message_stop") => {
+        "message_stop" => {
             // Final event - emit usage
             Some(StreamDelta::Usage(Usage {
                 input_tokens: *input_tokens,
@@ -971,6 +1039,33 @@ data: {"type":"message_stop"}"#;
                 input_tokens: 100,
                 output_tokens: 50
             }))
+        ));
+    }
+
+    #[test]
+    fn test_take_next_sse_event_handles_crlf_separator() {
+        let mut buffer =
+            "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n".to_string();
+
+        let event = take_next_sse_event(&mut buffer).unwrap();
+
+        assert!(is_message_stop_event(&event));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_sse_signature_delta_parsing_with_multiline_data_and_crlf() {
+        let event = "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\r\ndata: \"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}";
+
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut tool_ids = std::collections::HashMap::new();
+        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+
+        assert!(matches!(
+            delta,
+            Some(StreamDelta::SignatureDelta { delta, block_index })
+            if delta == "sig_123" && block_index == 0
         ));
     }
 
