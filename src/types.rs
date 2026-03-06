@@ -152,6 +152,11 @@ pub struct ToolResult {
     pub output: String,
     /// Optional structured data
     pub data: Option<serde_json::Value>,
+    /// Optional documents (PDFs, images) to pass back to the LLM as native content blocks.
+    /// The agent appends these as `ContentBlock::Document` / `ContentBlock::Image` blocks
+    /// in the same user message as the tool result, so the model can read them directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<crate::llm::ContentSource>,
     /// Duration of the tool execution in milliseconds
     pub duration_ms: Option<u64>,
 }
@@ -163,6 +168,7 @@ impl ToolResult {
             success: true,
             output: output.into(),
             data: None,
+            documents: Vec::new(),
             duration_ms: None,
         }
     }
@@ -173,6 +179,7 @@ impl ToolResult {
             success: true,
             output: output.into(),
             data: Some(data),
+            documents: Vec::new(),
             duration_ms: None,
         }
     }
@@ -183,6 +190,7 @@ impl ToolResult {
             success: false,
             output: message.into(),
             data: None,
+            documents: Vec::new(),
             duration_ms: None,
         }
     }
@@ -190,6 +198,25 @@ impl ToolResult {
     #[must_use]
     pub const fn with_duration(mut self, duration_ms: u64) -> Self {
         self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Attach documents (PDFs, images) to be sent back to the LLM as native content blocks.
+    ///
+    /// Use this when a tool produces a binary document that the model should read directly,
+    /// e.g. a decrypted PDF that Anthropic can parse natively via its document API.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use agent_sdk::{ToolResult, ContentSource};
+    ///
+    /// Ok(ToolResult::success("PDF decrypted.").with_documents(vec![
+    ///     ContentSource::new("application/pdf", base64_data),
+    /// ]))
+    /// ```
+    #[must_use]
+    pub fn with_documents(mut self, documents: Vec<crate::llm::ContentSource>) -> Self {
+        self.documents = documents;
         self
     }
 }

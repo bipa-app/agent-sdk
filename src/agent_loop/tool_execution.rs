@@ -749,14 +749,23 @@ where
         return Ok(());
     }
 
-    let blocks: Vec<ContentBlock> = tool_results
-        .iter()
-        .map(|(tool_id, result)| ContentBlock::ToolResult {
+    // Build tool result blocks, followed by any documents the tool wants to
+    // pass back to the LLM as native content blocks (e.g. a decrypted PDF).
+    // All blocks for a single agent turn are batched into one user message so
+    // the Anthropic API receives them together, as required.
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    for (tool_id, result) in tool_results {
+        blocks.push(ContentBlock::ToolResult {
             tool_use_id: tool_id.clone(),
             content: result.output.clone(),
             is_error: if result.success { None } else { Some(true) },
-        })
-        .collect();
+        });
+        for doc in &result.documents {
+            blocks.push(ContentBlock::Document {
+                source: doc.clone(),
+            });
+        }
+    }
 
     let batch_msg = Message {
         role: Role::User,

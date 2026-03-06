@@ -576,6 +576,7 @@ where
             success: result.success,
             output: result.final_response.clone(),
             data: Some(serde_json::to_value(&result).unwrap_or_default()),
+            documents: Vec::new(),
             duration_ms: Some(result.duration_ms),
         })
     }
