@@ -62,6 +62,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         provider,
         message_store,
         compaction_config,
+        compactor,
         tx,
         hooks,
         seq,
@@ -72,7 +73,7 @@ where
     H: AgentHooks,
     M: MessageStore,
 {
-    let mut messages = match message_store.get_history(thread_id).await {
+    let messages = match message_store.get_history(thread_id).await {
         Ok(m) => m,
         Err(error) => {
             send_event(
@@ -89,54 +90,122 @@ where
         }
     };
 
-    if let Some(compact_config) = compaction_config {
-        let compactor = LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+    maybe_compact_messages(MaybeCompactParams {
+        messages,
+        turn,
+        provider,
+        message_store,
+        thread_id,
+        compaction_config,
+        compactor,
+        tx,
+        hooks,
+        seq,
+    })
+    .await
+}
+
+struct MaybeCompactParams<'a, P, H, M> {
+    messages: Vec<Message>,
+    turn: usize,
+    provider: &'a Arc<P>,
+    message_store: &'a Arc<M>,
+    thread_id: &'a ThreadId,
+    compaction_config: Option<&'a CompactionConfig>,
+    compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn maybe_compact_messages<P, H, M>(
+    MaybeCompactParams {
+        messages,
+        turn,
+        provider,
+        message_store,
+        thread_id,
+        compaction_config,
+        compactor,
+        tx,
+        hooks,
+        seq,
+    }: MaybeCompactParams<'_, P, H, M>,
+) -> Result<Vec<Message>, AgentError>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let maybe_result = if let Some(compactor) = compactor {
         if compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
                 turn,
                 messages.len()
             );
+            Some(compactor.compact_history(messages.clone()).await)
+        } else {
+            None
+        }
+    } else if let Some(compact_config) = compaction_config {
+        let default_compactor =
+            LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
+        if default_compactor.needs_compaction(&messages) {
+            debug!(
+                "Context compaction triggered (turn={}, message_count={})",
+                turn,
+                messages.len()
+            );
+            Some(default_compactor.compact_history(messages.clone()).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-            match compactor.compact_history(messages.clone()).await {
-                Ok(result) => {
-                    if let Err(error) = message_store
-                        .replace_history(thread_id, result.messages.clone())
-                        .await
-                    {
-                        warn!("Failed to replace history after compaction: {error}");
-                    } else {
-                        send_event(
-                            tx,
-                            hooks,
-                            seq,
-                            AgentEvent::context_compacted(
-                                result.original_count,
-                                result.new_count,
-                                result.original_tokens,
-                                result.new_tokens,
-                            ),
-                        )
-                        .await;
+    let Some(result) = maybe_result else {
+        return Ok(messages);
+    };
 
-                        info!(
-                            "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
-                            result.original_count,
-                            result.new_count,
-                            result.original_tokens,
-                            result.new_tokens
-                        );
-                        messages = result.messages;
-                    }
-                }
-                Err(error) => {
-                    warn!("Context compaction failed, continuing with full history: {error}");
-                }
+    match result {
+        Ok(result) => {
+            if let Err(error) = message_store
+                .replace_history(thread_id, result.messages.clone())
+                .await
+            {
+                warn!("Failed to replace history after compaction: {error}");
+                Ok(messages)
+            } else {
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::context_compacted(
+                        result.original_count,
+                        result.new_count,
+                        result.original_tokens,
+                        result.new_tokens,
+                    ),
+                )
+                .await;
+
+                info!(
+                    "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
+                    result.original_count,
+                    result.new_count,
+                    result.original_tokens,
+                    result.new_tokens
+                );
+                Ok(result.messages)
             }
         }
+        Err(error) => {
+            warn!("Context compaction failed, continuing with full history: {error}");
+            Ok(messages)
+        }
     }
-
-    Ok(messages)
 }
 
 pub(super) fn build_turn_request<Ctx>(
@@ -542,6 +611,7 @@ where
 pub(super) async fn compact_after_context_overflow<P, M>(
     provider: &Arc<P>,
     compaction_config: &CompactionConfig,
+    compactor: Option<&Arc<dyn ContextCompactor>>,
     message_store: &Arc<M>,
     thread_id: &ThreadId,
 ) -> Result<(), AgentError>
@@ -549,7 +619,6 @@ where
     P: LlmProvider,
     M: MessageStore,
 {
-    let compactor = LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
     let history = message_store
         .get_history(thread_id)
         .await
@@ -560,7 +629,14 @@ where
             )
         })?;
 
-    let result = compactor.compact_history(history).await.map_err(|error| {
+    let result = if let Some(compactor) = compactor {
+        compactor.compact_history(history).await
+    } else {
+        let default_compactor =
+            LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
+        default_compactor.compact_history(history).await
+    }
+    .map_err(|error| {
         AgentError::new(
             format!("Context compaction failed after overflow: {error}"),
             false,
@@ -595,6 +671,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         provider,
         message_store,
         compaction_config,
+        compactor,
         tx,
         hooks,
         seq,
@@ -658,6 +735,7 @@ where
                 if let Err(error) = compact_after_context_overflow(
                     provider,
                     compact_config,
+                    compactor,
                     message_store,
                     &ctx.thread_id,
                 )
@@ -704,6 +782,7 @@ async fn try_recover_prompt_too_long<P, M>(
     error: &AgentError,
     ctx: &mut TurnContext,
     compaction_config: Option<&CompactionConfig>,
+    compactor: Option<&Arc<dyn ContextCompactor>>,
     provider: &Arc<P>,
     message_store: &Arc<M>,
 ) -> Option<InternalTurnResult>
@@ -718,9 +797,14 @@ where
             "Prompt too long, attempting emergency context compaction (turn={})",
             ctx.turn
         );
-        if let Err(compact_err) =
-            compact_after_context_overflow(provider, compact_config, message_store, &ctx.thread_id)
-                .await
+        if let Err(compact_err) = compact_after_context_overflow(
+            provider,
+            compact_config,
+            compactor,
+            message_store,
+            &ctx.thread_id,
+        )
+        .await
         {
             return Some(InternalTurnResult::Error(compact_err));
         }
@@ -745,6 +829,7 @@ pub(super) async fn execute_turn<Ctx, P, H, M>(
         message_store,
         config,
         compaction_config,
+        compactor,
         execution_store,
     }: ExecuteTurnParameters<'_, Ctx, P, H, M>,
 ) -> InternalTurnResult
@@ -764,6 +849,7 @@ where
         provider,
         message_store,
         compaction_config,
+        compactor,
         tx,
         hooks,
         seq,
@@ -794,9 +880,15 @@ where
     {
         Ok(response) => response,
         Err(error) => {
-            if let Some(result) =
-                try_recover_prompt_too_long(&error, ctx, compaction_config, provider, message_store)
-                    .await
+            if let Some(result) = try_recover_prompt_too_long(
+                &error,
+                ctx,
+                compaction_config,
+                compactor,
+                provider,
+                message_store,
+            )
+            .await
             {
                 return result;
             }
@@ -815,6 +907,7 @@ where
         hooks,
         message_store,
         compaction_config,
+        compactor,
         execution_store,
         tx,
         seq,
@@ -834,6 +927,7 @@ async fn process_response_and_run_tools<Ctx, P, H, M>(
     hooks: &Arc<H>,
     message_store: &Arc<M>,
     compaction_config: Option<&CompactionConfig>,
+    compactor: Option<&Arc<dyn ContextCompactor>>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     tx: &mpsc::Sender<AgentEventEnvelope>,
     seq: &SequenceCounter,
@@ -898,6 +992,7 @@ where
         provider,
         message_store,
         compaction_config,
+        compactor,
         tx,
         hooks,
         seq,

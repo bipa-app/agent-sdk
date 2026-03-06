@@ -1,4 +1,4 @@
-use crate::context::CompactionConfig;
+use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::{AgentEventEnvelope, SequenceCounter};
 use crate::llm::StopReason;
 use crate::stores::ToolExecutionStore;
@@ -146,6 +146,7 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) state_store: Arc<S>,
     pub(super) config: AgentConfig,
     pub(super) compaction_config: Option<CompactionConfig>,
+    pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
@@ -191,6 +192,7 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) seq: &'a SequenceCounter,
     pub(super) config: &'a AgentConfig,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
+    pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
 
@@ -223,6 +225,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) state_store: Arc<S>,
     pub(super) config: AgentConfig,
     pub(super) compaction_config: Option<CompactionConfig>,
+    pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
@@ -241,6 +244,7 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) config: &'a AgentConfig,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
+    pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
 
@@ -250,6 +254,7 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
+    pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
@@ -337,6 +342,7 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) provider: &'a Arc<P>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
+    pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,

@@ -46,7 +46,7 @@ use self::types::{RunLoopParameters, TurnParameters};
 
 pub use self::builder::AgentLoopBuilder;
 
-use crate::context::CompactionConfig;
+use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::{AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
@@ -115,6 +115,7 @@ where
     pub(super) state_store: Arc<S>,
     pub(super) config: AgentConfig,
     pub(super) compaction_config: Option<CompactionConfig>,
+    pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
@@ -150,6 +151,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: None,
+            compactor: None,
             execution_store: None,
         }
     }
@@ -173,6 +175,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: Some(compaction_config),
+            compactor: None,
             execution_store: None,
         }
     }
@@ -249,6 +252,7 @@ where
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
+        let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
 
         tokio::spawn(async move {
@@ -265,6 +269,7 @@ where
                 state_store,
                 config,
                 compaction_config,
+                compactor,
                 execution_store,
             })
             .await;
@@ -353,6 +358,7 @@ where
         let state_store = Arc::clone(&self.state_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
+        let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
 
         tokio::spawn(async move {
@@ -369,6 +375,7 @@ where
                 state_store,
                 config,
                 compaction_config,
+                compactor,
                 execution_store,
             })
             .await;
