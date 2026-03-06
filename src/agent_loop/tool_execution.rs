@@ -749,9 +749,10 @@ where
         return Ok(());
     }
 
-    // Build tool result blocks. If a result carries `data.pdf_base64`, inject a
-    // Document block alongside the tool result so the LLM can read the PDF content
-    // (Anthropic parses PDF document blocks natively; it cannot parse raw base64 in text).
+    // Build tool result blocks, followed by any documents the tool wants to
+    // pass back to the LLM as native content blocks (e.g. a decrypted PDF).
+    // All blocks for a single agent turn are batched into one user message so
+    // the Anthropic API receives them together, as required.
     let mut blocks: Vec<ContentBlock> = Vec::new();
     for (tool_id, result) in tool_results {
         blocks.push(ContentBlock::ToolResult {
@@ -759,17 +760,9 @@ where
             content: result.output.clone(),
             is_error: if result.success { None } else { Some(true) },
         });
-        if let Some(pdf_b64) = result
-            .data
-            .as_ref()
-            .and_then(|d| d.get("pdf_base64"))
-            .and_then(|v| v.as_str())
-        {
+        for doc in &result.documents {
             blocks.push(ContentBlock::Document {
-                source: crate::llm::ContentSource::new(
-                    "application/pdf".to_owned(),
-                    pdf_b64.to_owned(),
-                ),
+                source: doc.clone(),
             });
         }
     }
