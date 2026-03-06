@@ -93,6 +93,12 @@ pub trait LlmProvider: Send + Sync {
 
     fn model(&self) -> &str;
     fn provider(&self) -> &'static str;
+
+    /// Default maximum output tokens for this provider/model when the caller
+    /// does not explicitly override `AgentConfig.max_tokens`.
+    fn default_max_tokens(&self) -> u32 {
+        4096
+    }
 }
 
 /// Helper function to consume a stream and collect it into a `ChatResponse`.

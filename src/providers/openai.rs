@@ -447,6 +447,17 @@ impl LlmProvider for OpenAIProvider {
     fn provider(&self) -> &'static str {
         "openai"
     }
+
+    fn default_max_tokens(&self) -> u32 {
+        let model = self.model.to_lowercase();
+        if model.starts_with("gpt-5") {
+            128_000
+        } else if model == "o3" || model == "o4-mini" || model.starts_with("o3-") {
+            100_000
+        } else {
+            16_384
+        }
+    }
 }
 
 /// Apply a tool call update to the accumulator.

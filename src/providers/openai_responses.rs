@@ -323,6 +323,15 @@ impl LlmProvider for OpenAIResponsesProvider {
     fn provider(&self) -> &'static str {
         "openai-responses"
     }
+
+    fn default_max_tokens(&self) -> u32 {
+        let model = self.model.to_lowercase();
+        if model.starts_with("gpt-5") {
+            128_000
+        } else {
+            16_384
+        }
+    }
 }
 
 // ============================================================================

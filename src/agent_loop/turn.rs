@@ -208,13 +208,15 @@ where
     }
 }
 
-pub(super) fn build_turn_request<Ctx>(
+pub(super) fn build_turn_request<Ctx, P>(
     config: &AgentConfig,
+    provider: &Arc<P>,
     messages: Vec<Message>,
     tools: &Arc<ToolRegistry<Ctx>>,
 ) -> ChatRequest
 where
     Ctx: Send + Sync + 'static,
+    P: LlmProvider,
 {
     let llm_tools = if tools.is_empty() {
         None
@@ -226,7 +228,9 @@ where
         system: config.system_prompt.clone(),
         messages,
         tools: llm_tools,
-        max_tokens: config.max_tokens,
+        max_tokens: config
+            .max_tokens
+            .unwrap_or_else(|| provider.default_max_tokens()),
         thinking: config.thinking.clone(),
     }
 }
@@ -860,7 +864,7 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
-    let request = build_turn_request(config, messages, tools);
+    let request = build_turn_request(config, provider, messages, tools);
     log_chat_request(&request);
 
     let message_id = uuid::Uuid::new_v4().to_string();

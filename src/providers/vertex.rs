@@ -135,6 +135,32 @@ impl LlmProvider for VertexProvider {
     fn provider(&self) -> &'static str {
         "vertex"
     }
+
+    fn default_max_tokens(&self) -> u32 {
+        let model = self.model.to_lowercase();
+        if model.starts_with("claude-") {
+            if model == "claude-opus-4-6" {
+                128_000
+            } else if model == "claude-sonnet-4-5-20250929" || model == "claude-sonnet-4-20250514" {
+                64_000
+            } else if model.contains("claude-3-5-sonnet") || model.contains("claude-3-5-haiku") {
+                8_192
+            } else if model.contains("opus") {
+                32_000
+            } else if model.contains("sonnet") {
+                64_000
+            } else {
+                8_192
+            }
+        } else if model.starts_with("gemini-2.5")
+            || model.starts_with("gemini-3.0")
+            || model.starts_with("gemini-3.1")
+        {
+            65_536
+        } else {
+            8_192
+        }
+    }
 }
 
 // ============================================================================

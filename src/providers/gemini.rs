@@ -19,7 +19,11 @@ use reqwest::StatusCode;
 
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-// Gemini 3 series (latest, Dec 2025)
+// Gemini 3.1 series
+pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro";
+pub const MODEL_GEMINI_31_FLASH_LITE: &str = "gemini-3.1-flash-lite-preview";
+
+// Gemini 3 series
 pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3.0-flash";
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
@@ -56,10 +60,22 @@ impl GeminiProvider {
         Self::new(api_key, MODEL_GEMINI_3_FLASH.to_owned())
     }
 
+    /// Create a provider using Gemini 3.1 Flash Lite Preview.
+    #[must_use]
+    pub fn flash_lite_31(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GEMINI_31_FLASH_LITE.to_owned())
+    }
+
     /// Create a provider using Gemini 2.0 Flash Lite (fastest, most cost-effective).
     #[must_use]
     pub fn flash_lite(api_key: String) -> Self {
         Self::new(api_key, MODEL_GEMINI_2_FLASH_LITE.to_owned())
+    }
+
+    /// Create a provider using Gemini 3.1 Pro.
+    #[must_use]
+    pub fn pro_31(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GEMINI_31_PRO.to_owned())
     }
 
     /// Create a provider using Gemini 3.0 Pro (most capable).
@@ -266,6 +282,18 @@ impl LlmProvider for GeminiProvider {
     fn provider(&self) -> &'static str {
         "gemini"
     }
+
+    fn default_max_tokens(&self) -> u32 {
+        let model = self.model.to_lowercase();
+        if model.starts_with("gemini-2.5")
+            || model.starts_with("gemini-3.0")
+            || model.starts_with("gemini-3.1")
+        {
+            65_536
+        } else {
+            8_192
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +325,14 @@ mod tests {
     }
 
     #[test]
+    fn test_flash_lite_31_factory_creates_flash_lite_provider() {
+        let provider = GeminiProvider::flash_lite_31("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GEMINI_31_FLASH_LITE);
+        assert_eq!(provider.provider(), "gemini");
+    }
+
+    #[test]
     fn test_pro_factory_creates_pro_provider() {
         let provider = GeminiProvider::pro("test-api-key".to_string());
 
@@ -305,7 +341,17 @@ mod tests {
     }
 
     #[test]
+    fn test_pro_31_factory_creates_pro_provider() {
+        let provider = GeminiProvider::pro_31("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GEMINI_31_PRO);
+        assert_eq!(provider.provider(), "gemini");
+    }
+
+    #[test]
     fn test_model_constants_have_expected_values() {
+        assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro");
+        assert_eq!(MODEL_GEMINI_31_FLASH_LITE, "gemini-3.1-flash-lite-preview");
         assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
         assert_eq!(MODEL_GEMINI_25_FLASH, "gemini-2.5-flash");
