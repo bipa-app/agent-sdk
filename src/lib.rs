@@ -321,6 +321,7 @@ mod filesystem;
 mod hooks;
 pub mod llm;
 pub mod mcp;
+pub mod model_capabilities;
 pub mod primitive_tools;
 pub mod providers;
 pub mod reminders;
@@ -340,6 +341,10 @@ pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::{ContentBlock, ContentSource, LlmProvider, ThinkingConfig};
+pub use model_capabilities::{
+    ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
+    supported_model_capabilities,
+};
 pub use stores::{
     InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
 };

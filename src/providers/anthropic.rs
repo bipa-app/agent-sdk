@@ -28,6 +28,7 @@ pub const MODEL_OPUS_4: &str = "claude-opus-4-20250514";
 
 pub const MODEL_HAIKU_45: &str = "claude-haiku-4-5-20251001";
 pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
+pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 
 /// Anthropic LLM provider using the Messages API.
@@ -65,10 +66,22 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_HAIKU_45.to_owned())
     }
 
-    /// Create a provider using Claude Sonnet 4.5.
+    /// Create a provider using Claude Sonnet 4.6.
     #[must_use]
     pub fn sonnet(api_key: String) -> Self {
+        Self::new(api_key, MODEL_SONNET_46.to_owned())
+    }
+
+    /// Create a provider using Claude Sonnet 4.5.
+    #[must_use]
+    pub fn sonnet_45(api_key: String) -> Self {
         Self::new(api_key, MODEL_SONNET_45.to_owned())
+    }
+
+    /// Create a provider using Claude Sonnet 4.6.
+    #[must_use]
+    pub fn sonnet_46(api_key: String) -> Self {
+        Self::new(api_key, MODEL_SONNET_46.to_owned())
     }
 
     /// Create a provider using Claude Opus 4.6.
@@ -403,23 +416,6 @@ impl LlmProvider for AnthropicProvider {
     fn provider(&self) -> &'static str {
         "anthropic"
     }
-
-    fn default_max_tokens(&self) -> u32 {
-        let model = self.model.to_lowercase();
-        if model == "claude-opus-4-6" {
-            128_000
-        } else if model == "claude-sonnet-4-5-20250929" || model == "claude-sonnet-4-20250514" {
-            64_000
-        } else if model.contains("claude-3-5-sonnet") || model.contains("claude-3-5-haiku") {
-            8_192
-        } else if model.contains("opus") {
-            32_000
-        } else if model.contains("sonnet") {
-            64_000
-        } else {
-            8_192
-        }
-    }
 }
 
 #[cfg(test)]
@@ -451,7 +447,23 @@ mod tests {
     fn test_sonnet_factory_creates_sonnet_provider() {
         let provider = AnthropicProvider::sonnet("test-api-key".to_string());
 
+        assert_eq!(provider.model(), MODEL_SONNET_46);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_sonnet_45_factory_creates_sonnet_provider() {
+        let provider = AnthropicProvider::sonnet_45("test-api-key".to_string());
+
         assert_eq!(provider.model(), MODEL_SONNET_45);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_sonnet_46_factory_creates_sonnet_provider() {
+        let provider = AnthropicProvider::sonnet_46("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_SONNET_46);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -472,6 +484,7 @@ mod tests {
         assert!(MODEL_HAIKU_35.contains("haiku"));
         assert!(MODEL_SONNET_35.contains("sonnet"));
         assert!(MODEL_SONNET_4.contains("sonnet"));
+        assert!(MODEL_SONNET_46.contains("sonnet"));
         assert!(MODEL_OPUS_4.contains("opus"));
     }
 

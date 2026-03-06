@@ -282,18 +282,6 @@ impl LlmProvider for GeminiProvider {
     fn provider(&self) -> &'static str {
         "gemini"
     }
-
-    fn default_max_tokens(&self) -> u32 {
-        let model = self.model.to_lowercase();
-        if model.starts_with("gemini-2.5")
-            || model.starts_with("gemini-3.0")
-            || model.starts_with("gemini-3.1")
-        {
-            65_536
-        } else {
-            8_192
-        }
-    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use crate::model_capabilities::{
+    ModelCapabilities, default_max_output_tokens, get_model_capabilities,
+};
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Non-streaming chat completion.
@@ -94,10 +98,25 @@ pub trait LlmProvider: Send + Sync {
     fn model(&self) -> &str;
     fn provider(&self) -> &'static str;
 
+    /// Canonical capability metadata for this provider/model, if known.
+    fn capabilities(&self) -> Option<&'static ModelCapabilities> {
+        get_model_capabilities(self.provider(), self.model()).or_else(|| match self.provider() {
+            "openai-responses" => get_model_capabilities("openai", self.model()),
+            "vertex" if self.model().starts_with("claude-") => {
+                get_model_capabilities("anthropic", self.model())
+            }
+            "vertex" => get_model_capabilities("gemini", self.model()),
+            _ => None,
+        })
+    }
+
     /// Default maximum output tokens for this provider/model when the caller
     /// does not explicitly override `AgentConfig.max_tokens`.
     fn default_max_tokens(&self) -> u32 {
-        4096
+        self.capabilities()
+            .and_then(|caps| caps.max_output_tokens)
+            .or_else(|| default_max_output_tokens(self.provider(), self.model()))
+            .unwrap_or(4096)
     }
 }
 
