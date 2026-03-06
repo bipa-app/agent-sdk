@@ -51,7 +51,7 @@ impl std::fmt::Display for ThreadId {
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     /// Maximum number of turns (LLM round-trips) before stopping
-    pub max_turns: usize,
+    pub max_turns: Option<usize>,
     /// Maximum tokens per response.
     ///
     /// If `None`, the SDK uses the provider/model-specific default.
@@ -73,7 +73,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-5-20250929"),

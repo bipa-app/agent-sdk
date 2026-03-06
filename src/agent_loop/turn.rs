@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 pub(super) async fn begin_turn<H>(
     ctx: &mut TurnContext,
-    max_turns: usize,
+    max_turns: Option<usize>,
     tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
     seq: &SequenceCounter,
@@ -38,7 +38,9 @@ where
     ctx.turn += 1;
     ctx.state.turn_count = ctx.turn;
 
-    if ctx.turn > max_turns {
+    if let Some(max_turns) = max_turns
+        && ctx.turn > max_turns
+    {
         warn!("Max turns reached (turn={}, max={max_turns})", ctx.turn);
         let message = format!("Maximum turns ({max_turns}) reached");
         send_event(tx, hooks, seq, AgentEvent::error(message.clone(), true)).await;

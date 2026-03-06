@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Configure the agent
     let config = AgentConfig {
-        max_turns: 10,
+        max_turns: Some(10),
         system_prompt: "You are a helpful coding assistant. You have access to file tools. \
                         The workspace is at /workspace."
             .to_string(),

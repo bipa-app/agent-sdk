@@ -20,7 +20,7 @@ fn test_builder_creates_agent_loop() {
     let provider = MockProvider::new(vec![]);
     let agent = builder::<()>().provider(provider).build();
 
-    assert_eq!(agent.config.max_turns, 10);
+    assert_eq!(agent.config.max_turns, Some(10));
     assert_eq!(agent.config.max_tokens, None);
 }
 
@@ -28,7 +28,7 @@ fn test_builder_creates_agent_loop() {
 fn test_builder_with_custom_config() {
     let provider = MockProvider::new(vec![]);
     let config = AgentConfig {
-        max_turns: 5,
+        max_turns: Some(5),
         max_tokens: Some(2048),
         system_prompt: "Custom prompt".to_string(),
         model: "custom-model".to_string(),
@@ -37,7 +37,7 @@ fn test_builder_with_custom_config() {
 
     let agent = builder::<()>().provider(provider).config(config).build();
 
-    assert_eq!(agent.config.max_turns, 5);
+    assert_eq!(agent.config.max_turns, Some(5));
     assert_eq!(agent.config.max_tokens, Some(2048));
     assert_eq!(agent.config.system_prompt, "Custom prompt");
 }
@@ -67,7 +67,7 @@ fn test_builder_with_custom_stores() {
         .build_with_stores();
 
     // Just verify it builds without panicking
-    assert_eq!(agent.config.max_turns, 10);
+    assert_eq!(agent.config.max_turns, Some(10));
 }
 
 // ===================
@@ -160,7 +160,7 @@ async fn test_max_turns_limit() -> anyhow::Result<()> {
     tools.register(EchoTool);
 
     let config = AgentConfig {
-        max_turns: 2,
+        max_turns: Some(2),
         ..Default::default()
     };
 

@@ -57,7 +57,7 @@ pub struct SubagentConfig {
     /// System prompt for the subagent.
     pub system_prompt: String,
     /// Maximum number of turns before stopping.
-    pub max_turns: usize,
+    pub max_turns: Option<usize>,
     /// Optional timeout in milliseconds.
     pub timeout_ms: Option<u64>,
 }
@@ -69,7 +69,7 @@ impl SubagentConfig {
         Self {
             name: name.into(),
             system_prompt: String::new(),
-            max_turns: 10,
+            max_turns: Some(10),
             timeout_ms: None,
         }
     }
@@ -84,7 +84,7 @@ impl SubagentConfig {
     /// Set the maximum number of turns.
     #[must_use]
     pub const fn with_max_turns(mut self, max: usize) -> Self {
-        self.max_turns = max;
+        self.max_turns = Some(max);
         self
     }
 
@@ -595,7 +595,7 @@ mod tests {
 
         assert_eq!(config.name, "test");
         assert_eq!(config.system_prompt, "Test prompt");
-        assert_eq!(config.max_turns, 5);
+        assert_eq!(config.max_turns, Some(5));
         assert_eq!(config.timeout_ms, Some(30000));
     }
 
@@ -605,7 +605,7 @@ mod tests {
 
         assert_eq!(config.name, "default");
         assert!(config.system_prompt.is_empty());
-        assert_eq!(config.max_turns, 10);
+        assert_eq!(config.max_turns, Some(10));
         assert_eq!(config.timeout_ms, None);
     }
 
