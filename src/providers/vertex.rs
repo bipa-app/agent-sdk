@@ -9,7 +9,8 @@
 //! - All other models route to `publishers/google` using `generateContent`
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
+    Usage,
 };
 use crate::providers::anthropic::data as anthropic_data;
 use crate::providers::gemini::data::{
@@ -43,6 +44,7 @@ pub struct VertexProvider {
     project_id: String,
     region: String,
     model: String,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl VertexProvider {
@@ -61,6 +63,7 @@ impl VertexProvider {
             project_id,
             region,
             model,
+            thinking: None,
         }
     }
 
@@ -110,6 +113,13 @@ impl VertexProvider {
             model = self.model,
         )
     }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
 }
 
 #[async_trait]
@@ -135,6 +145,10 @@ impl LlmProvider for VertexProvider {
     fn provider(&self) -> &'static str {
         "vertex"
     }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
+    }
 }
 
 // ============================================================================
@@ -143,6 +157,10 @@ impl LlmProvider for VertexProvider {
 
 impl VertexProvider {
     async fn chat_gemini(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
         let system_instruction = if request.system.is_empty() {
@@ -157,7 +175,7 @@ impl VertexProvider {
             })
         };
 
-        let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+        let thinking_config = thinking.as_ref().map(map_thinking_config);
 
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
@@ -261,6 +279,16 @@ impl VertexProvider {
 
     fn chat_stream_gemini(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
+            let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
             let contents = build_api_contents(&request.messages);
             let tools = request.tools.map(convert_tools_to_config);
             let system_instruction = if request.system.is_empty() {
@@ -275,7 +303,7 @@ impl VertexProvider {
                 })
             };
 
-            let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+            let thinking_config = thinking.as_ref().map(map_thinking_config);
 
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
@@ -335,14 +363,16 @@ impl VertexProvider {
 
 impl VertexProvider {
     async fn chat_claude(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
         let messages = anthropic_data::build_api_messages(&request);
         let tools = anthropic_data::build_api_tools(&request);
-        let thinking = request
-            .thinking
+        let thinking = thinking_config
             .as_ref()
             .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
-        let output_config = request
-            .thinking
+        let output_config = thinking_config
             .as_ref()
             .and_then(|t| t.effort)
             .map(|effort| anthropic_data::ApiOutputConfig { effort });
@@ -446,14 +476,22 @@ impl VertexProvider {
     #[allow(clippy::too_many_lines)]
     fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
             let messages = anthropic_data::build_api_messages(&request);
             let tools = anthropic_data::build_api_tools(&request);
-            let thinking = request
-                .thinking
+            let thinking = thinking_config
                 .as_ref()
                 .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
-            let output_config = request
-                .thinking
+            let output_config = thinking_config
                 .as_ref()
                 .and_then(|t| t.effort)
                 .map(|effort| anthropic_data::ApiOutputConfig { effort });

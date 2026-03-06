@@ -142,7 +142,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         max_output_tokens: Some(64_000),
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
-        supports_adaptive_thinking: true,
+        supports_adaptive_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -154,7 +154,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         max_output_tokens: Some(64_000),
         pricing: Some(Pricing::flat(1.0, 5.0).with_notes("Anthropic Haiku tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
-        supports_adaptive_thinking: true,
+        supports_adaptive_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -166,7 +166,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         max_output_tokens: Some(64_000),
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
-        supports_adaptive_thinking: true,
+        supports_adaptive_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -178,7 +178,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         max_output_tokens: Some(32_000),
         pricing: Some(Pricing::flat(15.0, 75.0).with_notes("Anthropic Opus tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
-        supports_adaptive_thinking: true,
+        supports_adaptive_thinking: false,
         source_url: ANTHROPIC_MODELS_URL,
         source_status: SourceStatus::Derived,
         notes: None,
@@ -565,6 +565,12 @@ mod tests {
         assert_eq!(caps.context_window, Some(200_000));
         assert_eq!(caps.max_output_tokens, Some(64_000));
         assert!(caps.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn test_lookup_anthropic_sonnet_45_disables_adaptive_thinking() {
+        let caps = get_model_capabilities("anthropic", "claude-sonnet-4-5-20250929").unwrap();
+        assert!(!caps.supports_adaptive_thinking);
     }
 
     #[test]

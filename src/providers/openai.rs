@@ -79,6 +79,7 @@ pub struct OpenAIProvider {
     api_key: String,
     model: String,
     base_url: String,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl OpenAIProvider {
@@ -90,6 +91,7 @@ impl OpenAIProvider {
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
+            thinking: None,
         }
     }
 
@@ -101,6 +103,7 @@ impl OpenAIProvider {
             api_key,
             model,
             base_url,
+            thinking: None,
         }
     }
 
@@ -253,6 +256,13 @@ impl OpenAIProvider {
     pub fn gpt4o_mini(api_key: String) -> Self {
         Self::new(api_key, MODEL_GPT4O_MINI.to_owned())
     }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
 }
 
 #[async_trait]
@@ -260,15 +270,22 @@ impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
-            let responses_provider = OpenAIResponsesProvider::with_base_url(
+            let mut responses_provider = OpenAIResponsesProvider::with_base_url(
                 self.api_key.clone(),
                 self.model.clone(),
                 self.base_url.clone(),
             );
+            if let Some(thinking) = self.thinking.clone() {
+                responses_provider = responses_provider.with_thinking(thinking);
+            }
             return responses_provider.chat(request).await;
         }
 
-        let reasoning = build_api_reasoning(request.thinking.as_ref());
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let reasoning = build_api_reasoning(thinking_config.as_ref());
         let messages = build_api_messages(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -358,9 +375,13 @@ impl LlmProvider for OpenAIProvider {
             let api_key = self.api_key.clone();
             let model = self.model.clone();
             let base_url = self.base_url.clone();
+            let thinking = self.thinking.clone();
             return Box::pin(async_stream::stream! {
-                let responses_provider =
+                let mut responses_provider =
                     OpenAIResponsesProvider::with_base_url(api_key, model, base_url);
+                if let Some(thinking) = thinking {
+                    responses_provider = responses_provider.with_thinking(thinking);
+                }
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
                     yield item;
@@ -369,7 +390,17 @@ impl LlmProvider for OpenAIProvider {
         }
 
         Box::pin(async_stream::stream! {
-            let reasoning = build_api_reasoning(request.thinking.as_ref());
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
+            let reasoning = build_api_reasoning(thinking_config.as_ref());
             let messages = build_api_messages(&request);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
@@ -466,6 +497,10 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider(&self) -> &'static str {
         "openai"
+    }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
     }
 }
 
@@ -1787,6 +1822,19 @@ mod tests {
     #[test]
     fn test_build_api_reasoning_omits_adaptive_without_effort() {
         assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    }
+
+    #[test]
+    fn test_openai_rejects_adaptive_thinking() {
+        let provider = OpenAIProvider::gpt54("test-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adaptive thinking is not supported")
+        );
     }
 
     #[test]

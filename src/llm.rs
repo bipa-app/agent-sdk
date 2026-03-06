@@ -98,6 +98,11 @@ pub trait LlmProvider: Send + Sync {
     fn model(&self) -> &str;
     fn provider(&self) -> &'static str;
 
+    /// Provider-owned thinking configuration, if any.
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        None
+    }
+
     /// Canonical capability metadata for this provider/model, if known.
     fn capabilities(&self) -> Option<&'static ModelCapabilities> {
         get_model_capabilities(self.provider(), self.model()).or_else(|| match self.provider() {
@@ -108,6 +113,39 @@ pub trait LlmProvider: Send + Sync {
             "vertex" => get_model_capabilities("gemini", self.model()),
             _ => None,
         })
+    }
+
+    /// Validate a thinking configuration against the provider/model capabilities.
+    fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+        let Some(thinking) = thinking else {
+            return Ok(());
+        };
+
+        if matches!(thinking.mode, ThinkingMode::Adaptive)
+            && !self
+                .capabilities()
+                .is_some_and(|caps| caps.supports_adaptive_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "adaptive thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Resolve the effective thinking configuration for a request.
+    ///
+    /// Request-level thinking overrides provider-owned defaults when present.
+    fn resolve_thinking_config(
+        &self,
+        request_thinking: Option<&ThinkingConfig>,
+    ) -> Result<Option<ThinkingConfig>> {
+        let thinking = request_thinking.or_else(|| self.configured_thinking());
+        self.validate_thinking_config(thinking)?;
+        Ok(thinking.cloned())
     }
 
     /// Default maximum output tokens for this provider/model when the caller

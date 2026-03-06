@@ -93,9 +93,12 @@ use tokio::sync::{mpsc, oneshot};
 ///     AgentInput::Text("Hello!".to_string()),
 ///     tool_ctx,
 /// );
-/// while let Some(event) = events.recv().await {
-///     match event {
-///         AgentEvent::Text { text } => println!("{}", text),
+/// while let Some(envelope) = events.recv().await {
+///     match envelope.event {
+///         AgentEvent::Text {
+///             message_id: _,
+///             text,
+///         } => println!("{}", text),
 ///         AgentEvent::Done { .. } => break,
 ///         _ => {}
 ///     }
@@ -207,7 +210,7 @@ where
     ///     tool_ctx,
     /// );
     ///
-    /// while let Some(event) = events.recv().await {
+    /// while let Some(envelope) = events.recv().await {
     ///     // Handle events...
     /// }
     ///
@@ -316,7 +319,7 @@ where
     /// ).await;
     ///
     /// // Process events...
-    /// while let Some(event) = events.recv().await { /* ... */ }
+    /// while let Some(_envelope) = events.recv().await { /* ... */ }
     ///
     /// // Check outcome
     /// match outcome {

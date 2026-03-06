@@ -45,7 +45,7 @@ pub struct OpenAIResponsesProvider {
     api_key: String,
     model: String,
     base_url: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl OpenAIResponsesProvider {
@@ -57,7 +57,7 @@ impl OpenAIResponsesProvider {
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
-            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -69,7 +69,7 @@ impl OpenAIResponsesProvider {
             api_key,
             model,
             base_url,
-            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -85,18 +85,28 @@ impl OpenAIResponsesProvider {
         Self::gpt53_codex(api_key)
     }
 
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
     /// Set the reasoning effort level.
     #[must_use]
-    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = Some(effort);
-        self
+    pub fn with_reasoning_effort(self, effort: ReasoningEffort) -> Self {
+        self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAIResponsesProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-        let reasoning = build_api_reasoning(request.thinking.as_ref(), self.reasoning_effort);
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -195,7 +205,17 @@ impl LlmProvider for OpenAIResponsesProvider {
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
-            let reasoning = build_api_reasoning(request.thinking.as_ref(), self.reasoning_effort);
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
+            let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
@@ -333,6 +353,10 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     fn provider(&self) -> &'static str {
         "openai-responses"
+    }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
     }
 }
 
@@ -520,13 +544,9 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     blocks
 }
 
-fn build_api_reasoning(
-    thinking: Option<&ThinkingConfig>,
-    fallback: Option<ReasoningEffort>,
-) -> Option<ApiReasoning> {
+fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
     thinking
         .and_then(resolve_reasoning_effort)
-        .or(fallback)
         .map(|effort| ApiReasoning { effort })
 }
 
@@ -547,6 +567,15 @@ const fn map_effort(effort: Effort) -> ReasoningEffort {
         Effort::Medium => ReasoningEffort::Medium,
         Effort::High => ReasoningEffort::High,
         Effort::Max => ReasoningEffort::XHigh,
+    }
+}
+
+const fn map_reasoning_effort(effort: ReasoningEffort) -> Effort {
+    match effort {
+        ReasoningEffort::Low => Effort::Low,
+        ReasoningEffort::Medium => Effort::Medium,
+        ReasoningEffort::High => Effort::High,
+        ReasoningEffort::XHigh => Effort::Max,
     }
 }
 
@@ -803,27 +832,33 @@ mod tests {
     fn test_with_reasoning_effort() {
         let provider = OpenAIResponsesProvider::codex("test-key".to_string())
             .with_reasoning_effort(ReasoningEffort::High);
-        assert!(provider.reasoning_effort.is_some());
+        let thinking = provider.thinking.as_ref().unwrap();
+        assert!(matches!(thinking.effort, Some(Effort::High)));
     }
 
     #[test]
-    fn test_build_api_reasoning_prefers_request_thinking() {
-        let reasoning = build_api_reasoning(
-            Some(&ThinkingConfig::adaptive_with_effort(Effort::Low)),
-            Some(ReasoningEffort::High),
-        )
-        .unwrap();
+    fn test_build_api_reasoning_uses_explicit_effort() {
+        let reasoning =
+            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::Low))).unwrap();
         assert!(matches!(reasoning.effort, ReasoningEffort::Low));
     }
 
     #[test]
-    fn test_build_api_reasoning_falls_back_to_provider_default() {
-        let reasoning = build_api_reasoning(
-            Some(&ThinkingConfig::adaptive()),
-            Some(ReasoningEffort::High),
-        )
-        .unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::High));
+    fn test_build_api_reasoning_omits_adaptive_without_effort() {
+        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    }
+
+    #[test]
+    fn test_openai_responses_rejects_adaptive_thinking() {
+        let provider = OpenAIResponsesProvider::codex("test-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adaptive thinking is not supported")
+        );
     }
 
     #[test]

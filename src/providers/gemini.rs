@@ -6,7 +6,8 @@
 pub(crate) mod data;
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
+    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ pub struct GeminiProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl GeminiProvider {
@@ -51,6 +53,7 @@ impl GeminiProvider {
             client: reqwest::Client::new(),
             api_key,
             model,
+            thinking: None,
         }
     }
 
@@ -83,11 +86,22 @@ impl GeminiProvider {
     pub fn pro(api_key: String) -> Self {
         Self::new(api_key, MODEL_GEMINI_3_PRO.to_owned())
     }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
 }
 
 #[async_trait]
 impl LlmProvider for GeminiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
         let system_instruction = if request.system.is_empty() {
@@ -102,7 +116,7 @@ impl LlmProvider for GeminiProvider {
             })
         };
 
-        let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+        let thinking_config = thinking.as_ref().map(map_thinking_config);
 
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
@@ -207,6 +221,16 @@ impl LlmProvider for GeminiProvider {
 
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
+            let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
             let contents = build_api_contents(&request.messages);
             let tools = request.tools.map(convert_tools_to_config);
             let system_instruction = if request.system.is_empty() {
@@ -221,7 +245,7 @@ impl LlmProvider for GeminiProvider {
                 })
             };
 
-            let thinking_config = request.thinking.as_ref().map(map_thinking_config);
+            let thinking_config = thinking.as_ref().map(map_thinking_config);
 
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
@@ -281,6 +305,10 @@ impl LlmProvider for GeminiProvider {
 
     fn provider(&self) -> &'static str {
         "gemini"
+    }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
     }
 }
 
