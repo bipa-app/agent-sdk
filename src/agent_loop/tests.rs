@@ -21,7 +21,7 @@ fn test_builder_creates_agent_loop() {
     let agent = builder::<()>().provider(provider).build();
 
     assert_eq!(agent.config.max_turns, 10);
-    assert_eq!(agent.config.max_tokens, 4096);
+    assert_eq!(agent.config.max_tokens, None);
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn test_builder_with_custom_config() {
     let provider = MockProvider::new(vec![]);
     let config = AgentConfig {
         max_turns: 5,
-        max_tokens: 2048,
+        max_tokens: Some(2048),
         system_prompt: "Custom prompt".to_string(),
         model: "custom-model".to_string(),
         ..Default::default()
@@ -38,7 +38,7 @@ fn test_builder_with_custom_config() {
     let agent = builder::<()>().provider(provider).config(config).build();
 
     assert_eq!(agent.config.max_turns, 5);
-    assert_eq!(agent.config.max_tokens, 2048);
+    assert_eq!(agent.config.max_tokens, Some(2048));
     assert_eq!(agent.config.system_prompt, "Custom prompt");
 }
 
@@ -1037,6 +1037,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         state_store: Arc::new(InMemoryStore::new()),
         config: AgentConfig::default(),
         compaction_config: None,
+        compactor: None,
         execution_store: None,
     };
 

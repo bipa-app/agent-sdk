@@ -1,4 +1,4 @@
-use crate::context::CompactionConfig;
+use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::skills::Skill;
@@ -28,6 +28,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     state_store: Option<S>,
     config: Option<AgentConfig>,
     compaction_config: Option<CompactionConfig>,
+    compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
 }
 
@@ -43,6 +44,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             state_store: None,
             config: None,
             compaction_config: None,
+            compactor: None,
             execution_store: None,
         }
     }
@@ -66,6 +68,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }
@@ -88,6 +91,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }
@@ -106,6 +110,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: self.state_store,
             config: self.config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }
@@ -124,6 +129,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             state_store: Some(state_store),
             config: self.config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }
@@ -188,6 +194,13 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn with_auto_compaction(self) -> Self {
         self.with_compaction(CompactionConfig::default())
+    }
+
+    /// Override the default compactor with a custom implementation.
+    #[must_use]
+    pub fn with_custom_compactor(mut self, compactor: impl ContextCompactor + 'static) -> Self {
+        self.compactor = Some(Arc::new(compactor));
+        self
     }
 
     /// Apply a skill configuration.
@@ -260,6 +273,7 @@ where
             state_store: Arc::new(InMemoryStore::new()),
             config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }
@@ -305,6 +319,7 @@ where
             state_store: Arc::new(state_store),
             config,
             compaction_config: self.compaction_config,
+            compactor: self.compactor,
             execution_store: self.execution_store,
         }
     }

@@ -63,13 +63,22 @@ pub struct CompactionResult {
 pub struct LlmContextCompactor<P: LlmProvider> {
     provider: Arc<P>,
     config: CompactionConfig,
+    system_prompt: String,
+    summary_prompt_prefix: String,
+    summary_prompt_suffix: String,
 }
 
 impl<P: LlmProvider> LlmContextCompactor<P> {
     /// Create a new LLM context compactor.
     #[must_use]
-    pub const fn new(provider: Arc<P>, config: CompactionConfig) -> Self {
-        Self { provider, config }
+    pub fn new(provider: Arc<P>, config: CompactionConfig) -> Self {
+        Self {
+            provider,
+            config,
+            system_prompt: COMPACTION_SYSTEM_PROMPT.to_string(),
+            summary_prompt_prefix: COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
+            summary_prompt_suffix: COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
+        }
     }
 
     /// Create with default configuration.
@@ -82,6 +91,20 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
     #[must_use]
     pub const fn config(&self) -> &CompactionConfig {
         &self.config
+    }
+
+    /// Override the prompts used for LLM-based summarization.
+    #[must_use]
+    pub fn with_prompts(
+        mut self,
+        system_prompt: impl Into<String>,
+        summary_prompt_prefix: impl Into<String>,
+        summary_prompt_suffix: impl Into<String>,
+    ) -> Self {
+        self.system_prompt = system_prompt.into();
+        self.summary_prompt_prefix = summary_prompt_prefix.into();
+        self.summary_prompt_suffix = summary_prompt_suffix.into();
+        self
     }
 
     /// Return true when a content object is a previously inserted compaction summary marker.
@@ -258,9 +281,10 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
     }
 
     /// Build the summarization prompt.
-    fn build_summary_prompt(messages_text: &str) -> String {
+    fn build_summary_prompt(&self, messages_text: &str) -> String {
         format!(
-            "{COMPACTION_SUMMARY_PROMPT_PREFIX}{messages_text}{COMPACTION_SUMMARY_PROMPT_SUFFIX}"
+            "{}{}{}",
+            self.summary_prompt_prefix, messages_text, self.summary_prompt_suffix
         )
     }
 }
@@ -279,10 +303,10 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
         }
 
         let messages_text = Self::format_messages_for_summary(&messages_to_summarize);
-        let prompt = Self::build_summary_prompt(&messages_text);
+        let prompt = self.build_summary_prompt(&messages_text);
 
         let request = ChatRequest {
-            system: COMPACTION_SYSTEM_PROMPT.to_string(),
+            system: self.system_prompt.clone(),
             messages: vec![Message::user(prompt)],
             tools: None,
             max_tokens: 2000,
