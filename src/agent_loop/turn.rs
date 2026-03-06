@@ -213,7 +213,7 @@ pub(super) fn build_turn_request<Ctx, P>(
     provider: &Arc<P>,
     messages: Vec<Message>,
     tools: &Arc<ToolRegistry<Ctx>>,
-) -> ChatRequest
+) -> Result<ChatRequest, AgentError>
 where
     Ctx: Send + Sync + 'static,
     P: LlmProvider,
@@ -224,15 +224,19 @@ where
         Some(tools.to_llm_tools())
     };
 
-    ChatRequest {
+    let thinking = provider.resolve_thinking_config(None).map_err(|error| {
+        AgentError::new(format!("Invalid thinking configuration: {error}"), false)
+    })?;
+
+    Ok(ChatRequest {
         system: config.system_prompt.clone(),
         messages,
         tools: llm_tools,
         max_tokens: config
             .max_tokens
             .unwrap_or_else(|| provider.default_max_tokens()),
-        thinking: config.thinking.clone(),
-    }
+        thinking,
+    })
 }
 
 pub(super) fn log_chat_request(request: &ChatRequest) {
@@ -864,7 +868,10 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
-    let request = build_turn_request(config, provider, messages, tools);
+    let request = match build_turn_request(config, provider, messages, tools) {
+        Ok(request) => request,
+        Err(error) => return InternalTurnResult::Error(error),
+    };
     log_chat_request(&request);
 
     let message_id = uuid::Uuid::new_v4().to_string();

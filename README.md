@@ -7,7 +7,7 @@
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **⚠️ Early Development**: This library is in active development (v0.4.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+> **⚠️ Early Development**: This library is in active development (v0.5.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
 
 ## What is an Agent?
 
@@ -26,7 +26,7 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 - **Async Tools** - Long-running operations with progress streaming via `AsyncTool` trait
 - **Lifecycle Hooks** - Intercept tool calls for logging, user confirmation, rate limiting, or security checks
 - **Streaming Events** - Real-time event stream for building responsive UIs
-- **Extended Thinking** - Support for Anthropic's extended thinking feature via `ThinkingConfig`
+- **Thinking Configuration** - Provider-owned reasoning and thinking controls via `ThinkingConfig`
 - **Primitive Tools** - Ready-to-use tools for file operations (Read, Write, Edit, Glob, Grep, Bash, Notebooks)
 - **Web Tools** - Web search and URL fetching with SSRF protection
 - **Subagents** - Spawn isolated child agents for complex subtasks
@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = "0.4"
+agent-sdk = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -92,9 +92,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Process events as they arrive
-    while let Some(event) = events.recv().await {
-        match event {
-            AgentEvent::Text { text } => print!("{text}"),
+    while let Some(envelope) = events.recv().await {
+        match envelope.event {
+            AgentEvent::Text {
+                message_id: _,
+                text,
+            } => print!("{text}"),
             AgentEvent::Done { .. } => break,
             AgentEvent::Error { message, .. } => eprintln!("Error: {message}"),
             _ => {} // Other events: ToolCallStart, ToolCallEnd, etc.
@@ -258,23 +261,31 @@ tools.register_async(TransferTool);
 
 ## Extended Thinking
 
-Enable Anthropic's extended thinking for complex reasoning:
+Configure thinking on the provider when you choose the model:
 
 ```rust
-use agent_sdk::{builder, AgentConfig, ThinkingConfig, providers::AnthropicProvider};
+use agent_sdk::{builder, Effort, ThinkingConfig, providers::{AnthropicProvider, OpenAIProvider}};
 
-let agent = builder::<()>()
-    .provider(AnthropicProvider::sonnet(api_key))
-    .config(AgentConfig {
-        thinking: Some(ThinkingConfig {
-            budget_tokens: 10000, // Token budget for thinking
-        }),
-        ..Default::default()
-    })
+// Anthropic Claude Sonnet 4.6 / Opus 4.6 support adaptive thinking.
+let anthropic_agent = builder::<()>()
+    .provider(
+        AnthropicProvider::sonnet(api_key.clone())
+            .with_thinking(ThinkingConfig::adaptive()),
+    )
+    .build();
+
+// OpenAI models use explicit reasoning effort, not adaptive mode.
+let openai_agent = builder::<()>()
+    .provider(
+        OpenAIProvider::gpt54(openai_api_key)
+            .with_thinking(ThinkingConfig::new(10_000).with_effort(Effort::High)),
+    )
     .build();
 ```
 
-When enabled, the agent emits `AgentEvent::Thinking` events with the model's reasoning process.
+Adaptive thinking is only supported for Anthropic `claude-sonnet-4-6` and `claude-opus-4-6`.
+When thinking is enabled, the agent emits `AgentEvent::Thinking` and `AgentEvent::ThinkingDelta`
+events with the model's reasoning output.
 
 ## Lifecycle Hooks
 
@@ -418,9 +429,12 @@ The agent uses a bounded channel (capacity 100) for events. The SDK is designed 
 
 ```rust
 // GOOD: Process events quickly, offload heavy work
-while let Some(event) = events.recv().await {
-    match event {
-        AgentEvent::TextDelta { delta } => {
+while let Some(envelope) = events.recv().await {
+    match envelope.event {
+        AgentEvent::TextDelta {
+            message_id: _,
+            delta,
+        } => {
             // Quick: just buffer or forward
             buffer.push_str(&delta);
         }
@@ -430,16 +444,16 @@ while let Some(event) = events.recv().await {
 }
 
 // GOOD: Spawn heavy processing to avoid blocking
-while let Some(event) = events.recv().await {
-    let event = event.clone();
+while let Some(envelope) = events.recv().await {
+    let envelope = envelope.clone();
     tokio::spawn(async move {
         // Heavy processing in background
-        save_to_database(&event).await;
+        save_to_database(&envelope).await;
     });
 }
 
 // BAD: Blocking I/O in the event loop
-while let Some(event) = events.recv().await {
+while let Some(_envelope) = events.recv().await {
     // This blocks the consumer, causing backpressure
     std::thread::sleep(Duration::from_secs(1));
 }
@@ -464,12 +478,15 @@ while let Some(event) = events.recv().await {
 | `Error` | An error occurred |
 
 ```rust
-while let Some(event) = events.recv().await {
-    match event {
+while let Some(envelope) = events.recv().await {
+    match envelope.event {
         AgentEvent::Start { thread_id, turn } => {
             println!("Starting turn {turn}");
         }
-        AgentEvent::TextDelta { delta } => {
+        AgentEvent::TextDelta {
+            message_id: _,
+            delta,
+        } => {
             print!("{delta}"); // Stream to UI
         }
         AgentEvent::ToolCallStart { name, .. } => {
@@ -479,7 +496,8 @@ while let Some(event) = events.recv().await {
             println!("Progress: {stage} - {message}");
         }
         AgentEvent::Done { total_turns, total_usage, .. } => {
-            println!("Completed in {total_turns} turns, {} tokens", total_usage.total());
+            let total_tokens = total_usage.input_tokens + total_usage.output_tokens;
+            println!("Completed in {total_turns} turns, {total_tokens} tokens");
             break;
         }
         _ => {}
@@ -492,8 +510,8 @@ while let Some(event) = events.recv().await {
 | Provider | Models | Usage |
 |----------|--------|-------|
 | Anthropic | Claude Sonnet, Opus, Haiku | `AnthropicProvider::sonnet(api_key)` |
-| OpenAI | GPT-4, GPT-3.5, etc. | `OpenAIProvider::new(api_key, model)` |
-| Google | Gemini Pro, etc. | `GeminiProvider::new(api_key, model)` |
+| OpenAI | GPT-5.4, GPT-5.3-Codex, GPT-4.1, o-series | `OpenAIProvider::gpt54(api_key)` |
+| Google | Gemini 3.x and 2.x families | `GeminiProvider::new(api_key, model)` |
 
 Implement `LlmProvider` trait to add your own.
 

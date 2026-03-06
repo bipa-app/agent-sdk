@@ -13,7 +13,7 @@
 //! - [`AgentContinuation`]: Opaque state for resuming after confirmation
 //! - [`AgentState`]: Checkpointable agent state
 
-use crate::llm::{ContentBlock, ThinkingConfig};
+use crate::llm::ContentBlock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -62,8 +62,6 @@ pub struct AgentConfig {
     pub model: String,
     /// Retry configuration for transient errors
     pub retry: RetryConfig,
-    /// Optional extended thinking configuration
-    pub thinking: Option<ThinkingConfig>,
     /// Enable streaming responses from the LLM.
     ///
     /// When `true`, emits `TextDelta` and `ThinkingDelta` events as text arrives
@@ -80,7 +78,6 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-5-20250929"),
             retry: RetryConfig::default(),
-            thinking: None,
             streaming: false,
         }
     }

@@ -4,12 +4,12 @@
 //! Chat Completions API. It also supports `OpenAI`-compatible APIs (Ollama, vLLM, etc.)
 //! via the `with_base_url` constructor.
 //!
-//! Models that require the Responses API (like `gpt-5.2-codex`) are automatically
+//! Legacy models that require the Responses API (like `gpt-5.2-codex`) are automatically
 //! routed to the correct endpoint.
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
-    StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
+    StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -24,10 +24,16 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Check if a model requires the Responses API instead of Chat Completions.
 fn requires_responses_api(model: &str) -> bool {
-    model.contains("codex")
+    model == MODEL_GPT52_CODEX
 }
 
-// GPT-5.2 series (latest flagship, Dec 2025)
+// GPT-5.4 series
+pub const MODEL_GPT54: &str = "gpt-5.4";
+
+// GPT-5.3 Codex series
+pub const MODEL_GPT53_CODEX: &str = "gpt-5.3-codex";
+
+// GPT-5.2 series
 pub const MODEL_GPT52_INSTANT: &str = "gpt-5.2-instant";
 pub const MODEL_GPT52_THINKING: &str = "gpt-5.2-thinking";
 pub const MODEL_GPT52_PRO: &str = "gpt-5.2-pro";
@@ -73,6 +79,7 @@ pub struct OpenAIProvider {
     api_key: String,
     model: String,
     base_url: String,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl OpenAIProvider {
@@ -84,6 +91,7 @@ impl OpenAIProvider {
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
+            thinking: None,
         }
     }
 
@@ -95,6 +103,7 @@ impl OpenAIProvider {
             api_key,
             model,
             base_url,
+            thinking: None,
         }
     }
 
@@ -146,6 +155,18 @@ impl OpenAIProvider {
         Self::new(api_key, MODEL_GPT52_INSTANT.to_owned())
     }
 
+    /// Create a provider using GPT-5.4 (frontier reasoning with 1.05M context).
+    #[must_use]
+    pub fn gpt54(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT54.to_owned())
+    }
+
+    /// Create a provider using GPT-5.3 Codex (latest codex model).
+    #[must_use]
+    pub fn gpt53_codex(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT53_CODEX.to_owned())
+    }
+
     /// Create a provider using GPT-5.2 Thinking (complex reasoning, coding, analysis).
     #[must_use]
     pub fn gpt52_thinking(api_key: String) -> Self {
@@ -158,12 +179,10 @@ impl OpenAIProvider {
         Self::new(api_key, MODEL_GPT52_PRO.to_owned())
     }
 
-    /// Create a provider using GPT-5.2 Codex (optimized for agentic coding).
-    ///
-    /// Note: This model uses the Responses API internally.
+    /// Create a provider using the latest Codex model.
     #[must_use]
     pub fn codex(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GPT52_CODEX.to_owned())
+        Self::gpt53_codex(api_key)
     }
 
     /// Create a provider using GPT-5 (400k context, coding and reasoning).
@@ -237,6 +256,13 @@ impl OpenAIProvider {
     pub fn gpt4o_mini(api_key: String) -> Self {
         Self::new(api_key, MODEL_GPT4O_MINI.to_owned())
     }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
 }
 
 #[async_trait]
@@ -244,14 +270,22 @@ impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
-            let responses_provider = OpenAIResponsesProvider::with_base_url(
+            let mut responses_provider = OpenAIResponsesProvider::with_base_url(
                 self.api_key.clone(),
                 self.model.clone(),
                 self.base_url.clone(),
             );
+            if let Some(thinking) = self.thinking.clone() {
+                responses_provider = responses_provider.with_thinking(thinking);
+            }
             return responses_provider.chat(request).await;
         }
 
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let reasoning = build_api_reasoning(thinking_config.as_ref());
         let messages = build_api_messages(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -262,6 +296,7 @@ impl LlmProvider for OpenAIProvider {
             &messages,
             request.max_tokens,
             tools.as_deref(),
+            reasoning,
             use_max_tokens_alias(&self.base_url),
         );
 
@@ -334,15 +369,20 @@ impl LlmProvider for OpenAIProvider {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
         if requires_responses_api(&self.model) {
             let api_key = self.api_key.clone();
             let model = self.model.clone();
             let base_url = self.base_url.clone();
+            let thinking = self.thinking.clone();
             return Box::pin(async_stream::stream! {
-                let responses_provider =
+                let mut responses_provider =
                     OpenAIResponsesProvider::with_base_url(api_key, model, base_url);
+                if let Some(thinking) = thinking {
+                    responses_provider = responses_provider.with_thinking(thinking);
+                }
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
                     yield item;
@@ -351,6 +391,17 @@ impl LlmProvider for OpenAIProvider {
         }
 
         Box::pin(async_stream::stream! {
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
+            let reasoning = build_api_reasoning(thinking_config.as_ref());
             let messages = build_api_messages(&request);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
@@ -361,6 +412,7 @@ impl LlmProvider for OpenAIProvider {
                 &messages,
                 request.max_tokens,
                 tools.as_deref(),
+                reasoning,
                 use_max_tokens_alias(&self.base_url),
             );
 
@@ -446,6 +498,10 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider(&self) -> &'static str {
         "openai"
+    }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
     }
 }
 
@@ -605,6 +661,7 @@ fn build_api_chat_request<'a>(
     messages: &'a [ApiMessage],
     max_tokens: u32,
     tools: Option<&'a [ApiTool]>,
+    reasoning: Option<ApiReasoning>,
     include_max_tokens_alias: bool,
 ) -> ApiChatRequest<'a> {
     ApiChatRequest {
@@ -613,6 +670,7 @@ fn build_api_chat_request<'a>(
         max_completion_tokens: Some(max_tokens),
         max_tokens: include_max_tokens_alias.then_some(max_tokens),
         tools,
+        reasoning,
     }
 }
 
@@ -621,6 +679,7 @@ fn build_api_chat_request_streaming<'a>(
     messages: &'a [ApiMessage],
     max_tokens: u32,
     tools: Option<&'a [ApiTool]>,
+    reasoning: Option<ApiReasoning>,
     include_max_tokens_alias: bool,
 ) -> ApiChatRequestStreaming<'a> {
     ApiChatRequestStreaming {
@@ -629,7 +688,46 @@ fn build_api_chat_request_streaming<'a>(
         max_completion_tokens: Some(max_tokens),
         max_tokens: include_max_tokens_alias.then_some(max_tokens),
         tools,
+        reasoning,
         stream: true,
+    }
+}
+
+fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
+    thinking
+        .and_then(resolve_reasoning_effort)
+        .map(|effort| ApiReasoning { effort })
+}
+
+const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
+    if let Some(effort) = config.effort {
+        return Some(map_effort(effort));
+    }
+
+    match &config.mode {
+        ThinkingMode::Adaptive => None,
+        ThinkingMode::Enabled { budget_tokens } => Some(map_budget_to_reasoning(*budget_tokens)),
+    }
+}
+
+const fn map_effort(effort: Effort) -> ReasoningEffort {
+    match effort {
+        Effort::Low => ReasoningEffort::Low,
+        Effort::Medium => ReasoningEffort::Medium,
+        Effort::High => ReasoningEffort::High,
+        Effort::Max => ReasoningEffort::XHigh,
+    }
+}
+
+const fn map_budget_to_reasoning(budget_tokens: u32) -> ReasoningEffort {
+    if budget_tokens <= 4_096 {
+        ReasoningEffort::Low
+    } else if budget_tokens <= 16_384 {
+        ReasoningEffort::Medium
+    } else if budget_tokens <= 32_768 {
+        ReasoningEffort::High
+    } else {
+        ReasoningEffort::XHigh
     }
 }
 
@@ -791,6 +889,8 @@ struct ApiChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ApiReasoning>,
 }
 
 #[derive(Serialize)]
@@ -803,7 +903,24 @@ struct ApiChatRequestStreaming<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ApiReasoning>,
     stream: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
+#[derive(Serialize)]
+struct ApiReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Serialize)]
@@ -1032,6 +1149,30 @@ mod tests {
     }
 
     #[test]
+    fn test_gpt54_factory_creates_provider() {
+        let provider = OpenAIProvider::gpt54("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT54);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_gpt53_codex_factory_creates_provider() {
+        let provider = OpenAIProvider::gpt53_codex("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT53_CODEX);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_codex_factory_points_to_latest_codex_model() {
+        let provider = OpenAIProvider::codex("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_GPT53_CODEX);
+        assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
     fn test_gpt5_factory_creates_gpt5_provider() {
         let provider = OpenAIProvider::gpt5("test-api-key".to_string());
 
@@ -1149,10 +1290,14 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
+        // GPT-5.4 / GPT-5.3 Codex
+        assert_eq!(MODEL_GPT54, "gpt-5.4");
+        assert_eq!(MODEL_GPT53_CODEX, "gpt-5.3-codex");
         // GPT-5.2 series
         assert_eq!(MODEL_GPT52_INSTANT, "gpt-5.2-instant");
         assert_eq!(MODEL_GPT52_THINKING, "gpt-5.2-thinking");
         assert_eq!(MODEL_GPT52_PRO, "gpt-5.2-pro");
+        assert_eq!(MODEL_GPT52_CODEX, "gpt-5.2-codex");
         // GPT-5 series
         assert_eq!(MODEL_GPT5, "gpt-5");
         assert_eq!(MODEL_GPT5_MINI, "gpt-5-mini");
@@ -1656,6 +1801,44 @@ mod tests {
     }
 
     #[test]
+    fn test_requires_responses_api_only_for_legacy_codex_model() {
+        assert!(requires_responses_api(MODEL_GPT52_CODEX));
+        assert!(!requires_responses_api(MODEL_GPT53_CODEX));
+        assert!(!requires_responses_api(MODEL_GPT54));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_maps_enabled_budget_to_effort() {
+        let reasoning = build_api_reasoning(Some(&ThinkingConfig::new(40_000))).unwrap();
+        assert!(matches!(reasoning.effort, ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_uses_explicit_effort() {
+        let reasoning =
+            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::High))).unwrap();
+        assert!(matches!(reasoning.effort, ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_omits_adaptive_without_effort() {
+        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    }
+
+    #[test]
+    fn test_openai_rejects_adaptive_thinking() {
+        let provider = OpenAIProvider::gpt54("test-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adaptive thinking is not supported")
+        );
+    }
+
+    #[test]
     fn test_request_serialization_openai_uses_max_completion_tokens_only() {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
@@ -1670,6 +1853,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: None,
             tools: None,
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1692,6 +1876,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: Some(1024),
             tools: None,
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1714,6 +1899,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: None,
             tools: None,
+            reasoning: None,
             stream: true,
         };
 
@@ -1739,11 +1925,36 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: Some(1024),
             tools: None,
+            reasoning: None,
             stream: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
+    }
+
+    #[test]
+    fn test_request_serialization_includes_reasoning_when_present() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequest {
+            model: MODEL_GPT54,
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            reasoning: Some(ApiReasoning {
+                effort: ReasoningEffort::High,
+            }),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"reasoning\":{\"effort\":\"high\"}"));
     }
 }

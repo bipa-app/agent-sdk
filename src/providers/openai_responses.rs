@@ -1,12 +1,12 @@
 //! `OpenAI` Responses API provider implementation.
 //!
 //! This module provides an implementation of `LlmProvider` for the `OpenAI`
-//! Responses API (`/v1/responses`). This API is required for models like
-//! `gpt-5.2-codex` that are optimized for agentic workflows.
+//! Responses API (`/v1/responses`). This provider supports the Codex model family
+//! and other agentic `OpenAI` models that expose the Responses surface.
 
 use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, StopReason,
-    StreamBox, StreamDelta, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
+    StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-// GPT-5.2-Codex (agentic coding model, Responses API only)
+// GPT-5.3-Codex (latest Codex model)
+pub const MODEL_GPT53_CODEX: &str = "gpt-5.3-codex";
+
+// GPT-5.2-Codex (legacy Responses-first codex model)
 pub const MODEL_GPT52_CODEX: &str = "gpt-5.2-codex";
 
 /// Reasoning effort level for the model.
@@ -34,15 +37,15 @@ pub enum ReasoningEffort {
 
 /// `OpenAI` Responses API provider.
 ///
-/// This provider uses the `/v1/responses` endpoint which supports models like
-/// `gpt-5.2-codex` that are designed for agentic coding workflows.
+/// This provider uses the `/v1/responses` endpoint for `OpenAI` models that expose
+/// agentic workflows over the Responses API.
 #[derive(Clone)]
 pub struct OpenAIResponsesProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
     base_url: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl OpenAIResponsesProvider {
@@ -54,7 +57,7 @@ impl OpenAIResponsesProvider {
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
-            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -66,27 +69,44 @@ impl OpenAIResponsesProvider {
             api_key,
             model,
             base_url,
-            reasoning_effort: None,
+            thinking: None,
         }
     }
 
-    /// Create a provider using GPT-5.2-Codex (optimized for agentic coding).
+    /// Create a provider using GPT-5.3-Codex (latest codex model).
+    #[must_use]
+    pub fn gpt53_codex(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT53_CODEX.to_owned())
+    }
+
+    /// Create a provider using the latest Codex model.
     #[must_use]
     pub fn codex(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GPT52_CODEX.to_owned())
+        Self::gpt53_codex(api_key)
+    }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
     }
 
     /// Set the reasoning effort level.
     #[must_use]
-    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = Some(effort);
-        self
+    pub fn with_reasoning_effort(self, effort: ReasoningEffort) -> Self {
+        self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAIResponsesProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
         let tools: Option<Vec<ApiTool>> = request
             .tools
@@ -97,7 +117,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             input: &input,
             tools: tools.as_deref(),
             max_output_tokens: Some(request.max_tokens),
-            reasoning: self.reasoning_effort.map(|e| ApiReasoning { effort: e }),
+            reasoning,
         };
 
         log::debug!(
@@ -185,6 +205,17 @@ impl LlmProvider for OpenAIResponsesProvider {
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
         Box::pin(async_stream::stream! {
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
+            let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
@@ -195,7 +226,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                 input: &input,
                 tools: tools.as_deref(),
                 max_output_tokens: Some(request.max_tokens),
-                reasoning: self.reasoning_effort.map(|e| ApiReasoning { effort: e }),
+                reasoning,
                 stream: true,
             };
 
@@ -322,6 +353,10 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     fn provider(&self) -> &'static str {
         "openai-responses"
+    }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
     }
 }
 
@@ -507,6 +542,53 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     }
 
     blocks
+}
+
+fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
+    thinking
+        .and_then(resolve_reasoning_effort)
+        .map(|effort| ApiReasoning { effort })
+}
+
+const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
+    if let Some(effort) = config.effort {
+        return Some(map_effort(effort));
+    }
+
+    match &config.mode {
+        ThinkingMode::Adaptive => None,
+        ThinkingMode::Enabled { budget_tokens } => Some(map_budget_to_reasoning(*budget_tokens)),
+    }
+}
+
+const fn map_effort(effort: Effort) -> ReasoningEffort {
+    match effort {
+        Effort::Low => ReasoningEffort::Low,
+        Effort::Medium => ReasoningEffort::Medium,
+        Effort::High => ReasoningEffort::High,
+        Effort::Max => ReasoningEffort::XHigh,
+    }
+}
+
+const fn map_reasoning_effort(effort: ReasoningEffort) -> Effort {
+    match effort {
+        ReasoningEffort::Low => Effort::Low,
+        ReasoningEffort::Medium => Effort::Medium,
+        ReasoningEffort::High => Effort::High,
+        ReasoningEffort::XHigh => Effort::Max,
+    }
+}
+
+const fn map_budget_to_reasoning(budget_tokens: u32) -> ReasoningEffort {
+    if budget_tokens <= 4_096 {
+        ReasoningEffort::Low
+    } else if budget_tokens <= 16_384 {
+        ReasoningEffort::Medium
+    } else if budget_tokens <= 32_768 {
+        ReasoningEffort::High
+    } else {
+        ReasoningEffort::XHigh
+    }
 }
 
 // ============================================================================
@@ -719,13 +801,21 @@ mod tests {
 
     #[test]
     fn test_model_constant() {
+        assert_eq!(MODEL_GPT53_CODEX, "gpt-5.3-codex");
         assert_eq!(MODEL_GPT52_CODEX, "gpt-5.2-codex");
     }
 
     #[test]
     fn test_codex_factory() {
         let provider = OpenAIResponsesProvider::codex("test-key".to_string());
-        assert_eq!(provider.model(), MODEL_GPT52_CODEX);
+        assert_eq!(provider.model(), MODEL_GPT53_CODEX);
+        assert_eq!(provider.provider(), "openai-responses");
+    }
+
+    #[test]
+    fn test_gpt53_codex_factory() {
+        let provider = OpenAIResponsesProvider::gpt53_codex("test-key".to_string());
+        assert_eq!(provider.model(), MODEL_GPT53_CODEX);
         assert_eq!(provider.provider(), "openai-responses");
     }
 
@@ -742,7 +832,33 @@ mod tests {
     fn test_with_reasoning_effort() {
         let provider = OpenAIResponsesProvider::codex("test-key".to_string())
             .with_reasoning_effort(ReasoningEffort::High);
-        assert!(provider.reasoning_effort.is_some());
+        let thinking = provider.thinking.as_ref().unwrap();
+        assert!(matches!(thinking.effort, Some(Effort::High)));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_uses_explicit_effort() {
+        let reasoning =
+            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::Low))).unwrap();
+        assert!(matches!(reasoning.effort, ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn test_build_api_reasoning_omits_adaptive_without_effort() {
+        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    }
+
+    #[test]
+    fn test_openai_responses_rejects_adaptive_thinking() {
+        let provider = OpenAIResponsesProvider::codex("test-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adaptive thinking is not supported")
+        );
     }
 
     #[test]

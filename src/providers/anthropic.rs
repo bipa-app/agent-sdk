@@ -8,7 +8,7 @@ pub(crate) mod data;
 
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StreamBox, StreamDelta,
-    Usage,
+    ThinkingConfig, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -94,6 +94,7 @@ pub struct AnthropicProvider {
     /// Original tool names for reverse mapping in OAuth mode (reserved for future use).
     #[allow(dead_code)]
     original_tool_names: Vec<String>,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl AnthropicProvider {
@@ -125,6 +126,7 @@ impl AnthropicProvider {
             model,
             auth_mode,
             original_tool_names: Vec::new(),
+            thinking: None,
         }
     }
 
@@ -196,12 +198,23 @@ impl AnthropicProvider {
     pub fn opus(api_key: String) -> Self {
         Self::new(api_key, MODEL_OPUS_46.to_owned())
     }
+
+    /// Set the provider-owned thinking configuration for this model.
+    #[must_use]
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
 }
 
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl LlmProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+            Ok(thinking) => thinking,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
         let messages = build_api_messages(&request);
         let tools = if self.is_oauth() {
             build_api_tools(&request).map(|tools| {
@@ -216,12 +229,10 @@ impl LlmProvider for AnthropicProvider {
         } else {
             build_api_tools(&request)
         };
-        let thinking = request
-            .thinking
+        let thinking = thinking_config
             .as_ref()
             .map(ApiThinkingConfig::from_thinking_config);
-        let output_config = request
-            .thinking
+        let output_config = thinking_config
             .as_ref()
             .and_then(|t| t.effort)
             .map(|effort| ApiOutputConfig { effort });
@@ -361,12 +372,20 @@ impl LlmProvider for AnthropicProvider {
             } else {
                 build_api_tools(&request)
             };
-            let thinking = request
-                .thinking
+            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                Ok(thinking) => thinking,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        recoverable: false,
+                    });
+                    return;
+                }
+            };
+            let thinking = thinking_config
                 .as_ref()
                 .map(ApiThinkingConfig::from_thinking_config);
-            let output_config = request
-                .thinking
+            let output_config = thinking_config
                 .as_ref()
                 .and_then(|t| t.effort)
                 .map(|effort| ApiOutputConfig { effort });
@@ -585,6 +604,10 @@ impl LlmProvider for AnthropicProvider {
     fn provider(&self) -> &'static str {
         "anthropic"
     }
+
+    fn configured_thinking(&self) -> Option<&ThinkingConfig> {
+        self.thinking.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +633,26 @@ mod tests {
 
         assert_eq!(provider.model(), MODEL_HAIKU_45);
         assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_only_anthropic_46_models_accept_adaptive_thinking() {
+        let sonnet_46 = AnthropicProvider::sonnet_46("test-api-key".to_string());
+        assert!(
+            sonnet_46
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_ok()
+        );
+
+        let sonnet_45 = AnthropicProvider::sonnet_45("test-api-key".to_string());
+        let error = sonnet_45
+            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adaptive thinking is not supported")
+        );
     }
 
     #[test]
