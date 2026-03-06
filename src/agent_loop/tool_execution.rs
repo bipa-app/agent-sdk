@@ -749,14 +749,30 @@ where
         return Ok(());
     }
 
-    let blocks: Vec<ContentBlock> = tool_results
-        .iter()
-        .map(|(tool_id, result)| ContentBlock::ToolResult {
+    // Build tool result blocks. If a result carries `data.pdf_base64`, inject a
+    // Document block alongside the tool result so the LLM can read the PDF content
+    // (Anthropic parses PDF document blocks natively; it cannot parse raw base64 in text).
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    for (tool_id, result) in tool_results {
+        blocks.push(ContentBlock::ToolResult {
             tool_use_id: tool_id.clone(),
             content: result.output.clone(),
             is_error: if result.success { None } else { Some(true) },
-        })
-        .collect();
+        });
+        if let Some(pdf_b64) = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("pdf_base64"))
+            .and_then(|v| v.as_str())
+        {
+            blocks.push(ContentBlock::Document {
+                source: crate::llm::ContentSource::new(
+                    "application/pdf".to_owned(),
+                    pdf_b64.to_owned(),
+                ),
+            });
+        }
+    }
 
     let batch_msg = Message {
         role: Role::User,
