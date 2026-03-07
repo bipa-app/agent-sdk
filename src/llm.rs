@@ -107,7 +107,7 @@ pub trait LlmProvider: Send + Sync {
     /// Canonical capability metadata for this provider/model, if known.
     fn capabilities(&self) -> Option<&'static ModelCapabilities> {
         get_model_capabilities(self.provider(), self.model()).or_else(|| match self.provider() {
-            "openai-responses" => get_model_capabilities("openai", self.model()),
+            "openai-responses" | "openai-codex" => get_model_capabilities("openai", self.model()),
             "vertex" if self.model().starts_with("claude-") => {
                 get_model_capabilities("anthropic", self.model())
             }
