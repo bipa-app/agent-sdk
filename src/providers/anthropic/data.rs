@@ -231,6 +231,9 @@ pub enum SseContentBlock {
     RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
+    /// Catch-all for unknown content block types (future API additions).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +253,9 @@ pub enum SseDelta {
     Signature { signature: String },
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
+    /// Catch-all for unknown delta types (future API additions).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -537,7 +543,9 @@ pub fn parse_sse_event(
                             block_index: event.index,
                         })
                     }
-                    SseContentBlock::Text | SseContentBlock::Thinking => None,
+                    SseContentBlock::Text
+                    | SseContentBlock::Thinking
+                    | SseContentBlock::Unknown => None,
                 },
                 Err(error) => {
                     log_sse_parse_error(&event_type, &data, &error);
@@ -568,6 +576,7 @@ pub fn parse_sse_event(
                         block_index: event.index,
                     })
                 }
+                SseDelta::Unknown => None,
             },
             Err(error) => {
                 log_sse_parse_error(&event_type, &data, &error);
@@ -1088,6 +1097,24 @@ data: {"type":"message_stop"}"#;
         let json_delta: SseDelta =
             serde_json::from_str(r#"{"type":"input_json_delta","partial_json":"{}"}"#).unwrap();
         assert!(matches!(json_delta, SseDelta::InputJson { partial_json } if partial_json == "{}"));
+    }
+
+    #[test]
+    fn test_sse_delta_unknown_type_does_not_fail() {
+        // Future API additions should deserialize as Unknown rather than
+        // causing the entire content_block_delta event to fail.
+        let unknown: SseDelta =
+            serde_json::from_str(r#"{"type":"citations_delta","citations":[]}"#).unwrap();
+        assert!(matches!(unknown, SseDelta::Unknown));
+    }
+
+    #[test]
+    fn test_sse_content_block_unknown_type_does_not_fail() {
+        let unknown: SseContentBlock = serde_json::from_str(
+            r#"{"type":"server_tool_use","id":"st_1","name":"web_search","input":{}}"#,
+        )
+        .unwrap();
+        assert!(matches!(unknown, SseContentBlock::Unknown));
     }
 
     #[test]

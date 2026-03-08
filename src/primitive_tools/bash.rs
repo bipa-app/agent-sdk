@@ -26,14 +26,19 @@ impl<E: Environment> BashTool<E> {
 struct BashInput {
     /// Command to execute
     command: String,
-    /// Timeout in milliseconds (default: 120000 = 2 minutes)
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
+    /// Timeout in milliseconds (default: 120000 = 2 minutes).
+    /// Accepts either an integer or a numeric string such as "5000".
+    /// Uses `Option` so that explicit `null` from the model is handled
+    /// gracefully (falls back to the default rather than failing
+    /// deserialization).
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_optional_u64_from_string_or_int"
+    )]
+    timeout_ms: Option<u64>,
 }
 
-const fn default_timeout() -> u64 {
-    120_000 // 2 minutes
-}
+const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
 
 impl<E: Environment + 'static> Tool<()> for BashTool<E> {
     type Name = PrimitiveToolName;
@@ -63,8 +68,11 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
                     "description": "The shell command to execute"
                 },
                 "timeout_ms": {
-                    "type": "integer",
-                    "description": "Timeout in milliseconds. Default: 120000 (2 minutes)"
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "string", "pattern": "^[0-9]+$"}
+                    ],
+                    "description": "Timeout in milliseconds. Accepts either an integer or a numeric string. Default: 120000 (2 minutes)"
                 }
             },
             "required": ["command"]
@@ -72,8 +80,8 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
     }
 
     async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
-        let input: BashInput =
-            serde_json::from_value(input).context("Invalid input for bash tool")?;
+        let input: BashInput = serde_json::from_value(input.clone())
+            .with_context(|| format!("Invalid input for bash tool: {input}"))?;
 
         // Check exec capability
         if !self.ctx.capabilities.exec {
@@ -91,7 +99,7 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         }
 
         // Validate timeout
-        let timeout_ms = input.timeout_ms.min(600_000); // Max 10 minutes
+        let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(600_000); // Max 10 minutes
 
         // Execute command
         let result = self
@@ -481,6 +489,56 @@ mod tests {
         // Missing required command field
         let result = tool.execute(&tool_ctx(), json!({})).await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_null_timeout_ms() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hello", "hello", "", 0);
+        let tool = create_test_tool(env, AgentCapabilities::full_access());
+
+        // Model may send explicit null for optional fields — must not fail
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"command": "echo hello", "timeout_ms": null}),
+            )
+            .await?;
+
+        assert!(result.success);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_missing_timeout_uses_default() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hi", "hi", "", 0);
+        let tool = create_test_tool(env, AgentCapabilities::full_access());
+
+        // Omitted timeout_ms should use the default
+        let result = tool
+            .execute(&tool_ctx(), json!({"command": "echo hi"}))
+            .await?;
+
+        assert!(result.success);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_string_timeout_ms() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo timeout", "ok", "", 0);
+        let tool = create_test_tool(env, AgentCapabilities::full_access());
+
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"command": "echo timeout", "timeout_ms": "5000"}),
+            )
+            .await?;
+
+        assert!(result.success);
         Ok(())
     }
 

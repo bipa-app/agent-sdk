@@ -238,7 +238,18 @@ impl StreamAccumulator {
         // Add tool uses with their indices
         for tool in self.tool_uses {
             let input: serde_json::Value =
-                serde_json::from_str(&tool.input_json).unwrap_or_else(|_| serde_json::json!({}));
+                serde_json::from_str(&tool.input_json).unwrap_or_else(|e| {
+                    log::warn!(
+                        "Failed to parse streamed tool input JSON for tool '{}' (id={}): {} — \
+                         input_json ({} bytes): '{}'",
+                        tool.name,
+                        tool.id,
+                        e,
+                        tool.input_json.len(),
+                        tool.input_json.chars().take(500).collect::<String>(),
+                    );
+                    serde_json::json!({})
+                });
             blocks.push((
                 tool.block_index,
                 ContentBlock::ToolUse {
@@ -423,6 +434,63 @@ mod tests {
         match &blocks[0] {
             ContentBlock::ToolUse { input, .. } => {
                 assert!(input.is_object());
+            }
+            _ => panic!("Expected ToolUse block"),
+        }
+    }
+
+    #[test]
+    fn test_accumulator_empty_tool_input_falls_back_to_empty_object() {
+        // If no ToolInputDelta is received (e.g., stream interrupted or
+        // deltas had mismatched IDs), the tool use block should still be
+        // produced with an empty object so that the error is attributable
+        // to the tool rather than silently lost.
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::ToolUseStart {
+            id: "call_empty".to_string(),
+            name: "read".to_string(),
+            block_index: 0,
+            thought_signature: None,
+        });
+        // No ToolInputDelta applied
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, name, .. } => {
+                assert_eq!(name, "read");
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            _ => panic!("Expected ToolUse block"),
+        }
+    }
+
+    #[test]
+    fn test_accumulator_mismatched_delta_id_drops_input() {
+        // If ToolInputDelta has a different ID than any ToolUseStart,
+        // the input is silently dropped (the tool gets empty {}).
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::ToolUseStart {
+            id: "call_A".to_string(),
+            name: "bash".to_string(),
+            block_index: 0,
+            thought_signature: None,
+        });
+        // Delta with wrong ID
+        acc.apply(&StreamDelta::ToolInputDelta {
+            id: "call_B".to_string(),
+            delta: r#"{"command":"ls"}"#.to_string(),
+            block_index: 0,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                // Input should be empty because the delta had a mismatched ID
+                assert_eq!(input, &serde_json::json!({}));
             }
             _ => panic!("Expected ToolUse block"),
         }

@@ -33,11 +33,19 @@ struct ReadInput {
     /// Path to the file to read (also accepts `file_path` for compatibility)
     #[serde(alias = "file_path")]
     path: String,
-    /// Optional line offset to start from (1-based)
-    #[serde(default)]
+    /// Optional line offset to start from (1-based).
+    /// Accepts either an integer or a numeric string such as "55".
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_optional_usize_from_string_or_int"
+    )]
     offset: Option<usize>,
-    /// Optional number of lines to read
-    #[serde(default)]
+    /// Optional number of lines to read.
+    /// Accepts either an integer or a numeric string such as "40".
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_optional_usize_from_string_or_int"
+    )]
     limit: Option<usize>,
 }
 
@@ -75,12 +83,18 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
                     "description": "Path to the file to read"
                 },
                 "offset": {
-                    "type": "integer",
-                    "description": "Line number to start from (1-based). Optional. Only applies to text files."
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "string", "pattern": "^[0-9]+$"}
+                    ],
+                    "description": "Line number to start from (1-based). Accepts either an integer or a numeric string. Optional. Only applies to text files."
                 },
                 "limit": {
-                    "type": "integer",
-                    "description": "Number of lines to read. Optional. Only applies to text files."
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "string", "pattern": "^[0-9]+$"}
+                    ],
+                    "description": "Number of lines to read. Accepts either an integer or a numeric string. Optional. Only applies to text files."
                 }
             },
             "required": ["path"]
@@ -88,8 +102,8 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
     }
 
     async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
-        let input: ReadInput =
-            serde_json::from_value(input).context("Invalid input for read tool")?;
+        let input: ReadInput = serde_json::from_value(input.clone())
+            .with_context(|| format!("Invalid input for read tool: {input}"))?;
 
         let path = self.ctx.environment.resolve_path(&input.path);
 
@@ -383,6 +397,29 @@ mod tests {
             .execute(
                 &tool_ctx(),
                 json!({"path": "/workspace/test.txt", "offset": 2, "limit": 2}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Showing lines 2-3 of 5 total"));
+        assert!(result.output.contains("line 2"));
+        assert!(result.output.contains("line 3"));
+        assert!(!result.output.contains("\tline 1"));
+        assert!(!result.output.contains("\tline 4"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_with_string_offset_and_limit() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
+            .await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "offset": "2", "limit": "2"}),
             )
             .await?;
 

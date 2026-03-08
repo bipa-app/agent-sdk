@@ -407,7 +407,7 @@ where
                                 Some(millis_to_u64(tool_start.elapsed().as_millis()));
                             value
                         }
-                        Err(error) => ToolResult::error(format!("Tool error: {error}"))
+                        Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
                             .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                     }
                 })
@@ -495,7 +495,7 @@ where
     let outcome = match tool.execute(tool_context, pending.input.clone()).await {
         Ok(o) => o,
         Err(e) => {
-            return ToolResult::error(format!("Tool error: {e}"))
+            return ToolResult::error(format!("Tool error: {e:#}"))
                 .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
         }
     };
@@ -696,7 +696,7 @@ where
                         value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
                         value
                     }
-                    Err(error) => ToolResult::error(format!("Tool error: {error}"))
+                    Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
                         .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                 }
             },
