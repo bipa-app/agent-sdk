@@ -233,7 +233,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
 ///
 /// This is the core turn execution logic shared by both `run_loop` (looping mode)
 /// and `run_single_turn` (single-turn mode).
-pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M> {
+pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) ctx: &'a mut TurnContext,
@@ -242,6 +242,7 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M> {
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) message_store: &'a Arc<M>,
+    pub(super) state_store: &'a Arc<S>,
     pub(super) config: &'a AgentConfig,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,

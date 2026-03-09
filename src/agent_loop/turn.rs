@@ -14,7 +14,7 @@ use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
 };
-use crate::stores::{MessageStore, ToolExecutionStore};
+use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
@@ -827,7 +827,7 @@ where
     None
 }
 
-pub(super) async fn execute_turn<Ctx, P, H, M>(
+pub(super) async fn execute_turn<Ctx, P, H, M, S>(
     ExecuteTurnParameters {
         tx,
         seq,
@@ -837,17 +837,19 @@ pub(super) async fn execute_turn<Ctx, P, H, M>(
         tools,
         hooks,
         message_store,
+        state_store,
         config,
         compaction_config,
         compactor,
         execution_store,
-    }: ExecuteTurnParameters<'_, Ctx, P, H, M>,
+    }: ExecuteTurnParameters<'_, Ctx, P, H, M, S>,
 ) -> InternalTurnResult
 where
     Ctx: Send + Sync + Clone + 'static,
     P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
+    S: StateStore,
 {
     if let Err(error) = begin_turn(ctx, config.max_turns, tx, hooks, seq).await {
         return InternalTurnResult::Error(error);
@@ -919,6 +921,7 @@ where
         tools,
         hooks,
         message_store,
+        state_store,
         compaction_config,
         compactor,
         execution_store,
@@ -929,7 +932,7 @@ where
 }
 
 #[expect(clippy::too_many_arguments)]
-async fn process_response_and_run_tools<Ctx, P, H, M>(
+async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     response: ChatResponse,
     message_id: &str,
     thinking_id: &str,
@@ -939,6 +942,7 @@ async fn process_response_and_run_tools<Ctx, P, H, M>(
     tools: &Arc<ToolRegistry<Ctx>>,
     hooks: &Arc<H>,
     message_store: &Arc<M>,
+    state_store: &Arc<S>,
     compaction_config: Option<&CompactionConfig>,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
@@ -950,6 +954,7 @@ where
     P: LlmProvider,
     H: AgentHooks,
     M: MessageStore,
+    S: StateStore,
 {
     let turn_usage = apply_turn_usage(ctx, &response);
     let ProcessedTurnResponse {
@@ -974,6 +979,10 @@ where
     };
 
     let had_tool_calls = !pending_tool_calls.is_empty();
+
+    if had_tool_calls && let Err(error) = state_store.save(&ctx.state).await {
+        warn!("Failed to save pre-tool state checkpoint: {error}");
+    }
 
     if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
         pending_tool_calls,

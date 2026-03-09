@@ -8,6 +8,7 @@ use crate::llm::{
     ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, StreamDelta,
     Usage,
 };
+use crate::types::ToolResultEnvelope;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -366,11 +367,19 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
             tool_use_id,
             content,
             is_error,
-        } => Some(ApiContentBlockInput::ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
-            is_error: *is_error,
-        }),
+        } => {
+            let envelope =
+                ToolResultEnvelope::from_message_content(content, is_error.unwrap_or(false));
+            Some(ApiContentBlockInput::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: envelope.to_anthropic_content(),
+                is_error: if envelope.is_success() {
+                    None
+                } else {
+                    Some(true)
+                },
+            })
+        }
         ContentBlock::Image { source } => Some(ApiContentBlockInput::Image {
             source: ApiSource::from_content_source(source),
         }),
@@ -779,6 +788,39 @@ mod tests {
         assert_eq!(json[0]["content"][0]["signature"], "sig_123");
         assert_eq!(json[0]["content"][1]["type"], "text");
         assert_eq!(json[0]["content"][1]["text"], "Done.");
+    }
+
+    #[test]
+    fn test_build_api_messages_wraps_legacy_tool_result_content() {
+        let request = ChatRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_123".to_string(),
+                    content: r#"{"result":"failed","duration_ms":17,"output":"plain output"}"#
+                        .to_string(),
+                    is_error: Some(true),
+                }]),
+            }],
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        };
+
+        let messages = build_api_messages(&request);
+        let ApiMessageContent::Blocks(blocks) = &messages[0].content else {
+            panic!("expected block content");
+        };
+        let ApiContentBlockInput::ToolResult {
+            content, is_error, ..
+        } = &blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+
+        assert_eq!(content, "plain output");
+        assert_eq!(*is_error, Some(true));
     }
 
     #[test]

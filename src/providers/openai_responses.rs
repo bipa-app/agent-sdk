@@ -9,6 +9,7 @@ use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
 };
+use crate::types::ToolResultEnvelope;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -436,10 +437,17 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
-                            ..
+                            is_error,
                         } => {
+                            let envelope = ToolResultEnvelope::from_message_content(
+                                content,
+                                is_error.unwrap_or(false),
+                            );
                             items.push(ApiInputItem::FunctionCallOutput(
-                                ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
+                                ApiFunctionCallOutput::new(
+                                    tool_use_id.clone(),
+                                    envelope.to_openai_content(),
+                                ),
                             ));
                         }
                     }
@@ -906,6 +914,32 @@ mod tests {
                 .to_string()
                 .contains("adaptive thinking is not supported")
         );
+    }
+
+    #[test]
+    fn test_build_api_input_wraps_legacy_tool_result_content() {
+        let request = ChatRequest {
+            system: String::new(),
+            messages: vec![crate::llm::Message {
+                role: crate::llm::Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_123".to_string(),
+                    content: r#"{"result":"failed","duration_ms":17,"output":"plain output"}"#
+                        .to_string(),
+                    is_error: Some(true),
+                }]),
+            }],
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        };
+
+        let items = build_api_input(&request);
+        let ApiInputItem::FunctionCallOutput(output) = &items[0] else {
+            panic!("expected function call output");
+        };
+
+        assert_eq!(output.output, "plain output");
     }
 
     #[test]

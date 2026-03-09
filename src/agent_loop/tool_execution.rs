@@ -797,6 +797,31 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn test_append_tool_results_preserves_raw_output_content() -> anyhow::Result<()> {
+        let store = Arc::new(InMemoryStore::new());
+        let thread_id = ThreadId::from_string("thread-structured");
+        let result = ToolResult::error("command failed").with_duration(17);
+
+        append_tool_results(&[("tool_1".to_string(), result)], &thread_id, &store).await?;
+
+        let history = store.get_history(&thread_id).await?;
+        let Content::Blocks(blocks) = &history[0].content else {
+            anyhow::bail!("expected blocks")
+        };
+
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &blocks[0]
+        else {
+            anyhow::bail!("expected tool result block")
+        };
+
+        assert_eq!(content, "command failed");
+        assert_eq!(*is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_append_tool_results_uses_image_block_for_images() -> anyhow::Result<()> {
         let store = Arc::new(InMemoryStore::new());
         let thread_id = ThreadId::from_string("thread-1");

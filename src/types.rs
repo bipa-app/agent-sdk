@@ -140,6 +140,79 @@ impl TokenUsage {
     }
 }
 
+/// Success/failure status for persisted and provider-visible tool results.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolResultStatus {
+    Success,
+    Failed,
+}
+
+impl ToolResultStatus {
+    #[must_use]
+    pub const fn from_success(success: bool) -> Self {
+        if success { Self::Success } else { Self::Failed }
+    }
+
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Success)
+    }
+}
+
+/// Legacy structured wrapper for parsing previously persisted tool-result payloads.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultEnvelope {
+    /// Execution status as seen by the model.
+    pub result: ToolResultStatus,
+    /// Tool execution duration in milliseconds when available.
+    pub duration_ms: Option<u64>,
+    /// Human-readable tool output.
+    pub output: String,
+}
+
+impl ToolResultEnvelope {
+    #[must_use]
+    pub fn from_message_content(content: &str, is_error: bool) -> Self {
+        Self::parse(content).unwrap_or_else(|| Self {
+            result: ToolResultStatus::from_success(!is_error),
+            duration_ms: None,
+            output: content.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn parse(content: &str) -> Option<Self> {
+        serde_json::from_str(content).ok()
+    }
+
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.result.is_success()
+    }
+
+    #[must_use]
+    pub fn to_anthropic_content(&self) -> String {
+        self.output.clone()
+    }
+
+    #[must_use]
+    pub fn to_openai_content(&self) -> String {
+        self.output.clone()
+    }
+
+    #[must_use]
+    pub fn to_gemini_response(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            serde_json::json!({
+                "result": if self.is_success() { "success" } else { "failed" },
+                "duration_ms": self.duration_ms,
+                "output": self.output,
+            })
+        })
+    }
+}
+
 /// Result of a tool execution
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -601,4 +674,46 @@ pub enum TurnOutcome {
 
     /// An error occurred.
     Error(AgentError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolResult, ToolResultEnvelope, ToolResultStatus};
+
+    #[test]
+    fn tool_result_envelope_round_trips_structured_content() {
+        let result = ToolResult::error("command failed").with_duration(42);
+        let content = serde_json::to_string(&ToolResultEnvelope {
+            result: ToolResultStatus::from_success(result.success),
+            duration_ms: result.duration_ms,
+            output: result.output,
+        })
+        .expect("envelope should serialize");
+        let envelope = ToolResultEnvelope::parse(&content).expect("envelope should parse");
+
+        assert_eq!(envelope.result, ToolResultStatus::Failed);
+        assert_eq!(envelope.duration_ms, Some(42));
+        assert_eq!(envelope.output, "command failed");
+        assert!(!envelope.is_success());
+    }
+
+    #[test]
+    fn tool_result_envelope_supports_legacy_plain_text_content() {
+        let envelope = ToolResultEnvelope::from_message_content("plain output", false);
+
+        assert_eq!(envelope.result, ToolResultStatus::Success);
+        assert_eq!(envelope.duration_ms, None);
+        assert_eq!(envelope.output, "plain output");
+        assert!(envelope.is_success());
+    }
+
+    #[test]
+    fn tool_result_envelope_supports_empty_legacy_content() {
+        let envelope = ToolResultEnvelope::from_message_content("", true);
+
+        assert_eq!(envelope.result, ToolResultStatus::Failed);
+        assert_eq!(envelope.duration_ms, None);
+        assert_eq!(envelope.output, "");
+        assert!(!envelope.is_success());
+    }
 }
