@@ -12,7 +12,6 @@ use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
 };
-use crate::types::ToolResultEnvelope;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -804,16 +803,12 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
-                            is_error,
+                            ..
                         } => {
-                            let envelope = ToolResultEnvelope::from_message_content(
-                                content,
-                                is_error.unwrap_or(false),
-                            );
-                            // Tool results are separate messages in OpenAI.
+                            // Tool results are separate messages in OpenAI
                             messages.push(ApiMessage {
                                 role: ApiRole::Tool,
-                                content: Some(envelope.to_openai_content()),
+                                content: Some(content.clone()),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
                             });
@@ -1612,31 +1607,6 @@ mod tests {
         let api_messages = build_api_messages(&request);
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, ApiRole::User);
-    }
-
-    #[test]
-    fn test_build_api_messages_wraps_legacy_tool_result_content() {
-        let request = ChatRequest {
-            system: String::new(),
-            messages: vec![crate::llm::Message {
-                role: crate::llm::Role::User,
-                content: Content::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_123".to_string(),
-                    content: r#"{"result":"failed","duration_ms":17,"output":"plain output"}"#
-                        .to_string(),
-                    is_error: Some(true),
-                }]),
-            }],
-            tools: None,
-            max_tokens: 1024,
-            thinking: None,
-        };
-
-        let api_messages = build_api_messages(&request);
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, ApiRole::Tool);
-        let content = api_messages[0].content.as_deref().unwrap_or_default();
-        assert_eq!(content, "plain output");
     }
 
     #[test]

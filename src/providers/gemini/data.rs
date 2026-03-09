@@ -5,7 +5,6 @@
 
 use crate::llm::attachments::decode_attachment_bytes;
 use crate::llm::{Content, ContentBlock, StopReason, StreamBox, StreamDelta, Usage};
-use crate::types::ToolResultEnvelope;
 use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -265,14 +264,15 @@ pub fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
                                 .get(tool_use_id)
                                 .cloned()
                                 .unwrap_or_else(|| "unknown_function".to_owned());
-                            let envelope = ToolResultEnvelope::from_message_content(
-                                content,
-                                is_error.unwrap_or(false),
-                            );
+                            let response = if is_error.unwrap_or(false) {
+                                serde_json::json!({ "error": content })
+                            } else {
+                                serde_json::json!({ "result": content })
+                            };
                             parts.push(ApiPart::FunctionResponse {
                                 function_response: ApiFunctionResponse {
                                     name: func_name,
-                                    response: envelope.to_gemini_response(),
+                                    response,
                                 },
                             });
                         }
@@ -748,40 +748,6 @@ mod tests {
         let contents = build_api_contents(&messages);
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role, Some("model".to_string()));
-    }
-
-    #[test]
-    fn test_build_api_contents_wraps_legacy_tool_result_content() {
-        let messages = vec![
-            crate::llm::Message {
-                role: crate::llm::Role::Assistant,
-                content: Content::Blocks(vec![ContentBlock::ToolUse {
-                    id: "call_123".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "test.txt"}),
-                    thought_signature: None,
-                }]),
-            },
-            crate::llm::Message {
-                role: crate::llm::Role::User,
-                content: Content::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_123".to_string(),
-                    content: r#"{"result":"failed","duration_ms":17,"output":"plain output"}"#
-                        .to_string(),
-                    is_error: Some(true),
-                }]),
-            },
-        ];
-
-        let contents = build_api_contents(&messages);
-        let ApiPart::FunctionResponse { function_response } = &contents[1].parts[0] else {
-            panic!("expected function response part");
-        };
-
-        assert_eq!(function_response.name, "read_file");
-        assert_eq!(function_response.response["result"], "failed");
-        assert_eq!(function_response.response["duration_ms"], 17);
-        assert_eq!(function_response.response["output"], "plain output");
     }
 
     #[test]
