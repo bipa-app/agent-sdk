@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Capabilities that control what the agent can do.
 ///
 /// This provides a security model for primitive tools (Read, Write, Grep, Glob, Bash).
-/// Paths are matched using glob patterns.
+/// Paths are matched using glob patterns, commands using regex patterns.
+///
+/// By default, no paths or commands are denied — the SDK is unopinionated and leaves
+/// security policy to the client. Use the builder methods to configure restrictions.
 ///
 /// # Example
 ///
@@ -18,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// let caps = AgentCapabilities::full_access()
 ///     .with_denied_paths(vec!["**/.env*".into(), "**/secrets/**".into()]);
 /// ```
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     /// Can read files
     pub read: bool,
@@ -36,47 +39,6 @@ pub struct AgentCapabilities {
     pub denied_commands: Vec<String>,
 }
 
-impl Default for AgentCapabilities {
-    fn default() -> Self {
-        Self {
-            read: true,
-            write: false,
-            exec: false,
-            allowed_paths: vec![],
-            denied_paths: vec![
-                // Match .env files anywhere
-                ".env".into(),
-                ".env.*".into(),
-                "*/.env".into(),
-                "*/.env.*".into(),
-                "**/.env".into(),
-                "**/.env.*".into(),
-                // Match secrets/credentials anywhere
-                "**/secrets/**".into(),
-                "**/credentials/**".into(),
-                // Match key files anywhere
-                "*.pem".into(),
-                "**/*.pem".into(),
-                "*.key".into(),
-                "**/*.key".into(),
-                "**/id_rsa".into(),
-                "**/id_rsa.*".into(),
-            ],
-            allowed_commands: vec![],
-            denied_commands: vec![
-                r"rm\s+-rf\s+/".into(),     // rm -rf /
-                r"rm\s+-r\s+-f\s+/".into(), // rm -r -f /
-                r"rm\s+-f\s+-r\s+/".into(), // rm -f -r /
-                r"^sudo\s".into(),          // sudo commands
-                r"chmod\s+777".into(),      // chmod 777
-                r"mkfs\.".into(),           // mkfs commands
-                r"dd\s+if=".into(),         // dd commands
-                r">\s*/dev/".into(),        // redirect to /dev
-            ],
-        }
-    }
-}
-
 impl AgentCapabilities {
     /// Create capabilities with no access (must explicitly enable)
     #[must_use]
@@ -92,25 +54,31 @@ impl AgentCapabilities {
         }
     }
 
-    /// Create read-only capabilities (safe default)
+    /// Create read-only capabilities
     #[must_use]
-    pub fn read_only() -> Self {
+    pub const fn read_only() -> Self {
         Self {
             read: true,
             write: false,
             exec: false,
-            ..Default::default()
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_commands: vec![],
+            denied_commands: vec![],
         }
     }
 
-    /// Create full access capabilities (use with caution)
+    /// Create full access capabilities
     #[must_use]
-    pub fn full_access() -> Self {
+    pub const fn full_access() -> Self {
         Self {
             read: true,
             write: true,
             exec: true,
-            ..Default::default()
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_commands: vec![],
+            denied_commands: vec![],
         }
     }
 
@@ -278,49 +246,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_denies_sensitive_files() {
+    fn test_default_has_no_deny_lists() {
         let caps = AgentCapabilities::default();
 
-        // Direct .env files
-        assert!(!caps.path_allowed(".env"));
-        assert!(!caps.path_allowed(".env.local"));
-
-        // .env in subdirectories (relative)
-        assert!(!caps.path_allowed("config/.env"));
-        assert!(!caps.path_allowed("config/.env.local"));
-
-        // .env in subdirectories (absolute — the real-world case after resolve_path)
-        assert!(!caps.path_allowed("/workspace/.env"));
-        assert!(!caps.path_allowed("/workspace/.env.local"));
-        assert!(!caps.path_allowed("/workspace/config/.env"));
-        assert!(!caps.path_allowed("/workspace/config/.env.production"));
-
-        // Secrets directory
-        assert!(!caps.path_allowed("app/secrets/api_key.txt"));
-        assert!(!caps.path_allowed("/workspace/app/secrets/api_key.txt"));
-
-        // Key files
-        assert!(!caps.path_allowed("server.pem"));
-        assert!(!caps.path_allowed("certs/server.pem"));
-        assert!(!caps.path_allowed("/workspace/certs/server.pem"));
-        assert!(!caps.path_allowed("home/.ssh/id_rsa"));
-        assert!(!caps.path_allowed("/home/user/.ssh/id_rsa"));
+        // Default is permissive — no paths or commands are denied
+        assert!(caps.path_allowed("src/main.rs"));
+        assert!(caps.path_allowed(".env"));
+        assert!(caps.path_allowed("/workspace/secrets/key.txt"));
+        assert!(caps.command_allowed("any command"));
     }
 
     #[test]
-    fn test_default_allows_normal_files() {
-        let caps = AgentCapabilities::default();
+    fn test_full_access_allows_everything() {
+        let caps = AgentCapabilities::full_access();
 
-        // Relative paths
-        assert!(caps.path_allowed("src/main.rs"));
-        assert!(caps.path_allowed("README.md"));
-        assert!(caps.path_allowed("tests/test_utils.rs"));
-        assert!(caps.path_allowed("config/settings.toml"));
-
-        // Absolute paths (after resolve_path)
-        assert!(caps.path_allowed("/workspace/src/main.rs"));
-        assert!(caps.path_allowed("/workspace/README.md"));
-        assert!(caps.path_allowed("/Users/dev/project/config/settings.toml"));
+        assert!(caps.can_read("/any/path"));
+        assert!(caps.can_write("/any/path"));
+        assert!(caps.can_exec("any command"));
     }
 
     #[test]
@@ -333,9 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn test_client_configured_denied_paths() {
+        let caps = AgentCapabilities::full_access().with_denied_paths(vec![
+            "**/.env".into(),
+            "**/.env.*".into(),
+            "**/secrets/**".into(),
+            "**/*.pem".into(),
+        ]);
+
+        // Denied paths (relative)
+        assert!(!caps.path_allowed(".env"));
+        assert!(!caps.path_allowed("config/.env.local"));
+        assert!(!caps.path_allowed("app/secrets/key.txt"));
+        assert!(!caps.path_allowed("certs/server.pem"));
+
+        // Denied paths (absolute — after resolve_path)
+        assert!(!caps.path_allowed("/workspace/.env"));
+        assert!(!caps.path_allowed("/workspace/.env.production"));
+        assert!(!caps.path_allowed("/workspace/secrets/key.txt"));
+        assert!(!caps.path_allowed("/workspace/certs/server.pem"));
+
+        // Normal files still allowed
+        assert!(caps.path_allowed("src/main.rs"));
+        assert!(caps.path_allowed("/workspace/src/main.rs"));
+        assert!(caps.path_allowed("/workspace/README.md"));
+    }
+
+    #[test]
     fn test_allowed_paths_restriction() {
         let caps = AgentCapabilities::read_only()
-            .with_denied_paths(vec![]) // Clear defaults for this test
             .with_allowed_paths(vec!["src/**".into(), "tests/**".into()]);
 
         assert!(caps.path_allowed("src/main.rs"));
@@ -356,25 +324,23 @@ mod tests {
     }
 
     #[test]
-    fn test_dangerous_commands_denied() {
-        let caps = AgentCapabilities::full_access();
+    fn test_client_configured_denied_commands() {
+        let caps = AgentCapabilities::full_access()
+            .with_denied_commands(vec![r"rm\s+-rf\s+/".into(), r"^sudo\s".into()]);
 
-        // Dangerous commands should be denied by default
-        assert!(!caps.command_allowed("rm -rf /")); // Exact pattern match
-        assert!(!caps.command_allowed("sudo rm file")); // sudo prefix
-        assert!(!caps.command_allowed("chmod 777 file")); // chmod 777
+        assert!(!caps.command_allowed("rm -rf /"));
+        assert!(!caps.command_allowed("sudo rm file"));
 
-        // Safe commands should be allowed
+        // Common shell patterns are NOT blocked
         assert!(caps.command_allowed("ls -la"));
         assert!(caps.command_allowed("cargo build"));
-        assert!(caps.command_allowed("git status"));
-        assert!(caps.command_allowed("rm file.txt")); // Normal rm without -rf /
+        assert!(caps.command_allowed("unzip file.zip 2>/dev/null"));
+        assert!(caps.command_allowed("python3 -m markitdown file.pptx"));
     }
 
     #[test]
     fn test_allowed_commands_restriction() {
         let caps = AgentCapabilities::full_access()
-            .with_denied_commands(vec![]) // Clear defaults for this test
             .with_allowed_commands(vec![r"^cargo ".into(), r"^git ".into()]);
 
         assert!(caps.command_allowed("cargo build"));

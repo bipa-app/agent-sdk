@@ -504,9 +504,8 @@ mod tests {
         fs.write_file("src/main.rs", "fn main() {} ").await?;
         fs.write_file("config/settings.toml", "key = value").await?;
 
-        let caps = AgentCapabilities::read_only()
-            .with_denied_paths(vec![])
-            .with_allowed_paths(vec!["/workspace/src/**".into()]);
+        let caps =
+            AgentCapabilities::read_only().with_allowed_paths(vec!["/workspace/src/**".into()]);
 
         let tool = create_test_tool(Arc::clone(&fs), caps.clone());
 

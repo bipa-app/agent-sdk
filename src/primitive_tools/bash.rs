@@ -370,33 +370,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_dangerous_command_denied() -> anyhow::Result<()> {
+    async fn test_bash_denied_commands() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
 
-        // Full access but default denied commands
-        let caps = AgentCapabilities::full_access();
+        // Client configures denied commands
+        let caps = AgentCapabilities::full_access()
+            .with_denied_commands(vec![r"rm\s+-rf\s+/".into(), r"^sudo\s".into()]);
 
-        let tool = create_test_tool(env, caps);
+        let tool = create_test_tool(Arc::clone(&env), caps.clone());
         let result = tool
             .execute(&tool_ctx(), json!({"command": "rm -rf /"}))
             .await?;
-
         assert!(!result.success);
         assert!(result.output.contains("Permission denied"));
         assert!(result.output.contains("not allowed"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_bash_sudo_command_denied() -> anyhow::Result<()> {
-        let env = Arc::new(MockBashEnvironment::new());
-        let caps = AgentCapabilities::full_access();
 
         let tool = create_test_tool(env, caps);
         let result = tool
             .execute(&tool_ctx(), json!({"command": "sudo apt-get install foo"}))
             .await?;
-
         assert!(!result.success);
         assert!(result.output.contains("Permission denied"));
         Ok(())
@@ -409,7 +401,6 @@ mod tests {
 
         // Only allow cargo and git commands
         let caps = AgentCapabilities::full_access()
-            .with_denied_commands(vec![])
             .with_allowed_commands(vec![r"^cargo ".into(), r"^git ".into()]);
 
         let tool = create_test_tool(Arc::clone(&env), caps.clone());
