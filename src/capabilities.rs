@@ -252,14 +252,14 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     }
 
     // Handle glob patterns:
-    // - **/ at start or middle: zero or more directories
+    // - **/ at start or middle: zero or more path components (including leading /)
     // - /** at end: matches everything after
     // - * : matches any characters except /
     let pattern = escaped
         .replace("**/", "\x00") // **/ -> placeholder
         .replace("/**", "\x01") // /** -> placeholder
         .replace('*', "[^/]*") // * -> match non-slash characters
-        .replace('\x00', "([^/]+/)*") // **/ as zero or more dir components
+        .replace('\x00', "(.*/)?") // **/ as optional prefix (handles absolute paths)
         .replace('\x01', "(/.*)?"); // /** as optional suffix
 
     let regex = format!("^{pattern}$");
@@ -285,27 +285,42 @@ mod tests {
         assert!(!caps.path_allowed(".env"));
         assert!(!caps.path_allowed(".env.local"));
 
-        // .env in subdirectories
+        // .env in subdirectories (relative)
         assert!(!caps.path_allowed("config/.env"));
         assert!(!caps.path_allowed("config/.env.local"));
 
+        // .env in subdirectories (absolute — the real-world case after resolve_path)
+        assert!(!caps.path_allowed("/workspace/.env"));
+        assert!(!caps.path_allowed("/workspace/.env.local"));
+        assert!(!caps.path_allowed("/workspace/config/.env"));
+        assert!(!caps.path_allowed("/workspace/config/.env.production"));
+
         // Secrets directory
         assert!(!caps.path_allowed("app/secrets/api_key.txt"));
+        assert!(!caps.path_allowed("/workspace/app/secrets/api_key.txt"));
 
         // Key files
         assert!(!caps.path_allowed("server.pem"));
         assert!(!caps.path_allowed("certs/server.pem"));
+        assert!(!caps.path_allowed("/workspace/certs/server.pem"));
         assert!(!caps.path_allowed("home/.ssh/id_rsa"));
+        assert!(!caps.path_allowed("/home/user/.ssh/id_rsa"));
     }
 
     #[test]
     fn test_default_allows_normal_files() {
         let caps = AgentCapabilities::default();
 
+        // Relative paths
         assert!(caps.path_allowed("src/main.rs"));
         assert!(caps.path_allowed("README.md"));
         assert!(caps.path_allowed("tests/test_utils.rs"));
         assert!(caps.path_allowed("config/settings.toml"));
+
+        // Absolute paths (after resolve_path)
+        assert!(caps.path_allowed("/workspace/src/main.rs"));
+        assert!(caps.path_allowed("/workspace/README.md"));
+        assert!(caps.path_allowed("/Users/dev/project/config/settings.toml"));
     }
 
     #[test]
@@ -389,5 +404,18 @@ mod tests {
         // Root-level matches need direct pattern
         assert!(glob_match("test*", "test_main.rs"));
         assert!(glob_match("test*.rs", "test_main.rs"));
+
+        // Absolute paths (tools resolve to absolute before checking capabilities)
+        assert!(glob_match("**/.env", "/workspace/.env"));
+        assert!(glob_match("**/.env.*", "/workspace/.env.local"));
+        assert!(glob_match("**/secrets/**", "/workspace/secrets/key.txt"));
+        assert!(glob_match("**/*.pem", "/workspace/certs/server.pem"));
+        assert!(glob_match("**/*.key", "/workspace/server.key"));
+        assert!(glob_match("**/id_rsa", "/home/user/.ssh/id_rsa"));
+        assert!(glob_match("**/*.rs", "/Users/dev/project/src/main.rs"));
+
+        // Absolute paths should NOT false-positive
+        assert!(!glob_match("**/.env", "/workspace/src/main.rs"));
+        assert!(!glob_match("**/*.pem", "/workspace/src/lib.rs"));
     }
 }
