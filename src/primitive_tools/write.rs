@@ -259,9 +259,8 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
 
         // Only allow writing to src/
-        let caps = AgentCapabilities::full_access()
-            .with_denied_paths(vec![])
-            .with_allowed_paths(vec!["/workspace/src/**".into()]);
+        let caps =
+            AgentCapabilities::full_access().with_allowed_paths(vec!["/workspace/src/**".into()]);
 
         let tool = create_test_tool(Arc::clone(&fs), caps.clone());
 
