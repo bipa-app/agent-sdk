@@ -15,6 +15,8 @@ const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation conc
 const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
     "Provide a concise summary (aim for 500-1000 words):";
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
+const SUMMARY_ACKNOWLEDGMENT: &str =
+    "I understand the context from the summary. Let me continue from where we left off.";
 const MAX_RETAINED_TAIL_MESSAGE_TOKENS: usize = 20_000;
 const MAX_TOOL_RESULT_CHARS: usize = 500;
 
@@ -387,10 +389,13 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
         // Add summary as a user message
         new_messages.push(Message::user(format!("{SUMMARY_PREFIX}{summary}")));
 
-        // Add acknowledgment from assistant
-        new_messages.push(Message::assistant(
-            "I understand the context from the summary. Let me continue from where we left off.",
-        ));
+        // Add acknowledgment from assistant only when some recent tail remains.
+        // If compaction drops the entire retained tail due to the token cap, ending
+        // the request with this synthetic assistant message would act like assistant
+        // prefill and Anthropic rejects that shape.
+        if !to_keep.is_empty() {
+            new_messages.push(Message::assistant(SUMMARY_ACKNOWLEDGMENT));
+        }
 
         // Add recent messages
         new_messages.extend(to_keep.iter().cloned());
@@ -939,6 +944,38 @@ mod tests {
             TokenEstimator::estimate_history(retained_tail) <= MAX_RETAINED_TAIL_MESSAGE_TOKENS
         );
         assert!(compactor.needs_compaction(&result.messages));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_skips_summary_ack_when_retained_tail_is_empty() -> Result<()> {
+        let provider = Arc::new(MockProvider::new("Summary for oversized user turn."));
+        let config = CompactionConfig::default()
+            .with_retain_recent(1)
+            .with_min_messages(1)
+            .with_threshold_tokens(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::assistant("Earlier assistant context."),
+            Message::user(format!("oversized-user-turn: {}", "x".repeat(200_000))),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        assert_eq!(result.new_count, 1);
+        assert_eq!(result.messages.len(), 1);
+
+        let only_message = &result.messages[0];
+        assert_eq!(only_message.role, Role::User);
+
+        if let Content::Text(text) = &only_message.content {
+            assert!(text.contains("Previous conversation summary"));
+            assert!(!text.contains(SUMMARY_ACKNOWLEDGMENT));
+        } else {
+            panic!("Expected summary text when retained tail is empty");
+        }
 
         Ok(())
     }
