@@ -238,6 +238,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
             },
         };
 
@@ -262,6 +263,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
             },
         };
 
@@ -292,6 +294,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
             },
         };
 
@@ -329,6 +332,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
             },
         };
 

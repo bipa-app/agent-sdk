@@ -36,6 +36,7 @@ impl MockProvider {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cached_input_tokens: 0,
             },
         })
     }
@@ -58,6 +59,7 @@ impl MockProvider {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cached_input_tokens: 0,
             },
         })
     }
@@ -81,6 +83,7 @@ impl MockProvider {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cached_input_tokens: 0,
             },
         })
     }

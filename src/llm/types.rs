@@ -92,6 +92,10 @@ pub struct ChatRequest {
     pub max_tokens_explicit: bool,
     /// Optional session identifier for provider-side prompt caching or routing.
     pub session_id: Option<String>,
+    /// Optional provider-managed cached content reference.
+    ///
+    /// This currently maps to Gemini / Vertex AI `cachedContent` handles.
+    pub cached_content: Option<String>,
     /// Optional extended thinking configuration.
     pub thinking: Option<ThinkingConfig>,
 }
@@ -317,8 +321,12 @@ pub enum StopReason {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Usage {
+    /// Total input tokens reported by the provider.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Portion of `input_tokens` billed at a cached-input rate, when reported.
+    #[serde(default)]
+    pub cached_input_tokens: u32,
 }
 
 #[derive(Debug)]

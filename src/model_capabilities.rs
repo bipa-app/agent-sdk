@@ -64,7 +64,18 @@ impl Pricing {
 
     #[must_use]
     pub fn estimate_cost_usd(&self, usage: &Usage) -> Option<f64> {
-        let input = self.input.map(|p| p.estimate_cost_usd(usage.input_tokens));
+        let cached_input_tokens = usage.cached_input_tokens.min(usage.input_tokens);
+        let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
+
+        let input = match (self.input, self.cached_input) {
+            (Some(input), Some(cached_input)) => Some(
+                input.estimate_cost_usd(uncached_input_tokens)
+                    + cached_input.estimate_cost_usd(cached_input_tokens),
+            ),
+            (Some(input), None) => Some(input.estimate_cost_usd(usage.input_tokens)),
+            (None, Some(cached_input)) => Some(cached_input.estimate_cost_usd(cached_input_tokens)),
+            (None, None) => None,
+        };
         let output = self
             .output
             .map(|p| p.estimate_cost_usd(usage.output_tokens));
@@ -116,7 +127,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "claude-opus-4-6",
         context_window: Some(200_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat(15.0, 75.0).with_notes("Anthropic Opus tier pricing; verify exact current SKU mapping before billing-critical use.")),
+        pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.6 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
@@ -439,7 +450,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Gemini
     ModelCapabilities {
         provider: "gemini",
-        model_id: "gemini-3.1-pro",
+        model_id: "gemini-3.1-pro-preview",
         context_window: Some(1_048_576),
         max_output_tokens: Some(65_536),
         pricing: Some(Pricing::flat(2.0, 12.0).with_notes("Official pricing for prompts <= 200K tokens. For prompts > 200K, pricing increases to $4 input / $18 output per 1M tokens.")),
@@ -447,11 +458,35 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_adaptive_thinking: false,
         source_url: GOOGLE_PRICING_URL,
         source_status: SourceStatus::Official,
-        notes: Some("SDK model ID omits the preview suffix; pricing sourced from Gemini 3.1 Pro Preview docs."),
+        notes: Some("Pricing sourced from Gemini 3.1 Pro Preview docs."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3.1-pro",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        pricing: Some(Pricing::flat(2.0, 12.0).with_notes("Legacy alias retained for compatibility. For prompts > 200K, pricing increases to $4 input / $18 output per 1M tokens.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: GOOGLE_PRICING_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Legacy Gemini 3.1 Pro alias retained for compatibility; prefer gemini-3.1-pro-preview."),
     },
     ModelCapabilities {
         provider: "gemini",
         model_id: "gemini-3.1-flash-lite-preview",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        pricing: None,
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: GOOGLE_MODELS_URL,
+        source_status: SourceStatus::Unverified,
+        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+    },
+    ModelCapabilities {
+        provider: "gemini",
+        model_id: "gemini-3-flash-preview",
         context_window: Some(1_048_576),
         max_output_tokens: Some(65_536),
         pricing: None,
@@ -470,8 +505,8 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking: true,
         supports_adaptive_thinking: false,
         source_url: GOOGLE_MODELS_URL,
-        source_status: SourceStatus::Unverified,
-        notes: Some("Model presence confirmed from Google docs, but pricing was not extracted in this pass."),
+        source_status: SourceStatus::Derived,
+        notes: Some("Legacy Gemini 3.0 Flash model retained for compatibility; prefer gemini-3-flash-preview."),
     },
     ModelCapabilities {
         provider: "gemini",
@@ -600,14 +635,39 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_gemini_preview_models() {
+        let flash = get_model_capabilities("gemini", "gemini-3-flash-preview").unwrap();
+        assert_eq!(flash.context_window, Some(1_048_576));
+        assert!(flash.supports_thinking);
+
+        let pro = get_model_capabilities("gemini", "gemini-3.1-pro-preview").unwrap();
+        assert_eq!(pro.max_output_tokens, Some(65_536));
+        assert!(pro.supports_thinking);
+    }
+
+    #[test]
     fn test_estimate_cost_usd() {
         let caps = get_model_capabilities("openai", "gpt-4o").unwrap();
         let cost = caps
             .estimate_cost_usd(&Usage {
                 input_tokens: 2_000,
                 output_tokens: 1_000,
+                cached_input_tokens: 0,
             })
             .unwrap();
         assert!((cost - 0.0075).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_estimate_cost_usd_with_cached_input() {
+        let caps = get_model_capabilities("openai", "gpt-5.4").unwrap();
+        let cost = caps
+            .estimate_cost_usd(&Usage {
+                input_tokens: 2_000,
+                output_tokens: 1_000,
+                cached_input_tokens: 1_000,
+            })
+            .unwrap();
+        assert!((cost - 0.01775).abs() < f64::EPSILON);
     }
 }

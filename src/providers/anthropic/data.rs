@@ -242,6 +242,10 @@ pub enum ApiStopReason {
 pub struct ApiUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 // ============================================================================
@@ -261,6 +265,10 @@ pub struct SseMessageStartMessage {
 #[derive(Deserialize)]
 pub struct SseMessageStartUsage {
     pub input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -662,6 +670,7 @@ pub fn parse_sse_event(
     event_block: &str,
     input_tokens: &mut u32,
     output_tokens: &mut u32,
+    cached_input_tokens: &mut u32,
     tool_ids: &mut std::collections::HashMap<usize, String>,
 ) -> Option<StreamDelta> {
     let (event_type, data) = parse_sse_fields(event_block);
@@ -673,7 +682,10 @@ pub fn parse_sse_event(
             // Extract input tokens from message_start
             match serde_json::from_str::<SseMessageStart>(&data) {
                 Ok(event) => {
-                    *input_tokens = event.message.usage.input_tokens;
+                    *cached_input_tokens = event.message.usage.cache_read_input_tokens;
+                    *input_tokens = event.message.usage.input_tokens
+                        + event.message.usage.cache_creation_input_tokens
+                        + event.message.usage.cache_read_input_tokens;
                 }
                 Err(error) => log_sse_parse_error(&event_type, &data, &error),
             }
@@ -757,6 +769,7 @@ pub fn parse_sse_event(
             Some(StreamDelta::Usage(Usage {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
+                cached_input_tokens: *cached_input_tokens,
             }))
         }
         _ => None,
@@ -925,6 +938,7 @@ mod tests {
             max_tokens: 1024,
             max_tokens_explicit: true,
             session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -961,6 +975,7 @@ mod tests {
             max_tokens: 1024,
             max_tokens_explicit: true,
             session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -990,6 +1005,7 @@ mod tests {
             max_tokens: 1024,
             max_tokens_explicit: true,
             session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -1114,8 +1130,15 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1130,8 +1153,15 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1149,11 +1179,18 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         // Pre-populate tool_ids as if we received the tool_use_start event
         let mut tool_ids = std::collections::HashMap::new();
         tool_ids.insert(1, "toolu_123".to_string());
 
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         // Verify the tool ID is correctly looked up
         assert!(matches!(
@@ -1170,8 +1207,15 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(delta.is_none());
         assert_eq!(input_tokens, 150);
@@ -1184,8 +1228,15 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1203,14 +1254,22 @@ data: {"type":"message_stop"}"#;
 
         let mut input_tokens = 100;
         let mut output_tokens = 50;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
             Some(StreamDelta::Usage(Usage {
                 input_tokens: 100,
-                output_tokens: 50
+                output_tokens: 50,
+                ..
             }))
         ));
     }
@@ -1232,8 +1291,15 @@ data: {"type":"message_stop"}"#;
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1288,8 +1354,15 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,

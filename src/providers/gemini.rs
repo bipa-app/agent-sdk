@@ -22,11 +22,13 @@ use reqwest::StatusCode;
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 // Gemini 3.1 series
-pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro";
+pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
 pub const MODEL_GEMINI_31_FLASH_LITE: &str = "gemini-3.1-flash-lite-preview";
 
 // Gemini 3 series
-pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3.0-flash";
+pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3-flash-preview";
+
+// Legacy Gemini 3.0 Pro model kept for explicit opt-in.
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 // Gemini 2.5 series
@@ -58,7 +60,7 @@ impl GeminiProvider {
         }
     }
 
-    /// Create a provider using Gemini 3.0 Flash (fast and capable, current default).
+    /// Create a provider using Gemini 3 Flash Preview (fast and capable, current default).
     #[must_use]
     pub fn flash(api_key: String) -> Self {
         Self::new(api_key, MODEL_GEMINI_3_FLASH.to_owned())
@@ -76,16 +78,16 @@ impl GeminiProvider {
         Self::new(api_key, MODEL_GEMINI_2_FLASH_LITE.to_owned())
     }
 
-    /// Create a provider using Gemini 3.1 Pro.
+    /// Create a provider using Gemini 3.1 Pro Preview.
     #[must_use]
     pub fn pro_31(api_key: String) -> Self {
         Self::new(api_key, MODEL_GEMINI_31_PRO.to_owned())
     }
 
-    /// Create a provider using Gemini 3.0 Pro (most capable).
+    /// Create a provider using Gemini 3.1 Pro Preview (current recommended pro model).
     #[must_use]
     pub fn pro(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_3_PRO.to_owned())
+        Self::new(api_key, MODEL_GEMINI_31_PRO.to_owned())
     }
 
     /// Set the provider-owned thinking configuration for this model.
@@ -131,6 +133,7 @@ impl LlmProvider for GeminiProvider {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
             }),
+            cached_content: request.cached_content.as_deref(),
         };
 
         log::debug!(
@@ -210,6 +213,7 @@ impl LlmProvider for GeminiProvider {
         let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
             prompt_token_count: 0,
             candidates_token_count: 0,
+            cached_content_token_count: 0,
         });
 
         Ok(ChatOutcome::Success(ChatResponse {
@@ -220,6 +224,7 @@ impl LlmProvider for GeminiProvider {
             usage: Usage {
                 input_tokens: usage.prompt_token_count,
                 output_tokens: usage.candidates_token_count,
+                cached_input_tokens: usage.cached_content_token_count,
             },
         }))
     }
@@ -267,6 +272,7 @@ impl LlmProvider for GeminiProvider {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
                 }),
+                cached_content: request.cached_content.as_deref(),
             };
 
             log::debug!(
@@ -364,7 +370,7 @@ mod tests {
     fn test_pro_factory_creates_pro_provider() {
         let provider = GeminiProvider::pro("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_GEMINI_3_PRO);
+        assert_eq!(provider.model(), MODEL_GEMINI_31_PRO);
         assert_eq!(provider.provider(), "gemini");
     }
 
@@ -378,14 +384,23 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
-        assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro");
+        assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
         assert_eq!(MODEL_GEMINI_31_FLASH_LITE, "gemini-3.1-flash-lite-preview");
-        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
+        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
         assert_eq!(MODEL_GEMINI_25_FLASH, "gemini-2.5-flash");
         assert_eq!(MODEL_GEMINI_25_PRO, "gemini-2.5-pro");
         assert_eq!(MODEL_GEMINI_2_FLASH, "gemini-2.0-flash");
         assert_eq!(MODEL_GEMINI_2_FLASH_LITE, "gemini-2.0-flash-lite");
+    }
+
+    #[test]
+    fn test_gemini_20_models_reject_thinking() {
+        let provider = GeminiProvider::flash_lite("test-api-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("thinking is not supported"));
     }
 
     #[test]

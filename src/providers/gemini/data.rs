@@ -23,6 +23,8 @@ pub struct ApiGenerateContentRequest<'a> {
     pub tools: Option<&'a [ApiToolConfig]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<ApiGenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<&'a str>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +189,8 @@ pub struct ApiUsageMetadata {
     pub prompt_token_count: u32,
     #[serde(default)]
     pub candidates_token_count: u32,
+    #[serde(default)]
+    pub cached_content_token_count: u32,
 }
 
 // ============================================================================
@@ -407,6 +411,7 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                     usage = Some(Usage {
                         input_tokens: u.prompt_token_count,
                         output_tokens: u.candidates_token_count,
+                        cached_input_tokens: 0,
                     });
                 }
 
@@ -587,6 +592,27 @@ mod tests {
         assert!(json.contains("\"thinkingLevel\":\"HIGH\""));
     }
 
+    #[test]
+    fn test_generate_content_request_serializes_cached_content() {
+        let contents = vec![ApiContent {
+            role: Some("user".to_string()),
+            parts: vec![ApiPart::Text {
+                text: "Hello".to_string(),
+                thought_signature: None,
+            }],
+        }];
+        let request = ApiGenerateContentRequest {
+            contents: &contents,
+            system_instruction: None,
+            tools: None,
+            generation_config: None,
+            cached_content: Some("cachedContents/example"),
+        };
+
+        let json = serde_json::to_string(&request).unwrap_or_default();
+        assert!(json.contains("\"cachedContent\":\"cachedContents/example\""));
+    }
+
     // ===================
     // API Type Deserialization Tests
     // ===================
@@ -616,6 +642,7 @@ mod tests {
         let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
             prompt_token_count: 0,
             candidates_token_count: 0,
+            cached_content_token_count: 0,
         });
         assert_eq!(usage.prompt_token_count, 100);
         assert_eq!(usage.candidates_token_count, 50);
@@ -855,6 +882,7 @@ mod tests {
         let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
             prompt_token_count: 0,
             candidates_token_count: 0,
+            cached_content_token_count: 0,
         });
         assert_eq!(usage.prompt_token_count, 10);
         assert_eq!(usage.candidates_token_count, 5);

@@ -9,7 +9,7 @@ pub(crate) mod data;
 use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StreamBox, StreamDelta,
-    ThinkingConfig, Usage,
+    ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -230,6 +230,10 @@ impl AnthropicProvider {
         self.thinking = Some(thinking);
         self
     }
+
+    fn requires_adaptive_thinking(&self) -> bool {
+        matches!(self.model.as_str(), MODEL_SONNET_46 | MODEL_OPUS_46)
+    }
 }
 
 #[async_trait]
@@ -373,8 +377,11 @@ impl LlmProvider for AnthropicProvider {
             model: api_response.model,
             stop_reason,
             usage: Usage {
-                input_tokens: api_response.usage.input_tokens,
+                input_tokens: api_response.usage.input_tokens
+                    + api_response.usage.cache_creation_input_tokens
+                    + api_response.usage.cache_read_input_tokens,
                 output_tokens: api_response.usage.output_tokens,
+                cached_input_tokens: api_response.usage.cache_read_input_tokens,
             },
         }))
     }
@@ -506,6 +513,7 @@ impl LlmProvider for AnthropicProvider {
             let mut buffer = String::new();
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut cached_input_tokens: u32 = 0;
             // Track tool IDs by block index for correlating input deltas
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
@@ -571,6 +579,7 @@ impl LlmProvider for AnthropicProvider {
                         &event_block,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut cached_input_tokens,
                         &mut tool_ids,
                     ) {
                         // Reverse-map tool names from Claude Code casing
@@ -607,6 +616,7 @@ impl LlmProvider for AnthropicProvider {
                     remaining,
                     &mut input_tokens,
                     &mut output_tokens,
+                    &mut cached_input_tokens,
                     &mut tool_ids,
                 ) {
                     if is_oauth
@@ -632,6 +642,47 @@ impl LlmProvider for AnthropicProvider {
                 });
             }
         })
+    }
+
+    fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+        let Some(thinking) = thinking else {
+            return Ok(());
+        };
+
+        if self
+            .capabilities()
+            .is_some_and(|caps| !caps.supports_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if matches!(thinking.mode, ThinkingMode::Adaptive)
+            && !self
+                .capabilities()
+                .is_some_and(|caps| caps.supports_adaptive_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "adaptive thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if self.requires_adaptive_thinking()
+            && matches!(thinking.mode, ThinkingMode::Enabled { .. })
+        {
+            return Err(anyhow::anyhow!(
+                "budget_tokens thinking is deprecated for provider={} model={}; use ThinkingConfig::adaptive() instead",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        Ok(())
     }
 
     fn model(&self) -> &str {
@@ -701,6 +752,15 @@ mod tests {
                 .to_string()
                 .contains("adaptive thinking is not supported")
         );
+    }
+
+    #[test]
+    fn test_anthropic_46_models_reject_budgeted_thinking() {
+        let sonnet_46 = AnthropicProvider::sonnet_46("test-api-key".to_string());
+        let error = sonnet_46
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
     }
 
     #[test]

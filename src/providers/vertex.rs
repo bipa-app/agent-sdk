@@ -11,9 +11,9 @@
 use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
-    Usage,
+    ThinkingMode, Usage,
 };
-use crate::providers::anthropic::data as anthropic_data;
+use crate::providers::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
 use crate::providers::gemini::data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
@@ -24,7 +24,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::StatusCode;
 
-pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3.0-flash";
+pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3-flash-preview";
+pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
+
+// Legacy Gemini 3.0 Pro model kept for explicit opt-in.
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 /// The Anthropic API version used for Claude models on Vertex AI.
@@ -73,7 +76,7 @@ impl VertexProvider {
         }
     }
 
-    /// Create a provider using Gemini 3.0 Flash on Vertex AI.
+    /// Create a provider using Gemini 3 Flash Preview on Vertex AI.
     #[must_use]
     pub fn flash(access_token: String, project_id: String, region: String) -> Self {
         Self::new(
@@ -84,14 +87,14 @@ impl VertexProvider {
         )
     }
 
-    /// Create a provider using Gemini 3.0 Pro on Vertex AI.
+    /// Create a provider using Gemini 3.1 Pro Preview on Vertex AI.
     #[must_use]
     pub fn pro(access_token: String, project_id: String, region: String) -> Self {
         Self::new(
             access_token,
             project_id,
             region,
-            MODEL_GEMINI_3_PRO.to_owned(),
+            MODEL_GEMINI_31_PRO.to_owned(),
         )
     }
 
@@ -127,6 +130,10 @@ impl VertexProvider {
         self
     }
 
+    fn requires_anthropic_adaptive_thinking(&self) -> bool {
+        matches!(self.model.as_str(), MODEL_SONNET_46 | MODEL_OPUS_46)
+    }
+
     fn build_cached_vertex_claude_messages(
         request: &ChatRequest,
     ) -> Vec<anthropic_data::ApiMessage> {
@@ -159,6 +166,48 @@ impl LlmProvider for VertexProvider {
             return self.chat_stream_claude(request);
         }
         self.chat_stream_gemini(request)
+    }
+
+    fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+        let Some(thinking) = thinking else {
+            return Ok(());
+        };
+
+        if self
+            .capabilities()
+            .is_some_and(|caps| !caps.supports_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if matches!(thinking.mode, ThinkingMode::Adaptive)
+            && !self
+                .capabilities()
+                .is_some_and(|caps| caps.supports_adaptive_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "adaptive thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if self.is_claude_model()
+            && self.requires_anthropic_adaptive_thinking()
+            && matches!(thinking.mode, ThinkingMode::Enabled { .. })
+        {
+            return Err(anyhow::anyhow!(
+                "budget_tokens thinking is deprecated for provider={} model={}; use ThinkingConfig::adaptive() instead",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        Ok(())
     }
 
     fn model(&self) -> &str {
@@ -228,6 +277,7 @@ impl VertexProvider {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
             }),
+            cached_content: request.cached_content.as_deref(),
         };
 
         log::debug!(
@@ -306,6 +356,7 @@ impl VertexProvider {
         let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
             prompt_token_count: 0,
             candidates_token_count: 0,
+            cached_content_token_count: 0,
         });
 
         Ok(ChatOutcome::Success(ChatResponse {
@@ -316,6 +367,7 @@ impl VertexProvider {
             usage: Usage {
                 input_tokens: usage.prompt_token_count,
                 output_tokens: usage.candidates_token_count,
+                cached_input_tokens: usage.cached_content_token_count,
             },
         }))
     }
@@ -363,6 +415,7 @@ impl VertexProvider {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
                 }),
+                cached_content: request.cached_content.as_deref(),
             };
 
             log::debug!(
@@ -521,8 +574,11 @@ impl VertexProvider {
             model: api_response.model,
             stop_reason,
             usage: Usage {
-                input_tokens: api_response.usage.input_tokens,
+                input_tokens: api_response.usage.input_tokens
+                    + api_response.usage.cache_creation_input_tokens
+                    + api_response.usage.cache_read_input_tokens,
                 output_tokens: api_response.usage.output_tokens,
+                cached_input_tokens: api_response.usage.cache_read_input_tokens,
             },
         }))
     }
@@ -636,6 +692,7 @@ impl VertexProvider {
             let mut buffer = String::new();
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut cached_input_tokens: u32 = 0;
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
@@ -658,6 +715,7 @@ impl VertexProvider {
                         &event_block,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut cached_input_tokens,
                         &mut tool_ids,
                     ) {
                         yield Ok(delta);
@@ -676,6 +734,7 @@ impl VertexProvider {
                     remaining,
                     &mut input_tokens,
                     &mut output_tokens,
+                    &mut cached_input_tokens,
                     &mut tool_ids,
                 ) {
                     yield Ok(delta);
@@ -732,7 +791,7 @@ mod tests {
             "us-central1".to_string(),
         );
 
-        assert_eq!(provider.model(), MODEL_GEMINI_3_PRO);
+        assert_eq!(provider.model(), MODEL_GEMINI_31_PRO);
         assert_eq!(provider.provider(), "vertex");
     }
 
@@ -764,7 +823,7 @@ mod tests {
             "token".to_string(),
             "project".to_string(),
             "us-central1".to_string(),
-            "gemini-3.0-flash".to_string(),
+            "gemini-3-flash-preview".to_string(),
         );
         assert!(!gemini_provider.is_claude_model());
     }
@@ -775,13 +834,13 @@ mod tests {
             "token".to_string(),
             "my-project".to_string(),
             "us-central1".to_string(),
-            "gemini-3.0-flash".to_string(),
+            "gemini-3-flash-preview".to_string(),
         );
 
         let url = provider.base_url("google");
         assert_eq!(
             url,
-            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3.0-flash"
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3-flash-preview"
         );
     }
 
@@ -807,14 +866,14 @@ mod tests {
             "token".to_string(),
             "other-project".to_string(),
             "europe-west4".to_string(),
-            "gemini-3.0-pro".to_string(),
+            "gemini-3.1-pro-preview".to_string(),
         );
 
         let url = provider.base_url("google");
         assert!(url.starts_with("https://europe-west4-aiplatform.googleapis.com/"));
         assert!(url.contains("/projects/other-project/"));
         assert!(url.contains("/locations/europe-west4/"));
-        assert!(url.ends_with("/models/gemini-3.0-pro"));
+        assert!(url.ends_with("/models/gemini-3.1-pro-preview"));
     }
 
     #[test]
@@ -834,8 +893,24 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_claude_46_rejects_budgeted_thinking() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_SONNET_46.to_string(),
+        );
+
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+    }
+
+    #[test]
     fn test_model_constants() {
-        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
+        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
+        assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
     }
 }

@@ -269,10 +269,15 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cached_input_tokens: 0,
                 },
                 |u| Usage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
+                    cached_input_tokens: u
+                        .input_tokens_details
+                        .as_ref()
+                        .map_or(0, |details| details.cached_tokens),
                 },
             ),
         }))
@@ -432,6 +437,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     usage = Some(Usage {
                                         input_tokens: u.input_tokens,
                                         output_tokens: u.output_tokens,
+                                        cached_input_tokens: u
+                                            .input_tokens_details
+                                            .as_ref()
+                                            .map_or(0, |details| details.cached_tokens),
                                     });
                                 }
                             }
@@ -930,6 +939,14 @@ enum ApiStatus {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<ApiInputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]

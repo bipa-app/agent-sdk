@@ -63,6 +63,7 @@ where
             max_tokens: 50,
             max_tokens_explicit: true,
             session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
