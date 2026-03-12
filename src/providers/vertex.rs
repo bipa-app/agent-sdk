@@ -150,6 +150,26 @@ impl VertexProvider {
     ) -> Option<anthropic_data::ApiSystemPrompt<'_>> {
         anthropic_data::build_api_system_prompt(system, Some(vertex_cache_control()))
     }
+
+    fn map_claude_response(api_response: anthropic_data::ApiResponse) -> ChatResponse {
+        let content = anthropic_data::map_content_blocks(api_response.content);
+        let stop_reason = api_response
+            .stop_reason
+            .as_ref()
+            .map(anthropic_data::map_stop_reason);
+
+        ChatResponse {
+            id: api_response.id,
+            content,
+            model: api_response.model,
+            stop_reason,
+            usage: Usage {
+                input_tokens: api_response.usage.total_input_tokens(),
+                output_tokens: api_response.usage.output,
+                cached_input_tokens: api_response.usage.cached_input_tokens(),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -353,22 +373,21 @@ impl VertexProvider {
             .as_ref()
             .map(|r| map_finish_reason(r, has_tool_calls));
 
-        let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            cached_content_token_count: 0,
-        });
+        let usage = api_response
+            .usage_metadata
+            .unwrap_or(ApiUsageMetadata {
+                prompt: 0,
+                candidates: 0,
+                cached_content: 0,
+            })
+            .into_usage();
 
         Ok(ChatOutcome::Success(ChatResponse {
             id: String::new(),
             content,
             model: self.model.clone(),
             stop_reason,
-            usage: Usage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-                cached_input_tokens: usage.cached_content_token_count,
-            },
+            usage,
         }))
     }
 
@@ -557,30 +576,14 @@ impl VertexProvider {
             api_response.id,
             api_response.model,
             api_response.stop_reason,
-            api_response.usage.input_tokens,
-            api_response.usage.output_tokens,
+            api_response.usage.total_input_tokens(),
+            api_response.usage.output,
             api_response.content.len()
         );
 
-        let content = anthropic_data::map_content_blocks(api_response.content);
-        let stop_reason = api_response
-            .stop_reason
-            .as_ref()
-            .map(anthropic_data::map_stop_reason);
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: Usage {
-                input_tokens: api_response.usage.input_tokens
-                    + api_response.usage.cache_creation_input_tokens
-                    + api_response.usage.cache_read_input_tokens,
-                output_tokens: api_response.usage.output_tokens,
-                cached_input_tokens: api_response.usage.cache_read_input_tokens,
-            },
-        }))
+        Ok(ChatOutcome::Success(Self::map_claude_response(
+            api_response,
+        )))
     }
 
     #[allow(clippy::too_many_lines)]

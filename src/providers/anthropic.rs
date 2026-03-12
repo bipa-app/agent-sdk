@@ -348,8 +348,8 @@ impl LlmProvider for AnthropicProvider {
             api_response.id,
             api_response.model,
             api_response.stop_reason,
-            api_response.usage.input_tokens,
-            api_response.usage.output_tokens,
+            api_response.usage.total_input_tokens(),
+            api_response.usage.output,
             api_response.content.len()
         );
 
@@ -377,11 +377,9 @@ impl LlmProvider for AnthropicProvider {
             model: api_response.model,
             stop_reason,
             usage: Usage {
-                input_tokens: api_response.usage.input_tokens
-                    + api_response.usage.cache_creation_input_tokens
-                    + api_response.usage.cache_read_input_tokens,
-                output_tokens: api_response.usage.output_tokens,
-                cached_input_tokens: api_response.usage.cache_read_input_tokens,
+                input_tokens: api_response.usage.total_input_tokens(),
+                output_tokens: api_response.usage.output,
+                cached_input_tokens: api_response.usage.cached_input_tokens(),
             },
         }))
     }

@@ -240,12 +240,24 @@ pub enum ApiStopReason {
 
 #[derive(Deserialize)]
 pub struct ApiUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u32,
-    #[serde(default)]
-    pub cache_read_input_tokens: u32,
+    #[serde(rename = "input_tokens")]
+    pub input: u32,
+    #[serde(rename = "output_tokens")]
+    pub output: u32,
+    #[serde(default, rename = "cache_creation_input_tokens")]
+    pub cache_creation_input: u32,
+    #[serde(default, rename = "cache_read_input_tokens")]
+    pub cache_read_input: u32,
+}
+
+impl ApiUsage {
+    pub const fn total_input_tokens(&self) -> u32 {
+        self.input + self.cache_creation_input + self.cache_read_input
+    }
+
+    pub const fn cached_input_tokens(&self) -> u32 {
+        self.cache_read_input
+    }
 }
 
 // ============================================================================
@@ -264,11 +276,22 @@ pub struct SseMessageStartMessage {
 
 #[derive(Deserialize)]
 pub struct SseMessageStartUsage {
-    pub input_tokens: u32,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u32,
-    #[serde(default)]
-    pub cache_read_input_tokens: u32,
+    #[serde(rename = "input_tokens")]
+    pub input: u32,
+    #[serde(default, rename = "cache_creation_input_tokens")]
+    pub cache_creation: u32,
+    #[serde(default, rename = "cache_read_input_tokens")]
+    pub cache_read: u32,
+}
+
+impl SseMessageStartUsage {
+    pub const fn total_input_tokens(&self) -> u32 {
+        self.input + self.cache_creation + self.cache_read
+    }
+
+    pub const fn cached_input_tokens(&self) -> u32 {
+        self.cache_read
+    }
 }
 
 #[derive(Deserialize)]
@@ -682,10 +705,8 @@ pub fn parse_sse_event(
             // Extract input tokens from message_start
             match serde_json::from_str::<SseMessageStart>(&data) {
                 Ok(event) => {
-                    *cached_input_tokens = event.message.usage.cache_read_input_tokens;
-                    *input_tokens = event.message.usage.input_tokens
-                        + event.message.usage.cache_creation_input_tokens
-                        + event.message.usage.cache_read_input_tokens;
+                    *cached_input_tokens = event.message.usage.cached_input_tokens();
+                    *input_tokens = event.message.usage.total_input_tokens();
                 }
                 Err(error) => log_sse_parse_error(&event_type, &data, &error),
             }
@@ -1039,8 +1060,8 @@ mod tests {
         let response: ApiResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.model, "claude-3-5-sonnet");
-        assert_eq!(response.usage.input_tokens, 100);
-        assert_eq!(response.usage.output_tokens, 50);
+        assert_eq!(response.usage.input, 100);
+        assert_eq!(response.usage.output, 50);
     }
 
     #[test]

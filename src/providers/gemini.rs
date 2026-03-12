@@ -8,7 +8,6 @@ pub(crate) mod data;
 use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
-    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -210,22 +209,21 @@ impl LlmProvider for GeminiProvider {
             .as_ref()
             .map(|r| map_finish_reason(r, has_tool_calls));
 
-        let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            cached_content_token_count: 0,
-        });
+        let usage = api_response
+            .usage_metadata
+            .unwrap_or(ApiUsageMetadata {
+                prompt: 0,
+                candidates: 0,
+                cached_content: 0,
+            })
+            .into_usage();
 
         Ok(ChatOutcome::Success(ChatResponse {
             id: String::new(),
             content,
             model: self.model.clone(),
             stop_reason,
-            usage: Usage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-                cached_input_tokens: usage.cached_content_token_count,
-            },
+            usage,
         }))
     }
 

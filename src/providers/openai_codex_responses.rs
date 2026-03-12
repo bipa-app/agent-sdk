@@ -160,6 +160,44 @@ impl OpenAICodexResponsesProvider {
 
         Ok(headers)
     }
+
+    fn map_response(api_response: ApiResponse) -> ChatResponse {
+        let content = build_content_blocks(&api_response.output);
+        let has_tool_calls = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        let stop_reason = if has_tool_calls {
+            Some(StopReason::ToolUse)
+        } else {
+            api_response.status.map(|status| match status {
+                ApiStatus::Completed => StopReason::EndTurn,
+                ApiStatus::Incomplete => StopReason::MaxTokens,
+                ApiStatus::Failed => StopReason::StopSequence,
+            })
+        };
+
+        ChatResponse {
+            id: api_response.id,
+            content,
+            model: api_response.model,
+            stop_reason,
+            usage: api_response.usage.map_or(
+                Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+                |usage| Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_input_tokens: usage
+                        .input_tokens_details
+                        .as_ref()
+                        .map_or(0, |details| details.cached_tokens),
+                },
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -180,6 +218,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             .tools
             .as_ref()
             .map(|ts| ts.iter().cloned().map(convert_tool).collect());
+        let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         let api_request = ApiResponsesRequest {
             model: &self.model,
@@ -189,7 +228,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             max_output_tokens,
             reasoning,
             tool_choice: Some("auto"),
-            parallel_tool_calls: Some(true),
+            parallel_tool_calls: parallel_tool_calls.then_some(true),
             text: Some(ApiTextSettings {
                 verbosity: "medium",
             }),
@@ -243,44 +282,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
 
-        let content = build_content_blocks(&api_response.output);
-
-        // Determine stop reason based on output content
-        let has_tool_calls = content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-        let stop_reason = if has_tool_calls {
-            Some(StopReason::ToolUse)
-        } else {
-            api_response.status.map(|s| match s {
-                ApiStatus::Completed => StopReason::EndTurn,
-                ApiStatus::Incomplete => StopReason::MaxTokens,
-                ApiStatus::Failed => StopReason::StopSequence,
-            })
-        };
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: api_response.usage.map_or(
-                Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_input_tokens: 0,
-                },
-                |u| Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cached_input_tokens: u
-                        .input_tokens_details
-                        .as_ref()
-                        .map_or(0, |details| details.cached_tokens),
-                },
-            ),
-        }))
+        Ok(ChatOutcome::Success(Self::map_response(api_response)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -311,6 +313,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 .tools
                 .as_ref()
                 .map(|ts| ts.iter().cloned().map(convert_tool).collect());
+            let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
             let api_request = ApiResponsesRequestStreaming {
                 model: &self.model,
@@ -320,7 +323,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 max_output_tokens,
                 reasoning,
                 tool_choice: Some("auto"),
-                parallel_tool_calls: Some(true),
+                parallel_tool_calls: parallel_tool_calls.then_some(true),
                 text: Some(ApiTextSettings { verbosity: "medium" }),
                 include: Some(&["reasoning.encrypted_content"]),
                 prompt_cache_key,

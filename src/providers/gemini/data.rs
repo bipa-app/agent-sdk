@@ -185,12 +185,22 @@ pub enum ApiFinishReason {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiUsageMetadata {
-    #[serde(default)]
-    pub prompt_token_count: u32,
-    #[serde(default)]
-    pub candidates_token_count: u32,
-    #[serde(default)]
-    pub cached_content_token_count: u32,
+    #[serde(default, rename = "promptTokenCount")]
+    pub prompt: u32,
+    #[serde(default, rename = "candidatesTokenCount")]
+    pub candidates: u32,
+    #[serde(default, rename = "cachedContentTokenCount")]
+    pub cached_content: u32,
+}
+
+impl ApiUsageMetadata {
+    pub const fn into_usage(self) -> Usage {
+        Usage {
+            input_tokens: self.prompt,
+            output_tokens: self.candidates,
+            cached_input_tokens: self.cached_content,
+        }
+    }
 }
 
 // ============================================================================
@@ -408,11 +418,7 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
 
                 // Extract usage
                 if let Some(u) = resp.usage_metadata {
-                    usage = Some(Usage {
-                        input_tokens: u.prompt_token_count,
-                        output_tokens: u.candidates_token_count,
-                        cached_input_tokens: 0,
-                    });
+                    usage = Some(u.into_usage());
                 }
 
                 // Process candidates
@@ -640,12 +646,12 @@ mod tests {
         assert_eq!(response.candidates.len(), 1);
         assert!(response.usage_metadata.is_some());
         let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            cached_content_token_count: 0,
+            prompt: 0,
+            candidates: 0,
+            cached_content: 0,
         });
-        assert_eq!(usage.prompt_token_count, 100);
-        assert_eq!(usage.candidates_token_count, 50);
+        assert_eq!(usage.prompt, 100);
+        assert_eq!(usage.candidates, 50);
     }
 
     #[test]
@@ -880,12 +886,12 @@ mod tests {
         let response: ApiGenerateContentResponse =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("parse failed: {e}"));
         let usage = response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-            cached_content_token_count: 0,
+            prompt: 0,
+            candidates: 0,
+            cached_content: 0,
         });
-        assert_eq!(usage.prompt_token_count, 10);
-        assert_eq!(usage.candidates_token_count, 5);
+        assert_eq!(usage.prompt, 10);
+        assert_eq!(usage.candidates, 5);
         assert!(matches!(
             response.candidates[0].finish_reason,
             Some(ApiFinishReason::Stop)
