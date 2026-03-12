@@ -213,6 +213,7 @@ where
 pub(super) fn build_turn_request<Ctx, P>(
     config: &AgentConfig,
     provider: &Arc<P>,
+    thread_id: &ThreadId,
     messages: Vec<Message>,
     tools: &Arc<ToolRegistry<Ctx>>,
 ) -> Result<ChatRequest, AgentError>
@@ -237,6 +238,8 @@ where
         max_tokens: config
             .max_tokens
             .unwrap_or_else(|| provider.default_max_tokens()),
+        max_tokens_explicit: config.max_tokens.is_some(),
+        session_id: Some(thread_id.to_string()),
         thinking,
     })
 }
@@ -872,7 +875,7 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
-    let request = match build_turn_request(config, provider, messages, tools) {
+    let request = match build_turn_request(config, provider, &ctx.thread_id, messages, tools) {
         Ok(request) => request,
         Err(error) => return InternalTurnResult::Error(error),
     };

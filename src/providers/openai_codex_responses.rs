@@ -110,7 +110,19 @@ impl OpenAICodexResponsesProvider {
         self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 
-    fn build_headers(&self, streaming: bool) -> Result<reqwest::header::HeaderMap> {
+    const fn max_output_tokens(request: &ChatRequest) -> Option<u32> {
+        if request.max_tokens_explicit {
+            Some(request.max_tokens)
+        } else {
+            None
+        }
+    }
+
+    fn build_headers(
+        &self,
+        streaming: bool,
+        session_id: Option<&str>,
+    ) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{
             ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
         };
@@ -142,6 +154,9 @@ impl OpenAICodexResponsesProvider {
         if streaming {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         }
+        if let Some(session_id) = session_id {
+            headers.insert("session_id", HeaderValue::from_str(session_id)?);
+        }
 
         Ok(headers)
     }
@@ -159,16 +174,19 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
+        let max_output_tokens = Self::max_output_tokens(&request);
+        let prompt_cache_key = request.session_id.as_deref();
         let tools: Option<Vec<ApiTool>> = request
             .tools
-            .map(|ts| ts.into_iter().map(convert_tool).collect());
+            .as_ref()
+            .map(|ts| ts.iter().cloned().map(convert_tool).collect());
 
         let api_request = ApiResponsesRequest {
             model: &self.model,
             instructions: request.system.as_str(),
             input: &input,
             tools: tools.as_deref(),
-            max_output_tokens: Some(request.max_tokens),
+            max_output_tokens,
             reasoning,
             tool_choice: Some("auto"),
             parallel_tool_calls: Some(true),
@@ -176,6 +194,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 verbosity: "medium",
             }),
             include: Some(&["reasoning.encrypted_content"]),
+            prompt_cache_key,
         };
 
         log::debug!(
@@ -187,7 +206,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let response = self
             .client
             .post(codex_url(&self.base_url))
-            .headers(self.build_headers(false)?)
+            .headers(self.build_headers(false, request.session_id.as_deref())?)
             .json(&api_request)
             .send()
             .await
@@ -281,27 +300,31 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
+            let max_output_tokens = Self::max_output_tokens(&request);
+            let prompt_cache_key = request.session_id.as_deref();
             let tools: Option<Vec<ApiTool>> = request
                 .tools
-                .map(|ts| ts.into_iter().map(convert_tool).collect());
+                .as_ref()
+                .map(|ts| ts.iter().cloned().map(convert_tool).collect());
 
             let api_request = ApiResponsesRequestStreaming {
                 model: &self.model,
                 instructions: request.system.as_str(),
                 input: &input,
                 tools: tools.as_deref(),
-                max_output_tokens: Some(request.max_tokens),
+                max_output_tokens,
                 reasoning,
                 tool_choice: Some("auto"),
                 parallel_tool_calls: Some(true),
                 text: Some(ApiTextSettings { verbosity: "medium" }),
                 include: Some(&["reasoning.encrypted_content"]),
+                prompt_cache_key,
                 stream: true,
             };
 
             log::debug!("OpenAI Codex streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let headers = match self.build_headers(true) {
+            let headers = match self.build_headers(true, request.session_id.as_deref()) {
                 Ok(headers) => headers,
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
@@ -757,6 +780,8 @@ struct ApiResponsesRequest<'a> {
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -779,6 +804,8 @@ struct ApiResponsesRequestStreaming<'a> {
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
     stream: bool,
 }
 

@@ -312,6 +312,8 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
             messages: vec![Message::user(prompt)],
             tools: None,
             max_tokens: 2000,
+            max_tokens_explicit: true,
+            session_id: None,
             thinking: None,
         };
 

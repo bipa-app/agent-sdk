@@ -29,6 +29,11 @@ pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 /// The Anthropic API version used for Claude models on Vertex AI.
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
+const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+const fn vertex_cache_control() -> anthropic_data::ApiCacheControl {
+    anthropic_data::ApiCacheControl::ephemeral()
+}
 
 /// Google Vertex AI LLM provider.
 ///
@@ -121,6 +126,23 @@ impl VertexProvider {
         self.thinking = Some(thinking);
         self
     }
+
+    fn build_cached_vertex_claude_messages(
+        request: &ChatRequest,
+    ) -> Vec<anthropic_data::ApiMessage> {
+        let mut messages = anthropic_data::build_api_messages(request);
+        anthropic_data::apply_cache_control_to_last_user_message(
+            &mut messages,
+            vertex_cache_control(),
+        );
+        messages
+    }
+
+    fn build_vertex_claude_system_prompt(
+        system: &str,
+    ) -> Option<anthropic_data::ApiSystemPrompt<'_>> {
+        anthropic_data::build_api_system_prompt(system, Some(vertex_cache_control()))
+    }
 }
 
 #[async_trait]
@@ -149,6 +171,22 @@ impl LlmProvider for VertexProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        let provider = if self.is_claude_model() {
+            "anthropic"
+        } else {
+            "gemini"
+        };
+        let model_max = self
+            .capabilities()
+            .and_then(|caps| caps.max_output_tokens)
+            .or_else(|| {
+                crate::model_capabilities::default_max_output_tokens(provider, self.model())
+            })
+            .unwrap_or(4096);
+        model_max.clamp(4096, DEFAULT_SAFE_MAX_OUTPUT_TOKENS)
     }
 }
 
@@ -382,7 +420,7 @@ impl VertexProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        let messages = anthropic_data::build_api_messages(&request);
+        let messages = Self::build_cached_vertex_claude_messages(&request);
         let tools = anthropic_data::build_api_tools(&request);
         let thinking = thinking_config
             .as_ref()
@@ -391,11 +429,12 @@ impl VertexProvider {
             .as_ref()
             .and_then(|t| t.effort)
             .map(|effort| anthropic_data::ApiOutputConfig { effort });
+        let system = Self::build_vertex_claude_system_prompt(&request.system);
 
         let api_request = anthropic_data::ApiMessagesRequest {
             model: None, // model is in the URL for Vertex
             max_tokens: request.max_tokens,
-            system: &request.system,
+            system,
             messages: &messages,
             tools: tools.as_deref(),
             stream: false,
@@ -508,7 +547,7 @@ impl VertexProvider {
                 });
                 return;
             }
-            let messages = anthropic_data::build_api_messages(&request);
+            let messages = Self::build_cached_vertex_claude_messages(&request);
             let tools = anthropic_data::build_api_tools(&request);
             let thinking = thinking_config
                 .as_ref()
@@ -517,11 +556,12 @@ impl VertexProvider {
                 .as_ref()
                 .and_then(|t| t.effort)
                 .map(|effort| anthropic_data::ApiOutputConfig { effort });
+            let system = Self::build_vertex_claude_system_prompt(&request.system);
 
             let api_request = anthropic_data::ApiMessagesRequest {
                 model: None, // model is in the URL for Vertex
                 max_tokens: request.max_tokens,
-                system: &request.system,
+                system,
                 messages: &messages,
                 tools: tools.as_deref(),
                 stream: true,

@@ -24,6 +24,7 @@ use reqwest::StatusCode;
 const API_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const CLAUDE_CODE_VERSION: &str = "2.1.62";
+const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 pub const MODEL_HAIKU_35: &str = "claude-3-5-haiku-20241022";
 pub const MODEL_SONNET_35: &str = "claude-3-5-sonnet-20241022";
@@ -171,6 +172,28 @@ impl AnthropicProvider {
         }
     }
 
+    const fn cache_control() -> data::ApiCacheControl {
+        data::ApiCacheControl::ephemeral()
+    }
+
+    fn build_system_prompt_payload(system_prompt: &str) -> Option<data::ApiSystemPrompt<'_>> {
+        data::build_api_system_prompt(system_prompt, Some(Self::cache_control()))
+    }
+
+    fn build_cached_api_messages(request: &ChatRequest) -> Vec<data::ApiMessage> {
+        let mut messages = build_api_messages(request);
+        data::apply_cache_control_to_last_user_message(&mut messages, Self::cache_control());
+        messages
+    }
+
+    fn effective_max_tokens(&self, request: &ChatRequest) -> u32 {
+        if request.max_tokens_explicit {
+            request.max_tokens
+        } else {
+            self.default_max_tokens()
+        }
+    }
+
     /// Create a provider using Claude Haiku 4.5.
     #[must_use]
     pub fn haiku(api_key: String) -> Self {
@@ -220,7 +243,7 @@ impl LlmProvider for AnthropicProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        let messages = build_api_messages(&request);
+        let messages = Self::build_cached_api_messages(&request);
         let tools = if self.is_oauth() {
             build_api_tools(&request).map(|tools| {
                 tools
@@ -243,11 +266,13 @@ impl LlmProvider for AnthropicProvider {
             .map(|effort| ApiOutputConfig { effort });
 
         let system_prompt = self.wrap_system_prompt(&request.system);
+        let system = Self::build_system_prompt_payload(system_prompt.as_ref());
+        let max_tokens = self.effective_max_tokens(&request);
 
         let api_request = ApiMessagesRequest {
             model: Some(&self.model),
-            max_tokens: request.max_tokens,
-            system: &system_prompt,
+            max_tokens,
+            system,
             messages: &messages,
             tools: tools.as_deref(),
             stream: false,
@@ -259,7 +284,7 @@ impl LlmProvider for AnthropicProvider {
         log::debug!(
             "Anthropic LLM request model={} max_tokens={} oauth={}",
             self.model,
-            request.max_tokens,
+            max_tokens,
             self.is_oauth()
         );
 
@@ -371,7 +396,7 @@ impl LlmProvider for AnthropicProvider {
                 return;
             }
 
-            let messages = build_api_messages(&request);
+            let messages = Self::build_cached_api_messages(&request);
             let tools = if is_oauth {
                 build_api_tools(&request).map(|tools| {
                     tools
@@ -404,11 +429,13 @@ impl LlmProvider for AnthropicProvider {
                 .map(|effort| ApiOutputConfig { effort });
 
             let system_prompt = self.wrap_system_prompt(&request.system);
+            let system = Self::build_system_prompt_payload(system_prompt.as_ref());
+            let max_tokens = self.effective_max_tokens(&request);
 
             let api_request = ApiMessagesRequest {
                 model: Some(&self.model),
-                max_tokens: request.max_tokens,
-                system: &system_prompt,
+                max_tokens,
+                system,
                 messages: &messages,
                 tools: tools.as_deref(),
                 stream: true,
@@ -417,7 +444,7 @@ impl LlmProvider for AnthropicProvider {
                 anthropic_version: None,
             };
 
-            log::debug!("Anthropic streaming LLM request model={} max_tokens={} oauth={}", self.model, request.max_tokens, is_oauth);
+            log::debug!("Anthropic streaming LLM request model={} max_tokens={} oauth={}", self.model, max_tokens, is_oauth);
 
             // Log full request payload for debugging
             if log::log_enabled!(log::Level::Debug) {
@@ -617,6 +644,17 @@ impl LlmProvider for AnthropicProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        let model_max = self
+            .capabilities()
+            .and_then(|caps| caps.max_output_tokens)
+            .or_else(|| {
+                crate::model_capabilities::default_max_output_tokens(self.provider(), self.model())
+            })
+            .unwrap_or(4096);
+        model_max.clamp(4096, DEFAULT_SAFE_MAX_OUTPUT_TOKENS)
     }
 }
 

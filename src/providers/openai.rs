@@ -1580,6 +1580,8 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
             thinking: None,
         };
 
@@ -1601,6 +1603,8 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
             thinking: None,
         };
 

@@ -88,6 +88,10 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Option<Vec<Tool>>,
     pub max_tokens: u32,
+    /// Whether `max_tokens` was explicitly configured by the caller.
+    pub max_tokens_explicit: bool,
+    /// Optional session identifier for provider-side prompt caching or routing.
+    pub session_id: Option<String>,
     /// Optional extended thinking configuration.
     pub thinking: Option<ThinkingConfig>,
 }
