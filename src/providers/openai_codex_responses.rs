@@ -110,7 +110,19 @@ impl OpenAICodexResponsesProvider {
         self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
     }
 
-    fn build_headers(&self, streaming: bool) -> Result<reqwest::header::HeaderMap> {
+    const fn max_output_tokens(request: &ChatRequest) -> Option<u32> {
+        if request.max_tokens_explicit {
+            Some(request.max_tokens)
+        } else {
+            None
+        }
+    }
+
+    fn build_headers(
+        &self,
+        streaming: bool,
+        session_id: Option<&str>,
+    ) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{
             ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
         };
@@ -142,8 +154,49 @@ impl OpenAICodexResponsesProvider {
         if streaming {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         }
+        if let Some(session_id) = session_id {
+            headers.insert("session_id", HeaderValue::from_str(session_id)?);
+        }
 
         Ok(headers)
+    }
+
+    fn map_response(api_response: ApiResponse) -> ChatResponse {
+        let content = build_content_blocks(&api_response.output);
+        let has_tool_calls = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        let stop_reason = if has_tool_calls {
+            Some(StopReason::ToolUse)
+        } else {
+            api_response.status.map(|status| match status {
+                ApiStatus::Completed => StopReason::EndTurn,
+                ApiStatus::Incomplete => StopReason::MaxTokens,
+                ApiStatus::Failed => StopReason::StopSequence,
+            })
+        };
+
+        ChatResponse {
+            id: api_response.id,
+            content,
+            model: api_response.model,
+            stop_reason,
+            usage: api_response.usage.map_or(
+                Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+                |usage| Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_input_tokens: usage
+                        .input_tokens_details
+                        .as_ref()
+                        .map_or(0, |details| details.cached_tokens),
+                },
+            ),
+        }
     }
 }
 
@@ -159,23 +212,28 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
+        let max_output_tokens = Self::max_output_tokens(&request);
+        let prompt_cache_key = request.session_id.as_deref();
         let tools: Option<Vec<ApiTool>> = request
             .tools
-            .map(|ts| ts.into_iter().map(convert_tool).collect());
+            .as_ref()
+            .map(|ts| ts.iter().cloned().map(convert_tool).collect());
+        let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         let api_request = ApiResponsesRequest {
             model: &self.model,
             instructions: request.system.as_str(),
             input: &input,
             tools: tools.as_deref(),
-            max_output_tokens: Some(request.max_tokens),
+            max_output_tokens,
             reasoning,
             tool_choice: Some("auto"),
-            parallel_tool_calls: Some(true),
+            parallel_tool_calls: parallel_tool_calls.then_some(true),
             text: Some(ApiTextSettings {
                 verbosity: "medium",
             }),
             include: Some(&["reasoning.encrypted_content"]),
+            prompt_cache_key,
         };
 
         log::debug!(
@@ -187,7 +245,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let response = self
             .client
             .post(codex_url(&self.base_url))
-            .headers(self.build_headers(false)?)
+            .headers(self.build_headers(false, request.session_id.as_deref())?)
             .json(&api_request)
             .send()
             .await
@@ -224,39 +282,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
 
-        let content = build_content_blocks(&api_response.output);
-
-        // Determine stop reason based on output content
-        let has_tool_calls = content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-        let stop_reason = if has_tool_calls {
-            Some(StopReason::ToolUse)
-        } else {
-            api_response.status.map(|s| match s {
-                ApiStatus::Completed => StopReason::EndTurn,
-                ApiStatus::Incomplete => StopReason::MaxTokens,
-                ApiStatus::Failed => StopReason::StopSequence,
-            })
-        };
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: api_response.usage.map_or(
-                Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                },
-                |u| Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                },
-            ),
-        }))
+        Ok(ChatOutcome::Success(Self::map_response(api_response)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -281,27 +307,32 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
+            let max_output_tokens = Self::max_output_tokens(&request);
+            let prompt_cache_key = request.session_id.as_deref();
             let tools: Option<Vec<ApiTool>> = request
                 .tools
-                .map(|ts| ts.into_iter().map(convert_tool).collect());
+                .as_ref()
+                .map(|ts| ts.iter().cloned().map(convert_tool).collect());
+            let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
             let api_request = ApiResponsesRequestStreaming {
                 model: &self.model,
                 instructions: request.system.as_str(),
                 input: &input,
                 tools: tools.as_deref(),
-                max_output_tokens: Some(request.max_tokens),
+                max_output_tokens,
                 reasoning,
                 tool_choice: Some("auto"),
-                parallel_tool_calls: Some(true),
+                parallel_tool_calls: parallel_tool_calls.then_some(true),
                 text: Some(ApiTextSettings { verbosity: "medium" }),
                 include: Some(&["reasoning.encrypted_content"]),
+                prompt_cache_key,
                 stream: true,
             };
 
             log::debug!("OpenAI Codex streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let headers = match self.build_headers(true) {
+            let headers = match self.build_headers(true, request.session_id.as_deref()) {
                 Ok(headers) => headers,
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
@@ -409,6 +440,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     usage = Some(Usage {
                                         input_tokens: u.input_tokens,
                                         output_tokens: u.output_tokens,
+                                        cached_input_tokens: u
+                                            .input_tokens_details
+                                            .as_ref()
+                                            .map_or(0, |details| details.cached_tokens),
                                     });
                                 }
                             }
@@ -757,6 +792,8 @@ struct ApiResponsesRequest<'a> {
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -779,6 +816,8 @@ struct ApiResponsesRequestStreaming<'a> {
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<&'a [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
     stream: bool,
 }
 
@@ -903,6 +942,14 @@ enum ApiStatus {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<ApiInputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]

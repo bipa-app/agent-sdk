@@ -11,9 +11,9 @@
 use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
-    Usage,
+    ThinkingMode, Usage,
 };
-use crate::providers::anthropic::data as anthropic_data;
+use crate::providers::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
 use crate::providers::gemini::data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
@@ -24,11 +24,19 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::StatusCode;
 
-pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3.0-flash";
+pub const MODEL_GEMINI_3_FLASH: &str = "gemini-3-flash-preview";
+pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
+
+// Legacy Gemini 3.0 Pro model kept for explicit opt-in.
 pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 
 /// The Anthropic API version used for Claude models on Vertex AI.
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
+const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+const fn vertex_cache_control() -> anthropic_data::ApiCacheControl {
+    anthropic_data::ApiCacheControl::ephemeral()
+}
 
 /// Google Vertex AI LLM provider.
 ///
@@ -68,7 +76,7 @@ impl VertexProvider {
         }
     }
 
-    /// Create a provider using Gemini 3.0 Flash on Vertex AI.
+    /// Create a provider using Gemini 3 Flash Preview on Vertex AI.
     #[must_use]
     pub fn flash(access_token: String, project_id: String, region: String) -> Self {
         Self::new(
@@ -79,14 +87,14 @@ impl VertexProvider {
         )
     }
 
-    /// Create a provider using Gemini 3.0 Pro on Vertex AI.
+    /// Create a provider using Gemini 3.1 Pro Preview on Vertex AI.
     #[must_use]
     pub fn pro(access_token: String, project_id: String, region: String) -> Self {
         Self::new(
             access_token,
             project_id,
             region,
-            MODEL_GEMINI_3_PRO.to_owned(),
+            MODEL_GEMINI_31_PRO.to_owned(),
         )
     }
 
@@ -121,6 +129,47 @@ impl VertexProvider {
         self.thinking = Some(thinking);
         self
     }
+
+    fn requires_anthropic_adaptive_thinking(&self) -> bool {
+        matches!(self.model.as_str(), MODEL_SONNET_46 | MODEL_OPUS_46)
+    }
+
+    fn build_cached_vertex_claude_messages(
+        request: &ChatRequest,
+    ) -> Vec<anthropic_data::ApiMessage> {
+        let mut messages = anthropic_data::build_api_messages(request);
+        anthropic_data::apply_cache_control_to_last_user_message(
+            &mut messages,
+            vertex_cache_control(),
+        );
+        messages
+    }
+
+    fn build_vertex_claude_system_prompt(
+        system: &str,
+    ) -> Option<anthropic_data::ApiSystemPrompt<'_>> {
+        anthropic_data::build_api_system_prompt(system, Some(vertex_cache_control()))
+    }
+
+    fn map_claude_response(api_response: anthropic_data::ApiResponse) -> ChatResponse {
+        let content = anthropic_data::map_content_blocks(api_response.content);
+        let stop_reason = api_response
+            .stop_reason
+            .as_ref()
+            .map(anthropic_data::map_stop_reason);
+
+        ChatResponse {
+            id: api_response.id,
+            content,
+            model: api_response.model,
+            stop_reason,
+            usage: Usage {
+                input_tokens: api_response.usage.total_input_tokens(),
+                output_tokens: api_response.usage.output,
+                cached_input_tokens: api_response.usage.cached_input_tokens(),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -139,6 +188,48 @@ impl LlmProvider for VertexProvider {
         self.chat_stream_gemini(request)
     }
 
+    fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+        let Some(thinking) = thinking else {
+            return Ok(());
+        };
+
+        if self
+            .capabilities()
+            .is_some_and(|caps| !caps.supports_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if matches!(thinking.mode, ThinkingMode::Adaptive)
+            && !self
+                .capabilities()
+                .is_some_and(|caps| caps.supports_adaptive_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "adaptive thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        if self.is_claude_model()
+            && self.requires_anthropic_adaptive_thinking()
+            && matches!(thinking.mode, ThinkingMode::Enabled { .. })
+        {
+            return Err(anyhow::anyhow!(
+                "budget_tokens thinking is deprecated for provider={} model={}; use ThinkingConfig::adaptive() instead",
+                self.provider(),
+                self.model()
+            ));
+        }
+
+        Ok(())
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -149,6 +240,22 @@ impl LlmProvider for VertexProvider {
 
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        let provider = if self.is_claude_model() {
+            "anthropic"
+        } else {
+            "gemini"
+        };
+        let model_max = self
+            .capabilities()
+            .and_then(|caps| caps.max_output_tokens)
+            .or_else(|| {
+                crate::model_capabilities::default_max_output_tokens(provider, self.model())
+            })
+            .unwrap_or(4096);
+        model_max.clamp(4096, DEFAULT_SAFE_MAX_OUTPUT_TOKENS)
     }
 }
 
@@ -190,6 +297,7 @@ impl VertexProvider {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
             }),
+            cached_content: request.cached_content.as_deref(),
         };
 
         log::debug!(
@@ -265,20 +373,21 @@ impl VertexProvider {
             .as_ref()
             .map(|r| map_finish_reason(r, has_tool_calls));
 
-        let usage = api_response.usage_metadata.unwrap_or(ApiUsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: 0,
-        });
+        let usage = api_response
+            .usage_metadata
+            .unwrap_or(ApiUsageMetadata {
+                prompt: 0,
+                candidates: 0,
+                cached_content: 0,
+            })
+            .into_usage();
 
         Ok(ChatOutcome::Success(ChatResponse {
             id: String::new(),
             content,
             model: self.model.clone(),
             stop_reason,
-            usage: Usage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-            },
+            usage,
         }))
     }
 
@@ -325,6 +434,7 @@ impl VertexProvider {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
                 }),
+                cached_content: request.cached_content.as_deref(),
             };
 
             log::debug!(
@@ -382,7 +492,7 @@ impl VertexProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        let messages = anthropic_data::build_api_messages(&request);
+        let messages = Self::build_cached_vertex_claude_messages(&request);
         let tools = anthropic_data::build_api_tools(&request);
         let thinking = thinking_config
             .as_ref()
@@ -391,11 +501,12 @@ impl VertexProvider {
             .as_ref()
             .and_then(|t| t.effort)
             .map(|effort| anthropic_data::ApiOutputConfig { effort });
+        let system = Self::build_vertex_claude_system_prompt(&request.system);
 
         let api_request = anthropic_data::ApiMessagesRequest {
             model: None, // model is in the URL for Vertex
             max_tokens: request.max_tokens,
-            system: &request.system,
+            system,
             messages: &messages,
             tools: tools.as_deref(),
             stream: false,
@@ -465,27 +576,14 @@ impl VertexProvider {
             api_response.id,
             api_response.model,
             api_response.stop_reason,
-            api_response.usage.input_tokens,
-            api_response.usage.output_tokens,
+            api_response.usage.total_input_tokens(),
+            api_response.usage.output,
             api_response.content.len()
         );
 
-        let content = anthropic_data::map_content_blocks(api_response.content);
-        let stop_reason = api_response
-            .stop_reason
-            .as_ref()
-            .map(anthropic_data::map_stop_reason);
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: Usage {
-                input_tokens: api_response.usage.input_tokens,
-                output_tokens: api_response.usage.output_tokens,
-            },
-        }))
+        Ok(ChatOutcome::Success(Self::map_claude_response(
+            api_response,
+        )))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -508,7 +606,7 @@ impl VertexProvider {
                 });
                 return;
             }
-            let messages = anthropic_data::build_api_messages(&request);
+            let messages = Self::build_cached_vertex_claude_messages(&request);
             let tools = anthropic_data::build_api_tools(&request);
             let thinking = thinking_config
                 .as_ref()
@@ -517,11 +615,12 @@ impl VertexProvider {
                 .as_ref()
                 .and_then(|t| t.effort)
                 .map(|effort| anthropic_data::ApiOutputConfig { effort });
+            let system = Self::build_vertex_claude_system_prompt(&request.system);
 
             let api_request = anthropic_data::ApiMessagesRequest {
                 model: None, // model is in the URL for Vertex
                 max_tokens: request.max_tokens,
-                system: &request.system,
+                system,
                 messages: &messages,
                 tools: tools.as_deref(),
                 stream: true,
@@ -596,6 +695,7 @@ impl VertexProvider {
             let mut buffer = String::new();
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut cached_input_tokens: u32 = 0;
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
@@ -618,6 +718,7 @@ impl VertexProvider {
                         &event_block,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut cached_input_tokens,
                         &mut tool_ids,
                     ) {
                         yield Ok(delta);
@@ -636,6 +737,7 @@ impl VertexProvider {
                     remaining,
                     &mut input_tokens,
                     &mut output_tokens,
+                    &mut cached_input_tokens,
                     &mut tool_ids,
                 ) {
                     yield Ok(delta);
@@ -692,7 +794,7 @@ mod tests {
             "us-central1".to_string(),
         );
 
-        assert_eq!(provider.model(), MODEL_GEMINI_3_PRO);
+        assert_eq!(provider.model(), MODEL_GEMINI_31_PRO);
         assert_eq!(provider.provider(), "vertex");
     }
 
@@ -724,7 +826,7 @@ mod tests {
             "token".to_string(),
             "project".to_string(),
             "us-central1".to_string(),
-            "gemini-3.0-flash".to_string(),
+            "gemini-3-flash-preview".to_string(),
         );
         assert!(!gemini_provider.is_claude_model());
     }
@@ -735,13 +837,13 @@ mod tests {
             "token".to_string(),
             "my-project".to_string(),
             "us-central1".to_string(),
-            "gemini-3.0-flash".to_string(),
+            "gemini-3-flash-preview".to_string(),
         );
 
         let url = provider.base_url("google");
         assert_eq!(
             url,
-            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3.0-flash"
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3-flash-preview"
         );
     }
 
@@ -767,14 +869,14 @@ mod tests {
             "token".to_string(),
             "other-project".to_string(),
             "europe-west4".to_string(),
-            "gemini-3.0-pro".to_string(),
+            "gemini-3.1-pro-preview".to_string(),
         );
 
         let url = provider.base_url("google");
         assert!(url.starts_with("https://europe-west4-aiplatform.googleapis.com/"));
         assert!(url.contains("/projects/other-project/"));
         assert!(url.contains("/locations/europe-west4/"));
-        assert!(url.ends_with("/models/gemini-3.0-pro"));
+        assert!(url.ends_with("/models/gemini-3.1-pro-preview"));
     }
 
     #[test]
@@ -794,8 +896,24 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_claude_46_rejects_budgeted_thinking() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_SONNET_46.to_string(),
+        );
+
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+    }
+
+    #[test]
     fn test_model_constants() {
-        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3.0-flash");
+        assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
+        assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
     }
 }

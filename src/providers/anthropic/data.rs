@@ -19,7 +19,8 @@ pub struct ApiMessagesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<&'a str>,
     pub max_tokens: u32,
-    pub system: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<ApiSystemPrompt<'a>>,
     pub messages: &'a [ApiMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<&'a [ApiTool]>,
@@ -30,6 +31,40 @@ pub struct ApiMessagesRequest<'a> {
     pub output_config: Option<ApiOutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<&'a str>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ApiCacheControl {
+    #[serde(rename = "type")]
+    pub control_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<&'static str>,
+}
+
+impl ApiCacheControl {
+    #[must_use]
+    pub const fn ephemeral() -> Self {
+        Self {
+            control_type: "ephemeral",
+            ttl: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct ApiSystemBlock<'a> {
+    #[serde(rename = "type")]
+    pub block_type: &'static str,
+    pub text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<ApiCacheControl>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ApiSystemPrompt<'a> {
+    Text(&'a str),
+    Blocks(Vec<ApiSystemBlock<'a>>),
 }
 
 /// Configuration for extended thinking in the API request.
@@ -87,7 +122,7 @@ pub enum ApiMessageContent {
     Blocks(Vec<ApiContentBlockInput>),
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ApiSource {
     #[serde(rename = "type")]
     source_type: &'static str,
@@ -105,11 +140,15 @@ impl ApiSource {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ApiContentBlockInput {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ApiCacheControl>,
+    },
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -130,11 +169,21 @@ pub enum ApiContentBlockInput {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ApiCacheControl>,
     },
     #[serde(rename = "image")]
-    Image { source: ApiSource },
+    Image {
+        source: ApiSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ApiCacheControl>,
+    },
     #[serde(rename = "document")]
-    Document { source: ApiSource },
+    Document {
+        source: ApiSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ApiCacheControl>,
+    },
 }
 
 #[derive(Serialize)]
@@ -191,8 +240,24 @@ pub enum ApiStopReason {
 
 #[derive(Deserialize)]
 pub struct ApiUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    #[serde(rename = "input_tokens")]
+    pub input: u32,
+    #[serde(rename = "output_tokens")]
+    pub output: u32,
+    #[serde(default, rename = "cache_creation_input_tokens")]
+    pub cache_creation_input: u32,
+    #[serde(default, rename = "cache_read_input_tokens")]
+    pub cache_read_input: u32,
+}
+
+impl ApiUsage {
+    pub const fn total_input_tokens(&self) -> u32 {
+        self.input + self.cache_creation_input + self.cache_read_input
+    }
+
+    pub const fn cached_input_tokens(&self) -> u32 {
+        self.cache_read_input
+    }
 }
 
 // ============================================================================
@@ -211,7 +276,22 @@ pub struct SseMessageStartMessage {
 
 #[derive(Deserialize)]
 pub struct SseMessageStartUsage {
-    pub input_tokens: u32,
+    #[serde(rename = "input_tokens")]
+    pub input: u32,
+    #[serde(default, rename = "cache_creation_input_tokens")]
+    pub cache_creation: u32,
+    #[serde(default, rename = "cache_read_input_tokens")]
+    pub cache_read: u32,
+}
+
+impl SseMessageStartUsage {
+    pub const fn total_input_tokens(&self) -> u32 {
+        self.input + self.cache_creation + self.cache_read
+    }
+
+    pub const fn cached_input_tokens(&self) -> u32 {
+        self.cache_read
+    }
 }
 
 #[derive(Deserialize)]
@@ -336,7 +416,10 @@ fn build_api_message_content(content: &Content, role_label: &str) -> Option<ApiM
 
 fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<ApiContentBlockInput> {
     match block {
-        ContentBlock::Text { text } => Some(ApiContentBlockInput::Text { text: text.clone() }),
+        ContentBlock::Text { text } => Some(ApiContentBlockInput::Text {
+            text: text.clone(),
+            cache_control: None,
+        }),
         ContentBlock::Thinking {
             thinking,
             signature,
@@ -370,12 +453,15 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: *is_error,
+            cache_control: None,
         }),
         ContentBlock::Image { source } => Some(ApiContentBlockInput::Image {
             source: ApiSource::from_content_source(source),
+            cache_control: None,
         }),
         ContentBlock::Document { source } => Some(ApiContentBlockInput::Document {
             source: ApiSource::from_content_source(source),
+            cache_control: None,
         }),
     }
 }
@@ -391,6 +477,106 @@ pub fn build_api_tools(request: &ChatRequest) -> Option<Vec<ApiTool>> {
             })
             .collect()
     })
+}
+
+#[must_use]
+pub fn build_api_system_prompt(
+    system: &str,
+    cache_control: Option<ApiCacheControl>,
+) -> Option<ApiSystemPrompt<'_>> {
+    if system.is_empty() {
+        return None;
+    }
+
+    cache_control.map_or(Some(ApiSystemPrompt::Text(system)), |cache_control| {
+        Some(ApiSystemPrompt::Blocks(vec![ApiSystemBlock {
+            block_type: "text",
+            text: system,
+            cache_control: Some(cache_control),
+        }]))
+    })
+}
+
+pub fn apply_cache_control_to_last_user_message(
+    messages: &mut [ApiMessage],
+    cache_control: ApiCacheControl,
+) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(message.role, ApiRole::User))
+    else {
+        return;
+    };
+
+    let content = &mut message.content;
+    if apply_cache_control_to_content(content, cache_control.clone()) {
+        return;
+    }
+
+    if let ApiMessageContent::Text(text) = content {
+        let cached_text = std::mem::take(text);
+        *content = ApiMessageContent::Blocks(vec![ApiContentBlockInput::Text {
+            text: cached_text,
+            cache_control: Some(cache_control),
+        }]);
+    }
+}
+
+fn apply_cache_control_to_content(
+    content: &mut ApiMessageContent,
+    cache_control: ApiCacheControl,
+) -> bool {
+    let ApiMessageContent::Blocks(blocks) = content else {
+        return false;
+    };
+
+    let Some(block) = blocks
+        .iter_mut()
+        .rev()
+        .find(|block| block_supports_cache_control(block))
+    else {
+        return false;
+    };
+
+    set_cache_control(block, cache_control);
+    true
+}
+
+const fn block_supports_cache_control(block: &ApiContentBlockInput) -> bool {
+    matches!(
+        block,
+        ApiContentBlockInput::Text { .. }
+            | ApiContentBlockInput::ToolResult { .. }
+            | ApiContentBlockInput::Image { .. }
+            | ApiContentBlockInput::Document { .. }
+    )
+}
+
+const fn set_cache_control(block: &mut ApiContentBlockInput, cache_control: ApiCacheControl) {
+    match block {
+        ApiContentBlockInput::Text {
+            cache_control: slot,
+            ..
+        }
+        | ApiContentBlockInput::ToolResult {
+            cache_control: slot,
+            ..
+        }
+        | ApiContentBlockInput::Image {
+            cache_control: slot,
+            ..
+        }
+        | ApiContentBlockInput::Document {
+            cache_control: slot,
+            ..
+        } => {
+            *slot = Some(cache_control);
+        }
+        ApiContentBlockInput::Thinking { .. }
+        | ApiContentBlockInput::RedactedThinking { .. }
+        | ApiContentBlockInput::ToolUse { .. } => {}
+    }
 }
 
 /// Map an `ApiStopReason` to a `StopReason`.
@@ -507,6 +693,7 @@ pub fn parse_sse_event(
     event_block: &str,
     input_tokens: &mut u32,
     output_tokens: &mut u32,
+    cached_input_tokens: &mut u32,
     tool_ids: &mut std::collections::HashMap<usize, String>,
 ) -> Option<StreamDelta> {
     let (event_type, data) = parse_sse_fields(event_block);
@@ -518,7 +705,8 @@ pub fn parse_sse_event(
             // Extract input tokens from message_start
             match serde_json::from_str::<SseMessageStart>(&data) {
                 Ok(event) => {
-                    *input_tokens = event.message.usage.input_tokens;
+                    *cached_input_tokens = event.message.usage.cached_input_tokens();
+                    *input_tokens = event.message.usage.total_input_tokens();
                 }
                 Err(error) => log_sse_parse_error(&event_type, &data, &error),
             }
@@ -602,6 +790,7 @@ pub fn parse_sse_event(
             Some(StreamDelta::Usage(Usage {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
+                cached_input_tokens: *cached_input_tokens,
             }))
         }
         _ => None,
@@ -636,6 +825,7 @@ mod tests {
     fn test_api_content_block_text_serialization() {
         let block = ApiContentBlockInput::Text {
             text: "Hello, world!".to_string(),
+            cache_control: None,
         };
 
         let json = serde_json::to_string(&block).unwrap();
@@ -663,6 +853,7 @@ mod tests {
             tool_use_id: "tool_123".to_string(),
             content: "File contents here".to_string(),
             is_error: None,
+            cache_control: None,
         };
 
         let json = serde_json::to_string(&block).unwrap();
@@ -679,6 +870,7 @@ mod tests {
             tool_use_id: "tool_123".to_string(),
             content: "Error occurred".to_string(),
             is_error: Some(true),
+            cache_control: None,
         };
 
         let json = serde_json::to_string(&block).unwrap();
@@ -710,7 +902,7 @@ mod tests {
         let request = ApiMessagesRequest {
             model: Some("claude-3-5-sonnet"),
             max_tokens: 1024,
-            system: "You are helpful.",
+            system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
             tools: None,
             stream: true,
@@ -732,7 +924,7 @@ mod tests {
         let request = ApiMessagesRequest {
             model: None,
             max_tokens: 1024,
-            system: "You are helpful.",
+            system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
             tools: None,
             stream: false,
@@ -765,6 +957,9 @@ mod tests {
             }],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -799,6 +994,9 @@ mod tests {
             }],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -826,6 +1024,9 @@ mod tests {
             ],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -859,8 +1060,8 @@ mod tests {
         let response: ApiResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.model, "claude-3-5-sonnet");
-        assert_eq!(response.usage.input_tokens, 100);
-        assert_eq!(response.usage.output_tokens, 50);
+        assert_eq!(response.usage.input, 100);
+        assert_eq!(response.usage.output, 50);
     }
 
     #[test]
@@ -950,8 +1151,15 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -966,8 +1174,15 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -985,11 +1200,18 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         // Pre-populate tool_ids as if we received the tool_use_start event
         let mut tool_ids = std::collections::HashMap::new();
         tool_ids.insert(1, "toolu_123".to_string());
 
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         // Verify the tool ID is correctly looked up
         assert!(matches!(
@@ -1006,8 +1228,15 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(delta.is_none());
         assert_eq!(input_tokens, 150);
@@ -1020,8 +1249,15 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1039,14 +1275,22 @@ data: {"type":"message_stop"}"#;
 
         let mut input_tokens = 100;
         let mut output_tokens = 50;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
             Some(StreamDelta::Usage(Usage {
                 input_tokens: 100,
-                output_tokens: 50
+                output_tokens: 50,
+                ..
             }))
         ));
     }
@@ -1068,8 +1312,15 @@ data: {"type":"message_stop"}"#;
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,
@@ -1124,8 +1375,15 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
-        let delta = parse_sse_event(event, &mut input_tokens, &mut output_tokens, &mut tool_ids);
+        let delta = parse_sse_event(
+            event,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cached_input_tokens,
+            &mut tool_ids,
+        );
 
         assert!(matches!(
             delta,

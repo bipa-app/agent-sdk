@@ -61,6 +61,9 @@ where
             messages: vec![Message::user(classification_prompt)],
             tools: None,
             max_tokens: 50,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 

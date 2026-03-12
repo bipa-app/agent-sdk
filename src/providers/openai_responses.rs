@@ -115,6 +115,7 @@ impl LlmProvider for OpenAIResponsesProvider {
         let tools: Option<Vec<ApiTool>> = request
             .tools
             .map(|ts| ts.into_iter().map(convert_tool).collect());
+        let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
         let api_request = ApiResponsesRequest {
             model: &self.model,
@@ -122,6 +123,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             tools: tools.as_deref(),
             max_output_tokens: Some(request.max_tokens),
             reasoning,
+            parallel_tool_calls: parallel_tool_calls.then_some(true),
         };
 
         log::debug!(
@@ -197,10 +199,15 @@ impl LlmProvider for OpenAIResponsesProvider {
                 Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cached_input_tokens: 0,
                 },
                 |u| Usage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
+                    cached_input_tokens: u
+                        .input_tokens_details
+                        .as_ref()
+                        .map_or(0, |details| details.cached_tokens),
                 },
             ),
         }))
@@ -231,6 +238,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             let tools: Option<Vec<ApiTool>> = request
                 .tools
                 .map(|ts| ts.into_iter().map(convert_tool).collect());
+            let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
 
             let api_request = ApiResponsesRequestStreaming {
                 model: &self.model,
@@ -238,6 +246,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                 tools: tools.as_deref(),
                 max_output_tokens: Some(request.max_tokens),
                 reasoning,
+                parallel_tool_calls: parallel_tool_calls.then_some(true),
                 stream: true,
             };
 
@@ -341,6 +350,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     usage = Some(Usage {
                                         input_tokens: u.input_tokens,
                                         output_tokens: u.output_tokens,
+                                        cached_input_tokens: u
+                                            .input_tokens_details
+                                            .as_ref()
+                                            .map_or(0, |details| details.cached_tokens),
                                     });
                                 }
                             }
@@ -653,6 +666,8 @@ struct ApiResponsesRequest<'a> {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -665,6 +680,8 @@ struct ApiResponsesRequestStreaming<'a> {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
     stream: bool,
 }
 
@@ -785,6 +802,14 @@ enum ApiStatus {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<ApiInputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]

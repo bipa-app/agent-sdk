@@ -28,6 +28,31 @@ fn requires_responses_api(model: &str) -> bool {
     model == MODEL_GPT52_CODEX
 }
 
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    base_url == DEFAULT_BASE_URL || base_url.contains("api.openai.com")
+}
+
+fn request_is_agentic(request: &ChatRequest) -> bool {
+    request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty()) || request.messages.iter().any(|message| {
+        matches!(
+            &message.content,
+            Content::Blocks(blocks)
+                if blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. })
+                })
+        )
+    })
+}
+
+fn should_use_responses_api(base_url: &str, model: &str, request: &ChatRequest) -> bool {
+    requires_responses_api(model)
+        || request_has_attachments(request)
+        || (is_official_openai_base_url(base_url) && request_is_agentic(request))
+}
+
 // GPT-5.4 series
 pub const MODEL_GPT54: &str = "gpt-5.4";
 
@@ -269,9 +294,8 @@ impl OpenAIProvider {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-        // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
-        // or when the request includes native image/document attachments.
-        if requires_responses_api(&self.model) || request_has_attachments(&request) {
+        // Route official OpenAI agentic flows to the Responses API.
+        if should_use_responses_api(&self.base_url, &self.model, &request) {
             let mut responses_provider = OpenAIResponsesProvider::with_base_url(
                 self.api_key.clone(),
                 self.model.clone(),
@@ -370,15 +394,19 @@ impl LlmProvider for OpenAIProvider {
             usage: Usage {
                 input_tokens: api_response.usage.prompt_tokens,
                 output_tokens: api_response.usage.completion_tokens,
+                cached_input_tokens: api_response
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map_or(0, |details| details.cached_tokens),
             },
         }))
     }
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
-        // Route to Responses API for models that require it (e.g., gpt-5.2-codex)
-        // or when the request includes native image/document attachments.
-        if requires_responses_api(&self.model) || request_has_attachments(&request) {
+        // Route official OpenAI agentic flows to the Responses API.
+        if should_use_responses_api(&self.base_url, &self.model, &request) {
             let api_key = self.api_key.clone();
             let model = self.model.clone();
             let base_url = self.base_url.clone();
@@ -427,6 +455,7 @@ impl LlmProvider for OpenAIProvider {
                 tools.as_deref(),
                 reasoning,
                 use_max_tokens_alias(&self.base_url),
+                use_stream_usage_options(&self.base_url),
             );
 
             log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
@@ -616,6 +645,10 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
         results.push(SseProcessResult::Usage(Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
         }));
     }
 
@@ -653,6 +686,10 @@ fn use_max_tokens_alias(base_url: &str) -> bool {
     base_url.contains("moonshot.ai")
         || base_url.contains("api.z.ai")
         || base_url.contains("minimax.io")
+}
+
+fn use_stream_usage_options(base_url: &str) -> bool {
+    base_url == DEFAULT_BASE_URL || base_url.contains("api.openai.com")
 }
 
 fn map_finish_reason(finish_reason: &str) -> StopReason {
@@ -694,6 +731,7 @@ fn build_api_chat_request_streaming<'a>(
     tools: Option<&'a [ApiTool]>,
     reasoning: Option<ApiReasoning>,
     include_max_tokens_alias: bool,
+    include_stream_usage: bool,
 ) -> ApiChatRequestStreaming<'a> {
     ApiChatRequestStreaming {
         model,
@@ -702,6 +740,9 @@ fn build_api_chat_request_streaming<'a>(
         max_tokens: include_max_tokens_alias.then_some(max_tokens),
         tools,
         reasoning,
+        stream_options: include_stream_usage.then_some(ApiStreamOptions {
+            include_usage: true,
+        }),
         stream: true,
     }
 }
@@ -918,7 +959,14 @@ struct ApiChatRequestStreaming<'a> {
     tools: Option<&'a [ApiTool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ApiStreamOptions>,
     stream: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ApiStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1024,6 +1072,14 @@ struct ApiUsage {
     prompt_tokens: u32,
     #[serde(deserialize_with = "deserialize_u32_from_number")]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<ApiPromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiPromptTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_u32_from_number")]
+    cached_tokens: u32,
 }
 
 // ============================================================================
@@ -1076,6 +1132,8 @@ struct SseUsage {
     prompt_tokens: u32,
     #[serde(deserialize_with = "deserialize_u32_from_number")]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<ApiPromptTokensDetails>,
 }
 
 fn deserialize_u32_from_number<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
@@ -1580,6 +1638,9 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -1601,6 +1662,9 @@ mod tests {
             messages: vec![crate::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -1795,6 +1859,22 @@ mod tests {
     }
 
     #[test]
+    fn test_api_usage_deserializes_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 42,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {
+                "cached_tokens": 10
+            }
+        }"#;
+
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 10);
+    }
+
+    #[test]
     fn test_api_usage_rejects_fractional_numbers() {
         let json = r#"{
             "prompt_tokens": 42.5,
@@ -1818,6 +1898,35 @@ mod tests {
         assert!(requires_responses_api(MODEL_GPT52_CODEX));
         assert!(!requires_responses_api(MODEL_GPT53_CODEX));
         assert!(!requires_responses_api(MODEL_GPT54));
+    }
+
+    #[test]
+    fn test_should_use_responses_api_for_official_agentic_requests() {
+        let request = ChatRequest {
+            system: String::new(),
+            messages: vec![crate::llm::Message::user("Hello")],
+            tools: Some(vec![crate::llm::Tool {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: Some("thread-1".to_string()),
+            cached_content: None,
+            thinking: None,
+        };
+
+        assert!(should_use_responses_api(
+            DEFAULT_BASE_URL,
+            MODEL_GPT54,
+            &request
+        ));
+        assert!(!should_use_responses_api(
+            BASE_URL_KIMI,
+            MODEL_GPT54,
+            &request
+        ));
     }
 
     #[test]
@@ -1849,6 +1958,15 @@ mod tests {
                 .to_string()
                 .contains("adaptive thinking is not supported")
         );
+    }
+
+    #[test]
+    fn test_openai_non_reasoning_models_reject_thinking() {
+        let provider = OpenAIProvider::gpt4o("test-key".to_string());
+        let error = provider
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("thinking is not supported"));
     }
 
     #[test]
@@ -1913,6 +2031,9 @@ mod tests {
             max_tokens: None,
             tools: None,
             reasoning: None,
+            stream_options: Some(ApiStreamOptions {
+                include_usage: true,
+            }),
             stream: true,
         };
 
@@ -1920,6 +2041,7 @@ mod tests {
         assert!(json.contains("\"stream\":true"));
         assert!(json.contains("\"model\":\"gpt-4o\""));
         assert!(json.contains("\"max_completion_tokens\":1024"));
+        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
         assert!(!json.contains("\"max_tokens\""));
     }
 
@@ -1939,12 +2061,14 @@ mod tests {
             max_tokens: Some(1024),
             tools: None,
             reasoning: None,
+            stream_options: None,
             stream: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
+        assert!(!json.contains("\"stream_options\""));
     }
 
     #[test]

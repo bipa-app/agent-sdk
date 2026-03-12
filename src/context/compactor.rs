@@ -312,6 +312,9 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
             messages: vec![Message::user(prompt)],
             tools: None,
             max_tokens: 2000,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         };
 
@@ -478,6 +481,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    cached_input_tokens: 0,
                 },
             }))
         }

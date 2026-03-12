@@ -213,6 +213,7 @@ where
 pub(super) fn build_turn_request<Ctx, P>(
     config: &AgentConfig,
     provider: &Arc<P>,
+    thread_id: &ThreadId,
     messages: Vec<Message>,
     tools: &Arc<ToolRegistry<Ctx>>,
 ) -> Result<ChatRequest, AgentError>
@@ -237,17 +238,21 @@ where
         max_tokens: config
             .max_tokens
             .unwrap_or_else(|| provider.default_max_tokens()),
+        max_tokens_explicit: config.max_tokens.is_some(),
+        session_id: Some(thread_id.to_string()),
+        cached_content: None,
         thinking,
     })
 }
 
 pub(super) fn log_chat_request(request: &ChatRequest) {
     debug!(
-        "ChatRequest built: system_prompt_len={} num_messages={} num_tools={} max_tokens={}",
+        "ChatRequest built: system_prompt_len={} num_messages={} num_tools={} max_tokens={} cached_content={}",
         request.system.len(),
         request.messages.len(),
         request.tools.as_ref().map_or(0, Vec::len),
-        request.max_tokens
+        request.max_tokens,
+        request.cached_content.as_deref().unwrap_or("<none>")
     );
 
     for (message_idx, message) in request.messages.iter().enumerate() {
@@ -872,7 +877,7 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
-    let request = match build_turn_request(config, provider, messages, tools) {
+    let request = match build_turn_request(config, provider, &ctx.thread_id, messages, tools) {
         Ok(request) => request,
         Err(error) => return InternalTurnResult::Error(error),
     };

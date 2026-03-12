@@ -233,6 +233,9 @@ mod tests {
             }],
             tools: None,
             max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
             thinking: None,
         }
     }

@@ -127,6 +127,17 @@ pub trait LlmProvider: Send + Sync {
             return Ok(());
         };
 
+        if self
+            .capabilities()
+            .is_some_and(|caps| !caps.supports_thinking)
+        {
+            return Err(anyhow::anyhow!(
+                "thinking is not supported for provider={} model={}",
+                self.provider(),
+                self.model()
+            ));
+        }
+
         if matches!(thinking.mode, ThinkingMode::Adaptive)
             && !self
                 .capabilities()
@@ -213,6 +224,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
     let usage = accumulator.take_usage().unwrap_or(Usage {
         input_tokens: 0,
         output_tokens: 0,
+        cached_input_tokens: 0,
     });
     let stop_reason = accumulator.take_stop_reason();
     let content = accumulator.into_content_blocks();
