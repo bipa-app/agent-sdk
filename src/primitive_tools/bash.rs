@@ -1,4 +1,3 @@
-use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -140,14 +139,11 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         // Include exit code in output
         let _ = write!(output, "\n\nExit code: {}", result.exit_code);
 
-        let mut tool_result = if result.success() {
+        let tool_result = if result.success() {
             ToolResult::success(output)
         } else {
             ToolResult::error(output)
         };
-
-        // Add verification reminder
-        append_reminder(&mut tool_result, builtin::BASH_VERIFICATION_REMINDER);
 
         Ok(tool_result)
     }
