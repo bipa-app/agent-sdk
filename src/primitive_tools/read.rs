@@ -113,9 +113,9 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
 
         let path = self.ctx.environment.resolve_path(&input.path);
 
-        if !self.ctx.capabilities.can_read(&path) {
+        if let Err(reason) = self.ctx.capabilities.check_read(&path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot read '{path}'"
+                "Permission denied: cannot read '{path}': {reason}"
             )));
         }
 
@@ -210,9 +210,7 @@ fn truncate_line(line: &str) -> &str {
 
 /// Detect supported binary media types by file extension.
 fn detect_media_type(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path)
-        .extension()?
-        .to_ascii_lowercase();
+    let ext = std::path::Path::new(path).extension()?.to_ascii_lowercase();
 
     match ext.to_str()? {
         "png" => Some("image/png"),

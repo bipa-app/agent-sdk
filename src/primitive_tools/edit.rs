@@ -85,9 +85,9 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
         let path = self.ctx.environment.resolve_path(&input.path);
 
         // Check capabilities
-        if !self.ctx.capabilities.can_write(&path) {
+        if let Err(reason) = self.ctx.capabilities.check_write(&path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot edit '{path}'"
+                "Permission denied: cannot edit '{path}': {reason}"
             )));
         }
 

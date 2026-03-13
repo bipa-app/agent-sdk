@@ -68,9 +68,9 @@ impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
 
         let path = self.ctx.environment.resolve_path(&input.path);
 
-        if !self.ctx.capabilities.can_write(&path) {
+        if let Err(reason) = self.ctx.capabilities.check_write(&path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot write to '{path}'"
+                "Permission denied: cannot write to '{path}': {reason}"
             )));
         }
 

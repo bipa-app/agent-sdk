@@ -131,72 +131,109 @@ impl AgentCapabilities {
         self
     }
 
-    /// Check if a path can be read
-    #[must_use]
-    pub fn can_read(&self, path: &str) -> bool {
-        self.read && self.path_allowed(path)
+    /// Check read permission, returning the denial reason on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when read is disabled, the path matches a
+    /// denied pattern, or the path is not in the allowed list.
+    pub fn check_read(&self, path: &str) -> Result<(), String> {
+        if !self.read {
+            return Err("read access is disabled".into());
+        }
+        self.check_path(path)
     }
 
-    /// Check if a path can be written
-    #[must_use]
-    pub fn can_write(&self, path: &str) -> bool {
-        self.write && self.path_allowed(path)
+    /// Check write permission, returning the denial reason on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when write is disabled, the path matches a
+    /// denied pattern, or the path is not in the allowed list.
+    pub fn check_write(&self, path: &str) -> Result<(), String> {
+        if !self.write {
+            return Err("write access is disabled".into());
+        }
+        self.check_path(path)
     }
 
-    /// Check if a command can be executed
-    #[must_use]
-    pub fn can_exec(&self, command: &str) -> bool {
-        self.exec && self.command_allowed(command)
+    /// Check exec permission, returning the denial reason on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when exec is disabled, the command matches a
+    /// denied pattern, or the command is not in the allowed list.
+    pub fn check_exec(&self, command: &str) -> Result<(), String> {
+        if !self.exec {
+            return Err("command execution is disabled".into());
+        }
+        self.check_command(command)
     }
 
-    /// Check if a path is allowed (not in denied list and in allowed list if specified)
-    #[must_use]
-    pub fn path_allowed(&self, path: &str) -> bool {
-        // Check denied patterns first (takes precedence)
+    /// Check whether a path passes the allow/deny rules, returning
+    /// the specific denial reason on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when the path matches a denied pattern
+    /// or is not in the allowed list.
+    pub fn check_path(&self, path: &str) -> Result<(), String> {
+        // Denied patterns take precedence
         for pattern in &self.denied_paths {
             if glob_match(pattern, path) {
-                return false;
+                return Err(format!("path matches denied pattern '{pattern}'"));
             }
         }
 
         // If allowed_paths is empty, all non-denied paths are allowed
         if self.allowed_paths.is_empty() {
-            return true;
+            return Ok(());
         }
 
         // Check if path matches any allowed pattern
         for pattern in &self.allowed_paths {
             if glob_match(pattern, path) {
-                return true;
+                return Ok(());
             }
         }
 
-        false
+        Err(format!(
+            "path not in allowed list (allowed: [{}])",
+            self.allowed_paths.join(", ")
+        ))
     }
 
-    /// Check if a command is allowed
-    #[must_use]
-    pub fn command_allowed(&self, command: &str) -> bool {
-        // Check denied patterns first
+    /// Check whether a command passes the allow/deny rules, returning
+    /// the specific denial reason on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when the command matches a denied pattern
+    /// or is not in the allowed list.
+    pub fn check_command(&self, command: &str) -> Result<(), String> {
+        // Denied patterns take precedence
         for pattern in &self.denied_commands {
             if regex_match(pattern, command) {
-                return false;
+                return Err(format!("command matches denied pattern '{pattern}'"));
             }
         }
 
         // If allowed_commands is empty, all non-denied commands are allowed
         if self.allowed_commands.is_empty() {
-            return true;
+            return Ok(());
         }
 
         // Check if command matches any allowed pattern
         for pattern in &self.allowed_commands {
             if regex_match(pattern, command) {
-                return true;
+                return Ok(());
             }
         }
 
-        false
+        Err(format!(
+            "command not in allowed list (allowed: [{}])",
+            self.allowed_commands.join(", ")
+        ))
     }
 }
 
@@ -250,28 +287,28 @@ mod tests {
         let caps = AgentCapabilities::default();
 
         // Default is permissive — no paths or commands are denied
-        assert!(caps.path_allowed("src/main.rs"));
-        assert!(caps.path_allowed(".env"));
-        assert!(caps.path_allowed("/workspace/secrets/key.txt"));
-        assert!(caps.command_allowed("any command"));
+        assert!(caps.check_path("src/main.rs").is_ok());
+        assert!(caps.check_path(".env").is_ok());
+        assert!(caps.check_path("/workspace/secrets/key.txt").is_ok());
+        assert!(caps.check_command("any command").is_ok());
     }
 
     #[test]
     fn test_full_access_allows_everything() {
         let caps = AgentCapabilities::full_access();
 
-        assert!(caps.can_read("/any/path"));
-        assert!(caps.can_write("/any/path"));
-        assert!(caps.can_exec("any command"));
+        assert!(caps.check_read("/any/path").is_ok());
+        assert!(caps.check_write("/any/path").is_ok());
+        assert!(caps.check_exec("any command").is_ok());
     }
 
     #[test]
     fn test_read_only_cannot_write() {
         let caps = AgentCapabilities::read_only();
 
-        assert!(caps.can_read("src/main.rs"));
-        assert!(!caps.can_write("src/main.rs"));
-        assert!(!caps.can_exec("ls"));
+        assert!(caps.check_read("src/main.rs").is_ok());
+        assert!(caps.check_write("src/main.rs").is_err());
+        assert!(caps.check_exec("ls").is_err());
     }
 
     #[test]
@@ -284,21 +321,21 @@ mod tests {
         ]);
 
         // Denied paths (relative)
-        assert!(!caps.path_allowed(".env"));
-        assert!(!caps.path_allowed("config/.env.local"));
-        assert!(!caps.path_allowed("app/secrets/key.txt"));
-        assert!(!caps.path_allowed("certs/server.pem"));
+        assert!(caps.check_path(".env").is_err());
+        assert!(caps.check_path("config/.env.local").is_err());
+        assert!(caps.check_path("app/secrets/key.txt").is_err());
+        assert!(caps.check_path("certs/server.pem").is_err());
 
         // Denied paths (absolute — after resolve_path)
-        assert!(!caps.path_allowed("/workspace/.env"));
-        assert!(!caps.path_allowed("/workspace/.env.production"));
-        assert!(!caps.path_allowed("/workspace/secrets/key.txt"));
-        assert!(!caps.path_allowed("/workspace/certs/server.pem"));
+        assert!(caps.check_path("/workspace/.env").is_err());
+        assert!(caps.check_path("/workspace/.env.production").is_err());
+        assert!(caps.check_path("/workspace/secrets/key.txt").is_err());
+        assert!(caps.check_path("/workspace/certs/server.pem").is_err());
 
         // Normal files still allowed
-        assert!(caps.path_allowed("src/main.rs"));
-        assert!(caps.path_allowed("/workspace/src/main.rs"));
-        assert!(caps.path_allowed("/workspace/README.md"));
+        assert!(caps.check_path("src/main.rs").is_ok());
+        assert!(caps.check_path("/workspace/src/main.rs").is_ok());
+        assert!(caps.check_path("/workspace/README.md").is_ok());
     }
 
     #[test]
@@ -306,11 +343,11 @@ mod tests {
         let caps = AgentCapabilities::read_only()
             .with_allowed_paths(vec!["src/**".into(), "tests/**".into()]);
 
-        assert!(caps.path_allowed("src/main.rs"));
-        assert!(caps.path_allowed("src/lib/utils.rs"));
-        assert!(caps.path_allowed("tests/integration.rs"));
-        assert!(!caps.path_allowed("config/settings.toml"));
-        assert!(!caps.path_allowed("README.md"));
+        assert!(caps.check_path("src/main.rs").is_ok());
+        assert!(caps.check_path("src/lib/utils.rs").is_ok());
+        assert!(caps.check_path("tests/integration.rs").is_ok());
+        assert!(caps.check_path("config/settings.toml").is_err());
+        assert!(caps.check_path("README.md").is_err());
     }
 
     #[test]
@@ -319,8 +356,8 @@ mod tests {
             .with_denied_paths(vec!["**/secret/**".into()])
             .with_allowed_paths(vec!["**".into()]);
 
-        assert!(caps.path_allowed("src/main.rs"));
-        assert!(!caps.path_allowed("src/secret/key.txt"));
+        assert!(caps.check_path("src/main.rs").is_ok());
+        assert!(caps.check_path("src/secret/key.txt").is_err());
     }
 
     #[test]
@@ -328,14 +365,17 @@ mod tests {
         let caps = AgentCapabilities::full_access()
             .with_denied_commands(vec![r"rm\s+-rf\s+/".into(), r"^sudo\s".into()]);
 
-        assert!(!caps.command_allowed("rm -rf /"));
-        assert!(!caps.command_allowed("sudo rm file"));
+        assert!(caps.check_command("rm -rf /").is_err());
+        assert!(caps.check_command("sudo rm file").is_err());
 
         // Common shell patterns are NOT blocked
-        assert!(caps.command_allowed("ls -la"));
-        assert!(caps.command_allowed("cargo build"));
-        assert!(caps.command_allowed("unzip file.zip 2>/dev/null"));
-        assert!(caps.command_allowed("python3 -m markitdown file.pptx"));
+        assert!(caps.check_command("ls -la").is_ok());
+        assert!(caps.check_command("cargo build").is_ok());
+        assert!(caps.check_command("unzip file.zip 2>/dev/null").is_ok());
+        assert!(
+            caps.check_command("python3 -m markitdown file.pptx")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -343,10 +383,10 @@ mod tests {
         let caps = AgentCapabilities::full_access()
             .with_allowed_commands(vec![r"^cargo ".into(), r"^git ".into()]);
 
-        assert!(caps.command_allowed("cargo build"));
-        assert!(caps.command_allowed("git status"));
-        assert!(!caps.command_allowed("ls -la"));
-        assert!(!caps.command_allowed("npm install"));
+        assert!(caps.check_command("cargo build").is_ok());
+        assert!(caps.check_command("git status").is_ok());
+        assert!(caps.check_command("ls -la").is_err());
+        assert!(caps.check_command("npm install").is_err());
     }
 
     #[test]
@@ -383,5 +423,71 @@ mod tests {
         // Absolute paths should NOT false-positive
         assert!(!glob_match("**/.env", "/workspace/src/main.rs"));
         assert!(!glob_match("**/*.pem", "/workspace/src/lib.rs"));
+    }
+
+    // =============================================
+    // Diagnostic reason tests (check_* methods)
+    // =============================================
+
+    #[test]
+    fn check_read_disabled_explains_reason() {
+        let caps = AgentCapabilities::none();
+        let err = caps.check_read("src/main.rs").unwrap_err();
+        assert!(err.contains("read access is disabled"), "got: {err}");
+    }
+
+    #[test]
+    fn check_write_disabled_explains_reason() {
+        let caps = AgentCapabilities::read_only();
+        let err = caps.check_write("src/main.rs").unwrap_err();
+        assert!(err.contains("write access is disabled"), "got: {err}");
+    }
+
+    #[test]
+    fn check_exec_disabled_explains_reason() {
+        let caps = AgentCapabilities::read_only();
+        let err = caps.check_exec("ls").unwrap_err();
+        assert!(err.contains("command execution is disabled"), "got: {err}");
+    }
+
+    #[test]
+    fn check_read_denied_path_explains_pattern() {
+        let caps = AgentCapabilities::full_access().with_denied_paths(vec!["**/.env*".into()]);
+        let err = caps.check_read("/workspace/.env.local").unwrap_err();
+        assert!(err.contains("denied pattern"), "got: {err}");
+        assert!(err.contains("**/.env*"), "got: {err}");
+    }
+
+    #[test]
+    fn check_read_not_in_allowed_list() {
+        let caps = AgentCapabilities::full_access().with_allowed_paths(vec!["src/**".into()]);
+        let err = caps.check_read("/workspace/README.md").unwrap_err();
+        assert!(err.contains("not in allowed list"), "got: {err}");
+        assert!(err.contains("src/**"), "got: {err}");
+    }
+
+    #[test]
+    fn check_exec_denied_command_explains_pattern() {
+        let caps = AgentCapabilities::full_access().with_denied_commands(vec![r"^sudo\s".into()]);
+        let err = caps.check_exec("sudo rm -rf /").unwrap_err();
+        assert!(err.contains("denied pattern"), "got: {err}");
+        assert!(err.contains("^sudo\\s"), "got: {err}");
+    }
+
+    #[test]
+    fn check_exec_not_in_allowed_list() {
+        let caps = AgentCapabilities::full_access()
+            .with_allowed_commands(vec![r"^cargo ".into(), r"^git ".into()]);
+        let err = caps.check_exec("npm install").unwrap_err();
+        assert!(err.contains("not in allowed list"), "got: {err}");
+        assert!(err.contains("^cargo "), "got: {err}");
+    }
+
+    #[test]
+    fn check_allowed_operations_return_ok() {
+        let caps = AgentCapabilities::full_access();
+        assert!(caps.check_read("any/path").is_ok());
+        assert!(caps.check_write("any/path").is_ok());
+        assert!(caps.check_exec("any command").is_ok());
     }
 }
