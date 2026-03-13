@@ -84,9 +84,9 @@ impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
             |p| self.ctx.environment.resolve_path(p),
         );
 
-        if !self.ctx.capabilities.can_read(&search_path) {
+        if let Err(reason) = self.ctx.capabilities.check_read(&search_path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot search in '{search_path}'"
+                "Permission denied: cannot search in '{search_path}': {reason}"
             )));
         }
 
@@ -101,7 +101,7 @@ impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
         // Filter out files that the agent can't read
         let accessible_matches: Vec<_> = matches
             .into_iter()
-            .filter(|path| self.ctx.capabilities.can_read(path))
+            .filter(|path| self.ctx.capabilities.check_read(path).is_ok())
             .collect();
 
         if accessible_matches.is_empty() {

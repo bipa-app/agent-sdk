@@ -96,17 +96,14 @@ where
     }
 }
 
-pub(super) fn deserialize_optional_usize_from_string_or_int<'de, D>(
+pub(super) fn deserialize_usize_from_string_or_int<'de, D>(
     deserializer: D,
-) -> Result<Option<usize>, D::Error>
+) -> Result<usize, D::Error>
 where
     D: Deserializer<'de>,
 {
-    match Option::<StringOrUsize>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(StringOrUsize::Number(value)) => Ok(Some(value)),
-        Some(StringOrUsize::String(value)) => parse_numeric_string(&value)
-            .map(Some)
-            .map_err(de::Error::custom),
+    match StringOrUsize::deserialize(deserializer)? {
+        StringOrUsize::Number(value) => Ok(value),
+        StringOrUsize::String(value) => parse_numeric_string(&value).map_err(de::Error::custom),
     }
 }

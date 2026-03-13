@@ -1,4 +1,3 @@
-use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -83,17 +82,10 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         let input: BashInput = serde_json::from_value(input.clone())
             .with_context(|| format!("Invalid input for bash tool: {input}"))?;
 
-        // Check exec capability
-        if !self.ctx.capabilities.exec {
-            return Ok(ToolResult::error(
-                "Permission denied: command execution is disabled",
-            ));
-        }
-
-        // Check if command is allowed
-        if !self.ctx.capabilities.can_exec(&input.command) {
+        // Check exec capability and command allow/deny rules
+        if let Err(reason) = self.ctx.capabilities.check_exec(&input.command) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: command '{}' is not allowed",
+                "Permission denied: cannot execute '{}': {reason}",
                 truncate_command(&input.command, 100)
             )));
         }
@@ -140,14 +132,11 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         // Include exit code in output
         let _ = write!(output, "\n\nExit code: {}", result.exit_code);
 
-        let mut tool_result = if result.success() {
+        let tool_result = if result.success() {
             ToolResult::success(output)
         } else {
             ToolResult::error(output)
         };
-
-        // Add verification reminder
-        append_reminder(&mut tool_result, builtin::BASH_VERIFICATION_REMINDER);
 
         Ok(tool_result)
     }
@@ -383,7 +372,7 @@ mod tests {
             .await?;
         assert!(!result.success);
         assert!(result.output.contains("Permission denied"));
-        assert!(result.output.contains("not allowed"));
+        assert!(result.output.contains("denied pattern"));
 
         let tool = create_test_tool(env, caps);
         let result = tool
@@ -417,7 +406,7 @@ mod tests {
             .execute(&tool_ctx(), json!({"command": "ls -la"}))
             .await?;
         assert!(!result.success);
-        assert!(result.output.contains("not allowed"));
+        assert!(result.output.contains("not in allowed list"));
         Ok(())
     }
 

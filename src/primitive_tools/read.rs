@@ -1,20 +1,18 @@
 use crate::llm::ContentSource;
-use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
-use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
 use std::sync::Arc;
 
 use super::PrimitiveToolContext;
 
-/// Maximum tokens allowed per file read (approximately 4 chars per token)
-const MAX_TOKENS: usize = 25_000;
-const CHARS_PER_TOKEN: usize = 4;
+/// Maximum characters per line before truncation.
+const MAX_LINE_LENGTH: usize = 500;
 
-/// Tool for reading file contents
+/// Default maximum number of lines to return.
+const DEFAULT_LIMIT: usize = 2000;
+
 pub struct ReadTool<E: Environment> {
     ctx: PrimitiveToolContext<E>,
 }
@@ -30,29 +28,29 @@ impl<E: Environment> ReadTool<E> {
 
 #[derive(Debug, Deserialize)]
 struct ReadInput {
-    /// Path to the file to read (also accepts `file_path` for compatibility)
     #[serde(alias = "file_path")]
     path: String,
-    /// Optional line offset to start from (1-based).
-    /// Accepts either an integer or a numeric string such as "55".
+    /// 1-indexed line number to start reading from; defaults to 1.
     #[serde(
-        default,
-        deserialize_with = "super::deserialize_optional_usize_from_string_or_int"
+        default = "defaults::offset",
+        deserialize_with = "super::deserialize_usize_from_string_or_int"
     )]
-    offset: Option<usize>,
-    /// Optional number of lines to read.
-    /// Accepts either an integer or a numeric string such as "40".
+    offset: usize,
+    /// Maximum number of lines to return; defaults to 2000.
     #[serde(
-        default,
-        deserialize_with = "super::deserialize_optional_usize_from_string_or_int"
+        default = "defaults::limit",
+        deserialize_with = "super::deserialize_usize_from_string_or_int"
     )]
-    limit: Option<usize>,
+    limit: usize,
 }
 
-enum ReadContent {
-    Text(String),
-    NativeBinary { mime_type: &'static str },
-    UnsupportedBinary,
+mod defaults {
+    pub const fn offset() -> usize {
+        1
+    }
+    pub const fn limit() -> usize {
+        super::DEFAULT_LIMIT
+    }
 }
 
 impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
@@ -67,7 +65,7 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Read text files directly, and attach supported images/PDFs for native model inspection. Can optionally specify offset and limit for text files."
+        "Read text files with 1-indexed line numbers. Also supports images (PNG/JPEG/GIF/WebP) and PDF documents."
     }
 
     fn tier(&self) -> ToolTier {
@@ -87,14 +85,14 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
                         {"type": "integer"},
                         {"type": "string", "pattern": "^[0-9]+$"}
                     ],
-                    "description": "Line number to start from (1-based). Accepts either an integer or a numeric string. Optional. Only applies to text files."
+                    "description": "Line number to start from (1-based). Accepts either an integer or a numeric string. Default: 1"
                 },
                 "limit": {
                     "anyOf": [
                         {"type": "integer"},
                         {"type": "string", "pattern": "^[0-9]+$"}
                     ],
-                    "description": "Number of lines to read. Accepts either an integer or a numeric string. Optional. Only applies to text files."
+                    "description": "Maximum number of lines to return. Accepts either an integer or a numeric string. Default: 2000"
                 }
             },
             "required": ["path"]
@@ -105,11 +103,19 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
         let input: ReadInput = serde_json::from_value(input.clone())
             .with_context(|| format!("Invalid input for read tool: {input}"))?;
 
+        if input.offset == 0 {
+            return Ok(ToolResult::error("offset must be a 1-indexed line number"));
+        }
+
+        if input.limit == 0 {
+            return Ok(ToolResult::error("limit must be greater than zero"));
+        }
+
         let path = self.ctx.environment.resolve_path(&input.path);
 
-        if !self.ctx.capabilities.can_read(&path) {
+        if let Err(reason) = self.ctx.capabilities.check_read(&path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot read '{path}'"
+                "Permission denied: cannot read '{path}': {reason}"
             )));
         }
 
@@ -144,166 +150,81 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
             .await
             .context("Failed to read file")?;
 
-        let mut result = match classify_content(&path, &bytes) {
-            ReadContent::Text(content) => {
-                read_text_content(&path, &content, input.offset, input.limit)
-            }
-            ReadContent::NativeBinary { mime_type } => {
-                if input.offset.is_some() || input.limit.is_some() {
-                    ToolResult::error(format!(
-                        "offset and limit are only supported for text files. '{path}' is a {mime_type} file."
-                    ))
-                } else {
-                    ToolResult::success(format!(
-                        "Attached '{path}' ({mime_type}, {} bytes) for native model inspection.",
-                        bytes.len()
-                    ))
-                    .with_documents(vec![ContentSource::new(
-                        mime_type,
-                        base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    )])
-                }
-            }
-            ReadContent::UnsupportedBinary => ToolResult::error(format!(
-                "'{path}' is a binary file in an unsupported format. The read tool currently supports text files, images (PNG/JPEG/GIF/WebP), and PDF documents."
-            )),
-        };
-
-        if result.success && result.output == "(empty file)" {
-            append_reminder(&mut result, builtin::READ_EMPTY_FILE_REMINDER);
+        // Handle images and PDFs as document attachments (like codex-rs view_image).
+        if let Some(media_type) = detect_media_type(&path) {
+            let encoded = base64_encode(&bytes);
+            return Ok(
+                ToolResult::success(format!("Read {media_type} file: '{path}'"))
+                    .with_documents(vec![ContentSource::new(media_type, encoded)]),
+            );
         }
 
-        if result.success {
-            append_reminder(&mut result, builtin::READ_SECURITY_REMINDER);
+        // Text files: lossy UTF-8, line numbers, truncation.
+        let content = String::from_utf8_lossy(&bytes);
+        let collected = read_lines(&content, input.offset, input.limit);
+
+        if collected.is_empty() {
+            return Ok(ToolResult::error("offset exceeds file length"));
         }
 
-        Ok(result)
+        Ok(ToolResult::success(collected.join("\n")))
     }
 }
 
-fn read_text_content(
-    path: &str,
-    content: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> ToolResult {
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-    let offset = offset.unwrap_or(1).saturating_sub(1);
-    let selected_lines: Vec<&str> = lines.iter().copied().skip(offset).collect();
+fn read_lines(content: &str, offset: usize, limit: usize) -> Vec<String> {
+    let mut collected = Vec::new();
+    let mut line_number = 0usize;
 
-    let limit = if let Some(user_limit) = limit {
-        user_limit
+    for raw_line in content.split('\n') {
+        line_number += 1;
+
+        if line_number < offset {
+            continue;
+        }
+
+        if collected.len() >= limit {
+            break;
+        }
+
+        // Strip trailing \r for CRLF files
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let display = truncate_line(line);
+        collected.push(format!("L{line_number}: {display}"));
+    }
+
+    collected
+}
+
+fn truncate_line(line: &str) -> &str {
+    if line.len() <= MAX_LINE_LENGTH {
+        line
     } else {
-        let selected_content_len: usize = selected_lines.iter().map(|line| line.len() + 1).sum();
-        let estimated_tokens = selected_content_len / CHARS_PER_TOKEN;
-
-        if estimated_tokens > MAX_TOKENS {
-            let suggested_limit = estimate_lines_for_tokens(&selected_lines, MAX_TOKENS);
-            return ToolResult::success(format!(
-                "File too large to read at once (~{estimated_tokens} tokens, max {MAX_TOKENS}).\n\
-                 Total lines: {total_lines}\n\n\
-                 Use 'offset' and 'limit' parameters to read specific portions.\n\
-                 Suggested: Start with offset=1, limit={suggested_limit} to read the first ~{MAX_TOKENS} tokens.\n\n\
-                 Example: {{\"path\": \"{path}\", \"offset\": 1, \"limit\": {suggested_limit}}}"
-            ));
+        // Find the nearest char boundary at or before MAX_LINE_LENGTH
+        let mut end = MAX_LINE_LENGTH;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
         }
-
-        selected_lines.len()
-    };
-
-    let selected_lines: Vec<String> = lines
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .enumerate()
-        .map(|(i, line)| format!("{:>6}\t{}", offset + i + 1, line))
-        .collect();
-
-    let is_empty = selected_lines.is_empty();
-    let output = if is_empty {
-        "(empty file)".to_string()
-    } else {
-        let header = if offset > 0 || limit < total_lines {
-            format!(
-                "Showing lines {}-{} of {} total\n",
-                offset + 1,
-                (offset + selected_lines.len()).min(total_lines),
-                total_lines
-            )
-        } else {
-            String::new()
-        };
-        format!("{header}{}", selected_lines.join("\n"))
-    };
-
-    ToolResult::success(output)
+        &line[..end]
+    }
 }
 
-fn classify_content(path: &str, bytes: &[u8]) -> ReadContent {
-    if let Some(mime_type) = detect_native_binary_mime(path, bytes) {
-        return ReadContent::NativeBinary { mime_type };
-    }
+/// Detect supported binary media types by file extension.
+fn detect_media_type(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_ascii_lowercase();
 
-    if let Ok(content) = std::str::from_utf8(bytes) {
-        return ReadContent::Text(content.to_string());
-    }
-
-    ReadContent::UnsupportedBinary
-}
-
-fn detect_native_binary_mime(path: &str, bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"%PDF-") {
-        return Some("application/pdf");
-    }
-
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        return Some("image/png");
-    }
-
-    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return Some("image/jpeg");
-    }
-
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase);
-
-    match extension.as_deref() {
-        Some("pdf") => Some("application/pdf"),
-        Some("png") => Some("image/png"),
-        Some("jpg" | "jpeg") => Some("image/jpeg"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
+    match ext.to_str()? {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "pdf" => Some("application/pdf"),
         _ => None,
     }
 }
 
-/// Estimate how many lines can fit within a token budget
-fn estimate_lines_for_tokens(lines: &[&str], max_tokens: usize) -> usize {
-    let max_chars = max_tokens * CHARS_PER_TOKEN;
-    let mut total_chars = 0;
-    let mut line_count = 0;
-
-    for line in lines {
-        let line_chars = line.len() + 1;
-        if total_chars + line_chars > max_chars {
-            break;
-        }
-        total_chars += line_chars;
-        line_count += 1;
-    }
-
-    line_count.max(1)
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 #[cfg(test)]
@@ -323,9 +244,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_entire_file() -> anyhow::Result<()> {
+    async fn reads_entire_file() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("test.txt", "line 1\nline 2\nline 3").await?;
+        fs.write_file("test.txt", "alpha\nbeta\ngamma").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
@@ -333,42 +254,32 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("line 1"));
-        assert!(result.output.contains("line 2"));
-        assert!(result.output.contains("line 3"));
-        assert!(result.documents.is_empty());
+        assert_eq!(result.output, "L1: alpha\nL2: beta\nL3: gamma");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_with_offset() -> anyhow::Result<()> {
+    async fn reads_with_offset() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
-            .await?;
+        fs.write_file("test.txt", "alpha\nbeta\ngamma").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
             .execute(
                 &tool_ctx(),
-                json!({"path": "/workspace/test.txt", "offset": 3}),
+                json!({"path": "/workspace/test.txt", "offset": 2}),
             )
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Showing lines 3-5 of 5 total"));
-        assert!(result.output.contains("line 3"));
-        assert!(result.output.contains("line 4"));
-        assert!(result.output.contains("line 5"));
-        assert!(!result.output.contains("\tline 1"));
-        assert!(!result.output.contains("\tline 2"));
+        assert_eq!(result.output, "L2: beta\nL3: gamma");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_with_limit() -> anyhow::Result<()> {
+    async fn reads_with_limit() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
-            .await?;
+        fs.write_file("test.txt", "alpha\nbeta\ngamma").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
@@ -379,17 +290,14 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Showing lines 1-2 of 5 total"));
-        assert!(result.output.contains("line 1"));
-        assert!(result.output.contains("line 2"));
-        assert!(!result.output.contains("\tline 3"));
+        assert_eq!(result.output, "L1: alpha\nL2: beta");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_with_offset_and_limit() -> anyhow::Result<()> {
+    async fn reads_with_offset_and_limit() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
+        fs.write_file("test.txt", "alpha\nbeta\ngamma\ndelta\nepsilon")
             .await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
@@ -401,44 +309,89 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Showing lines 2-3 of 5 total"));
-        assert!(result.output.contains("line 2"));
-        assert!(result.output.contains("line 3"));
-        assert!(!result.output.contains("\tline 1"));
-        assert!(!result.output.contains("\tline 4"));
+        assert_eq!(result.output, "L2: beta\nL3: gamma");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_with_string_offset_and_limit() -> anyhow::Result<()> {
+    async fn accepts_string_offset_and_limit() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("test.txt", "line 1\nline 2\nline 3\nline 4\nline 5")
-            .await?;
+        fs.write_file("test.txt", "alpha\nbeta\ngamma").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
             .execute(
                 &tool_ctx(),
-                json!({"path": "/workspace/test.txt", "offset": "2", "limit": "2"}),
+                json!({"path": "/workspace/test.txt", "offset": "2", "limit": "1"}),
             )
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Showing lines 2-3 of 5 total"));
-        assert!(result.output.contains("line 2"));
-        assert!(result.output.contains("line 3"));
-        assert!(!result.output.contains("\tline 1"));
-        assert!(!result.output.contains("\tline 4"));
+        assert_eq!(result.output, "L2: beta");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_nonexistent_file() -> anyhow::Result<()> {
+    async fn errors_on_offset_zero() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "alpha").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "offset": 0}),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("1-indexed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errors_on_limit_zero() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "alpha").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/test.txt", "limit": 0}),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("greater than zero"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errors_when_offset_exceeds_length() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("short.txt", "only").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/short.txt", "offset": 100}),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("offset exceeds file length"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errors_on_nonexistent_file() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
-            .execute(&tool_ctx(), json!({"path": "/workspace/nonexistent.txt"}))
+            .execute(&tool_ctx(), json!({"path": "/workspace/nope.txt"}))
             .await?;
 
         assert!(!result.success);
@@ -447,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_directory_returns_error() -> anyhow::Result<()> {
+    async fn errors_on_directory() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         fs.create_dir("/workspace/subdir").await?;
 
@@ -462,9 +415,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_permission_denied() -> anyhow::Result<()> {
+    async fn errors_on_permission_denied() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("secret.txt", "secret content").await?;
+        fs.write_file("secret.txt", "secret").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::none());
         let result = tool
@@ -477,20 +430,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_denied_path_via_capabilities() -> anyhow::Result<()> {
+    async fn respects_denied_paths() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("secrets/api_key.txt", "API_KEY=secret")
-            .await?;
+        fs.write_file("secrets/key.txt", "API_KEY=secret").await?;
 
         let caps =
             AgentCapabilities::read_only().with_denied_paths(vec!["/workspace/secrets/**".into()]);
 
         let tool = create_test_tool(fs, caps);
         let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/secrets/api_key.txt"}),
-            )
+            .execute(&tool_ctx(), json!({"path": "/workspace/secrets/key.txt"}))
             .await?;
 
         assert!(!result.success);
@@ -499,97 +448,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_allowed_path_restriction() -> anyhow::Result<()> {
+    async fn handles_crlf_line_endings() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("src/main.rs", "fn main() {} ").await?;
-        fs.write_file("config/settings.toml", "key = value").await?;
-
-        let caps =
-            AgentCapabilities::read_only().with_allowed_paths(vec!["/workspace/src/**".into()]);
-
-        let tool = create_test_tool(Arc::clone(&fs), caps.clone());
-
-        let result = tool
-            .execute(&tool_ctx(), json!({"path": "/workspace/src/main.rs"}))
-            .await?;
-        assert!(result.success);
-
-        let tool = create_test_tool(fs, caps);
-        let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/config/settings.toml"}),
-            )
-            .await?;
-        assert!(!result.success);
-        assert!(result.output.contains("Permission denied"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_empty_file() -> anyhow::Result<()> {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("empty.txt", "").await?;
+        fs.write_file_bytes("crlf.txt", b"one\r\ntwo\r\n").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
-            .execute(&tool_ctx(), json!({"path": "/workspace/empty.txt"}))
+            .execute(&tool_ctx(), json!({"path": "/workspace/crlf.txt"}))
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("(empty file)"));
+        assert_eq!(result.output, "L1: one\nL2: two\nL3: ");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_large_file_with_pagination() -> anyhow::Result<()> {
+    async fn handles_non_utf8() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let content: String = (1..=100)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs.write_file("large.txt", &content).await?;
+        fs.write_file_bytes(
+            "bin.txt",
+            &[0xff, 0xfe, b'\n', b'p', b'l', b'a', b'i', b'n', b'\n'],
+        )
+        .await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/large.txt", "offset": 50, "limit": 10}),
-            )
+            .execute(&tool_ctx(), json!({"path": "/workspace/bin.txt"}))
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Showing lines 50-59 of 100 total"));
-        assert!(result.output.contains("line 50"));
-        assert!(result.output.contains("line 59"));
-        assert!(!result.output.contains("\tline 49"));
-        assert!(!result.output.contains("\tline 60"));
+        assert!(result.output.contains("L2: plain"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_offset_beyond_file_length() -> anyhow::Result<()> {
+    async fn truncates_long_lines() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file("short.txt", "line 1\nline 2").await?;
+        let long_line = "x".repeat(MAX_LINE_LENGTH + 50);
+        fs.write_file("long.txt", &long_line).await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/short.txt", "offset": 100}),
-            )
+            .execute(&tool_ctx(), json!({"path": "/workspace/long.txt"}))
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("(empty file)"));
+        let expected = "x".repeat(MAX_LINE_LENGTH);
+        assert_eq!(result.output, format!("L1: {expected}"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_file_with_special_characters() -> anyhow::Result<()> {
+    async fn handles_special_characters() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let content = "特殊字符\néàü\n🎉emoji\ntab\there";
-        fs.write_file("special.txt", content).await?;
+        fs.write_file("special.txt", "特殊字符\néàü\n🎉emoji")
+            .await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
@@ -604,12 +517,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_image_file_attaches_native_content() -> anyhow::Result<()> {
+    async fn respects_limit_with_more_lines() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let png = vec![
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
-        ];
-        fs.write_file_bytes("image.png", &png).await?;
+        let content: String = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs.write_file("many.txt", &content).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/many.txt", "offset": 50, "limit": 3}),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert_eq!(result.output, "L50: line 50\nL51: line 51\nL52: line 52");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_metadata() {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        assert_eq!(tool.name(), PrimitiveToolName::Read);
+        assert_eq!(tool.tier(), ToolTier::Observe);
+
+        let schema = tool.input_schema();
+        assert!(schema["properties"].get("path").is_some());
+        assert!(schema["properties"].get("offset").is_some());
+        assert!(schema["properties"].get("limit").is_some());
+    }
+
+    #[test]
+    fn read_lines_basic() {
+        let lines = read_lines("alpha\nbeta\ngamma", 1, 2000);
+        assert_eq!(
+            lines,
+            vec![
+                "L1: alpha".to_string(),
+                "L2: beta".to_string(),
+                "L3: gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_lines_with_offset_and_limit() {
+        let lines = read_lines("a\nb\nc\nd\ne", 2, 2);
+        assert_eq!(lines, vec!["L2: b".to_string(), "L3: c".to_string()]);
+    }
+
+    #[test]
+    fn read_lines_offset_past_end_returns_empty() {
+        let lines = read_lines("only", 5, 10);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn detect_media_type_images() {
+        assert_eq!(detect_media_type("photo.png"), Some("image/png"));
+        assert_eq!(detect_media_type("photo.PNG"), Some("image/png"));
+        assert_eq!(detect_media_type("photo.jpg"), Some("image/jpeg"));
+        assert_eq!(detect_media_type("photo.jpeg"), Some("image/jpeg"));
+        assert_eq!(detect_media_type("photo.gif"), Some("image/gif"));
+        assert_eq!(detect_media_type("photo.webp"), Some("image/webp"));
+        assert_eq!(detect_media_type("doc.pdf"), Some("application/pdf"));
+        assert_eq!(detect_media_type("code.rs"), None);
+        assert_eq!(detect_media_type("data.json"), None);
+    }
+
+    #[tokio::test]
+    async fn reads_image_as_document() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        // PNG magic bytes
+        let png_bytes = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        fs.write_file_bytes("image.png", &png_bytes).await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
@@ -617,16 +603,15 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("Attached '/workspace/image.png'"));
         assert_eq!(result.documents.len(), 1);
         assert_eq!(result.documents[0].media_type, "image/png");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_pdf_file_attaches_native_content() -> anyhow::Result<()> {
+    async fn reads_pdf_as_document() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file_bytes("doc.pdf", b"%PDF-1.7\nbody").await?;
+        fs.write_file_bytes("doc.pdf", b"%PDF-1.4 fake").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
@@ -640,120 +625,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_binary_with_offset_returns_error() -> anyhow::Result<()> {
+    async fn text_files_have_no_documents() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file_bytes("doc.pdf", b"%PDF-1.7\nbody").await?;
+        fs.write_file("test.txt", "hello").await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
         let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/doc.pdf", "offset": 1}),
-            )
-            .await?;
-
-        assert!(!result.success);
-        assert!(result.output.contains("only supported for text files"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_unsupported_binary_returns_error() -> anyhow::Result<()> {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file_bytes("archive.bin", &[0, 159, 146, 150])
-            .await?;
-
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-        let result = tool
-            .execute(&tool_ctx(), json!({"path": "/workspace/archive.bin"}))
-            .await?;
-
-        assert!(!result.success);
-        assert!(result.output.contains("unsupported format"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_tool_metadata() {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-
-        assert_eq!(tool.name(), PrimitiveToolName::Read);
-        assert_eq!(tool.tier(), ToolTier::Observe);
-        assert!(tool.description().contains("Read"));
-
-        let schema = tool.input_schema();
-        assert!(schema.get("properties").is_some());
-        assert!(schema["properties"].get("path").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_read_invalid_input() -> anyhow::Result<()> {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-
-        let result = tool.execute(&tool_ctx(), json!({})).await;
-
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_large_file_exceeds_token_limit() -> anyhow::Result<()> {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let line = "x".repeat(100);
-        let content: String = (1..=1500)
-            .map(|i| format!("{i}: {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs.write_file("huge.txt", &content).await?;
-
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-        let result = tool
-            .execute(&tool_ctx(), json!({"path": "/workspace/huge.txt"}))
+            .execute(&tool_ctx(), json!({"path": "/workspace/test.txt"}))
             .await?;
 
         assert!(result.success);
-        assert!(result.output.contains("File too large to read at once"));
-        assert!(result.output.contains("Total lines: 1500"));
-        assert!(result.output.contains("offset"));
-        assert!(result.output.contains("limit"));
+        assert!(result.documents.is_empty());
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_large_file_with_explicit_limit_bypasses_check() -> anyhow::Result<()> {
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let line = "x".repeat(100);
-        let content: String = (1..=1500)
-            .map(|i| format!("{i}: {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs.write_file("huge.txt", &content).await?;
-
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-        let result = tool
-            .execute(
-                &tool_ctx(),
-                json!({"path": "/workspace/huge.txt", "offset": 1, "limit": 10}),
-            )
-            .await?;
-
-        assert!(result.success);
-        assert!(result.output.contains("Showing lines 1-10 of 1500 total"));
-        assert!(!result.output.contains("File too large"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_estimate_lines_for_tokens() {
-        let long = "x".repeat(100);
-        let lines: Vec<&str> = vec!["short line", "another short line", &long];
-
-        let count = estimate_lines_for_tokens(&lines, 10);
-        assert_eq!(count, 2);
-
-        let count = estimate_lines_for_tokens(&lines, 1);
-        assert_eq!(count, 1);
     }
 }

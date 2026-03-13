@@ -1,4 +1,3 @@
-use crate::reminders::{append_reminder, builtin};
 use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -86,9 +85,9 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
         let path = self.ctx.environment.resolve_path(&input.path);
 
         // Check capabilities
-        if !self.ctx.capabilities.can_write(&path) {
+        if let Err(reason) = self.ctx.capabilities.check_write(&path) {
             return Ok(ToolResult::error(format!(
-                "Permission denied: cannot edit '{path}'"
+                "Permission denied: cannot edit '{path}': {reason}"
             )));
         }
 
@@ -158,14 +157,10 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
             .context("Failed to write file")?;
 
         let replacements = if input.replace_all { count } else { 1 };
-        let mut result = ToolResult::success(format!(
+
+        Ok(ToolResult::success(format!(
             "Successfully replaced {replacements} occurrence(s) in '{path}'"
-        ));
-
-        // Add verification reminder
-        append_reminder(&mut result, builtin::EDIT_VERIFICATION_REMINDER);
-
-        Ok(result)
+        )))
     }
 }
 
