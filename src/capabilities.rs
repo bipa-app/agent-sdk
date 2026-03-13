@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// This provides a security model for primitive tools (Read, Write, Grep, Glob, Bash).
 /// Paths are matched using glob patterns, commands using regex patterns.
 ///
-/// By default, no paths or commands are denied — the SDK is unopinionated and leaves
+/// By default, everything is allowed — the SDK is unopinionated and leaves
 /// security policy to the client. Use the builder methods to configure restrictions.
 ///
 /// # Example
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// let caps = AgentCapabilities::full_access()
 ///     .with_denied_paths(vec!["**/.env*".into(), "**/secrets/**".into()]);
 /// ```
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     /// Can read files
     pub read: bool,
@@ -37,6 +37,12 @@ pub struct AgentCapabilities {
     pub allowed_commands: Vec<String>,
     /// Denied commands (regex patterns). Takes precedence over `allowed_commands`.
     pub denied_commands: Vec<String>,
+}
+
+impl Default for AgentCapabilities {
+    fn default() -> Self {
+        Self::full_access()
+    }
 }
 
 impl AgentCapabilities {
@@ -168,6 +174,24 @@ impl AgentCapabilities {
             return Err("command execution is disabled".into());
         }
         self.check_command(command)
+    }
+
+    /// Returns `true` if reading `path` is allowed.
+    #[must_use]
+    pub fn can_read(&self, path: &str) -> bool {
+        self.check_read(path).is_ok()
+    }
+
+    /// Returns `true` if writing `path` is allowed.
+    #[must_use]
+    pub fn can_write(&self, path: &str) -> bool {
+        self.check_write(path).is_ok()
+    }
+
+    /// Returns `true` if executing `command` is allowed.
+    #[must_use]
+    pub fn can_exec(&self, command: &str) -> bool {
+        self.check_exec(command).is_ok()
     }
 
     /// Check whether a path passes the allow/deny rules, returning
@@ -489,5 +513,97 @@ mod tests {
         assert!(caps.check_read("any/path").is_ok());
         assert!(caps.check_write("any/path").is_ok());
         assert!(caps.check_exec("any command").is_ok());
+    }
+
+    /// Verify `full_access()` never blocks common shell patterns that agents
+    /// routinely emit. Each entry here was either denied in a real session
+    /// or represents a pattern class that naive deny-lists would break.
+    #[test]
+    fn full_access_allows_common_shell_patterns() {
+        let caps = AgentCapabilities::full_access();
+
+        let commands = [
+            // Heredoc with cat redirect (denied in previous session)
+            "cat > /tmp/test_caps.rs << 'EOF'\nfn main() { println!(\"hello\"); }\nEOF",
+            // Grep with pipe-separated OR patterns (denied in previous session)
+            r#"grep -n "agent_loop\|Permission\|permission\|denied\|Denied" src/agent_loop.rs"#,
+            // Multi-command chains
+            "cd /workspace && cargo build && cargo test",
+            "mkdir -p /tmp/test && cd /tmp/test && echo hello > file.txt",
+            // Pipes and redirects
+            "cargo test 2>&1 | head -50",
+            "cat file.txt | grep pattern | wc -l",
+            "echo 'data' >> /tmp/append.txt",
+            // Subshells and grouping
+            "(cd /tmp && ls -la)",
+            "{ echo a; echo b; } > /tmp/out.txt",
+            // Process substitution and special chars
+            "diff <(sort file1) <(sort file2)",
+            "find . -name '*.rs' -exec grep -l 'TODO' {} +",
+            // Common dev commands
+            "cargo clippy -- -D warnings",
+            "cargo fmt --check",
+            "git diff --stat HEAD~1",
+            "npm install && npm run build",
+            "python3 -c 'print(\"hello\")'",
+            // Commands with special regex chars that shouldn't trip up matching
+            "grep -rn 'foo(bar)' src/",
+            "echo '$HOME is ~/work'",
+            "ls *.rs",
+        ];
+
+        for cmd in &commands {
+            assert!(
+                caps.check_exec(cmd).is_ok(),
+                "full_access() unexpectedly blocked command: {cmd}"
+            );
+        }
+    }
+
+    /// Verify `full_access()` allows reading/writing any path, including
+    /// paths that a naive deny-list might block (dotfiles, tmp, etc.).
+    #[test]
+    fn full_access_allows_all_paths() {
+        let caps = AgentCapabilities::full_access();
+
+        let paths = [
+            "src/main.rs",
+            ".env",
+            ".env.local",
+            "/tmp/test_caps.rs",
+            "/home/user/.ssh/config",
+            "/workspace/secrets/api_key.txt",
+            "/workspace/certs/server.pem",
+            "Cargo.toml",
+            "node_modules/.package-lock.json",
+        ];
+
+        for path in &paths {
+            assert!(
+                caps.check_read(path).is_ok(),
+                "full_access() unexpectedly blocked read: {path}"
+            );
+            assert!(
+                caps.check_write(path).is_ok(),
+                "full_access() unexpectedly blocked write: {path}"
+            );
+        }
+    }
+
+    /// Verify `Default` is `full_access()` — the SDK is unopinionated out of the box.
+    /// Consumers restrict from there, not opt-in to each capability.
+    #[test]
+    fn default_is_full_access() {
+        let caps = AgentCapabilities::default();
+
+        // Everything allowed by default
+        assert!(caps.check_read("src/main.rs").is_ok());
+        assert!(caps.check_write("src/main.rs").is_ok());
+        assert!(caps.check_exec("ls").is_ok());
+
+        // No deny lists
+        assert!(caps.check_path(".env").is_ok());
+        assert!(caps.check_path("/home/user/.ssh/id_rsa").is_ok());
+        assert!(caps.check_command("sudo rm -rf /").is_ok());
     }
 }
