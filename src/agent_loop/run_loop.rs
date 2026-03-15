@@ -335,6 +335,7 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        cancel_token,
     }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
 ) -> Option<AgentRunState>
 where
@@ -345,6 +346,16 @@ where
     S: StateStore,
 {
     loop {
+        // Check for cancellation before starting a new turn
+        if cancel_token.is_cancelled() {
+            log::info!("Agent run cancelled before turn {}", ctx.turn);
+            return Some(AgentRunState::Cancelled {
+                total_turns: turns_to_u32(ctx.turn),
+                input_tokens: u64::from(ctx.total_usage.input_tokens),
+                output_tokens: u64::from(ctx.total_usage.output_tokens),
+            });
+        }
+
         let result = execute_turn(ExecuteTurnParameters {
             tx,
             seq,
@@ -494,6 +505,7 @@ pub(super) async fn run_loop<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        cancel_token,
     }: RunLoopParameters<Ctx, P, H, M, S>,
 ) -> AgentRunState
 where
@@ -573,6 +585,7 @@ where
         compaction_config: compaction_config.as_ref(),
         compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
+        cancel_token: &cancel_token,
     })
     .await
     {

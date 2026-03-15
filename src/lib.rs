@@ -339,6 +339,8 @@ pub use capabilities::AgentCapabilities;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
+
+// Re-export CancellationToken for use with `AgentLoop::run_with_cancel`.
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
 pub use model_capabilities::{
@@ -348,6 +350,7 @@ pub use model_capabilities::{
 pub use stores::{
     InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
 };
+pub use tokio_util::sync::CancellationToken;
 pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
     ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,

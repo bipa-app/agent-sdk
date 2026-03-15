@@ -55,6 +55,7 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId, TurnOutcome};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
 ///
@@ -244,6 +245,34 @@ where
     where
         Ctx: Clone,
     {
+        self.run_with_cancel(thread_id, input, tool_context, CancellationToken::new())
+    }
+
+    /// Run the agent loop with a cancellation token.
+    ///
+    /// When the token is cancelled, the agent will stop after the current turn
+    /// completes (i.e., no new turns will start). The final state will be
+    /// `AgentRunState::Cancelled`.
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The thread identifier for this conversation
+    /// * `input` - Either a new text message or a resume with confirmation decision
+    /// * `tool_context` - Context passed to tools
+    /// * `cancel_token` - Token to signal cancellation from outside
+    pub fn run_with_cancel(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+    ) -> (
+        mpsc::Receiver<AgentEventEnvelope>,
+        oneshot::Receiver<AgentRunState>,
+    )
+    where
+        Ctx: Clone,
+    {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = oneshot::channel();
         let seq = SequenceCounter::new();
@@ -274,6 +303,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                cancel_token,
             })
             .await;
 

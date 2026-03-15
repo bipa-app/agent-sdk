@@ -315,6 +315,13 @@ pub enum AgentRunState {
         /// Continuation state for resuming (boxed for enum size efficiency)
         continuation: Box<AgentContinuation>,
     },
+
+    /// Agent run was cancelled via a [`CancellationToken`].
+    Cancelled {
+        total_turns: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Information about a pending tool call that was extracted from the LLM response.
