@@ -55,6 +55,7 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId, TurnOutcome};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
 ///
@@ -189,11 +190,16 @@ where
     /// returning an `AgentRunState::AwaitingConfirmation` that contains the
     /// state needed to resume.
     ///
+    /// When the `cancel_token` is cancelled, the agent will stop after the
+    /// current turn completes (no new turns will start). The final state will
+    /// be `AgentRunState::Cancelled`.
+    ///
     /// # Arguments
     ///
     /// * `thread_id` - The thread identifier for this conversation
     /// * `input` - Either a new text message or a resume with confirmation decision
     /// * `tool_context` - Context passed to tools
+    /// * `cancel_token` - Token to signal cancellation from outside
     ///
     /// # Returns
     ///
@@ -204,10 +210,12 @@ where
     /// # Example
     ///
     /// ```ignore
+    /// let cancel = CancellationToken::new();
     /// let (events, final_state) = agent.run(
     ///     thread_id,
     ///     AgentInput::Text("Hello".to_string()),
     ///     tool_ctx,
+    ///     cancel.clone(),
     /// );
     ///
     /// while let Some(envelope) = events.recv().await {
@@ -216,6 +224,7 @@ where
     ///
     /// match final_state.await.unwrap() {
     ///     AgentRunState::Done { .. } => { /* completed */ }
+    ///     AgentRunState::Cancelled { .. } => { /* user cancelled */ }
     ///     AgentRunState::AwaitingConfirmation { continuation, .. } => {
     ///         // Get user decision, then resume:
     ///         let (events2, state2) = agent.run(
@@ -227,6 +236,7 @@ where
     ///                 rejection_reason: None,
     ///             },
     ///             tool_ctx,
+    ///             cancel.clone(),
     ///         );
     ///     }
     ///     AgentRunState::Error(e) => { /* handle error */ }
@@ -237,6 +247,7 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
     ) -> (
         mpsc::Receiver<AgentEventEnvelope>,
         oneshot::Receiver<AgentRunState>,
@@ -274,6 +285,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                cancel_token,
             })
             .await;
 
@@ -289,11 +301,15 @@ where
     /// to the caller. This enables external orchestration where each turn can be
     /// dispatched as a separate message (e.g., via Artemis or another message queue).
     ///
+    /// When the `cancel_token` is cancelled, the turn will be aborted before
+    /// starting execution and return `TurnOutcome::Cancelled`.
+    ///
     /// # Arguments
     ///
     /// * `thread_id` - The thread identifier for this conversation
     /// * `input` - Text to start, Resume after confirmation, or Continue after a turn
     /// * `tool_context` - Context passed to tools
+    /// * `cancel_token` - Token to signal cancellation from outside
     ///
     /// # Returns
     ///
@@ -306,16 +322,19 @@ where
     /// - `NeedsMoreTurns` - Turn completed, call again with `AgentInput::Continue`
     /// - `Done` - Agent completed successfully
     /// - `AwaitingConfirmation` - Tool needs confirmation, call again with `AgentInput::Resume`
+    /// - `Cancelled` - Turn was cancelled via the token
     /// - `Error` - An error occurred
     ///
     /// # Example
     ///
     /// ```ignore
+    /// let cancel = CancellationToken::new();
     /// // Start conversation
     /// let (events, outcome) = agent.run_turn(
     ///     thread_id.clone(),
     ///     AgentInput::Text("What is 2+2?".to_string()),
     ///     tool_ctx.clone(),
+    ///     cancel,
     /// ).await;
     ///
     /// // Process events...
@@ -343,6 +362,7 @@ where
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
     ) -> (
         mpsc::Receiver<AgentEventEnvelope>,
         oneshot::Receiver<TurnOutcome>,
@@ -380,6 +400,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                cancel_token,
             })
             .await;
 

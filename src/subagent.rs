@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for a subagent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -276,8 +277,12 @@ where
         let tool_ctx = ToolContext::new(());
 
         // Run with optional timeout
-        let (mut rx, _final_state) =
-            agent.run(thread_id, AgentInput::Text(task.to_string()), tool_ctx);
+        let (mut rx, _final_state) = agent.run(
+            thread_id,
+            AgentInput::Text(task.to_string()),
+            tool_ctx,
+            CancellationToken::new(),
+        );
 
         let mut final_response = String::new();
         let mut total_turns = 0;

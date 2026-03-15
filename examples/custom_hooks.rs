@@ -9,8 +9,8 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentHooks, AgentInput, DynamicToolName, InMemoryStore, ThreadId, Tool,
-    ToolContext, ToolDecision, ToolRegistry, ToolResult, ToolTier, builder,
+    AgentEvent, AgentHooks, AgentInput, CancellationToken, DynamicToolName, InMemoryStore,
+    ThreadId, Tool, ToolContext, ToolDecision, ToolRegistry, ToolResult, ToolTier, builder,
     providers::AnthropicProvider,
 };
 use anyhow::Result;
@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("Please send an email to test@example.com with subject 'Hello' and body 'This is a test message.'".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     println!("\n--- Agent Output ---\n");

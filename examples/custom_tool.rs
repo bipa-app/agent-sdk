@@ -14,8 +14,8 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentInput, DynamicToolName, ThreadId, Tool, ToolContext, ToolRegistry, ToolResult,
-    ToolTier, builder, providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, DynamicToolName, ThreadId, Tool, ToolContext,
+    ToolRegistry, ToolResult, ToolTier, builder, providers::AnthropicProvider,
 };
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("What is 42 + 17? Also, what time is it right now?".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     while let Some(envelope) = events.recv().await {

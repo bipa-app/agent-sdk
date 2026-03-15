@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk"
-version = "0.5.9"
+version = "0.6.0"
 edition = "2024"
 description = "Rust Agent SDK for building LLM agents"
 license = "Apache-2.0"
@@ -28,6 +28,7 @@ async-stream = "0.3"
 bytes = "1"
 log = "0.4"
 url = "2"
+tokio-util = "0.7"
 html2text = "0.14"
 base64 = "0.22"
 

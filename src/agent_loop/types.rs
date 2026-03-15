@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Internal result of executing a single turn.
 ///
@@ -148,6 +149,7 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) cancel_token: CancellationToken,
 }
 
 pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
@@ -194,6 +196,7 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) cancel_token: &'a CancellationToken,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -227,6 +230,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) cancel_token: CancellationToken,
 }
 
 /// Execute a single turn of the agent loop.

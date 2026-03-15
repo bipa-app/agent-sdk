@@ -315,6 +315,13 @@ pub enum AgentRunState {
         /// Continuation state for resuming (boxed for enum size efficiency)
         continuation: Box<AgentContinuation>,
     },
+
+    /// Agent run was cancelled via a [`CancellationToken`].
+    Cancelled {
+        total_turns: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Information about a pending tool call that was extracted from the LLM response.
@@ -592,6 +599,16 @@ pub enum TurnOutcome {
     /// Model refused the request (safety/policy).
     Refusal {
         /// Total turns executed
+        total_turns: u32,
+        /// Total input tokens consumed
+        input_tokens: u64,
+        /// Total output tokens consumed
+        output_tokens: u64,
+    },
+
+    /// The turn was cancelled via a [`CancellationToken`].
+    Cancelled {
+        /// Total turns executed before cancellation
         total_turns: u32,
         /// Total input tokens consumed
         input_tokens: u64,
