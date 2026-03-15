@@ -15,8 +15,8 @@
 //! ```
 
 use agent_sdk::{
-    AgentCapabilities, AgentConfig, AgentEvent, AgentInput, AllowAllHooks, Environment,
-    InMemoryFileSystem, InMemoryStore, ThreadId, ToolContext, ToolRegistry, builder,
+    AgentCapabilities, AgentConfig, AgentEvent, AgentInput, AllowAllHooks, CancellationToken,
+    Environment, InMemoryFileSystem, InMemoryStore, ThreadId, ToolContext, ToolRegistry, builder,
     primitive_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool},
     providers::AnthropicProvider,
 };
@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("List all .rs files in the workspace, then add a simple test to src/lib.rs that tests the greet function.".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     println!("--- Agent Working ---\n");

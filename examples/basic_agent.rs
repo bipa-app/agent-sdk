@@ -14,7 +14,8 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentInput, ThreadId, ToolContext, builder, providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, ThreadId, ToolContext, builder,
+    providers::AnthropicProvider,
 };
 
 #[tokio::main]
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("What is the capital of France? Answer in one sentence.".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     // Process events as they stream in

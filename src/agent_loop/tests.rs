@@ -82,7 +82,12 @@ async fn test_simple_text_response() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) = agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Hi".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -124,6 +129,7 @@ async fn test_tool_execution() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("Run echo".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     let mut events = Vec::new();
@@ -172,8 +178,12 @@ async fn test_max_turns_limit() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) =
-        agent.run(thread_id, AgentInput::Text("Loop".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Loop".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -208,6 +218,7 @@ async fn test_unknown_tool_handling() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("Call unknown".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     let mut events = Vec::new();
@@ -253,7 +264,12 @@ async fn test_rate_limit_handling() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) = agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Hi".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -286,7 +302,12 @@ async fn test_rate_limit_recovery() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) = agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Hi".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -325,7 +346,12 @@ async fn test_server_error_handling() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) = agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Hi".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -358,7 +384,12 @@ async fn test_server_error_recovery() -> anyhow::Result<()> {
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
-    let (mut rx, _final_state) = agent.run(thread_id, AgentInput::Text("Hi".to_string()), tool_ctx);
+    let (mut rx, _final_state) = agent.run(
+        thread_id,
+        AgentInput::Text("Hi".to_string()),
+        tool_ctx,
+        CancellationToken::new(),
+    );
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -388,6 +419,7 @@ async fn test_envelope_event_ids_are_unique() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let mut ids = std::collections::HashSet::new();
@@ -412,6 +444,7 @@ async fn test_envelope_sequences_are_strictly_increasing() -> anyhow::Result<()>
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let mut envelopes = Vec::new();
@@ -440,6 +473,7 @@ async fn test_envelope_sequences_start_at_zero() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let first = rx.recv().await.expect("should have at least one event");
@@ -463,6 +497,7 @@ async fn test_envelope_sequences_have_no_gaps() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Go".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let mut sequences = Vec::new();
@@ -488,6 +523,7 @@ async fn test_envelope_timestamps_are_non_decreasing() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let mut envelopes = Vec::new();
@@ -519,11 +555,13 @@ async fn test_separate_runs_have_independent_sequences() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let (mut rx_b, _) = agent_b.run(
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let first_a = rx_a.recv().await.expect("run A should emit events");
@@ -548,6 +586,7 @@ async fn test_envelope_event_ids_are_valid_uuid_v4() -> anyhow::Result<()> {
         ThreadId::new(),
         AgentInput::Text("Hi".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     while let Some(envelope) = rx.recv().await {
@@ -576,6 +615,7 @@ async fn test_envelope_with_tool_calls_maintains_invariants() -> anyhow::Result<
         ThreadId::new(),
         AgentInput::Text("Go".into()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     let mut envelopes = Vec::new();
@@ -633,6 +673,7 @@ async fn test_listen_tool_confirmation_flow() -> anyhow::Result<()> {
         thread_id.clone(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_1 = outcome_rx_1.await?;
 
@@ -655,13 +696,18 @@ async fn test_listen_tool_confirmation_flow() -> anyhow::Result<()> {
             rejection_reason: None,
         },
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_2 = outcome_rx_2.await?;
     assert!(matches!(outcome_2, TurnOutcome::NeedsMoreTurns { .. }));
 
     // Turn 3: continue and finish
-    let (_events_3, outcome_rx_3) =
-        agent.run_turn(thread_id, AgentInput::Continue, ToolContext::new(()));
+    let (_events_3, outcome_rx_3) = agent.run_turn(
+        thread_id,
+        AgentInput::Continue,
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
     let outcome_3 = outcome_rx_3.await?;
     assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
@@ -689,6 +735,7 @@ async fn test_listen_tool_rejection_cancels_operation() -> anyhow::Result<()> {
         thread_id.clone(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_1 = outcome_rx_1.await?;
 
@@ -710,6 +757,7 @@ async fn test_listen_tool_rejection_cancels_operation() -> anyhow::Result<()> {
             rejection_reason: Some("nope".to_string()),
         },
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let _ = outcome_rx_2.await?;
 
@@ -741,6 +789,7 @@ async fn test_listen_tool_invalidated_stream_returns_error_result() -> anyhow::R
         ThreadId::new(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let events = drain_events(rx).await;
 
@@ -787,6 +836,7 @@ async fn test_listen_tool_stream_end_before_ready_is_reported() -> anyhow::Resul
         ThreadId::new(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let events = drain_events(rx).await;
 
@@ -833,6 +883,7 @@ async fn test_listen_tool_max_updates_exceeded_is_reported() -> anyhow::Result<(
         ThreadId::new(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let events = drain_events(rx).await;
 
@@ -874,6 +925,7 @@ async fn test_listen_tool_stream_disconnect_triggers_cancel() -> anyhow::Result<
         ThreadId::new(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     drop(events_rx);
 
@@ -911,6 +963,7 @@ async fn test_listen_execute_error_after_confirmation_is_reported() -> anyhow::R
         thread_id.clone(),
         AgentInput::Text("Run listen tool".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_1 = outcome_rx_1.await?;
     let (continuation, tool_call_id) = match outcome_1 {
@@ -931,6 +984,7 @@ async fn test_listen_execute_error_after_confirmation_is_reported() -> anyhow::R
             rejection_reason: None,
         },
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_2 = outcome_rx_2.await?;
     let events_2 = drain_events(events_2).await;
@@ -971,6 +1025,7 @@ async fn test_mixed_listen_and_sync_tool_calls_in_one_turn() -> anyhow::Result<(
         thread_id.clone(),
         AgentInput::Text("Run mixed tools".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_1 = outcome_rx_1.await?;
     let (continuation, tool_call_id) = match outcome_1 {
@@ -991,6 +1046,7 @@ async fn test_mixed_listen_and_sync_tool_calls_in_one_turn() -> anyhow::Result<(
             rejection_reason: None,
         },
         ToolContext::new(()),
+        CancellationToken::new(),
     );
     let outcome_2 = outcome_rx_2.await?;
     let events_2 = drain_events(events_2).await;
@@ -1003,8 +1059,12 @@ async fn test_mixed_listen_and_sync_tool_calls_in_one_turn() -> anyhow::Result<(
         matches!(&event.event, AgentEvent::ToolCallEnd { id, .. } if id == "tool_echo")
     }));
 
-    let (_events_3, outcome_rx_3) =
-        agent.run_turn(thread_id, AgentInput::Continue, ToolContext::new(()));
+    let (_events_3, outcome_rx_3) = agent.run_turn(
+        thread_id,
+        AgentInput::Continue,
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
     let outcome_3 = outcome_rx_3.await?;
     assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
@@ -1046,6 +1106,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         thread_id.clone(),
         AgentInput::Text("Run both tools".to_string()),
         ToolContext::new(()),
+        CancellationToken::new(),
     );
 
     while rx.recv().await.is_some() {}
