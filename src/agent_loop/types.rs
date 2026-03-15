@@ -230,6 +230,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) cancel_token: CancellationToken,
 }
 
 /// Execute a single turn of the agent loop.

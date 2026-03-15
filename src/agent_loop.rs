@@ -380,6 +380,36 @@ where
     where
         Ctx: Clone,
     {
+        self.run_turn_with_cancel(thread_id, input, tool_context, CancellationToken::new())
+    }
+
+    /// Run a single turn of the agent loop with a cancellation token.
+    ///
+    /// When the token is cancelled, the turn will be aborted before starting
+    /// execution and return `TurnOutcome::Cancelled`. If the turn is already
+    /// in progress (LLM call or tool execution), it will complete the current
+    /// operation and then return `TurnOutcome::Cancelled` before starting the
+    /// next operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The thread identifier for this conversation
+    /// * `input` - Text to start, Resume after confirmation, or Continue after a turn
+    /// * `tool_context` - Context passed to tools
+    /// * `cancel_token` - Token to signal cancellation from outside
+    pub fn run_turn_with_cancel(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+    ) -> (
+        mpsc::Receiver<AgentEventEnvelope>,
+        oneshot::Receiver<TurnOutcome>,
+    )
+    where
+        Ctx: Clone,
+    {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let seq = SequenceCounter::new();
@@ -410,6 +440,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                cancel_token,
             })
             .await;
 

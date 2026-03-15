@@ -606,6 +606,16 @@ pub enum TurnOutcome {
         output_tokens: u64,
     },
 
+    /// The turn was cancelled via a [`CancellationToken`].
+    Cancelled {
+        /// Total turns executed before cancellation
+        total_turns: u32,
+        /// Total input tokens consumed
+        input_tokens: u64,
+        /// Total output tokens consumed
+        output_tokens: u64,
+    },
+
     /// An error occurred.
     Error(AgentError),
 }

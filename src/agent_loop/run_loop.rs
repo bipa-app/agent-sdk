@@ -633,6 +633,7 @@ pub(super) async fn run_single_turn<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        cancel_token,
     }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
 where
@@ -642,6 +643,16 @@ where
     M: MessageStore,
     S: StateStore,
 {
+    // Check for cancellation before starting any work
+    if cancel_token.is_cancelled() {
+        log::info!("Agent turn cancelled before execution started");
+        return TurnOutcome::Cancelled {
+            total_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+    }
+
     let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
     let start_time = Instant::now();
     let init_state =
