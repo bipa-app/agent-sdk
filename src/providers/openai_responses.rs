@@ -348,18 +348,16 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 // the call_id and name before deltas arrive.
                                 if let Some(item) = &event.item
                                     && item.r#type.as_deref() == Some("function_call")
-                                {
-                                    if let (Some(item_id), Some(call_id), Some(name)) =
+                                    && let (Some(item_id), Some(call_id), Some(name)) =
                                         (&item.id, &item.call_id, &item.name)
-                                    {
-                                        tool_calls
-                                            .entry(item_id.clone())
-                                            .or_insert_with(|| ToolCallAccumulator {
-                                                id: call_id.clone(),
-                                                name: name.clone(),
-                                                arguments: String::new(),
-                                            });
-                                    }
+                                {
+                                    tool_calls
+                                        .entry(item_id.clone())
+                                        .or_insert_with(|| ToolCallAccumulator {
+                                            id: call_id.clone(),
+                                            name: name.clone(),
+                                            arguments: String::new(),
+                                        });
                                 }
                             }
                             "response.function_call_arguments.delta" => {
@@ -685,7 +683,34 @@ fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
 
 /// Check if a JSON schema contains any object-typed properties without
 /// defined `properties` (free-form objects). These are incompatible with
-/// OpenAI strict mode.
+/// `OpenAI` strict mode.
+/// Wrap a schema in `anyOf: [{original}, {"type": "null"}]` so that
+/// the property accepts its original type OR null.
+///
+/// If the schema already has an `anyOf`, appends `{"type": "null"}` to it.
+fn make_nullable(schema: &mut serde_json::Value) {
+    // Already nullable via anyOf — append null variant if missing
+    if let Some(any_of) = schema
+        .as_object_mut()
+        .and_then(|o| o.get_mut("anyOf"))
+        .and_then(|v| v.as_array_mut())
+    {
+        let has_null = any_of
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"));
+        if !has_null {
+            any_of.push(serde_json::json!({"type": "null"}));
+        }
+        return;
+    }
+
+    // Wrap the original schema in anyOf
+    let original = schema.clone();
+    *schema = serde_json::json!({
+        "anyOf": [original, {"type": "null"}]
+    });
+}
+
 fn has_freeform_object(schema: &serde_json::Value) -> bool {
     let Some(obj) = schema.as_object() else {
         return false;
@@ -709,10 +734,10 @@ fn has_freeform_object(schema: &serde_json::Value) -> bool {
     }
 
     // Recurse into array items
-    if let Some(items) = obj.get("items") {
-        if has_freeform_object(items) {
-            return true;
-        }
+    if let Some(items) = obj.get("items")
+        && has_freeform_object(items)
+    {
+        return true;
     }
 
     // Recurse into anyOf/oneOf/allOf
@@ -1037,7 +1062,7 @@ struct ApiStreamEvent {
     r#type: String,
     #[serde(default)]
     delta: Option<String>,
-    /// Present on `output_item.added` / `output_item.done` for function_call items.
+    /// Present on `output_item.added` / `output_item.done` for `function_call` items.
     #[serde(default)]
     item: Option<ApiStreamItem>,
     /// Present on `function_call_arguments.delta`.
@@ -1058,7 +1083,7 @@ impl ApiStreamEvent {
         self.item_id
             .as_deref()
             .or(self.call_id.as_deref())
-            .or(self.item.as_ref().and_then(|i| i.id.as_deref()))
+            .or_else(|| self.item.as_ref().and_then(|i| i.id.as_deref()))
     }
 }
 
