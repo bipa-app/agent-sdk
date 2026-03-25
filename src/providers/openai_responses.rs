@@ -292,7 +292,14 @@ impl LlmProvider for OpenAIResponsesProvider {
                     buffer = buffer[pos + 1..].to_string();
                     if line.is_empty() { continue; }
 
-                    let Some(data) = line.strip_prefix("data: ") else { continue; };
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        log::trace!("Responses SSE non-data line: {line}");
+                        continue;
+                    };
+                    if log::log_enabled!(log::Level::Trace) {
+                        let truncated: String = data.chars().take(200).collect();
+                        log::trace!("Responses SSE data: {truncated}");
+                    }
 
                     if data == "[DONE]" {
                         // Emit any accumulated tool calls
@@ -324,25 +331,62 @@ impl LlmProvider for OpenAIResponsesProvider {
                     }
 
                     // Parse streaming event
-                    if let Ok(event) = serde_json::from_str::<ApiStreamEvent>(data) {
+                    let parse_result = serde_json::from_str::<ApiStreamEvent>(data);
+                    if parse_result.is_err() {
+                        log::debug!("Failed to parse Responses SSE event: {data}");
+                    }
+                    if let Ok(event) = parse_result {
                         match event.r#type.as_str() {
+                            // ── Content deltas ──────────────────────────
                             "response.output_text.delta" => {
                                 if let Some(delta) = event.delta {
                                     yield Ok(StreamDelta::TextDelta { delta, block_index: 0 });
                                 }
                             }
+                            "response.output_item.added" => {
+                                // Register function_call items so we know
+                                // the call_id and name before deltas arrive.
+                                if let Some(item) = &event.item
+                                    && item.r#type.as_deref() == Some("function_call")
+                                {
+                                    if let (Some(item_id), Some(call_id), Some(name)) =
+                                        (&item.id, &item.call_id, &item.name)
+                                    {
+                                        tool_calls
+                                            .entry(item_id.clone())
+                                            .or_insert_with(|| ToolCallAccumulator {
+                                                id: call_id.clone(),
+                                                name: name.clone(),
+                                                arguments: String::new(),
+                                            });
+                                    }
+                                }
+                            }
                             "response.function_call_arguments.delta" => {
-                                if let (Some(call_id), Some(delta)) = (event.call_id, event.delta) {
-                                    let acc = tool_calls.entry(call_id.clone()).or_insert_with(|| {
-                                        ToolCallAccumulator {
-                                            id: call_id,
-                                            name: event.name.unwrap_or_default(),
-                                            arguments: String::new(),
-                                        }
-                                    });
+                                if let (Some(item_id), Some(delta)) =
+                                    (event.resolve_item_id().map(str::to_owned), event.delta)
+                                {
+                                    let acc =
+                                        tool_calls.entry(item_id.clone()).or_insert_with(|| {
+                                            ToolCallAccumulator {
+                                                id: item_id,
+                                                name: event.name.unwrap_or_default(),
+                                                arguments: String::new(),
+                                            }
+                                        });
                                     acc.arguments.push_str(&delta);
                                 }
                             }
+                            // ── Reasoning (thinking) deltas ─────────────
+                            "response.reasoning.delta" => {
+                                if let Some(delta) = event.delta {
+                                    yield Ok(StreamDelta::ThinkingDelta {
+                                        delta,
+                                        block_index: 0,
+                                    });
+                                }
+                            }
+                            // ── Completion / usage ──────────────────────
                             "response.completed" => {
                                 if let Some(resp) = event.response
                                     && let Some(u) = resp.usage
@@ -357,17 +401,66 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     });
                                 }
                             }
-                            _ => {}
+                            // ── Error ───────────────────────────────────
+                            "error" | "response.failed" => {
+                                let is_server_error = data.contains("server_error");
+                                let recoverable = is_server_error;
+                                if recoverable {
+                                    log::warn!("Responses API server error (recoverable): {data}");
+                                } else {
+                                    log::error!("Responses API error event: {data}");
+                                }
+                                yield Ok(StreamDelta::Error {
+                                    message: data.to_owned(),
+                                    recoverable,
+                                });
+                                return;
+                            }
+                            // ── Lifecycle events (no content) ───────────
+                            "response.created"
+                            | "response.in_progress"
+                            | "response.output_item.done"
+                            | "response.content_part.added"
+                            | "response.content_part.done"
+                            | "response.output_text.done"
+                            | "response.function_call_arguments.done"
+                            | "response.reasoning.done"
+                            | "response.reasoning_summary_text.delta"
+                            | "response.reasoning_summary_text.done" => {}
+                            // ── Unknown ─────────────────────────────────
+                            other => {
+                                log::debug!("Unhandled Responses SSE event type: {other}");
+                            }
                         }
                     }
                 }
             }
 
-            // Stream ended without [DONE]
+            // Stream ended without [DONE] — flush accumulated tool calls
+            for acc in tool_calls.values() {
+                yield Ok(StreamDelta::ToolUseStart {
+                    id: acc.id.clone(),
+                    name: acc.name.clone(),
+                    block_index: 1,
+                    thought_signature: None,
+                });
+                yield Ok(StreamDelta::ToolInputDelta {
+                    id: acc.id.clone(),
+                    delta: acc.arguments.clone(),
+                    block_index: 1,
+                });
+            }
+
             if let Some(u) = usage {
                 yield Ok(StreamDelta::Usage(u));
             }
-            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn) });
+
+            let stop_reason = if tool_calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolUse
+            };
+            yield Ok(StreamDelta::Done { stop_reason: Some(stop_reason) });
         })
     }
 
@@ -417,7 +510,15 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            content_parts.push(ApiInputContent::Text { text: text.clone() });
+                            let part = match msg.role {
+                                crate::llm::Role::Assistant => {
+                                    ApiInputContent::OutputText { text: text.clone() }
+                                }
+                                crate::llm::Role::User => {
+                                    ApiInputContent::InputText { text: text.clone() }
+                                }
+                            };
+                            content_parts.push(part);
                         }
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Image { source } => {
@@ -493,6 +594,32 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
             serde_json::Value::Bool(false),
         );
 
+        // Ensure properties and required exist (strict mode needs them even if empty)
+        obj.entry("properties".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        obj.entry("required".to_owned())
+            .or_insert_with(|| serde_json::json!([]));
+
+        // Collect the set of originally required keys
+        let originally_required: std::collections::HashSet<String> = obj
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Wrap previously-optional properties in anyOf with null
+        if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
+            for (key, prop_schema) in props.iter_mut() {
+                if !originally_required.contains(key) {
+                    make_nullable(prop_schema);
+                }
+            }
+        }
+
         // Ensure all properties are marked as required
         if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
             let all_keys: Vec<serde_json::Value> = props
@@ -530,20 +657,76 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
 }
 
 fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
-    // The Responses API with strict: true requires:
-    // 1. additionalProperties: false on all object schemas
-    // 2. All properties must be in the required array
-    // These requirements apply recursively to nested schemas
     let mut schema = tool.input_schema;
-    fix_schema_for_strict_mode(&mut schema);
+
+    // Strict mode requires additionalProperties: false on all objects and
+    // every property in required. This is incompatible with free-form object
+    // schemas (objects with no defined properties). Detect and skip strict
+    // for those tools.
+    let use_strict = if has_freeform_object(&schema) {
+        log::debug!(
+            "Tool '{}' has free-form object schema — disabling strict mode",
+            tool.name
+        );
+        None
+    } else {
+        fix_schema_for_strict_mode(&mut schema);
+        Some(true)
+    };
 
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
         parameters: Some(schema),
-        strict: Some(true),
+        strict: use_strict,
     }
+}
+
+/// Check if a JSON schema contains any object-typed properties without
+/// defined `properties` (free-form objects). These are incompatible with
+/// OpenAI strict mode.
+fn has_freeform_object(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+
+    let is_object = obj
+        .get("type")
+        .is_some_and(|t| t.as_str() == Some("object"));
+
+    if is_object && !obj.contains_key("properties") {
+        return true;
+    }
+
+    // Recurse into properties
+    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
+        for prop in props.values() {
+            if has_freeform_object(prop) {
+                return true;
+            }
+        }
+    }
+
+    // Recurse into array items
+    if let Some(items) = obj.get("items") {
+        if has_freeform_object(items) {
+            return true;
+        }
+    }
+
+    // Recurse into anyOf/oneOf/allOf
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if has_freeform_object(item) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn suggested_filename(media_type: &str) -> String {
@@ -720,10 +903,15 @@ enum ApiMessageContent {
 }
 
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 enum ApiInputContent {
-    Text { text: String },
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
     Image { image_url: String },
+    #[serde(rename = "input_file")]
     File { filename: String, file_data: String },
 }
 
@@ -849,12 +1037,41 @@ struct ApiStreamEvent {
     r#type: String,
     #[serde(default)]
     delta: Option<String>,
+    /// Present on `output_item.added` / `output_item.done` for function_call items.
+    #[serde(default)]
+    item: Option<ApiStreamItem>,
+    /// Present on `function_call_arguments.delta`.
+    #[serde(default)]
+    item_id: Option<String>,
+    /// Legacy field — some older events use `call_id` instead of `item_id`.
     #[serde(default)]
     call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     response: Option<ApiStreamResponse>,
+}
+
+impl ApiStreamEvent {
+    /// Resolve the item identifier from whichever field is present.
+    fn resolve_item_id(&self) -> Option<&str> {
+        self.item_id
+            .as_deref()
+            .or(self.call_id.as_deref())
+            .or(self.item.as_ref().and_then(|i| i.id.as_deref()))
+    }
+}
+
+#[derive(Deserialize)]
+struct ApiStreamItem {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]

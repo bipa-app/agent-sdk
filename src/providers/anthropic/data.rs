@@ -75,10 +75,12 @@ pub enum ApiThinkingConfig {
         #[serde(rename = "type")]
         config_type: &'static str,
         budget_tokens: u32,
+        display: &'static str,
     },
     Adaptive {
         #[serde(rename = "type")]
         config_type: &'static str,
+        display: &'static str,
     },
 }
 
@@ -88,9 +90,11 @@ impl ApiThinkingConfig {
             crate::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
                 config_type: "enabled",
                 budget_tokens: *budget_tokens,
+                display: "omitted",
             },
             crate::llm::ThinkingMode::Adaptive => Self::Adaptive {
                 config_type: "adaptive",
+                display: "omitted",
             },
         }
     }
@@ -107,6 +111,8 @@ pub struct ApiTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<ApiCacheControl>,
 }
 
 #[derive(Serialize)]
@@ -469,13 +475,20 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
 /// Build API tools from the chat request.
 pub fn build_api_tools(request: &ChatRequest) -> Option<Vec<ApiTool>> {
     request.tools.clone().map(|ts| {
-        ts.into_iter()
+        let mut tools: Vec<ApiTool> = ts
+            .into_iter()
             .map(|t| ApiTool {
                 name: t.name,
                 description: t.description,
                 input_schema: t.input_schema,
+                cache_control: None,
             })
-            .collect()
+            .collect();
+        // Mark the last tool with cache_control so the entire tool list is cached.
+        if let Some(last) = tools.last_mut() {
+            last.cache_control = Some(ApiCacheControl::ephemeral());
+        }
+        tools
     })
 }
 
@@ -888,6 +901,7 @@ mod tests {
                     "arg": {"type": "string"}
                 }
             }),
+            cache_control: None,
         };
 
         let json = serde_json::to_string(&tool).unwrap();

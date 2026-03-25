@@ -116,12 +116,29 @@ pub struct ApiThinkingConfig {
 }
 
 /// Map an agent-sdk `ThinkingConfig` to the Gemini API thinking level.
+///
+/// Gemini 3 models use `thinkingLevel` with values:
+/// - `MINIMAL`: near-zero thinking (Flash/Flash-Lite only, not Pro)
+/// - `LOW`: minimal latency and cost
+/// - `MEDIUM`: balanced
+/// - `HIGH`: maximum reasoning depth (default, dynamic)
 pub const fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingConfig {
-    use crate::llm::ThinkingMode;
+    use crate::llm::{Effort, ThinkingMode};
+    // If an explicit effort is set, use it directly
+    if let Some(effort) = config.effort {
+        let level = match effort {
+            Effort::Low => "LOW",
+            Effort::Medium => "MEDIUM",
+            Effort::High | Effort::Max => "HIGH",
+        };
+        return ApiThinkingConfig {
+            thinking_level: level,
+        };
+    }
     let level = match &config.mode {
-        // Adaptive → let the model decide (HIGH gives it the most room)
+        // Adaptive → let the model decide (HIGH = dynamic)
         ThinkingMode::Adaptive => "HIGH",
-        // Explicit budget: map to LOW / MEDIUM / HIGH based on token budget
+        // Explicit budget: map to LOW / MEDIUM / HIGH
         ThinkingMode::Enabled { budget_tokens } => {
             if *budget_tokens <= 4_096 {
                 "LOW"
