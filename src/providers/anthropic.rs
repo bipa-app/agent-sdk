@@ -93,11 +93,14 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    base_url: String,
     auth_mode: AuthMode,
     /// Original tool names for reverse mapping in OAuth mode (reserved for future use).
     #[allow(dead_code)]
     original_tool_names: Vec<String>,
     thinking: Option<ThinkingConfig>,
+    /// Extra headers applied to every request (e.g. for gateway authentication).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl AnthropicProvider {
@@ -127,9 +130,11 @@ impl AnthropicProvider {
             client,
             api_key,
             model,
+            base_url: API_BASE_URL.to_owned(),
             auth_mode,
             original_tool_names: Vec::new(),
             thinking: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -140,21 +145,32 @@ impl AnthropicProvider {
     }
 
     /// Applies authentication headers to a request builder.
+    ///
+    /// When `api_key` is empty the provider-specific credential header is
+    /// skipped — useful for BYOK gateways where auth is handled externally
+    /// via `extra_headers`.
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.auth_mode {
-            AuthMode::ApiKey => builder
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", API_VERSION),
-            AuthMode::OAuth => builder
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("anthropic-version", API_VERSION)
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
-                )
-                .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
-                .header("x-app", "cli"),
-        }
+        let builder = if self.api_key.is_empty() {
+            builder.header("anthropic-version", API_VERSION)
+        } else {
+            match self.auth_mode {
+                AuthMode::ApiKey => builder
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", API_VERSION),
+                AuthMode::OAuth => builder
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("anthropic-version", API_VERSION)
+                    .header(
+                        "anthropic-beta",
+                        "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+                    )
+                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                    .header("x-app", "cli"),
+            }
+        };
+        self.extra_headers
+            .iter()
+            .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 
     /// Wraps the system prompt for OAuth mode (prepends Claude Code identity).
@@ -231,6 +247,20 @@ impl AnthropicProvider {
         self
     }
 
+    /// Override the base URL (default: `https://api.anthropic.com`).
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    /// Add extra HTTP headers applied to every request.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
     fn requires_adaptive_thinking(&self) -> bool {
         matches!(self.model.as_str(), MODEL_SONNET_46 | MODEL_OPUS_46)
     }
@@ -302,7 +332,7 @@ impl LlmProvider for AnthropicProvider {
 
         let builder = self
             .client
-            .post(format!("{API_BASE_URL}/v1/messages"))
+            .post(format!("{}/v1/messages", self.base_url))
             .header("Content-Type", "application/json");
         let response = self
             .apply_auth(builder)
@@ -461,7 +491,7 @@ impl LlmProvider for AnthropicProvider {
 
             let builder = self
                 .client
-                .post(format!("{API_BASE_URL}/v1/messages"))
+                .post(format!("{}/v1/messages", self.base_url))
                 .header("Content-Type", "application/json");
             let response = match self
                 .apply_auth(builder)

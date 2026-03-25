@@ -106,6 +106,8 @@ pub struct OpenAIProvider {
     model: String,
     base_url: String,
     thinking: Option<ThinkingConfig>,
+    /// Extra headers applied to every request (e.g. for gateway authentication).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAIProvider {
@@ -118,6 +120,7 @@ impl OpenAIProvider {
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -130,6 +133,7 @@ impl OpenAIProvider {
             model,
             base_url,
             thinking: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -289,6 +293,26 @@ impl OpenAIProvider {
         self.thinking = Some(thinking);
         self
     }
+
+    /// Add extra HTTP headers applied to every request.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Apply auth + extra headers. Skips `Authorization` when `api_key` is
+    /// empty (BYOK gateway mode — auth handled via `extra_headers`).
+    fn apply_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.header("Authorization", format!("Bearer {}", self.api_key))
+        };
+        self.extra_headers
+            .iter()
+            .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
+    }
 }
 
 #[async_trait]
@@ -335,11 +359,12 @@ impl LlmProvider for OpenAIProvider {
             request.max_tokens
         );
 
-        let response = self
+        let builder = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_headers(builder)
             .json(&api_request)
             .send()
             .await
@@ -460,10 +485,11 @@ impl LlmProvider for OpenAIProvider {
 
             log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let Ok(response) = self.client
+            let stream_builder = self.client
                 .post(format!("{}/chat/completions", self.base_url))
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json");
+            let Ok(response) = self
+                .apply_headers(stream_builder)
                 .json(&api_request)
                 .send()
                 .await

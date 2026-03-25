@@ -44,7 +44,13 @@ pub struct GeminiProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    base_url: String,
     thinking: Option<ThinkingConfig>,
+    /// When true, send the API key via `x-goog-api-key` header instead of a
+    /// query parameter. Required when routing through proxies.
+    use_header_auth: bool,
+    /// Extra headers applied to every request (e.g. for gateway authentication).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl GeminiProvider {
@@ -55,7 +61,10 @@ impl GeminiProvider {
             client: reqwest::Client::new(),
             api_key,
             model,
+            base_url: API_BASE_URL.to_owned(),
             thinking: None,
+            use_header_auth: false,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -94,6 +103,43 @@ impl GeminiProvider {
     pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
+    }
+
+    /// Override the base URL.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    /// Send the API key via `x-goog-api-key` header instead of `?key=` query
+    /// parameter. Required when routing through proxies.
+    #[must_use]
+    pub const fn with_header_auth(mut self) -> Self {
+        self.use_header_auth = true;
+        self
+    }
+
+    /// Add extra HTTP headers applied to every request.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Apply auth + extra headers. Skips provider auth when `api_key` is
+    /// empty (BYOK gateway mode).
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else if self.use_header_auth {
+            builder.header("x-goog-api-key", &self.api_key)
+        } else {
+            builder.query(&[("key", &self.api_key)])
+        };
+        self.extra_headers
+            .iter()
+            .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 }
 
@@ -141,14 +187,15 @@ impl LlmProvider for GeminiProvider {
             request.max_tokens
         );
 
-        let response = self
+        let builder = self
             .client
             .post(format!(
-                "{API_BASE_URL}/models/{}:generateContent",
-                self.model
+                "{}/models/{}:generateContent",
+                self.base_url, self.model
             ))
-            .header("Content-Type", "application/json")
-            .query(&[("key", &self.api_key)])
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_auth(builder)
             .json(&api_request)
             .send()
             .await
@@ -279,14 +326,16 @@ impl LlmProvider for GeminiProvider {
                 request.max_tokens
             );
 
-            let Ok(response) = self
+            let stream_builder = self
                 .client
                 .post(format!(
-                    "{API_BASE_URL}/models/{}:streamGenerateContent",
-                    self.model
+                    "{}/models/{}:streamGenerateContent",
+                    self.base_url, self.model
                 ))
                 .header("Content-Type", "application/json")
-                .query(&[("key", &self.api_key), ("alt", &"sse".to_string())])
+                .query(&[("alt", "sse")]);
+            let Ok(response) = self
+                .apply_auth(stream_builder)
                 .json(&api_request)
                 .send()
                 .await
