@@ -25,6 +25,12 @@ impl TokenEstimator {
     /// Overhead for tool result blocks (id, formatting).
     const TOOL_RESULT_OVERHEAD: usize = 10;
 
+    /// Minimum token estimate for redacted thinking blocks.
+    ///
+    /// Even small redacted thinking blocks carry significant API token cost
+    /// because they contain encrypted reasoning that the model must process.
+    const REDACTED_THINKING_MIN_TOKENS: usize = 512;
+
     /// Estimate tokens for a text string.
     #[must_use]
     pub const fn estimate_text(text: &str) -> usize {
@@ -49,7 +55,20 @@ impl TokenEstimator {
         match block {
             ContentBlock::Text { text } => Self::estimate_text(text),
             ContentBlock::Thinking { thinking, .. } => Self::estimate_text(thinking),
-            ContentBlock::RedactedThinking { .. } => 10, // Fixed overhead for opaque block
+            ContentBlock::RedactedThinking { data } => {
+                // The data field is a base64-encoded encrypted blob whose size
+                // correlates with the original thinking content.  Base64 encodes
+                // 3 bytes into 4 chars, so `data.len() * 3 / 4` approximates
+                // the raw byte count.  Using the same chars-per-token heuristic
+                // on the raw bytes gives a reasonable lower bound.
+                //
+                // A floor of REDACTED_THINKING_MIN_TOKENS prevents tiny blocks
+                // from being under-counted — the API charges substantial token
+                // overhead for every redacted thinking block regardless of size.
+                let raw_bytes = data.len() * 3 / 4;
+                let estimated = raw_bytes.div_ceil(Self::CHARS_PER_TOKEN);
+                estimated.max(Self::REDACTED_THINKING_MIN_TOKENS)
+            }
             ContentBlock::ToolUse { name, input, .. } => {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
                 Self::estimate_text(name)
@@ -166,5 +185,57 @@ mod tests {
     fn test_empty_history() {
         let messages: Vec<Message> = vec![];
         assert_eq!(TokenEstimator::estimate_history(&messages), 0);
+    }
+
+    #[test]
+    fn test_estimate_redacted_thinking_uses_data_length() {
+        // Simulate a realistic redacted thinking blob (~8KB base64 data).
+        // 8192 base64 chars → ~6144 raw bytes → 6144/4 = 1536 estimated tokens.
+        let data = "A".repeat(8192);
+        let block = ContentBlock::RedactedThinking { data };
+
+        let estimate = TokenEstimator::estimate_block(&block);
+        assert_eq!(estimate, 1536);
+    }
+
+    #[test]
+    fn test_estimate_redacted_thinking_respects_minimum() {
+        // Tiny data blob: 100 base64 chars → ~75 raw bytes → 75/4 = 19 tokens.
+        // Should be clamped to the minimum (512).
+        let data = "A".repeat(100);
+        let block = ContentBlock::RedactedThinking { data };
+
+        let estimate = TokenEstimator::estimate_block(&block);
+        assert_eq!(estimate, TokenEstimator::REDACTED_THINKING_MIN_TOKENS);
+    }
+
+    #[test]
+    fn test_estimate_redacted_thinking_empty_data() {
+        // Empty data should return the minimum floor.
+        let block = ContentBlock::RedactedThinking {
+            data: String::new(),
+        };
+
+        let estimate = TokenEstimator::estimate_block(&block);
+        assert_eq!(estimate, TokenEstimator::REDACTED_THINKING_MIN_TOKENS);
+    }
+
+    #[test]
+    fn test_redacted_thinking_accumulates_in_history() {
+        // 5 redacted thinking blocks at ~2000 tokens each should produce a
+        // meaningful total that triggers compaction.
+        let blocks: Vec<ContentBlock> = (0..5)
+            .map(|_| ContentBlock::RedactedThinking {
+                data: "B".repeat(10_000), // 10k base64 → 7500 raw → 1875 tokens
+            })
+            .collect();
+        let message = Message {
+            role: Role::Assistant,
+            content: Content::Blocks(blocks),
+        };
+
+        let estimate = TokenEstimator::estimate_message(&message);
+        // 5 × 1875 + 4 message overhead = 9379
+        assert_eq!(estimate, 9379);
     }
 }
