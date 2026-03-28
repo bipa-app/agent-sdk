@@ -37,15 +37,14 @@ pub(super) fn calculate_backoff_delay(attempt: u32, config: &RetryConfig) -> Dur
         .base_delay_ms
         .saturating_mul(1u64 << (attempt.saturating_sub(1)));
 
-    // Add jitter (0-1000ms or 10% of base, whichever is smaller) to avoid thundering herd
+    // Add jitter (0-1000ms or 10% of base, whichever is smaller) to avoid thundering herd.
+    // Uses RandomState for per-process randomness instead of system clock.
     let max_jitter = config.base_delay_ms.min(1000);
     let jitter = if max_jitter > 0 {
-        u64::from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos(),
-        ) % max_jitter
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let h = RandomState::new().build_hasher().finish();
+        h % max_jitter
     } else {
         0
     };
