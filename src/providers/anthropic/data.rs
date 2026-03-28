@@ -715,6 +715,7 @@ pub fn parse_sse_event(
     output_tokens: &mut u32,
     cached_input_tokens: &mut u32,
     tool_ids: &mut std::collections::HashMap<usize, String>,
+    pending_stop_reason: &mut Option<StopReason>,
 ) -> Option<StreamDelta> {
     let (event_type, data) = parse_sse_fields(event_block);
     let event_type = event_type?;
@@ -795,9 +796,11 @@ pub fn parse_sse_event(
             match serde_json::from_str::<SseMessageDelta>(&data) {
                 Ok(event) => {
                     *output_tokens = event.usage.output_tokens;
-                    let stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
-                    // Emit final events
-                    Some(StreamDelta::Done { stop_reason })
+                    // Store the stop reason for emission in message_stop,
+                    // ensuring Usage is emitted before Done.
+                    *pending_stop_reason =
+                        event.delta.stop_reason.as_ref().map(map_stop_reason);
+                    None
                 }
                 Err(error) => {
                     log_sse_parse_error(&event_type, &data, &error);
@@ -806,7 +809,9 @@ pub fn parse_sse_event(
             }
         }
         "message_stop" => {
-            // Final event - emit usage
+            // Emit Usage — the caller is responsible for emitting Done
+            // with the pending_stop_reason afterwards, ensuring consumers
+            // always receive token counts before the stream ends.
             Some(StreamDelta::Usage(Usage {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
@@ -1174,12 +1179,14 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(matches!(
@@ -1197,12 +1204,14 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(matches!(
@@ -1225,6 +1234,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
         // Pre-populate tool_ids as if we received the tool_use_start event
         let mut tool_ids = std::collections::HashMap::new();
         tool_ids.insert(1, "toolu_123".to_string());
+        let mut pending_stop_reason = None;
 
         let delta = parse_sse_event(
             event,
@@ -1232,6 +1242,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         // Verify the tool ID is correctly looked up
@@ -1251,12 +1262,14 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(delta.is_none());
@@ -1272,21 +1285,21 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
-        assert!(matches!(
-            delta,
-            Some(StreamDelta::Done {
-                stop_reason: Some(StopReason::EndTurn)
-            })
-        ));
+        // message_delta no longer emits Done directly; it stores the stop
+        // reason for the caller to emit after Usage in message_stop.
+        assert!(delta.is_none());
         assert_eq!(output_tokens, 42);
+        assert!(matches!(pending_stop_reason, Some(StopReason::EndTurn)));
     }
 
     #[test]
@@ -1298,12 +1311,14 @@ data: {"type":"message_stop"}"#;
         let mut output_tokens = 50;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(matches!(
@@ -1335,12 +1350,14 @@ data: {"type":"message_stop"}"#;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(matches!(
@@ -1398,12 +1415,14 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
+        let mut pending_stop_reason = None;
         let delta = parse_sse_event(
             event,
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
             &mut tool_ids,
+            &mut pending_stop_reason,
         );
 
         assert!(matches!(

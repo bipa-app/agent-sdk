@@ -582,6 +582,7 @@ impl LlmProvider for AnthropicProvider {
                 std::collections::HashMap::new();
 
             let mut received_message_stop = false;
+            let mut pending_stop_reason: Option<crate::llm::StopReason> = None;
             let mut chunk_count: u64 = 0;
             let mut total_bytes: u64 = 0;
 
@@ -644,6 +645,7 @@ impl LlmProvider for AnthropicProvider {
                         &mut output_tokens,
                         &mut cached_input_tokens,
                         &mut tool_ids,
+                        &mut pending_stop_reason,
                     ) {
                         // Reverse-map tool names from Claude Code casing
                         if is_oauth
@@ -652,6 +654,12 @@ impl LlmProvider for AnthropicProvider {
                             *name = from_claude_code_name(name, &original_tool_names);
                         }
                         yield Ok(delta);
+                    }
+                    // After message_stop (which emits Usage), emit Done
+                    if is_message_stop_event(&event_block) {
+                        yield Ok(StreamDelta::Done {
+                            stop_reason: pending_stop_reason.take(),
+                        });
                     }
                 }
             }
@@ -681,6 +689,7 @@ impl LlmProvider for AnthropicProvider {
                     &mut output_tokens,
                     &mut cached_input_tokens,
                     &mut tool_ids,
+                    &mut pending_stop_reason,
                 ) {
                     if is_oauth
                         && let StreamDelta::ToolUseStart { ref mut name, .. } = delta
@@ -688,6 +697,12 @@ impl LlmProvider for AnthropicProvider {
                         *name = from_claude_code_name(name, &original_tool_names);
                     }
                     yield Ok(delta);
+                }
+                // After message_stop (which emits Usage), emit Done
+                if is_message_stop_event(remaining) {
+                    yield Ok(StreamDelta::Done {
+                        stop_reason: pending_stop_reason.take(),
+                    });
                 }
             }
 

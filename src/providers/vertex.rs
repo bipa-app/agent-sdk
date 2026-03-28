@@ -699,6 +699,7 @@ impl VertexProvider {
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
+            let mut pending_stop_reason: Option<crate::llm::StopReason> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 let Ok(chunk) = chunk_result else {
@@ -720,8 +721,14 @@ impl VertexProvider {
                         &mut output_tokens,
                         &mut cached_input_tokens,
                         &mut tool_ids,
+                        &mut pending_stop_reason,
                     ) {
                         yield Ok(delta);
+                    }
+                    if anthropic_data::is_message_stop_event(&event_block) {
+                        yield Ok(StreamDelta::Done {
+                            stop_reason: pending_stop_reason.take(),
+                        });
                     }
                 }
             }
@@ -739,8 +746,14 @@ impl VertexProvider {
                     &mut output_tokens,
                     &mut cached_input_tokens,
                     &mut tool_ids,
+                    &mut pending_stop_reason,
                 ) {
                     yield Ok(delta);
+                }
+                if anthropic_data::is_message_stop_event(remaining) {
+                    yield Ok(StreamDelta::Done {
+                        stop_reason: pending_stop_reason.take(),
+                    });
                 }
             }
 
