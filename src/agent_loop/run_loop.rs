@@ -10,7 +10,7 @@ use super::types::{
 
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
-use crate::llm::{LlmProvider, Message};
+use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
 use crate::stores::{MessageStore, StateStore};
 use crate::types::{
     AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ThreadId, TokenUsage,
@@ -47,6 +47,9 @@ where
                     return Err(AgentError::new(format!("Failed to load state: {e}"), false));
                 }
             };
+
+            // Recover from orphaned tool_use blocks (crash between persist and execution)
+            recover_orphaned_tool_use(thread_id, message_store).await?;
 
             // Add user message to history
             let user_msg = Message::user(&user_message);
@@ -131,6 +134,9 @@ where
                     return Err(AgentError::new(format!("Failed to load state: {e}"), false));
                 }
             };
+
+            // Recover from orphaned tool_use blocks (crash between persist and execution)
+            recover_orphaned_tool_use(thread_id, message_store).await?;
 
             // Continue from where we left off
             Ok(InitializedState {
@@ -499,6 +505,88 @@ where
     }
 }
 
+/// Checks if the last message in the history is an assistant message with
+/// `ToolUse` content blocks but no subsequent user message containing
+/// `ToolResult` blocks. This indicates a crash between persisting the
+/// assistant response and executing tools.
+fn has_orphaned_tool_use(messages: &[Message]) -> bool {
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    if last.role != Role::Assistant {
+        return false;
+    }
+    let Content::Blocks(blocks) = &last.content else {
+        return false;
+    };
+    blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+}
+
+/// Synthesizes error `ToolResult` blocks for every `ToolUse` in the last
+/// assistant message, allowing the conversation to continue after a crash.
+fn synthesize_error_tool_results(messages: &[Message]) -> Option<Message> {
+    let last = messages.last()?;
+    let Content::Blocks(blocks) = &last.content else {
+        return None;
+    };
+
+    let result_blocks: Vec<ContentBlock> = blocks
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::ToolUse { id, .. } = b {
+                Some(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "Tool execution was interrupted by a crash. Please retry."
+                        .to_string(),
+                    is_error: Some(true),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if result_blocks.is_empty() {
+        return None;
+    }
+
+    Some(Message {
+        role: Role::User,
+        content: Content::Blocks(result_blocks),
+    })
+}
+
+/// Recovers from orphaned tool_use messages by appending synthetic error
+/// tool_result blocks so the conversation can continue.
+async fn recover_orphaned_tool_use<M>(
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+) -> Result<(), AgentError>
+where
+    M: MessageStore,
+{
+    let history = message_store
+        .get_history(thread_id)
+        .await
+        .map_err(|e| AgentError::new(format!("Failed to get history for recovery: {e}"), false))?;
+
+    if has_orphaned_tool_use(&history) {
+        warn!("Detected orphaned tool_use blocks — synthesizing error results for crash recovery");
+        if let Some(recovery_msg) = synthesize_error_tool_results(&history) {
+            message_store
+                .append(thread_id, recovery_msg)
+                .await
+                .map_err(|e| {
+                    AgentError::new(
+                        format!("Failed to append recovery tool results: {e}"),
+                        false,
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn run_loop<Ctx, P, H, M, S>(
     RunLoopParameters {
         tx,
@@ -793,5 +881,82 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             continuation,
         },
         InternalTurnResult::Error(e) => TurnOutcome::Error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_orphaned_tool_use_empty_history() {
+        assert!(!has_orphaned_tool_use(&[]));
+    }
+
+    #[test]
+    fn test_has_orphaned_tool_use_user_last() {
+        let messages = vec![Message::user("hello")];
+        assert!(!has_orphaned_tool_use(&messages));
+    }
+
+    #[test]
+    fn test_has_orphaned_tool_use_assistant_text_only() {
+        let messages = vec![Message::assistant("Sure, I can help.")];
+        assert!(!has_orphaned_tool_use(&messages));
+    }
+
+    #[test]
+    fn test_has_orphaned_tool_use_assistant_with_tool_use() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![ContentBlock::ToolUse {
+                id: "tool_1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "/test"}),
+                thought_signature: None,
+            }]),
+        }];
+        assert!(has_orphaned_tool_use(&messages));
+    }
+
+    #[test]
+    fn test_synthesize_error_tool_results() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![
+                ContentBlock::Text {
+                    text: "Let me read that.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/test"}),
+                    thought_signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_2".to_string(),
+                    name: "grep".to_string(),
+                    input: serde_json::json!({"pattern": "foo"}),
+                    thought_signature: None,
+                },
+            ]),
+        }];
+
+        let recovery = synthesize_error_tool_results(&messages);
+        assert!(recovery.is_some());
+
+        let msg = recovery.unwrap();
+        assert_eq!(msg.role, Role::User);
+
+        let Content::Blocks(blocks) = &msg.content else {
+            panic!("Expected Blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        for block in blocks {
+            let ContentBlock::ToolResult { is_error, .. } = block else {
+                panic!("Expected ToolResult");
+            };
+            assert_eq!(*is_error, Some(true));
+        }
     }
 }
