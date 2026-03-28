@@ -87,7 +87,7 @@ fn from_claude_code_name(name: &str, original_names: &[String]) -> String {
 /// Returns true if the API key is an OAuth token (`sk-ant-oat-*`).
 #[must_use]
 pub fn is_oauth_token(api_key: &str) -> bool {
-    api_key.contains("sk-ant-oat")
+    api_key.starts_with("sk-ant-oat")
 }
 
 /// Authentication mode for the Anthropic provider.
