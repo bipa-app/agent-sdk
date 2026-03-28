@@ -801,6 +801,17 @@ where
     }
 }
 
+/// Checks if an error message indicates the prompt exceeds the model's context
+/// window. Matches multiple known error patterns from different providers.
+fn is_prompt_too_long_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("maximum context length")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("input is too long")
+        || lower.contains("request too large")
+}
+
 /// When the prompt exceeds the model's context window at the API level (returned as a 400 error
 /// rather than a `stop_reason`), attempt compaction and retry instead of failing immediately.
 async fn try_recover_prompt_too_long<P, M>(
@@ -815,7 +826,7 @@ where
     P: LlmProvider,
     M: MessageStore,
 {
-    if error.message.contains("prompt is too long")
+    if is_prompt_too_long_error(&error.message)
         && let Some(compact_config) = compaction_config
     {
         ctx.compaction_retries += 1;
