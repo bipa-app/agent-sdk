@@ -170,6 +170,16 @@ where
         confirmed,
         rejection_reason,
     } = resume_data;
+    if cont.awaiting_index >= cont.pending_tool_calls.len() {
+        return Err(AgentError::new(
+            format!(
+                "Invalid continuation: awaiting_index {} out of bounds ({})",
+                cont.awaiting_index,
+                cont.pending_tool_calls.len()
+            ),
+            false,
+        ));
+    }
     let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
     if awaiting_tool.id != tool_call_id {
