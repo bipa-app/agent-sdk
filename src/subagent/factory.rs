@@ -28,6 +28,8 @@
 
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
+
 use crate::llm::LlmProvider;
 use crate::tools::ToolRegistry;
 
@@ -81,30 +83,36 @@ where
     /// This is useful for exploration, research, and investigation tasks
     /// where the subagent should not modify any files.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if no read-only registry has been set.
-    #[must_use]
-    pub fn create_read_only(&self, config: SubagentConfig) -> SubagentTool<P> {
+    /// Returns an error if no read-only registry has been set.
+    pub fn create_read_only(&self, config: SubagentConfig) -> Result<SubagentTool<P>> {
         let registry = self
             .read_only_registry
             .as_ref()
-            .expect("read-only registry not set; call with_read_only_registry first");
-        SubagentTool::new(config, Arc::clone(&self.provider), Arc::clone(registry))
+            .context("read-only registry not set; call with_read_only_registry first")?;
+        Ok(SubagentTool::new(
+            config,
+            Arc::clone(&self.provider),
+            Arc::clone(registry),
+        ))
     }
 
     /// Creates a subagent with all available tools.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if no full registry has been set.
-    #[must_use]
-    pub fn create_full_access(&self, config: SubagentConfig) -> SubagentTool<P> {
+    /// Returns an error if no full registry has been set.
+    pub fn create_full_access(&self, config: SubagentConfig) -> Result<SubagentTool<P>> {
         let registry = self
             .full_registry
             .as_ref()
-            .expect("full registry not set; call with_full_registry first");
-        SubagentTool::new(config, Arc::clone(&self.provider), Arc::clone(registry))
+            .context("full registry not set; call with_full_registry first")?;
+        Ok(SubagentTool::new(
+            config,
+            Arc::clone(&self.provider),
+            Arc::clone(registry),
+        ))
     }
 
     /// Creates a subagent with a custom tool registry.
