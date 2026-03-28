@@ -746,6 +746,16 @@ where
         }
         Some(StopReason::ModelContextWindowExceeded) => {
             warn!("Model context window exceeded (turn={})", ctx.turn);
+            ctx.compaction_retries += 1;
+            if ctx.compaction_retries > super::types::MAX_COMPACTION_RETRIES {
+                return InternalTurnResult::Error(AgentError::new(
+                    format!(
+                        "Context window exceeded after {} compaction retries — giving up",
+                        super::types::MAX_COMPACTION_RETRIES
+                    ),
+                    false,
+                ));
+            }
             if let Some(compact_config) = compaction_config {
                 if let Err(error) = compact_after_context_overflow(
                     provider,
@@ -808,9 +818,19 @@ where
     if error.message.contains("prompt is too long")
         && let Some(compact_config) = compaction_config
     {
+        ctx.compaction_retries += 1;
+        if ctx.compaction_retries > super::types::MAX_COMPACTION_RETRIES {
+            return Some(InternalTurnResult::Error(AgentError::new(
+                format!(
+                    "Prompt too long after {} compaction retries — giving up",
+                    super::types::MAX_COMPACTION_RETRIES
+                ),
+                false,
+            )));
+        }
         warn!(
-            "Prompt too long, attempting emergency context compaction (turn={})",
-            ctx.turn
+            "Prompt too long, attempting emergency context compaction (turn={}, retry={})",
+            ctx.turn, ctx.compaction_retries
         );
         if let Err(compact_err) = compact_after_context_overflow(
             provider,

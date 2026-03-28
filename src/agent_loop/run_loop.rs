@@ -667,6 +667,7 @@ where
         total_usage,
         state,
         start_time,
+        compaction_retries: 0,
     };
 
     if let Some(outcome) = run_loop_turns(RunLoopTurnsParams {
@@ -800,6 +801,7 @@ where
         total_usage,
         state,
         start_time,
+        compaction_retries: 0,
     };
 
     let result = execute_turn(ExecuteTurnParameters {

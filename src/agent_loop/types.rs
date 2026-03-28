@@ -36,6 +36,9 @@ pub(super) enum InternalTurnResult {
     Error(AgentError),
 }
 
+/// Maximum number of compaction retries before giving up.
+pub(super) const MAX_COMPACTION_RETRIES: usize = 3;
+
 /// Mutable context for turn execution.
 ///
 /// This holds all the state that's modified during execution.
@@ -45,6 +48,8 @@ pub(super) struct TurnContext {
     pub(super) total_usage: TokenUsage,
     pub(super) state: AgentState,
     pub(super) start_time: Instant,
+    /// Number of consecutive compaction retries for context overflow.
+    pub(super) compaction_retries: usize,
 }
 
 /// Data extracted from `AgentInput::Resume` after validation.
