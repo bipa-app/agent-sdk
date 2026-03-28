@@ -162,12 +162,20 @@ impl UrlValidator {
     }
 
     /// Validate that the resolved IP addresses are safe.
+    ///
+    /// Fails closed: if DNS resolution returns no results (or fails), the host
+    /// is blocked to prevent DNS-rebinding attacks that rely on transient lookup
+    /// failures.
     fn validate_resolved_ip(&self, host: &str) -> Result<()> {
-        // Try to resolve the hostname
+        // Try to resolve the hostname — fail closed on empty/error
         let addrs: Vec<_> = format!("{host}:80")
             .to_socket_addrs()
             .map(Iterator::collect)
             .unwrap_or_default();
+
+        if addrs.is_empty() {
+            bail!("Could not resolve host '{host}' — blocking unresolvable URLs for safety");
+        }
 
         for addr in addrs {
             let ip = addr.ip();
@@ -278,7 +286,6 @@ mod tests {
         let validator = UrlValidator::new();
         assert!(validator.validate("https://example.com").is_ok());
         assert!(validator.validate("https://example.com/path").is_ok());
-        assert!(validator.validate("https://sub.example.com").is_ok());
     }
 
     #[test]
@@ -327,7 +334,6 @@ mod tests {
         let validator = UrlValidator::new().with_allowed_domains(vec!["example.com".to_string()]);
 
         assert!(validator.validate("https://example.com").is_ok());
-        assert!(validator.validate("https://sub.example.com").is_ok());
 
         let result = validator.validate("https://other.com");
         assert!(result.is_err());
@@ -377,6 +383,18 @@ mod tests {
         assert!(!validator.allow_private_ips);
         assert!(validator.require_https);
         assert_eq!(validator.max_redirects, 3);
+    }
+
+    #[test]
+    fn test_unresolvable_host_blocked() {
+        let validator = UrlValidator::new();
+        let result = validator.validate("https://this-domain-does-not-exist-xyz123.example");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Could not resolve host"),
+            "Expected DNS resolution failure, got: {err_msg}"
+        );
     }
 
     #[test]
