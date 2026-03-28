@@ -249,7 +249,7 @@ where
     );
 
     Ok(ChatResponse {
-        id: String::new(),
+        id: uuid::Uuid::new_v4().to_string(),
         content: content_blocks,
         model: provider.model().to_string(),
         stop_reason,
