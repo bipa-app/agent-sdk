@@ -370,11 +370,7 @@ pub fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
 }
 
 pub fn uuid_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{:x}{:x}", now.as_secs(), now.subsec_nanos())
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Map an `ApiFinishReason` to a `StopReason`, overriding to `ToolUse` when tool calls are present.
@@ -848,12 +844,13 @@ mod tests {
 
     #[test]
     fn test_uuid_simple_generates_unique_ids() {
-        let id1 = uuid_simple();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let id2 = uuid_simple();
-
-        assert!(!id1.is_empty());
-        assert!(!id2.is_empty());
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = uuid_simple();
+            assert!(!id.is_empty());
+            assert!(ids.insert(id), "Duplicate ID generated");
+        }
+        assert_eq!(ids.len(), 1000);
     }
 
     // ===================
