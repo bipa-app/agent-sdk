@@ -138,9 +138,9 @@ impl LinkFetchTool {
                 .context("Invalid Location header")?;
 
             // Resolve relative redirect URLs against the current URL
-            let redirect_url_str = url.join(location)
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| location.to_string());
+            let redirect_url_str = url
+                .join(location)
+                .map_or_else(|_| location.to_string(), |u| u.to_string());
 
             // Validate the redirect target through the same SSRF checks
             url = self.validator.validate(&redirect_url_str)?;

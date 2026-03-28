@@ -149,6 +149,33 @@ where
     }
 }
 
+fn validate_resume_continuation(
+    cont: &AgentContinuation,
+    tool_call_id: &str,
+) -> Result<(), AgentError> {
+    if cont.awaiting_index >= cont.pending_tool_calls.len() {
+        return Err(AgentError::new(
+            format!(
+                "Invalid continuation: awaiting_index {} out of bounds ({})",
+                cont.awaiting_index,
+                cont.pending_tool_calls.len()
+            ),
+            false,
+        ));
+    }
+    let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
+    if awaiting_tool.id != tool_call_id {
+        return Err(AgentError::new(
+            format!(
+                "Tool call ID mismatch: expected {}, got {}",
+                awaiting_tool.id, tool_call_id
+            ),
+            false,
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn process_resume<Ctx, H, M>(
     ResumeProcessingParameters {
         resume_data,
@@ -176,27 +203,8 @@ where
         confirmed,
         rejection_reason,
     } = resume_data;
-    if cont.awaiting_index >= cont.pending_tool_calls.len() {
-        return Err(AgentError::new(
-            format!(
-                "Invalid continuation: awaiting_index {} out of bounds ({})",
-                cont.awaiting_index,
-                cont.pending_tool_calls.len()
-            ),
-            false,
-        ));
-    }
+    validate_resume_continuation(&cont, &tool_call_id)?;
     let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
-
-    if awaiting_tool.id != tool_call_id {
-        return Err(AgentError::new(
-            format!(
-                "Tool call ID mismatch: expected {}, got {}",
-                awaiting_tool.id, tool_call_id
-            ),
-            false,
-        ));
-    }
 
     let mut tool_results = cont.completed_results.clone();
     let rejection =
@@ -556,8 +564,8 @@ fn synthesize_error_tool_results(messages: &[Message]) -> Option<Message> {
     })
 }
 
-/// Recovers from orphaned tool_use messages by appending synthetic error
-/// tool_result blocks so the conversation can continue.
+/// Recovers from orphaned `tool_use` messages by appending synthetic error
+/// `tool_result` blocks so the conversation can continue.
 async fn recover_orphaned_tool_use<M>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,

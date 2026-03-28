@@ -196,7 +196,7 @@ impl UrlValidator {
 
 /// Check if an IP address is private.
 ///
-/// Also handles IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) by extracting
+/// Also handles IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) by extracting
 /// the embedded IPv4 address and applying IPv4 checks.
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -247,8 +247,8 @@ const fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
 
 /// Check if an IP is a loopback address.
 ///
-/// Handles IPv4-mapped IPv6 addresses (::ffff:127.0.0.1).
-fn is_loopback(ip: &IpAddr) -> bool {
+/// Handles IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`).
+const fn is_loopback(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => ipv4.is_loopback(),
         IpAddr::V6(ipv6) => {
@@ -262,8 +262,8 @@ fn is_loopback(ip: &IpAddr) -> bool {
 
 /// Check if an IP is a link-local address.
 ///
-/// Handles IPv4-mapped IPv6 addresses (::ffff:169.254.x.x).
-fn is_link_local(ip: &IpAddr) -> bool {
+/// Handles IPv4-mapped IPv6 addresses (`::ffff:169.254.x.x`).
+const fn is_link_local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => ipv4.is_link_local(),
         IpAddr::V6(ipv6) => {

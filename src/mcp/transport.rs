@@ -257,6 +257,7 @@ impl McpTransport for StdioTransport {
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        drop(writer);
         Ok(())
     }
 

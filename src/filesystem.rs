@@ -196,16 +196,13 @@ impl Environment for LocalFileSystem {
     }
 
     fn root(&self) -> &str {
-        match self.root.to_str() {
-            Some(s) => s,
-            None => {
-                log::error!(
-                    "LocalFileSystem root path contains invalid UTF-8: {}",
-                    self.root.to_string_lossy()
-                );
-                "/"
-            }
-        }
+        self.root.to_str().unwrap_or_else(|| {
+            log::error!(
+                "LocalFileSystem root path contains invalid UTF-8: {}",
+                self.root.to_string_lossy()
+            );
+            "/"
+        })
     }
 }
 
