@@ -63,7 +63,7 @@ impl GeminiProvider {
             model,
             base_url: API_BASE_URL.to_owned(),
             thinking: None,
-            use_header_auth: false,
+            use_header_auth: true,
             extra_headers: Vec::new(),
         }
     }
@@ -448,6 +448,15 @@ mod tests {
             .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
             .unwrap_err();
         assert!(error.to_string().contains("thinking is not supported"));
+    }
+
+    #[test]
+    fn test_default_uses_header_auth() {
+        let provider = GeminiProvider::new("test-key".to_string(), "model".to_string());
+        assert!(
+            provider.use_header_auth,
+            "Default should use header auth for security"
+        );
     }
 
     #[test]
