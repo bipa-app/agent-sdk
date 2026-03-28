@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
 
 /// Entry in a directory listing
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,13 +139,48 @@ pub trait Environment: Send + Sync {
     /// Get the root/working directory for this environment
     fn root(&self) -> &str;
 
-    /// Resolve a relative path to absolute within this environment
+    /// Resolve a relative path to absolute within this environment.
+    ///
+    /// Normalizes `..` and `.` components to prevent path traversal attacks.
     fn resolve_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            path.to_string()
+        let joined = if path.starts_with('/') {
+            PathBuf::from(path)
         } else {
-            format!("{}/{}", self.root().trim_end_matches('/'), path)
+            PathBuf::from(self.root()).join(path)
+        };
+        normalize_path(&joined)
+    }
+}
+
+/// Lexically normalize a path by resolving `.` and `..` components without
+/// hitting the filesystem.
+///
+/// This prevents path traversal attacks where `../../etc/passwd` could escape
+/// an allowed directory. Unlike `std::fs::canonicalize`, this does not require
+/// the path to exist and does not follow symlinks.
+pub fn normalize_path(path: &Path) -> String {
+    normalize_path_buf(path).to_string_lossy().into_owned()
+}
+
+/// Lexically normalize a path, returning a `PathBuf`.
+pub fn normalize_path_buf(path: &Path) -> PathBuf {
+    let mut components: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                // Only pop if we have a normal component to pop (don't pop past root)
+                if matches!(components.last(), Some(Component::Normal(_))) {
+                    components.pop();
+                }
+            }
+            Component::CurDir => {} // skip `.`
+            other => components.push(other),
         }
+    }
+    if components.is_empty() {
+        PathBuf::from("/")
+    } else {
+        components.iter().collect()
     }
 }
 
@@ -208,5 +244,56 @@ impl Environment for NullEnvironment {
 
     fn root(&self) -> &'static str {
         "/"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_path_resolves_parent_dir() {
+        let path = Path::new("/workspace/src/../../etc/passwd");
+        assert_eq!(normalize_path(path), "/etc/passwd");
+    }
+
+    #[test]
+    fn test_normalize_path_resolves_current_dir() {
+        let path = Path::new("/workspace/./src/./file.rs");
+        assert_eq!(normalize_path(path), "/workspace/src/file.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_does_not_escape_root() {
+        let path = Path::new("/workspace/../../../etc/shadow");
+        assert_eq!(normalize_path(path), "/etc/shadow");
+    }
+
+    #[test]
+    fn test_normalize_path_identity() {
+        let path = Path::new("/workspace/src/main.rs");
+        assert_eq!(normalize_path(path), "/workspace/src/main.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_clamps_at_root() {
+        // Trying to go above root should stop at /
+        let path = Path::new("/a/../../../../z");
+        assert_eq!(normalize_path(path), "/z");
+    }
+
+    #[test]
+    fn test_resolve_path_normalizes_traversal() {
+        let env = NullEnvironment;
+        // NullEnvironment root is "/", so relative paths are joined with "/"
+        let resolved = env.resolve_path("src/../../etc/passwd");
+        assert_eq!(resolved, "/etc/passwd");
+    }
+
+    #[test]
+    fn test_resolve_path_absolute_normalized() {
+        let env = NullEnvironment;
+        let resolved = env.resolve_path("/workspace/src/../../../etc/passwd");
+        assert_eq!(resolved, "/etc/passwd");
     }
 }
