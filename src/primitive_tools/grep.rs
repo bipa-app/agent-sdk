@@ -161,7 +161,7 @@ fn truncate_line(s: &str, max_len: usize) -> String {
     if trimmed.len() <= max_len {
         trimmed.to_string()
     } else {
-        format!("{}...", &trimmed[..max_len])
+        format!("{}...", super::truncate_str(trimmed, max_len))
     }
 }
 

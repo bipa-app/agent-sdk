@@ -442,9 +442,9 @@ fn extract_tool_context(name: &str, input: &Value) -> String {
             .to_string(),
         "bash" => {
             let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
-            // Truncate long commands
+            // Truncate long commands (UTF-8 safe)
             if cmd.len() > 60 {
-                format!("{}...", &cmd[..57])
+                format!("{}...", crate::primitive_tools::truncate_str(cmd, 57))
             } else {
                 cmd.to_string()
             }
@@ -468,7 +468,10 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
     if !result.success {
         let first_line = result.output.lines().next().unwrap_or("Error");
         return if first_line.len() > 50 {
-            format!("{}...", &first_line[..47])
+            format!(
+                "{}...",
+                crate::primitive_tools::truncate_str(first_line, 47)
+            )
         } else {
             first_line.to_string()
         };
@@ -488,7 +491,7 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
             } else if lines.len() == 1 {
                 let line = lines[0];
                 if line.len() > 50 {
-                    format!("{}...", &line[..47])
+                    format!("{}...", crate::primitive_tools::truncate_str(line, 47))
                 } else {
                     line.to_string()
                 }

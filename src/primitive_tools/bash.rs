@@ -119,12 +119,12 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
             output = "(no output)".to_string();
         }
 
-        // Truncate if too long
+        // Truncate if too long (UTF-8 safe)
         let max_output_len = 30_000;
         if output.len() > max_output_len {
+            let truncated = super::truncate_str(&output, max_output_len);
             output = format!(
-                "{}...\n\n(output truncated, {} total characters)",
-                &output[..max_output_len],
+                "{truncated}...\n\n(output truncated, {} total characters)",
                 output.len()
             );
         }
@@ -146,7 +146,7 @@ fn truncate_command(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        format!("{}...", super::truncate_str(s, max_len))
     }
 }
 

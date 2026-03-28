@@ -96,6 +96,66 @@ where
     }
 }
 
+/// Truncate a string to at most `max_bytes` without splitting a multi-byte
+/// UTF-8 character. Returns the original string when it already fits.
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_str;
+
+    #[test]
+    fn test_truncate_str_ascii_fits() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_ascii_exact() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_ascii_truncated() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_multibyte_emoji() {
+        let s = "Hello 🎉 world";
+        // "Hello " is 6 bytes, emoji is 4 bytes, so cutting at 8 would
+        // land inside the emoji. The helper must back up to byte 6.
+        let result = truncate_str(s, 8);
+        assert_eq!(result, "Hello ");
+    }
+
+    #[test]
+    fn test_truncate_str_cjk() {
+        let s = "漢字テスト";
+        // Each CJK char is 3 bytes. Truncating at 7 should give 2 chars (6 bytes).
+        let result = truncate_str(s, 7);
+        assert_eq!(result, "漢字");
+    }
+
+    #[test]
+    fn test_truncate_str_zero_max() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_str_empty() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+}
+
 pub(super) fn deserialize_usize_from_string_or_int<'de, D>(
     deserializer: D,
 ) -> Result<usize, D::Error>
