@@ -239,6 +239,9 @@ where
     ///
     /// If `parent_tx` is provided, the subagent will emit `SubagentProgress` events
     /// to the parent's event channel, allowing the UI to show live progress.
+    ///
+    /// The `parent_cancel` token links the subagent's lifecycle to its parent.
+    /// Cancelling the parent token will also cancel the subagent.
     #[allow(clippy::too_many_lines)]
     async fn run_subagent(
         &self,
@@ -246,6 +249,7 @@ where
         subagent_id: String,
         parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
         parent_seq: Option<SequenceCounter>,
+        parent_cancel: CancellationToken,
     ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
@@ -256,9 +260,9 @@ where
         let message_store = (self.message_store_factory)();
         let state_store = (self.state_store_factory)();
 
-        // Create agent config
+        // Create agent config with a default max_turns to prevent unbounded execution
         let agent_config = AgentConfig {
-            max_turns: self.config.max_turns,
+            max_turns: Some(self.config.max_turns.unwrap_or(100)),
             system_prompt: self.config.system_prompt.clone(),
             ..Default::default()
         };
@@ -276,12 +280,14 @@ where
         // Create tool context
         let tool_ctx = ToolContext::new(());
 
-        // Run with optional timeout
+        // Run with a child cancellation token so parent cancellation propagates
+        let cancel_token = parent_cancel.child_token();
+        let timeout_cancel = cancel_token.clone();
         let (mut rx, _final_state) = agent.run(
             thread_id,
             AgentInput::Text(task.to_string()),
             tool_ctx,
-            CancellationToken::new(),
+            cancel_token,
         );
 
         let mut final_response = String::new();
@@ -299,6 +305,7 @@ where
             let recv_result = if let Some(timeout) = timeout_duration {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
+                    timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
                     success = false;
                     break;
@@ -397,6 +404,7 @@ where
                 },
                 Ok(None) => break,
                 Err(_) => {
+                    timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
                     success = false;
                     break;
@@ -573,8 +581,12 @@ where
                 .as_nanos()
         );
 
+        // Use the context's cancellation token if available, otherwise create a standalone one.
+        // This ensures that when a parent agent is cancelled, subagents are also cancelled.
+        let cancel_token = ctx.cancel_token().unwrap_or_default();
+
         let result = self
-            .run_subagent(task, subagent_id, parent_tx, parent_seq)
+            .run_subagent(task, subagent_id, parent_tx, parent_seq, cancel_token)
             .await?;
 
         Ok(ToolResult {
