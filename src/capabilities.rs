@@ -230,14 +230,25 @@ impl AgentCapabilities {
     /// Check whether a command passes the allow/deny rules, returning
     /// the specific denial reason on failure.
     ///
+    /// # Security Note
+    ///
+    /// Regex-based command filtering is a heuristic, not a security boundary.
+    /// Shell metacharacters (`;`, `&&`, `|`, backticks, `$()`) allow chaining
+    /// arbitrary commands. For example, `denied_commands: ["^sudo"]` does NOT
+    /// block `bash -c "sudo rm -rf /"`. The `pre_tool_use` hook is the
+    /// authoritative gate for command approval.
+    ///
+    /// Invalid deny patterns fail closed (block everything) to prevent
+    /// misconfigured deny rules from silently allowing dangerous commands.
+    ///
     /// # Errors
     ///
     /// Returns the denial reason when the command matches a denied pattern
     /// or is not in the allowed list.
     pub fn check_command(&self, command: &str) -> Result<(), String> {
-        // Denied patterns take precedence
+        // Denied patterns take precedence. Invalid patterns fail CLOSED.
         for pattern in &self.denied_commands {
-            if regex_match(pattern, command) {
+            if regex_match_deny(pattern, command) {
                 return Err(format!("command matches denied pattern '{pattern}'"));
             }
         }
@@ -295,11 +306,21 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     regex_match(&regex, path)
 }
 
-/// Simple regex matching (returns false on invalid patterns)
+/// Simple regex matching (returns false on invalid patterns).
+/// Used for allow rules — an invalid allow pattern should not grant access.
 fn regex_match(pattern: &str, text: &str) -> bool {
     regex::Regex::new(pattern)
         .map(|re| re.is_match(text))
         .unwrap_or(false)
+}
+
+/// Regex matching for deny rules — fails CLOSED on invalid patterns.
+/// An invalid deny pattern blocks everything to prevent misconfigured
+/// deny rules from silently allowing dangerous commands.
+fn regex_match_deny(pattern: &str, text: &str) -> bool {
+    regex::Regex::new(pattern)
+        .map(|re| re.is_match(text))
+        .unwrap_or(true) // Invalid pattern = deny (fail closed)
 }
 
 #[cfg(test)]
@@ -588,6 +609,27 @@ mod tests {
                 "full_access() unexpectedly blocked write: {path}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_deny_regex_fails_closed() {
+        // An invalid regex in denied_commands should block everything (fail closed)
+        let caps = AgentCapabilities::full_access()
+            .with_denied_commands(vec!["[unclosed".into()]);
+
+        // The invalid pattern should cause all commands to be denied
+        assert!(caps.check_command("cargo build").is_err());
+        assert!(caps.check_command("ls").is_err());
+    }
+
+    #[test]
+    fn invalid_allow_regex_fails_open() {
+        // An invalid regex in allowed_commands should not grant access (fail open)
+        let caps = AgentCapabilities::full_access()
+            .with_allowed_commands(vec!["[unclosed".into()]);
+
+        // The invalid pattern should not match, so nothing is allowed
+        assert!(caps.check_command("cargo build").is_err());
     }
 
     /// Verify `Default` is `full_access()` — the SDK is unopinionated out of the box.
