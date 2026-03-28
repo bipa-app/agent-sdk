@@ -64,15 +64,25 @@ impl FileSkillLoader {
     }
 
     /// Get the file path for a skill by name.
-    fn skill_path(&self, name: &str) -> PathBuf {
-        self.base_path.join(format!("{name}.md"))
+    ///
+    /// Validates that the name does not contain path separators, `..`, or null
+    /// bytes to prevent directory-traversal attacks via crafted skill names.
+    fn skill_path(&self, name: &str) -> Result<PathBuf> {
+        if name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.contains('\0')
+        {
+            bail!("Invalid skill name: must not contain path separators, '..', or null bytes");
+        }
+        Ok(self.base_path.join(format!("{name}.md")))
     }
 }
 
 #[async_trait]
 impl SkillLoader for FileSkillLoader {
     async fn load(&self, name: &str) -> Result<Skill> {
-        let path = self.skill_path(name);
+        let path = self.skill_path(name)?;
 
         if !path.exists() {
             bail!("Skill file not found: {}", path.display());
@@ -331,5 +341,34 @@ Content"
         let loader = InMemorySkillLoader::new();
         let result = loader.load("nonexistent").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_loader_blocks_path_traversal() -> Result<()> {
+        let dir = TempDir::new()?;
+        let loader = FileSkillLoader::new(dir.path());
+
+        let traversal_names = [
+            "../etc/passwd",
+            "..\\windows\\system32",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "skill\0name",
+        ];
+
+        for name in &traversal_names {
+            let result = loader.load(name).await;
+            assert!(result.is_err(), "Expected error for skill name: {name}");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Invalid skill name"),
+                "Expected 'Invalid skill name' error for: {name}"
+            );
+        }
+
+        Ok(())
     }
 }
