@@ -163,6 +163,10 @@ where
     hooks: Arc<H>,
     message_store_factory: Arc<dyn Fn() -> M + Send + Sync>,
     state_store_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    /// Cached display name to avoid `Box::leak` on every call.
+    cached_display_name: &'static str,
+    /// Cached description to avoid `Box::leak` on every call.
+    cached_description: &'static str,
 }
 
 impl<P> SubagentTool<P, DefaultHooks, InMemoryStore, InMemoryStore>
@@ -172,6 +176,16 @@ where
     /// Create a new subagent tool with default hooks and in-memory stores.
     #[must_use]
     pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
+        // Cache leaked strings at construction time (bounded by number of tools)
+        let cached_display_name =
+            Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
+        let cached_description = Box::leak(
+            format!(
+                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
+                config.name
+            )
+            .into_boxed_str(),
+        );
         Self {
             config,
             provider,
@@ -179,6 +193,8 @@ where
             hooks: Arc::new(DefaultHooks),
             message_store_factory: Arc::new(InMemoryStore::new),
             state_store_factory: Arc::new(InMemoryStore::new),
+            cached_display_name,
+            cached_description,
         }
     }
 }
@@ -203,6 +219,8 @@ where
             hooks,
             message_store_factory: self.message_store_factory,
             state_store_factory: self.state_store_factory,
+            cached_display_name: self.cached_display_name,
+            cached_description: self.cached_description,
         }
     }
 
@@ -226,6 +244,8 @@ where
             hooks: self.hooks,
             message_store_factory: Arc::new(message_factory),
             state_store_factory: Arc::new(state_factory),
+            cached_display_name: self.cached_display_name,
+            cached_description: self.cached_description,
         }
     }
 
@@ -532,18 +552,11 @@ where
     }
 
     fn display_name(&self) -> &'static str {
-        // Leak the name to get 'static lifetime (acceptable for long-lived tools)
-        Box::leak(format!("Subagent: {}", self.config.name).into_boxed_str())
+        self.cached_display_name
     }
 
     fn description(&self) -> &'static str {
-        Box::leak(
-            format!(
-                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
-                self.config.name
-            )
-            .into_boxed_str(),
-        )
+        self.cached_description
     }
 
     fn input_schema(&self) -> Value {
