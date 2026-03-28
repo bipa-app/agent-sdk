@@ -103,10 +103,9 @@ impl<T: McpTransport> McpClient<T> {
             .context("Failed to parse initialize response")?
             .context("Initialize response missing result")?;
 
-        // Send initialized notification
+        // Send initialized notification (fire-and-forget)
         let notification = JsonRpcRequest::new("notifications/initialized", None, 0);
-        // Notifications don't expect a response, but we send through the same channel
-        let _ = self.transport.send(notification).await;
+        let _ = self.transport.send_notification(notification).await;
 
         self.server_info = Some(result);
 

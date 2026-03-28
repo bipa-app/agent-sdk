@@ -33,6 +33,13 @@ pub trait McpTransport: Send + Sync {
     /// Returns an error if the request fails to send or the response fails to parse.
     async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse>;
 
+    /// Send a notification (fire-and-forget, no response expected).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message fails to serialize or write.
+    async fn send_notification(&self, request: JsonRpcRequest) -> Result<()>;
+
     /// Close the transport connection.
     ///
     /// # Errors
@@ -40,6 +47,9 @@ pub trait McpTransport: Send + Sync {
     /// Returns an error if the transport fails to close cleanly.
     async fn close(&self) -> Result<()>;
 }
+
+/// Default response timeout for MCP requests (60 seconds).
+const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Stdio transport for MCP servers.
 ///
@@ -53,6 +63,8 @@ pub struct StdioTransport {
     writer: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
     /// Child process handle.
     _child: Arc<Mutex<Child>>,
+    /// Timeout for awaiting responses.
+    response_timeout: std::time::Duration,
 }
 
 impl StdioTransport {
@@ -84,6 +96,7 @@ impl StdioTransport {
             pending: Mutex::new(HashMap::new()),
             writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
             _child: Arc::new(Mutex::new(child)),
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         });
 
         // Spawn reader task
@@ -97,6 +110,15 @@ impl StdioTransport {
                 match reader.read_line(&mut line).await {
                     Ok(0) | Err(_) => break, // EOF or error
                     Ok(_) => {
+                        const MAX_LINE_LEN: usize = 10 * 1024 * 1024; // 10 MiB
+                        if line.len() > MAX_LINE_LEN {
+                            log::warn!(
+                                "MCP stdout line exceeds {} bytes (got {}), skipping",
+                                MAX_LINE_LEN,
+                                line.len()
+                            );
+                            continue;
+                        }
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
                             let mut pending = transport_clone.pending.lock().await;
                             if let Some(sender) = pending.remove(&response.id) {
@@ -146,6 +168,7 @@ impl StdioTransport {
             pending: Mutex::new(HashMap::new()),
             writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
             _child: Arc::new(Mutex::new(child)),
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         });
 
         // Spawn reader task
@@ -159,6 +182,15 @@ impl StdioTransport {
                 match reader.read_line(&mut line).await {
                     Ok(0) | Err(_) => break, // EOF or error
                     Ok(_) => {
+                        const MAX_LINE_LEN: usize = 10 * 1024 * 1024; // 10 MiB
+                        if line.len() > MAX_LINE_LEN {
+                            log::warn!(
+                                "MCP stdout line exceeds {} bytes (got {}), skipping",
+                                MAX_LINE_LEN,
+                                line.len()
+                            );
+                            continue;
+                        }
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
                             let mut pending = transport_clone.pending.lock().await;
                             if let Some(sender) = pending.remove(&response.id) {
@@ -201,8 +233,11 @@ impl McpTransport for StdioTransport {
         writer.flush().await?;
         drop(writer);
 
-        // Wait for response
-        let response = rx.await.context("Response channel closed")?;
+        // Wait for response with timeout
+        let response = tokio::time::timeout(self.response_timeout, rx)
+            .await
+            .context("MCP response timed out")?
+            .context("Response channel closed")?;
 
         // Check for JSON-RPC error
         if let Some(ref error) = response.error {
@@ -210,6 +245,19 @@ impl McpTransport for StdioTransport {
         }
 
         Ok(response)
+    }
+
+    async fn send_notification(&self, mut request: JsonRpcRequest) -> Result<()> {
+        // Assign an ID for serialization but don't register a pending response
+        let id = self.next_request_id();
+        request.id = RequestId::Number(id);
+
+        let json = serde_json::to_string(&request)?;
+        let mut writer = self.writer.lock().await;
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
     }
 
     async fn close(&self) -> Result<()> {
