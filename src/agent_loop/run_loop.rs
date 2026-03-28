@@ -527,7 +527,9 @@ fn has_orphaned_tool_use(messages: &[Message]) -> bool {
     let Content::Blocks(blocks) = &last.content else {
         return false;
     };
-    blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
 }
 
 /// Synthesizes error `ToolResult` blocks for every `ToolUse` in the last
@@ -544,8 +546,7 @@ fn synthesize_error_tool_results(messages: &[Message]) -> Option<Message> {
             if let ContentBlock::ToolUse { id, .. } = b {
                 Some(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: "Tool execution was interrupted by a crash. Please retry."
-                        .to_string(),
+                    content: "Tool execution was interrupted by a crash. Please retry.".to_string(),
                     is_error: Some(true),
                 })
             } else {

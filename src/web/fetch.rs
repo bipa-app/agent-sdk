@@ -125,9 +125,7 @@ impl LinkFetchTool {
         while response.status().is_redirection() {
             redirects += 1;
             if redirects > max_redirects {
-                bail!(
-                    "Too many redirects ({redirects} > {max_redirects})"
-                );
+                bail!("Too many redirects ({redirects} > {max_redirects})");
             }
 
             let location = response

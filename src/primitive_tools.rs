@@ -109,6 +109,18 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+pub(super) fn deserialize_usize_from_string_or_int<'de, D>(
+    deserializer: D,
+) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match StringOrUsize::deserialize(deserializer)? {
+        StringOrUsize::Number(value) => Ok(value),
+        StringOrUsize::String(value) => parse_numeric_string(&value).map_err(de::Error::custom),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::truncate_str;
@@ -153,17 +165,5 @@ mod tests {
     #[test]
     fn test_truncate_str_empty() {
         assert_eq!(truncate_str("", 10), "");
-    }
-}
-
-pub(super) fn deserialize_usize_from_string_or_int<'de, D>(
-    deserializer: D,
-) -> Result<usize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match StringOrUsize::deserialize(deserializer)? {
-        StringOrUsize::Number(value) => Ok(value),
-        StringOrUsize::String(value) => parse_numeric_string(&value).map_err(de::Error::custom),
     }
 }

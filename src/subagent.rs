@@ -177,8 +177,7 @@ where
     #[must_use]
     pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
         // Cache leaked strings at construction time (bounded by number of tools)
-        let cached_display_name =
-            Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
+        let cached_display_name = Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
         let cached_description = Box::leak(
             format!(
                 "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",

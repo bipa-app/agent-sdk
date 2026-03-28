@@ -798,8 +798,7 @@ pub fn parse_sse_event(
                     *output_tokens = event.usage.output_tokens;
                     // Store the stop reason for emission in message_stop,
                     // ensuring Usage is emitted before Done.
-                    *pending_stop_reason =
-                        event.delta.stop_reason.as_ref().map(map_stop_reason);
+                    *pending_stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
                     None
                 }
                 Err(error) => {

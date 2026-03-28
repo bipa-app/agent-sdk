@@ -68,11 +68,7 @@ impl FileSkillLoader {
     /// Validates that the name does not contain path separators, `..`, or null
     /// bytes to prevent directory-traversal attacks via crafted skill names.
     fn skill_path(&self, name: &str) -> Result<PathBuf> {
-        if name.contains('/')
-            || name.contains('\\')
-            || name.contains("..")
-            || name.contains('\0')
-        {
+        if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
             bail!("Invalid skill name: must not contain path separators, '..', or null bytes");
         }
         Ok(self.base_path.join(format!("{name}.md")))

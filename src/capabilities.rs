@@ -614,8 +614,7 @@ mod tests {
     #[test]
     fn invalid_deny_regex_fails_closed() {
         // An invalid regex in denied_commands should block everything (fail closed)
-        let caps = AgentCapabilities::full_access()
-            .with_denied_commands(vec!["[unclosed".into()]);
+        let caps = AgentCapabilities::full_access().with_denied_commands(vec!["[unclosed".into()]);
 
         // The invalid pattern should cause all commands to be denied
         assert!(caps.check_command("cargo build").is_err());
@@ -625,8 +624,7 @@ mod tests {
     #[test]
     fn invalid_allow_regex_fails_open() {
         // An invalid regex in allowed_commands should not grant access (fail open)
-        let caps = AgentCapabilities::full_access()
-            .with_allowed_commands(vec!["[unclosed".into()]);
+        let caps = AgentCapabilities::full_access().with_allowed_commands(vec!["[unclosed".into()]);
 
         // The invalid pattern should not match, so nothing is allowed
         assert!(caps.check_command("cargo build").is_err());
