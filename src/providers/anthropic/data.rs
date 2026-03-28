@@ -242,6 +242,10 @@ pub enum ApiStopReason {
     StopSequence,
     Refusal,
     ModelContextWindowExceeded,
+    /// OAuth sessions may pause mid-turn; treat as end-of-turn for resubmission.
+    PauseTurn,
+    /// Content flagged by safety filters.
+    Sensitive,
 }
 
 #[derive(Deserialize)]
@@ -595,11 +599,14 @@ const fn set_cache_control(block: &mut ApiContentBlockInput, cache_control: ApiC
 /// Map an `ApiStopReason` to a `StopReason`.
 pub const fn map_stop_reason(reason: &ApiStopReason) -> StopReason {
     match reason {
-        ApiStopReason::EndTurn => StopReason::EndTurn,
+        // OAuth sessions may pause mid-turn; treat like end-of-turn so the
+        // caller can resubmit the conversation.
+        ApiStopReason::EndTurn | ApiStopReason::PauseTurn => StopReason::EndTurn,
         ApiStopReason::ToolUse => StopReason::ToolUse,
         ApiStopReason::MaxTokens => StopReason::MaxTokens,
         ApiStopReason::StopSequence => StopReason::StopSequence,
-        ApiStopReason::Refusal => StopReason::Refusal,
+        // Content flagged by safety filters – surface as refusal.
+        ApiStopReason::Refusal | ApiStopReason::Sensitive => StopReason::Refusal,
         ApiStopReason::ModelContextWindowExceeded => StopReason::ModelContextWindowExceeded,
     }
 }

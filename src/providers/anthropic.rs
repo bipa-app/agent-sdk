@@ -23,7 +23,7 @@ use reqwest::StatusCode;
 
 const API_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
-const CLAUDE_CODE_VERSION: &str = "2.1.62";
+const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 pub const MODEL_HAIKU_35: &str = "claude-3-5-haiku-20241022";
@@ -39,6 +39,9 @@ pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 /// Claude Code tool name mappings for OAuth mode.
 ///
 /// When using OAuth tokens, tool names must match Claude Code's exact casing.
+/// The mapper passes unknown names through unchanged, so extra entries here are
+/// harmless — they future-proof against new tools being registered later.
+/// Source: <https://cchistory.mariozechner.at/data/prompts-2.1.11.md>
 const CLAUDE_CODE_TOOLS: &[&str] = &[
     "Read",
     "Write",
@@ -46,6 +49,15 @@ const CLAUDE_CODE_TOOLS: &[&str] = &[
     "Bash",
     "Grep",
     "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
     "WebFetch",
     "WebSearch",
 ];
@@ -157,15 +169,25 @@ impl AnthropicProvider {
                 AuthMode::ApiKey => builder
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", API_VERSION),
-                AuthMode::OAuth => builder
-                    .header("Authorization", format!("Bearer {}", self.api_key))
-                    .header("anthropic-version", API_VERSION)
-                    .header(
-                        "anthropic-beta",
-                        "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
-                    )
-                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
-                    .header("x-app", "cli"),
+                AuthMode::OAuth => {
+                    // Build beta features list matching Claude Code's behaviour.
+                    // Adaptive-thinking models (4.6) have interleaved thinking
+                    // built-in; for older reasoning models we need the explicit beta.
+                    let mut beta_features = vec![
+                        "claude-code-20250219",
+                        "oauth-2025-04-20",
+                        "fine-grained-tool-streaming-2025-05-14",
+                    ];
+                    if !self.requires_adaptive_thinking() {
+                        beta_features.push("interleaved-thinking-2025-05-14");
+                    }
+                    builder
+                        .header("Authorization", format!("Bearer {}", self.api_key))
+                        .header("anthropic-version", API_VERSION)
+                        .header("anthropic-beta", beta_features.join(","))
+                        .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                        .header("x-app", "cli")
+                }
             }
         };
         self.extra_headers
@@ -173,27 +195,42 @@ impl AnthropicProvider {
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 
-    /// Wraps the system prompt for OAuth mode (prepends Claude Code identity).
-    fn wrap_system_prompt<'a>(&self, system: &'a str) -> std::borrow::Cow<'a, str> {
+    const OAUTH_IDENTITY: &'static str =
+        "You are Claude Code, Anthropic's official CLI for Claude.";
+
+    /// Build the system prompt payload, accounting for OAuth mode.
+    ///
+    /// In OAuth mode the identity string must be a **separate** system block
+    /// (matching the layout Claude Code itself sends).  For API-key auth the
+    /// user-supplied system prompt is sent as a single block.
+    fn build_system_prompt_for_request<'a>(
+        &self,
+        system: &'a str,
+    ) -> Option<data::ApiSystemPrompt<'a>> {
+        let cc = Self::cache_control();
+
         match self.auth_mode {
-            AuthMode::ApiKey => std::borrow::Cow::Borrowed(system),
+            AuthMode::ApiKey => data::build_api_system_prompt(system, Some(cc)),
             AuthMode::OAuth => {
-                let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
-                if system.is_empty() {
-                    std::borrow::Cow::Owned(identity.to_string())
-                } else {
-                    std::borrow::Cow::Owned(format!("{identity}\n\n{system}"))
+                let mut blocks = vec![data::ApiSystemBlock {
+                    block_type: "text",
+                    text: Self::OAUTH_IDENTITY,
+                    cache_control: Some(cc.clone()),
+                }];
+                if !system.is_empty() {
+                    blocks.push(data::ApiSystemBlock {
+                        block_type: "text",
+                        text: system,
+                        cache_control: Some(cc),
+                    });
                 }
+                Some(data::ApiSystemPrompt::Blocks(blocks))
             }
         }
     }
 
     const fn cache_control() -> data::ApiCacheControl {
         data::ApiCacheControl::ephemeral()
-    }
-
-    fn build_system_prompt_payload(system_prompt: &str) -> Option<data::ApiSystemPrompt<'_>> {
-        data::build_api_system_prompt(system_prompt, Some(Self::cache_control()))
     }
 
     fn build_cached_api_messages(request: &ChatRequest) -> Vec<data::ApiMessage> {
@@ -299,8 +336,7 @@ impl LlmProvider for AnthropicProvider {
             .and_then(|t| t.effort)
             .map(|effort| ApiOutputConfig { effort });
 
-        let system_prompt = self.wrap_system_prompt(&request.system);
-        let system = Self::build_system_prompt_payload(system_prompt.as_ref());
+        let system = self.build_system_prompt_for_request(&request.system);
         let max_tokens = self.effective_max_tokens(&request);
 
         let api_request = ApiMessagesRequest {
@@ -463,8 +499,7 @@ impl LlmProvider for AnthropicProvider {
                 .and_then(|t| t.effort)
                 .map(|effort| ApiOutputConfig { effort });
 
-            let system_prompt = self.wrap_system_prompt(&request.system);
-            let system = Self::build_system_prompt_payload(system_prompt.as_ref());
+            let system = self.build_system_prompt_for_request(&request.system);
             let max_tokens = self.effective_max_tokens(&request);
 
             let api_request = ApiMessagesRequest {
