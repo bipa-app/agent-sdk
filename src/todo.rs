@@ -131,9 +131,11 @@ impl TodoState {
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or parsed.
-    pub fn load(&mut self) -> Result<()> {
+    pub async fn load(&mut self) -> Result<()> {
         if let Some(ref path) = self.storage_path.as_ref().filter(|p| p.exists()) {
-            let content = std::fs::read_to_string(path).context("Failed to read todos file")?;
+            let content = tokio::fs::read_to_string(path)
+                .await
+                .context("Failed to read todos file")?;
             self.items = serde_json::from_str(&content).context("Failed to parse todos file")?;
         }
         Ok(())
@@ -144,15 +146,19 @@ impl TodoState {
     /// # Errors
     ///
     /// Returns an error if the file cannot be written.
-    pub fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> Result<()> {
         if let Some(ref path) = self.storage_path {
             // Ensure parent directory exists
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).context("Failed to create todos directory")?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("Failed to create todos directory")?;
             }
             let content =
                 serde_json::to_string_pretty(&self.items).context("Failed to serialize todos")?;
-            std::fs::write(path, content).context("Failed to write todos file")?;
+            tokio::fs::write(path, content)
+                .await
+                .context("Failed to write todos file")?;
         }
         Ok(())
     }
@@ -340,7 +346,7 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
             state.set_items(items);
 
             // Save to storage if configured
-            if let Err(e) = state.save() {
+            if let Err(e) = state.save().await {
                 log::warn!("Failed to save todos: {e}");
             }
 
