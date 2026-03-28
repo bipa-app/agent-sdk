@@ -21,6 +21,7 @@ use crate::tools::{
 };
 use crate::types::{
     AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolOutcome, ToolResult,
+    ToolTier,
 };
 
 /// Execute a single tool call with hook checks.
@@ -581,6 +582,27 @@ where
 {
     if let Some(reason) = rejection_reason {
         return handle_confirmed_tool_rejection(awaiting_tool, ctx, reason).await;
+    }
+
+    // Defense-in-depth: re-check pre_tool_use for audit logging.
+    // The user already confirmed, so we still execute even if the hook says Block.
+    let tier = ctx
+        .tools
+        .get(&awaiting_tool.name)
+        .map(|t| t.tier())
+        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
+        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
+        .unwrap_or(ToolTier::Confirm);
+
+    let hook_decision = ctx
+        .hooks
+        .pre_tool_use(&awaiting_tool.name, &awaiting_tool.input, tier)
+        .await;
+    if let ToolDecision::Block(reason) = &hook_decision {
+        log::warn!(
+            "pre_tool_use returned Block for confirmed tool '{}': {reason} (executing anyway — user already confirmed)",
+            awaiting_tool.name
+        );
     }
 
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await
