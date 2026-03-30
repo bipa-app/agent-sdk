@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 /// Call the LLM with retry logic for rate limits and server errors.
+///
+/// Returns the result and the number of retries that occurred.
 pub(super) async fn call_llm_with_retry<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
@@ -20,7 +22,7 @@ pub(super) async fn call_llm_with_retry<P, H>(
     tx: &mpsc::Sender<AgentEventEnvelope>,
     hooks: &Arc<H>,
     seq: &SequenceCounter,
-) -> Result<ChatResponse, AgentError>
+) -> (Result<ChatResponse, AgentError>, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -32,19 +34,22 @@ where
         let outcome = match provider.chat(request.clone()).await {
             Ok(o) => o,
             Err(e) => {
-                return Err(AgentError::new(format!("LLM error: {e}"), false));
+                return (
+                    Err(AgentError::new(format!("LLM error: {e}"), false)),
+                    attempt,
+                );
             }
         };
 
         match outcome {
-            ChatOutcome::Success(response) => return Ok(response),
+            ChatOutcome::Success(response) => return (Ok(response), attempt),
             ChatOutcome::RateLimited => {
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Rate limited by LLM provider after {max_retries} retries");
                     let error_msg = format!("Rate limited after {max_retries} retries");
                     send_event(tx, hooks, seq, AgentEvent::error(&error_msg, true)).await;
-                    return Err(AgentError::new(error_msg, true));
+                    return (Err(AgentError::new(error_msg, true)), attempt);
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
@@ -57,7 +62,10 @@ where
             }
             ChatOutcome::InvalidRequest(msg) => {
                 error!("Invalid request to LLM: {msg}");
-                return Err(AgentError::new(format!("Invalid request: {msg}"), false));
+                return (
+                    Err(AgentError::new(format!("Invalid request: {msg}"), false)),
+                    attempt,
+                );
             }
             ChatOutcome::ServerError(msg) => {
                 attempt += 1;
@@ -65,7 +73,7 @@ where
                     error!("LLM server error after {max_retries} retries: {msg}");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
                     send_event(tx, hooks, seq, AgentEvent::error(&error_msg, true)).await;
-                    return Err(AgentError::new(error_msg, true));
+                    return (Err(AgentError::new(error_msg, true)), attempt);
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
@@ -84,6 +92,8 @@ where
 /// This function handles streaming responses from the LLM, emitting `TextDelta`
 /// and `Thinking` events in real-time as content arrives. It includes retry logic
 /// for recoverable errors (rate limits, server errors).
+///
+/// Returns the result and the number of retries that occurred.
 pub(super) async fn call_llm_streaming<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
@@ -92,7 +102,7 @@ pub(super) async fn call_llm_streaming<P, H>(
     hooks: &Arc<H>,
     seq: &SequenceCounter,
     ids: (&str, &str),
-) -> Result<ChatResponse, AgentError>
+) -> (Result<ChatResponse, AgentError>, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -106,14 +116,14 @@ where
             process_stream(provider, &request, tx, hooks, seq, message_id, thinking_id).await;
 
         match result {
-            Ok(response) => return Ok(response),
+            Ok(response) => return (Ok(response), attempt),
             Err(StreamError::Recoverable(msg)) => {
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
                     let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
                     send_event(tx, hooks, seq, AgentEvent::error(&err_msg, true)).await;
-                    return Err(AgentError::new(err_msg, true));
+                    return (Err(AgentError::new(err_msg, true)), attempt);
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
@@ -125,7 +135,10 @@ where
             }
             Err(StreamError::Fatal(msg)) => {
                 error!("Streaming error (non-recoverable): {msg}");
-                return Err(AgentError::new(format!("Streaming error: {msg}"), false));
+                return (
+                    Err(AgentError::new(format!("Streaming error: {msg}"), false)),
+                    attempt,
+                );
             }
         }
     }

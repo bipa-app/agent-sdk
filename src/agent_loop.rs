@@ -137,6 +137,8 @@ where
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 /// Create a new builder for constructing an `AgentLoop`.
@@ -173,6 +175,8 @@ where
             compaction_config: None,
             compactor: None,
             execution_store: None,
+            #[cfg(feature = "otel")]
+            observability_store: None,
         }
     }
 
@@ -197,7 +201,23 @@ where
             compaction_config: Some(compaction_config),
             compactor: None,
             execution_store: None,
+            #[cfg(feature = "otel")]
+            observability_store: None,
         }
+    }
+
+    /// Set the observability store for `GenAI` payload capture.
+    ///
+    /// When set, the store is called at each LLM request boundary to decide
+    /// whether payloads are inlined on spans, externalized, or omitted.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn with_observability_store(
+        mut self,
+        store: impl crate::observability::ObservabilityStore + 'static,
+    ) -> Self {
+        self.observability_store = Some(Arc::new(store));
+        self
     }
 
     /// Run the agent loop.
@@ -284,8 +304,12 @@ where
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
+        #[cfg(feature = "otel")]
+        let observability_store = self.observability_store.clone();
+        #[cfg(feature = "otel")]
+        let parent_cx = crate::observability::context::capture_context();
 
-        tokio::spawn(async move {
+        let task = async move {
             let result = run_loop(RunLoopParameters {
                 tx: event_tx,
                 seq,
@@ -303,11 +327,21 @@ where
                 execution_store,
                 cancel_token,
                 input_rx: None,
+                #[cfg(feature = "otel")]
+                observability_store,
             })
             .await;
 
             let _ = state_tx.send(result);
-        });
+        };
+
+        #[cfg(feature = "otel")]
+        let task = {
+            use opentelemetry::trace::FutureExt;
+            task.with_context(parent_cx)
+        };
+
+        tokio::spawn(task);
 
         (event_rx, state_rx)
     }
@@ -347,9 +381,13 @@ where
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
+        #[cfg(feature = "otel")]
+        let observability_store = self.observability_store.clone();
         let cancel_handle = cancel_token.clone();
+        #[cfg(feature = "otel")]
+        let parent_cx = crate::observability::context::capture_context();
 
-        tokio::spawn(async move {
+        let task = async move {
             let result = run_loop(RunLoopParameters {
                 tx: event_tx,
                 seq,
@@ -367,11 +405,21 @@ where
                 execution_store,
                 cancel_token,
                 input_rx: Some(input_rx),
+                #[cfg(feature = "otel")]
+                observability_store,
             })
             .await;
 
             let _ = state_tx.send(result);
-        });
+        };
+
+        #[cfg(feature = "otel")]
+        let task = {
+            use opentelemetry::trace::FutureExt;
+            task.with_context(parent_cx)
+        };
+
+        tokio::spawn(task);
 
         AgentHandle {
             input_tx,
@@ -469,8 +517,12 @@ where
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
+        #[cfg(feature = "otel")]
+        let observability_store = self.observability_store.clone();
+        #[cfg(feature = "otel")]
+        let parent_cx = crate::observability::context::capture_context();
 
-        tokio::spawn(async move {
+        let task = async move {
             let result = run_single_turn(TurnParameters {
                 tx: event_tx,
                 seq,
@@ -487,11 +539,21 @@ where
                 compactor,
                 execution_store,
                 cancel_token,
+                #[cfg(feature = "otel")]
+                observability_store,
             })
             .await;
 
             let _ = outcome_tx.send(result);
-        });
+        };
+
+        #[cfg(feature = "otel")]
+        let task = {
+            use opentelemetry::trace::FutureExt;
+            task.with_context(parent_cx)
+        };
+
+        tokio::spawn(task);
 
         (event_rx, outcome_rx)
     }

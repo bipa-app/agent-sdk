@@ -481,7 +481,7 @@ where
             }
         }
 
-        Ok(SubagentResult {
+        let result = SubagentResult {
             name: self.config.name.clone(),
             final_response,
             total_turns,
@@ -492,7 +492,51 @@ where
             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             error_details,
             failed_tool,
-        })
+        };
+
+        #[cfg(feature = "otel")]
+        {
+            use crate::observability::{attrs, provider_name, spans};
+            use opentelemetry::KeyValue;
+            use opentelemetry::trace::Span;
+
+            let mut span = spans::start_internal_span(
+                "invoke_agent",
+                vec![
+                    KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
+                    KeyValue::new(attrs::GEN_AI_AGENT_NAME, self.config.name.clone()),
+                    KeyValue::new(
+                        attrs::GEN_AI_PROVIDER_NAME,
+                        provider_name::normalize(self.provider.provider()),
+                    ),
+                    KeyValue::new(
+                        attrs::GEN_AI_REQUEST_MODEL,
+                        self.provider.model().to_string(),
+                    ),
+                    KeyValue::new(attrs::SDK_RUN_MODE, "loop"),
+                ],
+            );
+            let outcome = if result.success { "done" } else { "error" };
+            span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
+            span.set_attribute(attrs::kv_i64(
+                attrs::SDK_TOTAL_TURNS,
+                i64::try_from(result.total_turns).unwrap_or(0),
+            ));
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_INPUT_TOKENS,
+                i64::from(result.usage.input_tokens),
+            ));
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+                i64::from(result.usage.output_tokens),
+            ));
+            if outcome == "error" {
+                spans::set_span_error(&mut span, "agent_error", "subagent invocation failed");
+            }
+            span.end();
+        }
+
+        Ok(result)
     }
 }
 

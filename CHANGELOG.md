@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cancelled outcomes in observability spans** - Root and turn-level observability instrumentation now records `cancelled` outcomes instead of omitting cancellation states.
+
 ### Changed
 
 - **Non-blocking event channel** - The agent loop now uses non-blocking sends for events. If the event channel is full, it logs a warning and waits up to 30 seconds before timing out. If the channel is closed (consumer disconnected), the agent continues processing without blocking. This prevents slow consumers from stalling the LLM stream.
@@ -16,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Switched from `tracing` to `log` crate** - The SDK now uses the standard `log` crate instead of `tracing` for logging, making it compatible with any logging framework that implements `log` (e.g., `env_logger`, `simple_logger`, `fern`).
 
 ### Added
+
+- **Optional OpenTelemetry observability** - Added an `otel` feature with observability helpers, payload/context propagation, `ObservabilityStore` hooks, and instrumentation for agent runs, turns, LLM calls, tool execution, subagent invocations, MCP client calls, and context compaction spans.
 
 - **Stream progress logging** - Added periodic debug logging during stream processing to help diagnose issues:
   - `SSE chunk progress` every 10 chunks from the HTTP stream

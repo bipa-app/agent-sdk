@@ -310,7 +310,13 @@
 //!
 //! ## Feature Flags
 //!
-//! All features are enabled by default. The crate has no optional features currently.
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `otel`  | No      | Enable OpenTelemetry tracing instrumentation |
+//!
+//! When `otel` is enabled, the SDK emits OpenTelemetry spans for agent
+//! invocations, turns, LLM requests, tool execution, subagent runs, MCP
+//! operations, and context compaction. See [`observability`] for details.
 
 #![forbid(unsafe_code)]
 
@@ -335,6 +341,14 @@ mod tools;
 mod types;
 pub mod user_interaction;
 pub mod web;
+
+#[cfg(feature = "otel")]
+pub mod observability;
+
+#[cfg(feature = "otel")]
+pub use observability::{
+    CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle,
+};
 
 pub use agent_loop::{AgentHandle, AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;

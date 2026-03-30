@@ -7,7 +7,7 @@
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **⚠️ Early Development**: This library is in active development (v0.5.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+> **⚠️ Early Development**: This library is in active development (v0.8.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
 
 ## What is an Agent?
 
@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = "0.5"
+agent-sdk = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -62,10 +62,65 @@ Or to install the latest development version from git:
 agent-sdk = { git = "https://github.com/bipa-app/agent-sdk", branch = "main" }
 ```
 
+## OpenTelemetry
+
+Enable the optional `otel` feature to emit OpenTelemetry spans from the agent loop:
+
+```toml
+[dependencies]
+agent-sdk = { version = "0.8", features = ["otel"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+# Add the exporter crate that matches your backend, for example opentelemetry-otlp.
+```
+
+Then configure a global tracer provider in your application and optionally provide an `ObservabilityStore` to control whether GenAI payloads are inlined, stored externally, or omitted:
+
+```rust
+use agent_sdk::{
+    builder,
+    observability::{CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle},
+    providers::AnthropicProvider,
+};
+use async_trait::async_trait;
+use opentelemetry::global;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+
+struct InlinePayloadStore;
+
+#[async_trait]
+impl ObservabilityStore for InlinePayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> anyhow::Result<CaptureResult> {
+        Ok(CaptureResult {
+            system_instructions: CaptureDecision::Inline,
+            input_messages: CaptureDecision::Inline,
+            output_messages: CaptureDecision::Inline,
+        })
+    }
+}
+
+let tracer_provider = SdkTracerProvider::builder().build();
+global::set_tracer_provider(tracer_provider);
+
+let agent = builder::<()>()
+    .provider(AnthropicProvider::sonnet(api_key))
+    .observability_store(InlinePayloadStore)
+    .build();
+```
+
+If you only want spans, you can omit `.observability_store(...)` and just configure the global tracer provider. For a complete runnable example, see `examples/otel.rs`:
+
+```bash
+cargo run --example otel --features otel
+```
+
 ## Quick Start
 
 ```rust
-use agent_sdk::{builder, ThreadId, ToolContext, AgentEvent, AgentInput, providers::AnthropicProvider};
+use agent_sdk::{
+    builder, AgentEvent, AgentInput, CancellationToken, ThreadId, ToolContext,
+    providers::AnthropicProvider,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -89,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         thread_id,
         AgentInput::Text("What is the capital of France?".to_string()),
         tool_ctx,
+        CancellationToken::new(),
     );
 
     // Process events as they arrive
@@ -127,6 +183,9 @@ ANTHROPIC_API_KEY=your_key cargo run --example custom_hooks
 
 # Agent with file operation tools
 ANTHROPIC_API_KEY=your_key cargo run --example with_primitive_tools
+
+# OpenTelemetry instrumentation (self-contained, no API key required)
+cargo run --example otel --features otel
 ```
 
 ## Creating Custom Tools
@@ -377,7 +436,7 @@ let tool_ctx = ToolContext::new(MyContext {
     user_id: "user_123".to_string(),
     database: db,
 });
-agent.run(thread_id, prompt, tool_ctx);
+agent.run(thread_id, prompt, tool_ctx, CancellationToken::new());
 ```
 
 ## Architecture

@@ -157,6 +157,8 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) cancel_token: CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
@@ -240,6 +242,8 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
     pub(super) cancel_token: CancellationToken,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 /// Execute a single turn of the agent loop.

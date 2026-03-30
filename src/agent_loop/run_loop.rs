@@ -649,6 +649,67 @@ where
 }
 
 pub(super) async fn run_loop<Ctx, P, H, M, S>(
+    params: RunLoopParameters<Ctx, P, H, M, S>,
+) -> AgentRunState
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    #[cfg(feature = "otel")]
+    let mut root_span = crate::observability::instrument::start_root_span(
+        params.provider.as_ref(),
+        &params.tools,
+        &params.config,
+        &params.thread_id,
+        &params.input,
+        "loop",
+    );
+    #[cfg(feature = "otel")]
+    let root_context = {
+        use opentelemetry::trace::Span;
+
+        crate::observability::context::current_with_span_context(root_span.span_context().clone())
+    };
+
+    #[cfg(feature = "otel")]
+    let result = {
+        use opentelemetry::trace::FutureExt;
+
+        run_loop_inner(params).with_context(root_context).await
+    };
+    #[cfg(not(feature = "otel"))]
+    let result = run_loop_inner(params).await;
+
+    #[cfg(feature = "otel")]
+    {
+        use crate::observability::instrument::{end_root_span, run_state_outcome};
+        let (turns, inp, out) = match &result {
+            AgentRunState::Done {
+                total_turns,
+                input_tokens,
+                output_tokens,
+            }
+            | AgentRunState::Refusal {
+                total_turns,
+                input_tokens,
+                output_tokens,
+            } => (
+                usize::try_from(*total_turns).unwrap_or(0),
+                *input_tokens,
+                *output_tokens,
+            ),
+            _ => (0, 0, 0),
+        };
+        end_root_span(&mut root_span, turns, inp, out, run_state_outcome(&result));
+    }
+
+    result
+}
+
+async fn run_loop_inner<Ctx, P, H, M, S>(
     RunLoopParameters {
         tx,
         seq,
@@ -666,6 +727,8 @@ pub(super) async fn run_loop<Ctx, P, H, M, S>(
         execution_store,
         cancel_token,
         mut input_rx,
+        #[cfg(feature = "otel")]
+            observability_store: _observability_store,
     }: RunLoopParameters<Ctx, P, H, M, S>,
 ) -> AgentRunState
 where
@@ -782,6 +845,76 @@ where
 /// The caller is responsible for continuing execution by calling again with
 /// `AgentInput::Continue`.
 pub(super) async fn run_single_turn<Ctx, P, H, M, S>(
+    params: TurnParameters<Ctx, P, H, M, S>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    #[cfg(feature = "otel")]
+    let mut root_span = crate::observability::instrument::start_root_span(
+        params.provider.as_ref(),
+        &params.tools,
+        &params.config,
+        &params.thread_id,
+        &params.input,
+        "single_turn",
+    );
+    #[cfg(feature = "otel")]
+    let root_context = {
+        use opentelemetry::trace::Span;
+
+        crate::observability::context::current_with_span_context(root_span.span_context().clone())
+    };
+
+    #[cfg(feature = "otel")]
+    let outcome = {
+        use opentelemetry::trace::FutureExt;
+
+        run_single_turn_inner(params)
+            .with_context(root_context)
+            .await
+    };
+    #[cfg(not(feature = "otel"))]
+    let outcome = run_single_turn_inner(params).await;
+
+    #[cfg(feature = "otel")]
+    {
+        use crate::observability::instrument::{end_root_span, turn_outcome_str};
+        let (turns, inp, out) = match &outcome {
+            TurnOutcome::Done {
+                total_turns,
+                input_tokens,
+                output_tokens,
+            }
+            | TurnOutcome::Refusal {
+                total_turns,
+                input_tokens,
+                output_tokens,
+            } => (
+                usize::try_from(*total_turns).unwrap_or(0),
+                *input_tokens,
+                *output_tokens,
+            ),
+            TurnOutcome::NeedsMoreTurns {
+                turn, total_usage, ..
+            } => (
+                *turn,
+                u64::from(total_usage.input_tokens),
+                u64::from(total_usage.output_tokens),
+            ),
+            _ => (0, 0, 0),
+        };
+        end_root_span(&mut root_span, turns, inp, out, turn_outcome_str(&outcome));
+    }
+
+    outcome
+}
+
+async fn run_single_turn_inner<Ctx, P, H, M, S>(
     TurnParameters {
         tx,
         seq,
@@ -798,6 +931,8 @@ pub(super) async fn run_single_turn<Ctx, P, H, M, S>(
         compactor,
         execution_store,
         cancel_token,
+        #[cfg(feature = "otel")]
+            observability_store: _observability_store,
     }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
 where

@@ -30,6 +30,8 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    #[cfg(feature = "otel")]
+    observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
@@ -46,6 +48,8 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             compaction_config: None,
             compactor: None,
             execution_store: None,
+            #[cfg(feature = "otel")]
+            observability_store: None,
         }
     }
 }
@@ -70,6 +74,8 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 
@@ -93,6 +99,8 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 
@@ -112,6 +120,8 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 
@@ -131,6 +141,8 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 
@@ -154,6 +166,17 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn execution_store(mut self, store: impl ToolExecutionStore + 'static) -> Self {
         self.execution_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Set the observability store for `GenAI` payload capture.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn observability_store(
+        mut self,
+        store: impl crate::observability::ObservabilityStore + 'static,
+    ) -> Self {
+        self.observability_store = Some(Arc::new(store));
         self
     }
 
@@ -275,6 +298,8 @@ where
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 }
@@ -321,6 +346,8 @@ where
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store,
         }
     }
 }

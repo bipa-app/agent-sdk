@@ -83,6 +83,22 @@ impl<T: McpTransport> McpClient<T> {
     ///
     /// Returns an error if the server rejects initialization.
     pub async fn initialize(&mut self) -> Result<&InitializeResult> {
+        #[cfg(feature = "otel")]
+        let mut span = start_mcp_span("mcp.initialize", &self.server_name);
+
+        let result = self.initialize_inner().await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_span(&mut span, &result);
+
+        result?;
+
+        self.server_info
+            .as_ref()
+            .context("Server info not available")
+    }
+
+    async fn initialize_inner(&mut self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
@@ -108,10 +124,7 @@ impl<T: McpTransport> McpClient<T> {
         let _ = self.transport.send_notification(notification).await;
 
         self.server_info = Some(result);
-
-        self.server_info
-            .as_ref()
-            .context("Server info not available")
+        Ok(())
     }
 
     /// Get the server name.
@@ -132,6 +145,28 @@ impl<T: McpTransport> McpClient<T> {
     ///
     /// Returns an error if the request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDefinition>> {
+        #[cfg(feature = "otel")]
+        let mut span = start_mcp_span("mcp.tools/list", &self.server_name);
+
+        let result = self.list_tools_inner().await;
+
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::KeyValue;
+            use opentelemetry::trace::Span;
+            if let Ok(ref tools) = result {
+                span.set_attribute(KeyValue::new(
+                    "mcp.tools.count",
+                    i64::try_from(tools.len()).unwrap_or(0),
+                ));
+            }
+            finish_mcp_span(&mut span, &result);
+        }
+
+        result
+    }
+
+    async fn list_tools_inner(&self) -> Result<Vec<McpToolDefinition>> {
         let request = JsonRpcRequest::new("tools/list", None, 0);
 
         let response = self.transport.send(request).await?;
@@ -157,6 +192,27 @@ impl<T: McpTransport> McpClient<T> {
     ///
     /// Returns an error if the tool call fails.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpToolCallResult> {
+        #[cfg(feature = "otel")]
+        let mut span = {
+            use opentelemetry::KeyValue;
+            start_mcp_span_with_attrs(
+                "mcp.tools/call",
+                vec![
+                    KeyValue::new("mcp.server.name", self.server_name.clone()),
+                    KeyValue::new("gen_ai.tool.name", name.to_string()),
+                ],
+            )
+        };
+
+        let result = self.call_tool_inner(name, arguments).await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_call_tool_span(&mut span, &result);
+
+        result
+    }
+
+    async fn call_tool_inner(&self, name: &str, arguments: Value) -> Result<McpToolCallResult> {
         let params = ToolCallParams {
             name: name.to_string(),
             arguments: Some(arguments),
@@ -207,6 +263,66 @@ impl<T: McpTransport> McpClient<T> {
     pub async fn close(&self) -> Result<()> {
         self.transport.close().await
     }
+}
+
+#[cfg(feature = "otel")]
+fn start_mcp_span(
+    name: impl Into<std::borrow::Cow<'static, str>>,
+    server_name: &str,
+) -> opentelemetry::global::BoxedSpan {
+    use opentelemetry::KeyValue;
+    start_mcp_span_with_attrs(
+        name,
+        vec![KeyValue::new("mcp.server.name", server_name.to_string())],
+    )
+}
+
+#[cfg(feature = "otel")]
+fn start_mcp_span_with_attrs(
+    name: impl Into<std::borrow::Cow<'static, str>>,
+    attrs: Vec<opentelemetry::KeyValue>,
+) -> opentelemetry::global::BoxedSpan {
+    use crate::observability::spans;
+    spans::start_client_span(name, attrs)
+}
+
+#[cfg(feature = "otel")]
+fn finish_mcp_span<T>(span: &mut opentelemetry::global::BoxedSpan, result: &Result<T>) {
+    use crate::observability::spans;
+    use opentelemetry::trace::Span;
+
+    if let Err(err) = result {
+        spans::set_span_error(span, "mcp_error", &format!("{err}"));
+    }
+    span.end();
+}
+
+#[cfg(feature = "otel")]
+fn finish_mcp_call_tool_span(
+    span: &mut opentelemetry::global::BoxedSpan,
+    result: &Result<super::protocol::McpToolCallResult>,
+) {
+    use crate::observability::spans;
+    use opentelemetry::trace::Span;
+
+    match result {
+        Ok(tool_result) if tool_result.is_error => {
+            let error_text = tool_result
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    super::protocol::McpContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("MCP tool returned error");
+            spans::set_span_error(span, "tool_error", error_text);
+        }
+        Err(err) => {
+            spans::set_span_error(span, "mcp_error", &format!("{err}"));
+        }
+        Ok(_) => {}
+    }
+    span.end();
 }
 
 #[cfg(test)]

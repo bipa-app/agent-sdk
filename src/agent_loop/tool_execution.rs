@@ -40,6 +40,114 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    #[cfg(feature = "otel")]
+    let mut tool_span = start_tool_span(pending, ctx);
+
+    let outcome = execute_tool_call_inner(pending, ctx).await;
+
+    #[cfg(feature = "otel")]
+    finish_tool_span(&mut tool_span, &outcome);
+
+    outcome
+}
+
+#[cfg(feature = "otel")]
+fn start_tool_span<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> opentelemetry::global::BoxedSpan
+where
+    Ctx: Send + Sync + 'static,
+    H: AgentHooks,
+{
+    use crate::observability::{attrs, spans};
+    use opentelemetry::KeyValue;
+
+    let mut span_attrs = vec![
+        KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "execute_tool"),
+        KeyValue::new(attrs::GEN_AI_TOOL_NAME, pending.name.clone()),
+        KeyValue::new(attrs::GEN_AI_TOOL_CALL_ID, pending.id.clone()),
+    ];
+    if !pending.display_name.is_empty() {
+        span_attrs.push(KeyValue::new(
+            attrs::SDK_TOOL_DISPLAY_NAME,
+            pending.display_name.clone(),
+        ));
+    }
+
+    // Add tool metadata if the tool was found
+    if let Some(tool) = ctx.tools.get(&pending.name) {
+        span_attrs.push(KeyValue::new(
+            attrs::SDK_TOOL_TIER,
+            attrs::tool_tier_str(tool.tier()),
+        ));
+        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "sync"));
+    } else if let Some(tool) = ctx.tools.get_async(&pending.name) {
+        span_attrs.push(KeyValue::new(
+            attrs::SDK_TOOL_TIER,
+            attrs::tool_tier_str(tool.tier()),
+        ));
+        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "async"));
+    } else if let Some(tool) = ctx.tools.get_listen(&pending.name) {
+        span_attrs.push(KeyValue::new(
+            attrs::SDK_TOOL_TIER,
+            attrs::tool_tier_str(tool.tier()),
+        ));
+        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "listen"));
+    }
+
+    spans::start_internal_span("execute_tool", span_attrs)
+}
+
+#[cfg(feature = "otel")]
+fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolExecutionOutcome) {
+    use crate::observability::attrs;
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::Span;
+
+    match outcome {
+        ToolExecutionOutcome::Completed { result, .. } => {
+            let outcome_str = if result.output.starts_with("Unknown tool:") {
+                span.set_attribute(KeyValue::new(attrs::ERROR_TYPE, "unknown_tool"));
+                span.set_status(opentelemetry::trace::Status::error(result.output.clone()));
+                "error"
+            } else if result.output.starts_with("Blocked:") {
+                "blocked"
+            } else if result.output.starts_with("Rejected:") {
+                "rejected"
+            } else if result.success {
+                "success"
+            } else {
+                "error"
+            };
+            span.set_attribute(KeyValue::new(attrs::SDK_TOOL_OUTCOME, outcome_str));
+            if let Some(ms) = result.duration_ms {
+                span.set_attribute(attrs::kv_i64(
+                    attrs::SDK_TOOL_DURATION_MS,
+                    i64::try_from(ms).unwrap_or(i64::MAX),
+                ));
+            }
+        }
+        ToolExecutionOutcome::RequiresConfirmation { .. } => {
+            span.set_attribute(attrs::kv_bool(attrs::SDK_TOOL_CONFIRMATION_REQUIRED, true));
+            span.set_attribute(KeyValue::new(
+                attrs::SDK_TOOL_OUTCOME,
+                "awaiting_confirmation",
+            ));
+        }
+    }
+
+    span.end();
+}
+
+async fn execute_tool_call_inner<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &pending.id).await {
         return ToolExecutionOutcome::Completed {
             tool_id: pending.id.clone(),

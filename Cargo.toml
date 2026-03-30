@@ -32,11 +32,17 @@ tokio-util = "0.7"
 html2text = "0.14"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"], optional = true }
+
+[features]
+default = []
+otel = ["opentelemetry"]
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 env_logger = "0.11"
 tempfile = "3"
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 
 [[example]]
 name = "basic_agent"
@@ -53,6 +59,11 @@ path = "examples/custom_hooks.rs"
 [[example]]
 name = "with_primitive_tools"
 path = "examples/with_primitive_tools.rs"
+
+[[example]]
+name = "otel"
+path = "examples/otel.rs"
+required-features = ["otel"]
 
 [lints.rust]
 unsafe_code = "forbid"

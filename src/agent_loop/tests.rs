@@ -1099,6 +1099,8 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         compaction_config: None,
         compactor: None,
         execution_store: None,
+        #[cfg(feature = "otel")]
+        observability_store: None,
     };
 
     let thread_id = ThreadId::new();

@@ -139,18 +139,29 @@ where
     H: AgentHooks,
     M: MessageStore,
 {
-    let maybe_result = if let Some(compactor) = compactor {
+    if let Some(compactor) = compactor {
         if compactor.needs_compaction(&messages) {
             debug!(
                 "Context compaction triggered (turn={}, message_count={})",
                 turn,
                 messages.len()
             );
-            Some(compactor.compact_history(messages.clone()).await)
-        } else {
-            None
+            return compact_messages_for_threshold(
+                compactor.as_ref(),
+                messages,
+                message_store,
+                thread_id,
+                tx,
+                hooks,
+                seq,
+            )
+            .await;
         }
-    } else if let Some(compact_config) = compaction_config {
+
+        return Ok(messages);
+    }
+
+    if let Some(compact_config) = compaction_config {
         let default_compactor =
             LlmContextCompactor::new(Arc::clone(provider), compact_config.clone());
         if default_compactor.needs_compaction(&messages) {
@@ -159,55 +170,208 @@ where
                 turn,
                 messages.len()
             );
-            Some(default_compactor.compact_history(messages.clone()).await)
-        } else {
-            None
+            return compact_messages_for_threshold(
+                &default_compactor,
+                messages,
+                message_store,
+                thread_id,
+                tx,
+                hooks,
+                seq,
+            )
+            .await;
         }
-    } else {
-        None
-    };
+    }
 
-    let Some(result) = maybe_result else {
-        return Ok(messages);
-    };
+    Ok(messages)
+}
 
-    match result {
+struct StoredCompactionResult {
+    messages: Vec<Message>,
+    original_count: usize,
+    new_count: usize,
+    original_tokens: usize,
+    new_tokens: usize,
+}
+
+async fn compact_messages_for_threshold<C, H, M>(
+    compactor: &C,
+    messages: Vec<Message>,
+    message_store: &Arc<M>,
+    thread_id: &ThreadId,
+    tx: &mpsc::Sender<AgentEventEnvelope>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+) -> Result<Vec<Message>, AgentError>
+where
+    C: ContextCompactor + ?Sized,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let original_messages = messages.clone();
+    match compact_history_and_store(
+        compactor,
+        messages,
+        message_store,
+        thread_id,
+        "threshold",
+        "Context compaction failed",
+        "Failed to replace history after compaction",
+    )
+    .await
+    {
         Ok(result) => {
-            if let Err(error) = message_store
-                .replace_history(thread_id, result.messages.clone())
-                .await
-            {
-                warn!("Failed to replace history after compaction: {error}");
-                Ok(messages)
-            } else {
-                send_event(
-                    tx,
-                    hooks,
-                    seq,
-                    AgentEvent::context_compacted(
-                        result.original_count,
-                        result.new_count,
-                        result.original_tokens,
-                        result.new_tokens,
-                    ),
-                )
-                .await;
-
-                info!(
-                    "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::context_compacted(
                     result.original_count,
                     result.new_count,
                     result.original_tokens,
-                    result.new_tokens
-                );
-                Ok(result.messages)
-            }
+                    result.new_tokens,
+                ),
+            )
+            .await;
+
+            info!(
+                "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
+                result.original_count, result.new_count, result.original_tokens, result.new_tokens
+            );
+
+            Ok(result.messages)
         }
         Err(error) => {
             warn!("Context compaction failed, continuing with full history: {error}");
-            Ok(messages)
+            Ok(original_messages)
         }
     }
+}
+
+async fn compact_history_and_store<C, M>(
+    compactor: &C,
+    messages: Vec<Message>,
+    message_store: &Arc<M>,
+    thread_id: &ThreadId,
+    trigger: &'static str,
+    compaction_error_prefix: &'static str,
+    replace_history_error_prefix: &'static str,
+) -> Result<StoredCompactionResult, AgentError>
+where
+    C: ContextCompactor + ?Sized,
+    M: MessageStore,
+{
+    #[cfg(not(feature = "otel"))]
+    let _ = trigger;
+    #[cfg(feature = "otel")]
+    let mut compaction_span = start_compaction_span(trigger);
+
+    let result = match compactor.compact_history(messages).await {
+        Ok(result) => result,
+        Err(error) => {
+            #[cfg(feature = "otel")]
+            finish_compaction_span_error(
+                &mut compaction_span,
+                "context_compaction_failed",
+                &error.to_string(),
+            );
+            return Err(AgentError::new(
+                format!("{compaction_error_prefix}: {error}"),
+                false,
+            ));
+        }
+    };
+
+    let stored_result = StoredCompactionResult {
+        messages: result.messages,
+        original_count: result.original_count,
+        new_count: result.new_count,
+        original_tokens: result.original_tokens,
+        new_tokens: result.new_tokens,
+    };
+
+    #[cfg(feature = "otel")]
+    record_compaction_result(&mut compaction_span, &stored_result);
+
+    if let Err(error) = message_store
+        .replace_history(thread_id, stored_result.messages.clone())
+        .await
+    {
+        #[cfg(feature = "otel")]
+        finish_compaction_span_error(
+            &mut compaction_span,
+            "context_compaction_history_replace_failed",
+            &error.to_string(),
+        );
+        return Err(AgentError::new(
+            format!("{replace_history_error_prefix}: {error}"),
+            false,
+        ));
+    }
+
+    #[cfg(feature = "otel")]
+    finish_compaction_span_success(&mut compaction_span);
+
+    Ok(stored_result)
+}
+
+#[cfg(feature = "otel")]
+fn start_compaction_span(trigger: &'static str) -> opentelemetry::global::BoxedSpan {
+    use crate::observability::{attrs, spans};
+
+    spans::start_internal_span(
+        "agent.context_compaction",
+        vec![attrs::kv(attrs::SDK_COMPACTION_TRIGGER, trigger)],
+    )
+}
+
+#[cfg(feature = "otel")]
+fn record_compaction_result(
+    span: &mut opentelemetry::global::BoxedSpan,
+    result: &StoredCompactionResult,
+) {
+    use crate::observability::attrs;
+    use opentelemetry::trace::Span;
+
+    span.set_attribute(attrs::kv_i64(
+        attrs::SDK_COMPACTION_ORIGINAL_COUNT,
+        i64::try_from(result.original_count).unwrap_or(0),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::SDK_COMPACTION_NEW_COUNT,
+        i64::try_from(result.new_count).unwrap_or(0),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::SDK_COMPACTION_ORIGINAL_TOKENS,
+        i64::try_from(result.original_tokens).unwrap_or(0),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::SDK_COMPACTION_NEW_TOKENS,
+        i64::try_from(result.new_tokens).unwrap_or(0),
+    ));
+}
+
+#[cfg(feature = "otel")]
+fn finish_compaction_span_success(span: &mut opentelemetry::global::BoxedSpan) {
+    use crate::observability::attrs;
+    use opentelemetry::trace::Span;
+
+    span.set_attribute(attrs::kv(attrs::SDK_OUTCOME, "success"));
+    span.end();
+}
+
+#[cfg(feature = "otel")]
+fn finish_compaction_span_error(
+    span: &mut opentelemetry::global::BoxedSpan,
+    error_type: &'static str,
+    message: &str,
+) {
+    use crate::observability::{attrs, spans};
+    use opentelemetry::trace::Span;
+
+    span.set_attribute(attrs::kv(attrs::SDK_OUTCOME, "error"));
+    spans::set_span_error(span, error_type, message);
+    span.end();
 }
 
 pub(super) fn build_turn_request<Ctx, P>(
@@ -336,7 +500,30 @@ where
 {
     debug!("Calling LLM (turn={turn}, streaming={})", config.streaming);
 
-    if config.streaming {
+    #[cfg(feature = "otel")]
+    let mut llm_span = {
+        use crate::observability::{attrs, spans};
+        use opentelemetry::KeyValue;
+
+        let span_name = format!("chat {}", provider.model());
+        let provider_name = crate::observability::provider_name::normalize(provider.provider());
+        let mut init_attrs = vec![
+            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, provider.model().to_string()),
+            attrs::kv_bool(attrs::SDK_LLM_STREAMING, config.streaming),
+            KeyValue::new(attrs::SDK_PROVIDER_ID, provider.provider()),
+        ];
+        if let Some(max_tokens) = config.max_tokens {
+            init_attrs.push(attrs::kv_i64(
+                attrs::GEN_AI_REQUEST_MAX_OUTPUT_TOKENS,
+                i64::from(max_tokens),
+            ));
+        }
+        spans::start_client_span(span_name, init_attrs)
+    };
+
+    let (result, retry_count) = if config.streaming {
         call_llm_streaming(
             provider,
             request,
@@ -349,7 +536,89 @@ where
         .await
     } else {
         call_llm_with_retry(provider, request, config, tx, hooks, seq).await
+    };
+
+    #[cfg(feature = "otel")]
+    finish_llm_span(&mut llm_span, &result, retry_count);
+
+    // Silence unused binding when otel is disabled.
+    let _ = retry_count;
+
+    result
+}
+
+#[cfg(feature = "otel")]
+fn finish_llm_span(
+    span: &mut opentelemetry::global::BoxedSpan,
+    result: &Result<ChatResponse, AgentError>,
+    retry_count: u32,
+) {
+    use crate::observability::{attrs, spans};
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::Span;
+
+    for attempt in 1..=retry_count {
+        span.add_event(
+            "llm.retry",
+            vec![KeyValue::new("retry.attempt", i64::from(attempt))],
+        );
     }
+
+    match result {
+        Ok(response) => {
+            if !response.id.is_empty() {
+                span.set_attribute(KeyValue::new(
+                    attrs::GEN_AI_RESPONSE_ID,
+                    response.id.clone(),
+                ));
+            }
+            span.set_attribute(KeyValue::new(
+                attrs::GEN_AI_RESPONSE_MODEL,
+                response.model.clone(),
+            ));
+            if let Some(reason) = response.stop_reason {
+                span.set_attribute(KeyValue::new(
+                    attrs::GEN_AI_RESPONSE_FINISH_REASONS,
+                    attrs::finish_reason_str(reason),
+                ));
+            }
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_INPUT_TOKENS,
+                i64::from(response.usage.input_tokens),
+            ));
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+                i64::from(response.usage.output_tokens),
+            ));
+            span.set_attribute(attrs::kv_bool(
+                attrs::SDK_LLM_HAD_TOOL_CALLS,
+                response.has_tool_use(),
+            ));
+            span.set_attribute(attrs::kv_bool(
+                attrs::SDK_LLM_TEXT_OUTPUT_PRESENT,
+                response.first_text().is_some(),
+            ));
+            span.set_attribute(attrs::kv_bool(
+                attrs::SDK_LLM_THINKING_PRESENT,
+                response.first_thinking().is_some(),
+            ));
+        }
+        Err(err) => {
+            let error_type = if err.message.contains("Rate limited") {
+                "rate_limited"
+            } else if err.message.contains("Invalid request") {
+                "invalid_request"
+            } else if err.message.contains("Server error") {
+                "server_error"
+            } else if err.message.contains("Stream") {
+                "stream_error"
+            } else {
+                "_OTHER"
+            };
+            spans::set_span_error(span, error_type, &err.message);
+        }
+    }
+    span.end();
 }
 
 pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -> TokenUsage {
@@ -645,33 +914,36 @@ where
         })?;
 
     let result = if let Some(compactor) = compactor {
-        compactor.compact_history(history).await
+        compact_history_and_store(
+            compactor.as_ref(),
+            history,
+            message_store,
+            thread_id,
+            "overflow",
+            "Context compaction failed after overflow",
+            "Failed to replace history after overflow compaction",
+        )
+        .await?
     } else {
         let default_compactor =
             LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
-        default_compactor.compact_history(history).await
-    }
-    .map_err(|error| {
-        AgentError::new(
-            format!("Context compaction failed after overflow: {error}"),
-            false,
+        compact_history_and_store(
+            &default_compactor,
+            history,
+            message_store,
+            thread_id,
+            "overflow",
+            "Context compaction failed after overflow",
+            "Failed to replace history after overflow compaction",
         )
-    })?;
-
-    message_store
-        .replace_history(thread_id, result.messages)
-        .await
-        .map_err(|error| {
-            AgentError::new(
-                format!("Failed to replace history after overflow compaction: {error}"),
-                false,
-            )
-        })?;
+        .await?
+    };
 
     info!(
         "Context compacted after overflow (original_tokens={}, new_tokens={})",
         result.original_tokens, result.new_tokens
     );
+
     Ok(())
 }
 
@@ -864,6 +1136,77 @@ where
 }
 
 pub(super) async fn execute_turn<Ctx, P, H, M, S>(
+    params: ExecuteTurnParameters<'_, Ctx, P, H, M, S>,
+) -> InternalTurnResult
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    #[cfg(feature = "otel")]
+    let turn_number = params.ctx.turn + 1; // begin_turn increments
+
+    let result = execute_turn_inner(params).await;
+
+    #[cfg(feature = "otel")]
+    {
+        // Span is created and ended in one shot after the turn completes.
+        // This avoids holding a span across all the awaits inside the turn.
+        use crate::observability::{attrs, spans};
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::Span;
+
+        let mut turn_span = spans::start_internal_span(
+            "agent.turn",
+            vec![attrs::kv_i64(
+                attrs::SDK_TURN_NUMBER,
+                i64::try_from(turn_number).unwrap_or(0),
+            )],
+        );
+
+        match &result {
+            InternalTurnResult::Continue { turn_usage } => {
+                let had_tools = turn_usage.input_tokens > 0 || turn_usage.output_tokens > 0;
+                turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "continue"));
+                turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, had_tools));
+                turn_span.set_attribute(attrs::kv_i64(
+                    attrs::SDK_TURN_INPUT_TOKENS,
+                    i64::from(turn_usage.input_tokens),
+                ));
+                turn_span.set_attribute(attrs::kv_i64(
+                    attrs::SDK_TURN_OUTPUT_TOKENS,
+                    i64::from(turn_usage.output_tokens),
+                ));
+            }
+            InternalTurnResult::Done => {
+                turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "done"));
+                turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            }
+            InternalTurnResult::Refusal => {
+                turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "refusal"));
+                turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            }
+            InternalTurnResult::AwaitingConfirmation { .. } => {
+                turn_span.set_attribute(KeyValue::new(
+                    attrs::SDK_TURN_STOP_REASON,
+                    "awaiting_confirmation",
+                ));
+                turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, true));
+            }
+            InternalTurnResult::Error(err) => {
+                turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "error"));
+                spans::set_span_error(&mut turn_span, "turn_error", &err.message);
+            }
+        }
+        turn_span.end();
+    }
+
+    result
+}
+
+async fn execute_turn_inner<Ctx, P, H, M, S>(
     ExecuteTurnParameters {
         tx,
         seq,
