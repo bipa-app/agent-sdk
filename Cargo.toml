@@ -31,6 +31,7 @@ url = "2"
 tokio-util = "0.7"
 html2text = "0.14"
 base64 = "0.22"
+tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }

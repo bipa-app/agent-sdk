@@ -12,12 +12,26 @@ use crate::llm::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_CODEX_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
+const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const OPENAI_CODEX_RESPONSES_BETA_HEADER: &str = "responses=experimental";
+const OPENAI_CODEX_RESPONSES_WEBSOCKETS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
+const OPENAI_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str =
+    "websocket_connection_limit_reached";
 
 // GPT-5.4 (frontier reasoning with 1.05M context)
 pub const MODEL_GPT54: &str = "gpt-5.4";
@@ -29,7 +43,7 @@ pub const MODEL_GPT53_CODEX: &str = "gpt-5.3-codex";
 pub const MODEL_GPT52_CODEX: &str = "gpt-5.2-codex";
 
 /// Reasoning effort level for the model.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
@@ -52,6 +66,21 @@ pub struct OpenAICodexResponsesProvider {
     model: String,
     base_url: String,
     thinking: Option<ThinkingConfig>,
+    account_id: Option<String>,
+    websocket_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<WebsocketSessionState>>>>>,
+}
+
+type CodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Default)]
+struct WebsocketSessionState {
+    connection: Option<CodexWebSocket>,
+    last_request: Option<ApiStreamingRequest>,
+    last_response_id: Option<String>,
+    last_response_items: Vec<ApiInputItem>,
+    turn_state: Option<String>,
+    prewarmed: bool,
+    websocket_disabled: bool,
 }
 
 impl OpenAICodexResponsesProvider {
@@ -64,6 +93,8 @@ impl OpenAICodexResponsesProvider {
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
+            account_id: None,
+            websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -76,6 +107,8 @@ impl OpenAICodexResponsesProvider {
             model,
             base_url,
             thinking: None,
+            account_id: None,
+            websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -104,6 +137,13 @@ impl OpenAICodexResponsesProvider {
         self
     }
 
+    /// Set a known ChatGPT account id, avoiding JWT decoding on each request.
+    #[must_use]
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+
     /// Set the reasoning effort level.
     #[must_use]
     pub fn with_reasoning_effort(self, effort: ReasoningEffort) -> Self {
@@ -122,12 +162,45 @@ impl OpenAICodexResponsesProvider {
         &self,
         streaming: bool,
         session_id: Option<&str>,
+        turn_state: Option<&str>,
+    ) -> Result<reqwest::header::HeaderMap> {
+        self.build_headers_with_beta(
+            streaming,
+            session_id,
+            OPENAI_CODEX_RESPONSES_BETA_HEADER,
+            turn_state,
+        )
+    }
+
+    fn build_websocket_headers(
+        &self,
+        session_id: Option<&str>,
+        turn_state: Option<&str>,
+    ) -> Result<reqwest::header::HeaderMap> {
+        self.build_headers_with_beta(
+            false,
+            session_id,
+            OPENAI_CODEX_RESPONSES_WEBSOCKETS_BETA_HEADER,
+            turn_state,
+        )
+    }
+
+    fn build_headers_with_beta(
+        &self,
+        streaming: bool,
+        session_id: Option<&str>,
+        beta_header: &'static str,
+        turn_state: Option<&str>,
     ) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{
             ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
         };
 
-        let account_id = extract_account_id(&self.api_key)
+        let account_id = self
+            .account_id
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| extract_account_id(&self.api_key))
             .context("failed to extract chatgpt account id from OpenAI Codex OAuth token")?;
 
         let mut headers = HeaderMap::new();
@@ -136,29 +209,70 @@ impl OpenAICodexResponsesProvider {
             HeaderValue::from_str(&format!("Bearer {}", self.api_key))?,
         );
         headers.insert("chatgpt-account-id", HeaderValue::from_str(&account_id)?);
+        headers.insert("OpenAI-Beta", HeaderValue::from_static(beta_header));
         headers.insert(
-            "OpenAI-Beta",
-            HeaderValue::from_static("responses=experimental"),
+            "originator",
+            HeaderValue::from_static(OPENAI_CODEX_ORIGINATOR),
         );
-        headers.insert("originator", HeaderValue::from_static("bip"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
             HeaderValue::from_str(&format!(
-                "bip ({} {}; {})",
+                "{OPENAI_CODEX_ORIGINATOR}/{} ({} {})",
+                env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                env!("CARGO_PKG_VERSION")
             ))?,
         );
         if streaming {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         }
         if let Some(session_id) = session_id {
-            headers.insert("session_id", HeaderValue::from_str(session_id)?);
+            let session_id_header = HeaderValue::from_str(session_id)?;
+            headers.insert("session_id", session_id_header.clone());
+            headers.insert("x-client-request-id", session_id_header);
+        }
+        if let Some(turn_state) = turn_state {
+            headers.insert(
+                OPENAI_CODEX_TURN_STATE_HEADER,
+                HeaderValue::from_str(turn_state)?,
+            );
         }
 
         Ok(headers)
+    }
+
+    async fn websocket_session(&self, session_id: &str) -> Arc<Mutex<WebsocketSessionState>> {
+        let mut sessions = self.websocket_sessions.lock().await;
+        sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(WebsocketSessionState::default())))
+            .clone()
+    }
+
+    async fn connect_websocket(
+        &self,
+        session_id: Option<&str>,
+        turn_state: Option<&str>,
+    ) -> Result<(CodexWebSocket, Option<String>)> {
+        let headers = self.build_websocket_headers(session_id, turn_state)?;
+        let url = codex_websocket_url(&self.base_url)
+            .context("failed to build OpenAI Codex websocket URL")?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .context("failed to build OpenAI Codex websocket request")?;
+        request.headers_mut().extend(headers);
+
+        let (stream, response) = connect_async(request)
+            .await
+            .context("failed to connect OpenAI Codex websocket")?;
+        let turn_state = response
+            .headers()
+            .get(OPENAI_CODEX_TURN_STATE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        Ok((stream, turn_state))
     }
 
     fn map_response(api_response: ApiResponse) -> ChatResponse {
@@ -229,6 +343,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             reasoning,
             tool_choice: Some("auto"),
             parallel_tool_calls: parallel_tool_calls.then_some(true),
+            store: false,
             text: Some(ApiTextSettings {
                 verbosity: "medium",
             }),
@@ -245,7 +360,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let response = self
             .client
             .post(codex_url(&self.base_url))
-            .headers(self.build_headers(false, request.session_id.as_deref())?)
+            .headers(self.build_headers(false, request.session_id.as_deref(), None)?)
             .json(&api_request)
             .send()
             .await
@@ -305,34 +420,692 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 });
                 return;
             }
+
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
             let max_output_tokens = Self::max_output_tokens(&request);
-            let prompt_cache_key = request.session_id.as_deref();
             let tools: Option<Vec<ApiTool>> = request
                 .tools
                 .as_ref()
                 .map(|ts| ts.iter().cloned().map(convert_tool).collect());
             let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-
-            let api_request = ApiResponsesRequestStreaming {
-                model: &self.model,
-                instructions: request.system.as_str(),
-                input: &input,
-                tools: tools.as_deref(),
+            let api_request = ApiStreamingRequest {
+                model: self.model.clone(),
+                instructions: request.system.clone(),
+                input,
+                tools,
                 max_output_tokens,
                 reasoning,
-                tool_choice: Some("auto"),
+                tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: parallel_tool_calls.then_some(true),
+                store: false,
                 text: Some(ApiTextSettings { verbosity: "medium" }),
-                include: Some(&["reasoning.encrypted_content"]),
-                prompt_cache_key,
+                include: Some(vec!["reasoning.encrypted_content".to_string()]),
+                prompt_cache_key: request.session_id.clone(),
                 stream: true,
             };
 
             log::debug!("OpenAI Codex streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let headers = match self.build_headers(true, request.session_id.as_deref()) {
+            let mut sse_turn_state: Option<String> = None;
+
+            if let Some(session_id) = request.session_id.as_deref() {
+                let session = self.websocket_session(session_id).await;
+                let mut websocket_session = session.lock().await;
+
+                if !websocket_session.websocket_disabled {
+                    'websocket_attempts: for attempt in 0..2 {
+                        if websocket_session.connection.is_none() {
+                            match self
+                                .connect_websocket(
+                                    Some(session_id),
+                                    websocket_session.turn_state.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok((connection, turn_state)) => {
+                                    websocket_session.connection = Some(connection);
+                                    if let Some(turn_state) = turn_state {
+                                        websocket_session.turn_state = Some(turn_state);
+                                    }
+                                    websocket_session.prewarmed = false;
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "OpenAI Codex websocket connect failed on attempt {}: {error:#}",
+                                        attempt + 1,
+                                    );
+                                    if attempt == 1 {
+                                        websocket_session.websocket_disabled = true;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if websocket_session.connection.is_some()
+                            && websocket_session.last_request.is_none()
+                            && !websocket_session.prewarmed
+                        {
+                            let mut warmup_request = ApiWebsocketRequest::from(&api_request);
+                            warmup_request.generate = Some(false);
+                            let warmup_payload = match serde_json::to_string(&warmup_request) {
+                                Ok(payload) => payload,
+                                Err(error) => {
+                                    yield Ok(StreamDelta::Error {
+                                        message: format!(
+                                            "failed to encode websocket warmup request: {error}"
+                                        ),
+                                        recoverable: false,
+                                    });
+                                    return;
+                                }
+                            };
+
+                            let warmup_send_result = if let Some(connection) =
+                                websocket_session.connection.as_mut()
+                            {
+                                connection.send(WebSocketMessage::Text(warmup_payload.into())).await
+                            } else {
+                                Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+                            };
+
+                            if let Err(error) = warmup_send_result {
+                                log::warn!(
+                                    "OpenAI Codex websocket warmup send failed on attempt {}: {error}",
+                                    attempt + 1,
+                                );
+                                reset_websocket_connection(&mut websocket_session);
+                                if attempt == 1 {
+                                    websocket_session.websocket_disabled = true;
+                                }
+                                continue;
+                            }
+
+                            let mut warmup_response_id: Option<String> = None;
+                            let mut warmup_response_items = Vec::new();
+
+                            loop {
+                                let message_result = if let Some(connection) =
+                                    websocket_session.connection.as_mut()
+                                {
+                                    connection.next().await
+                                } else {
+                                    None
+                                };
+                                let Some(message_result) = message_result else {
+                                    log::warn!(
+                                        "OpenAI Codex websocket warmup closed before completion on attempt {}",
+                                        attempt + 1,
+                                    );
+                                    reset_websocket_connection(&mut websocket_session);
+                                    if attempt == 1 {
+                                        websocket_session.websocket_disabled = true;
+                                    }
+                                    continue 'websocket_attempts;
+                                };
+
+                                let message = match message_result {
+                                    Ok(message) => message,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "OpenAI Codex websocket warmup failed on attempt {}: {error}",
+                                            attempt + 1,
+                                        );
+                                        reset_websocket_connection(&mut websocket_session);
+                                        if attempt == 1 {
+                                            websocket_session.websocket_disabled = true;
+                                        }
+                                        continue 'websocket_attempts;
+                                    }
+                                };
+
+                                match message {
+                                    WebSocketMessage::Text(text) => {
+                                        if let Some((status, message)) =
+                                            parse_wrapped_websocket_error_event(&text)
+                                        {
+                                            log::warn!(
+                                                "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                attempt + 1,
+                                                status,
+                                            );
+                                            if status == StatusCode::UNAUTHORIZED
+                                                || status == StatusCode::UPGRADE_REQUIRED
+                                                || status.is_client_error()
+                                            {
+                                                websocket_session.websocket_disabled = true;
+                                            }
+                                            reset_websocket_connection(&mut websocket_session);
+                                            continue 'websocket_attempts;
+                                        }
+                                        if let Ok(event) =
+                                            serde_json::from_str::<ApiStreamEvent>(&text)
+                                        {
+                                            match event.r#type.as_str() {
+                                                "response.output_item.added" => {
+                                                    if let Some(item) = event.item
+                                                        && let Ok(item) =
+                                                            serde_json::from_value::<ApiOutputItem>(item)
+                                                        && let Some(item) =
+                                                            output_item_to_input_item(item)
+                                                    {
+                                                        warmup_response_items.push(item);
+                                                    }
+                                                }
+                                                "response.completed" | "response.done" => {
+                                                    if let Some(resp) = event.response
+                                                        && let Some(id) = resp.id
+                                                    {
+                                                        warmup_response_id = Some(id);
+                                                    }
+                                                    websocket_session.last_request =
+                                                        Some(api_request.clone());
+                                                    websocket_session.last_response_id =
+                                                        warmup_response_id;
+                                                    websocket_session.last_response_items =
+                                                        warmup_response_items;
+                                                    websocket_session.prewarmed = true;
+                                                    break;
+                                                }
+                                                "response.incomplete" | "response.failed" => {
+                                                    log::warn!(
+                                                        "OpenAI Codex websocket warmup returned {} on attempt {}",
+                                                        event.r#type,
+                                                        attempt + 1,
+                                                    );
+                                                    reset_websocket_connection(&mut websocket_session);
+                                                    if attempt == 1 {
+                                                        websocket_session.websocket_disabled = true;
+                                                    }
+                                                    continue 'websocket_attempts;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    WebSocketMessage::Binary(bytes) => {
+                                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                            if let Some((status, message)) =
+                                                parse_wrapped_websocket_error_event(&text)
+                                            {
+                                                log::warn!(
+                                                    "OpenAI Codex websocket warmup wrapped error on attempt {} status={} message={message}",
+                                                    attempt + 1,
+                                                    status,
+                                                );
+                                                if status == StatusCode::UNAUTHORIZED
+                                                    || status == StatusCode::UPGRADE_REQUIRED
+                                                    || status.is_client_error()
+                                                {
+                                                    websocket_session.websocket_disabled = true;
+                                                }
+                                                reset_websocket_connection(&mut websocket_session);
+                                                continue 'websocket_attempts;
+                                            }
+
+                                            if let Ok(event) =
+                                                serde_json::from_str::<ApiStreamEvent>(&text)
+                                            {
+                                                match event.r#type.as_str() {
+                                                    "response.output_item.added" => {
+                                                        if let Some(item) = event.item
+                                                            && let Ok(item) = serde_json::from_value::<
+                                                                ApiOutputItem,
+                                                            >(item)
+                                                            && let Some(item) =
+                                                                output_item_to_input_item(item)
+                                                        {
+                                                            warmup_response_items.push(item);
+                                                        }
+                                                    }
+                                                    "response.completed" | "response.done" => {
+                                                        if let Some(resp) = event.response
+                                                            && let Some(id) = resp.id
+                                                        {
+                                                            warmup_response_id = Some(id);
+                                                        }
+                                                        websocket_session.last_request =
+                                                            Some(api_request.clone());
+                                                        websocket_session.last_response_id =
+                                                            warmup_response_id;
+                                                        websocket_session.last_response_items =
+                                                            warmup_response_items;
+                                                        websocket_session.prewarmed = true;
+                                                        break;
+                                                    }
+                                                    "response.incomplete" | "response.failed" => {
+                                                        log::warn!(
+                                                            "OpenAI Codex websocket warmup returned {} on attempt {}",
+                                                            event.r#type,
+                                                            attempt + 1,
+                                                        );
+                                                        reset_websocket_connection(&mut websocket_session);
+                                                        if attempt == 1 {
+                                                            websocket_session.websocket_disabled = true;
+                                                        }
+                                                        continue 'websocket_attempts;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    WebSocketMessage::Ping(payload) => {
+                                        if let Some(connection) =
+                                            websocket_session.connection.as_mut()
+                                            && let Err(error) = connection
+                                                .send(WebSocketMessage::Pong(payload))
+                                                .await
+                                        {
+                                            log::warn!(
+                                                "OpenAI Codex websocket warmup pong failed on attempt {}: {error}",
+                                                attempt + 1,
+                                            );
+                                            reset_websocket_connection(&mut websocket_session);
+                                            if attempt == 1 {
+                                                websocket_session.websocket_disabled = true;
+                                            }
+                                            continue 'websocket_attempts;
+                                        }
+                                    }
+                                    WebSocketMessage::Pong(_) => {}
+                                    WebSocketMessage::Close(_) => {
+                                        log::warn!(
+                                            "OpenAI Codex websocket warmup closed on attempt {}",
+                                            attempt + 1,
+                                        );
+                                        reset_websocket_connection(&mut websocket_session);
+                                        if attempt == 1 {
+                                            websocket_session.websocket_disabled = true;
+                                        }
+                                        continue 'websocket_attempts;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let websocket_request = prepare_websocket_request(
+                            &api_request,
+                            &websocket_session,
+                            websocket_session.prewarmed,
+                        );
+                        let request_payload = match serde_json::to_string(&websocket_request) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                yield Ok(StreamDelta::Error {
+                                    message: format!(
+                                        "failed to encode websocket request: {error}"
+                                    ),
+                                    recoverable: false,
+                                });
+                                return;
+                            }
+                        };
+
+                        let send_result = if let Some(connection) = websocket_session.connection.as_mut() {
+                            connection.send(WebSocketMessage::Text(request_payload.into())).await
+                        } else {
+                            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+                        };
+
+                        if let Err(error) = send_result {
+                            log::warn!(
+                                "OpenAI Codex websocket send failed on attempt {}: {error}",
+                                attempt + 1,
+                            );
+                            reset_websocket_connection(&mut websocket_session);
+                            if attempt == 1 {
+                                websocket_session.websocket_disabled = true;
+                            }
+                            continue;
+                        }
+
+                        let mut usage: Option<Usage> = None;
+                        let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
+                        let mut response_id: Option<String> = None;
+                        let mut response_items = Vec::new();
+                        let mut emitted_output = false;
+
+                        loop {
+                            let message_result = if let Some(connection) =
+                                websocket_session.connection.as_mut()
+                            {
+                                connection.next().await
+                            } else {
+                                None
+                            };
+                            let Some(message_result) = message_result else {
+                                if emitted_output {
+                                    reset_websocket_connection(&mut websocket_session);
+                                    yield Ok(StreamDelta::Error {
+                                        message: "websocket closed before response.completed"
+                                            .to_string(),
+                                        recoverable: true,
+                                    });
+                                    return;
+                                }
+                                reset_websocket_connection(&mut websocket_session);
+                                if attempt == 1 {
+                                    websocket_session.websocket_disabled = true;
+                                }
+                                continue 'websocket_attempts;
+                            };
+
+                            let message = match message_result {
+                                Ok(message) => message,
+                                Err(error) => {
+                                    if emitted_output {
+                                        reset_websocket_connection(&mut websocket_session);
+                                        yield Ok(StreamDelta::Error {
+                                            message: format!("websocket error: {error}"),
+                                            recoverable: true,
+                                        });
+                                        return;
+                                    }
+                                    reset_websocket_connection(&mut websocket_session);
+                                    if attempt == 1 {
+                                        websocket_session.websocket_disabled = true;
+                                    }
+                                    continue 'websocket_attempts;
+                                }
+                            };
+
+                            match message {
+                                WebSocketMessage::Text(text) => {
+                                    if let Some((status, message)) =
+                                        parse_wrapped_websocket_error_event(&text)
+                                    {
+                                        let recoverable =
+                                            status == StatusCode::TOO_MANY_REQUESTS
+                                                || status.is_server_error();
+                                        if emitted_output {
+                                            reset_websocket_connection(&mut websocket_session);
+                                            yield Ok(StreamDelta::Error {
+                                                message,
+                                                recoverable,
+                                            });
+                                            return;
+                                        }
+                                        if status == StatusCode::UNAUTHORIZED
+                                            || status == StatusCode::UPGRADE_REQUIRED
+                                            || status.is_client_error()
+                                        {
+                                            websocket_session.websocket_disabled = true;
+                                        }
+                                        reset_websocket_connection(&mut websocket_session);
+                                        continue 'websocket_attempts;
+                                    }
+                                    if let Ok(event) = serde_json::from_str::<ApiStreamEvent>(&text) {
+                                        match event.r#type.as_str() {
+                                            "response.output_text.delta" => {
+                                                if let Some(delta) = event.delta {
+                                                    emitted_output = true;
+                                                    yield Ok(StreamDelta::TextDelta {
+                                                        delta,
+                                                        block_index: 0,
+                                                    });
+                                                }
+                                            }
+                                            "response.function_call_arguments.delta" => {
+                                                if let (Some(call_id), Some(delta)) =
+                                                    (event.call_id, event.delta)
+                                                {
+                                                    let acc = tool_calls
+                                                        .entry(call_id.clone())
+                                                        .or_insert_with(|| ToolCallAccumulator {
+                                                            id: call_id,
+                                                            name: event.name.unwrap_or_default(),
+                                                            arguments: String::new(),
+                                                        });
+                                                    acc.arguments.push_str(&delta);
+                                                }
+                                            }
+                                            "response.output_item.added" => {
+                                                if let Some(item) = event.item
+                                                    && let Ok(item) =
+                                                        serde_json::from_value::<ApiOutputItem>(item)
+                                                    && let Some(item) = output_item_to_input_item(item)
+                                                {
+                                                    response_items.push(item);
+                                                }
+                                            }
+                                            "response.completed"
+                                            | "response.incomplete"
+                                            | "response.done" => {
+                                                if let Some(resp) = event.response {
+                                                    if let Some(u) = resp.usage {
+                                                        usage = Some(usage_from_api_usage(u));
+                                                    }
+                                                    if let Some(id) = resp.id {
+                                                        response_id = Some(id);
+                                                    }
+                                                }
+                                                let final_status = Some(match event.r#type.as_str() {
+                                                    "response.incomplete" => ApiStatus::Incomplete,
+                                                    _ => ApiStatus::Completed,
+                                                });
+                                                for delta in emit_accumulated_tool_calls(&tool_calls) {
+                                                    yield Ok(delta);
+                                                }
+                                                if let Some(u) = usage.take() {
+                                                    yield Ok(StreamDelta::Usage(u));
+                                                }
+                                                websocket_session.last_request = Some(api_request.clone());
+                                                websocket_session.last_response_id = response_id;
+                                                websocket_session.last_response_items = response_items;
+                                                websocket_session.prewarmed = false;
+                                                yield Ok(StreamDelta::Done {
+                                                    stop_reason: Some(stop_reason_from_stream_state(
+                                                        &tool_calls,
+                                                        final_status,
+                                                    )),
+                                                });
+                                                return;
+                                            }
+                                            "response.failed" => {
+                                                websocket_session.last_request = None;
+                                                websocket_session.last_response_id = None;
+                                                websocket_session.last_response_items.clear();
+                                                websocket_session.prewarmed = false;
+                                                let message = event
+                                                    .response
+                                                    .and_then(|resp| resp.error)
+                                                    .and_then(|error| error.message)
+                                                    .unwrap_or_else(|| {
+                                                        "Codex response failed".to_string()
+                                                    });
+                                                yield Ok(StreamDelta::Error {
+                                                    message,
+                                                    recoverable: false,
+                                                });
+                                                return;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                WebSocketMessage::Binary(bytes) => {
+                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                        if let Some((status, message)) =
+                                            parse_wrapped_websocket_error_event(&text)
+                                        {
+                                            let recoverable =
+                                                status == StatusCode::TOO_MANY_REQUESTS
+                                                    || status.is_server_error();
+                                            if emitted_output {
+                                                reset_websocket_connection(&mut websocket_session);
+                                                yield Ok(StreamDelta::Error {
+                                                    message,
+                                                    recoverable,
+                                                });
+                                                return;
+                                            }
+                                            if status == StatusCode::UNAUTHORIZED
+                                                || status == StatusCode::UPGRADE_REQUIRED
+                                                || status.is_client_error()
+                                            {
+                                                websocket_session.websocket_disabled = true;
+                                            }
+                                            reset_websocket_connection(&mut websocket_session);
+                                            continue 'websocket_attempts;
+                                        }
+
+                                        if let Ok(event) =
+                                            serde_json::from_str::<ApiStreamEvent>(&text)
+                                        {
+                                            match event.r#type.as_str() {
+                                                "response.output_text.delta" => {
+                                                    if let Some(delta) = event.delta {
+                                                        emitted_output = true;
+                                                        yield Ok(StreamDelta::TextDelta {
+                                                            delta,
+                                                            block_index: 0,
+                                                        });
+                                                    }
+                                                }
+                                                "response.function_call_arguments.delta" => {
+                                                    if let (Some(call_id), Some(delta)) =
+                                                        (event.call_id, event.delta)
+                                                    {
+                                                        let acc = tool_calls
+                                                            .entry(call_id.clone())
+                                                            .or_insert_with(|| ToolCallAccumulator {
+                                                                id: call_id,
+                                                                name: event.name.unwrap_or_default(),
+                                                                arguments: String::new(),
+                                                            });
+                                                        acc.arguments.push_str(&delta);
+                                                    }
+                                                }
+                                                "response.output_item.added" => {
+                                                    if let Some(item) = event.item
+                                                        && let Ok(item) = serde_json::from_value::<
+                                                            ApiOutputItem,
+                                                        >(item)
+                                                        && let Some(item) =
+                                                            output_item_to_input_item(item)
+                                                    {
+                                                        response_items.push(item);
+                                                    }
+                                                }
+                                                "response.completed"
+                                                | "response.incomplete"
+                                                | "response.done" => {
+                                                    if let Some(resp) = event.response {
+                                                        if let Some(u) = resp.usage {
+                                                            usage = Some(usage_from_api_usage(u));
+                                                        }
+                                                        if let Some(id) = resp.id {
+                                                            response_id = Some(id);
+                                                        }
+                                                    }
+                                                    let final_status = Some(
+                                                        match event.r#type.as_str() {
+                                                            "response.incomplete" => ApiStatus::Incomplete,
+                                                            _ => ApiStatus::Completed,
+                                                        },
+                                                    );
+                                                    for delta in
+                                                        emit_accumulated_tool_calls(&tool_calls)
+                                                    {
+                                                        yield Ok(delta);
+                                                    }
+                                                    if let Some(u) = usage.take() {
+                                                        yield Ok(StreamDelta::Usage(u));
+                                                    }
+                                                    websocket_session.last_request =
+                                                        Some(api_request.clone());
+                                                    websocket_session.last_response_id = response_id;
+                                                    websocket_session.last_response_items =
+                                                        response_items;
+                                                    websocket_session.prewarmed = false;
+                                                    yield Ok(StreamDelta::Done {
+                                                        stop_reason: Some(
+                                                            stop_reason_from_stream_state(
+                                                                &tool_calls,
+                                                                final_status,
+                                                            ),
+                                                        ),
+                                                    });
+                                                    return;
+                                                }
+                                                "response.failed" => {
+                                                    websocket_session.last_request = None;
+                                                    websocket_session.last_response_id = None;
+                                                    websocket_session.last_response_items.clear();
+                                                    websocket_session.prewarmed = false;
+                                                    let message = event
+                                                        .response
+                                                        .and_then(|resp| resp.error)
+                                                        .and_then(|error| error.message)
+                                                        .unwrap_or_else(|| {
+                                                            "Codex response failed".to_string()
+                                                        });
+                                                    yield Ok(StreamDelta::Error {
+                                                        message,
+                                                        recoverable: false,
+                                                    });
+                                                    return;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                WebSocketMessage::Ping(payload) => {
+                                    if let Some(connection) = websocket_session.connection.as_mut()
+                                        && let Err(error) = connection
+                                            .send(WebSocketMessage::Pong(payload))
+                                            .await
+                                    {
+                                        if emitted_output {
+                                            reset_websocket_connection(&mut websocket_session);
+                                            yield Ok(StreamDelta::Error {
+                                                message: format!("websocket pong failed: {error}"),
+                                                recoverable: true,
+                                            });
+                                            return;
+                                        }
+                                        reset_websocket_connection(&mut websocket_session);
+                                        if attempt == 1 {
+                                            websocket_session.websocket_disabled = true;
+                                        }
+                                        continue 'websocket_attempts;
+                                    }
+                                }
+                                WebSocketMessage::Pong(_) => {}
+                                WebSocketMessage::Close(_) => {
+                                    if emitted_output {
+                                        reset_websocket_connection(&mut websocket_session);
+                                        yield Ok(StreamDelta::Error {
+                                            message: "websocket closed before response.completed"
+                                                .to_string(),
+                                            recoverable: true,
+                                        });
+                                        return;
+                                    }
+                                    reset_websocket_connection(&mut websocket_session);
+                                    if attempt == 1 {
+                                        websocket_session.websocket_disabled = true;
+                                    }
+                                    continue 'websocket_attempts;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                sse_turn_state = websocket_session.turn_state.clone();
+                drop(websocket_session);
+            }
+
+            let headers = match self.build_headers(
+                true,
+                request.session_id.as_deref(),
+                sse_turn_state.as_deref(),
+            ) {
                 Ok(headers) => headers,
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
@@ -355,7 +1128,6 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             };
 
             let status = response.status();
-
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
@@ -364,11 +1136,24 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 return;
             }
 
+            if let Some(session_id) = request.session_id.as_deref() {
+                let turn_state = response
+                    .headers()
+                    .get(OPENAI_CODEX_TURN_STATE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                if let Some(turn_state) = turn_state {
+                    let session = self.websocket_session(session_id).await;
+                    let mut websocket_session = session.lock().await;
+                    websocket_session.turn_state = Some(turn_state);
+                }
+            }
+
             let mut buffer = String::new();
             let mut stream = response.bytes_stream();
             let mut usage: Option<Usage> = None;
-            let mut tool_calls: std::collections::HashMap<String, ToolCallAccumulator> =
-                std::collections::HashMap::new();
+            let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
+            let mut final_status: Option<ApiStatus> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 let Ok(chunk) = chunk_result else {
@@ -380,40 +1165,27 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
                     buffer = buffer[pos + 1..].to_string();
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
 
-                    let Some(data) = line.strip_prefix("data: ") else { continue; };
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        continue;
+                    };
 
                     if data == "[DONE]" {
-                        // Emit any accumulated tool calls
-                        for acc in tool_calls.values() {
-                            yield Ok(StreamDelta::ToolUseStart {
-                                id: acc.id.clone(),
-                                name: acc.name.clone(),
-                                block_index: 1,
-                                thought_signature: None,
-                            });
-                            yield Ok(StreamDelta::ToolInputDelta {
-                                id: acc.id.clone(),
-                                delta: acc.arguments.clone(),
-                                block_index: 1,
-                            });
+                        for delta in emit_accumulated_tool_calls(&tool_calls) {
+                            yield Ok(delta);
                         }
-
                         if let Some(u) = usage.take() {
                             yield Ok(StreamDelta::Usage(u));
                         }
-
-                        let stop_reason = if tool_calls.is_empty() {
-                            StopReason::EndTurn
-                        } else {
-                            StopReason::ToolUse
-                        };
-                        yield Ok(StreamDelta::Done { stop_reason: Some(stop_reason) });
+                        yield Ok(StreamDelta::Done {
+                            stop_reason: Some(stop_reason_from_stream_state(&tool_calls, final_status)),
+                        });
                         return;
                     }
 
-                    // Parse streaming event
                     if let Ok(event) = serde_json::from_str::<ApiStreamEvent>(data) {
                         match event.r#type.as_str() {
                             "response.output_text.delta" => {
@@ -433,19 +1205,28 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     acc.arguments.push_str(&delta);
                                 }
                             }
-                            "response.completed" => {
-                                if let Some(resp) = event.response
-                                    && let Some(u) = resp.usage
-                                {
-                                    usage = Some(Usage {
-                                        input_tokens: u.input_tokens,
-                                        output_tokens: u.output_tokens,
-                                        cached_input_tokens: u
-                                            .input_tokens_details
-                                            .as_ref()
-                                            .map_or(0, |details| details.cached_tokens),
-                                    });
+                            "response.completed" | "response.incomplete" | "response.done" => {
+                                if let Some(resp) = event.response {
+                                    if let Some(u) = resp.usage {
+                                        usage = Some(usage_from_api_usage(u));
+                                    }
                                 }
+                                final_status = Some(match event.r#type.as_str() {
+                                    "response.incomplete" => ApiStatus::Incomplete,
+                                    _ => ApiStatus::Completed,
+                                });
+                            }
+                            "response.failed" => {
+                                let message = event
+                                    .response
+                                    .and_then(|resp| resp.error)
+                                    .and_then(|error| error.message)
+                                    .unwrap_or_else(|| "Codex response failed".to_string());
+                                yield Ok(StreamDelta::Error {
+                                    message,
+                                    recoverable: false,
+                                });
+                                return;
                             }
                             _ => {}
                         }
@@ -453,11 +1234,12 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 }
             }
 
-            // Stream ended without [DONE]
             if let Some(u) = usage {
                 yield Ok(StreamDelta::Usage(u));
             }
-            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn) });
+            yield Ok(StreamDelta::Done {
+                stop_reason: Some(stop_reason_from_stream_state(&tool_calls, final_status)),
+            });
         })
     }
 
@@ -736,6 +1518,19 @@ fn codex_url(base_url: &str) -> String {
     }
 }
 
+fn codex_websocket_url(base_url: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(&codex_url(base_url))
+        .context("failed to parse OpenAI Codex websocket URL")?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" | "wss" => return Ok(url),
+        _ => return Ok(url),
+    };
+    let _ = url.set_scheme(scheme);
+    Ok(url)
+}
+
 fn extract_account_id(token: &str) -> Result<String> {
     let payload = token
         .split('.')
@@ -768,6 +1563,158 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+fn usage_from_api_usage(usage: ApiUsage) -> Usage {
+    Usage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens),
+    }
+}
+
+fn emit_accumulated_tool_calls(
+    tool_calls: &HashMap<String, ToolCallAccumulator>,
+) -> Vec<StreamDelta> {
+    let block_index = usize::from(!tool_calls.is_empty());
+    let mut deltas = Vec::new();
+    for acc in tool_calls.values() {
+        deltas.push(StreamDelta::ToolUseStart {
+            id: acc.id.clone(),
+            name: acc.name.clone(),
+            block_index,
+            thought_signature: None,
+        });
+        deltas.push(StreamDelta::ToolInputDelta {
+            id: acc.id.clone(),
+            delta: acc.arguments.clone(),
+            block_index,
+        });
+    }
+    deltas
+}
+
+fn stop_reason_from_stream_state(
+    tool_calls: &HashMap<String, ToolCallAccumulator>,
+    status: Option<ApiStatus>,
+) -> StopReason {
+    if !tool_calls.is_empty() {
+        StopReason::ToolUse
+    } else {
+        match status.unwrap_or(ApiStatus::Completed) {
+            ApiStatus::Completed => StopReason::EndTurn,
+            ApiStatus::Incomplete => StopReason::MaxTokens,
+            ApiStatus::Failed => StopReason::StopSequence,
+        }
+    }
+}
+
+fn reset_websocket_connection(session: &mut WebsocketSessionState) {
+    session.connection = None;
+    if session.prewarmed {
+        session.last_request = None;
+        session.last_response_id = None;
+        session.last_response_items.clear();
+    }
+    session.prewarmed = false;
+}
+
+fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, String)> {
+    let event: ApiWrappedWebsocketErrorEvent = serde_json::from_str(payload).ok()?;
+    if event.kind != "error" {
+        return None;
+    }
+
+    if event.error.as_ref().and_then(|error| error.code.as_deref())
+        == Some(OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE)
+    {
+        let message = event
+            .error
+            .and_then(|error| error.message)
+            .unwrap_or_else(|| "Responses websocket connection limit reached".to_string());
+        return Some((StatusCode::TOO_MANY_REQUESTS, message));
+    }
+
+    let status = StatusCode::from_u16(event.status?).ok()?;
+    let message = event
+        .error
+        .and_then(|error| error.message)
+        .unwrap_or_else(|| payload.to_string());
+    if status.is_success() {
+        None
+    } else {
+        Some((status, message))
+    }
+}
+
+fn output_item_to_input_item(item: ApiOutputItem) -> Option<ApiInputItem> {
+    match item {
+        ApiOutputItem::Message { content, .. } => {
+            let parts: Vec<ApiInputContent> = content
+                .into_iter()
+                .filter_map(|content| match content {
+                    ApiOutputContent::Text { text } if !text.is_empty() => {
+                        Some(ApiInputContent::Text { text })
+                    }
+                    ApiOutputContent::Unknown => None,
+                    ApiOutputContent::Text { .. } => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::Assistant,
+                    content: ApiMessageContent::Parts(parts),
+                }))
+            }
+        }
+        ApiOutputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => Some(ApiInputItem::FunctionCall(ApiFunctionCall::new(
+            call_id, name, arguments,
+        ))),
+        ApiOutputItem::Unknown => None,
+    }
+}
+
+fn prepare_websocket_request(
+    request: &ApiStreamingRequest,
+    session: &WebsocketSessionState,
+    allow_empty_delta: bool,
+) -> ApiWebsocketRequest {
+    let mut websocket_request = ApiWebsocketRequest::from(request);
+
+    let Some(last_request) = session.last_request.as_ref() else {
+        return websocket_request;
+    };
+    let Some(last_response_id) = session.last_response_id.as_ref() else {
+        return websocket_request;
+    };
+
+    let mut previous_without_input = last_request.clone();
+    previous_without_input.input.clear();
+    let mut current_without_input = request.clone();
+    current_without_input.input.clear();
+    if previous_without_input != current_without_input {
+        return websocket_request;
+    }
+
+    let mut baseline = last_request.input.clone();
+    baseline.extend(session.last_response_items.clone());
+    if request.input.starts_with(&baseline)
+        && (allow_empty_delta || baseline.len() < request.input.len())
+    {
+        websocket_request.previous_response_id = Some(last_response_id.clone());
+        websocket_request.input = request.input[baseline.len()..].to_vec();
+    }
+
+    websocket_request
+}
+
 // ============================================================================
 // API Request Types
 // ============================================================================
@@ -788,6 +1735,7 @@ struct ApiResponsesRequest<'a> {
     tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,42 +1744,98 @@ struct ApiResponsesRequest<'a> {
     prompt_cache_key: Option<&'a str>,
 }
 
-#[derive(Serialize)]
-struct ApiResponsesRequestStreaming<'a> {
-    model: &'a str,
-    #[serde(skip_serializing_if = "is_empty")]
-    instructions: &'a str,
-    input: &'a [ApiInputItem],
+#[derive(Clone, PartialEq, Serialize)]
+struct ApiStreamingRequest {
+    model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    instructions: String,
+    input: Vec<ApiInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ApiTool]>,
+    tools: Option<Vec<ApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<ApiTextSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    include: Option<&'a [&'static str]>,
+    include: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
+    prompt_cache_key: Option<String>,
     stream: bool,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Serialize)]
+struct ApiWebsocketRequest {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    input: Vec<ApiInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<ApiTextSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generate: Option<bool>,
+}
+
+impl From<&ApiStreamingRequest> for ApiWebsocketRequest {
+    fn from(request: &ApiStreamingRequest) -> Self {
+        Self {
+            kind: "response.create",
+            model: request.model.clone(),
+            instructions: request.instructions.clone(),
+            previous_response_id: None,
+            input: request.input.clone(),
+            tools: request.tools.clone(),
+            max_output_tokens: request.max_output_tokens,
+            reasoning: request.reasoning.clone(),
+            tool_choice: request.tool_choice.clone(),
+            parallel_tool_calls: request.parallel_tool_calls,
+            store: request.store,
+            text: request.text,
+            include: request.include.clone(),
+            prompt_cache_key: request.prompt_cache_key.clone(),
+            stream: request.stream,
+            generate: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
 struct ApiTextSettings {
     verbosity: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiReasoning {
     effort: ReasoningEffort,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 enum ApiInputItem {
     Message(ApiMessage),
@@ -839,27 +1843,27 @@ enum ApiInputItem {
     FunctionCallOutput(ApiFunctionCallOutput),
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiMessage {
     role: ApiRole,
     content: ApiMessageContent,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ApiRole {
     User,
     Assistant,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 enum ApiMessageContent {
     Text(String),
     Parts(Vec<ApiInputContent>),
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiInputContent {
     Text { text: String },
@@ -867,7 +1871,7 @@ enum ApiInputContent {
     File { filename: String, file_data: String },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiFunctionCall {
     r#type: &'static str,
     call_id: String,
@@ -886,7 +1890,7 @@ impl ApiFunctionCall {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiFunctionCallOutput {
     r#type: &'static str,
     call_id: String,
@@ -903,7 +1907,7 @@ impl ApiFunctionCallOutput {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiTool {
     r#type: String,
     name: String,
@@ -930,7 +1934,7 @@ struct ApiResponse {
     usage: Option<ApiUsage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ApiStatus {
     Completed,
@@ -994,13 +1998,43 @@ struct ApiStreamEvent {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    item: Option<serde_json::Value>,
+    #[serde(default)]
     response: Option<ApiStreamResponse>,
 }
 
 #[derive(Deserialize)]
 struct ApiStreamResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     usage: Option<ApiUsage>,
+    #[serde(default)]
+    error: Option<ApiErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorBody {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiWrappedWebsocketErrorBody {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiWrappedWebsocketErrorEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(alias = "status_code")]
+    status: Option<u16>,
+    #[serde(default)]
+    error: Option<ApiWrappedWebsocketErrorBody>,
 }
 
 // ============================================================================
@@ -1095,6 +2129,226 @@ mod tests {
         assert!(json.contains("\"type\":\"function\""));
         assert!(json.contains("\"name\":\"get_weather\""));
         assert!(json.contains("\"strict\":true"));
+    }
+
+    fn test_token() -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"{OPENAI_CODEX_JWT_CLAIM_PATH}":{{"chatgpt_account_id":"acct_123"}}}}"#
+        ));
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn test_build_headers_match_codex_style_defaults() -> anyhow::Result<()> {
+        let provider = OpenAICodexResponsesProvider::codex(test_token());
+
+        let headers = provider.build_headers(true, Some("session-123"), None)?;
+        assert_eq!(headers.get("originator").unwrap(), OPENAI_CODEX_ORIGINATOR);
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+        assert_eq!(headers.get("session_id").unwrap(), "session-123");
+        assert_eq!(headers.get("x-client-request-id").unwrap(), "session-123");
+        assert_eq!(
+            headers.get("OpenAI-Beta").unwrap(),
+            OPENAI_CODEX_RESPONSES_BETA_HEADER
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_websocket_headers_match_codex_style_defaults() -> anyhow::Result<()> {
+        let provider = OpenAICodexResponsesProvider::codex(test_token());
+
+        let headers = provider.build_websocket_headers(Some("session-123"), Some("turn-1"))?;
+        assert_eq!(headers.get("originator").unwrap(), OPENAI_CODEX_ORIGINATOR);
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+        assert_eq!(headers.get("session_id").unwrap(), "session-123");
+        assert_eq!(headers.get("x-client-request-id").unwrap(), "session-123");
+        assert_eq!(
+            headers.get(OPENAI_CODEX_TURN_STATE_HEADER).unwrap(),
+            "turn-1"
+        );
+        assert_eq!(
+            headers.get("OpenAI-Beta").unwrap(),
+            OPENAI_CODEX_RESPONSES_WEBSOCKETS_BETA_HEADER,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_headers_uses_configured_account_id_without_jwt_decode() -> anyhow::Result<()> {
+        let provider = OpenAICodexResponsesProvider::codex("not-a-jwt".to_string())
+            .with_account_id("acct_stored");
+
+        let headers = provider.build_headers(true, Some("session-123"), Some("turn-1"))?;
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_stored");
+        assert_eq!(
+            headers.get(OPENAI_CODEX_TURN_STATE_HEADER).unwrap(),
+            "turn-1"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_serialization_includes_store_false() {
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: Vec::new(),
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some("auto".to_string()),
+            parallel_tool_calls: Some(true),
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+            }),
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
+            prompt_cache_key: Some("session-123".to_string()),
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"store\":false"));
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn test_prepare_websocket_request_uses_previous_response_id_for_incremental_input() {
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: vec![
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("first".to_string()),
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::Assistant,
+                    content: ApiMessageContent::Parts(vec![ApiInputContent::Text {
+                        text: "answer".to_string(),
+                    }]),
+                }),
+                ApiInputItem::Message(ApiMessage {
+                    role: ApiRole::User,
+                    content: ApiMessageContent::Text("follow up".to_string()),
+                }),
+            ],
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some("auto".to_string()),
+            parallel_tool_calls: None,
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+            }),
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
+            prompt_cache_key: Some("thread-1".to_string()),
+            stream: true,
+        };
+        let previous_request = ApiStreamingRequest {
+            input: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text("first".to_string()),
+            })],
+            ..request.clone()
+        };
+        let session = WebsocketSessionState {
+            connection: None,
+            last_request: Some(previous_request),
+            last_response_id: Some("resp_prev".to_string()),
+            last_response_items: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::Assistant,
+                content: ApiMessageContent::Parts(vec![ApiInputContent::Text {
+                    text: "answer".to_string(),
+                }]),
+            })],
+            turn_state: None,
+            prewarmed: false,
+            websocket_disabled: false,
+        };
+
+        let websocket_request = prepare_websocket_request(&request, &session, false);
+        assert_eq!(
+            websocket_request.previous_response_id.as_deref(),
+            Some("resp_prev")
+        );
+        assert_eq!(websocket_request.input.len(), 1);
+        match &websocket_request.input[0] {
+            ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text(text),
+            }) => assert_eq!(text, "follow up"),
+            _ => panic!("expected incremental follow-up user message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wrapped_websocket_error_event_maps_http_status() {
+        let payload = r#"{"type":"error","status":401,"error":{"message":"unauthorized"}}"#;
+        let parsed = parse_wrapped_websocket_error_event(payload);
+        assert_eq!(
+            parsed,
+            Some((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_parse_wrapped_websocket_error_event_maps_connection_limit() {
+        let payload = format!(
+            r#"{{"type":"error","status":429,"error":{{"code":"{}","message":"limit"}}}}"#,
+            OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+        );
+        let parsed = parse_wrapped_websocket_error_event(&payload);
+        assert_eq!(
+            parsed,
+            Some((StatusCode::TOO_MANY_REQUESTS, "limit".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_prepare_websocket_request_allows_empty_delta_after_prewarm() {
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: "system".to_string(),
+            input: vec![ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Text("first".to_string()),
+            })],
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some("auto".to_string()),
+            parallel_tool_calls: None,
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+            }),
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
+            prompt_cache_key: Some("thread-1".to_string()),
+            stream: true,
+        };
+        let session = WebsocketSessionState {
+            connection: None,
+            last_request: Some(request.clone()),
+            last_response_id: Some("resp_prewarm".to_string()),
+            last_response_items: Vec::new(),
+            turn_state: None,
+            prewarmed: true,
+            websocket_disabled: false,
+        };
+
+        let websocket_request = prepare_websocket_request(&request, &session, true);
+        assert_eq!(
+            websocket_request.previous_response_id.as_deref(),
+            Some("resp_prewarm")
+        );
+        assert!(websocket_request.input.is_empty());
     }
 
     #[test]
