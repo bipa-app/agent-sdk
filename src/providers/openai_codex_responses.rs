@@ -137,7 +137,7 @@ impl OpenAICodexResponsesProvider {
         self
     }
 
-    /// Set a known ChatGPT account id, avoiding JWT decoding on each request.
+    /// Set a known `ChatGPT` account id, avoiding JWT decoding on each request.
     #[must_use]
     pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
         self.account_id = Some(account_id.into());
@@ -199,8 +199,7 @@ impl OpenAICodexResponsesProvider {
         let account_id = self
             .account_id
             .clone()
-            .map(Ok)
-            .unwrap_or_else(|| extract_account_id(&self.api_key))
+            .map_or_else(|| extract_account_id(&self.api_key), Ok)
             .context("failed to extract chatgpt account id from OpenAI Codex OAuth token")?;
 
         let mut headers = HeaderMap::new();
@@ -709,7 +708,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             continue 'websocket_attempts;
                                         }
                                     }
-                                    WebSocketMessage::Pong(_) => {}
+                                    WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                                     WebSocketMessage::Close(_) => {
                                         log::warn!(
                                             "OpenAI Codex websocket warmup closed on attempt {}",
@@ -721,7 +720,6 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         }
                                         continue 'websocket_attempts;
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -876,7 +874,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             | "response.done" => {
                                                 if let Some(resp) = event.response {
                                                     if let Some(u) = resp.usage {
-                                                        usage = Some(usage_from_api_usage(u));
+                                                        usage = Some(usage_from_api_usage(&u));
                                                     }
                                                     if let Some(id) = resp.id {
                                                         response_id = Some(id);
@@ -995,7 +993,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 | "response.done" => {
                                                     if let Some(resp) = event.response {
                                                         if let Some(u) = resp.usage {
-                                                            usage = Some(usage_from_api_usage(u));
+                                                            usage = Some(usage_from_api_usage(&u));
                                                         }
                                                         if let Some(id) = resp.id {
                                                             response_id = Some(id);
@@ -1075,7 +1073,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         continue 'websocket_attempts;
                                     }
                                 }
-                                WebSocketMessage::Pong(_) => {}
+                                WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                                 WebSocketMessage::Close(_) => {
                                     if emitted_output {
                                         reset_websocket_connection(&mut websocket_session);
@@ -1092,7 +1090,6 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     }
                                     continue 'websocket_attempts;
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -1206,10 +1203,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 }
                             }
                             "response.completed" | "response.incomplete" | "response.done" => {
-                                if let Some(resp) = event.response {
-                                    if let Some(u) = resp.usage {
-                                        usage = Some(usage_from_api_usage(u));
-                                    }
+                                if let Some(resp) = event.response
+                                    && let Some(u) = resp.usage
+                                {
+                                    usage = Some(usage_from_api_usage(&u));
                                 }
                                 final_status = Some(match event.r#type.as_str() {
                                     "response.incomplete" => ApiStatus::Incomplete,
@@ -1521,13 +1518,17 @@ fn codex_url(base_url: &str) -> String {
 fn codex_websocket_url(base_url: &str) -> Result<url::Url> {
     let mut url = url::Url::parse(&codex_url(base_url))
         .context("failed to parse OpenAI Codex websocket URL")?;
+
     let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        "ws" | "wss" => return Ok(url),
-        _ => return Ok(url),
+        "http" => Some("ws"),
+        "https" => Some("wss"),
+        _ => None,
     };
-    let _ = url.set_scheme(scheme);
+
+    if let Some(scheme) = scheme {
+        let _ = url.set_scheme(scheme);
+    }
+
     Ok(url)
 }
 
@@ -1563,7 +1564,7 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
-fn usage_from_api_usage(usage: ApiUsage) -> Usage {
+fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
     Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -1599,14 +1600,14 @@ fn stop_reason_from_stream_state(
     tool_calls: &HashMap<String, ToolCallAccumulator>,
     status: Option<ApiStatus>,
 ) -> StopReason {
-    if !tool_calls.is_empty() {
-        StopReason::ToolUse
-    } else {
+    if tool_calls.is_empty() {
         match status.unwrap_or(ApiStatus::Completed) {
             ApiStatus::Completed => StopReason::EndTurn,
             ApiStatus::Incomplete => StopReason::MaxTokens,
             ApiStatus::Failed => StopReason::StopSequence,
         }
+    } else {
+        StopReason::ToolUse
     }
 }
 
@@ -1657,8 +1658,7 @@ fn output_item_to_input_item(item: ApiOutputItem) -> Option<ApiInputItem> {
                     ApiOutputContent::Text { text } if !text.is_empty() => {
                         Some(ApiInputContent::Text { text })
                     }
-                    ApiOutputContent::Unknown => None,
-                    ApiOutputContent::Text { .. } => None,
+                    ApiOutputContent::Unknown | ApiOutputContent::Text { .. } => None,
                 })
                 .collect();
             if parts.is_empty() {
@@ -2301,8 +2301,7 @@ mod tests {
     #[test]
     fn test_parse_wrapped_websocket_error_event_maps_connection_limit() {
         let payload = format!(
-            r#"{{"type":"error","status":429,"error":{{"code":"{}","message":"limit"}}}}"#,
-            OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+            r#"{{"type":"error","status":429,"error":{{"code":"{OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE}","message":"limit"}}}}"#,
         );
         let parsed = parse_wrapped_websocket_error_event(&payload);
         assert_eq!(
