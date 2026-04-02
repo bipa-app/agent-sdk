@@ -125,7 +125,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     ModelCapabilities {
         provider: "anthropic",
         model_id: "claude-opus-4-6",
-        context_window: Some(200_000),
+        context_window: Some(1_00_000),
         max_output_tokens: Some(128_000),
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.6 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
@@ -137,7 +137,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     ModelCapabilities {
         provider: "anthropic",
         model_id: "claude-sonnet-4-6",
-        context_window: Some(200_000),
+        context_window: Some(1_00_000),
         max_output_tokens: Some(64_000),
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
