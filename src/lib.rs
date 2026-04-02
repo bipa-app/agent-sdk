@@ -336,7 +336,7 @@ mod types;
 pub mod user_interaction;
 pub mod web;
 
-pub use agent_loop::{AgentLoop, AgentLoopBuilder, builder};
+pub use agent_loop::{AgentHandle, AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};

@@ -344,6 +344,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
     RunLoopTurnsParams {
         ctx,
@@ -360,6 +361,7 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         compactor,
         execution_store,
         cancel_token,
+        mut input_rx,
     }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
 ) -> Option<AgentRunState>
 where
@@ -403,7 +405,57 @@ where
                     warn!("Failed to save state checkpoint: {error}");
                 }
             }
-            InternalTurnResult::Done => return None,
+            InternalTurnResult::Done => {
+                // Persistent mode: wait for new input instead of exiting
+                if let Some(ref mut rx) = input_rx {
+                    // Emit a TurnComplete event so the caller knows we're idle
+                    send_event(
+                        tx,
+                        hooks,
+                        seq,
+                        AgentEvent::TurnComplete {
+                            turn: ctx.turn,
+                            usage: ctx.total_usage.clone(),
+                        },
+                    )
+                    .await;
+
+                    // Wait for new input or cancellation
+                    tokio::select! {
+                        msg = rx.recv() => {
+                            match msg {
+                                Some(AgentInput::Text(text)) => {
+                                    let user_msg = Message::user(&text);
+                                    if let Err(e) = message_store.append(&ctx.thread_id, user_msg).await {
+                                        warn!("Failed to append injected message: {e}");
+                                        return None;
+                                    }
+                                    ctx.turn += 1;
+                                    // Continue the loop for the next turn
+                                }
+                                Some(AgentInput::Message(blocks)) => {
+                                    let user_msg = Message::user_with_content(blocks);
+                                    if let Err(e) = message_store.append(&ctx.thread_id, user_msg).await {
+                                        warn!("Failed to append injected message: {e}");
+                                        return None;
+                                    }
+                                    ctx.turn += 1;
+                                }
+                                _ => return None, // Channel closed or unsupported input
+                            }
+                        }
+                        () = cancel_token.cancelled() => {
+                            return Some(AgentRunState::Cancelled {
+                                total_turns: turns_to_u32(ctx.turn),
+                                input_tokens: u64::from(ctx.total_usage.input_tokens),
+                                output_tokens: u64::from(ctx.total_usage.output_tokens),
+                            });
+                        }
+                    }
+                } else {
+                    return None; // Non-persistent mode: exit as before
+                }
+            }
             InternalTurnResult::Refusal => {
                 return Some(AgentRunState::Refusal {
                     total_turns: turns_to_u32(ctx.turn),
@@ -613,6 +665,7 @@ pub(super) async fn run_loop<Ctx, P, H, M, S>(
         compactor,
         execution_store,
         cancel_token,
+        mut input_rx,
     }: RunLoopParameters<Ctx, P, H, M, S>,
 ) -> AgentRunState
 where
@@ -696,6 +749,7 @@ where
         compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
         cancel_token: &cancel_token,
+        input_rx: input_rx.as_mut(),
     })
     .await
     {

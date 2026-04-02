@@ -155,6 +155,8 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
     pub(super) cancel_token: CancellationToken,
+    /// Optional channel for receiving new messages in persistent mode.
+    pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
 }
 
 pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
@@ -202,6 +204,8 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
     pub(super) cancel_token: &'a CancellationToken,
+    /// Optional channel for receiving new messages in persistent mode.
+    pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {

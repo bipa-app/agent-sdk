@@ -10,7 +10,7 @@ keywords = ["agent", "llm", "ai", "anthropic", "tools"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
-tokio = { version = "1.40", features = ["sync", "fs", "process", "time"] }
+tokio = { version = "1.40", features = ["sync", "fs", "process", "time", "macros"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"

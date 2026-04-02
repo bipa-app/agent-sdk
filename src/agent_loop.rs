@@ -57,6 +57,22 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Handle to a persistent agent thread.
+///
+/// Returned by [`AgentLoop::run_persistent`]. Allows the caller to send
+/// new messages to the running agent, observe events, and cancel execution.
+pub struct AgentHandle {
+    /// Send new messages to the running agent. The agent will process
+    /// them as new user turns after completing the current turn.
+    pub input_tx: mpsc::Sender<AgentInput>,
+    /// Receive agent events (text, tool calls, progress).
+    pub events_rx: mpsc::Receiver<AgentEventEnvelope>,
+    /// Final run state (sent once when the agent completes).
+    pub state_rx: oneshot::Receiver<AgentRunState>,
+    /// Cancel the running agent.
+    pub cancel_token: CancellationToken,
+}
+
 /// The main agent loop that orchestrates LLM calls and tool execution.
 ///
 /// `AgentLoop` is the core component that:
@@ -286,6 +302,7 @@ where
                 compactor,
                 execution_store,
                 cancel_token,
+                input_rx: None,
             })
             .await;
 
@@ -293,6 +310,75 @@ where
         });
 
         (event_rx, state_rx)
+    }
+
+    /// Run the agent with a persistent input channel.
+    ///
+    /// Unlike [`run`], this returns an [`AgentHandle`] that allows the caller
+    /// to inject new user messages into the running agent via `input_tx`.
+    /// The agent will process the initial input, then wait for new messages
+    /// on the channel between turns instead of exiting on `Done`.
+    ///
+    /// The agent exits when:
+    /// - The `input_tx` sender is dropped (no more messages)
+    /// - The `cancel_token` is cancelled
+    /// - Max turns exceeded
+    pub fn run_persistent(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+    ) -> AgentHandle
+    where
+        Ctx: Clone,
+    {
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let (state_tx, state_rx) = oneshot::channel();
+        let (input_tx, input_rx) = mpsc::channel(32);
+        let seq = SequenceCounter::new();
+
+        let provider = Arc::clone(&self.provider);
+        let tools = Arc::clone(&self.tools);
+        let hooks = Arc::clone(&self.hooks);
+        let message_store = Arc::clone(&self.message_store);
+        let state_store = Arc::clone(&self.state_store);
+        let config = self.config.clone();
+        let compaction_config = self.compaction_config.clone();
+        let compactor = self.compactor.clone();
+        let execution_store = self.execution_store.clone();
+        let cancel_handle = cancel_token.clone();
+
+        tokio::spawn(async move {
+            let result = run_loop(RunLoopParameters {
+                tx: event_tx,
+                seq,
+                thread_id,
+                input,
+                tool_context,
+                provider,
+                tools,
+                hooks,
+                message_store,
+                state_store,
+                config,
+                compaction_config,
+                compactor,
+                execution_store,
+                cancel_token,
+                input_rx: Some(input_rx),
+            })
+            .await;
+
+            let _ = state_tx.send(result);
+        });
+
+        AgentHandle {
+            input_tx,
+            events_rx: event_rx,
+            state_rx,
+            cancel_token: cancel_handle,
+        }
     }
 
     /// Run a single turn of the agent loop.

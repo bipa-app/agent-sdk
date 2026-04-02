@@ -72,6 +72,9 @@ pub struct SubagentConfig {
     pub max_turns: Option<usize>,
     /// Optional timeout in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// Optional model override for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl SubagentConfig {
@@ -83,6 +86,7 @@ impl SubagentConfig {
             system_prompt: String::new(),
             max_turns: None,
             timeout_ms: None,
+            model: None,
         }
     }
 
@@ -104,6 +108,13 @@ impl SubagentConfig {
     #[must_use]
     pub const fn with_timeout_ms(mut self, timeout: u64) -> Self {
         self.timeout_ms = Some(timeout);
+        self
+    }
+
+    /// Set the model override for this subagent.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 }
