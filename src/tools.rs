@@ -295,6 +295,8 @@ pub struct ToolContext<Ctx> {
     event_seq: Option<SequenceCounter>,
     /// Optional cancellation token for propagating cancellation to subtasks
     cancel_token: Option<CancellationToken>,
+    /// Optional semaphore for limiting concurrent subagent threads.
+    subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -306,6 +308,7 @@ impl<Ctx> ToolContext<Ctx> {
             event_tx: None,
             event_seq: None,
             cancel_token: None,
+            subagent_semaphore: None,
         }
     }
 
@@ -374,6 +377,19 @@ impl<Ctx> ToolContext<Ctx> {
     #[must_use]
     pub fn cancel_token(&self) -> Option<CancellationToken> {
         self.cancel_token.clone()
+    }
+
+    /// Set a shared semaphore for limiting concurrent subagent threads.
+    #[must_use]
+    pub fn with_subagent_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.subagent_semaphore = Some(semaphore);
+        self
+    }
+
+    /// Get the subagent thread-limiting semaphore (if set).
+    #[must_use]
+    pub fn subagent_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.subagent_semaphore.clone()
     }
 }
 

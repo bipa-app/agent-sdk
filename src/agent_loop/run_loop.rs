@@ -622,7 +622,9 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
+    let tool_context = tool_context
+        .with_event_tx(tx.clone(), seq.clone())
+        .with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
@@ -761,7 +763,9 @@ where
         };
     }
 
-    let tool_context = tool_context.with_event_tx(tx.clone(), seq.clone());
+    let tool_context = tool_context
+        .with_event_tx(tx.clone(), seq.clone())
+        .with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {

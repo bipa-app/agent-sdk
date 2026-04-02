@@ -372,7 +372,10 @@ pub use user_interaction::{
 };
 
 // Re-export subagent types for convenience
-pub use subagent::{SubagentConfig, SubagentFactory, SubagentTool};
+pub use subagent::{
+    METADATA_MAX_SUBAGENT_DEPTH, METADATA_SUBAGENT_DEPTH, SubagentConfig, SubagentFactory,
+    SubagentTool,
+};
 
 // Re-export todo types for convenience
 pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};

@@ -42,13 +42,24 @@ use crate::llm::LlmProvider;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage, ToolResult, ToolTier};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Metadata key for tracking the current subagent nesting depth.
+///
+/// When a subagent spawns another subagent, the depth is incremented.
+/// Tools check this value against the configured maximum depth.
+pub const METADATA_SUBAGENT_DEPTH: &str = "subagent_depth";
+
+/// Metadata key for the maximum allowed subagent nesting depth.
+///
+/// Set by the host application (e.g. bip) to prevent unbounded recursion.
+pub const METADATA_MAX_SUBAGENT_DEPTH: &str = "max_subagent_depth";
 
 /// Configuration for a subagent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +144,18 @@ pub struct SubagentResult {
     pub success: bool,
     /// Duration in milliseconds.
     pub duration_ms: u64,
+    /// Detailed error information when `success` is false.
+    ///
+    /// Contains the raw error message from the agent event, which may include
+    /// stack trace information or structured error context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_details: Option<String>,
+    /// Name of the tool that caused the failure (if applicable).
+    ///
+    /// Populated when the subagent encountered an error during a specific
+    /// tool execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tool: Option<String>,
 }
 
 /// Tool for spawning subagents.
@@ -317,6 +340,8 @@ where
             std::collections::HashMap::new();
         let mut total_usage = TokenUsage::default();
         let mut success = true;
+        let mut error_details: Option<String> = None;
+        let mut failed_tool: Option<String> = None;
 
         let timeout_duration = self.config.timeout_ms.map(Duration::from_millis);
 
@@ -326,6 +351,11 @@ where
                 if remaining.is_zero() {
                     timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
+                    error_details = Some(format!(
+                        "Subagent '{}' timed out after {}ms",
+                        self.config.name,
+                        self.config.timeout_ms.unwrap_or(0)
+                    ));
                     success = false;
                     break;
                 }
@@ -415,6 +445,11 @@ where
                         break;
                     }
                     AgentEvent::Error { message, .. } => {
+                        error_details = Some(message.clone());
+                        // If there are pending tool calls, the last one is likely the culprit.
+                        if let Some(last_tool) = pending_tools.values().last() {
+                            failed_tool = Some(last_tool.0.clone());
+                        }
                         final_response = message;
                         success = false;
                         break;
@@ -425,6 +460,10 @@ where
                 Err(_) => {
                     timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
+                    error_details = Some(format!(
+                        "Subagent '{}' timed out waiting for event",
+                        self.config.name,
+                    ));
                     success = false;
                     break;
                 }
@@ -440,6 +479,8 @@ where
             usage: total_usage,
             success,
             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            error_details,
+            failed_tool,
         })
     }
 }
@@ -582,6 +623,48 @@ where
             .and_then(Value::as_str)
             .context("Missing 'task' parameter")?;
 
+        // ── Depth limit enforcement ───────────────────────────────────
+        let current_depth = ctx
+            .metadata
+            .get(METADATA_SUBAGENT_DEPTH)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_depth = ctx
+            .metadata
+            .get(METADATA_MAX_SUBAGENT_DEPTH)
+            .and_then(Value::as_u64)
+            .unwrap_or(3); // default: 3 levels deep
+
+        if current_depth >= max_depth {
+            bail!(
+                "Subagent depth limit exceeded ({current_depth}/{max_depth}). \
+                 Cannot spawn nested subagent '{}' — maximum nesting depth reached.",
+                self.config.name
+            );
+        }
+
+        // ── Thread limit enforcement (semaphore) ──────────────────────
+        let _permit = if let Some(ref sem) = ctx.subagent_semaphore() {
+            match sem.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Cannot spawn subagent '{}': maximum concurrent subagent limit reached. \
+                             Try again when another subagent completes.",
+                            self.config.name
+                        ),
+                        data: None,
+                        documents: Vec::new(),
+                        duration_ms: Some(0),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         // Get event channel and sequence counter from context for progress updates
         let parent_tx = ctx.event_tx();
         let parent_seq = ctx.event_seq();
@@ -669,6 +752,8 @@ mod tests {
             usage: TokenUsage::default(),
             success: true,
             duration_ms: 1000,
+            error_details: None,
+            failed_tool: None,
         };
 
         let json = serde_json::to_string(&result).expect("serialize");
@@ -701,6 +786,8 @@ mod tests {
             },
             success: true,
             duration_ms: 2500,
+            error_details: None,
+            failed_tool: None,
         };
 
         let value = serde_json::to_value(&result).expect("serialize to value");
