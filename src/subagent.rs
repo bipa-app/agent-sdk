@@ -333,10 +333,12 @@ where
         // Create tool context
         let tool_ctx = ToolContext::new(());
 
-        // Run with a child cancellation token so parent cancellation propagates
+        // Run with a child cancellation token so parent cancellation propagates.
+        // Use `run_abortable` so we can abort the spawned task on timeout
+        // instead of leaving a detached task that continues making API calls.
         let cancel_token = parent_cancel.child_token();
         let timeout_cancel = cancel_token.clone();
-        let (mut rx, _final_state) = agent.run(
+        let (mut rx, _final_state, task_handle) = agent.run_abortable(
             thread_id,
             AgentInput::Text(task.to_string()),
             tool_ctx,
@@ -360,7 +362,11 @@ where
             let recv_result = if let Some(timeout) = timeout_duration {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    timeout_cancel.cancel(); // Cancel the child agent on timeout
+                    timeout_cancel.cancel();
+                    // Abort the spawned task so its in-flight LLM stream is
+                    // dropped immediately instead of continuing in the
+                    // background and consuming API capacity.
+                    task_handle.abort();
                     final_response = "Subagent timed out".to_string();
                     error_details = Some(format!(
                         "Subagent '{}' timed out after {}ms",
@@ -469,7 +475,8 @@ where
                 },
                 Ok(None) => break,
                 Err(_) => {
-                    timeout_cancel.cancel(); // Cancel the child agent on timeout
+                    timeout_cancel.cancel();
+                    task_handle.abort();
                     final_response = "Subagent timed out".to_string();
                     error_details = Some(format!(
                         "Subagent '{}' timed out waiting for event",

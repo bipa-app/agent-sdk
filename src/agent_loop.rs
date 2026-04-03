@@ -291,6 +291,32 @@ where
     where
         Ctx: Clone,
     {
+        let (event_rx, state_rx, _handle) =
+            self.run_abortable(thread_id, input, tool_context, cancel_token);
+        (event_rx, state_rx)
+    }
+
+    /// Like [`run`](Self::run), but also returns the [`JoinHandle`] for the
+    /// spawned task.
+    ///
+    /// Callers that need to forcibly abort the agent loop (e.g. subagent
+    /// timeout) can call [`JoinHandle::abort`] on the returned handle.
+    /// Aborting the handle drops the in-flight LLM stream immediately
+    /// instead of waiting for the current turn to finish.
+    pub fn run_abortable(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+    ) -> (
+        mpsc::Receiver<AgentEventEnvelope>,
+        oneshot::Receiver<AgentRunState>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        Ctx: Clone,
+    {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = oneshot::channel();
         let seq = SequenceCounter::new();
@@ -341,9 +367,9 @@ where
             task.with_context(parent_cx)
         };
 
-        tokio::spawn(task);
+        let handle = tokio::spawn(task);
 
-        (event_rx, state_rx)
+        (event_rx, state_rx, handle)
     }
 
     /// Run the agent with a persistent input channel.
