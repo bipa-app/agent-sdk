@@ -594,13 +594,11 @@ impl LlmProvider for AnthropicProvider {
             impl Drop for StreamDropGuard {
                 fn drop(&mut self) {
                     if !self.completed {
-                        // Use eprintln as a last resort since log might not be available during task cancellation
-                        eprintln!(
-                            "[agent-sdk] CRITICAL: SSE stream DROPPED at chunk_count={} - task was cancelled!",
-                            self.chunk_count
-                        );
-                        log::error!(
-                            "SSE stream was DROPPED before completion at chunk_count={} - the consuming task was likely cancelled",
+                        // Stream drops are expected when the user cancels a running
+                        // agent loop (Esc / Ctrl-C).  Log at debug level so it does
+                        // not surface as noise in every cancelled session.
+                        log::debug!(
+                            "SSE stream dropped before completion at chunk_count={} (task was likely cancelled)",
                             self.chunk_count
                         );
                     }
