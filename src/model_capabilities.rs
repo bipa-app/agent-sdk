@@ -125,7 +125,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     ModelCapabilities {
         provider: "anthropic",
         model_id: "claude-opus-4-6",
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
         pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.6 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
@@ -137,7 +137,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     ModelCapabilities {
         provider: "anthropic",
         model_id: "claude-sonnet-4-6",
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         max_output_tokens: Some(64_000),
         pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet tier pricing; verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
@@ -595,9 +595,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_lookup_anthropic_opus_46() {
+        let caps = get_model_capabilities("anthropic", "claude-opus-4-6").unwrap();
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_adaptive_thinking);
+    }
+
+    #[test]
     fn test_lookup_anthropic_sonnet_46() {
         let caps = get_model_capabilities("anthropic", "claude-sonnet-4-6").unwrap();
-        assert_eq!(caps.context_window, Some(200_000));
+        assert_eq!(caps.context_window, Some(1_000_000));
         assert_eq!(caps.max_output_tokens, Some(64_000));
         assert!(caps.supports_adaptive_thinking);
     }
