@@ -66,6 +66,8 @@ pub const METADATA_MAX_SUBAGENT_DEPTH: &str = "max_subagent_depth";
 pub struct SubagentConfig {
     /// Name of the subagent (for identification).
     pub name: String,
+    /// Human-friendly nickname assigned by the parent (e.g., "Zara").
+    pub nickname: Option<String>,
     /// System prompt for the subagent.
     pub system_prompt: String,
     /// Maximum number of turns before stopping.
@@ -83,6 +85,7 @@ impl SubagentConfig {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            nickname: None,
             system_prompt: String::new(),
             max_turns: None,
             timeout_ms: None,
@@ -115,6 +118,13 @@ impl SubagentConfig {
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Set a human-friendly nickname for this subagent.
+    #[must_use]
+    pub fn with_nickname(mut self, nickname: impl Into<String>) -> Self {
+        self.nickname = Some(nickname.into());
         self
     }
 }
@@ -402,6 +412,9 @@ where
                             let event = AgentEvent::SubagentProgress {
                                 subagent_id: subagent_id.clone(),
                                 subagent_name: self.config.name.clone(),
+                                nickname: self.config.nickname.clone(),
+                                #[allow(clippy::cast_possible_truncation)]
+                                max_turns: self.config.max_turns.map(|t| t as u32),
                                 tool_name: name,
                                 tool_context: context,
                                 completed: false,
@@ -440,6 +453,9 @@ where
                             let event = AgentEvent::SubagentProgress {
                                 subagent_id: subagent_id.clone(),
                                 subagent_name: self.config.name.clone(),
+                                nickname: self.config.nickname.clone(),
+                                #[allow(clippy::cast_possible_truncation)]
+                                max_turns: self.config.max_turns.map(|t| t as u32),
                                 tool_name: name,
                                 tool_context: context,
                                 completed: true,
