@@ -119,6 +119,10 @@ pub enum AgentEvent {
         subagent_id: String,
         /// Name of the subagent (e.g., "explore", "plan")
         subagent_name: String,
+        /// Human-friendly nickname assigned by the parent (e.g., "Zara")
+        nickname: Option<String>,
+        /// Maximum turns configured for this subagent
+        max_turns: Option<u32>,
         /// Tool name that just started or completed
         tool_name: String,
         /// Brief context for the tool (e.g., file path, pattern)
