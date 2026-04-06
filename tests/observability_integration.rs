@@ -5,7 +5,9 @@
 use agent_sdk::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, StopReason, Usage,
 };
-use agent_sdk::observability::attrs;
+use agent_sdk::observability::{
+    CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle, attrs,
+};
 use agent_sdk::{
     AgentEvent, AgentEventEnvelope, AgentInput, AgentState, AllowAllHooks, CancellationToken,
     DynamicToolName, InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, Tool,
@@ -15,8 +17,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use opentelemetry::global;
 use opentelemetry::trace::{Status, TraceId};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -170,13 +173,56 @@ impl StateStore for SharedStore {
     }
 }
 
+struct InlinePayloadStore;
+
+#[async_trait]
+impl ObservabilityStore for InlinePayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> Result<CaptureResult> {
+        Ok(CaptureResult {
+            system_instructions: CaptureDecision::Inline,
+            input_messages: CaptureDecision::Inline,
+            output_messages: CaptureDecision::Inline,
+        })
+    }
+}
+
+struct FailingPayloadStore;
+
+#[async_trait]
+impl ObservabilityStore for FailingPayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> Result<CaptureResult> {
+        Err(anyhow!("payload capture failed"))
+    }
+}
+
+struct CountingPayloadStore {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObservabilityStore for CountingPayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> Result<CaptureResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CaptureResult {
+            system_instructions: CaptureDecision::Omit,
+            input_messages: CaptureDecision::Omit,
+            output_messages: CaptureDecision::Omit,
+        })
+    }
+}
+
 async fn acquire_test_lock() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().await
 }
 
 fn setup_tracer() -> (SdkTracerProvider, InMemorySpanExporter) {
+    setup_tracer_with_sampler(Sampler::AlwaysOn)
+}
+
+fn setup_tracer_with_sampler(sampler: Sampler) -> (SdkTracerProvider, InMemorySpanExporter) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
+        .with_sampler(sampler)
         .with_simple_exporter(exporter.clone())
         .build();
     global::set_tracer_provider(provider.clone());
@@ -221,6 +267,17 @@ fn get_attr(span: &SpanData, key: &str) -> Option<String> {
         .iter()
         .find(|kv| kv.key.as_str() == key)
         .map(|kv| format!("{}", kv.value))
+}
+
+fn parse_json_attr(span: &SpanData, key: &str) -> Result<Value> {
+    let raw = get_attr(span, key).with_context(|| format!("missing {key} attribute"))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {key}: {raw}"))
+}
+
+fn span_has_event(span: &SpanData, event_name: &str) -> bool {
+    span.events
+        .iter()
+        .any(|event| event.name.as_ref() == event_name)
 }
 
 async fn drain_events(mut rx: tokio::sync::mpsc::Receiver<AgentEventEnvelope>) {
@@ -474,6 +531,117 @@ async fn llm_span_emitted_with_model_name() -> Result<()> {
     );
     assert!(get_attr(llm, attrs::GEN_AI_USAGE_INPUT_TOKENS).is_some());
     assert!(get_attr(llm, attrs::GEN_AI_USAGE_OUTPUT_TOKENS).is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn inline_payload_store_records_input_and_output_messages() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi there")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(InlinePayloadStore)
+        .build();
+    let thread_id = ThreadId::new();
+    let (rx, final_state) = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    drain_events(rx).await;
+    let _ = final_state.await.context("agent state channel closed")?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    let input_messages = parse_json_attr(llm, attrs::GEN_AI_INPUT_MESSAGES)?;
+    let output_messages = parse_json_attr(llm, attrs::GEN_AI_OUTPUT_MESSAGES)?;
+    let input = input_messages
+        .as_array()
+        .and_then(|messages| messages.first())
+        .context("missing first input message")?;
+    let output = output_messages
+        .as_array()
+        .and_then(|messages| messages.first())
+        .context("missing first output message")?;
+
+    assert_eq!(input["role"], "user");
+    assert_eq!(input["content"][0]["text"], "Hello");
+    assert_eq!(output["role"], "assistant");
+    assert_eq!(output["content"][0]["text"], "Hi there");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failing_payload_store_does_not_fail_agent() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Still works")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(FailingPayloadStore)
+        .build();
+    let thread_id = ThreadId::new();
+    let (rx, final_state) = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    drain_events(rx).await;
+    let state = final_state.await.context("agent state channel closed")?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    assert!(matches!(state, agent_sdk::AgentRunState::Done { .. }));
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert!(span_has_event(llm, "payload_capture_failed"));
+    assert!(get_attr(llm, attrs::GEN_AI_INPUT_MESSAGES).is_none());
+    assert!(get_attr(llm, attrs::GEN_AI_OUTPUT_MESSAGES).is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn payload_store_is_called_for_non_recording_spans() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, _exporter) = setup_tracer_with_sampler(Sampler::AlwaysOff);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(CountingPayloadStore {
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    let (rx, final_state) = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    drain_events(rx).await;
+    let _ = final_state.await.context("agent state channel closed")?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     Ok(())
 }
