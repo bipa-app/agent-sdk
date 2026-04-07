@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Inline payload capture on LLM spans** - `ObservabilityStore` inline capture decisions now set `gen_ai.input.messages` and `gen_ai.output.messages` on LLM spans, and payload capture failures add a `payload_capture_failed` event without failing the agent run.
+
 - **Cancelled outcomes in observability spans** - Root and turn-level observability instrumentation now records `cancelled` outcomes instead of omitting cancellation states.
 
 ### Changed

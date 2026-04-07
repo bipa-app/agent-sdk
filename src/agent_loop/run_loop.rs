@@ -362,6 +362,8 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         execution_store,
         cancel_token,
         mut input_rx,
+        #[cfg(feature = "otel")]
+        observability_store,
     }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
 ) -> Option<AgentRunState>
 where
@@ -396,6 +398,8 @@ where
             compaction_config,
             compactor,
             execution_store,
+            #[cfg(feature = "otel")]
+            observability_store,
         })
         .await;
 
@@ -728,7 +732,7 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         cancel_token,
         mut input_rx,
         #[cfg(feature = "otel")]
-            observability_store: _observability_store,
+        observability_store,
     }: RunLoopParameters<Ctx, P, H, M, S>,
 ) -> AgentRunState
 where
@@ -814,6 +818,8 @@ where
         execution_store: execution_store.as_ref(),
         cancel_token: &cancel_token,
         input_rx: input_rx.as_mut(),
+        #[cfg(feature = "otel")]
+        observability_store: observability_store.as_ref(),
     })
     .await
     {
@@ -933,7 +939,7 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         execution_store,
         cancel_token,
         #[cfg(feature = "otel")]
-            observability_store: _observability_store,
+        observability_store,
     }: TurnParameters<Ctx, P, H, M, S>,
 ) -> TurnOutcome
 where
@@ -1022,6 +1028,8 @@ where
         compaction_config: compaction_config.as_ref(),
         compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
+        #[cfg(feature = "otel")]
+        observability_store: observability_store.as_ref(),
     })
     .await;
 

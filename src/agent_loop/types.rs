@@ -213,6 +213,8 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) cancel_token: &'a CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -269,6 +271,8 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
@@ -290,9 +294,12 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
+    pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
     pub(super) message_id: &'a str,
     pub(super) thinking_id: &'a str,
+    #[cfg(feature = "otel")]
+    pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
 pub(super) struct ProcessedTurnResponse {

@@ -506,9 +506,12 @@ pub(super) async fn request_llm_response<P, H>(
         tx,
         hooks,
         seq,
+        thread_id,
         turn,
         message_id,
         thinking_id,
+        #[cfg(feature = "otel")]
+        observability_store,
     }: LlmCallParams<'_, P, H>,
 ) -> Result<ChatResponse, AgentError>
 where
@@ -540,6 +543,9 @@ where
         spans::start_client_span(span_name, init_attrs)
     };
 
+    #[cfg(feature = "otel")]
+    let request_for_capture = observability_store.map(|_| request.clone());
+
     let (result, retry_count) = if config.streaming {
         call_llm_streaming(
             provider,
@@ -556,12 +562,82 @@ where
     };
 
     #[cfg(feature = "otel")]
+    if let (Some(observability_store), Some(request), Ok(response)) = (
+        observability_store,
+        request_for_capture.as_ref(),
+        result.as_ref(),
+    ) {
+        capture_llm_payloads(
+            &mut llm_span,
+            observability_store.as_ref(),
+            provider,
+            request,
+            response,
+            thread_id,
+            turn,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "otel")]
     finish_llm_span(&mut llm_span, &result, retry_count);
 
     // Silence unused binding when otel is disabled.
     let _ = retry_count;
+    let _ = thread_id;
 
     result
+}
+
+#[cfg(feature = "otel")]
+async fn capture_llm_payloads<P>(
+    span: &mut opentelemetry::global::BoxedSpan,
+    observability_store: &dyn crate::observability::ObservabilityStore,
+    provider: &Arc<P>,
+    request: &ChatRequest,
+    response: &ChatResponse,
+    thread_id: &ThreadId,
+    turn: usize,
+) where
+    P: LlmProvider,
+{
+    use crate::observability::{CaptureKind, PayloadBundle, payload, spans};
+    use opentelemetry::trace::Span;
+
+    let system_json = payload::convert_system_instructions(request);
+    let input_json = payload::convert_input_messages(request);
+    let output_json = payload::convert_output_messages(response);
+    let bundle = PayloadBundle {
+        capture_id: uuid::Uuid::new_v4().to_string(),
+        capture_kind: CaptureKind::TurnChat,
+        thread_id: thread_id.clone(),
+        turn_number: turn,
+        provider_name: crate::observability::provider_name::normalize(provider.provider())
+            .to_string(),
+        provider_id: provider.provider().to_string(),
+        span_is_recording: span.is_recording(),
+        request_model: provider.model().to_string(),
+        response_model: Some(response.model.clone()),
+        system_instructions: system_json.clone(),
+        input_messages: input_json.clone(),
+        output_messages: output_json.clone(),
+    };
+
+    match observability_store.capture(&bundle).await {
+        Ok(result) => {
+            spans::record_payload_on_span(
+                span,
+                &result,
+                system_json.as_ref(),
+                &input_json,
+                &output_json,
+            );
+        }
+        Err(error) => {
+            warn!("Failed to capture observability payloads: {error}");
+            span.add_event("payload_capture_failed", vec![]);
+        }
+    }
 }
 
 #[cfg(feature = "otel")]
@@ -1238,6 +1314,8 @@ async fn execute_turn_inner<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        #[cfg(feature = "otel")]
+        observability_store,
     }: ExecuteTurnParameters<'_, Ctx, P, H, M, S>,
 ) -> InternalTurnResult
 where
@@ -1289,9 +1367,12 @@ where
         tx,
         hooks,
         seq,
+        thread_id: &ctx.thread_id,
         turn: ctx.turn,
         message_id: &message_id,
         thinking_id: &thinking_id,
+        #[cfg(feature = "otel")]
+        observability_store,
     })
     .await
     {
