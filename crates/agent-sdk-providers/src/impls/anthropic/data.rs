@@ -4,9 +4,9 @@
 //! (`OAuth2` Bearer auth for Claude models on Vertex AI) since they share the same
 //! request/response format.
 
-use crate::llm::{
-    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, StreamDelta,
-    Usage,
+use crate::streaming::StreamDelta;
+use agent_sdk_core::llm::{
+    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,14 +85,14 @@ pub enum ApiThinkingConfig {
 }
 
 impl ApiThinkingConfig {
-    pub const fn from_thinking_config(config: &crate::llm::ThinkingConfig) -> Self {
+    pub const fn from_thinking_config(config: &agent_sdk_core::llm::ThinkingConfig) -> Self {
         match &config.mode {
-            crate::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
+            agent_sdk_core::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
                 config_type: "enabled",
                 budget_tokens: *budget_tokens,
                 display: "omitted",
             },
-            crate::llm::ThinkingMode::Adaptive => Self::Adaptive {
+            agent_sdk_core::llm::ThinkingMode::Adaptive => Self::Adaptive {
                 config_type: "adaptive",
                 display: "omitted",
             },
@@ -103,7 +103,7 @@ impl ApiThinkingConfig {
 /// Output configuration for effort level.
 #[derive(Serialize)]
 pub struct ApiOutputConfig {
-    pub effort: crate::llm::Effort,
+    pub effort: agent_sdk_core::llm::Effort,
 }
 
 #[derive(Serialize)]

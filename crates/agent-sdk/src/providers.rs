@@ -1,20 +1,37 @@
 //! LLM Provider implementations.
 //!
-//! This module contains implementations of the `LlmProvider` trait for
-//! various AI services.
+//! Re-exported from [`agent_sdk_providers::impls`].
 
-pub mod anthropic;
-pub mod cloudflare_ai_gateway;
-pub mod gemini;
-pub mod openai;
-pub mod openai_codex_responses;
-pub mod openai_responses;
-pub mod vertex;
+pub mod anthropic {
+    //! Anthropic Messages API provider.
+    pub use agent_sdk_providers::impls::anthropic::*;
+}
+pub mod cloudflare_ai_gateway {
+    //! Cloudflare AI Gateway proxy provider.
+    pub use agent_sdk_providers::impls::cloudflare_ai_gateway::*;
+}
+pub mod gemini {
+    //! Google Gemini API provider.
+    pub use agent_sdk_providers::impls::gemini::*;
+}
+pub mod openai {
+    //! `OpenAI` Chat Completions API provider.
+    pub use agent_sdk_providers::impls::openai::*;
+}
+pub mod openai_codex_responses {
+    //! `OpenAI` Codex / `ChatGPT` WebSocket provider.
+    pub use agent_sdk_providers::impls::openai_codex_responses::*;
+}
+pub mod openai_responses {
+    //! `OpenAI` Responses API provider.
+    pub use agent_sdk_providers::impls::openai_responses::*;
+}
+pub mod vertex {
+    //! Google Vertex AI provider.
+    pub use agent_sdk_providers::impls::vertex::*;
+}
 
-pub use anthropic::{AnthropicProvider, is_oauth_token};
-pub use cloudflare_ai_gateway::CloudflareAIGatewayProvider;
-pub use gemini::GeminiProvider;
-pub use openai::OpenAIProvider;
-pub use openai_codex_responses::OpenAICodexResponsesProvider;
-pub use openai_responses::OpenAIResponsesProvider;
-pub use vertex::VertexProvider;
+pub use agent_sdk_providers::impls::{
+    AnthropicProvider, CloudflareAIGatewayProvider, GeminiProvider, OpenAICodexResponsesProvider,
+    OpenAIProvider, OpenAIResponsesProvider, VertexProvider, is_oauth_token,
+};

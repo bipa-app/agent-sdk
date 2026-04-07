@@ -7,10 +7,12 @@
 //! Legacy models that require the Responses API (like `gpt-5.2-codex`) are automatically
 //! routed to the correct endpoint.
 
-use crate::llm::attachments::{request_has_attachments, validate_request_attachments};
-use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
-    StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
+use crate::attachments::{request_has_attachments, validate_request_attachments};
+use crate::provider::LlmProvider;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
+    ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -830,8 +832,8 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
             Content::Text(text) => {
                 messages.push(ApiMessage {
                     role: match msg.role {
-                        crate::llm::Role::User => ApiRole::User,
-                        crate::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_core::llm::Role::User => ApiRole::User,
+                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
                     },
                     content: Some(text.clone()),
                     tool_calls: None,
@@ -886,8 +888,8 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                 // Add assistant message with text and/or tool calls
                 if !text_parts.is_empty() || !tool_calls.is_empty() {
                     let role = match msg.role {
-                        crate::llm::Role::User => ApiRole::User,
-                        crate::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_core::llm::Role::User => ApiRole::User,
+                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
                     };
 
                     // Only add if it's an assistant message or has text content
@@ -915,7 +917,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
     messages
 }
 
-fn convert_tool(t: crate::llm::Tool) -> ApiTool {
+fn convert_tool(t: agent_sdk_core::llm::Tool) -> ApiTool {
     ApiTool {
         r#type: "function".to_owned(),
         function: ApiFunction {
@@ -1661,7 +1663,7 @@ mod tests {
     fn test_build_api_messages_with_system() {
         let request = ChatRequest {
             system: "You are helpful.".to_string(),
-            messages: vec![crate::llm::Message::user("Hello")],
+            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
             max_tokens_explicit: true,
@@ -1685,7 +1687,7 @@ mod tests {
     fn test_build_api_messages_empty_system() {
         let request = ChatRequest {
             system: String::new(),
-            messages: vec![crate::llm::Message::user("Hello")],
+            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
             max_tokens_explicit: true,
@@ -1701,7 +1703,7 @@ mod tests {
 
     #[test]
     fn test_convert_tool() {
-        let tool = crate::llm::Tool {
+        let tool = agent_sdk_core::llm::Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
@@ -1930,8 +1932,8 @@ mod tests {
     fn test_should_use_responses_api_for_official_agentic_requests() {
         let request = ChatRequest {
             system: String::new(),
-            messages: vec![crate::llm::Message::user("Hello")],
-            tools: Some(vec![crate::llm::Tool {
+            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
+            tools: Some(vec![agent_sdk_core::llm::Tool {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),

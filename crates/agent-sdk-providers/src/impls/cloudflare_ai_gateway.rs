@@ -26,7 +26,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! use agent_sdk::providers::CloudflareAIGatewayProvider;
 //!
 //! // BYOK — CF token is the only secret at runtime
@@ -45,11 +45,13 @@
 //! ).with_gateway_token("your-cf-api-token");
 //! ```
 
-use crate::llm::{ChatOutcome, ChatRequest, LlmProvider, StreamBox, ThinkingConfig};
+use crate::impls::anthropic::AnthropicProvider;
+use crate::impls::gemini::GeminiProvider;
+use crate::impls::openai::OpenAIProvider;
 use crate::model_capabilities::ModelCapabilities;
-use crate::providers::anthropic::AnthropicProvider;
-use crate::providers::gemini::GeminiProvider;
-use crate::providers::openai::OpenAIProvider;
+use crate::provider::LlmProvider;
+use crate::streaming::StreamBox;
+use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 

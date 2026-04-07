@@ -33,7 +33,7 @@ impl LlmProvider for DemoProvider {
         }))
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &'static str {
         "demo-model"
     }
 

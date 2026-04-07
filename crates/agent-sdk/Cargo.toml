@@ -11,6 +11,8 @@ categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 agent-sdk-core = { workspace = true }
+agent-sdk-tools = { workspace = true }
+agent-sdk-providers = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }

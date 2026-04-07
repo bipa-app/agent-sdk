@@ -6,10 +6,11 @@
 
 pub(crate) mod data;
 
-use crate::llm::attachments::validate_request_attachments;
-use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StreamBox, StreamDelta,
-    ThinkingConfig, ThinkingMode, Usage,
+use crate::attachments::validate_request_attachments;
+use crate::provider::LlmProvider;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -582,7 +583,7 @@ impl LlmProvider for AnthropicProvider {
                 std::collections::HashMap::new();
 
             let mut received_message_stop = false;
-            let mut pending_stop_reason: Option<crate::llm::StopReason> = None;
+            let mut pending_stop_reason: Option<agent_sdk_core::llm::StopReason> = None;
             let mut chunk_count: u64 = 0;
             let mut total_bytes: u64 = 0;
 

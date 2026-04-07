@@ -4,10 +4,12 @@
 //! `ChatGPT` Codex backend using OAuth bearer tokens captured from the `ChatGPT`
 //! Plus/Pro login flow.
 
-use crate::llm::attachments::validate_request_attachments;
-use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
-    StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
+use crate::attachments::validate_request_attachments;
+use crate::provider::LlmProvider;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
+    ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -1267,8 +1269,8 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
             Content::Text(text) => {
                 items.push(ApiInputItem::Message(ApiMessage {
                     role: match msg.role {
-                        crate::llm::Role::User => ApiRole::User,
-                        crate::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_core::llm::Role::User => ApiRole::User,
+                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
                     },
                     content: ApiMessageContent::Text(text.clone()),
                 }));
@@ -1323,8 +1325,8 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 if !content_parts.is_empty() {
                     items.push(ApiInputItem::Message(ApiMessage {
                         role: match msg.role {
-                            crate::llm::Role::User => ApiRole::User,
-                            crate::llm::Role::Assistant => ApiRole::Assistant,
+                            agent_sdk_core::llm::Role::User => ApiRole::User,
+                            agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
                         },
                         content: ApiMessageContent::Parts(content_parts),
                     }));
@@ -1391,7 +1393,7 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
     }
 }
 
-fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
+fn convert_tool(tool: agent_sdk_core::llm::Tool) -> ApiTool {
     // The Responses API with strict: true requires:
     // 1. additionalProperties: false on all object schemas
     // 2. All properties must be in the required array

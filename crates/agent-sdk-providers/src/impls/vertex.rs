@@ -8,16 +8,17 @@
 //! - `claude-*` models route to `publishers/anthropic` using `rawPredict`
 //! - All other models route to `publishers/google` using `generateContent`
 
-use crate::llm::attachments::validate_request_attachments;
-use crate::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamBox, StreamDelta, ThinkingConfig,
-    ThinkingMode, Usage,
-};
-use crate::providers::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
-use crate::providers::gemini::data::{
+use crate::attachments::validate_request_attachments;
+use crate::impls::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
+use crate::impls::gemini::data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
     map_finish_reason, map_thinking_config, stream_gemini_response,
+};
+use crate::provider::LlmProvider;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -366,7 +367,7 @@ impl VertexProvider {
 
         let has_tool_calls = content
             .iter()
-            .any(|b| matches!(b, crate::llm::ContentBlock::ToolUse { .. }));
+            .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. }));
 
         let stop_reason = candidate
             .finish_reason
@@ -699,7 +700,7 @@ impl VertexProvider {
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
-            let mut pending_stop_reason: Option<crate::llm::StopReason> = None;
+            let mut pending_stop_reason: Option<agent_sdk_core::llm::StopReason> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 let Ok(chunk) = chunk_result else {

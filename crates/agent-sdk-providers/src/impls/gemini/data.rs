@@ -3,8 +3,9 @@
 //! Used by both the `GeminiProvider` (API key auth) and `VertexProvider` (`OAuth2` Bearer auth)
 //! since they share the same request/response format.
 
-use crate::llm::attachments::decode_attachment_bytes;
-use crate::llm::{Content, ContentBlock, StopReason, StreamBox, StreamDelta, Usage};
+use crate::attachments::decode_attachment_bytes;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{Content, ContentBlock, StopReason, Usage};
 use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -122,8 +123,10 @@ pub struct ApiThinkingConfig {
 /// - `LOW`: minimal latency and cost
 /// - `MEDIUM`: balanced
 /// - `HIGH`: maximum reasoning depth (default, dynamic)
-pub const fn map_thinking_config(config: &crate::llm::ThinkingConfig) -> ApiThinkingConfig {
-    use crate::llm::{Effort, ThinkingMode};
+pub const fn map_thinking_config(
+    config: &agent_sdk_core::llm::ThinkingConfig,
+) -> ApiThinkingConfig {
+    use agent_sdk_core::llm::{Effort, ThinkingMode};
     // If an explicit effort is set, use it directly
     if let Some(effort) = config.effort {
         let level = match effort {
@@ -224,7 +227,7 @@ impl ApiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
-pub fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
+pub fn build_api_contents(messages: &[agent_sdk_core::llm::Message]) -> Vec<ApiContent> {
     // Build a mapping of tool_use_id -> function_name from all messages
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -242,8 +245,8 @@ pub fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
 
     for msg in messages {
         let role = match msg.role {
-            crate::llm::Role::User => "user",
-            crate::llm::Role::Assistant => "model",
+            agent_sdk_core::llm::Role::User => "user",
+            agent_sdk_core::llm::Role::Assistant => "model",
         };
 
         let parts = match &msg.content {
@@ -322,7 +325,7 @@ pub fn build_api_contents(messages: &[crate::llm::Message]) -> Vec<ApiContent> {
     contents
 }
 
-pub fn convert_tools_to_config(tools: Vec<crate::llm::Tool>) -> ApiToolConfig {
+pub fn convert_tools_to_config(tools: Vec<agent_sdk_core::llm::Tool>) -> ApiToolConfig {
     ApiToolConfig {
         function_declarations: tools
             .into_iter()
@@ -779,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_build_api_contents_simple() {
-        let messages = vec![crate::llm::Message::user("Hello")];
+        let messages = vec![agent_sdk_core::llm::Message::user("Hello")];
 
         let contents = build_api_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -789,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_build_api_contents_assistant() {
-        let messages = vec![crate::llm::Message::assistant("Hi there!")];
+        let messages = vec![agent_sdk_core::llm::Message::assistant("Hi there!")];
 
         let contents = build_api_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -798,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_convert_tools_to_config() {
-        let tools = vec![crate::llm::Tool {
+        let tools = vec![agent_sdk_core::llm::Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),

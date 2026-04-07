@@ -4,7 +4,7 @@
 //! The [`StreamDelta`] enum represents individual events in a streaming response,
 //! and [`StreamAccumulator`] helps collect these events into a final response.
 
-use crate::llm::{ContentBlock, StopReason, Usage};
+use agent_sdk_core::llm::{ContentBlock, StopReason, Usage};
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
