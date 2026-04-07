@@ -50,6 +50,11 @@ pub(super) struct TurnContext {
     pub(super) start_time: Instant,
     /// Number of consecutive compaction retries for context overflow.
     pub(super) compaction_retries: usize,
+    /// Optional system reminder to inject into the next LLM call.
+    ///
+    /// Set by `begin_turn` when approaching the turn limit, then consumed
+    /// by `execute_turn_inner` to append a user message to the conversation.
+    pub(super) pending_reminder: Option<String>,
 }
 
 /// Data extracted from `AgentInput::Resume` after validation.

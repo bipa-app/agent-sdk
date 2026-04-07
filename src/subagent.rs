@@ -415,6 +415,9 @@ where
                                 nickname: self.config.nickname.clone(),
                                 #[allow(clippy::cast_possible_truncation)]
                                 max_turns: self.config.max_turns.map(|t| t as u32),
+                                #[allow(clippy::cast_possible_truncation)]
+                                current_turn: Some(total_turns as u32),
+                                model: self.config.model.clone(),
                                 tool_name: name,
                                 tool_context: context,
                                 completed: false,
@@ -456,6 +459,9 @@ where
                                 nickname: self.config.nickname.clone(),
                                 #[allow(clippy::cast_possible_truncation)]
                                 max_turns: self.config.max_turns.map(|t| t as u32),
+                                #[allow(clippy::cast_possible_truncation)]
+                                current_turn: Some(total_turns as u32),
+                                model: self.config.model.clone(),
                                 tool_name: name,
                                 tool_context: context,
                                 completed: true,

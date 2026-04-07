@@ -795,6 +795,7 @@ where
         state,
         start_time,
         compaction_retries: 0,
+        pending_reminder: None,
     };
 
     if let Some(outcome) = run_loop_turns(RunLoopTurnsParams {
@@ -1004,6 +1005,7 @@ where
         state,
         start_time,
         compaction_retries: 0,
+        pending_reminder: None,
     };
 
     let result = execute_turn(ExecuteTurnParameters {

@@ -123,6 +123,10 @@ pub enum AgentEvent {
         nickname: Option<String>,
         /// Maximum turns configured for this subagent
         max_turns: Option<u32>,
+        /// Current turn number of the subagent
+        current_turn: Option<u32>,
+        /// Model being used by the subagent
+        model: Option<String>,
         /// Tool name that just started or completed
         tool_name: String,
         /// Brief context for the tool (e.g., file path, pattern)
