@@ -38,6 +38,23 @@ where
     ctx.turn += 1;
     ctx.state.turn_count = ctx.turn;
 
+    // Warn the agent when approaching turn limit
+    if let Some(max_turns) = max_turns {
+        let remaining = max_turns.saturating_sub(ctx.turn);
+        if remaining == 2 {
+            info!(
+                "Injecting turn-budget reminder (turn={}, max={max_turns})",
+                ctx.turn
+            );
+            ctx.pending_reminder = Some(
+                "TURN BUDGET WARNING: You have only 2 turns remaining before your turn limit. \
+                 You MUST provide your final response NOW with everything you've found so far. \
+                 Do NOT start any new tool calls — summarize your findings immediately."
+                    .to_string(),
+            );
+        }
+    }
+
     if let Some(max_turns) = max_turns
         && ctx.turn > max_turns
     {
@@ -1250,6 +1267,12 @@ where
         Ok(messages) => messages,
         Err(error) => return InternalTurnResult::Error(error),
     };
+
+    // Inject the turn-budget reminder as a user message if one was set.
+    let mut messages = messages;
+    if let Some(reminder) = ctx.pending_reminder.take() {
+        messages.push(Message::user(reminder));
+    }
 
     let request = match build_turn_request(config, provider, &ctx.thread_id, messages, tools) {
         Ok(request) => request,
