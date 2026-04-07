@@ -10,6 +10,7 @@ keywords = ["agent", "llm", "ai", "anthropic", "tools"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
+agent-sdk-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
