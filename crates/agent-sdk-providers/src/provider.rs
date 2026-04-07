@@ -8,7 +8,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use crate::model_capabilities::{ModelCapabilities, default_max_output_tokens, get_model_capabilities};
+use crate::model_capabilities::{
+    ModelCapabilities, default_max_output_tokens, get_model_capabilities,
+};
 use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta};
 
 #[async_trait]

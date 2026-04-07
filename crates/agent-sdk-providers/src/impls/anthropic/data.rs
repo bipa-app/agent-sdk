@@ -4,11 +4,10 @@
 //! (`OAuth2` Bearer auth for Claude models on Vertex AI) since they share the same
 //! request/response format.
 
-use agent_sdk_core::llm::{
-    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason,
-    Usage,
-};
 use crate::streaming::StreamDelta;
+use agent_sdk_core::llm::{
+    ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, Usage,
+};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================

@@ -2,8 +2,8 @@ use std::fmt::Write;
 
 use anyhow::Result;
 
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, Message, Role};
 use crate::provider::LlmProvider;
+use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, Message, Role};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTier {

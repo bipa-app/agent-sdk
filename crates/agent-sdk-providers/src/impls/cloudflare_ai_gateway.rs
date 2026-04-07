@@ -45,13 +45,13 @@
 //! ).with_gateway_token("your-cf-api-token");
 //! ```
 
-use crate::provider::LlmProvider;
-use crate::streaming::StreamBox;
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
-use crate::model_capabilities::ModelCapabilities;
 use crate::impls::anthropic::AnthropicProvider;
 use crate::impls::gemini::GeminiProvider;
 use crate::impls::openai::OpenAIProvider;
+use crate::model_capabilities::ModelCapabilities;
+use crate::provider::LlmProvider;
+use crate::streaming::StreamBox;
+use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 

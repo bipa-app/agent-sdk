@@ -10,8 +10,7 @@ use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta};
 use agent_sdk_core::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock,
-    ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;

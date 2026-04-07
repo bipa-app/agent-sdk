@@ -9,17 +9,16 @@
 //! - All other models route to `publishers/google` using `generateContent`
 
 use crate::attachments::validate_request_attachments;
-use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
-use agent_sdk_core::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig,
-    ThinkingMode, Usage,
-};
 use crate::impls::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
 use crate::impls::gemini::data::{
     ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
     ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
     map_finish_reason, map_thinking_config, stream_gemini_response,
+};
+use crate::provider::LlmProvider;
+use crate::streaming::{StreamBox, StreamDelta};
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;

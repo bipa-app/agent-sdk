@@ -123,7 +123,9 @@ pub struct ApiThinkingConfig {
 /// - `LOW`: minimal latency and cost
 /// - `MEDIUM`: balanced
 /// - `HIGH`: maximum reasoning depth (default, dynamic)
-pub const fn map_thinking_config(config: &agent_sdk_core::llm::ThinkingConfig) -> ApiThinkingConfig {
+pub const fn map_thinking_config(
+    config: &agent_sdk_core::llm::ThinkingConfig,
+) -> ApiThinkingConfig {
     use agent_sdk_core::llm::{Effort, ThinkingMode};
     // If an explicit effort is set, use it directly
     if let Some(effort) = config.effort {
