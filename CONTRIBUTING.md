@@ -25,6 +25,8 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Building
 
+This is a Cargo workspace. All commands run from the repo root:
+
 ```bash
 cargo build
 ```
@@ -138,6 +140,20 @@ pub fn create(params: CreateParams) { }
 ```
 
 ## Pull Request Process
+
+### sdk/v2 Rewrite PRs
+
+The SDK rewrite is developed on the **`sdk/v2`** branch. All rewrite PRs
+must target `sdk/v2` as their base branch — **not** `main`.
+
+```bash
+# Start a rewrite feature branch
+git checkout sdk/v2
+git pull --rebase origin sdk/v2
+git checkout -b feat/my-phase-0-work
+```
+
+### General PRs
 
 1. Ensure all quality checks pass
 2. Update documentation if you're changing public APIs

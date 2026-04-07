@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'Cargo.toml'
+      - 'crates/agent-sdk/Cargo.toml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,8 +24,8 @@ jobs:
       - name: Check if version changed
         id: version
         run: |
-          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          git show HEAD~1:Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
+          CURRENT_VERSION=$(grep '^version' crates/agent-sdk/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          git show HEAD~1:crates/agent-sdk/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
           OLD_VERSION=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
@@ -113,4 +113,4 @@ jobs:
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        run: cargo publish -p agent-sdk
