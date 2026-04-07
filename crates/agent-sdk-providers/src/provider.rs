@@ -3,7 +3,9 @@
 //! This module defines the [`LlmProvider`] trait that all LLM backends implement,
 //! as well as the [`collect_stream`] helper for consuming a streaming response.
 
-use agent_sdk_core::llm::*;
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;

@@ -15,15 +15,15 @@ pub mod gemini {
     pub use agent_sdk_providers::impls::gemini::*;
 }
 pub mod openai {
-    //! OpenAI Chat Completions API provider.
+    //! `OpenAI` Chat Completions API provider.
     pub use agent_sdk_providers::impls::openai::*;
 }
 pub mod openai_codex_responses {
-    //! OpenAI Codex / ChatGPT WebSocket provider.
+    //! `OpenAI` Codex / `ChatGPT` WebSocket provider.
     pub use agent_sdk_providers::impls::openai_codex_responses::*;
 }
 pub mod openai_responses {
-    //! OpenAI Responses API provider.
+    //! `OpenAI` Responses API provider.
     pub use agent_sdk_providers::impls::openai_responses::*;
 }
 pub mod vertex {

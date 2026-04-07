@@ -158,11 +158,13 @@ pub trait Environment: Send + Sync {
 /// This prevents path traversal attacks where `../../etc/passwd` could escape
 /// an allowed directory. Unlike `std::fs::canonicalize`, this does not require
 /// the path to exist and does not follow symlinks.
+#[must_use]
 pub fn normalize_path(path: &Path) -> String {
     normalize_path_buf(path).to_string_lossy().into_owned()
 }
 
 /// Lexically normalize a path, returning a `PathBuf`.
+#[must_use]
 pub fn normalize_path_buf(path: &Path) -> PathBuf {
     let mut components: Vec<Component<'_>> = Vec::new();
     for component in path.components() {
