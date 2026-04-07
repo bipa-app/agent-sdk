@@ -45,13 +45,7 @@ mod tests {
     #[test]
     fn dependency_edges_are_wired() {
         // Core types
-        fn _assert_core_types(
-            _id: ThreadId,
-            _cfg: AgentConfig,
-            _msg: Message,
-            _role: Role,
-        ) {
-        }
+        fn _assert_core_types(_id: ThreadId, _cfg: AgentConfig, _msg: Message, _role: Role) {}
 
         // Tool-layer traits (object-safe)
         fn _assert_tool_traits(
