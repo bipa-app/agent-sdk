@@ -111,18 +111,6 @@ impl crate::llm::LlmProvider for MockProvider {
     }
 }
 
-// Make ChatOutcome clonable for tests
-impl Clone for ChatOutcome {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Success(r) => Self::Success(r.clone()),
-            Self::RateLimited => Self::RateLimited,
-            Self::InvalidRequest(s) => Self::InvalidRequest(s.clone()),
-            Self::ServerError(s) => Self::ServerError(s.clone()),
-        }
-    }
-}
-
 pub async fn drain_events(
     mut rx: tokio::sync::mpsc::Receiver<AgentEventEnvelope>,
 ) -> Vec<AgentEventEnvelope> {

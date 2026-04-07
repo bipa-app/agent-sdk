@@ -1,0 +1,21 @@
+[package]
+name = "agent-sdk-core"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared contract types for the Agent SDK (IDs, events, LLM messages, turn outcomes)"
+keywords = ["agent", "llm", "ai", "types"]
+categories = ["data-structures"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
