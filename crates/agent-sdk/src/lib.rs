@@ -275,6 +275,20 @@
 //! }
 //! ```
 //!
+//! ## Workspace Architecture
+//!
+//! The SDK is split into focused crates. This `agent-sdk` crate is the
+//! **public façade** — it re-exports everything you need so downstream
+//! users only depend on `agent-sdk`.
+//!
+//! | Crate | Purpose |
+//! |-------|---------|
+//! | [`agent_sdk_core`] | Data-only contract types (IDs, events, LLM messages) |
+//! | [`agent_sdk_tools`] | Tool traits, registry, hooks, stores, environment |
+//! | [`agent_sdk_providers`] | LLM provider trait and first-party implementations |
+//! | `agent-server` | Server-side orchestration (internal, not published) |
+//! | **`agent-sdk`** | **This crate** — façade with agent loop, examples, and convenience re-exports |
+//!
 //! ## Modules
 //!
 //! | Module | Description |
@@ -284,7 +298,7 @@
 //! | [`llm`] | LLM abstraction layer |
 //! | [`subagent`] | Nested agent execution with [`SubagentFactory`] |
 //! | [`mcp`] | Model Context Protocol support |
-//! | [`todo`] | Task tracking tools ([`TodoWriteTool`], [`TodoReadTool`]) |
+//! | [`todo`](mod@todo) | Task tracking tools ([`TodoWriteTool`], [`TodoReadTool`]) |
 //! | [`user_interaction`] | User question/confirmation tools ([`AskUserQuestionTool`]) |
 //! | [`web`] | Web search and fetch tools |
 //! | [`skills`] | Custom skill/command loading |
@@ -320,81 +334,88 @@
 
 #![forbid(unsafe_code)]
 
+// ── Private modules (owned by this crate) ────────────────────────────
 mod agent_loop;
 mod capabilities;
 pub mod context;
-mod environment;
-mod events;
 mod filesystem;
-mod hooks;
-pub mod llm;
 pub mod mcp;
-pub mod model_capabilities;
 pub mod primitive_tools;
-pub mod providers;
 pub mod reminders;
 pub mod skills;
-mod stores;
 pub mod subagent;
 pub mod todo;
-mod tools;
-mod types;
 pub mod user_interaction;
 pub mod web;
 
 #[cfg(feature = "otel")]
 pub mod observability;
 
-#[cfg(feature = "otel")]
-pub use observability::{
-    CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle,
-};
+// ── Re-export modules from workspace crates ──────────────────────────
+// These thin modules delegate to the extracted crates so that
+// `use agent_sdk::llm::*` etc. keep working for downstream users.
+mod environment;
+mod events;
+mod hooks;
+pub mod llm;
+pub mod model_capabilities;
+pub mod providers;
+mod stores;
+mod tools;
+mod types;
 
+// ── Flat re-exports ──────────────────────────────────────────────────
+// Grouped by source crate so the provenance is clear.
+
+// agent-sdk (owned — agent loop)
 pub use agent_loop::{AgentHandle, AgentLoop, AgentLoopBuilder, builder};
 pub use capabilities::AgentCapabilities;
-pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
-pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
-
-// Re-export CancellationToken for use with `AgentLoop::run_with_cancel`.
-pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
-pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
-pub use model_capabilities::{
-    ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
-    supported_model_capabilities,
-};
-pub use stores::{
-    InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
-};
 pub use tokio_util::sync::CancellationToken;
-pub use tools::{
-    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
-    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
-    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
-    tool_name_to_string,
-};
+
+// agent-sdk-core (via thin modules)
+pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
     TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolTier, TurnOutcome,
 };
 
-// Re-export user interaction types for convenience
+// agent-sdk-tools (via thin modules)
+pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
+pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
+pub use stores::{
+    InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
+};
+pub use tools::{
+    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
+    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
+    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
+    tool_name_to_string,
+};
+
+// agent-sdk-providers (via thin modules)
+pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
+pub use model_capabilities::{
+    ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
+    supported_model_capabilities,
+};
+
+// Convenience re-exports
+pub use reminders::{
+    ReminderConfig, ReminderTracker, ReminderTrigger, ToolReminder, append_reminder, wrap_reminder,
+};
+pub use subagent::{
+    METADATA_MAX_SUBAGENT_DEPTH, METADATA_SUBAGENT_DEPTH, SubagentConfig, SubagentFactory,
+    SubagentTool,
+};
+pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};
 pub use user_interaction::{
     AskUserQuestionTool, ConfirmationRequest, ConfirmationResponse, QuestionOption,
     QuestionRequest, QuestionResponse,
 };
 
-// Re-export subagent types for convenience
-pub use subagent::{
-    METADATA_MAX_SUBAGENT_DEPTH, METADATA_SUBAGENT_DEPTH, SubagentConfig, SubagentFactory,
-    SubagentTool,
-};
-
-// Re-export todo types for convenience
-pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};
-
-// Re-export reminder types for convenience
-pub use reminders::{
-    ReminderConfig, ReminderTracker, ReminderTrigger, ToolReminder, append_reminder, wrap_reminder,
+#[cfg(feature = "otel")]
+pub use observability::{
+    CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle,
 };
