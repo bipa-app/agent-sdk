@@ -377,7 +377,9 @@ mod types;
 // Grouped by source crate so the provenance is clear.
 
 // agent-sdk (owned — agent loop)
-pub use agent_loop::{AgentHandle, AgentLoop, AgentLoopBuilder, builder};
+pub use agent_loop::{
+    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, builder,
+};
 pub use capabilities::AgentCapabilities;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;

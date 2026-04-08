@@ -1591,8 +1591,7 @@ async fn test_external_tool_runtime_no_tools_returns_done() -> anyhow::Result<()
 
     assert!(
         matches!(outcome, TurnOutcome::Done { .. }),
-        "Expected Done when no tool calls, got {:?}",
-        outcome
+        "Expected Done when no tool calls, got {outcome:?}"
     );
     Ok(())
 }
@@ -1631,8 +1630,7 @@ async fn test_strict_durability_saves_state_checkpoints() -> anyhow::Result<()> 
     // Should complete normally with NeedsMoreTurns (tool was executed inline).
     assert!(
         matches!(outcome, TurnOutcome::NeedsMoreTurns { .. }),
-        "Expected NeedsMoreTurns, got {:?}",
-        outcome
+        "Expected NeedsMoreTurns, got {outcome:?}"
     );
     Ok(())
 }

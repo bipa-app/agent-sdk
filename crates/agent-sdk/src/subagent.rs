@@ -423,14 +423,16 @@ where
                     emit_subagent_progress(
                         parent_ctx,
                         &self.config,
-                        &subagent_id,
-                        total_turns,
-                        &total_usage,
-                        name,
-                        context,
-                        false,
-                        false,
-                        tool_count,
+                        SubagentProgressUpdate {
+                            subagent_id: &subagent_id,
+                            total_turns,
+                            total_usage: &total_usage,
+                            tool_name: name,
+                            tool_context: context,
+                            completed: false,
+                            success: false,
+                            tool_count,
+                        },
                     )
                     .await?;
                 }
@@ -459,14 +461,16 @@ where
                     emit_subagent_progress(
                         parent_ctx,
                         &self.config,
-                        &subagent_id,
-                        total_turns,
-                        &total_usage,
-                        name,
-                        context,
-                        true,
-                        tool_success,
-                        tool_count,
+                        SubagentProgressUpdate {
+                            subagent_id: &subagent_id,
+                            total_turns,
+                            total_usage: &total_usage,
+                            tool_name: name,
+                            tool_context: context,
+                            completed: true,
+                            success: tool_success,
+                            tool_count,
+                        },
                     )
                     .await?;
                 }
@@ -571,17 +575,30 @@ fn subagent_total_tokens(total_usage: &TokenUsage) -> u64 {
     u64::from(total_usage.input_tokens) + u64::from(total_usage.output_tokens)
 }
 
-async fn emit_subagent_progress(
-    parent_ctx: &ToolContext<()>,
-    config: &SubagentConfig,
-    subagent_id: &str,
+struct SubagentProgressUpdate<'a> {
+    subagent_id: &'a str,
     total_turns: usize,
-    total_usage: &TokenUsage,
+    total_usage: &'a TokenUsage,
     tool_name: String,
     tool_context: String,
     completed: bool,
     success: bool,
     tool_count: u32,
+}
+
+async fn emit_subagent_progress(
+    parent_ctx: &ToolContext<()>,
+    config: &SubagentConfig,
+    SubagentProgressUpdate {
+        subagent_id,
+        total_turns,
+        total_usage,
+        tool_name,
+        tool_context,
+        completed,
+        success,
+        tool_count,
+    }: SubagentProgressUpdate<'_>,
 ) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let max_turns = config.max_turns.map(|turns| turns as u32);

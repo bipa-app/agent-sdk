@@ -2,10 +2,10 @@ use super::helpers::{build_assistant_message, extract_content, pending_tool_inde
 use super::llm::{call_llm_streaming, call_llm_with_retry};
 use super::tool_execution::{append_tool_results, execute_tool_call};
 use super::types::{
-    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, ProcessedTurnResponse,
-    ToolBatchExecutionParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnCompletionParams,
-    TurnContext, TurnMessageLoadParams, TurnResponseProcessingParams, TurnStopReasonParams,
-    TurnToolPhaseParams,
+    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmStreamIds,
+    ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
+    ToolExecutionOutcome, TurnCompletionParams, TurnContext, TurnMessageLoadParams,
+    TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
 
 use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
@@ -174,8 +174,8 @@ where
                 turn,
                 messages.len()
             );
-            return compact_messages_for_threshold(
-                compactor.as_ref(),
+            return compact_messages_for_threshold(ThresholdCompactionParams {
+                compactor: compactor.as_ref(),
                 messages,
                 message_store,
                 thread_id,
@@ -183,7 +183,7 @@ where
                 turn,
                 hooks,
                 seq,
-            )
+            })
             .await;
         }
 
@@ -199,8 +199,8 @@ where
                 turn,
                 messages.len()
             );
-            return compact_messages_for_threshold(
-                &default_compactor,
+            return compact_messages_for_threshold(ThresholdCompactionParams {
+                compactor: &default_compactor,
                 messages,
                 message_store,
                 thread_id,
@@ -208,7 +208,7 @@ where
                 turn,
                 hooks,
                 seq,
-            )
+            })
             .await;
         }
     }
@@ -224,15 +224,28 @@ struct StoredCompactionResult {
     new_tokens: usize,
 }
 
-async fn compact_messages_for_threshold<C, H, M>(
-    compactor: &C,
+struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
+    compactor: &'a C,
     messages: Vec<Message>,
-    message_store: &Arc<M>,
-    thread_id: &ThreadId,
-    event_store: &Arc<dyn EventStore>,
+    message_store: &'a Arc<M>,
+    thread_id: &'a ThreadId,
+    event_store: &'a Arc<dyn EventStore>,
     turn: usize,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn compact_messages_for_threshold<C, H, M>(
+    ThresholdCompactionParams {
+        compactor,
+        messages,
+        message_store,
+        thread_id,
+        event_store,
+        turn,
+        hooks,
+        seq,
+    }: ThresholdCompactionParams<'_, C, H, M>,
 ) -> Result<Vec<Message>, AgentError>
 where
     C: ContextCompactor + ?Sized,
@@ -535,6 +548,13 @@ where
     H: AgentHooks,
 {
     debug!("Calling LLM (turn={turn}, streaming={})", config.streaming);
+    let event_ctx = LlmEventContext {
+        event_store,
+        hooks,
+        seq,
+        thread_id,
+        turn,
+    };
 
     #[cfg(feature = "otel")]
     let mut llm_span = {
@@ -567,26 +587,15 @@ where
             provider,
             request,
             config,
-            event_store,
-            hooks,
-            seq,
-            (message_id, thinking_id),
-            thread_id,
-            turn,
+            &event_ctx,
+            LlmStreamIds {
+                message_id,
+                thinking_id,
+            },
         )
         .await
     } else {
-        call_llm_with_retry(
-            provider,
-            request,
-            config,
-            event_store,
-            hooks,
-            seq,
-            thread_id,
-            turn,
-        )
-        .await
+        call_llm_with_retry(provider, request, config, &event_ctx).await
     };
 
     #[cfg(feature = "otel")]
@@ -1529,10 +1538,8 @@ where
         if let Err(error) = state_store.save(&ctx.state).await {
             warn!("Strict durability: failed to save post-LLM state: {error}");
         }
-    } else if had_tool_calls {
-        if let Err(error) = state_store.save(&ctx.state).await {
-            warn!("Failed to save pre-tool state checkpoint: {error}");
-        }
+    } else if had_tool_calls && let Err(error) = state_store.save(&ctx.state).await {
+        warn!("Failed to save pre-tool state checkpoint: {error}");
     }
 
     // External tool runtime: return pending tool calls to the caller instead
@@ -1576,10 +1583,10 @@ where
     }
 
     // Strict durability: checkpoint after tool execution.
-    if turn_options.strict_durability {
-        if let Err(error) = state_store.save(&ctx.state).await {
-            warn!("Strict durability: failed to save post-tool state: {error}");
-        }
+    if turn_options.strict_durability
+        && let Err(error) = state_store.save(&ctx.state).await
+    {
+        warn!("Strict durability: failed to save post-tool state: {error}");
     }
 
     handle_turn_stop_reason(TurnStopReasonParams {

@@ -102,8 +102,8 @@ mod tests {
         assert_eq!(opts.tool_runtime, ToolRuntime::External);
         assert!(opts.strict_durability);
 
-        fn _assert_event_store(_store: &dyn EventStore, _turns: StoredTurnEvents) {}
         let store = InMemoryEventStore::new();
-        _assert_event_store(&store, StoredTurnEvents::default());
+        let _: &dyn EventStore = &store;
+        let _: StoredTurnEvents = StoredTurnEvents::default();
     }
 }

@@ -73,6 +73,22 @@ pub struct AgentHandle {
     pub cancel_token: CancellationToken,
 }
 
+/// Configuration bundle for constructing an [`AgentLoop`] with compaction.
+pub struct AgentLoopCompactionConfig {
+    pub agent_config: AgentConfig,
+    pub compaction_config: CompactionConfig,
+}
+
+impl AgentLoopCompactionConfig {
+    #[must_use]
+    pub const fn new(agent_config: AgentConfig, compaction_config: CompactionConfig) -> Self {
+        Self {
+            agent_config,
+            compaction_config,
+        }
+    }
+}
+
 /// The main agent loop that orchestrates LLM calls and tool execution.
 ///
 /// `AgentLoop` is the core component that:
@@ -179,9 +195,12 @@ where
         message_store: M,
         state_store: S,
         event_store: Arc<dyn EventStore>,
-        config: AgentConfig,
-        compaction_config: CompactionConfig,
+        config: AgentLoopCompactionConfig,
     ) -> Self {
+        let AgentLoopCompactionConfig {
+            agent_config,
+            compaction_config,
+        } = config;
         Self {
             provider: Arc::new(provider),
             tools: Arc::new(tools),
@@ -189,7 +208,7 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             event_store,
-            config,
+            config: agent_config,
             compaction_config: Some(compaction_config),
             compactor: None,
             execution_store: None,
@@ -455,7 +474,7 @@ where
     ///
     /// # Returns
     ///
-    /// A [`TurnOutcome`] returned only after the configured event store's
+    /// A [`crate::types::TurnOutcome`] returned only after the configured event store's
     /// `finish_turn(thread_id, turn)` barrier has completed.
     ///
     /// # Turn Outcomes

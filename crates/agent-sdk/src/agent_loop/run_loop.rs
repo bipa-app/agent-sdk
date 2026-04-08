@@ -2,10 +2,11 @@ use super::helpers::{pending_tool_index, send_event, turns_to_u32};
 use super::tool_execution::{append_tool_results, execute_confirmed_tool, execute_tool_call};
 use super::turn::execute_turn;
 use super::types::{
-    ConfirmedToolExecutionContext, ExecuteTurnParameters, InitializedState, InternalTurnResult,
-    ResumeData, ResumeProcessingParameters, ResumeProcessingResult, RunLoopParameters,
-    RunLoopResumeParams, RunLoopTurnsParams, SingleTurnResumeParams, ToolCallExecutionContext,
-    ToolExecutionOutcome, TurnContext, TurnParameters,
+    ConfirmedToolExecutionContext, ConvertTurnResultParams, ExecuteTurnParameters,
+    InitializedState, InternalTurnResult, ResumeData, ResumeProcessingParameters,
+    ResumeProcessingResult, RunLoopParameters, RunLoopResumeParams, RunLoopTurnsParams,
+    SingleTurnResumeParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnContext,
+    TurnParameters,
 };
 
 use crate::types::TurnOptions;
@@ -361,6 +362,192 @@ async fn finish_turn_or_error(
         .map_err(|error| {
             AgentError::new(format!("Failed to finish turn event store: {error}"), false)
         })
+}
+
+async fn initialize_run_loop_state<M, S>(
+    input: AgentInput,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+    state_store: &Arc<S>,
+) -> Result<InitializedState, AgentRunState>
+where
+    M: MessageStore,
+    S: StateStore,
+{
+    initialize_from_input(input, thread_id, message_store, state_store)
+        .await
+        .map_err(AgentRunState::Error)
+}
+
+async fn handle_run_loop_resume_state<Ctx, H, M>(
+    params: RunLoopResumeParams<'_, Ctx, H, M>,
+) -> Option<AgentRunState>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let turn = params.turn;
+    let thread_id = params.thread_id;
+    let event_store = params.event_store;
+    let hooks = params.hooks;
+    let seq = params.seq;
+
+    match handle_run_loop_resume(params).await {
+        Ok(Some(outcome)) => {
+            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
+                return Some(AgentRunState::Error(store_error));
+            }
+            Some(outcome)
+        }
+        Ok(None) => {
+            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
+                return Some(AgentRunState::Error(store_error));
+            }
+            None
+        }
+        Err(error) => {
+            if let Err(store_error) = send_event(
+                event_store,
+                thread_id,
+                turn,
+                hooks,
+                seq,
+                AgentEvent::error(&error.message, error.recoverable),
+            )
+            .await
+            {
+                return Some(AgentRunState::Error(store_error));
+            }
+            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
+                return Some(AgentRunState::Error(store_error));
+            }
+            Some(AgentRunState::Error(error))
+        }
+    }
+}
+
+async fn initialize_single_turn_state<H, M, S>(
+    input: AgentInput,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+    state_store: &Arc<S>,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+) -> Result<InitializedState, TurnOutcome>
+where
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    match initialize_from_input(input, thread_id, message_store, state_store).await {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            if let Err(store_error) = send_event(
+                event_store,
+                thread_id,
+                0,
+                hooks,
+                seq,
+                AgentEvent::error(&error.message, error.recoverable),
+            )
+            .await
+            {
+                return Err(TurnOutcome::Error(store_error));
+            }
+            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, 0).await {
+                return Err(TurnOutcome::Error(store_error));
+            }
+            Err(TurnOutcome::Error(error))
+        }
+    }
+}
+
+async fn handle_single_turn_resume_state<Ctx, H, M, S>(
+    params: SingleTurnResumeParams<Ctx, H, M, S>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    let turn = params.turn;
+    let thread_id = params.thread_id.clone();
+    let event_store = Arc::clone(&params.event_store);
+    let outcome = handle_single_turn_resume(params).await;
+    if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await {
+        return TurnOutcome::Error(store_error);
+    }
+    outcome
+}
+
+fn build_turn_context(
+    thread_id: &ThreadId,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    start_time: Instant,
+) -> TurnContext {
+    TurnContext {
+        thread_id: thread_id.clone(),
+        turn,
+        total_usage,
+        state,
+        start_time,
+        compaction_retries: 0,
+        pending_reminder: None,
+    }
+}
+
+const fn cancelled_turn_outcome() -> TurnOutcome {
+    TurnOutcome::Cancelled {
+        total_turns: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+    }
+}
+
+async fn finish_run_loop_success<H, S>(
+    ctx: TurnContext,
+    state_store: &Arc<S>,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+) -> AgentRunState
+where
+    H: AgentHooks,
+    S: StateStore,
+{
+    if let Err(error) = state_store.save(&ctx.state).await {
+        warn!("Failed to save final state: {error}");
+    }
+
+    let duration = ctx.start_time.elapsed();
+    if let Err(error) = send_event(
+        event_store,
+        &ctx.thread_id,
+        ctx.turn,
+        hooks,
+        seq,
+        AgentEvent::done(
+            ctx.thread_id.clone(),
+            ctx.turn,
+            ctx.total_usage.clone(),
+            duration,
+        ),
+    )
+    .await
+    {
+        return AgentRunState::Error(error);
+    }
+
+    AgentRunState::Done {
+        total_turns: turns_to_u32(ctx.turn),
+        input_tokens: u64::from(ctx.total_usage.input_tokens),
+        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -828,9 +1015,9 @@ where
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
     let init_state =
-        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
+        match initialize_run_loop_state(input, &thread_id, &message_store, &state_store).await {
             Ok(state) => state,
-            Err(error) => return AgentRunState::Error(error),
+            Err(error) => return error,
         };
 
     let InitializedState {
@@ -847,7 +1034,7 @@ where
             turn,
             seq.clone(),
         );
-        let resume_result = handle_run_loop_resume(RunLoopResumeParams {
+        if let Some(outcome) = handle_run_loop_resume_state(RunLoopResumeParams {
             resume_data,
             turn,
             total_usage: &total_usage,
@@ -861,53 +1048,13 @@ where
             message_store: &message_store,
             execution_store: execution_store.as_ref(),
         })
-        .await;
-
-        match resume_result {
-            Ok(Some(outcome)) => {
-                if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await
-                {
-                    return AgentRunState::Error(store_error);
-                }
-                return outcome;
-            }
-            Ok(None) => {
-                if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await
-                {
-                    return AgentRunState::Error(store_error);
-                }
-            }
-            Err(error) => {
-                if let Err(store_error) = send_event(
-                    &event_store,
-                    &thread_id,
-                    turn,
-                    &hooks,
-                    &seq,
-                    AgentEvent::error(&error.message, error.recoverable),
-                )
-                .await
-                {
-                    return AgentRunState::Error(store_error);
-                }
-                if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await
-                {
-                    return AgentRunState::Error(store_error);
-                }
-                return AgentRunState::Error(error);
-            }
+        .await
+        {
+            return outcome;
         }
     }
 
-    let mut ctx = TurnContext {
-        thread_id: thread_id.clone(),
-        turn,
-        total_usage,
-        state,
-        start_time,
-        compaction_retries: 0,
-        pending_reminder: None,
-    };
+    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
 
     let default_turn_options = TurnOptions::default();
 
@@ -936,34 +1083,7 @@ where
         return outcome;
     }
 
-    if let Err(e) = state_store.save(&ctx.state).await {
-        warn!("Failed to save final state: {e}");
-    }
-
-    let duration = ctx.start_time.elapsed();
-    if let Err(error) = send_event(
-        &event_store,
-        &thread_id,
-        ctx.turn,
-        &hooks,
-        &seq,
-        AgentEvent::done(
-            thread_id.clone(),
-            ctx.turn,
-            ctx.total_usage.clone(),
-            duration,
-        ),
-    )
-    .await
-    {
-        return AgentRunState::Error(error);
-    }
-
-    AgentRunState::Done {
-        total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
-    }
+    finish_run_loop_success(ctx, &state_store, &event_store, &hooks, &seq).await
 }
 
 /// Run a single turn of the agent loop.
@@ -1073,37 +1193,25 @@ where
     // Check for cancellation before starting any work
     if cancel_token.is_cancelled() {
         log::info!("Agent turn cancelled before execution started");
-        return TurnOutcome::Cancelled {
-            total_turns: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-        };
+        return cancelled_turn_outcome();
     }
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
-    let init_state =
-        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
-            Ok(state) => state,
-            Err(error) => {
-                if let Err(store_error) = send_event(
-                    &event_store,
-                    &thread_id,
-                    0,
-                    &hooks,
-                    &seq,
-                    AgentEvent::error(&error.message, error.recoverable),
-                )
-                .await
-                {
-                    return TurnOutcome::Error(store_error);
-                }
-                if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, 0).await {
-                    return TurnOutcome::Error(store_error);
-                }
-                return TurnOutcome::Error(error);
-            }
-        };
+    let init_state = match initialize_single_turn_state(
+        input,
+        &thread_id,
+        &message_store,
+        &state_store,
+        &event_store,
+        &hooks,
+        &seq,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(outcome) => return outcome,
+    };
 
     let InitializedState {
         turn,
@@ -1119,7 +1227,7 @@ where
             turn,
             seq.clone(),
         );
-        let outcome = handle_single_turn_resume(SingleTurnResumeParams {
+        return handle_single_turn_resume_state(SingleTurnResumeParams {
             resume_data,
             turn,
             total_usage,
@@ -1135,21 +1243,9 @@ where
             execution_store,
         })
         .await;
-        if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await {
-            return TurnOutcome::Error(store_error);
-        }
-        return outcome;
     }
 
-    let mut ctx = TurnContext {
-        thread_id: thread_id.clone(),
-        turn,
-        total_usage,
-        state,
-        start_time,
-        compaction_retries: 0,
-        pending_reminder: None,
-    };
+    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
 
     let current_turn = ctx.turn.saturating_add(1);
     let turn_tool_context = tool_context.clone().with_event_store(
@@ -1178,16 +1274,16 @@ where
     })
     .await;
 
-    let outcome = convert_turn_result(
+    let outcome = convert_turn_result(ConvertTurnResultParams {
         result,
         ctx,
-        &event_store,
-        &hooks,
-        &seq,
-        thread_id.clone(),
+        event_store: &event_store,
+        hooks: &hooks,
+        seq: &seq,
+        thread_id: thread_id.clone(),
         current_turn,
-        &state_store,
-    )
+        state_store: &state_store,
+    })
     .await;
 
     if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, current_turn).await {
@@ -1198,14 +1294,16 @@ where
 }
 
 pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
-    result: InternalTurnResult,
-    ctx: TurnContext,
-    event_store: &Arc<dyn EventStore>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
-    thread_id: ThreadId,
-    current_turn: usize,
-    state_store: &Arc<S>,
+    ConvertTurnResultParams {
+        result,
+        ctx,
+        event_store,
+        hooks,
+        seq,
+        thread_id,
+        current_turn,
+        state_store,
+    }: ConvertTurnResultParams<'_, H, S>,
 ) -> TurnOutcome {
     match result {
         InternalTurnResult::Continue { turn_usage } => {

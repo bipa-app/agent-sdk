@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         .context("failed to read finished spans")?;
 
     println!("Final state: {state:?}");
-    println!("Persisted {} events", event_count);
+    println!("Persisted {event_count} events");
     println!("Exported {} spans:", spans.len());
     for span in spans {
         println!("- {}", span.name);

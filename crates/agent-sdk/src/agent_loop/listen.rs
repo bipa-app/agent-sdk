@@ -1,13 +1,12 @@
 use super::helpers::send_event;
 use super::types::{
-    LISTEN_TOTAL_TIMEOUT, LISTEN_UPDATE_TIMEOUT, ListenReady, ListenUpdateHandling,
-    MAX_LISTEN_UPDATES,
+    LISTEN_TOTAL_TIMEOUT, LISTEN_UPDATE_TIMEOUT, ListenReady, ListenUpdateContext,
+    ListenUpdateHandling, ListenWaitParams, MAX_LISTEN_UPDATES,
 };
-use crate::events::{AgentEvent, SequenceCounter};
+use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
-use crate::stores::EventStore;
 use crate::tools::{ErasedListenTool, ListenStopReason, ListenToolUpdate, ToolContext};
-use crate::types::{AgentError, PendingToolCallInfo, ThreadId, ToolResult};
+use crate::types::{AgentError, PendingToolCallInfo, ToolResult};
 use futures::StreamExt;
 use log::warn;
 use std::sync::Arc;
@@ -94,12 +93,7 @@ pub(super) async fn cancel_last_listen_operation<Ctx>(
 }
 
 pub(super) async fn handle_listen_update<H>(
-    pending: &PendingToolCallInfo,
-    hooks: &Arc<H>,
-    event_store: &Arc<dyn EventStore>,
-    thread_id: &ThreadId,
-    turn: usize,
-    seq: &SequenceCounter,
+    ctx: &ListenUpdateContext<'_, H>,
     update: ListenToolUpdate,
     last_operation_id: &mut Option<String>,
 ) -> Result<ListenUpdateHandling, ListenWaitError>
@@ -114,31 +108,16 @@ where
             snapshot,
             expires_at,
         } => {
-            *last_operation_id = Some(operation_id.clone());
-            let data = Some(build_listen_progress_data(
-                &operation_id,
+            handle_listening_update(
+                ctx,
+                operation_id,
                 revision,
-                snapshot.as_ref(),
+                message,
+                snapshot,
                 expires_at,
-            ));
-            send_event(
-                event_store,
-                thread_id,
-                turn,
-                hooks,
-                seq,
-                AgentEvent::tool_progress(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    "listen_update",
-                    message,
-                    data,
-                ),
+                last_operation_id,
             )
             .await
-            .map_err(ListenWaitError::Event)?;
-            Ok(ListenUpdateHandling::Continue)
         }
         ListenToolUpdate::Ready {
             operation_id,
@@ -146,112 +125,139 @@ where
             message,
             snapshot,
             expires_at,
-        } => {
-            let data = Some(build_listen_progress_data(
-                &operation_id,
-                revision,
-                Some(&snapshot),
-                expires_at,
-            ));
-            send_event(
-                event_store,
-                thread_id,
-                turn,
-                hooks,
-                seq,
-                AgentEvent::tool_progress(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    "listen_ready",
-                    message,
-                    data,
-                ),
-            )
-            .await
-            .map_err(ListenWaitError::Event)?;
-            Ok(ListenUpdateHandling::Ready(ListenReady {
-                operation_id,
-                revision,
-                snapshot,
-                expires_at,
-            }))
-        }
+        } => handle_ready_update(ctx, operation_id, revision, message, snapshot, expires_at).await,
         ListenToolUpdate::Invalidated {
             operation_id,
             message,
             recoverable,
-        } => {
-            let data = Some(serde_json::json!({
-                "operation_id": operation_id,
-                "recoverable": recoverable,
-            }));
-            send_event(
-                event_store,
-                thread_id,
-                turn,
-                hooks,
-                seq,
-                AgentEvent::tool_progress(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    "listen_invalidated",
-                    message.clone(),
-                    data,
-                ),
-            )
-            .await
-            .map_err(ListenWaitError::Event)?;
-
-            let prefix = if recoverable {
-                "Listen operation invalidated (recoverable)"
-            } else {
-                "Listen operation invalidated"
-            };
-            Err(ListenWaitError::Tool(ToolResult::error(format!(
-                "{prefix}: {message}"
-            ))))
-        }
+        } => handle_invalidated_update(ctx, operation_id, message, recoverable).await,
     }
 }
 
-pub(super) async fn wait_for_listen_ready<Ctx, H>(
-    pending: &PendingToolCallInfo,
-    tool: &Arc<dyn ErasedListenTool<Ctx>>,
-    tool_context: &ToolContext<Ctx>,
-    hooks: &Arc<H>,
-    event_store: &Arc<dyn EventStore>,
-    thread_id: &ThreadId,
-    turn: usize,
-    seq: &SequenceCounter,
-) -> Result<ListenReady, ListenWaitError>
+async fn send_listen_progress_event<H>(
+    ctx: &ListenUpdateContext<'_, H>,
+    stage: &str,
+    message: String,
+    data: Option<serde_json::Value>,
+) -> Result<(), ListenWaitError>
 where
-    Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
-    wait_for_listen_ready_inner(
+    send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_progress(
+            &ctx.pending.id,
+            &ctx.pending.name,
+            &ctx.pending.display_name,
+            stage,
+            message,
+            data,
+        ),
+    )
+    .await
+    .map_err(ListenWaitError::Event)
+}
+
+async fn handle_listening_update<H>(
+    ctx: &ListenUpdateContext<'_, H>,
+    operation_id: String,
+    revision: u64,
+    message: String,
+    snapshot: Option<serde_json::Value>,
+    expires_at: Option<OffsetDateTime>,
+    last_operation_id: &mut Option<String>,
+) -> Result<ListenUpdateHandling, ListenWaitError>
+where
+    H: AgentHooks,
+{
+    *last_operation_id = Some(operation_id.clone());
+    send_listen_progress_event(
+        ctx,
+        "listen_update",
+        message,
+        Some(build_listen_progress_data(
+            &operation_id,
+            revision,
+            snapshot.as_ref(),
+            expires_at,
+        )),
+    )
+    .await?;
+    Ok(ListenUpdateHandling::Continue)
+}
+
+async fn handle_ready_update<H>(
+    ctx: &ListenUpdateContext<'_, H>,
+    operation_id: String,
+    revision: u64,
+    message: String,
+    snapshot: serde_json::Value,
+    expires_at: Option<OffsetDateTime>,
+) -> Result<ListenUpdateHandling, ListenWaitError>
+where
+    H: AgentHooks,
+{
+    send_listen_progress_event(
+        ctx,
+        "listen_ready",
+        message,
+        Some(build_listen_progress_data(
+            &operation_id,
+            revision,
+            Some(&snapshot),
+            expires_at,
+        )),
+    )
+    .await?;
+    Ok(ListenUpdateHandling::Ready(ListenReady {
+        operation_id,
+        revision,
+        snapshot,
+        expires_at,
+    }))
+}
+
+async fn handle_invalidated_update<H>(
+    ctx: &ListenUpdateContext<'_, H>,
+    operation_id: String,
+    message: String,
+    recoverable: bool,
+) -> Result<ListenUpdateHandling, ListenWaitError>
+where
+    H: AgentHooks,
+{
+    send_listen_progress_event(
+        ctx,
+        "listen_invalidated",
+        message.clone(),
+        Some(serde_json::json!({
+            "operation_id": operation_id,
+            "recoverable": recoverable,
+        })),
+    )
+    .await?;
+
+    let prefix = if recoverable {
+        "Listen operation invalidated (recoverable)"
+    } else {
+        "Listen operation invalidated"
+    };
+    Err(ListenWaitError::Tool(ToolResult::error(format!(
+        "{prefix}: {message}"
+    ))))
+}
+
+pub(super) async fn wait_for_listen_ready<Ctx, H>(
+    ListenWaitParams {
         pending,
         tool,
         tool_context,
-        hooks,
-        event_store,
-        thread_id,
-        turn,
-        seq,
-    )
-    .await
-}
-
-async fn wait_for_listen_ready_inner<Ctx, H>(
-    pending: &PendingToolCallInfo,
-    tool: &Arc<dyn ErasedListenTool<Ctx>>,
-    tool_context: &ToolContext<Ctx>,
-    hooks: &Arc<H>,
-    event_store: &Arc<dyn EventStore>,
-    thread_id: &ThreadId,
-    turn: usize,
-    seq: &SequenceCounter,
+        update_ctx,
+    }: ListenWaitParams<'_, Ctx, H>,
 ) -> Result<ListenReady, ListenWaitError>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -308,18 +314,7 @@ where
         };
 
         update_count += 1;
-        match handle_listen_update::<H>(
-            pending,
-            hooks,
-            event_store,
-            thread_id,
-            turn,
-            seq,
-            update,
-            &mut last_operation_id,
-        )
-        .await
-        {
+        match handle_listen_update::<H>(&update_ctx, update, &mut last_operation_id).await {
             Ok(ListenUpdateHandling::Continue) => {}
             Ok(ListenUpdateHandling::Ready(ready)) => return Ok(ready),
             Err(error) => return Err(error),

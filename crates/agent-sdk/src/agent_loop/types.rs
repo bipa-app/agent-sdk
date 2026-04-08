@@ -112,6 +112,22 @@ pub(super) enum ListenUpdateHandling {
     Ready(ListenReady),
 }
 
+pub(super) struct ListenUpdateContext<'a, H> {
+    pub(super) pending: &'a PendingToolCallInfo,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
+    pub(super) seq: &'a SequenceCounter,
+}
+
+pub(super) struct ListenWaitParams<'a, Ctx, H> {
+    pub(super) pending: &'a PendingToolCallInfo,
+    pub(super) tool: &'a Arc<dyn crate::tools::ErasedListenTool<Ctx>>,
+    pub(super) tool_context: &'a ToolContext<Ctx>,
+    pub(super) update_ctx: ListenUpdateContext<'a, H>,
+}
+
 pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) thread_id: &'a ThreadId,
@@ -315,6 +331,20 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
+pub(super) struct LlmEventContext<'a, H> {
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LlmStreamIds<'a> {
+    pub(super) message_id: &'a str,
+    pub(super) thinking_id: &'a str,
+}
+
 pub(super) struct ProcessedTurnResponse {
     pub(super) stop_reason: Option<StopReason>,
     pub(super) text_content: Option<String>,
@@ -390,6 +420,17 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
+}
+
+pub(super) struct ConvertTurnResultParams<'a, H, S> {
+    pub(super) result: InternalTurnResult,
+    pub(super) ctx: TurnContext,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) thread_id: ThreadId,
+    pub(super) current_turn: usize,
+    pub(super) state_store: &'a Arc<S>,
 }
 
 /// Extracted content from an LLM response: (thinking, text, `tool_uses`).

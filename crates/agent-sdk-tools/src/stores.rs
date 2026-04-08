@@ -226,12 +226,12 @@ impl InMemoryEventStore {
         Self::default()
     }
 
-    async fn update_turn<R>(
+    async fn update_turn(
         &self,
         thread_id: &ThreadId,
         turn: usize,
-        update: impl FnOnce(&mut StoredTurnEvents) -> R,
-    ) -> R {
+        update: impl FnOnce(&mut StoredTurnEvents),
+    ) {
         let mut turns = self.inner.turns.write().await;
         let stored_turn = turns
             .entry(thread_id.0.clone())
@@ -242,7 +242,8 @@ impl InMemoryEventStore {
                 events: Vec::new(),
                 finished: false,
             });
-        update(stored_turn)
+        update(stored_turn);
+        drop(turns);
     }
 }
 

@@ -1,12 +1,11 @@
 use super::helpers::{calculate_backoff_delay, send_event};
-use super::types::StreamError;
-use crate::events::{AgentEvent, SequenceCounter};
+use super::types::{LlmEventContext, LlmStreamIds, StreamError};
+use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamAccumulator, StreamDelta, Usage,
 };
-use crate::stores::EventStore;
-use crate::types::{AgentConfig, AgentError, ThreadId};
+use crate::types::{AgentConfig, AgentError};
 use futures::StreamExt;
 use log::{error, warn};
 use std::sync::Arc;
@@ -19,11 +18,7 @@ pub(super) async fn call_llm_with_retry<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
     config: &AgentConfig,
-    event_store: &Arc<dyn EventStore>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
-    thread_id: &ThreadId,
-    turn: usize,
+    event_ctx: &LlmEventContext<'_, H>,
 ) -> (Result<ChatResponse, AgentError>, u32)
 where
     P: LlmProvider,
@@ -50,16 +45,7 @@ where
                 if attempt > max_retries {
                     error!("Rate limited by LLM provider after {max_retries} retries");
                     let error_msg = format!("Rate limited after {max_retries} retries");
-                    if let Err(error) = send_event(
-                        event_store,
-                        thread_id,
-                        turn,
-                        hooks,
-                        seq,
-                        AgentEvent::error(&error_msg, true),
-                    )
-                    .await
-                    {
+                    if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
                         return (Err(error), attempt);
                     }
                     return (Err(AgentError::new(error_msg, true)), attempt);
@@ -85,16 +71,7 @@ where
                 if attempt > max_retries {
                     error!("LLM server error after {max_retries} retries: {msg}");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
-                    if let Err(error) = send_event(
-                        event_store,
-                        thread_id,
-                        turn,
-                        hooks,
-                        seq,
-                        AgentEvent::error(&error_msg, true),
-                    )
-                    .await
-                    {
+                    if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
                         return (Err(error), attempt);
                     }
                     return (Err(AgentError::new(error_msg, true)), attempt);
@@ -122,34 +99,18 @@ pub(super) async fn call_llm_streaming<P, H>(
     provider: &Arc<P>,
     request: ChatRequest,
     config: &AgentConfig,
-    event_store: &Arc<dyn EventStore>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
-    ids: (&str, &str),
-    thread_id: &ThreadId,
-    turn: usize,
+    event_ctx: &LlmEventContext<'_, H>,
+    stream_ids: LlmStreamIds<'_>,
 ) -> (Result<ChatResponse, AgentError>, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
 {
-    let (message_id, thinking_id) = ids;
     let max_retries = config.retry.max_retries;
     let mut attempt = 0u32;
 
     loop {
-        let result = process_stream(
-            provider,
-            &request,
-            event_store,
-            hooks,
-            seq,
-            message_id,
-            thinking_id,
-            thread_id,
-            turn,
-        )
-        .await;
+        let result = process_stream(provider, &request, event_ctx, stream_ids).await;
 
         match result {
             Ok(response) => return (Ok(response), attempt),
@@ -158,16 +119,7 @@ where
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
                     let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
-                    if let Err(error) = send_event(
-                        event_store,
-                        thread_id,
-                        turn,
-                        hooks,
-                        seq,
-                        AgentEvent::error(&err_msg, true),
-                    )
-                    .await
-                    {
+                    if let Err(error) = send_llm_error_event(event_ctx, &err_msg).await {
                         return (Err(error), attempt);
                     }
                     return (Err(AgentError::new(err_msg, true)), attempt);
@@ -195,18 +147,17 @@ where
 async fn process_stream<P, H>(
     provider: &Arc<P>,
     request: &ChatRequest,
-    event_store: &Arc<dyn EventStore>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
-    message_id: &str,
-    thinking_id: &str,
-    thread_id: &ThreadId,
-    turn: usize,
+    event_ctx: &LlmEventContext<'_, H>,
+    stream_ids: LlmStreamIds<'_>,
 ) -> Result<ChatResponse, StreamError>
 where
     P: LlmProvider,
     H: AgentHooks,
 {
+    let LlmStreamIds {
+        message_id,
+        thinking_id,
+    } = stream_ids;
     let mut stream = std::pin::pin!(provider.chat_stream(request.clone()));
     let mut accumulator = StreamAccumulator::new();
     let mut delta_count: u64 = 0;
@@ -226,11 +177,11 @@ where
                 match &delta {
                     StreamDelta::TextDelta { delta, .. } => {
                         if let Err(error) = send_event(
-                            event_store,
-                            thread_id,
-                            turn,
-                            hooks,
-                            seq,
+                            event_ctx.event_store,
+                            event_ctx.thread_id,
+                            event_ctx.turn,
+                            event_ctx.hooks,
+                            event_ctx.seq,
                             AgentEvent::text_delta(message_id, delta.clone()),
                         )
                         .await
@@ -240,11 +191,11 @@ where
                     }
                     StreamDelta::ThinkingDelta { delta, .. } => {
                         if let Err(error) = send_event(
-                            event_store,
-                            thread_id,
-                            turn,
-                            hooks,
-                            seq,
+                            event_ctx.event_store,
+                            event_ctx.thread_id,
+                            event_ctx.turn,
+                            event_ctx.hooks,
+                            event_ctx.seq,
                             AgentEvent::thinking_delta(thinking_id, delta.clone()),
                         )
                         .await
@@ -305,4 +256,22 @@ where
         stop_reason,
         usage,
     })
+}
+
+async fn send_llm_error_event<H>(
+    event_ctx: &LlmEventContext<'_, H>,
+    error_msg: &str,
+) -> Result<(), AgentError>
+where
+    H: AgentHooks,
+{
+    send_event(
+        event_ctx.event_store,
+        event_ctx.thread_id,
+        event_ctx.turn,
+        event_ctx.hooks,
+        event_ctx.seq,
+        AgentEvent::error(error_msg, true),
+    )
+    .await
 }
