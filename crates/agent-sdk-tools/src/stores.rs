@@ -225,6 +225,25 @@ impl InMemoryEventStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    async fn update_turn<R>(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        update: impl FnOnce(&mut StoredTurnEvents) -> R,
+    ) -> R {
+        let mut turns = self.inner.turns.write().await;
+        let stored_turn = turns
+            .entry(thread_id.0.clone())
+            .or_default()
+            .entry(turn)
+            .or_insert_with(|| StoredTurnEvents {
+                turn,
+                events: Vec::new(),
+                finished: false,
+            });
+        update(stored_turn)
+    }
 }
 
 #[async_trait]
@@ -302,37 +321,18 @@ impl EventStore for InMemoryEventStore {
         turn: usize,
         envelope: AgentEventEnvelope,
     ) -> Result<()> {
-        self.inner
-            .turns
-            .write()
-            .await
-            .entry(thread_id.0.clone())
-            .or_default()
-            .entry(turn)
-            .or_insert_with(|| StoredTurnEvents {
-                turn,
-                events: Vec::new(),
-                finished: false,
-            })
-            .events
-            .push(envelope);
+        self.update_turn(thread_id, turn, |stored_turn| {
+            stored_turn.events.push(envelope);
+        })
+        .await;
         Ok(())
     }
 
     async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
-        self.inner
-            .turns
-            .write()
-            .await
-            .entry(thread_id.0.clone())
-            .or_default()
-            .entry(turn)
-            .or_insert_with(|| StoredTurnEvents {
-                turn,
-                events: Vec::new(),
-                finished: false,
-            })
-            .finished = true;
+        self.update_turn(thread_id, turn, |stored_turn| {
+            stored_turn.finished = true;
+        })
+        .await;
         Ok(())
     }
 
@@ -442,6 +442,7 @@ impl ToolExecutionStore for InMemoryExecutionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
     use agent_sdk_core::llm::Message;
     use agent_sdk_core::types::ToolResult;
 
@@ -532,6 +533,79 @@ mod tests {
         store.delete(&thread_id).await?;
         let state = store.load(&thread_id).await?;
         assert!(state.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_tracks_turns_and_finish_barrier() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_1", "hello"), &seq),
+            )
+            .await?;
+        store
+            .append(
+                &thread_id,
+                2,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_2", "world"), &seq),
+            )
+            .await?;
+
+        let turn_1 = store
+            .get_turn(&thread_id, 1)
+            .await?
+            .context("missing turn 1")?;
+        assert_eq!(turn_1.turn, 1);
+        assert_eq!(turn_1.events.len(), 1);
+        assert!(!turn_1.finished);
+
+        store.finish_turn(&thread_id, 1).await?;
+        store.finish_turn(&thread_id, 2).await?;
+
+        let turn_1 = store
+            .get_turn(&thread_id, 1)
+            .await?
+            .context("missing finished turn 1")?;
+        let turn_2 = store
+            .get_turn(&thread_id, 2)
+            .await?
+            .context("missing finished turn 2")?;
+        assert!(turn_1.finished);
+        assert!(turn_2.finished);
+
+        let turns = store.get_turns(&thread_id).await?;
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn, 1);
+        assert_eq!(turns[1].turn, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_finish_turn_without_events_creates_finished_turn()
+    -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+
+        store.finish_turn(&thread_id, 3).await?;
+
+        let turn = store
+            .get_turn(&thread_id, 3)
+            .await?
+            .context("missing empty finished turn")?;
+        assert_eq!(turn.turn, 3);
+        assert!(turn.events.is_empty());
+        assert!(turn.finished);
+
+        store.clear(&thread_id).await?;
+        assert!(store.get_turns(&thread_id).await?.is_empty());
 
         Ok(())
     }

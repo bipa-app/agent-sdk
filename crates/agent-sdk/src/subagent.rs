@@ -393,30 +393,15 @@ where
             Some(Ok(state_rx.await))
         };
 
-        match wait_result {
-            None => {
-                timeout_cancel.cancel();
-                task_handle.abort();
-                final_response = "Subagent timed out".to_string();
-                error_details = Some(format!(
-                    "Subagent '{}' timed out after {}ms",
-                    self.config.name,
-                    self.config.timeout_ms.unwrap_or(0)
-                ));
-                success = false;
-            }
-            Some(Ok(Ok(_))) | Some(Ok(Err(_))) => {}
-            Some(Err(_)) => {
-                timeout_cancel.cancel();
-                task_handle.abort();
-                final_response = "Subagent timed out".to_string();
-                error_details = Some(format!(
-                    "Subagent '{}' timed out after {}ms",
-                    self.config.name,
-                    self.config.timeout_ms.unwrap_or(0)
-                ));
-                success = false;
-            }
+        if matches!(wait_result, None | Some(Err(_))) {
+            timeout_cancel.cancel();
+            task_handle.abort();
+            mark_subagent_timeout(
+                &self.config,
+                &mut final_response,
+                &mut error_details,
+                &mut success,
+            );
         }
 
         for envelope in event_store.get_events(&thread_id).await? {
@@ -435,25 +420,19 @@ where
                     let context = extract_tool_context(&name, &input);
                     pending_tools.insert(id, (name.clone(), context.clone()));
 
-                    parent_ctx
-                        .emit_event(AgentEvent::SubagentProgress {
-                            subagent_id: subagent_id.clone(),
-                            subagent_name: self.config.name.clone(),
-                            nickname: self.config.nickname.clone(),
-                            #[allow(clippy::cast_possible_truncation)]
-                            max_turns: self.config.max_turns.map(|t| t as u32),
-                            #[allow(clippy::cast_possible_truncation)]
-                            current_turn: Some(total_turns as u32),
-                            model: self.config.model.clone(),
-                            tool_name: name,
-                            tool_context: context,
-                            completed: false,
-                            success: false,
-                            tool_count,
-                            total_tokens: u64::from(total_usage.input_tokens)
-                                + u64::from(total_usage.output_tokens),
-                        })
-                        .await?;
+                    emit_subagent_progress(
+                        parent_ctx,
+                        &self.config,
+                        &subagent_id,
+                        total_turns,
+                        &total_usage,
+                        name,
+                        context,
+                        false,
+                        false,
+                        tool_count,
+                    )
+                    .await?;
                 }
                 AgentEvent::ToolCallEnd {
                     id,
@@ -477,25 +456,19 @@ where
                         duration_ms: result.duration_ms,
                     });
 
-                    parent_ctx
-                        .emit_event(AgentEvent::SubagentProgress {
-                            subagent_id: subagent_id.clone(),
-                            subagent_name: self.config.name.clone(),
-                            nickname: self.config.nickname.clone(),
-                            #[allow(clippy::cast_possible_truncation)]
-                            max_turns: self.config.max_turns.map(|t| t as u32),
-                            #[allow(clippy::cast_possible_truncation)]
-                            current_turn: Some(total_turns as u32),
-                            model: self.config.model.clone(),
-                            tool_name: name,
-                            tool_context: context,
-                            completed: true,
-                            success: tool_success,
-                            tool_count,
-                            total_tokens: u64::from(total_usage.input_tokens)
-                                + u64::from(total_usage.output_tokens),
-                        })
-                        .await?;
+                    emit_subagent_progress(
+                        parent_ctx,
+                        &self.config,
+                        &subagent_id,
+                        total_turns,
+                        &total_usage,
+                        name,
+                        context,
+                        true,
+                        tool_success,
+                        tool_count,
+                    )
+                    .await?;
                 }
                 AgentEvent::TurnComplete { turn, usage, .. } => {
                     total_turns = turn;
@@ -577,6 +550,60 @@ where
 
         Ok(result)
     }
+}
+
+fn mark_subagent_timeout(
+    config: &SubagentConfig,
+    final_response: &mut String,
+    error_details: &mut Option<String>,
+    success: &mut bool,
+) {
+    *final_response = "Subagent timed out".to_string();
+    *error_details = Some(format!(
+        "Subagent '{}' timed out after {}ms",
+        config.name,
+        config.timeout_ms.unwrap_or(0)
+    ));
+    *success = false;
+}
+
+fn subagent_total_tokens(total_usage: &TokenUsage) -> u64 {
+    u64::from(total_usage.input_tokens) + u64::from(total_usage.output_tokens)
+}
+
+async fn emit_subagent_progress(
+    parent_ctx: &ToolContext<()>,
+    config: &SubagentConfig,
+    subagent_id: &str,
+    total_turns: usize,
+    total_usage: &TokenUsage,
+    tool_name: String,
+    tool_context: String,
+    completed: bool,
+    success: bool,
+    tool_count: u32,
+) -> Result<()> {
+    #[allow(clippy::cast_possible_truncation)]
+    let max_turns = config.max_turns.map(|turns| turns as u32);
+    #[allow(clippy::cast_possible_truncation)]
+    let current_turn = Some(total_turns as u32);
+
+    parent_ctx
+        .emit_event(AgentEvent::SubagentProgress {
+            subagent_id: subagent_id.to_string(),
+            subagent_name: config.name.clone(),
+            nickname: config.nickname.clone(),
+            max_turns,
+            current_turn,
+            model: config.model.clone(),
+            tool_name,
+            tool_context,
+            completed,
+            success,
+            tool_count,
+            total_tokens: subagent_total_tokens(total_usage),
+        })
+        .await
 }
 
 /// Extracts context information from tool input for display.
@@ -790,6 +817,179 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
+    use crate::stores::{EventStore, InMemoryEventStore, StoredTurnEvents};
+    use anyhow::{Context, Result};
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct TestProvider {
+        responses: Arc<Mutex<Vec<ChatOutcome>>>,
+        delay: Option<Duration>,
+    }
+
+    impl TestProvider {
+        fn new(responses: Vec<ChatOutcome>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                delay: None,
+            }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
+        fn text_response(text: &str) -> ChatOutcome {
+            ChatOutcome::Success(ChatResponse {
+                id: "resp_text".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+                model: "test-model".to_string(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cached_input_tokens: 0,
+                },
+            })
+        }
+
+        fn tool_use_response(tool_id: &str, tool_name: &str, input: Value) -> ChatOutcome {
+            ChatOutcome::Success(ChatResponse {
+                id: "resp_tool".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_id.to_string(),
+                    name: tool_name.to_string(),
+                    input,
+                    thought_signature: None,
+                }],
+                model: "test-model".to_string(),
+                stop_reason: Some(StopReason::ToolUse),
+                usage: Usage {
+                    input_tokens: 15,
+                    output_tokens: 25,
+                    cached_input_tokens: 0,
+                },
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TestProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                Ok(Self::text_response("default"))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        fn model(&self) -> &'static str {
+            "test-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    struct TestEchoTool;
+
+    impl Tool<()> for TestEchoTool {
+        type Name = DynamicToolName;
+
+        fn name(&self) -> DynamicToolName {
+            DynamicToolName::new("echo")
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Echo the input"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            })
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Observe
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+            let message = input
+                .get("message")
+                .and_then(Value::as_str)
+                .context("missing echo message")?;
+            Ok(ToolResult::success(format!("Echo: {message}")))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEventStore {
+        inner: Arc<InMemoryEventStore>,
+        appended: Arc<Mutex<Vec<(ThreadId, usize, AgentEventEnvelope)>>>,
+    }
+
+    impl RecordingEventStore {
+        async fn appended_events(&self) -> Vec<(ThreadId, usize, AgentEventEnvelope)> {
+            self.appended.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for RecordingEventStore {
+        async fn append(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+            envelope: AgentEventEnvelope,
+        ) -> Result<()> {
+            self.appended
+                .lock()
+                .await
+                .push((thread_id.clone(), turn, envelope.clone()));
+            self.inner.append(thread_id, turn, envelope).await
+        }
+
+        async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
+            self.inner.finish_turn(thread_id, turn).await
+        }
+
+        async fn get_turn(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+        ) -> Result<Option<StoredTurnEvents>> {
+            self.inner.get_turn(thread_id, turn).await
+        }
+
+        async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>> {
+            self.inner.get_turns(thread_id).await
+        }
+
+        async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
+            self.inner.clear(thread_id).await
+        }
+    }
 
     #[test]
     fn test_subagent_config_builder() {
@@ -815,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_subagent_result_serialization() {
+    fn test_subagent_result_serialization() -> Result<()> {
         let result = SubagentResult {
             name: "test".to_string(),
             final_response: "Done".to_string(),
@@ -846,17 +1046,18 @@ mod tests {
             failed_tool: None,
         };
 
-        let json = serde_json::to_string(&result).expect("serialize");
+        let json = serde_json::to_string(&result).context("failed to serialize subagent result")?;
         assert!(json.contains("test"));
         assert!(json.contains("Done"));
         assert!(json.contains("tool_count"));
         assert!(json.contains("tool_logs"));
         assert!(json.contains("/tmp/test.rs"));
+
+        Ok(())
     }
 
     #[test]
-    fn test_subagent_result_field_extraction() {
-        // Test that verifies the exact JSON structure expected by bip's tui_session.rs
+    fn test_subagent_result_field_extraction() -> Result<()> {
         let result = SubagentResult {
             name: "explore".to_string(),
             final_response: "Found 3 config files".to_string(),
@@ -880,23 +1081,22 @@ mod tests {
             failed_tool: None,
         };
 
-        let value = serde_json::to_value(&result).expect("serialize to value");
+        let value =
+            serde_json::to_value(&result).context("failed to convert subagent result to json")?;
 
-        // Test tool_count extraction (as_u64 should work for u32)
         let tool_count = value.get("tool_count").and_then(Value::as_u64);
         assert_eq!(tool_count, Some(5));
 
-        // Test usage extraction
-        let usage = value.get("usage").expect("usage field");
+        let usage = value.get("usage").context("missing usage field")?;
         let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
         let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
         assert_eq!(input_tokens, Some(1500));
         assert_eq!(output_tokens, Some(500));
 
-        // Test tool_logs extraction
-        let tool_logs = value.get("tool_logs").and_then(Value::as_array);
-        assert!(tool_logs.is_some());
-        let logs = tool_logs.unwrap();
+        let logs = value
+            .get("tool_logs")
+            .and_then(Value::as_array)
+            .context("missing tool_logs array")?;
         assert_eq!(logs.len(), 1);
 
         let first_log = &logs[0];
@@ -913,5 +1113,119 @@ mod tests {
             first_log.get("success").and_then(Value::as_bool),
             Some(true)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_subagent_uses_isolated_child_thread() -> Result<()> {
+        let event_store = Arc::new(RecordingEventStore::default());
+        let provider = Arc::new(TestProvider::new(vec![
+            TestProvider::tool_use_response("tool_1", "echo", json!({ "message": "child" })),
+            TestProvider::text_response("Subagent complete"),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(TestEchoTool);
+
+        let tool = SubagentTool::new(SubagentConfig::new("worker"), provider, Arc::new(tools), {
+            let store = Arc::clone(&event_store);
+            move || -> Arc<dyn EventStore> { store.clone() }
+        });
+        let parent_thread = ThreadId::new();
+        let parent_ctx = ToolContext::new(()).with_event_store(
+            event_store.clone(),
+            parent_thread.clone(),
+            1,
+            SequenceCounter::new(),
+        );
+
+        let result = tool
+            .run_subagent(
+                "Inspect the repo",
+                "subagent_1".to_string(),
+                &parent_ctx,
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert!(result.success);
+        assert_eq!(result.tool_count, 1);
+        assert_eq!(result.tool_logs.len(), 1);
+
+        let parent_turn = event_store
+            .get_turn(&parent_thread, 1)
+            .await?
+            .context("missing parent turn")?;
+        assert!(!parent_turn.events.is_empty());
+        assert!(
+            parent_turn
+                .events
+                .iter()
+                .all(|envelope| { matches!(envelope.event, AgentEvent::SubagentProgress { .. }) })
+        );
+
+        let appended = event_store.appended_events().await;
+        let child_thread = appended
+            .iter()
+            .map(|(thread_id, _, _)| thread_id.clone())
+            .find(|thread_id| thread_id != &parent_thread)
+            .context("missing child thread events")?;
+        let child_turn = event_store
+            .get_turn(&child_thread, 1)
+            .await?
+            .context("missing child turn")?;
+        let child_events = event_store.get_events(&child_thread).await?;
+
+        assert!(
+            child_turn
+                .events
+                .iter()
+                .any(|envelope| { matches!(envelope.event, AgentEvent::ToolCallStart { .. }) })
+        );
+        assert!(
+            child_events
+                .iter()
+                .any(|envelope| { matches!(envelope.event, AgentEvent::Done { .. }) })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_subagent_timeout_marks_result_as_failed() -> Result<()> {
+        let event_store = Arc::new(RecordingEventStore::default());
+        let provider = Arc::new(
+            TestProvider::new(vec![TestProvider::text_response("Too late")])
+                .with_delay(Duration::from_millis(50)),
+        );
+        let tool = SubagentTool::new(
+            SubagentConfig::new("worker").with_timeout_ms(10),
+            provider,
+            Arc::new(ToolRegistry::<()>::new()),
+            {
+                let store = Arc::clone(&event_store);
+                move || -> Arc<dyn EventStore> { store.clone() }
+            },
+        );
+
+        let result = tool
+            .run_subagent(
+                "Take too long",
+                "subagent_timeout".to_string(),
+                &ToolContext::new(()),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert_eq!(result.final_response, "Subagent timed out");
+        assert!(
+            result
+                .error_details
+                .context("missing timeout details")?
+                .contains("timed out")
+        );
+
+        Ok(())
     }
 }

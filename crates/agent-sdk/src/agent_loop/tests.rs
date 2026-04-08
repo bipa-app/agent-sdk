@@ -3,14 +3,36 @@ use super::*;
 use crate::events::{AgentEvent, AgentEventEnvelope};
 use crate::hooks::AllowAllHooks;
 use crate::llm::{ChatOutcome, Content, ContentBlock};
-use crate::stores::InMemoryStore;
-use crate::stores::MessageStore;
+use crate::stores::{
+    EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StoredTurnEvents,
+};
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, AgentRunState, TurnOptions, TurnOutcome};
 use anyhow::Context;
+use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn expected_turn_for_input(input: &AgentInput, existing_turns: &[StoredTurnEvents]) -> usize {
+    match input {
+        AgentInput::Resume { continuation, .. } => continuation.turn,
+        _ => existing_turns
+            .last()
+            .map_or(1, |turn| turn.turn.saturating_add(1)),
+    }
+}
+
+async fn load_turn_events(
+    store: &dyn EventStore,
+    thread_id: &ThreadId,
+    turn: usize,
+) -> anyhow::Result<Vec<AgentEventEnvelope>> {
+    Ok(store
+        .get_turn(thread_id, turn)
+        .await?
+        .map_or_else(Vec::new, |stored_turn| stored_turn.events))
+}
 
 async fn run_turn_recorded<Ctx, P, H, M, S>(
     agent: &AgentLoop<Ctx, P, H, M, S>,
@@ -26,6 +48,8 @@ where
     M: crate::stores::MessageStore + 'static,
     S: crate::stores::StateStore + 'static,
 {
+    let existing_turns = agent.event_store.get_turns(&thread_id).await?;
+    let expected_turn = expected_turn_for_input(&input, &existing_turns);
     let outcome = agent
         .run_turn(
             thread_id.clone(),
@@ -35,7 +59,7 @@ where
             options,
         )
         .await;
-    let events = load_events(agent.event_store.as_ref(), &thread_id).await?;
+    let events = load_turn_events(agent.event_store.as_ref(), &thread_id, expected_turn).await?;
     Ok((outcome, events))
 }
 
@@ -61,6 +85,65 @@ where
     let state = state_rx.await?;
     let events = load_events(agent.event_store.as_ref(), &thread_id).await?;
     Ok((state, events))
+}
+
+#[derive(Clone, Copy)]
+enum EventStoreFailureMode {
+    Append,
+    FinishTurn,
+}
+
+#[derive(Clone)]
+struct FailingEventStore {
+    inner: Arc<InMemoryEventStore>,
+    failure_mode: EventStoreFailureMode,
+}
+
+impl FailingEventStore {
+    fn new(failure_mode: EventStoreFailureMode) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemoryEventStore::new()),
+            failure_mode,
+        })
+    }
+}
+
+#[async_trait]
+impl EventStore for FailingEventStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> anyhow::Result<()> {
+        if matches!(self.failure_mode, EventStoreFailureMode::Append) {
+            anyhow::bail!("append failure");
+        }
+        self.inner.append(thread_id, turn, envelope).await
+    }
+
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
+        if matches!(self.failure_mode, EventStoreFailureMode::FinishTurn) {
+            anyhow::bail!("finish failure");
+        }
+        self.inner.finish_turn(thread_id, turn).await
+    }
+
+    async fn get_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+    ) -> anyhow::Result<Option<StoredTurnEvents>> {
+        self.inner.get_turn(thread_id, turn).await
+    }
+
+    async fn get_turns(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<StoredTurnEvents>> {
+        self.inner.get_turns(thread_id).await
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.clear(thread_id).await
+    }
 }
 
 // ===================
@@ -1317,6 +1400,116 @@ async fn test_run_turn_is_direct_async_no_spawn() -> anyhow::Result<()> {
         stored_turn.finished,
         "Expected finish_turn barrier to complete"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_returns_error_when_event_append_fails() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(FailingEventStore::new(EventStoreFailureMode::Append))
+        .build();
+
+    let outcome = agent
+        .run_turn(
+            ThreadId::new(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+        )
+        .await;
+
+    match outcome {
+        TurnOutcome::Error(error) => {
+            assert!(error.message.contains("Failed to append event"));
+        }
+        other => panic!("Expected append failure, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_returns_error_when_event_append_fails() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(FailingEventStore::new(EventStoreFailureMode::Append))
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    match state {
+        AgentRunState::Error(error) => {
+            assert!(error.message.contains("Failed to append event"));
+        }
+        other => panic!("Expected append failure, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_returns_error_when_finish_turn_fails() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(FailingEventStore::new(EventStoreFailureMode::FinishTurn))
+        .build();
+
+    let outcome = agent
+        .run_turn(
+            ThreadId::new(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+        )
+        .await;
+
+    match outcome {
+        TurnOutcome::Error(error) => {
+            assert!(error.message.contains("Failed to finish turn event store"));
+        }
+        other => panic!("Expected finish failure, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_returns_error_when_finish_turn_fails() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(FailingEventStore::new(EventStoreFailureMode::FinishTurn))
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    match state {
+        AgentRunState::Error(error) => {
+            assert!(error.message.contains("Failed to finish turn event store"));
+        }
+        other => panic!("Expected finish failure, got {other:?}"),
+    }
+
     Ok(())
 }
 
