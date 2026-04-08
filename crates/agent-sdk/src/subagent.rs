@@ -173,10 +173,12 @@ pub struct SubagentResult {
     /// stack trace information or structured error context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_details: Option<String>,
-    /// Name of the tool that caused the failure (if applicable).
+    /// Retained for serialization compatibility with older clients.
     ///
-    /// Populated when the subagent encountered an error during a specific
-    /// tool execution.
+    /// The previous implementation inferred this from the "last pending tool"
+    /// when any generic error occurred, which was incorrect for LLM or
+    /// transport failures. The field is currently never populated until the
+    /// SDK has deterministic error provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_tool: Option<String>,
 }
@@ -372,7 +374,7 @@ where
 
         let wait_result = wait_for_subagent_state(self.config.timeout_ms, start, state_rx).await;
         let mut state = SubagentExecutionState::new();
-        apply_subagent_wait_outcome(
+        let replay_events = apply_subagent_wait_outcome(
             classify_subagent_wait_result(wait_result.as_ref()),
             &self.config,
             &timeout_cancel,
@@ -380,7 +382,7 @@ where
             &mut state,
         );
 
-        if state.success {
+        if replay_events {
             replay_subagent_events(
                 &event_store,
                 &thread_id,
@@ -424,6 +426,42 @@ fn mark_subagent_disconnected(
         "Subagent '{}' ended before returning a final state",
         config.name
     ));
+    *success = false;
+}
+
+fn mark_subagent_cancelled(
+    config: &SubagentConfig,
+    final_response: &mut String,
+    error_details: &mut Option<String>,
+    success: &mut bool,
+) {
+    *final_response = "Subagent cancelled".to_string();
+    *error_details = Some(format!("Subagent '{}' was cancelled", config.name));
+    *success = false;
+}
+
+fn mark_subagent_awaiting_confirmation(
+    config: &SubagentConfig,
+    final_response: &mut String,
+    error_details: &mut Option<String>,
+    success: &mut bool,
+) {
+    *final_response = "Subagent requires confirmation".to_string();
+    *error_details = Some(format!(
+        "Subagent '{}' requested confirmation, which is not supported in nested runs",
+        config.name
+    ));
+    *success = false;
+}
+
+fn mark_subagent_agent_error(
+    final_response: &mut String,
+    error_details: &mut Option<String>,
+    success: &mut bool,
+    message: &str,
+) {
+    *final_response = message.to_string();
+    *error_details = Some(message.to_string());
     *success = false;
 }
 
@@ -490,11 +528,13 @@ struct SubagentProgressUpdate<'a> {
     tool_count: u32,
 }
 
-#[derive(Clone, Copy)]
 enum SubagentWaitOutcome {
-    Completed,
+    ReplayEvents,
     TimedOut,
     Disconnected,
+    Cancelled,
+    AwaitingConfirmation,
+    Error(crate::types::AgentError),
 }
 
 async fn wait_for_subagent_state(
@@ -514,11 +554,20 @@ async fn wait_for_subagent_state(
     }
 }
 
-const fn classify_subagent_wait_result(
-    wait_result: Option<&SubagentWaitResult>,
-) -> SubagentWaitOutcome {
+fn classify_subagent_wait_result(wait_result: Option<&SubagentWaitResult>) -> SubagentWaitOutcome {
     match wait_result {
-        Some(Ok(Ok(_))) => SubagentWaitOutcome::Completed,
+        Some(Ok(Ok(
+            crate::types::AgentRunState::Done { .. } | crate::types::AgentRunState::Refusal { .. },
+        ))) => SubagentWaitOutcome::ReplayEvents,
+        Some(Ok(Ok(crate::types::AgentRunState::Cancelled { .. }))) => {
+            SubagentWaitOutcome::Cancelled
+        }
+        Some(Ok(Ok(crate::types::AgentRunState::AwaitingConfirmation { .. }))) => {
+            SubagentWaitOutcome::AwaitingConfirmation
+        }
+        Some(Ok(Ok(crate::types::AgentRunState::Error(error)))) => {
+            SubagentWaitOutcome::Error(error.clone())
+        }
         Some(Ok(Err(_))) => SubagentWaitOutcome::Disconnected,
         None | Some(Err(_)) => SubagentWaitOutcome::TimedOut,
     }
@@ -530,9 +579,9 @@ fn apply_subagent_wait_outcome(
     timeout_cancel: &CancellationToken,
     task_handle: &tokio::task::JoinHandle<()>,
     state: &mut SubagentExecutionState,
-) {
+) -> bool {
     match outcome {
-        SubagentWaitOutcome::Completed => {}
+        SubagentWaitOutcome::ReplayEvents => true,
         SubagentWaitOutcome::TimedOut => {
             timeout_cancel.cancel();
             task_handle.abort();
@@ -542,6 +591,7 @@ fn apply_subagent_wait_outcome(
                 &mut state.error_details,
                 &mut state.success,
             );
+            false
         }
         SubagentWaitOutcome::Disconnected => {
             timeout_cancel.cancel();
@@ -552,6 +602,40 @@ fn apply_subagent_wait_outcome(
                 &mut state.error_details,
                 &mut state.success,
             );
+            false
+        }
+        SubagentWaitOutcome::Cancelled => {
+            timeout_cancel.cancel();
+            task_handle.abort();
+            mark_subagent_cancelled(
+                config,
+                &mut state.final_response,
+                &mut state.error_details,
+                &mut state.success,
+            );
+            false
+        }
+        SubagentWaitOutcome::AwaitingConfirmation => {
+            timeout_cancel.cancel();
+            task_handle.abort();
+            mark_subagent_awaiting_confirmation(
+                config,
+                &mut state.final_response,
+                &mut state.error_details,
+                &mut state.success,
+            );
+            false
+        }
+        SubagentWaitOutcome::Error(error) => {
+            timeout_cancel.cancel();
+            task_handle.abort();
+            mark_subagent_agent_error(
+                &mut state.final_response,
+                &mut state.error_details,
+                &mut state.success,
+                &error.message,
+            );
+            false
         }
     }
 }
@@ -644,10 +728,19 @@ async fn replay_subagent_events(
                 state.total_turns = turns;
                 break;
             }
+            AgentEvent::Refusal { text, .. } => {
+                let refusal_message =
+                    text.unwrap_or_else(|| "Subagent refused the request".to_string());
+                state.error_details = Some(refusal_message.clone());
+                state.final_response = refusal_message;
+                state.success = false;
+                break;
+            }
             AgentEvent::Error { message, .. } => {
                 state.error_details = Some(message.clone());
                 state.final_response = message;
                 state.success = false;
+                break;
             }
             _ => {}
         }
@@ -1031,6 +1124,25 @@ mod tests {
                 usage: Usage {
                     input_tokens: 15,
                     output_tokens: 25,
+                    cached_input_tokens: 0,
+                },
+            })
+        }
+
+        fn refusal_response(text: Option<&str>) -> ChatOutcome {
+            let content = text.map_or_else(Vec::new, |text| {
+                vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }]
+            });
+            ChatOutcome::Success(ChatResponse {
+                id: "resp_refusal".to_string(),
+                content,
+                model: "test-model".to_string(),
+                stop_reason: Some(StopReason::Refusal),
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 0,
                     cached_input_tokens: 0,
                 },
             })
@@ -1543,6 +1655,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_subagent_refusal_marks_result_as_failed() -> Result<()> {
+        let tool = SubagentTool::new(
+            SubagentConfig::new("worker"),
+            Arc::new(TestProvider::new(vec![TestProvider::refusal_response(
+                Some("Refused for policy reasons"),
+            )])),
+            Arc::new(ToolRegistry::<()>::new()),
+            || Arc::new(InMemoryEventStore::new()),
+        );
+
+        let result = tool
+            .run_subagent(
+                "Refuse",
+                "subagent_refusal".to_string(),
+                &ToolContext::new(()),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert_eq!(result.final_response, "Refused for policy reasons");
+        assert_eq!(
+            result.error_details.as_deref(),
+            Some("Refused for policy reasons")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_subagent_cancelled_marks_result_as_failed() -> Result<()> {
+        let tool = SubagentTool::new(
+            SubagentConfig::new("worker"),
+            Arc::new(
+                TestProvider::new(vec![TestProvider::text_response("Too late")])
+                    .with_delay(Duration::from_millis(50)),
+            ),
+            Arc::new(ToolRegistry::<()>::new()),
+            || Arc::new(InMemoryEventStore::new()),
+        );
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let result = tool
+            .run_subagent(
+                "Cancel",
+                "subagent_cancelled".to_string(),
+                &ToolContext::new(()),
+                cancel_token,
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert_eq!(result.final_response, "Subagent cancelled");
+        assert!(
+            result
+                .error_details
+                .context("missing cancellation details")?
+                .contains("cancelled")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_run_subagent_llm_error_does_not_infer_failed_tool() -> Result<()> {
         let provider = Arc::new(TestProvider::new(vec![
             ChatOutcome::ServerError("llm transport failed".to_string()),
@@ -1580,6 +1757,56 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Server error")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_subagent_events_stops_after_error() -> Result<()> {
+        let event_store: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+        event_store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(
+                    AgentEvent::Error {
+                        message: "subagent boom".to_string(),
+                        recoverable: false,
+                    },
+                    &seq,
+                ),
+            )
+            .await?;
+        event_store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(
+                    AgentEvent::Text {
+                        message_id: "msg_after_error".to_string(),
+                        text: "should not be appended".to_string(),
+                    },
+                    &seq,
+                ),
+            )
+            .await?;
+
+        let mut state = SubagentExecutionState::new();
+        replay_subagent_events(
+            &event_store,
+            &thread_id,
+            &ToolContext::new(()),
+            &SubagentConfig::new("worker"),
+            "subagent_error",
+            &mut state,
+        )
+        .await?;
+
+        assert!(!state.success);
+        assert_eq!(state.final_response, "subagent boom");
+        assert_eq!(state.error_details.as_deref(), Some("subagent boom"));
 
         Ok(())
     }

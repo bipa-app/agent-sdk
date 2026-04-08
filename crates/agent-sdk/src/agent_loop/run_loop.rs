@@ -428,40 +428,19 @@ where
     }
 }
 
-async fn initialize_single_turn_state<H, M, S>(
+async fn initialize_single_turn_state<M, S>(
     input: AgentInput,
     thread_id: &ThreadId,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
-    event_store: &Arc<dyn EventStore>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
 ) -> Result<InitializedState, TurnOutcome>
 where
-    H: AgentHooks,
     M: MessageStore,
     S: StateStore,
 {
     match initialize_from_input(input, thread_id, message_store, state_store).await {
         Ok(state) => Ok(state),
-        Err(error) => {
-            if let Err(store_error) = send_event(
-                event_store,
-                thread_id,
-                0,
-                hooks,
-                seq,
-                AgentEvent::error(&error.message, error.recoverable),
-            )
-            .await
-            {
-                return Err(TurnOutcome::Error(store_error));
-            }
-            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, 0).await {
-                return Err(TurnOutcome::Error(store_error));
-            }
-            Err(TurnOutcome::Error(error))
-        }
+        Err(error) => Err(TurnOutcome::Error(error)),
     }
 }
 
@@ -1290,20 +1269,11 @@ where
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
-    let init_state = match initialize_single_turn_state(
-        input,
-        &thread_id,
-        &message_store,
-        &state_store,
-        &event_store,
-        &hooks,
-        &seq,
-    )
-    .await
-    {
-        Ok(state) => state,
-        Err(outcome) => return outcome,
-    };
+    let init_state =
+        match initialize_single_turn_state(input, &thread_id, &message_store, &state_store).await {
+            Ok(state) => state,
+            Err(outcome) => return outcome,
+        };
 
     let InitializedState {
         turn,

@@ -146,6 +146,36 @@ impl EventStore for FailingEventStore {
     }
 }
 
+#[derive(Clone, Default)]
+struct FailingMessageStore;
+
+#[async_trait]
+impl MessageStore for FailingMessageStore {
+    async fn append(
+        &self,
+        _thread_id: &ThreadId,
+        _message: crate::llm::Message,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("message store unavailable");
+    }
+
+    async fn get_history(&self, _thread_id: &ThreadId) -> anyhow::Result<Vec<crate::llm::Message>> {
+        Ok(Vec::new())
+    }
+
+    async fn clear(&self, _thread_id: &ThreadId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn replace_history(
+        &self,
+        _thread_id: &ThreadId,
+        _messages: Vec<crate::llm::Message>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ConfirmAllHooks;
 
@@ -1751,6 +1781,42 @@ async fn test_run_returns_error_when_finish_turn_fails() -> anyhow::Result<()> {
         }
         other => panic!("Expected finish failure, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_turn_repeated_init_failures_preserve_original_error() -> anyhow::Result<()> {
+    let event_store = new_event_store();
+    let thread_id = ThreadId::new();
+    let agent = builder::<()>()
+        .provider(MockProvider::new(vec![]))
+        .hooks(AllowAllHooks)
+        .message_store(FailingMessageStore)
+        .state_store(InMemoryStore::new())
+        .event_store(event_store.clone())
+        .build_with_stores();
+
+    for _ in 0..2 {
+        let outcome = agent
+            .run_turn(
+                thread_id.clone(),
+                AgentInput::Text("Hi".to_string()),
+                ToolContext::new(()),
+                CancellationToken::new(),
+                TurnOptions::default(),
+            )
+            .await;
+
+        match outcome {
+            TurnOutcome::Error(error) => {
+                assert!(error.message.contains("message store unavailable"));
+            }
+            other => panic!("Expected initialization failure, got {other:?}"),
+        }
+    }
+
+    assert!(event_store.get_turn(&thread_id, 0).await?.is_none());
 
     Ok(())
 }
