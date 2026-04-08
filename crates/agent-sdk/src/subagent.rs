@@ -646,9 +646,6 @@ async fn replay_subagent_events(
             }
             AgentEvent::Error { message, .. } => {
                 state.error_details = Some(message.clone());
-                if let Some(last_tool) = state.pending_tools.values().last() {
-                    state.failed_tool = Some(last_tool.0.clone());
-                }
                 state.final_response = message;
                 state.success = false;
             }
@@ -1540,6 +1537,48 @@ mod tests {
                 .error_details
                 .context("missing disconnect details")?
                 .contains("ended before returning a final state")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_subagent_llm_error_does_not_infer_failed_tool() -> Result<()> {
+        let provider = Arc::new(TestProvider::new(vec![
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+            ChatOutcome::ServerError("llm transport failed".to_string()),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(TestEchoTool);
+
+        let tool = SubagentTool::new(
+            SubagentConfig::new("worker"),
+            provider,
+            Arc::new(tools),
+            || Arc::new(InMemoryEventStore::new()),
+        );
+
+        let result = tool
+            .run_subagent(
+                "Trigger an llm failure",
+                "subagent_llm_error".to_string(),
+                &ToolContext::new(()),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.failed_tool.is_none());
+        assert!(
+            result
+                .error_details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Server error")
         );
 
         Ok(())
