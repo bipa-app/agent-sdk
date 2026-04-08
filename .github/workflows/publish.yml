@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/agent-sdk/Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'Cargo.toml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,11 +61,11 @@ jobs:
 
       - name: Run tests
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
-        run: cargo test
+        run: cargo test --workspace --all-features
 
       - name: Run clippy
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Get previous tag
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
@@ -109,8 +110,16 @@ jobs:
             --notes-file /tmp/changelog.md \
             --target ${{ github.sha }}
 
-      - name: Publish to crates.io
+      # Publish crates in dependency order.
+      # agent-server is `publish = false` and is skipped automatically.
+      - name: Publish crates
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p agent-sdk
+        run: |
+          for crate in agent-sdk-core agent-sdk-tools agent-sdk-providers agent-sdk; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --no-verify
+            # crates.io needs time to index before dependents can resolve
+            sleep 30
+          done

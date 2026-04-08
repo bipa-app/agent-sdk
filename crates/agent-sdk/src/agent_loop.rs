@@ -296,11 +296,11 @@ where
         (event_rx, state_rx)
     }
 
-    /// Like [`run`](Self::run), but also returns the [`JoinHandle`] for the
+    /// Like [`run`](Self::run), but also returns the [`tokio::task::JoinHandle`] for the
     /// spawned task.
     ///
     /// Callers that need to forcibly abort the agent loop (e.g. subagent
-    /// timeout) can call [`JoinHandle::abort`] on the returned handle.
+    /// timeout) can call [`tokio::task::JoinHandle::abort`] on the returned handle.
     /// Aborting the handle drops the in-flight LLM stream immediately
     /// instead of waiting for the current turn to finish.
     pub fn run_abortable(
@@ -374,7 +374,7 @@ where
 
     /// Run the agent with a persistent input channel.
     ///
-    /// Unlike [`run`], this returns an [`AgentHandle`] that allows the caller
+    /// Unlike [`Self::run`], this returns an [`AgentHandle`] that allows the caller
     /// to inject new user messages into the running agent via `input_tx`.
     /// The agent will process the initial input, then wait for new messages
     /// on the channel between turns instead of exiting on `Done`.

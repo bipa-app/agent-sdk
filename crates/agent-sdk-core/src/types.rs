@@ -316,7 +316,7 @@ pub enum AgentRunState {
         continuation: Box<AgentContinuation>,
     },
 
-    /// Agent run was cancelled via a [`CancellationToken`].
+    /// Agent run was cancelled via a cancellation token.
     Cancelled {
         total_turns: u32,
         input_tokens: u64,
@@ -606,7 +606,7 @@ pub enum TurnOutcome {
         output_tokens: u64,
     },
 
-    /// The turn was cancelled via a [`CancellationToken`].
+    /// The turn was cancelled via a cancellation token.
     Cancelled {
         /// Total turns executed before cancellation
         total_turns: u32,
