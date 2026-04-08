@@ -1281,7 +1281,15 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            content_parts.push(ApiInputContent::Text { text: text.clone() });
+                            let part = match msg.role {
+                                agent_sdk_core::llm::Role::Assistant => {
+                                    ApiInputContent::OutputText { text: text.clone() }
+                                }
+                                agent_sdk_core::llm::Role::User => {
+                                    ApiInputContent::InputText { text: text.clone() }
+                                }
+                            };
+                            content_parts.push(part);
                         }
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Image { source } => {
@@ -1658,7 +1666,7 @@ fn output_item_to_input_item(item: ApiOutputItem) -> Option<ApiInputItem> {
                 .into_iter()
                 .filter_map(|content| match content {
                     ApiOutputContent::Text { text } if !text.is_empty() => {
-                        Some(ApiInputContent::Text { text })
+                        Some(ApiInputContent::OutputText { text })
                     }
                     ApiOutputContent::Unknown | ApiOutputContent::Text { .. } => None,
                 })
@@ -1866,10 +1874,15 @@ enum ApiMessageContent {
 }
 
 #[derive(Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 enum ApiInputContent {
-    Text { text: String },
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
     Image { image_url: String },
+    #[serde(rename = "input_file")]
     File { filename: String, file_data: String },
 }
 
@@ -2231,7 +2244,7 @@ mod tests {
                 }),
                 ApiInputItem::Message(ApiMessage {
                     role: ApiRole::Assistant,
-                    content: ApiMessageContent::Parts(vec![ApiInputContent::Text {
+                    content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
                         text: "answer".to_string(),
                     }]),
                 }),
@@ -2266,7 +2279,7 @@ mod tests {
             last_response_id: Some("resp_prev".to_string()),
             last_response_items: vec![ApiInputItem::Message(ApiMessage {
                 role: ApiRole::Assistant,
-                content: ApiMessageContent::Parts(vec![ApiInputContent::Text {
+                content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
                     text: "answer".to_string(),
                 }]),
             })],
@@ -2410,6 +2423,80 @@ mod tests {
             }
             _ => panic!("Expected FunctionCall"),
         }
+    }
+
+    #[test]
+    fn test_build_api_input_uses_responses_text_types_by_role() {
+        let request = ChatRequest {
+            system: "system".to_string(),
+            messages: vec![
+                agent_sdk_core::llm::Message::user_with_content(vec![ContentBlock::Text {
+                    text: "question".to_string(),
+                }]),
+                agent_sdk_core::llm::Message {
+                    role: agent_sdk_core::llm::Role::Assistant,
+                    content: Content::Blocks(vec![ContentBlock::Text {
+                        text: "answer".to_string(),
+                    }]),
+                },
+            ],
+            tools: None,
+            max_tokens: 512,
+            max_tokens_explicit: false,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+        };
+
+        let input = build_api_input(&request);
+        assert_eq!(input.len(), 2);
+
+        match &input[0] {
+            ApiInputItem::Message(ApiMessage {
+                role: ApiRole::User,
+                content: ApiMessageContent::Parts(parts),
+            }) => assert!(matches!(
+                parts.as_slice(),
+                [ApiInputContent::InputText { text }] if text == "question"
+            )),
+            _ => panic!("expected user message with input_text content"),
+        }
+
+        match &input[1] {
+            ApiInputItem::Message(ApiMessage {
+                role: ApiRole::Assistant,
+                content: ApiMessageContent::Parts(parts),
+            }) => assert!(matches!(
+                parts.as_slice(),
+                [ApiInputContent::OutputText { text }] if text == "answer"
+            )),
+            _ => panic!("expected assistant message with output_text content"),
+        }
+    }
+
+    #[test]
+    fn test_api_input_content_serialization_uses_current_responses_tags() {
+        let json = serde_json::to_string(&ApiMessageContent::Parts(vec![
+            ApiInputContent::InputText {
+                text: "prompt".to_string(),
+            },
+            ApiInputContent::OutputText {
+                text: "reply".to_string(),
+            },
+            ApiInputContent::Image {
+                image_url: "data:image/png;base64,abc".to_string(),
+            },
+            ApiInputContent::File {
+                filename: "notes.txt".to_string(),
+                file_data: "data:text/plain;base64,abc".to_string(),
+            },
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"type\":\"input_text\""));
+        assert!(json.contains("\"type\":\"output_text\""));
+        assert!(json.contains("\"type\":\"input_image\""));
+        assert!(json.contains("\"type\":\"input_file\""));
     }
 
     #[test]
