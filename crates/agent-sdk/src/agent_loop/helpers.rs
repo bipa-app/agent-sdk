@@ -8,23 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Saturating conversion from usize to u32.
-#[allow(clippy::cast_possible_truncation)]
-pub(super) const fn turns_to_u32(turns: usize) -> u32 {
-    if turns > u32::MAX as usize {
-        u32::MAX
-    } else {
-        turns as u32
-    }
+pub(super) fn turns_to_u32(turns: usize) -> u32 {
+    u32::try_from(turns).unwrap_or(u32::MAX)
 }
 
 /// Convert u128 milliseconds to u64, capping at `u64::MAX`
-#[allow(clippy::cast_possible_truncation)]
-pub(super) const fn millis_to_u64(millis: u128) -> u64 {
-    if millis > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        millis as u64
-    }
+pub(super) fn millis_to_u64(millis: u128) -> u64 {
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// Calculate exponential backoff delay with jitter.
