@@ -10,7 +10,7 @@
 //! |--------|-------------|
 //! | [`tools`]       | Tool traits, registry, `ToolContext`, name types |
 //! | [`hooks`]       | Lifecycle hooks (pre/post tool, events, errors) |
-//! | [`stores`]      | Persistence traits for messages, state, and tool executions |
+//! | [`stores`]      | Persistence traits for messages, state, events, and tool executions |
 //! | [`environment`] | Filesystem / process environment abstraction |
 
 #![forbid(unsafe_code)]
@@ -24,7 +24,8 @@ pub mod tools;
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use stores::{
-    InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
+    EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
+    StateStore, StoredTurnEvents, ToolExecutionStore,
 };
 pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,

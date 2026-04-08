@@ -3,16 +3,16 @@ use super::types::{
     LISTEN_TOTAL_TIMEOUT, LISTEN_UPDATE_TIMEOUT, ListenReady, ListenUpdateHandling,
     MAX_LISTEN_UPDATES,
 };
-use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use crate::events::{AgentEvent, SequenceCounter};
 use crate::hooks::AgentHooks;
+use crate::stores::EventStore;
 use crate::tools::{ErasedListenTool, ListenStopReason, ListenToolUpdate, ToolContext};
-use crate::types::{PendingToolCallInfo, ToolResult};
+use crate::types::{AgentError, PendingToolCallInfo, ThreadId, ToolResult};
 use futures::StreamExt;
 use log::warn;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 pub(super) fn build_listen_progress_data(
@@ -47,6 +47,11 @@ pub(super) fn build_listen_confirmation_input(
         "revision": ready.revision,
         "expires_at": ready.expires_at,
     })
+}
+
+pub(super) enum ListenWaitError {
+    Tool(ToolResult),
+    Event(AgentError),
 }
 
 pub(super) async fn cancel_listen_with_warning<Ctx>(
@@ -91,11 +96,13 @@ pub(super) async fn cancel_last_listen_operation<Ctx>(
 pub(super) async fn handle_listen_update<H>(
     pending: &PendingToolCallInfo,
     hooks: &Arc<H>,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
     seq: &SequenceCounter,
     update: ListenToolUpdate,
     last_operation_id: &mut Option<String>,
-) -> Result<ListenUpdateHandling, ToolResult>
+) -> Result<ListenUpdateHandling, ListenWaitError>
 where
     H: AgentHooks,
 {
@@ -115,7 +122,9 @@ where
                 expires_at,
             ));
             send_event(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 hooks,
                 seq,
                 AgentEvent::tool_progress(
@@ -127,7 +136,8 @@ where
                     data,
                 ),
             )
-            .await;
+            .await
+            .map_err(ListenWaitError::Event)?;
             Ok(ListenUpdateHandling::Continue)
         }
         ListenToolUpdate::Ready {
@@ -144,7 +154,9 @@ where
                 expires_at,
             ));
             send_event(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 hooks,
                 seq,
                 AgentEvent::tool_progress(
@@ -156,7 +168,8 @@ where
                     data,
                 ),
             )
-            .await;
+            .await
+            .map_err(ListenWaitError::Event)?;
             Ok(ListenUpdateHandling::Ready(ListenReady {
                 operation_id,
                 revision,
@@ -174,7 +187,9 @@ where
                 "recoverable": recoverable,
             }));
             send_event(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 hooks,
                 seq,
                 AgentEvent::tool_progress(
@@ -186,14 +201,17 @@ where
                     data,
                 ),
             )
-            .await;
+            .await
+            .map_err(ListenWaitError::Event)?;
 
             let prefix = if recoverable {
                 "Listen operation invalidated (recoverable)"
             } else {
                 "Listen operation invalidated"
             };
-            Err(ToolResult::error(format!("{prefix}: {message}")))
+            Err(ListenWaitError::Tool(ToolResult::error(format!(
+                "{prefix}: {message}"
+            ))))
         }
     }
 }
@@ -203,9 +221,38 @@ pub(super) async fn wait_for_listen_ready<Ctx, H>(
     tool: &Arc<dyn ErasedListenTool<Ctx>>,
     tool_context: &ToolContext<Ctx>,
     hooks: &Arc<H>,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
     seq: &SequenceCounter,
-) -> Result<ListenReady, ToolResult>
+) -> Result<ListenReady, ListenWaitError>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    wait_for_listen_ready_inner(
+        pending,
+        tool,
+        tool_context,
+        hooks,
+        event_store,
+        thread_id,
+        turn,
+        seq,
+    )
+    .await
+}
+
+async fn wait_for_listen_ready_inner<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    tool: &Arc<dyn ErasedListenTool<Ctx>>,
+    tool_context: &ToolContext<Ctx>,
+    hooks: &Arc<H>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
+    seq: &SequenceCounter,
+) -> Result<ListenReady, ListenWaitError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
@@ -225,10 +272,10 @@ where
                 ListenStopReason::StreamEnded,
             )
             .await;
-            return Err(ToolResult::error(format!(
+            return Err(ListenWaitError::Tool(ToolResult::error(format!(
                 "Listen tool exceeded wall-clock timeout ({}s)",
                 LISTEN_TOTAL_TIMEOUT.as_secs()
-            )));
+            ))));
         }
 
         let Ok(next_update) = timeout(LISTEN_UPDATE_TIMEOUT, updates.next()).await else {
@@ -240,10 +287,10 @@ where
                 ListenStopReason::StreamEnded,
             )
             .await;
-            return Err(ToolResult::error(format!(
+            return Err(ListenWaitError::Tool(ToolResult::error(format!(
                 "Listen stream timed out after {}s waiting for updates",
                 LISTEN_UPDATE_TIMEOUT.as_secs()
-            )));
+            ))));
         };
 
         let Some(update) = next_update else {
@@ -255,32 +302,27 @@ where
                 ListenStopReason::StreamEnded,
             )
             .await;
-            return Err(ToolResult::error(
+            return Err(ListenWaitError::Tool(ToolResult::error(
                 "Listen stream ended before operation became ready",
-            ));
+            )));
         };
 
         update_count += 1;
-        match handle_listen_update::<H>(pending, hooks, tx, seq, update, &mut last_operation_id)
-            .await
+        match handle_listen_update::<H>(
+            pending,
+            hooks,
+            event_store,
+            thread_id,
+            turn,
+            seq,
+            update,
+            &mut last_operation_id,
+        )
+        .await
         {
             Ok(ListenUpdateHandling::Continue) => {}
             Ok(ListenUpdateHandling::Ready(ready)) => return Ok(ready),
             Err(error) => return Err(error),
-        }
-
-        if tx.is_closed() {
-            cancel_last_listen_operation(
-                tool,
-                tool_context,
-                pending,
-                last_operation_id.as_deref(),
-                ListenStopReason::StreamDisconnected,
-            )
-            .await;
-            return Err(ToolResult::error(
-                "Listen stream disconnected before operation became ready",
-            ));
         }
 
         if update_count >= MAX_LISTEN_UPDATES {
@@ -292,9 +334,9 @@ where
                 ListenStopReason::StreamEnded,
             )
             .await;
-            return Err(ToolResult::error(format!(
+            return Err(ListenWaitError::Tool(ToolResult::error(format!(
                 "Listen tool exceeded max updates ({MAX_LISTEN_UPDATES})"
-            )));
+            ))));
         }
     }
 }

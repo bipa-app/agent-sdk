@@ -1,22 +1,27 @@
-//! Storage traits for message history and agent state.
+//! Storage traits for message history, agent state, and event persistence.
 //!
-//! The SDK uses two storage abstractions:
+//! The SDK uses three storage abstractions:
 //!
 //! - [`MessageStore`] - Stores conversation message history per thread
 //! - [`StateStore`] - Stores agent state checkpoints for recovery
+//! - [`EventStore`] - Stores turn-scoped event envelopes for retrieval
 //!
 //! # Built-in Implementation
 //!
-//! [`InMemoryStore`] implements both traits and is suitable for testing
-//! and single-process deployments. For production, implement custom stores
-//! backed by your database (e.g., Postgres, Redis).
+//! [`InMemoryStore`] implements the message/state traits and is suitable for
+//! testing and single-process deployments. [`InMemoryEventStore`] provides the
+//! corresponding in-memory event journal. For production, implement custom
+//! stores backed by your database (e.g., Postgres, Redis).
 
+use agent_sdk_core::events::AgentEventEnvelope;
 use agent_sdk_core::llm;
 use agent_sdk_core::types::{AgentState, ThreadId, ToolExecution};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 
 /// Trait for storing and retrieving conversation messages.
 /// Implement this trait to persist messages to your storage backend.
@@ -83,6 +88,73 @@ pub trait StateStore: Send + Sync {
     async fn delete(&self, thread_id: &ThreadId) -> Result<()>;
 }
 
+/// Stored event data for a single turn.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoredTurnEvents {
+    /// Turn number (1-based once execution starts).
+    pub turn: usize,
+    /// Events emitted for this turn.
+    pub events: Vec<AgentEventEnvelope>,
+    /// Whether `finish_turn()` has completed for this turn.
+    pub finished: bool,
+}
+
+/// Trait for storing and retrieving turn-scoped event streams.
+///
+/// Event writes are split into two phases:
+/// 1. [`append`](EventStore::append) records individual envelopes
+/// 2. [`finish_turn`](EventStore::finish_turn) marks the authoritative close barrier
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    /// Append an event envelope for the given thread and turn.
+    ///
+    /// # Errors
+    /// Returns an error if the event cannot be persisted.
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> Result<()>;
+
+    /// Mark the given turn as finished and flush any buffered writes.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot durably close the turn.
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()>;
+
+    /// Retrieve the stored data for a single turn.
+    ///
+    /// # Errors
+    /// Returns an error if the turn cannot be retrieved.
+    async fn get_turn(&self, thread_id: &ThreadId, turn: usize)
+    -> Result<Option<StoredTurnEvents>>;
+
+    /// Retrieve all stored turns for the given thread in ascending turn order.
+    ///
+    /// # Errors
+    /// Returns an error if the thread history cannot be retrieved.
+    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>>;
+
+    /// Retrieve all event envelopes for the given thread across every stored turn.
+    ///
+    /// # Errors
+    /// Returns an error if the thread history cannot be retrieved.
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<AgentEventEnvelope>> {
+        let turns = self.get_turns(thread_id).await?;
+        Ok(turns
+            .into_iter()
+            .flat_map(|turn| turn.events.into_iter())
+            .collect())
+    }
+
+    /// Clear all events for the given thread.
+    ///
+    /// # Errors
+    /// Returns an error if the thread cannot be cleared.
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()>;
+}
+
 /// Store for tracking tool executions (idempotency).
 ///
 /// This trait enables write-ahead execution tracking to ensure tool idempotency.
@@ -129,6 +201,26 @@ pub struct InMemoryStore {
 }
 
 impl InMemoryStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Default)]
+struct InMemoryEventStoreInner {
+    turns: AsyncRwLock<HashMap<String, BTreeMap<usize, StoredTurnEvents>>>,
+}
+
+/// In-memory implementation of [`EventStore`].
+///
+/// Cloning this type shares the same underlying event journal.
+#[derive(Clone, Default)]
+pub struct InMemoryEventStore {
+    inner: Arc<InMemoryEventStoreInner>,
+}
+
+impl InMemoryEventStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -198,6 +290,76 @@ impl StateStore for InMemoryStore {
             .ok()
             .context("lock poisoned")?
             .remove(&thread_id.0);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventStore for InMemoryEventStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> Result<()> {
+        self.inner
+            .turns
+            .write()
+            .await
+            .entry(thread_id.0.clone())
+            .or_default()
+            .entry(turn)
+            .or_insert_with(|| StoredTurnEvents {
+                turn,
+                events: Vec::new(),
+                finished: false,
+            })
+            .events
+            .push(envelope);
+        Ok(())
+    }
+
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
+        self.inner
+            .turns
+            .write()
+            .await
+            .entry(thread_id.0.clone())
+            .or_default()
+            .entry(turn)
+            .or_insert_with(|| StoredTurnEvents {
+                turn,
+                events: Vec::new(),
+                finished: false,
+            })
+            .finished = true;
+        Ok(())
+    }
+
+    async fn get_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+    ) -> Result<Option<StoredTurnEvents>> {
+        let turns = self.inner.turns.read().await;
+        Ok(turns
+            .get(&thread_id.0)
+            .and_then(|thread_turns| thread_turns.get(&turn).cloned()))
+    }
+
+    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>> {
+        let turns = self.inner.turns.read().await;
+        Ok(turns
+            .get(&thread_id.0)
+            .map(|thread_turns| thread_turns.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
+        {
+            let mut turns = self.inner.turns.write().await;
+            turns.remove(&thread_id.0);
+        }
         Ok(())
     }
 }

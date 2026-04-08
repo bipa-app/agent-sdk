@@ -20,7 +20,9 @@
 //!     .with_system_prompt("You are a research specialist...")
 //!     .with_max_turns(10);
 //!
-//! let tool = SubagentTool::new(config, provider, tools);
+//! let tool = SubagentTool::new(config, provider, tools, || {
+//!     std::sync::Arc::new(agent_sdk::InMemoryEventStore::new())
+//! });
 //! registry.register(tool);
 //! ```
 //!
@@ -36,10 +38,10 @@ mod factory;
 
 pub use factory::SubagentFactory;
 
-use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
-use crate::stores::{InMemoryStore, MessageStore, StateStore};
+use crate::stores::{EventStore, InMemoryStore, MessageStore, StateStore};
 use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage, ToolResult, ToolTier};
 use anyhow::{Context, Result, bail};
@@ -47,7 +49,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Metadata key for tracking the current subagent nesting depth.
@@ -192,7 +193,9 @@ pub struct SubagentResult {
 /// let config = SubagentConfig::new("analyzer")
 ///     .with_system_prompt("You analyze code...");
 ///
-/// let tool = SubagentTool::new(config, provider.clone(), tools.clone());
+/// let tool = SubagentTool::new(config, provider.clone(), tools.clone(), || {
+///     std::sync::Arc::new(agent_sdk::InMemoryEventStore::new())
+/// });
 /// ```
 pub struct SubagentTool<P, H = DefaultHooks, M = InMemoryStore, S = InMemoryStore>
 where
@@ -207,6 +210,7 @@ where
     hooks: Arc<H>,
     message_store_factory: Arc<dyn Fn() -> M + Send + Sync>,
     state_store_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    event_store_factory: Arc<dyn Fn() -> Arc<dyn EventStore> + Send + Sync>,
     /// Cached display name to avoid `Box::leak` on every call.
     cached_display_name: &'static str,
     /// Cached description to avoid `Box::leak` on every call.
@@ -217,9 +221,17 @@ impl<P> SubagentTool<P, DefaultHooks, InMemoryStore, InMemoryStore>
 where
     P: LlmProvider + 'static,
 {
-    /// Create a new subagent tool with default hooks and in-memory stores.
+    /// Create a new subagent tool with default hooks and in-memory message/state stores.
     #[must_use]
-    pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
+    pub fn new<EF>(
+        config: SubagentConfig,
+        provider: Arc<P>,
+        tools: Arc<ToolRegistry<()>>,
+        event_store_factory: EF,
+    ) -> Self
+    where
+        EF: Fn() -> Arc<dyn EventStore> + Send + Sync + 'static,
+    {
         // Cache leaked strings at construction time (bounded by number of tools)
         let cached_display_name = Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
         let cached_description = Box::leak(
@@ -236,6 +248,7 @@ where
             hooks: Arc::new(DefaultHooks),
             message_store_factory: Arc::new(InMemoryStore::new),
             state_store_factory: Arc::new(InMemoryStore::new),
+            event_store_factory: Arc::new(event_store_factory),
             cached_display_name,
             cached_description,
         }
@@ -262,6 +275,7 @@ where
             hooks,
             message_store_factory: self.message_store_factory,
             state_store_factory: self.state_store_factory,
+            event_store_factory: self.event_store_factory,
             cached_display_name: self.cached_display_name,
             cached_description: self.cached_description,
         }
@@ -287,6 +301,7 @@ where
             hooks: self.hooks,
             message_store_factory: Arc::new(message_factory),
             state_store_factory: Arc::new(state_factory),
+            event_store_factory: self.event_store_factory,
             cached_display_name: self.cached_display_name,
             cached_description: self.cached_description,
         }
@@ -300,9 +315,6 @@ where
 
     /// Run the subagent with a task.
     ///
-    /// If `parent_tx` is provided, the subagent will emit `SubagentProgress` events
-    /// to the parent's event channel, allowing the UI to show live progress.
-    ///
     /// The `parent_cancel` token links the subagent's lifecycle to its parent.
     /// Cancelling the parent token will also cancel the subagent.
     #[allow(clippy::too_many_lines)]
@@ -310,18 +322,20 @@ where
         &self,
         task: &str,
         subagent_id: String,
-        parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
-        parent_seq: Option<SequenceCounter>,
+        parent_ctx: &ToolContext<()>,
         parent_cancel: CancellationToken,
     ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
         let start = Instant::now();
+        // Each subagent run gets its own thread id, so a shared event store
+        // only returns this subagent's events when queried with `thread_id`.
         let thread_id = ThreadId::new();
 
         // Create stores for this subagent run
         let message_store = (self.message_store_factory)();
         let state_store = (self.state_store_factory)();
+        let event_store = (self.event_store_factory)();
 
         // Create agent config with a default max_turns to prevent unbounded execution
         let agent_config = AgentConfig {
@@ -337,6 +351,7 @@ where
             (*self.hooks).clone(),
             message_store,
             state_store,
+            Arc::clone(&event_store),
             agent_config,
         );
 
@@ -348,8 +363,8 @@ where
         // instead of leaving a detached task that continues making API calls.
         let cancel_token = parent_cancel.child_token();
         let timeout_cancel = cancel_token.clone();
-        let (mut rx, _final_state, task_handle) = agent.run_abortable(
-            thread_id,
+        let (state_rx, task_handle) = agent.run_abortable(
+            thread_id.clone(),
             AgentInput::Text(task.to_string()),
             tool_ctx,
             cancel_token,
@@ -367,146 +382,141 @@ where
         let mut failed_tool: Option<String> = None;
 
         let timeout_duration = self.config.timeout_ms.map(Duration::from_millis);
+        let timed_out = timeout_duration
+            .is_some_and(|timeout| timeout.saturating_sub(start.elapsed()).is_zero());
+        let wait_result = if timed_out {
+            None
+        } else if let Some(timeout) = timeout_duration {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            Some(tokio::time::timeout(remaining, state_rx).await)
+        } else {
+            Some(Ok(state_rx.await))
+        };
 
-        loop {
-            let recv_result = if let Some(timeout) = timeout_duration {
-                let remaining = timeout.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    timeout_cancel.cancel();
-                    // Abort the spawned task so its in-flight LLM stream is
-                    // dropped immediately instead of continuing in the
-                    // background and consuming API capacity.
-                    task_handle.abort();
-                    final_response = "Subagent timed out".to_string();
-                    error_details = Some(format!(
-                        "Subagent '{}' timed out after {}ms",
-                        self.config.name,
-                        self.config.timeout_ms.unwrap_or(0)
-                    ));
-                    success = false;
-                    break;
+        match wait_result {
+            None => {
+                timeout_cancel.cancel();
+                task_handle.abort();
+                final_response = "Subagent timed out".to_string();
+                error_details = Some(format!(
+                    "Subagent '{}' timed out after {}ms",
+                    self.config.name,
+                    self.config.timeout_ms.unwrap_or(0)
+                ));
+                success = false;
+            }
+            Some(Ok(Ok(_))) | Some(Ok(Err(_))) => {}
+            Some(Err(_)) => {
+                timeout_cancel.cancel();
+                task_handle.abort();
+                final_response = "Subagent timed out".to_string();
+                error_details = Some(format!(
+                    "Subagent '{}' timed out after {}ms",
+                    self.config.name,
+                    self.config.timeout_ms.unwrap_or(0)
+                ));
+                success = false;
+            }
+        }
+
+        for envelope in event_store.get_events(&thread_id).await? {
+            match envelope.event {
+                AgentEvent::Text {
+                    message_id: _,
+                    text,
+                } => {
+                    final_response.push_str(&text);
                 }
-                tokio::time::timeout(remaining, rx.recv()).await
-            } else {
-                Ok(rx.recv().await)
-            };
+                AgentEvent::ToolCallStart {
+                    id, name, input, ..
+                } => {
+                    // Track tool calls made by the subagent
+                    tool_count += 1;
+                    let context = extract_tool_context(&name, &input);
+                    pending_tools.insert(id, (name.clone(), context.clone()));
 
-            match recv_result {
-                Ok(Some(envelope)) => match envelope.event {
-                    AgentEvent::Text {
-                        message_id: _,
-                        text,
-                    } => {
-                        final_response.push_str(&text);
-                    }
-                    AgentEvent::ToolCallStart {
-                        id, name, input, ..
-                    } => {
-                        // Track tool calls made by the subagent
-                        tool_count += 1;
-                        let context = extract_tool_context(&name, &input);
-                        pending_tools.insert(id, (name.clone(), context.clone()));
+                    parent_ctx
+                        .emit_event(AgentEvent::SubagentProgress {
+                            subagent_id: subagent_id.clone(),
+                            subagent_name: self.config.name.clone(),
+                            nickname: self.config.nickname.clone(),
+                            #[allow(clippy::cast_possible_truncation)]
+                            max_turns: self.config.max_turns.map(|t| t as u32),
+                            #[allow(clippy::cast_possible_truncation)]
+                            current_turn: Some(total_turns as u32),
+                            model: self.config.model.clone(),
+                            tool_name: name,
+                            tool_context: context,
+                            completed: false,
+                            success: false,
+                            tool_count,
+                            total_tokens: u64::from(total_usage.input_tokens)
+                                + u64::from(total_usage.output_tokens),
+                        })
+                        .await?;
+                }
+                AgentEvent::ToolCallEnd {
+                    id,
+                    name,
+                    display_name,
+                    result,
+                } => {
+                    // Create log entry when tool completes
+                    let context = pending_tools
+                        .remove(&id)
+                        .map(|(_, ctx)| ctx)
+                        .unwrap_or_default();
+                    let result_summary = summarize_tool_result(&name, &result);
+                    let tool_success = result.success;
+                    tool_logs.push(ToolCallLog {
+                        name: name.clone(),
+                        display_name: display_name.clone(),
+                        context: context.clone(),
+                        result: result_summary,
+                        success: tool_success,
+                        duration_ms: result.duration_ms,
+                    });
 
-                        // Emit progress event to parent
-                        if let (Some(tx), Some(seq)) = (&parent_tx, &parent_seq) {
-                            let event = AgentEvent::SubagentProgress {
-                                subagent_id: subagent_id.clone(),
-                                subagent_name: self.config.name.clone(),
-                                nickname: self.config.nickname.clone(),
-                                #[allow(clippy::cast_possible_truncation)]
-                                max_turns: self.config.max_turns.map(|t| t as u32),
-                                #[allow(clippy::cast_possible_truncation)]
-                                current_turn: Some(total_turns as u32),
-                                model: self.config.model.clone(),
-                                tool_name: name,
-                                tool_context: context,
-                                completed: false,
-                                success: false,
-                                tool_count,
-                                total_tokens: u64::from(total_usage.input_tokens)
-                                    + u64::from(total_usage.output_tokens),
-                            };
-                            let _ = tx.send(AgentEventEnvelope::wrap(event, seq)).await;
-                        }
-                    }
-                    AgentEvent::ToolCallEnd {
-                        id,
-                        name,
-                        display_name,
-                        result,
-                    } => {
-                        // Create log entry when tool completes
-                        let context = pending_tools
-                            .remove(&id)
-                            .map(|(_, ctx)| ctx)
-                            .unwrap_or_default();
-                        let result_summary = summarize_tool_result(&name, &result);
-                        let tool_success = result.success;
-                        tool_logs.push(ToolCallLog {
-                            name: name.clone(),
-                            display_name: display_name.clone(),
-                            context: context.clone(),
-                            result: result_summary,
+                    parent_ctx
+                        .emit_event(AgentEvent::SubagentProgress {
+                            subagent_id: subagent_id.clone(),
+                            subagent_name: self.config.name.clone(),
+                            nickname: self.config.nickname.clone(),
+                            #[allow(clippy::cast_possible_truncation)]
+                            max_turns: self.config.max_turns.map(|t| t as u32),
+                            #[allow(clippy::cast_possible_truncation)]
+                            current_turn: Some(total_turns as u32),
+                            model: self.config.model.clone(),
+                            tool_name: name,
+                            tool_context: context,
+                            completed: true,
                             success: tool_success,
-                            duration_ms: result.duration_ms,
-                        });
-
-                        // Emit progress event to parent
-                        if let (Some(tx), Some(seq)) = (&parent_tx, &parent_seq) {
-                            let event = AgentEvent::SubagentProgress {
-                                subagent_id: subagent_id.clone(),
-                                subagent_name: self.config.name.clone(),
-                                nickname: self.config.nickname.clone(),
-                                #[allow(clippy::cast_possible_truncation)]
-                                max_turns: self.config.max_turns.map(|t| t as u32),
-                                #[allow(clippy::cast_possible_truncation)]
-                                current_turn: Some(total_turns as u32),
-                                model: self.config.model.clone(),
-                                tool_name: name,
-                                tool_context: context,
-                                completed: true,
-                                success: tool_success,
-                                tool_count,
-                                total_tokens: u64::from(total_usage.input_tokens)
-                                    + u64::from(total_usage.output_tokens),
-                            };
-                            let _ = tx.send(AgentEventEnvelope::wrap(event, seq)).await;
-                        }
-                    }
-                    AgentEvent::TurnComplete { turn, usage, .. } => {
-                        total_turns = turn;
-                        total_usage.add(&usage);
-                    }
-                    AgentEvent::Done {
-                        total_turns: turns, ..
-                    } => {
-                        total_turns = turns;
-                        break;
-                    }
-                    AgentEvent::Error { message, .. } => {
-                        error_details = Some(message.clone());
-                        // If there are pending tool calls, the last one is likely the culprit.
-                        if let Some(last_tool) = pending_tools.values().last() {
-                            failed_tool = Some(last_tool.0.clone());
-                        }
-                        final_response = message;
-                        success = false;
-                        break;
-                    }
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(_) => {
-                    timeout_cancel.cancel();
-                    task_handle.abort();
-                    final_response = "Subagent timed out".to_string();
-                    error_details = Some(format!(
-                        "Subagent '{}' timed out waiting for event",
-                        self.config.name,
-                    ));
-                    success = false;
+                            tool_count,
+                            total_tokens: u64::from(total_usage.input_tokens)
+                                + u64::from(total_usage.output_tokens),
+                        })
+                        .await?;
+                }
+                AgentEvent::TurnComplete { turn, usage, .. } => {
+                    total_turns = turn;
+                    total_usage.add(&usage);
+                }
+                AgentEvent::Done {
+                    total_turns: turns, ..
+                } => {
+                    total_turns = turns;
                     break;
                 }
+                AgentEvent::Error { message, .. } => {
+                    error_details = Some(message.clone());
+                    // If there are pending tool calls, the last one is likely the culprit.
+                    if let Some(last_tool) = pending_tools.values().last() {
+                        failed_tool = Some(last_tool.0.clone());
+                    }
+                    final_response = message;
+                    success = false;
+                }
+                _ => {}
             }
         }
 
@@ -749,10 +759,6 @@ where
             None
         };
 
-        // Get event channel and sequence counter from context for progress updates
-        let parent_tx = ctx.event_tx();
-        let parent_seq = ctx.event_seq();
-
         // Generate a unique ID for this subagent execution
         let subagent_id = format!(
             "{}_{:x}",
@@ -768,7 +774,7 @@ where
         let cancel_token = ctx.cancel_token().unwrap_or_default();
 
         let result = self
-            .run_subagent(task, subagent_id, parent_tx, parent_seq, cancel_token)
+            .run_subagent(task, subagent_id, ctx, cancel_token)
             .await?;
 
         Ok(ToolResult {

@@ -9,13 +9,14 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentHooks, AgentInput, CancellationToken, DynamicToolName, InMemoryStore,
-    ThreadId, Tool, ToolContext, ToolDecision, ToolRegistry, ToolResult, ToolTier, builder,
-    providers::AnthropicProvider,
+    AgentEvent, AgentHooks, AgentInput, CancellationToken, DynamicToolName, EventStore,
+    InMemoryEventStore, InMemoryStore, ThreadId, Tool, ToolContext, ToolDecision, ToolRegistry,
+    ToolResult, ToolTier, builder, providers::AnthropicProvider,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A simple tool that simulates sending an email.
@@ -176,28 +177,31 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting agent with custom hooks (max 3 tool calls)\n");
 
     // Build the agent with custom hooks
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
         .tools(tools)
         .hooks(hooks)
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
+        .event_store(event_store.clone())
         .build_with_stores();
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent to send an email
-    let (mut events, _final_state) = agent.run(
-        thread_id,
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("Please send an email to test@example.com with subject 'Hello' and body 'This is a test message.'".to_string()),
         tool_ctx,
         CancellationToken::new(),
     );
+    let _ = final_state.await?;
 
     println!("\n--- Agent Output ---\n");
 
-    while let Some(envelope) = events.recv().await {
+    for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {
             AgentEvent::Text {
                 message_id: _,

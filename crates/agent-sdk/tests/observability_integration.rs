@@ -9,9 +9,9 @@ use agent_sdk::observability::{
     CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle, attrs,
 };
 use agent_sdk::{
-    AgentEvent, AgentEventEnvelope, AgentInput, AgentState, AllowAllHooks, CancellationToken,
-    DynamicToolName, InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, Tool,
-    ToolContext, ToolRegistry, ToolResult, ToolTier, builder,
+    AgentInput, AgentState, AllowAllHooks, CancellationToken, DynamicToolName, InMemoryEventStore,
+    InMemoryStore, LlmProvider, MessageStore, StateStore, ThreadId, Tool, ToolContext,
+    ToolRegistry, ToolResult, ToolTier, TurnOptions, builder,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -280,16 +280,16 @@ fn span_has_event(span: &SpanData, event_name: &str) -> bool {
         .any(|event| event.name.as_ref() == event_name)
 }
 
-async fn drain_events(mut rx: tokio::sync::mpsc::Receiver<AgentEventEnvelope>) {
-    while let Some(envelope) = rx.recv().await {
-        if matches!(
-            envelope.event,
-            AgentEvent::Done { .. } | AgentEvent::Error { .. }
-        ) {
-            break;
-        }
-    }
+fn new_event_store() -> Arc<InMemoryEventStore> {
+    Arc::new(InMemoryEventStore::new())
+}
+
+async fn wait_for_run(
+    final_state: tokio::sync::oneshot::Receiver<agent_sdk::AgentRunState>,
+) -> Result<()> {
+    let _ = final_state.await.context("agent state channel closed")?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(())
 }
 
 async fn seed_compaction_history(store: &SharedStore, thread_id: &ThreadId) -> Result<()> {
@@ -308,16 +308,18 @@ async fn root_span_emitted_for_simple_run() -> Result<()> {
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Hello!")]);
-    let agent = builder::<()>().provider(provider).build();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hi".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -348,16 +350,18 @@ async fn turn_span_emitted() -> Result<()> {
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Done")]);
-    let agent = builder::<()>().provider(provider).build();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hi".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -384,11 +388,13 @@ async fn context_compaction_span_is_child_of_root_span() -> Result<()> {
         TestProvider::text_response("Conversation summary"),
         TestProvider::text_response("Done"),
     ]);
+    let event_store = new_event_store();
     let agent = builder::<()>()
         .provider(provider)
         .hooks(AllowAllHooks)
         .message_store(store.clone())
         .state_store(store.clone())
+        .event_store(event_store)
         .with_compaction(
             agent_sdk::context::CompactionConfig::new()
                 .with_threshold_tokens(1)
@@ -396,14 +402,13 @@ async fn context_compaction_span_is_child_of_root_span() -> Result<()> {
                 .with_retain_recent(1),
         )
         .build_with_stores();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Follow up".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -451,11 +456,13 @@ async fn context_compaction_failure_sets_error_status() -> Result<()> {
         ChatOutcome::ServerError("summary backend unavailable".to_string()),
         TestProvider::text_response("Done"),
     ]);
+    let event_store = new_event_store();
     let agent = builder::<()>()
         .provider(provider)
         .hooks(AllowAllHooks)
         .message_store(store.clone())
         .state_store(store.clone())
+        .event_store(event_store)
         .with_compaction(
             agent_sdk::context::CompactionConfig::new()
                 .with_threshold_tokens(1)
@@ -463,14 +470,13 @@ async fn context_compaction_failure_sets_error_status() -> Result<()> {
                 .with_retain_recent(1),
         )
         .build_with_stores();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Follow up".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -503,16 +509,18 @@ async fn llm_span_emitted_with_model_name() -> Result<()> {
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
-    let agent = builder::<()>().provider(provider).build();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hello".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -544,16 +552,16 @@ async fn inline_payload_store_records_input_and_output_messages() -> Result<()> 
     let agent = builder::<()>()
         .provider(provider)
         .observability_store(InlinePayloadStore)
+        .event_store(new_event_store())
         .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hello".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -590,16 +598,17 @@ async fn failing_payload_store_does_not_fail_agent() -> Result<()> {
     let agent = builder::<()>()
         .provider(provider)
         .observability_store(FailingPayloadStore)
+        .event_store(new_event_store())
         .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hello".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
     let state = final_state.await.context("agent state channel closed")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -629,15 +638,15 @@ async fn payload_store_is_called_for_non_recording_spans() -> Result<()> {
         .observability_store(CountingPayloadStore {
             calls: Arc::clone(&calls),
         })
+        .event_store(new_event_store())
         .build();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         ThreadId::new(),
         AgentInput::Text("Hello".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -658,22 +667,23 @@ async fn tool_span_emitted_with_tool_name() -> Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register(EchoTool);
 
+    let event_store = new_event_store();
     let agent = builder::<()>()
         .provider(provider)
         .tools(tools)
         .hooks(AllowAllHooks)
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
+        .event_store(event_store)
         .build_with_stores();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Echo something".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -716,21 +726,22 @@ async fn unknown_tool_span_has_error_type() -> Result<()> {
         TestProvider::text_response("Done"),
     ]);
 
+    let event_store = new_event_store();
     let agent = builder::<()>()
         .provider(provider)
         .hooks(AllowAllHooks)
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
+        .event_store(event_store)
         .build_with_stores();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Use nonexistent tool".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -757,16 +768,18 @@ async fn provider_name_normalized_on_root_span() -> Result<()> {
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
-    let agent = builder::<()>().provider(provider).build();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Hello".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -790,16 +803,20 @@ async fn single_turn_mode_sets_run_mode() -> Result<()> {
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
-    let agent = builder::<()>().provider(provider).build();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
     let thread_id = ThreadId::new();
-    let (rx, outcome_rx) = agent.run_turn(
-        thread_id.clone(),
-        AgentInput::Text("Hello".to_string()),
-        ToolContext::new(()),
-        CancellationToken::new(),
-    );
-    drain_events(rx).await;
-    let _ = outcome_rx.await.context("turn outcome channel closed")?;
+    let _ = agent
+        .run_turn(
+            thread_id.clone(),
+            AgentInput::Text("Hello".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+        )
+        .await;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -825,22 +842,23 @@ async fn all_span_types_present_for_tool_call_flow() -> Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register(EchoTool);
 
+    let event_store = new_event_store();
     let agent = builder::<()>()
         .provider(provider)
         .tools(tools)
         .hooks(AllowAllHooks)
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
+        .event_store(event_store)
         .build_with_stores();
     let thread_id = ThreadId::new();
-    let (rx, final_state) = agent.run(
+    let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text("Test".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-    drain_events(rx).await;
-    let _ = final_state.await.context("agent state channel closed")?;
+    wait_for_run(final_state).await?;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 

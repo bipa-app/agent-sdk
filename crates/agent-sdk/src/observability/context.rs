@@ -1,9 +1,10 @@
 //! OpenTelemetry context propagation helpers for async boundaries.
 //!
-//! The SDK uses `tokio::spawn` in `run()` and `run_turn()`. The spawned
-//! futures are wrapped with `FutureExt::with_context()` so the caller's
-//! `OTel` context is re-attached on every poll, surviving task migration
-//! across tokio worker threads.
+//! The SDK uses `tokio::spawn` in `run()`. Those spawned futures are wrapped
+//! with `FutureExt::with_context()` so the caller's `OTel` context is
+//! re-attached on every poll, surviving task migration across tokio worker
+//! threads. `run_turn()` executes directly in the caller task and therefore
+//! does not need an extra spawn propagation hop.
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanContext, TraceContextExt};

@@ -618,4 +618,54 @@ pub enum TurnOutcome {
 
     /// An error occurred.
     Error(AgentError),
+
+    /// Tool calls are ready for external execution.
+    ///
+    /// Only returned when [`ToolRuntime::External`] is set in [`TurnOptions`].
+    /// The caller is responsible for executing the tool calls and resuming
+    /// with `AgentInput::Continue` (after appending tool results to the
+    /// message store).
+    PendingToolCalls {
+        /// The turn number that produced these tool calls
+        turn: usize,
+        /// Token usage for this turn's LLM call
+        turn_usage: TokenUsage,
+        /// Cumulative token usage so far
+        total_usage: TokenUsage,
+        /// Tool calls to execute externally
+        tool_calls: Vec<PendingToolCallInfo>,
+        /// Continuation state for resuming after external tool execution
+        continuation: Box<AgentContinuation>,
+    },
+}
+
+// ── Execution options ────────────────────────────────────────────────
+
+/// How tool calls should be handled during a turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ToolRuntime {
+    /// Tools are executed inline by the SDK (the default local-agent behavior).
+    #[default]
+    Inline,
+    /// Tool calls are returned to the caller for external execution.
+    ///
+    /// When set, `run_turn` yields [`TurnOutcome::PendingToolCalls`] instead
+    /// of executing tools itself. The server is responsible for running
+    /// tools and calling `run_turn` again.
+    External,
+}
+
+/// Options that control how a single `run_turn` invocation behaves.
+///
+/// The default is suitable for local/CLI usage (inline tools, no extra
+/// durability). Server mode should set `tool_runtime: External` and
+/// `strict_durability: true`.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOptions {
+    /// How tool calls should be handled.
+    pub tool_runtime: ToolRuntime,
+    /// When true, state is checkpointed at every critical boundary
+    /// (before LLM call, after LLM response, after tool execution).
+    /// Provides crash-safe server semantics at the cost of extra writes.
+    pub strict_durability: bool,
 }

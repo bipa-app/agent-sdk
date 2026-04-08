@@ -31,6 +31,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::llm::LlmProvider;
+use crate::stores::EventStore;
 use crate::tools::ToolRegistry;
 
 use super::{SubagentConfig, SubagentTool};
@@ -44,6 +45,7 @@ where
     P: LlmProvider + 'static,
 {
     provider: Arc<P>,
+    event_store_factory: Arc<dyn Fn() -> Arc<dyn EventStore> + Send + Sync>,
     read_only_registry: Option<Arc<ToolRegistry<()>>>,
     full_registry: Option<Arc<ToolRegistry<()>>>,
 }
@@ -52,11 +54,15 @@ impl<P> SubagentFactory<P>
 where
     P: LlmProvider + 'static,
 {
-    /// Creates a new factory with the given LLM provider.
+    /// Creates a new factory with the given LLM provider and event store factory.
     #[must_use]
-    pub const fn new(provider: Arc<P>) -> Self {
+    pub fn new<EF>(provider: Arc<P>, event_store_factory: EF) -> Self
+    where
+        EF: Fn() -> Arc<dyn EventStore> + Send + Sync + 'static,
+    {
         Self {
             provider,
+            event_store_factory: Arc::new(event_store_factory),
             read_only_registry: None,
             full_registry: None,
         }
@@ -91,10 +97,12 @@ where
             .read_only_registry
             .as_ref()
             .context("read-only registry not set; call with_read_only_registry first")?;
+        let event_store_factory = Arc::clone(&self.event_store_factory);
         Ok(SubagentTool::new(
             config,
             Arc::clone(&self.provider),
             Arc::clone(registry),
+            move || event_store_factory(),
         ))
     }
 
@@ -108,10 +116,12 @@ where
             .full_registry
             .as_ref()
             .context("full registry not set; call with_full_registry first")?;
+        let event_store_factory = Arc::clone(&self.event_store_factory);
         Ok(SubagentTool::new(
             config,
             Arc::clone(&self.provider),
             Arc::clone(registry),
+            move || event_store_factory(),
         ))
     }
 
@@ -122,7 +132,10 @@ where
         config: SubagentConfig,
         registry: Arc<ToolRegistry<()>>,
     ) -> SubagentTool<P> {
-        SubagentTool::new(config, Arc::clone(&self.provider), registry)
+        let event_store_factory = Arc::clone(&self.event_store_factory);
+        SubagentTool::new(config, Arc::clone(&self.provider), registry, move || {
+            event_store_factory()
+        })
     }
 
     /// Returns the provider for manual subagent construction.
@@ -139,6 +152,7 @@ where
     fn clone(&self) -> Self {
         Self {
             provider: Arc::clone(&self.provider),
+            event_store_factory: Arc::clone(&self.event_store_factory),
             read_only_registry: self.read_only_registry.clone(),
             full_registry: self.full_registry.clone(),
         }

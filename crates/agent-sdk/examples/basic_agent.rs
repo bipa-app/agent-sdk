@@ -14,9 +14,10 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentInput, CancellationToken, ThreadId, ToolContext, builder,
-    providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore, ThreadId,
+    ToolContext, builder, providers::AnthropicProvider,
 };
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,8 +29,10 @@ async fn main() -> anyhow::Result<()> {
         .expect("ANTHROPIC_API_KEY environment variable must be set");
 
     // Build the agent with default settings
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
+        .event_store(event_store.clone())
         .build();
 
     // Create a new conversation thread
@@ -39,15 +42,15 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting conversation (thread: {thread_id})\n");
 
     // Run the agent with a simple prompt
-    let (mut events, _final_state) = agent.run(
-        thread_id,
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("What is the capital of France? Answer in one sentence.".to_string()),
         tool_ctx,
         CancellationToken::new(),
     );
+    let _ = final_state.await?;
 
-    // Process events as they stream in
-    while let Some(envelope) = events.recv().await {
+    for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {
             AgentEvent::Text {
                 message_id: _,
