@@ -230,8 +230,8 @@ impl InMemoryEventStore {
         &self,
         thread_id: &ThreadId,
         turn: usize,
-        update: impl FnOnce(&mut StoredTurnEvents),
-    ) {
+        update: impl FnOnce(&mut StoredTurnEvents) -> Result<()>,
+    ) -> Result<()> {
         let mut turns = self.inner.turns.write().await;
         let stored_turn = turns
             .entry(thread_id.0.clone())
@@ -242,8 +242,9 @@ impl InMemoryEventStore {
                 events: Vec::new(),
                 finished: false,
             });
-        update(stored_turn);
+        let result = update(stored_turn);
         drop(turns);
+        result
     }
 }
 
@@ -323,18 +324,23 @@ impl EventStore for InMemoryEventStore {
         envelope: AgentEventEnvelope,
     ) -> Result<()> {
         self.update_turn(thread_id, turn, |stored_turn| {
+            anyhow::ensure!(
+                !stored_turn.finished,
+                "cannot append to finished turn {turn}"
+            );
             stored_turn.events.push(envelope);
+            Ok(())
         })
-        .await;
-        Ok(())
+        .await
     }
 
     async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
         self.update_turn(thread_id, turn, |stored_turn| {
+            anyhow::ensure!(!stored_turn.finished, "turn {turn} is already finished");
             stored_turn.finished = true;
+            Ok(())
         })
-        .await;
-        Ok(())
+        .await
     }
 
     async fn get_turn(
@@ -608,6 +614,43 @@ mod tests {
         store.clear(&thread_id).await?;
         assert!(store.get_turns(&thread_id).await?.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_rejects_append_after_finish() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        store.finish_turn(&thread_id, 1).await?;
+
+        let error = store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_1", "late"), &seq),
+            )
+            .await
+            .expect_err("append after finish should fail");
+
+        assert!(error.to_string().contains("cannot append to finished turn"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_rejects_duplicate_finish() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+
+        store.finish_turn(&thread_id, 1).await?;
+
+        let error = store
+            .finish_turn(&thread_id, 1)
+            .await
+            .expect_err("duplicate finish should fail");
+
+        assert!(error.to_string().contains("already finished"));
         Ok(())
     }
 

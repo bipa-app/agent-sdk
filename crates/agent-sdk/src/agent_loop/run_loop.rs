@@ -3,10 +3,10 @@ use super::tool_execution::{append_tool_results, execute_confirmed_tool, execute
 use super::turn::execute_turn;
 use super::types::{
     ConfirmedToolExecutionContext, ConvertTurnResultParams, ExecuteTurnParameters,
-    InitializedState, InternalTurnResult, ResumeData, ResumeProcessingParameters,
-    ResumeProcessingResult, RunLoopParameters, RunLoopResumeParams, RunLoopTurnsParams,
-    SingleTurnResumeParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnContext,
-    TurnParameters,
+    InitializedState, InternalTurnResult, PersistentDoneParams, ResumeData,
+    ResumeProcessingParameters, ResumeProcessingResult, RunLoopParameters, RunLoopResumeParams,
+    RunLoopTurnResultParams, RunLoopTurnsParams, SingleTurnResumeParams, ToolCallExecutionContext,
+    ToolExecutionOutcome, TurnContext, TurnParameters,
 };
 
 use crate::types::TurnOptions;
@@ -22,6 +22,12 @@ use crate::types::{
 use log::warn;
 use std::sync::Arc;
 use std::time::Instant;
+
+enum RunLoopTurnAction {
+    Continue,
+    FinishRun,
+    Return(AgentRunState),
+}
 
 /// Initialize agent state from the given input.
 ///
@@ -394,12 +400,7 @@ where
     let seq = params.seq;
 
     match handle_run_loop_resume(params).await {
-        Ok(Some(outcome)) => {
-            if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
-                return Some(AgentRunState::Error(store_error));
-            }
-            Some(outcome)
-        }
+        Ok(Some(outcome)) => Some(outcome),
         Ok(None) => {
             if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
                 return Some(AgentRunState::Error(store_error));
@@ -477,7 +478,9 @@ where
     let thread_id = params.thread_id.clone();
     let event_store = Arc::clone(&params.event_store);
     let outcome = handle_single_turn_resume(params).await;
-    if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await {
+    if !turn_outcome_keeps_turn_open(&outcome)
+        && let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, turn).await
+    {
         return TurnOutcome::Error(store_error);
     }
     outcome
@@ -506,6 +509,213 @@ const fn cancelled_turn_outcome() -> TurnOutcome {
         total_turns: 0,
         input_tokens: 0,
         output_tokens: 0,
+    }
+}
+
+const fn turn_outcome_keeps_turn_open(outcome: &TurnOutcome) -> bool {
+    matches!(outcome, TurnOutcome::AwaitingConfirmation { .. })
+}
+
+fn done_run_state(ctx: &TurnContext) -> AgentRunState {
+    AgentRunState::Done {
+        total_turns: turns_to_u32(ctx.turn),
+        input_tokens: u64::from(ctx.total_usage.input_tokens),
+        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    }
+}
+
+fn cancelled_run_state(ctx: &TurnContext) -> AgentRunState {
+    AgentRunState::Cancelled {
+        total_turns: turns_to_u32(ctx.turn),
+        input_tokens: u64::from(ctx.total_usage.input_tokens),
+        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    }
+}
+
+fn refusal_run_state(ctx: &TurnContext) -> AgentRunState {
+    AgentRunState::Refusal {
+        total_turns: turns_to_u32(ctx.turn),
+        input_tokens: u64::from(ctx.total_usage.input_tokens),
+        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    }
+}
+
+async fn emit_persistent_turn_complete<H>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    seq: &SequenceCounter,
+    current_turn: usize,
+) -> Result<(), AgentRunState>
+where
+    H: AgentHooks,
+{
+    if let Err(error) = send_event(
+        event_store,
+        &ctx.thread_id,
+        current_turn,
+        hooks,
+        seq,
+        AgentEvent::TurnComplete {
+            turn: ctx.turn,
+            usage: ctx.total_usage.clone(),
+        },
+    )
+    .await
+    {
+        return Err(AgentRunState::Error(error));
+    }
+    if let Err(error) = finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await {
+        return Err(AgentRunState::Error(error));
+    }
+    Ok(())
+}
+
+async fn handle_persistent_done<M, H>(
+    PersistentDoneParams {
+        ctx,
+        rx,
+        message_store,
+        event_store,
+        hooks,
+        seq,
+        current_turn,
+        cancel_token,
+    }: PersistentDoneParams<'_, H, M>,
+) -> Option<AgentRunState>
+where
+    M: MessageStore,
+    H: AgentHooks,
+{
+    if let Err(state) =
+        emit_persistent_turn_complete(ctx, event_store, hooks, seq, current_turn).await
+    {
+        return Some(state);
+    }
+
+    tokio::select! {
+        msg = rx.recv() => {
+            match msg {
+                Some(AgentInput::Text(text)) => {
+                    let user_msg = Message::user(&text);
+                    if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
+                        warn!("Failed to append injected message: {error}");
+                        return Some(done_run_state(ctx));
+                    }
+                    None
+                }
+                Some(AgentInput::Message(blocks)) => {
+                    let user_msg = Message::user_with_content(blocks);
+                    if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
+                        warn!("Failed to append injected message: {error}");
+                        return Some(done_run_state(ctx));
+                    }
+                    None
+                }
+                _ => Some(done_run_state(ctx)),
+            }
+        }
+        () = cancel_token.cancelled() => Some(cancelled_run_state(ctx)),
+    }
+}
+
+async fn finish_turn_or_run_state(
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
+) -> Result<(), RunLoopTurnAction> {
+    finish_turn_or_error(event_store, thread_id, turn)
+        .await
+        .map_err(|error| RunLoopTurnAction::Return(AgentRunState::Error(error)))
+}
+
+async fn handle_run_loop_turn_result<H, M, S>(
+    RunLoopTurnResultParams {
+        result,
+        ctx,
+        input_rx,
+        message_store,
+        state_store,
+        event_store,
+        hooks,
+        seq,
+        cancel_token,
+        current_turn,
+    }: RunLoopTurnResultParams<'_, H, M, S>,
+) -> RunLoopTurnAction
+where
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    match result {
+        InternalTurnResult::Continue { .. } => {
+            if let Err(error) = state_store.save(&ctx.state).await {
+                warn!("Failed to save state checkpoint: {error}");
+            }
+            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
+                .await
+                .map_or_else(std::convert::identity, |()| RunLoopTurnAction::Continue)
+        }
+        InternalTurnResult::Done => {
+            if let Some(rx) = input_rx {
+                handle_persistent_done(super::types::PersistentDoneParams {
+                    ctx,
+                    rx,
+                    message_store,
+                    event_store,
+                    hooks,
+                    seq,
+                    current_turn,
+                    cancel_token,
+                })
+                .await
+                .map_or(RunLoopTurnAction::Continue, RunLoopTurnAction::Return)
+            } else {
+                RunLoopTurnAction::FinishRun
+            }
+        }
+        InternalTurnResult::Refusal => {
+            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
+                .await
+                .map_or_else(std::convert::identity, |()| {
+                    RunLoopTurnAction::Return(refusal_run_state(ctx))
+                })
+        }
+        InternalTurnResult::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        } => RunLoopTurnAction::Return(AgentRunState::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        }),
+        InternalTurnResult::PendingToolCalls { .. } => finish_turn_or_run_state(
+            event_store,
+            &ctx.thread_id,
+            current_turn,
+        )
+        .await
+        .map_or_else(std::convert::identity, |()| {
+            RunLoopTurnAction::Return(AgentRunState::Error(crate::types::AgentError::new(
+                "PendingToolCalls returned in looping mode (expected inline tool execution)",
+                false,
+            )))
+        }),
+        InternalTurnResult::Error(error) => {
+            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
+                .await
+                .map_or_else(std::convert::identity, |()| {
+                    RunLoopTurnAction::Return(AgentRunState::Error(error))
+                })
+        }
     }
 }
 
@@ -542,6 +752,9 @@ where
     {
         return AgentRunState::Error(error);
     }
+    if let Err(error) = finish_turn_or_error(event_store, &ctx.thread_id, ctx.turn).await {
+        return AgentRunState::Error(error);
+    }
 
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
@@ -550,7 +763,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
     RunLoopTurnsParams {
         ctx,
@@ -581,14 +793,9 @@ where
     S: StateStore,
 {
     loop {
-        // Check for cancellation before starting a new turn
         if cancel_token.is_cancelled() {
             log::info!("Agent run cancelled before turn {}", ctx.turn);
-            return Some(AgentRunState::Cancelled {
-                total_turns: turns_to_u32(ctx.turn),
-                input_tokens: u64::from(ctx.total_usage.input_tokens),
-                output_tokens: u64::from(ctx.total_usage.output_tokens),
-            });
+            return Some(cancelled_run_state(ctx));
         }
 
         let current_turn = ctx.turn.saturating_add(1);
@@ -618,138 +825,23 @@ where
         })
         .await;
 
-        match result {
-            InternalTurnResult::Continue { .. } => {
-                if let Err(error) = state_store.save(&ctx.state).await {
-                    warn!("Failed to save state checkpoint: {error}");
-                }
-                if let Err(error) =
-                    finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                {
-                    return Some(AgentRunState::Error(error));
-                }
-            }
-            InternalTurnResult::Done => {
-                // Persistent mode: wait for new input instead of exiting
-                if let Some(ref mut rx) = input_rx {
-                    // Emit a TurnComplete event so the caller knows we're idle
-                    if let Err(error) = send_event(
-                        event_store,
-                        &ctx.thread_id,
-                        current_turn,
-                        hooks,
-                        seq,
-                        AgentEvent::TurnComplete {
-                            turn: ctx.turn,
-                            usage: ctx.total_usage.clone(),
-                        },
-                    )
-                    .await
-                    {
-                        return Some(AgentRunState::Error(error));
-                    }
-                    if let Err(error) =
-                        finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                    {
-                        return Some(AgentRunState::Error(error));
-                    }
-
-                    // Wait for new input or cancellation
-                    tokio::select! {
-                        msg = rx.recv() => {
-                            match msg {
-                                Some(AgentInput::Text(text)) => {
-                                    let user_msg = Message::user(&text);
-                                    if let Err(e) = message_store.append(&ctx.thread_id, user_msg).await {
-                                        warn!("Failed to append injected message: {e}");
-                                        return None;
-                                    }
-                                    ctx.turn += 1;
-                                    // Continue the loop for the next turn
-                                }
-                                Some(AgentInput::Message(blocks)) => {
-                                    let user_msg = Message::user_with_content(blocks);
-                                    if let Err(e) = message_store.append(&ctx.thread_id, user_msg).await {
-                                        warn!("Failed to append injected message: {e}");
-                                        return None;
-                                    }
-                                    ctx.turn += 1;
-                                }
-                                _ => return None, // Channel closed or unsupported input
-                            }
-                        }
-                        () = cancel_token.cancelled() => {
-                            return Some(AgentRunState::Cancelled {
-                                total_turns: turns_to_u32(ctx.turn),
-                                input_tokens: u64::from(ctx.total_usage.input_tokens),
-                                output_tokens: u64::from(ctx.total_usage.output_tokens),
-                            });
-                        }
-                    }
-                } else {
-                    if let Err(error) =
-                        finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                    {
-                        return Some(AgentRunState::Error(error));
-                    }
-                    return None; // Non-persistent mode: exit as before
-                }
-            }
-            InternalTurnResult::Refusal => {
-                if let Err(error) =
-                    finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                {
-                    return Some(AgentRunState::Error(error));
-                }
-                return Some(AgentRunState::Refusal {
-                    total_turns: turns_to_u32(ctx.turn),
-                    input_tokens: u64::from(ctx.total_usage.input_tokens),
-                    output_tokens: u64::from(ctx.total_usage.output_tokens),
-                });
-            }
-            InternalTurnResult::AwaitingConfirmation {
-                tool_call_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                continuation,
-            } => {
-                if let Err(error) =
-                    finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                {
-                    return Some(AgentRunState::Error(error));
-                }
-                return Some(AgentRunState::AwaitingConfirmation {
-                    tool_call_id,
-                    tool_name,
-                    display_name,
-                    input,
-                    description,
-                    continuation,
-                });
-            }
-            InternalTurnResult::PendingToolCalls { .. } => {
-                // In the looping run_loop path, we always use inline tools,
-                // so this variant should never appear. Treat as an error.
-                if let Err(error) =
-                    finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                {
-                    return Some(AgentRunState::Error(error));
-                }
-                return Some(AgentRunState::Error(crate::types::AgentError::new(
-                    "PendingToolCalls returned in looping mode (expected inline tool execution)",
-                    false,
-                )));
-            }
-            InternalTurnResult::Error(error) => {
-                if let Err(store_error) =
-                    finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
-                {
-                    return Some(AgentRunState::Error(store_error));
-                }
-                return Some(AgentRunState::Error(error));
-            }
+        match handle_run_loop_turn_result(super::types::RunLoopTurnResultParams {
+            result,
+            ctx,
+            input_rx: input_rx.as_deref_mut(),
+            message_store,
+            state_store,
+            event_store,
+            hooks,
+            seq,
+            cancel_token,
+            current_turn,
+        })
+        .await
+        {
+            RunLoopTurnAction::Continue => {}
+            RunLoopTurnAction::FinishRun => return None,
+            RunLoopTurnAction::Return(state) => return Some(state),
         }
     }
 }
@@ -1286,7 +1378,9 @@ where
     })
     .await;
 
-    if let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, current_turn).await {
+    if !turn_outcome_keeps_turn_open(&outcome)
+        && let Err(store_error) = finish_turn_or_error(&event_store, &thread_id, current_turn).await
+    {
         return TurnOutcome::Error(store_error);
     }
 

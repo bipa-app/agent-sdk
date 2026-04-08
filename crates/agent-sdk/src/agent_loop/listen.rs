@@ -1,7 +1,7 @@
 use super::helpers::send_event;
 use super::types::{
-    LISTEN_TOTAL_TIMEOUT, LISTEN_UPDATE_TIMEOUT, ListenReady, ListenUpdateContext,
-    ListenUpdateHandling, ListenWaitParams, MAX_LISTEN_UPDATES,
+    LISTEN_TOTAL_TIMEOUT, LISTEN_UPDATE_TIMEOUT, ListenProgressStage, ListenReady,
+    ListenUpdateContext, ListenUpdateHandling, ListenWaitParams, MAX_LISTEN_UPDATES,
 };
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
@@ -136,7 +136,7 @@ where
 
 async fn send_listen_progress_event<H>(
     ctx: &ListenUpdateContext<'_, H>,
-    stage: &str,
+    stage: ListenProgressStage,
     message: String,
     data: Option<serde_json::Value>,
 ) -> Result<(), ListenWaitError>
@@ -153,7 +153,7 @@ where
             &ctx.pending.id,
             &ctx.pending.name,
             &ctx.pending.display_name,
-            stage,
+            stage.as_str(),
             message,
             data,
         ),
@@ -177,7 +177,7 @@ where
     *last_operation_id = Some(operation_id.clone());
     send_listen_progress_event(
         ctx,
-        "listen_update",
+        ListenProgressStage::Update,
         message,
         Some(build_listen_progress_data(
             &operation_id,
@@ -203,7 +203,7 @@ where
 {
     send_listen_progress_event(
         ctx,
-        "listen_ready",
+        ListenProgressStage::Ready,
         message,
         Some(build_listen_progress_data(
             &operation_id,
@@ -232,7 +232,7 @@ where
 {
     send_listen_progress_event(
         ctx,
-        "listen_invalidated",
+        ListenProgressStage::Invalidated,
         message.clone(),
         Some(serde_json::json!({
             "operation_id": operation_id,

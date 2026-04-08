@@ -107,6 +107,23 @@ pub(super) struct ListenReady {
     pub(super) expires_at: Option<OffsetDateTime>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ListenProgressStage {
+    Update,
+    Ready,
+    Invalidated,
+}
+
+impl ListenProgressStage {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "listen_update",
+            Self::Ready => "listen_ready",
+            Self::Invalidated => "listen_invalidated",
+        }
+    }
+}
+
 pub(super) enum ListenUpdateHandling {
     Continue,
     Ready(ListenReady),
@@ -242,6 +259,30 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) turn_options: &'a TurnOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
+}
+
+pub(super) struct PersistentDoneParams<'a, H, M> {
+    pub(super) ctx: &'a TurnContext,
+    pub(super) rx: &'a mut mpsc::Receiver<AgentInput>,
+    pub(super) message_store: &'a Arc<M>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) current_turn: usize,
+    pub(super) cancel_token: &'a CancellationToken,
+}
+
+pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
+    pub(super) result: InternalTurnResult,
+    pub(super) ctx: &'a TurnContext,
+    pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
+    pub(super) message_store: &'a Arc<M>,
+    pub(super) state_store: &'a Arc<S>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) cancel_token: &'a CancellationToken,
+    pub(super) current_turn: usize,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {

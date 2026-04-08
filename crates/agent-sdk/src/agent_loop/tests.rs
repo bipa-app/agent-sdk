@@ -1,13 +1,13 @@
 use super::test_utils::*;
 use super::*;
 use crate::events::{AgentEvent, AgentEventEnvelope};
-use crate::hooks::AllowAllHooks;
+use crate::hooks::{AgentHooks, AllowAllHooks, ToolDecision};
 use crate::llm::{ChatOutcome, Content, ContentBlock};
 use crate::stores::{
     EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StoredTurnEvents,
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, AgentRunState, TurnOptions, TurnOutcome};
+use crate::types::{AgentConfig, AgentInput, AgentRunState, ToolTier, TurnOptions, TurnOutcome};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
@@ -143,6 +143,21 @@ impl EventStore for FailingEventStore {
 
     async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
         self.inner.clear(thread_id).await
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConfirmAllHooks;
+
+#[async_trait]
+impl AgentHooks for ConfirmAllHooks {
+    async fn pre_tool_use(
+        &self,
+        tool_name: &str,
+        _input: &serde_json::Value,
+        _tier: ToolTier,
+    ) -> ToolDecision {
+        ToolDecision::RequiresConfirmation(format!("Confirm {tool_name}?"))
     }
 }
 
@@ -890,6 +905,100 @@ async fn test_listen_tool_confirmation_flow() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_run_turn_handles_multiple_confirmation_resumes_on_same_turn() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("tool_1", "echo", json!({"message": "first"})),
+            ("tool_2", "echo", json!({"message": "second"})),
+        ]),
+        MockProvider::text_response("All confirmations complete"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(ConfirmAllHooks)
+        .tools(tools)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (outcome_1, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run two tools".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let (continuation_1, tool_call_id_1) = match outcome_1 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected first confirmation, got {other:?}"),
+    };
+    assert_eq!(continuation_1.turn, 1);
+
+    let (outcome_2, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Resume {
+            continuation: continuation_1,
+            tool_call_id: tool_call_id_1,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let (continuation_2, tool_call_id_2) = match outcome_2 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected second confirmation, got {other:?}"),
+    };
+    assert_eq!(continuation_2.turn, 1);
+
+    let (outcome_3, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Resume {
+            continuation: continuation_2,
+            tool_call_id: tool_call_id_2,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    assert!(matches!(outcome_3, TurnOutcome::NeedsMoreTurns { .. }));
+
+    let (outcome_4, _) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Continue,
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    assert!(matches!(outcome_4, TurnOutcome::Done { .. }));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_listen_tool_rejection_cancels_operation() -> anyhow::Result<()> {
     let provider = MockProvider::new(vec![
         MockProvider::tool_use_response("tool_1", "listen_echo", json!({"message": "test"})),
@@ -1400,6 +1509,139 @@ async fn test_run_turn_is_direct_async_no_spawn() -> anyhow::Result<()> {
         stored_turn.finished,
         "Expected finish_turn barrier to complete"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_confirmation_resume_keeps_turn_open_until_resume_completes() -> anyhow::Result<()>
+{
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("tool_1", "echo", json!({"message": "first"})),
+            ("tool_2", "echo", json!({"message": "second"})),
+        ]),
+        MockProvider::text_response("Run complete"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(ConfirmAllHooks)
+        .tools(tools)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let state_1 = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("Need confirmation twice".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    let (continuation_1, tool_call_id_1) = match state_1 {
+        AgentRunState::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected first run confirmation, got {other:?}"),
+    };
+    let first_turn = agent
+        .event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("missing open turn after first confirmation")?;
+    assert!(!first_turn.finished);
+
+    let state_2 = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Resume {
+                continuation: continuation_1,
+                tool_call_id: tool_call_id_1,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    let (continuation_2, tool_call_id_2) = match state_2 {
+        AgentRunState::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected second run confirmation, got {other:?}"),
+    };
+    let second_turn = agent
+        .event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("missing open turn after second confirmation")?;
+    assert!(!second_turn.finished);
+
+    let state_3 = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Resume {
+                continuation: continuation_2,
+                tool_call_id: tool_call_id_2,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert!(matches!(state_3, AgentRunState::Done { .. }));
+    let completed_turn = agent
+        .event_store
+        .get_turn(&thread_id, 1)
+        .await?
+        .context("missing completed turn after run finishes")?;
+    assert!(completed_turn.finished);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_marks_done_turn_finished() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let state = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert!(matches!(state, AgentRunState::Done { .. }));
+    assert!(
+        agent
+            .event_store
+            .get_turn(&thread_id, 1)
+            .await?
+            .context("missing persisted run turn")?
+            .finished
+    );
+
     Ok(())
 }
 
