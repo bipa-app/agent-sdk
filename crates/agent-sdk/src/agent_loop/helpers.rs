@@ -2,29 +2,19 @@ use super::types::ExtractedContent;
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::{ChatResponse, Content, ContentBlock, Message, Role};
-use crate::types::{AgentError, PendingToolCallInfo, RetryConfig};
+use crate::stores::EventStore;
+use crate::types::{AgentError, PendingToolCallInfo, RetryConfig, ThreadId};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// Saturating conversion from usize to u32.
-#[allow(clippy::cast_possible_truncation)]
-pub(super) const fn turns_to_u32(turns: usize) -> u32 {
-    if turns > u32::MAX as usize {
-        u32::MAX
-    } else {
-        turns as u32
-    }
+pub(super) fn turns_to_u32(turns: usize) -> u32 {
+    u32::try_from(turns).unwrap_or(u32::MAX)
 }
 
 /// Convert u128 milliseconds to u64, capping at `u64::MAX`
-#[allow(clippy::cast_possible_truncation)]
-pub(super) const fn millis_to_u64(millis: u128) -> u64 {
-    if millis > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        millis as u64
-    }
+pub(super) fn millis_to_u64(millis: u128) -> u64 {
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// Calculate exponential backoff delay with jitter.
@@ -111,65 +101,42 @@ pub(super) fn extract_content(response: &ChatResponse) -> ExtractedContent {
     (thinking, text, tool_uses)
 }
 
-/// Send an event to the consumer channel with non-blocking behavior.
-///
-/// This function first calls the hook's `on_event` method, then attempts to send
-/// the event to the consumer channel. The sending behavior is designed to be
-/// resilient to slow or disconnected consumers:
-///
-/// 1. First attempts a non-blocking send via `try_send`
-/// 2. If the channel is full, waits up to 30 seconds for space
-/// 3. If the channel is closed, logs and continues without blocking
-/// 4. On timeout, logs an error and continues
-///
-/// This ensures that the agent loop doesn't block indefinitely if the consumer
-/// is slow or has disconnected.
+/// Send an event to the authoritative turn observer.
 pub(super) async fn send_event<H>(
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
     hooks: &Arc<H>,
     seq: &SequenceCounter,
     event: AgentEvent,
-) where
+) -> Result<(), AgentError>
+where
     H: AgentHooks,
 {
     hooks.on_event(&event).await;
 
     let envelope = AgentEventEnvelope::wrap(event, seq);
-
-    // Try non-blocking send first to detect backpressure
-    match tx.try_send(envelope) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(envelope)) => {
-            // Channel is full - consumer is slow or blocked
-            log::debug!("Event channel full, waiting for consumer...");
-            // Fall back to blocking send with timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(30), tx.send(envelope)).await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    log::warn!("Event channel closed while sending - consumer disconnected");
-                }
-                Err(_) => {
-                    log::error!("Timeout waiting to send event - consumer may be deadlocked");
-                }
-            }
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            log::debug!("Event channel closed - consumer disconnected");
-        }
-    }
+    event_store
+        .append(thread_id, turn, envelope)
+        .await
+        .map_err(|error| AgentError::new(format!("Failed to append event: {error}"), false))
 }
 
-/// Send an event directly to the channel without going through hooks.
+/// Send an event directly to the store without going through hooks.
 ///
 /// Used by async tool execution for progress events that bypass the hook system.
 pub(super) async fn wrap_and_send(
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
     event: AgentEvent,
     seq: &SequenceCounter,
-) {
+) -> Result<(), AgentError> {
     let envelope = AgentEventEnvelope::wrap(event, seq);
-    let _ = tx.send(envelope).await;
+    event_store
+        .append(thread_id, turn, envelope)
+        .await
+        .map_err(|error| AgentError::new(format!("Failed to append event: {error}"), false))
 }
 
 pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {

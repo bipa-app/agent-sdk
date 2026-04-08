@@ -14,11 +14,13 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentInput, CancellationToken, DynamicToolName, ThreadId, Tool, ToolContext,
-    ToolRegistry, ToolResult, ToolTier, builder, providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, DynamicToolName, EventStore, InMemoryEventStore,
+    ThreadId, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier, builder,
+    providers::AnthropicProvider,
 };
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// A simple calculator tool that can add two numbers.
 struct CalculatorTool;
@@ -138,23 +140,26 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     // Build the agent with our tools
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
         .tools(tools)
+        .event_store(event_store.clone())
         .build();
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent something that requires using our tools
-    let (mut events, _final_state) = agent.run(
-        thread_id,
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("What is 42 + 17? Also, what time is it right now?".to_string()),
         tool_ctx,
         CancellationToken::new(),
     );
+    let _ = final_state.await?;
 
-    while let Some(envelope) = events.recv().await {
+    for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {
             AgentEvent::ToolCallStart { name, input, .. } => {
                 println!("[Tool] Calling {name} with {input}");

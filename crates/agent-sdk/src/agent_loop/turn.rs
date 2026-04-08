@@ -2,33 +2,32 @@ use super::helpers::{build_assistant_message, extract_content, pending_tool_inde
 use super::llm::{call_llm_streaming, call_llm_with_retry};
 use super::tool_execution::{append_tool_results, execute_tool_call};
 use super::types::{
-    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, ProcessedTurnResponse,
-    ToolBatchExecutionParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnCompletionParams,
-    TurnContext, TurnMessageLoadParams, TurnResponseProcessingParams, TurnStopReasonParams,
-    TurnToolPhaseParams,
+    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmStreamIds,
+    ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
+    ToolExecutionOutcome, TurnCompletionParams, TurnContext, TurnMessageLoadParams,
+    TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
 
 use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
-use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use crate::events::{AgentEvent, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
 };
-use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
+use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
-    ToolResult,
+    ToolResult, ToolRuntime, TurnOptions,
 };
 
 use log::{debug, info, warn};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 pub(super) async fn begin_turn<H>(
     ctx: &mut TurnContext,
     max_turns: Option<usize>,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
     hooks: &Arc<H>,
     seq: &SequenceCounter,
 ) -> Result<(), AgentError>
@@ -60,17 +59,27 @@ where
     {
         warn!("Max turns reached (turn={}, max={max_turns})", ctx.turn);
         let message = format!("Maximum turns ({max_turns}) reached");
-        send_event(tx, hooks, seq, AgentEvent::error(message.clone(), true)).await;
+        send_event(
+            event_store,
+            &ctx.thread_id,
+            ctx.turn,
+            hooks,
+            seq,
+            AgentEvent::error(message.clone(), true),
+        )
+        .await?;
         return Err(AgentError::new(message, true));
     }
 
     send_event(
-        tx,
+        event_store,
+        &ctx.thread_id,
+        ctx.turn,
         hooks,
         seq,
         AgentEvent::start(ctx.thread_id.clone(), ctx.turn),
     )
-    .await;
+    .await?;
     Ok(())
 }
 
@@ -82,7 +91,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         message_store,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     }: TurnMessageLoadParams<'_, P, H, M>,
@@ -96,12 +105,14 @@ where
         Ok(m) => m,
         Err(error) => {
             send_event(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 hooks,
                 seq,
                 AgentEvent::error(format!("Failed to get history: {error}"), false),
             )
-            .await;
+            .await?;
             return Err(AgentError::new(
                 format!("Failed to get history: {error}"),
                 false,
@@ -117,7 +128,7 @@ where
         thread_id,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     })
@@ -132,7 +143,7 @@ struct MaybeCompactParams<'a, P, H, M> {
     thread_id: &'a ThreadId,
     compaction_config: Option<&'a CompactionConfig>,
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
-    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     seq: &'a SequenceCounter,
 }
@@ -146,7 +157,7 @@ async fn maybe_compact_messages<P, H, M>(
         thread_id,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     }: MaybeCompactParams<'_, P, H, M>,
@@ -163,15 +174,16 @@ where
                 turn,
                 messages.len()
             );
-            return compact_messages_for_threshold(
-                compactor.as_ref(),
+            return compact_messages_for_threshold(ThresholdCompactionParams {
+                compactor: compactor.as_ref(),
                 messages,
                 message_store,
                 thread_id,
-                tx,
+                event_store,
+                turn,
                 hooks,
                 seq,
-            )
+            })
             .await;
         }
 
@@ -187,15 +199,16 @@ where
                 turn,
                 messages.len()
             );
-            return compact_messages_for_threshold(
-                &default_compactor,
+            return compact_messages_for_threshold(ThresholdCompactionParams {
+                compactor: &default_compactor,
                 messages,
                 message_store,
                 thread_id,
-                tx,
+                event_store,
+                turn,
                 hooks,
                 seq,
-            )
+            })
             .await;
         }
     }
@@ -211,14 +224,28 @@ struct StoredCompactionResult {
     new_tokens: usize,
 }
 
-async fn compact_messages_for_threshold<C, H, M>(
-    compactor: &C,
+struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
+    compactor: &'a C,
     messages: Vec<Message>,
-    message_store: &Arc<M>,
-    thread_id: &ThreadId,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
-    hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    message_store: &'a Arc<M>,
+    thread_id: &'a ThreadId,
+    event_store: &'a Arc<dyn EventStore>,
+    turn: usize,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+}
+
+async fn compact_messages_for_threshold<C, H, M>(
+    ThresholdCompactionParams {
+        compactor,
+        messages,
+        message_store,
+        thread_id,
+        event_store,
+        turn,
+        hooks,
+        seq,
+    }: ThresholdCompactionParams<'_, C, H, M>,
 ) -> Result<Vec<Message>, AgentError>
 where
     C: ContextCompactor + ?Sized,
@@ -239,7 +266,9 @@ where
     {
         Ok(result) => {
             send_event(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 hooks,
                 seq,
                 AgentEvent::context_compacted(
@@ -249,7 +278,7 @@ where
                     result.new_tokens,
                 ),
             )
-            .await;
+            .await?;
 
             info!(
                 "Context compacted successfully (original_count={}, new_count={}, original_tokens={}, new_tokens={})",
@@ -503,7 +532,7 @@ pub(super) async fn request_llm_response<P, H>(
         provider,
         request,
         config,
-        tx,
+        event_store,
         hooks,
         seq,
         thread_id,
@@ -519,6 +548,13 @@ where
     H: AgentHooks,
 {
     debug!("Calling LLM (turn={turn}, streaming={})", config.streaming);
+    let event_ctx = LlmEventContext {
+        event_store,
+        hooks,
+        seq,
+        thread_id,
+        turn,
+    };
 
     #[cfg(feature = "otel")]
     let mut llm_span = {
@@ -551,14 +587,15 @@ where
             provider,
             request,
             config,
-            tx,
-            hooks,
-            seq,
-            (message_id, thinking_id),
+            &event_ctx,
+            LlmStreamIds {
+                message_id,
+                thinking_id,
+            },
         )
         .await
     } else {
-        call_llm_with_retry(provider, request, config, tx, hooks, seq).await
+        call_llm_with_retry(provider, request, config, &event_ctx).await
     };
 
     #[cfg(feature = "otel")]
@@ -730,9 +767,10 @@ pub(super) async fn process_turn_response<Ctx, H, M>(
         message_id,
         thinking_id,
         thread_id,
+        turn,
         tools,
         message_store,
-        tx,
+        event_store,
         hooks,
         seq,
     }: TurnResponseProcessingParams<'_, Ctx, H, M>,
@@ -747,22 +785,34 @@ where
 
     if let Some(thinking) = &thinking_content {
         send_event(
-            tx,
+            event_store,
+            thread_id,
+            turn,
             hooks,
             seq,
             AgentEvent::thinking(thinking_id, thinking.clone()),
         )
-        .await;
+        .await?;
     }
 
     if let Some(text) = &text_content {
-        send_event(tx, hooks, seq, AgentEvent::text(message_id, text.clone())).await;
+        send_event(
+            event_store,
+            thread_id,
+            turn,
+            hooks,
+            seq,
+            AgentEvent::text(message_id, text.clone()),
+        )
+        .await?;
     }
 
     let assistant_msg = build_assistant_message(&response);
     if let Err(error) = message_store.append(thread_id, assistant_msg).await {
         send_event(
-            tx,
+            event_store,
+            thread_id,
+            turn,
             hooks,
             seq,
             AgentEvent::error(
@@ -770,7 +820,7 @@ where
                 false,
             ),
         )
-        .await;
+        .await?;
         return Err(AgentError::new(
             format!("Failed to append assistant message: {error}"),
             false,
@@ -827,7 +877,7 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         thread_id,
         tools,
         hooks,
-        tx,
+        event_store,
         seq,
         execution_store,
         turn,
@@ -847,7 +897,8 @@ where
         thread_id,
         tools,
         hooks,
-        tx,
+        event_store,
+        turn,
         seq,
         execution_store,
     };
@@ -893,6 +944,7 @@ where
                     continuation: Box::new(continuation),
                 });
             }
+            ToolExecutionOutcome::Error(error) => return Err(InternalTurnResult::Error(error)),
         }
     }
 
@@ -906,7 +958,7 @@ pub(super) async fn append_tool_results_and_emit_turn_complete<H, M>(
         turn,
         turn_usage,
         message_store,
-        tx,
+        event_store,
         hooks,
         seq,
     }: TurnCompletionParams<'_, H, M>,
@@ -917,7 +969,9 @@ where
 {
     append_tool_results(tool_results, thread_id, message_store).await?;
     send_event(
-        tx,
+        event_store,
+        thread_id,
+        turn,
         hooks,
         seq,
         AgentEvent::TurnComplete {
@@ -925,7 +979,7 @@ where
             usage: turn_usage.clone(),
         },
     )
-    .await;
+    .await?;
     Ok(())
 }
 
@@ -936,7 +990,7 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         thread_id,
         tools,
         hooks,
-        tx,
+        event_store,
         seq,
         execution_store,
         turn,
@@ -957,7 +1011,7 @@ where
         thread_id,
         tools,
         hooks,
-        tx,
+        event_store,
         seq,
         execution_store,
         turn,
@@ -973,7 +1027,7 @@ where
         turn,
         turn_usage,
         message_store,
-        tx,
+        event_store,
         hooks,
         seq,
     })
@@ -1052,7 +1106,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         message_store,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     }: TurnStopReasonParams<'_, P, H, M>,
@@ -1076,13 +1130,18 @@ where
                 "Model refused request (turn={}): {:?}",
                 ctx.turn, text_content
             );
-            send_event(
-                tx,
+            if let Err(error) = send_event(
+                event_store,
+                &ctx.thread_id,
+                ctx.turn,
                 hooks,
                 seq,
                 AgentEvent::refusal(message_id, text_content),
             )
-            .await;
+            .await
+            {
+                return InternalTurnResult::Error(error);
+            }
             InternalTurnResult::Refusal
         }
         Some(StopReason::MaxTokens) => {
@@ -1288,6 +1347,13 @@ where
                 ));
                 turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, true));
             }
+            InternalTurnResult::PendingToolCalls { .. } => {
+                turn_span.set_attribute(KeyValue::new(
+                    attrs::SDK_TURN_STOP_REASON,
+                    "pending_tool_calls",
+                ));
+                turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, true));
+            }
             InternalTurnResult::Error(err) => {
                 turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "error"));
                 spans::set_span_error(&mut turn_span, "turn_error", &err.message);
@@ -1301,7 +1367,7 @@ where
 
 async fn execute_turn_inner<Ctx, P, H, M, S>(
     ExecuteTurnParameters {
-        tx,
+        event_store,
         seq,
         ctx,
         tool_context,
@@ -1314,6 +1380,7 @@ async fn execute_turn_inner<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        turn_options,
         #[cfg(feature = "otel")]
         observability_store,
     }: ExecuteTurnParameters<'_, Ctx, P, H, M, S>,
@@ -1325,7 +1392,7 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    if let Err(error) = begin_turn(ctx, config.max_turns, tx, hooks, seq).await {
+    if let Err(error) = begin_turn(ctx, config.max_turns, event_store, hooks, seq).await {
         return InternalTurnResult::Error(error);
     }
 
@@ -1336,7 +1403,7 @@ where
         message_store,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     })
@@ -1364,7 +1431,7 @@ where
         provider,
         request,
         config,
-        tx,
+        event_store,
         hooks,
         seq,
         thread_id: &ctx.thread_id,
@@ -1408,7 +1475,8 @@ where
         compaction_config,
         compactor,
         execution_store,
-        tx,
+        turn_options,
+        event_store,
         seq,
     )
     .await
@@ -1429,7 +1497,8 @@ async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     compaction_config: Option<&CompactionConfig>,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    turn_options: &TurnOptions,
+    event_store: &Arc<dyn EventStore>,
     seq: &SequenceCounter,
 ) -> InternalTurnResult
 where
@@ -1449,9 +1518,10 @@ where
         message_id,
         thinking_id,
         thread_id: &ctx.thread_id,
+        turn: ctx.turn,
         tools,
         message_store,
-        tx,
+        event_store,
         hooks,
         seq,
     })
@@ -1463,8 +1533,33 @@ where
 
     let had_tool_calls = !pending_tool_calls.is_empty();
 
-    if had_tool_calls && let Err(error) = state_store.save(&ctx.state).await {
+    // Strict durability: checkpoint after LLM response, before tool execution.
+    if turn_options.strict_durability {
+        if let Err(error) = state_store.save(&ctx.state).await {
+            warn!("Strict durability: failed to save post-LLM state: {error}");
+        }
+    } else if had_tool_calls && let Err(error) = state_store.save(&ctx.state).await {
         warn!("Failed to save pre-tool state checkpoint: {error}");
+    }
+
+    // External tool runtime: return pending tool calls to the caller instead
+    // of executing them inline.
+    if had_tool_calls && turn_options.tool_runtime == ToolRuntime::External {
+        let continuation = AgentContinuation {
+            thread_id: ctx.thread_id.clone(),
+            turn: ctx.turn,
+            total_usage: ctx.total_usage.clone(),
+            turn_usage: turn_usage.clone(),
+            pending_tool_calls: pending_tool_calls.clone(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: ctx.state.clone(),
+        };
+        return InternalTurnResult::PendingToolCalls {
+            turn_usage,
+            pending_tool_calls,
+            continuation: Box::new(continuation),
+        };
     }
 
     if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
@@ -1473,7 +1568,7 @@ where
         thread_id: &ctx.thread_id,
         tools,
         hooks,
-        tx,
+        event_store,
         seq,
         execution_store,
         turn: ctx.turn,
@@ -1487,6 +1582,13 @@ where
         return outcome;
     }
 
+    // Strict durability: checkpoint after tool execution.
+    if turn_options.strict_durability
+        && let Err(error) = state_store.save(&ctx.state).await
+    {
+        warn!("Strict durability: failed to save post-tool state: {error}");
+    }
+
     handle_turn_stop_reason(TurnStopReasonParams {
         stop_reason,
         text_content,
@@ -1498,7 +1600,7 @@ where
         message_store,
         compaction_config,
         compactor,
-        tx,
+        event_store,
         hooks,
         seq,
     })

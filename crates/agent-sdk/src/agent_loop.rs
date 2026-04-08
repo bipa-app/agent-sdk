@@ -12,7 +12,7 @@
 //! 3. Processes the LLM response (text or tool calls)
 //! 4. If tool calls are present, executes them and feeds results back to LLM
 //! 5. Repeats until the LLM responds with only text (no tool calls)
-//! 6. Emits events throughout for real-time UI updates
+//! 6. Persists events throughout to the configured event store
 //!
 //! # Building an Agent
 //!
@@ -24,6 +24,7 @@
 //! let agent = builder()
 //!     .provider(AnthropicProvider::sonnet(api_key))
 //!     .tools(my_tools)
+//!     .event_store(event_store)
 //!     .build();
 //! ```
 
@@ -43,16 +44,17 @@ mod types;
 
 use self::run_loop::{run_loop, run_single_turn};
 use self::types::{RunLoopParameters, TurnParameters};
+use crate::types::TurnOptions;
 
 pub use self::builder::AgentLoopBuilder;
 
 use crate::context::{CompactionConfig, ContextCompactor};
-use crate::events::{AgentEventEnvelope, SequenceCounter};
+use crate::events::SequenceCounter;
 use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
-use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
+use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId, TurnOutcome};
+use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -60,17 +62,31 @@ use tokio_util::sync::CancellationToken;
 /// Handle to a persistent agent thread.
 ///
 /// Returned by [`AgentLoop::run_persistent`]. Allows the caller to send
-/// new messages to the running agent, observe events, and cancel execution.
+/// new messages to the running agent and cancel execution.
 pub struct AgentHandle {
     /// Send new messages to the running agent. The agent will process
     /// them as new user turns after completing the current turn.
     pub input_tx: mpsc::Sender<AgentInput>,
-    /// Receive agent events (text, tool calls, progress).
-    pub events_rx: mpsc::Receiver<AgentEventEnvelope>,
     /// Final run state (sent once when the agent completes).
     pub state_rx: oneshot::Receiver<AgentRunState>,
     /// Cancel the running agent.
     pub cancel_token: CancellationToken,
+}
+
+/// Configuration bundle for constructing an [`AgentLoop`] with compaction.
+pub struct AgentLoopCompactionConfig {
+    pub agent_config: AgentConfig,
+    pub compaction_config: CompactionConfig,
+}
+
+impl AgentLoopCompactionConfig {
+    #[must_use]
+    pub const fn new(agent_config: AgentConfig, compaction_config: CompactionConfig) -> Self {
+        Self {
+            agent_config,
+            compaction_config,
+        }
+    }
 }
 
 /// The main agent loop that orchestrates LLM calls and tool execution.
@@ -79,7 +95,7 @@ pub struct AgentHandle {
 /// - Manages conversation state via message and state stores
 /// - Calls the LLM provider and processes responses
 /// - Executes tools through the tool registry
-/// - Emits events for real-time updates via an async channel
+/// - Persists events to the configured event store
 /// - Enforces hooks for tool permissions and lifecycle events
 ///
 /// # Type Parameters
@@ -90,36 +106,23 @@ pub struct AgentHandle {
 /// - `M`: The message store implementation
 /// - `S`: The state store implementation
 ///
-/// # Event Channel Behavior
+/// # Event Storage
 ///
-/// The agent uses a bounded channel (capacity 100) for events. Events are sent
-/// using non-blocking sends:
-///
-/// - If the channel has space, events are sent immediately
-/// - If the channel is full, the agent waits up to 30 seconds before timing out
-/// - If the receiver is dropped, the agent continues processing without blocking
-///
-/// This design ensures that slow consumers don't stall the LLM stream, but events
-/// may be dropped if the consumer is too slow or disconnects.
+/// Every loop instance requires an [`EventStore`] configured at construction
+/// time. Events are written to that store for the entire lifecycle of the loop,
+/// and callers read them back from the store instead of receiving an in-process
+/// channel from the runtime.
 ///
 /// # Running the Agent
 ///
 /// ```ignore
-/// let (mut events, final_state) = agent.run(
+/// let final_state = agent.run(
 ///     thread_id,
 ///     AgentInput::Text("Hello!".to_string()),
 ///     tool_ctx,
 /// );
-/// while let Some(envelope) = events.recv().await {
-///     match envelope.event {
-///         AgentEvent::Text {
-///             message_id: _,
-///             text,
-///         } => println!("{}", text),
-///         AgentEvent::Done { .. } => break,
-///         _ => {}
-///     }
-/// }
+/// let state = final_state.await?;
+/// let events = event_store.get_events(&thread_id).await?;
 /// ```
 pub struct AgentLoop<Ctx, P, H, M, S>
 where
@@ -133,6 +136,7 @@ where
     pub(super) hooks: Arc<H>,
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
+    pub(super) event_store: Arc<dyn EventStore>,
     pub(super) config: AgentConfig,
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
@@ -163,6 +167,7 @@ where
         hooks: H,
         message_store: M,
         state_store: S,
+        event_store: Arc<dyn EventStore>,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -171,6 +176,7 @@ where
             hooks: Arc::new(hooks),
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
+            event_store,
             config,
             compaction_config: None,
             compactor: None,
@@ -188,16 +194,21 @@ where
         hooks: H,
         message_store: M,
         state_store: S,
-        config: AgentConfig,
-        compaction_config: CompactionConfig,
+        event_store: Arc<dyn EventStore>,
+        config: AgentLoopCompactionConfig,
     ) -> Self {
+        let AgentLoopCompactionConfig {
+            agent_config,
+            compaction_config,
+        } = config;
         Self {
             provider: Arc::new(provider),
             tools: Arc::new(tools),
             hooks: Arc::new(hooks),
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
-            config,
+            event_store,
+            config: agent_config,
             compaction_config: Some(compaction_config),
             compactor: None,
             execution_store: None,
@@ -239,31 +250,25 @@ where
     ///
     /// # Returns
     ///
-    /// A tuple of:
-    /// - `mpsc::Receiver<AgentEvent>` - Channel for streaming events
-    /// - `oneshot::Receiver<AgentRunState>` - Channel for the final state
+    /// A [`oneshot::Receiver`] that resolves to the final run state.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let cancel = CancellationToken::new();
-    /// let (events, final_state) = agent.run(
+    /// let final_state = agent.run(
     ///     thread_id,
     ///     AgentInput::Text("Hello".to_string()),
     ///     tool_ctx,
     ///     cancel.clone(),
     /// );
     ///
-    /// while let Some(envelope) = events.recv().await {
-    ///     // Handle events...
-    /// }
-    ///
     /// match final_state.await.unwrap() {
     ///     AgentRunState::Done { .. } => { /* completed */ }
     ///     AgentRunState::Cancelled { .. } => { /* user cancelled */ }
     ///     AgentRunState::AwaitingConfirmation { continuation, .. } => {
     ///         // Get user decision, then resume:
-    ///         let (events2, state2) = agent.run(
+    ///         let state2 = agent.run(
     ///             thread_id,
     ///             AgentInput::Resume {
     ///                 continuation,
@@ -284,16 +289,12 @@ where
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
-    ) -> (
-        mpsc::Receiver<AgentEventEnvelope>,
-        oneshot::Receiver<AgentRunState>,
-    )
+    ) -> oneshot::Receiver<AgentRunState>
     where
         Ctx: Clone,
     {
-        let (event_rx, state_rx, _handle) =
-            self.run_abortable(thread_id, input, tool_context, cancel_token);
-        (event_rx, state_rx)
+        let (state_rx, _handle) = self.run_abortable(thread_id, input, tool_context, cancel_token);
+        state_rx
     }
 
     /// Like [`run`](Self::run), but also returns the [`tokio::task::JoinHandle`] for the
@@ -310,14 +311,12 @@ where
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
     ) -> (
-        mpsc::Receiver<AgentEventEnvelope>,
         oneshot::Receiver<AgentRunState>,
         tokio::task::JoinHandle<()>,
     )
     where
         Ctx: Clone,
     {
-        let (event_tx, event_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = oneshot::channel();
         let seq = SequenceCounter::new();
 
@@ -326,6 +325,7 @@ where
         let hooks = Arc::clone(&self.hooks);
         let message_store = Arc::clone(&self.message_store);
         let state_store = Arc::clone(&self.state_store);
+        let event_store = Arc::clone(&self.event_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
@@ -337,7 +337,7 @@ where
 
         let task = async move {
             let result = run_loop(RunLoopParameters {
-                tx: event_tx,
+                event_store,
                 seq,
                 thread_id,
                 input,
@@ -369,7 +369,7 @@ where
 
         let handle = tokio::spawn(task);
 
-        (event_rx, state_rx, handle)
+        (state_rx, handle)
     }
 
     /// Run the agent with a persistent input channel.
@@ -393,7 +393,6 @@ where
     where
         Ctx: Clone,
     {
-        let (event_tx, event_rx) = mpsc::channel(100);
         let (state_tx, state_rx) = oneshot::channel();
         let (input_tx, input_rx) = mpsc::channel(32);
         let seq = SequenceCounter::new();
@@ -403,6 +402,7 @@ where
         let hooks = Arc::clone(&self.hooks);
         let message_store = Arc::clone(&self.message_store);
         let state_store = Arc::clone(&self.state_store);
+        let event_store = Arc::clone(&self.event_store);
         let config = self.config.clone();
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
@@ -415,7 +415,7 @@ where
 
         let task = async move {
             let result = run_loop(RunLoopParameters {
-                tx: event_tx,
+                event_store,
                 seq,
                 thread_id,
                 input,
@@ -449,17 +449,17 @@ where
 
         AgentHandle {
             input_tx,
-            events_rx: event_rx,
             state_rx,
             cancel_token: cancel_handle,
         }
     }
 
-    /// Run a single turn of the agent loop.
+    /// Run a single turn of the agent loop — the authoritative server boundary.
     ///
-    /// Unlike `run()`, this method executes exactly one turn and returns control
-    /// to the caller. This enables external orchestration where each turn can be
-    /// dispatched as a separate message (e.g., via Artemis or another message queue).
+    /// Unlike `run()`, this method executes exactly one turn **directly in the
+    /// caller's task** (no `tokio::spawn`) and returns the result inline. This
+    /// enables external orchestration where each turn can be dispatched as a
+    /// separate message (e.g., via Artemis or another message queue).
     ///
     /// When the `cancel_token` is cancelled, the turn will be aborted before
     /// starting execution and return `TurnOutcome::Cancelled`.
@@ -470,117 +470,87 @@ where
     /// * `input` - Text to start, Resume after confirmation, or Continue after a turn
     /// * `tool_context` - Context passed to tools
     /// * `cancel_token` - Token to signal cancellation from outside
+    /// * `options` - Execution options (tool runtime strategy, durability)
     ///
     /// # Returns
     ///
-    /// A tuple of:
-    /// - `mpsc::Receiver<AgentEvent>` - Channel for streaming events from this turn
-    /// - `TurnOutcome` - The turn's outcome
+    /// A [`crate::types::TurnOutcome`] returned only after the configured event store's
+    /// `finish_turn(thread_id, turn)` barrier has completed.
     ///
     /// # Turn Outcomes
     ///
     /// - `NeedsMoreTurns` - Turn completed, call again with `AgentInput::Continue`
     /// - `Done` - Agent completed successfully
     /// - `AwaitingConfirmation` - Tool needs confirmation, call again with `AgentInput::Resume`
+    /// - `PendingToolCalls` - Tools need external execution (only with `ToolRuntime::External`)
     /// - `Cancelled` - Turn was cancelled via the token
     /// - `Error` - An error occurred
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use std::sync::Arc;
+    /// use agent_sdk::{InMemoryEventStore, TurnOptions};
+    ///
     /// let cancel = CancellationToken::new();
-    /// // Start conversation
-    /// let (events, outcome) = agent.run_turn(
+    /// let event_store = Arc::new(InMemoryEventStore::new());
+    /// let outcome = agent.run_turn(
     ///     thread_id.clone(),
     ///     AgentInput::Text("What is 2+2?".to_string()),
     ///     tool_ctx.clone(),
     ///     cancel,
+    ///     TurnOptions::default(),
     /// ).await;
     ///
-    /// // Process events...
-    /// while let Some(_envelope) = events.recv().await { /* ... */ }
+    /// let events = event_store.get_events(&thread_id).await?;
     ///
     /// // Check outcome
     /// match outcome {
     ///     TurnOutcome::NeedsMoreTurns { turn, .. } => {
     ///         // Dispatch another message to continue
-    ///         // (e.g., schedule an Artemis message)
     ///     }
     ///     TurnOutcome::Done { .. } => {
     ///         // Conversation complete
     ///     }
-    ///     TurnOutcome::AwaitingConfirmation { continuation, .. } => {
-    ///         // Get user confirmation, then resume
+    ///     TurnOutcome::PendingToolCalls { tool_calls, .. } => {
+    ///         // Execute tools externally, then call run_turn with Continue
     ///     }
-    ///     TurnOutcome::Error(e) => {
-    ///         // Handle error
-    ///     }
+    ///     _ => {}
     /// }
     /// ```
-    pub fn run_turn(
+    pub async fn run_turn(
         &self,
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
-    ) -> (
-        mpsc::Receiver<AgentEventEnvelope>,
-        oneshot::Receiver<TurnOutcome>,
-    )
+        options: TurnOptions,
+    ) -> crate::types::TurnOutcome
     where
         Ctx: Clone,
     {
-        let (event_tx, event_rx) = mpsc::channel(100);
-        let (outcome_tx, outcome_rx) = oneshot::channel();
         let seq = SequenceCounter::new();
 
-        let provider = Arc::clone(&self.provider);
-        let tools = Arc::clone(&self.tools);
-        let hooks = Arc::clone(&self.hooks);
-        let message_store = Arc::clone(&self.message_store);
-        let state_store = Arc::clone(&self.state_store);
-        let config = self.config.clone();
-        let compaction_config = self.compaction_config.clone();
-        let compactor = self.compactor.clone();
-        let execution_store = self.execution_store.clone();
-        #[cfg(feature = "otel")]
-        let observability_store = self.observability_store.clone();
-        #[cfg(feature = "otel")]
-        let parent_cx = crate::observability::context::capture_context();
-
-        let task = async move {
-            let result = run_single_turn(TurnParameters {
-                tx: event_tx,
-                seq,
-                thread_id,
-                input,
-                tool_context,
-                provider,
-                tools,
-                hooks,
-                message_store,
-                state_store,
-                config,
-                compaction_config,
-                compactor,
-                execution_store,
-                cancel_token,
-                #[cfg(feature = "otel")]
-                observability_store,
-            })
-            .await;
-
-            let _ = outcome_tx.send(result);
-        };
-
-        #[cfg(feature = "otel")]
-        let task = {
-            use opentelemetry::trace::FutureExt;
-            task.with_context(parent_cx)
-        };
-
-        tokio::spawn(task);
-
-        (event_rx, outcome_rx)
+        run_single_turn(TurnParameters {
+            event_store: Arc::clone(&self.event_store),
+            seq,
+            thread_id,
+            input,
+            tool_context,
+            provider: Arc::clone(&self.provider),
+            tools: Arc::clone(&self.tools),
+            hooks: Arc::clone(&self.hooks),
+            message_store: Arc::clone(&self.message_store),
+            state_store: Arc::clone(&self.state_store),
+            config: self.config.clone(),
+            compaction_config: self.compaction_config.clone(),
+            compactor: self.compactor.clone(),
+            execution_store: self.execution_store.clone(),
+            cancel_token,
+            turn_options: options,
+            #[cfg(feature = "otel")]
+            observability_store: self.observability_store.clone(),
+        })
+        .await
     }
 }

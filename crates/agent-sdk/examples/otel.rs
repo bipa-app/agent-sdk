@@ -7,11 +7,15 @@
 
 use agent_sdk::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
 use agent_sdk::observability::{CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle};
-use agent_sdk::{AgentInput, CancellationToken, LlmProvider, ThreadId, ToolContext, builder};
+use agent_sdk::{
+    AgentInput, CancellationToken, EventStore, InMemoryEventStore, LlmProvider, ThreadId,
+    ToolContext, builder,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use opentelemetry::global;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use std::sync::Arc;
 
 struct DemoProvider;
 
@@ -63,21 +67,22 @@ async fn main() -> Result<()> {
         .build();
     global::set_tracer_provider(tracer_provider.clone());
 
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(DemoProvider)
         .observability_store(InlinePayloadStore)
+        .event_store(event_store.clone())
         .build();
 
-    let (mut events, final_state) = agent.run(
-        ThreadId::new(),
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("Say hello in one sentence.".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
     );
-
-    while events.recv().await.is_some() {}
-
     let state = final_state.await.context("agent state channel closed")?;
+    let event_count = event_store.get_events(&thread_id).await?.len();
     tracer_provider
         .force_flush()
         .context("failed to flush tracer provider")?;
@@ -86,6 +91,7 @@ async fn main() -> Result<()> {
         .context("failed to read finished spans")?;
 
     println!("Final state: {state:?}");
+    println!("Persisted {event_count} events");
     println!("Exported {} spans:", spans.len());
     for span in spans {
         println!("- {}", span.name);

@@ -5,16 +5,17 @@
 //! This crate provides the infrastructure to build agents that can:
 //! - Converse with users via multiple LLM providers
 //! - Execute tools to interact with external systems
-//! - Stream events in real-time for responsive UIs
+//! - Persist turn events for downstream consumers and UIs
 //! - Persist conversation history and state
 //!
 //! ## Quick Start
 //!
 //! ```no_run
 //! use agent_sdk::{
-//!     builder, AgentEvent, AgentInput, CancellationToken, ThreadId, ToolContext,
-//!     providers::AnthropicProvider,
+//!     builder, AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
+//!     ThreadId, ToolContext, providers::AnthropicProvider,
 //! };
+//! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // 1. Create an LLM provider
@@ -22,23 +23,26 @@
 //! let provider = AnthropicProvider::sonnet(api_key);
 //!
 //! // 2. Build the agent
+//! let event_store = Arc::new(InMemoryEventStore::new());
 //! let agent = builder::<()>()
 //!     .provider(provider)
+//!     .event_store(event_store.clone())
 //!     .build();
 //!
 //! // 3. Run a conversation
 //! let thread_id = ThreadId::new();
 //! let ctx = ToolContext::new(());
 //! let cancel = CancellationToken::new();
-//! let (mut events, _final_state) = agent.run(
-//!     thread_id,
+//! let final_state = agent.run(
+//!     thread_id.clone(),
 //!     AgentInput::Text("Hello!".to_string()),
 //!     ctx,
 //!     cancel,
 //! );
+//! let _ = final_state.await?;
 //!
-//! // 4. Process streaming events
-//! while let Some(envelope) = events.recv().await {
+//! // 4. Read persisted events
+//! for envelope in event_store.get_events(&thread_id).await? {
 //!     match envelope.event {
 //!         AgentEvent::Text { message_id: _, text } => print!("{text}"),
 //!         AgentEvent::Done { .. } => break,
@@ -64,10 +68,12 @@
 //! Use [`builder()`] to construct an agent:
 //!
 //! ```no_run
-//! use agent_sdk::{builder, AgentConfig, providers::AnthropicProvider};
+//! use agent_sdk::{builder, AgentConfig, InMemoryEventStore, providers::AnthropicProvider};
+//! use std::sync::Arc;
 //!
 //! # fn example() {
 //! # let api_key = String::new();
+//! let event_store = Arc::new(InMemoryEventStore::new());
 //! let agent = builder::<()>()
 //!     .provider(AnthropicProvider::sonnet(api_key))
 //!     .config(AgentConfig {
@@ -75,6 +81,7 @@
 //!         system_prompt: "You are a helpful assistant.".into(),
 //!         ..Default::default()
 //!     })
+//!     .event_store(event_store)
 //!     .build();
 //! # }
 //! ```
@@ -151,9 +158,11 @@
 //! let mut tools = ToolRegistry::new();
 //! tools.register(WeatherTool);
 //!
+//! let event_store = std::sync::Arc::new(agent_sdk::InMemoryEventStore::new());
 //! let agent = builder::<()>()
 //!     .provider(AnthropicProvider::sonnet(api_key))
 //!     .tools(tools)
+//!     .event_store(event_store)
 //!     .build();
 //! # }
 //! ```
@@ -368,7 +377,9 @@ mod types;
 // Grouped by source crate so the provenance is clear.
 
 // agent-sdk (owned — agent loop)
-pub use agent_loop::{AgentHandle, AgentLoop, AgentLoopBuilder, builder};
+pub use agent_loop::{
+    AgentHandle, AgentLoop, AgentLoopBuilder, AgentLoopCompactionConfig, builder,
+};
 pub use capabilities::AgentCapabilities;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;
@@ -378,14 +389,16 @@ pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
-    TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolTier, TurnOutcome,
+    TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
+    TurnOutcome,
 };
 
 // agent-sdk-tools (via thin modules)
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use stores::{
-    InMemoryExecutionStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore,
+    EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
+    StateStore, StoredTurnEvents, ToolExecutionStore,
 };
 pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,

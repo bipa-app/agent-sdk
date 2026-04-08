@@ -1,11 +1,11 @@
 use crate::context::{CompactionConfig, ContextCompactor};
-use crate::events::{AgentEventEnvelope, SequenceCounter};
+use crate::events::SequenceCounter;
 use crate::llm::StopReason;
-use crate::stores::ToolExecutionStore;
+use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
-    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult,
+    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +30,12 @@ pub(super) enum InternalTurnResult {
         display_name: String,
         input: serde_json::Value,
         description: String,
+        continuation: Box<AgentContinuation>,
+    },
+    /// Tool calls ready for external execution (server mode)
+    PendingToolCalls {
+        turn_usage: TokenUsage,
+        pending_tool_calls: Vec<PendingToolCallInfo>,
         continuation: Box<AgentContinuation>,
     },
     /// Error
@@ -86,6 +92,8 @@ pub(super) enum ToolExecutionOutcome {
         description: String,
         listen_context: Option<ListenExecutionContext>,
     },
+    /// Event persistence or other infrastructure failure aborted the tool step.
+    Error(AgentError),
 }
 
 pub(super) const MAX_LISTEN_UPDATES: usize = 240;
@@ -99,9 +107,42 @@ pub(super) struct ListenReady {
     pub(super) expires_at: Option<OffsetDateTime>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ListenProgressStage {
+    Update,
+    Ready,
+    Invalidated,
+}
+
+impl ListenProgressStage {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "listen_update",
+            Self::Ready => "listen_ready",
+            Self::Invalidated => "listen_invalidated",
+        }
+    }
+}
+
 pub(super) enum ListenUpdateHandling {
     Continue,
     Ready(ListenReady),
+}
+
+pub(super) struct ListenUpdateContext<'a, H> {
+    pub(super) pending: &'a PendingToolCallInfo,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
+    pub(super) seq: &'a SequenceCounter,
+}
+
+pub(super) struct ListenWaitParams<'a, Ctx, H> {
+    pub(super) pending: &'a PendingToolCallInfo,
+    pub(super) tool: &'a Arc<dyn crate::tools::ErasedListenTool<Ctx>>,
+    pub(super) tool_context: &'a ToolContext<Ctx>,
+    pub(super) update_ctx: ListenUpdateContext<'a, H>,
 }
 
 pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
@@ -109,7 +150,8 @@ pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
     pub(super) thread_id: &'a ThreadId,
     pub(super) tools: &'a ToolRegistry<Ctx>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) turn: usize,
     pub(super) seq: &'a SequenceCounter,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
@@ -119,7 +161,8 @@ pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
     pub(super) thread_id: &'a ThreadId,
     pub(super) tools: &'a ToolRegistry<Ctx>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) turn: usize,
     pub(super) seq: &'a SequenceCounter,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
@@ -145,7 +188,7 @@ pub(super) enum ResumeProcessingResult {
 }
 
 pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
-    pub(super) tx: mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: Arc<dyn EventStore>,
     pub(super) seq: SequenceCounter,
     pub(super) thread_id: ThreadId,
     pub(super) input: AgentInput,
@@ -175,7 +218,7 @@ pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
@@ -190,7 +233,7 @@ pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
@@ -204,7 +247,7 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) hooks: &'a Arc<H>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) state_store: &'a Arc<S>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) config: &'a AgentConfig,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
@@ -213,8 +256,33 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) cancel_token: &'a CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
+    pub(super) turn_options: &'a TurnOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
+}
+
+pub(super) struct PersistentDoneParams<'a, H, M> {
+    pub(super) ctx: &'a TurnContext,
+    pub(super) rx: &'a mut mpsc::Receiver<AgentInput>,
+    pub(super) message_store: &'a Arc<M>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) current_turn: usize,
+    pub(super) cancel_token: &'a CancellationToken,
+}
+
+pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
+    pub(super) result: InternalTurnResult,
+    pub(super) ctx: &'a TurnContext,
+    pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
+    pub(super) message_store: &'a Arc<M>,
+    pub(super) state_store: &'a Arc<S>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) cancel_token: &'a CancellationToken,
+    pub(super) current_turn: usize,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -226,7 +294,7 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     pub(super) tool_context: ToolContext<Ctx>,
     pub(super) tools: Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: Arc<H>,
-    pub(super) tx: mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: Arc<dyn EventStore>,
     pub(super) seq: SequenceCounter,
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
@@ -234,7 +302,7 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
-    pub(super) tx: mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: Arc<dyn EventStore>,
     pub(super) seq: SequenceCounter,
     pub(super) thread_id: ThreadId,
     pub(super) input: AgentInput,
@@ -249,6 +317,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
     pub(super) cancel_token: CancellationToken,
+    pub(super) turn_options: TurnOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -258,7 +327,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
 /// This is the core turn execution logic shared by both `run_loop` (looping mode)
 /// and `run_single_turn` (single-turn mode).
 pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) ctx: &'a mut TurnContext,
     pub(super) tool_context: &'a ToolContext<Ctx>,
@@ -271,6 +340,7 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) turn_options: &'a TurnOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -282,7 +352,7 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
 }
@@ -291,7 +361,7 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) provider: &'a Arc<P>,
     pub(super) request: crate::llm::ChatRequest,
     pub(super) config: &'a AgentConfig,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) thread_id: &'a ThreadId,
@@ -300,6 +370,20 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) thinking_id: &'a str,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
+}
+
+pub(super) struct LlmEventContext<'a, H> {
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LlmStreamIds<'a> {
+    pub(super) message_id: &'a str,
+    pub(super) thinking_id: &'a str,
 }
 
 pub(super) struct ProcessedTurnResponse {
@@ -313,9 +397,10 @@ pub(super) struct TurnResponseProcessingParams<'a, Ctx, H, M> {
     pub(super) message_id: &'a str,
     pub(super) thinking_id: &'a str,
     pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) message_store: &'a Arc<M>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
 }
@@ -326,7 +411,7 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     pub(super) thread_id: &'a ThreadId,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
     pub(super) turn: usize,
@@ -341,7 +426,7 @@ pub(super) struct TurnCompletionParams<'a, H, M> {
     pub(super) turn: usize,
     pub(super) turn_usage: &'a TokenUsage,
     pub(super) message_store: &'a Arc<M>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
 }
@@ -352,7 +437,7 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     pub(super) thread_id: &'a ThreadId,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) seq: &'a SequenceCounter,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
     pub(super) turn: usize,
@@ -373,9 +458,20 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
-    pub(super) tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) seq: &'a SequenceCounter,
+}
+
+pub(super) struct ConvertTurnResultParams<'a, H, S> {
+    pub(super) result: InternalTurnResult,
+    pub(super) ctx: TurnContext,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) hooks: &'a Arc<H>,
+    pub(super) seq: &'a SequenceCounter,
+    pub(super) thread_id: ThreadId,
+    pub(super) current_turn: usize,
+    pub(super) state_store: &'a Arc<S>,
 }
 
 /// Extracted content from an LLM response: (thinking, text, `tool_uses`).

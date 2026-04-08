@@ -1,22 +1,27 @@
-//! Storage traits for message history and agent state.
+//! Storage traits for message history, agent state, and event persistence.
 //!
-//! The SDK uses two storage abstractions:
+//! The SDK uses three storage abstractions:
 //!
 //! - [`MessageStore`] - Stores conversation message history per thread
 //! - [`StateStore`] - Stores agent state checkpoints for recovery
+//! - [`EventStore`] - Stores turn-scoped event envelopes for retrieval
 //!
 //! # Built-in Implementation
 //!
-//! [`InMemoryStore`] implements both traits and is suitable for testing
-//! and single-process deployments. For production, implement custom stores
-//! backed by your database (e.g., Postgres, Redis).
+//! [`InMemoryStore`] implements the message/state traits and is suitable for
+//! testing and single-process deployments. [`InMemoryEventStore`] provides the
+//! corresponding in-memory event journal. For production, implement custom
+//! stores backed by your database (e.g., Postgres, Redis).
 
+use agent_sdk_core::events::AgentEventEnvelope;
 use agent_sdk_core::llm;
 use agent_sdk_core::types::{AgentState, ThreadId, ToolExecution};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 
 /// Trait for storing and retrieving conversation messages.
 /// Implement this trait to persist messages to your storage backend.
@@ -83,6 +88,73 @@ pub trait StateStore: Send + Sync {
     async fn delete(&self, thread_id: &ThreadId) -> Result<()>;
 }
 
+/// Stored event data for a single turn.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoredTurnEvents {
+    /// Turn number (1-based once execution starts).
+    pub turn: usize,
+    /// Events emitted for this turn.
+    pub events: Vec<AgentEventEnvelope>,
+    /// Whether `finish_turn()` has completed for this turn.
+    pub finished: bool,
+}
+
+/// Trait for storing and retrieving turn-scoped event streams.
+///
+/// Event writes are split into two phases:
+/// 1. [`append`](EventStore::append) records individual envelopes
+/// 2. [`finish_turn`](EventStore::finish_turn) marks the authoritative close barrier
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    /// Append an event envelope for the given thread and turn.
+    ///
+    /// # Errors
+    /// Returns an error if the event cannot be persisted.
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> Result<()>;
+
+    /// Mark the given turn as finished and flush any buffered writes.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot durably close the turn.
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()>;
+
+    /// Retrieve the stored data for a single turn.
+    ///
+    /// # Errors
+    /// Returns an error if the turn cannot be retrieved.
+    async fn get_turn(&self, thread_id: &ThreadId, turn: usize)
+    -> Result<Option<StoredTurnEvents>>;
+
+    /// Retrieve all stored turns for the given thread in ascending turn order.
+    ///
+    /// # Errors
+    /// Returns an error if the thread history cannot be retrieved.
+    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>>;
+
+    /// Retrieve all event envelopes for the given thread across every stored turn.
+    ///
+    /// # Errors
+    /// Returns an error if the thread history cannot be retrieved.
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<AgentEventEnvelope>> {
+        let turns = self.get_turns(thread_id).await?;
+        Ok(turns
+            .into_iter()
+            .flat_map(|turn| turn.events.into_iter())
+            .collect())
+    }
+
+    /// Clear all events for the given thread.
+    ///
+    /// # Errors
+    /// Returns an error if the thread cannot be cleared.
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()>;
+}
+
 /// Store for tracking tool executions (idempotency).
 ///
 /// This trait enables write-ahead execution tracking to ensure tool idempotency.
@@ -132,6 +204,47 @@ impl InMemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[derive(Default)]
+struct InMemoryEventStoreInner {
+    turns: AsyncRwLock<HashMap<String, BTreeMap<usize, StoredTurnEvents>>>,
+}
+
+/// In-memory implementation of [`EventStore`].
+///
+/// Cloning this type shares the same underlying event journal.
+#[derive(Clone, Default)]
+pub struct InMemoryEventStore {
+    inner: Arc<InMemoryEventStoreInner>,
+}
+
+impl InMemoryEventStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn update_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        update: impl FnOnce(&mut StoredTurnEvents) -> Result<()>,
+    ) -> Result<()> {
+        let mut turns = self.inner.turns.write().await;
+        let stored_turn = turns
+            .entry(thread_id.0.clone())
+            .or_default()
+            .entry(turn)
+            .or_insert_with(|| StoredTurnEvents {
+                turn,
+                events: Vec::new(),
+                finished: false,
+            });
+        let result = update(stored_turn);
+        drop(turns);
+        result
     }
 }
 
@@ -198,6 +311,62 @@ impl StateStore for InMemoryStore {
             .ok()
             .context("lock poisoned")?
             .remove(&thread_id.0);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventStore for InMemoryEventStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> Result<()> {
+        self.update_turn(thread_id, turn, |stored_turn| {
+            anyhow::ensure!(
+                !stored_turn.finished,
+                "cannot append to finished turn {turn}"
+            );
+            stored_turn.events.push(envelope);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
+        self.update_turn(thread_id, turn, |stored_turn| {
+            anyhow::ensure!(!stored_turn.finished, "turn {turn} is already finished");
+            stored_turn.finished = true;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+    ) -> Result<Option<StoredTurnEvents>> {
+        let turns = self.inner.turns.read().await;
+        Ok(turns
+            .get(&thread_id.0)
+            .and_then(|thread_turns| thread_turns.get(&turn).cloned()))
+    }
+
+    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>> {
+        let turns = self.inner.turns.read().await;
+        Ok(turns
+            .get(&thread_id.0)
+            .map(|thread_turns| thread_turns.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
+        {
+            let mut turns = self.inner.turns.write().await;
+            turns.remove(&thread_id.0);
+        }
         Ok(())
     }
 }
@@ -280,6 +449,7 @@ impl ToolExecutionStore for InMemoryExecutionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
     use agent_sdk_core::llm::Message;
     use agent_sdk_core::types::ToolResult;
 
@@ -371,6 +541,116 @@ mod tests {
         let state = store.load(&thread_id).await?;
         assert!(state.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_tracks_turns_and_finish_barrier() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_1", "hello"), &seq),
+            )
+            .await?;
+        store
+            .append(
+                &thread_id,
+                2,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_2", "world"), &seq),
+            )
+            .await?;
+
+        let turn_1 = store
+            .get_turn(&thread_id, 1)
+            .await?
+            .context("missing turn 1")?;
+        assert_eq!(turn_1.turn, 1);
+        assert_eq!(turn_1.events.len(), 1);
+        assert!(!turn_1.finished);
+
+        store.finish_turn(&thread_id, 1).await?;
+        store.finish_turn(&thread_id, 2).await?;
+
+        let turn_1 = store
+            .get_turn(&thread_id, 1)
+            .await?
+            .context("missing finished turn 1")?;
+        let turn_2 = store
+            .get_turn(&thread_id, 2)
+            .await?
+            .context("missing finished turn 2")?;
+        assert!(turn_1.finished);
+        assert!(turn_2.finished);
+
+        let turns = store.get_turns(&thread_id).await?;
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn, 1);
+        assert_eq!(turns[1].turn, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_finish_turn_without_events_creates_finished_turn()
+    -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+
+        store.finish_turn(&thread_id, 3).await?;
+
+        let turn = store
+            .get_turn(&thread_id, 3)
+            .await?
+            .context("missing empty finished turn")?;
+        assert_eq!(turn.turn, 3);
+        assert!(turn.events.is_empty());
+        assert!(turn.finished);
+
+        store.clear(&thread_id).await?;
+        assert!(store.get_turns(&thread_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_rejects_append_after_finish() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        store.finish_turn(&thread_id, 1).await?;
+
+        let error = store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("msg_1", "late"), &seq),
+            )
+            .await
+            .expect_err("append after finish should fail");
+
+        assert!(error.to_string().contains("cannot append to finished turn"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_event_store_rejects_duplicate_finish() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+
+        store.finish_turn(&thread_id, 1).await?;
+
+        let error = store
+            .finish_turn(&thread_id, 1)
+            .await
+            .expect_err("duplicate finish should fail");
+
+        assert!(error.to_string().contains("already finished"));
         Ok(())
     }
 

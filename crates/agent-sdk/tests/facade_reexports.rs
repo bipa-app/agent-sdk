@@ -36,7 +36,7 @@ fn core_events() {
 fn core_turn_outcomes() {
     use agent_sdk::{
         AgentContinuation, AgentError, AgentRunState, AgentState, ExecutionStatus, TokenUsage,
-        ToolExecution, ToolOutcome, ToolResult, ToolTier, TurnOutcome,
+        ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
     };
 
     let _result = ToolResult::success("ok");
@@ -52,6 +52,8 @@ fn core_turn_outcomes() {
         _to: ToolOutcome,
         _turn: TurnOutcome,
         _tier: ToolTier,
+        _opts: TurnOptions,
+        _rt: ToolRuntime,
     ) {
     }
 }
@@ -79,18 +81,27 @@ fn tool_traits_and_registry() {
 #[test]
 fn hooks_and_stores() {
     use agent_sdk::{
-        AgentHooks, AllowAllHooks, DefaultHooks, InMemoryExecutionStore, InMemoryStore,
-        LoggingHooks, MessageStore, StateStore, ToolDecision, ToolExecutionStore,
+        AgentHooks, AllowAllHooks, DefaultHooks, EventStore, InMemoryEventStore,
+        InMemoryExecutionStore, InMemoryStore, LoggingHooks, MessageStore, StateStore,
+        StoredTurnEvents, ToolDecision, ToolExecutionStore,
     };
 
     let _hooks: &dyn AgentHooks = &DefaultHooks;
     let _allow: &dyn AgentHooks = &AllowAllHooks;
     let _log: &dyn AgentHooks = &LoggingHooks;
     let _mem = InMemoryStore::new();
+    let _events = InMemoryEventStore::new();
     let _exec = InMemoryExecutionStore::new();
 
-    fn _assert_stores(_m: &dyn MessageStore, _s: &dyn StateStore, _t: &dyn ToolExecutionStore) {}
+    fn _assert_stores(
+        _m: &dyn MessageStore,
+        _s: &dyn StateStore,
+        _e: &dyn EventStore,
+        _t: &dyn ToolExecutionStore,
+    ) {
+    }
     fn _assert_decision(_d: ToolDecision) {}
+    fn _assert_turns(_turns: StoredTurnEvents) {}
 }
 
 #[test]

@@ -2,7 +2,7 @@ use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::skills::Skill;
-use crate::stores::{InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
+use crate::stores::{EventStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::ToolRegistry;
 use crate::types::AgentConfig;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     hooks: Option<H>,
     message_store: Option<M>,
     state_store: Option<S>,
+    event_store: Option<Arc<dyn EventStore>>,
     config: Option<AgentConfig>,
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
@@ -44,6 +45,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             hooks: None,
             message_store: None,
             state_store: None,
+            event_store: None,
             config: None,
             compaction_config: None,
             compactor: None,
@@ -70,6 +72,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             hooks: self.hooks,
             message_store: self.message_store,
             state_store: self.state_store,
+            event_store: self.event_store,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -95,6 +98,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             hooks: Some(hooks),
             message_store: self.message_store,
             state_store: self.state_store,
+            event_store: self.event_store,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -116,6 +120,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             hooks: self.hooks,
             message_store: Some(message_store),
             state_store: self.state_store,
+            event_store: self.event_store,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -137,6 +142,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             hooks: self.hooks,
             message_store: self.message_store,
             state_store: Some(state_store),
+            event_store: self.event_store,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -144,6 +150,13 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
+    }
+
+    /// Set the authoritative event store for the loop lifecycle.
+    #[must_use]
+    pub fn event_store(mut self, store: Arc<dyn EventStore>) -> Self {
+        self.event_store = Some(store);
+        self
     }
 
     /// Set the execution store for tool idempotency.
@@ -271,7 +284,7 @@ where
     Ctx: Send + Sync + 'static,
     P: LlmProvider + 'static,
 {
-    /// Build the agent loop with default hooks and in-memory stores.
+    /// Build the agent loop with default hooks and in-memory message/state stores.
     ///
     /// This is a convenience method that uses:
     /// - `DefaultHooks` for hooks
@@ -284,7 +297,12 @@ where
     /// Panics if a provider has not been set.
     #[must_use]
     pub fn build(self) -> AgentLoop<Ctx, P, DefaultHooks, InMemoryStore, InMemoryStore> {
-        let provider = self.provider.expect("provider is required");
+        let Some(provider) = self.provider else {
+            panic!("provider is required");
+        };
+        let Some(event_store) = self.event_store else {
+            panic!("event_store is required");
+        };
         let tools = self.tools.unwrap_or_default();
         let config = self.config.unwrap_or_default();
 
@@ -294,6 +312,7 @@ where
             hooks: Arc::new(DefaultHooks),
             message_store: Arc::new(InMemoryStore::new()),
             state_store: Arc::new(InMemoryStore::new()),
+            event_store,
             config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -321,19 +340,25 @@ where
     /// - `hooks`
     /// - `message_store`
     /// - `state_store`
+    /// - `event_store`
     #[must_use]
     pub fn build_with_stores(self) -> AgentLoop<Ctx, P, H, M, S> {
-        let provider = self.provider.expect("provider is required");
+        let Some(provider) = self.provider else {
+            panic!("provider is required");
+        };
         let tools = self.tools.unwrap_or_default();
-        let hooks = self
-            .hooks
-            .expect("hooks is required when using build_with_stores");
-        let message_store = self
-            .message_store
-            .expect("message_store is required when using build_with_stores");
-        let state_store = self
-            .state_store
-            .expect("state_store is required when using build_with_stores");
+        let Some(hooks) = self.hooks else {
+            panic!("hooks is required when using build_with_stores");
+        };
+        let Some(message_store) = self.message_store else {
+            panic!("message_store is required when using build_with_stores");
+        };
+        let Some(state_store) = self.state_store else {
+            panic!("state_store is required when using build_with_stores");
+        };
+        let Some(event_store) = self.event_store else {
+            panic!("event_store is required when using build_with_stores");
+        };
         let config = self.config.unwrap_or_default();
 
         AgentLoop {
@@ -342,6 +367,7 @@ where
             hooks: Arc::new(hooks),
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
+            event_store,
             config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,

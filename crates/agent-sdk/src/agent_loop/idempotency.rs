@@ -1,5 +1,7 @@
 use crate::stores::ToolExecutionStore;
-use crate::types::{ExecutionStatus, PendingToolCallInfo, ThreadId, ToolExecution, ToolResult};
+use crate::types::{
+    AgentError, ExecutionStatus, PendingToolCallInfo, ThreadId, ToolExecution, ToolResult,
+};
 use log::warn;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -13,14 +15,17 @@ pub(super) async fn execute_with_idempotency<Fut>(
     pending: &PendingToolCallInfo,
     thread_id: &ThreadId,
     execute: Fut,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
-    Fut: std::future::Future<Output = ToolResult>,
+    Fut: std::future::Future<Output = Result<ToolResult, AgentError>>,
 {
     let started_at = OffsetDateTime::now_utc();
     record_execution_start(execution_store, pending, thread_id, started_at).await;
     let result = execute.await;
-    record_execution_complete(execution_store, pending, thread_id, &result, started_at).await;
+    if let Ok(tool_result) = &result {
+        record_execution_complete(execution_store, pending, thread_id, tool_result, started_at)
+            .await;
+    }
     result
 }
 

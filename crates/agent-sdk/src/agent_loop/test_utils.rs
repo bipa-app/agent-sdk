@@ -1,10 +1,12 @@
 use crate::events::AgentEventEnvelope;
 use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
+use crate::stores::{EventStore, InMemoryEventStore};
 use crate::tools::{ListenExecuteTool, ListenStopReason, ListenToolUpdate, Tool, ToolContext};
-use crate::types::{ToolResult, ToolTier};
+use crate::types::{ThreadId, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -111,14 +113,15 @@ impl crate::llm::LlmProvider for MockProvider {
     }
 }
 
-pub async fn drain_events(
-    mut rx: tokio::sync::mpsc::Receiver<AgentEventEnvelope>,
-) -> Vec<AgentEventEnvelope> {
-    let mut events = Vec::new();
-    while let Some(event) = rx.recv().await {
-        events.push(event);
-    }
-    events
+pub fn new_event_store() -> Arc<InMemoryEventStore> {
+    Arc::new(InMemoryEventStore::new())
+}
+
+pub async fn load_events(
+    store: &dyn EventStore,
+    thread_id: &ThreadId,
+) -> Result<Vec<AgentEventEnvelope>> {
+    store.get_events(thread_id).await
 }
 
 // ===================

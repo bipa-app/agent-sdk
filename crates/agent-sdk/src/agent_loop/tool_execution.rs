@@ -2,20 +2,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
 use super::helpers::{millis_to_u64, send_event, wrap_and_send};
 use super::idempotency::{execute_with_idempotency, try_get_cached_result};
 use super::listen::{
-    build_listen_confirmation_input, cancel_listen_with_warning, wait_for_listen_ready,
+    ListenWaitError, build_listen_confirmation_input, cancel_listen_with_warning,
+    wait_for_listen_ready,
 };
 use super::types::{
-    ConfirmedToolExecutionContext, ListenReady, ToolCallExecutionContext, ToolExecutionOutcome,
+    ConfirmedToolExecutionContext, ListenReady, ListenUpdateContext, ListenWaitParams,
+    ToolCallExecutionContext, ToolExecutionOutcome,
 };
-use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use crate::events::{AgentEvent, SequenceCounter};
 use crate::hooks::{AgentHooks, ToolDecision};
 use crate::llm::{Content, ContentBlock, Message, Role};
-use crate::stores::MessageStore;
+use crate::stores::{EventStore, MessageStore};
 use crate::tools::{
     ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenStopReason, ToolContext,
 };
@@ -135,6 +136,11 @@ fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolE
                 "awaiting_confirmation",
             ));
         }
+        ToolExecutionOutcome::Error(error) => {
+            span.set_attribute(KeyValue::new(attrs::ERROR_TYPE, "event_store"));
+            span.set_status(opentelemetry::trace::Status::error(error.message.clone()));
+            span.set_attribute(KeyValue::new(attrs::SDK_TOOL_OUTCOME, "error"));
+        }
     }
 
     span.end();
@@ -183,8 +189,10 @@ where
     H: AgentHooks,
 {
     let tier = listen_tool.tier();
-    send_event(
-        ctx.tx,
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_start(
@@ -195,21 +203,32 @@ where
             tier,
         ),
     )
-    .await;
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
 
     let tool_start = Instant::now();
-    let ready = match wait_for_listen_ready(
+    let ready = match wait_for_listen_ready(ListenWaitParams {
         pending,
-        listen_tool,
-        ctx.tool_context,
-        ctx.hooks,
-        ctx.tx,
-        ctx.seq,
-    )
+        tool: listen_tool,
+        tool_context: ctx.tool_context,
+        update_ctx: ListenUpdateContext {
+            pending,
+            hooks: ctx.hooks,
+            event_store: ctx.event_store,
+            thread_id: ctx.thread_id,
+            turn: ctx.turn,
+            seq: ctx.seq,
+        },
+    })
     .await
     {
         Ok(ready) => ready,
-        Err(result) => return finish_listen_ready_failure(pending, ctx, tool_start, result).await,
+        Err(ListenWaitError::Tool(result)) => {
+            return finish_listen_ready_failure(pending, ctx, tool_start, result).await;
+        }
+        Err(ListenWaitError::Event(error)) => return ToolExecutionOutcome::Error(error),
     };
 
     match ctx
@@ -241,8 +260,10 @@ where
 {
     result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
     ctx.hooks.post_tool_use(&pending.name, &result).await;
-    send_event(
-        ctx.tx,
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_end(
@@ -252,7 +273,10 @@ where
             result.clone(),
         ),
     )
-    .await;
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
     ToolExecutionOutcome::Completed {
         tool_id: pending.id.clone(),
         result,
@@ -270,23 +294,32 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
-    let result = execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-        match listen_tool
-            .execute(ctx.tool_context, &ready.operation_id, ready.revision)
-            .await
+    let result =
+        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+            Ok(
+                match listen_tool
+                    .execute(ctx.tool_context, &ready.operation_id, ready.revision)
+                    .await
+                {
+                    Ok(mut value) => {
+                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        value
+                    }
+                    Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                },
+            )
+        })
+        .await
         {
-            Ok(mut value) => {
-                value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                value
-            }
-            Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-        }
-    })
-    .await;
+            Ok(result) => result,
+            Err(error) => return ToolExecutionOutcome::Error(error),
+        };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
-    send_event(
-        ctx.tx,
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_end(
@@ -296,7 +329,10 @@ where
             result.clone(),
         ),
     )
-    .await;
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
     ToolExecutionOutcome::Completed {
         tool_id: pending.id.clone(),
         result,
@@ -324,8 +360,10 @@ where
     )
     .await;
     let result = ToolResult::error(format!("Blocked: {reason}"));
-    send_event(
-        ctx.tx,
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_end(
@@ -335,7 +373,10 @@ where
             result.clone(),
         ),
     )
-    .await;
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
     ToolExecutionOutcome::Completed {
         tool_id: pending.id.clone(),
         result,
@@ -353,8 +394,10 @@ where
     H: AgentHooks,
 {
     let input = build_listen_confirmation_input(&pending.input, &ready);
-    send_event(
-        ctx.tx,
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::ToolRequiresConfirmation {
@@ -364,7 +407,10 @@ where
             description: description.clone(),
         },
     )
-    .await;
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
     ToolExecutionOutcome::RequiresConfirmation {
         tool_id: pending.id.clone(),
         tool_name: pending.name.clone(),
@@ -380,18 +426,19 @@ where
     }
 }
 
-pub(super) async fn execute_async_tool_call<Ctx, H>(
+async fn send_tool_call_start_event<Ctx, H>(
     pending: &PendingToolCallInfo,
-    async_tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
+    tier: ToolTier,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
-) -> ToolExecutionOutcome
+) -> Result<(), AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
-    let tier = async_tool.tier();
     send_event(
-        ctx.tx,
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_start(
@@ -402,77 +449,187 @@ where
             tier,
         ),
     )
-    .await;
+    .await
+}
+
+async fn send_tool_call_end_event<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    result: &ToolResult,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> Result<(), AgentError>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            result.clone(),
+        ),
+    )
+    .await
+}
+
+async fn block_tool_call<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    reason: String,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let result = ToolResult::error(format!("Blocked: {reason}"));
+    if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        return ToolExecutionOutcome::Error(error);
+    }
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+async fn require_tool_confirmation<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    description: String,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    if let Err(error) = send_event(
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::ToolRequiresConfirmation {
+            id: pending.id.clone(),
+            name: pending.name.clone(),
+            input: pending.input.clone(),
+            description: description.clone(),
+        },
+    )
+    .await
+    {
+        return ToolExecutionOutcome::Error(error);
+    }
+    ToolExecutionOutcome::RequiresConfirmation {
+        tool_id: pending.id.clone(),
+        tool_name: pending.name.clone(),
+        display_name: pending.display_name.clone(),
+        input: pending.input.clone(),
+        description,
+        listen_context: None,
+    }
+}
+
+async fn complete_async_tool_call<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    async_tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let result =
+        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+            execute_async_tool(
+                pending,
+                async_tool,
+                ctx.tool_context,
+                ctx.event_store,
+                ctx.thread_id,
+                ctx.turn,
+                ctx.seq,
+            )
+            .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return ToolExecutionOutcome::Error(error),
+        };
+    ctx.hooks.post_tool_use(&pending.name, &result).await;
+    if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        return ToolExecutionOutcome::Error(error);
+    }
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+async fn complete_sync_tool_call<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    tool: &Arc<dyn ErasedTool<Ctx>>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let tool_start = Instant::now();
+    let result =
+        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+            Ok(
+                match tool.execute(ctx.tool_context, pending.input.clone()).await {
+                    Ok(mut value) => {
+                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                        value
+                    }
+                    Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
+                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                },
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return ToolExecutionOutcome::Error(error),
+        };
+    ctx.hooks.post_tool_use(&pending.name, &result).await;
+    if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        return ToolExecutionOutcome::Error(error);
+    }
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
+
+pub(super) async fn execute_async_tool_call<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    async_tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    let tier = async_tool.tier();
+    if let Err(error) = send_tool_call_start_event(pending, tier, ctx).await {
+        return ToolExecutionOutcome::Error(error);
+    }
 
     match ctx
         .hooks
         .pre_tool_use(&pending.name, &pending.input, tier)
         .await
     {
-        ToolDecision::Allow => {
-            let result =
-                execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-                    execute_async_tool(pending, async_tool, ctx.tool_context, ctx.tx, ctx.seq).await
-                })
-                .await;
-            ctx.hooks.post_tool_use(&pending.name, &result).await;
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
-        }
-        ToolDecision::Block(reason) => {
-            let result = ToolResult::error(format!("Blocked: {reason}"));
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
-        }
+        ToolDecision::Allow => complete_async_tool_call(pending, async_tool, ctx).await,
+        ToolDecision::Block(reason) => block_tool_call(pending, ctx, reason).await,
         ToolDecision::RequiresConfirmation(description) => {
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::ToolRequiresConfirmation {
-                    id: pending.id.clone(),
-                    name: pending.name.clone(),
-                    input: pending.input.clone(),
-                    description: description.clone(),
-                },
-            )
-            .await;
-            ToolExecutionOutcome::RequiresConfirmation {
-                tool_id: pending.id.clone(),
-                tool_name: pending.name.clone(),
-                display_name: pending.display_name.clone(),
-                input: pending.input.clone(),
-                description,
-                listen_context: None,
-            }
+            require_tool_confirmation(pending, ctx, description).await
         }
     }
 }
@@ -487,98 +644,19 @@ where
     H: AgentHooks,
 {
     let tier = tool.tier();
-    send_event(
-        ctx.tx,
-        ctx.hooks,
-        ctx.seq,
-        AgentEvent::tool_call_start(
-            &pending.id,
-            &pending.name,
-            &pending.display_name,
-            pending.input.clone(),
-            tier,
-        ),
-    )
-    .await;
+    if let Err(error) = send_tool_call_start_event(pending, tier, ctx).await {
+        return ToolExecutionOutcome::Error(error);
+    }
 
     match ctx
         .hooks
         .pre_tool_use(&pending.name, &pending.input, tier)
         .await
     {
-        ToolDecision::Allow => {
-            let tool_start = Instant::now();
-            let result =
-                execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-                    match tool.execute(ctx.tool_context, pending.input.clone()).await {
-                        Ok(mut value) => {
-                            value.duration_ms =
-                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                            value
-                        }
-                        Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
-                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                    }
-                })
-                .await;
-            ctx.hooks.post_tool_use(&pending.name, &result).await;
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
-        }
-        ToolDecision::Block(reason) => {
-            let result = ToolResult::error(format!("Blocked: {reason}"));
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::tool_call_end(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    result.clone(),
-                ),
-            )
-            .await;
-            ToolExecutionOutcome::Completed {
-                tool_id: pending.id.clone(),
-                result,
-            }
-        }
+        ToolDecision::Allow => complete_sync_tool_call(pending, tool, ctx).await,
+        ToolDecision::Block(reason) => block_tool_call(pending, ctx, reason).await,
         ToolDecision::RequiresConfirmation(description) => {
-            send_event(
-                ctx.tx,
-                ctx.hooks,
-                ctx.seq,
-                AgentEvent::ToolRequiresConfirmation {
-                    id: pending.id.clone(),
-                    name: pending.name.clone(),
-                    input: pending.input.clone(),
-                    description: description.clone(),
-                },
-            )
-            .await;
-            ToolExecutionOutcome::RequiresConfirmation {
-                tool_id: pending.id.clone(),
-                tool_name: pending.name.clone(),
-                display_name: pending.display_name.clone(),
-                input: pending.input.clone(),
-                description,
-                listen_context: None,
-            }
+            require_tool_confirmation(pending, ctx, description).await
         }
     }
 }
@@ -592,9 +670,11 @@ pub(super) async fn execute_async_tool<Ctx>(
     pending: &PendingToolCallInfo,
     tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
     tool_context: &ToolContext<Ctx>,
-    tx: &mpsc::Sender<AgentEventEnvelope>,
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    turn: usize,
     seq: &SequenceCounter,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone,
 {
@@ -604,8 +684,8 @@ where
     let outcome = match tool.execute(tool_context, pending.input.clone()).await {
         Ok(o) => o,
         Err(e) => {
-            return ToolResult::error(format!("Tool error: {e:#}"))
-                .with_duration(millis_to_u64(tool_start.elapsed().as_millis()));
+            return Ok(ToolResult::error(format!("Tool error: {e:#}"))
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis())));
         }
     };
 
@@ -613,7 +693,7 @@ where
         // Synchronous completion - return immediately
         ToolOutcome::Success(mut result) | ToolOutcome::Failed(mut result) => {
             result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-            result
+            Ok(result)
         }
 
         // Async operation - stream status until completion
@@ -623,7 +703,9 @@ where
         } => {
             // Emit initial progress
             wrap_and_send(
-                tx,
+                event_store,
+                thread_id,
+                turn,
                 AgentEvent::tool_progress(
                     &pending.id,
                     &pending.name,
@@ -634,7 +716,7 @@ where
                 ),
                 seq,
             )
-            .await;
+            .await?;
 
             // Stream status updates
             let mut stream = tool.check_status_stream(tool_context, &operation_id);
@@ -647,7 +729,9 @@ where
                         data,
                     } => {
                         wrap_and_send(
-                            tx,
+                            event_store,
+                            thread_id,
+                            turn,
                             AgentEvent::tool_progress(
                                 &pending.id,
                                 &pending.name,
@@ -658,19 +742,21 @@ where
                             ),
                             seq,
                         )
-                        .await;
+                        .await?;
                     }
                     ErasedToolStatus::Completed(mut result)
                     | ErasedToolStatus::Failed(mut result) => {
                         result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
 
             // Stream ended without completion (shouldn't happen)
-            ToolResult::error("Async tool stream ended without completion")
-                .with_duration(millis_to_u64(tool_start.elapsed().as_millis()))
+            Ok(
+                ToolResult::error("Async tool stream ended without completion")
+                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+            )
         }
     }
 }
@@ -683,7 +769,7 @@ pub(super) async fn execute_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     rejection_reason: Option<String>,
     ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
@@ -718,7 +804,7 @@ where
         return finish_confirmed_tool(awaiting_tool, ctx, cached_result).await;
     }
 
-    let result = execute_confirmed_tool_inner(awaiting_tool, ctx).await;
+    let result = execute_confirmed_tool_inner(awaiting_tool, ctx).await?;
     finish_confirmed_tool(awaiting_tool, ctx, result).await
 }
 
@@ -726,7 +812,7 @@ pub(super) async fn handle_confirmed_tool_rejection<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
     reason: String,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
@@ -747,7 +833,9 @@ where
 
     let result = ToolResult::error(format!("Rejected: {reason}"));
     send_event(
-        ctx.tx,
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_end(
@@ -757,24 +845,24 @@ where
             result.clone(),
         ),
     )
-    .await;
-    result
+    .await?;
+    Ok(result)
 }
 
 pub(super) async fn execute_confirmed_tool_inner<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
     if let Some(listen_tool) = ctx.tools.get_listen(&awaiting_tool.name) {
         let Some(listen) = awaiting_tool.listen_context.as_ref() else {
-            return ToolResult::error(format!(
+            return Ok(ToolResult::error(format!(
                 "Listen context missing for tool: {}",
                 awaiting_tool.name
-            ));
+            )));
         };
         let tool_start = Instant::now();
         return execute_with_idempotency(
@@ -782,17 +870,20 @@ where
             awaiting_tool,
             ctx.thread_id,
             async {
-                match listen_tool
-                    .execute(ctx.tool_context, &listen.operation_id, listen.revision)
-                    .await
-                {
-                    Ok(mut value) => {
-                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        value
-                    }
-                    Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                }
+                Ok(
+                    match listen_tool
+                        .execute(ctx.tool_context, &listen.operation_id, listen.revision)
+                        .await
+                    {
+                        Ok(mut value) => {
+                            value.duration_ms =
+                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                            value
+                        }
+                        Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
+                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                    },
+                )
             },
         )
         .await;
@@ -804,8 +895,16 @@ where
             awaiting_tool,
             ctx.thread_id,
             async {
-                execute_async_tool(awaiting_tool, async_tool, ctx.tool_context, ctx.tx, ctx.seq)
-                    .await
+                execute_async_tool(
+                    awaiting_tool,
+                    async_tool,
+                    ctx.tool_context,
+                    ctx.event_store,
+                    ctx.thread_id,
+                    ctx.turn,
+                    ctx.seq,
+                )
+                .await
             },
         )
         .await;
@@ -818,37 +917,45 @@ where
             awaiting_tool,
             ctx.thread_id,
             async {
-                match tool
-                    .execute(ctx.tool_context, awaiting_tool.input.clone())
-                    .await
-                {
-                    Ok(mut value) => {
-                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        value
-                    }
-                    Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
-                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                }
+                Ok(
+                    match tool
+                        .execute(ctx.tool_context, awaiting_tool.input.clone())
+                        .await
+                    {
+                        Ok(mut value) => {
+                            value.duration_ms =
+                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                            value
+                        }
+                        Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
+                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+                    },
+                )
             },
         )
         .await;
     }
 
-    ToolResult::error(format!("Unknown tool: {}", awaiting_tool.name))
+    Ok(ToolResult::error(format!(
+        "Unknown tool: {}",
+        awaiting_tool.name
+    )))
 }
 
 pub(super) async fn finish_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
     result: ToolResult,
-) -> ToolResult
+) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
     ctx.hooks.post_tool_use(&awaiting_tool.name, &result).await;
     send_event(
-        ctx.tx,
+        ctx.event_store,
+        ctx.thread_id,
+        ctx.turn,
         ctx.hooks,
         ctx.seq,
         AgentEvent::tool_call_end(
@@ -858,8 +965,8 @@ where
             result.clone(),
         ),
     )
-    .await;
-    result
+    .await?;
+    Ok(result)
 }
 
 /// Append tool results to message history.

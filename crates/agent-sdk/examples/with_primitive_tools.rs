@@ -16,7 +16,8 @@
 
 use agent_sdk::{
     AgentCapabilities, AgentConfig, AgentEvent, AgentInput, AllowAllHooks, CancellationToken,
-    Environment, InMemoryFileSystem, InMemoryStore, ThreadId, ToolContext, ToolRegistry, builder,
+    Environment, EventStore, InMemoryEventStore, InMemoryFileSystem, InMemoryStore, ThreadId,
+    ToolContext, ToolRegistry, builder,
     primitive_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool},
     providers::AnthropicProvider,
 };
@@ -86,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the agent
     // We use AllowAllHooks to auto-approve tool calls for this demo
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
         .tools(tools)
@@ -93,22 +95,24 @@ async fn main() -> anyhow::Result<()> {
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
         .config(config)
+        .event_store(event_store.clone())
         .build_with_stores();
 
     let thread_id = ThreadId::new();
     let tool_ctx = ToolContext::new(());
 
     // Ask the agent to explore and modify files
-    let (mut events, _final_state) = agent.run(
-        thread_id,
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("List all .rs files in the workspace, then add a simple test to src/lib.rs that tests the greet function.".to_string()),
         tool_ctx,
         CancellationToken::new(),
     );
+    let _ = final_state.await?;
 
     println!("--- Agent Working ---\n");
 
-    while let Some(envelope) = events.recv().await {
+    for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {
             AgentEvent::ToolCallStart { name, .. } => {
                 println!("[Using tool: {name}]");

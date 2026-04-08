@@ -95,6 +95,7 @@ pub const fn turn_outcome_str(outcome: &crate::types::TurnOutcome) -> &'static s
         crate::types::TurnOutcome::Refusal { .. } => "refusal",
         crate::types::TurnOutcome::NeedsMoreTurns { .. } => "needs_more_turns",
         crate::types::TurnOutcome::AwaitingConfirmation { .. } => "awaiting_confirmation",
+        crate::types::TurnOutcome::PendingToolCalls { .. } => "pending_tool_calls",
         crate::types::TurnOutcome::Cancelled { .. } => "cancelled",
         crate::types::TurnOutcome::Error(_) => "error",
     }

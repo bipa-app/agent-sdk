@@ -33,6 +33,7 @@
 //! }
 //! ```
 
+use crate::stores::EventStore;
 use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use agent_sdk_core::llm;
 use agent_sdk_core::types::{ToolOutcome, ToolResult, ToolTier};
@@ -47,7 +48,6 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
@@ -284,13 +284,18 @@ impl<S: ProgressStage> From<ToolStatus<S>> for ErasedToolStatus {
 }
 
 /// Context passed to tool execution
+#[derive(Clone)]
 pub struct ToolContext<Ctx> {
     /// Application-specific context (e.g., `user_id`, db connection)
     pub app: Ctx,
     /// Tool-specific metadata
     pub metadata: HashMap<String, Value>,
-    /// Optional channel for tools to emit events (e.g., subagent progress)
-    event_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
+    /// Optional event store for tools to emit turn-scoped events.
+    event_store: Option<Arc<dyn EventStore>>,
+    /// Thread associated with the bound event store.
+    event_thread_id: Option<agent_sdk_core::types::ThreadId>,
+    /// Turn associated with the bound event store.
+    event_turn: Option<usize>,
     /// Optional sequence counter for wrapping events in envelopes
     event_seq: Option<SequenceCounter>,
     /// Optional cancellation token for propagating cancellation to subtasks
@@ -305,7 +310,9 @@ impl<Ctx> ToolContext<Ctx> {
         Self {
             app,
             metadata: HashMap::new(),
-            event_tx: None,
+            event_store: None,
+            event_thread_id: None,
+            event_turn: None,
             event_seq: None,
             cancel_token: None,
             subagent_semaphore: None,
@@ -318,46 +325,51 @@ impl<Ctx> ToolContext<Ctx> {
         self
     }
 
-    /// Set the event channel and sequence counter for tools that need to emit
-    /// events during execution.
+    /// Bind the tool context to the event store for a specific thread/turn.
     #[must_use]
-    pub fn with_event_tx(
+    pub fn with_event_store(
         mut self,
-        tx: mpsc::Sender<AgentEventEnvelope>,
+        store: Arc<dyn EventStore>,
+        thread_id: agent_sdk_core::types::ThreadId,
+        turn: usize,
         seq: SequenceCounter,
     ) -> Self {
-        self.event_tx = Some(tx);
+        self.event_store = Some(store);
+        self.event_thread_id = Some(thread_id);
+        self.event_turn = Some(turn);
         self.event_seq = Some(seq);
         self
     }
 
-    /// Emit an event through the event channel (if set).
+    /// Emit an event through the configured event store (if set).
     ///
     /// The event is wrapped in an [`AgentEventEnvelope`] with a unique ID,
-    /// sequence number, and timestamp before sending.
+    /// sequence number, and timestamp before publishing.
     ///
-    /// This uses `try_send` to avoid blocking and to ensure the future is `Send`.
-    /// The event is silently dropped if the channel is full.
-    pub fn emit_event(&self, event: AgentEvent) {
-        if let Some((tx, seq)) = self.event_tx.as_ref().zip(self.event_seq.as_ref()) {
+    /// # Errors
+    /// Returns an error if the configured event store cannot persist the event.
+    pub async fn emit_event(&self, event: AgentEvent) -> Result<()>
+    where
+        Ctx: Sync,
+    {
+        if let Some((store, seq, thread_id, turn)) = self
+            .event_store
+            .as_ref()
+            .zip(self.event_seq.as_ref())
+            .zip(self.event_thread_id.as_ref())
+            .zip(self.event_turn)
+            .map(|(((store, seq), thread_id), turn)| (store, seq, thread_id, turn))
+        {
             let envelope = AgentEventEnvelope::wrap(event, seq);
-            let _ = tx.try_send(envelope);
+            store.append(thread_id, turn, envelope).await?;
         }
-    }
-
-    /// Get a clone of the event channel sender (if set).
-    ///
-    /// This is useful for tools that spawn subprocesses (like subagents)
-    /// and need to forward events to the parent's event stream.
-    #[must_use]
-    pub fn event_tx(&self) -> Option<mpsc::Sender<AgentEventEnvelope>> {
-        self.event_tx.clone()
+        Ok(())
     }
 
     /// Get a clone of the sequence counter (if set).
     ///
     /// This is useful for tools that spawn subprocesses (like subagents)
-    /// and need to assign sequence numbers to events sent to the parent's stream.
+    /// and need to assign sequence numbers to events sent to the parent's turn log.
     #[must_use]
     pub fn event_seq(&self) -> Option<SequenceCounter> {
         self.event_seq.clone()
