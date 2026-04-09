@@ -144,6 +144,93 @@ where
     }
 }
 
+struct StreamDeltaEventParams<'a, H> {
+    delta: &'a StreamDelta,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+    message_id: &'a str,
+    thinking_id: &'a str,
+    channel_closed: &'a mut bool,
+    delta_count: u64,
+}
+
+async fn handle_stream_delta_event<H>(
+    StreamDeltaEventParams {
+        delta,
+        tx,
+        hooks,
+        seq,
+        message_id,
+        thinking_id,
+        channel_closed,
+        delta_count,
+    }: StreamDeltaEventParams<'_, H>,
+) -> Result<(), StreamError>
+where
+    H: AgentHooks,
+{
+    match delta {
+        StreamDelta::TextDelta { delta, .. } => {
+            if *channel_closed {
+                return Ok(());
+            }
+            if tx.is_closed() {
+                log::warn!(
+                    "Event channel closed by receiver at delta_count={delta_count} - consumer may have disconnected"
+                );
+                *channel_closed = true;
+            } else {
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::text_delta(message_id, delta.clone()),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        StreamDelta::ThinkingDelta { delta, .. } => {
+            if *channel_closed {
+                return Ok(());
+            }
+            if tx.is_closed() {
+                log::warn!("Event channel closed by receiver at delta_count={delta_count}");
+                *channel_closed = true;
+            } else {
+                send_event(
+                    tx,
+                    hooks,
+                    seq,
+                    AgentEvent::thinking_delta(thinking_id, delta.clone()),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        StreamDelta::Error {
+            message,
+            recoverable,
+        } => {
+            log::warn!(
+                "Stream error received delta_count={delta_count} message={message} recoverable={recoverable}"
+            );
+            if *recoverable {
+                Err(StreamError::Recoverable(message.clone()))
+            } else {
+                Err(StreamError::Fatal(message.clone()))
+            }
+        }
+        StreamDelta::Done { .. }
+        | StreamDelta::Usage(_)
+        | StreamDelta::ToolUseStart { .. }
+        | StreamDelta::ToolInputDelta { .. }
+        | StreamDelta::SignatureDelta { .. }
+        | StreamDelta::RedactedThinking { .. } => Ok(()),
+    }
+}
+
 /// Process a single streaming attempt and return the response or error.
 async fn process_stream<P, H>(
     provider: &Arc<P>,
@@ -177,65 +264,17 @@ where
             Ok(delta) => {
                 delta_count += 1;
                 accumulator.apply(&delta);
-                match &delta {
-                    StreamDelta::TextDelta { delta, .. } => {
-                        // Check if channel is still open before sending
-                        if !channel_closed {
-                            if tx.is_closed() {
-                                log::warn!(
-                                    "Event channel closed by receiver at delta_count={delta_count} - consumer may have disconnected"
-                                );
-                                channel_closed = true;
-                            } else {
-                                send_event(
-                                    tx,
-                                    hooks,
-                                    seq,
-                                    AgentEvent::text_delta(message_id, delta.clone()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    StreamDelta::ThinkingDelta { delta, .. } => {
-                        if !channel_closed {
-                            if tx.is_closed() {
-                                log::warn!(
-                                    "Event channel closed by receiver at delta_count={delta_count}"
-                                );
-                                channel_closed = true;
-                            } else {
-                                send_event(
-                                    tx,
-                                    hooks,
-                                    seq,
-                                    AgentEvent::thinking_delta(thinking_id, delta.clone()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    StreamDelta::Error {
-                        message,
-                        recoverable,
-                    } => {
-                        log::warn!(
-                            "Stream error received delta_count={delta_count} message={message} recoverable={recoverable}"
-                        );
-                        return if *recoverable {
-                            Err(StreamError::Recoverable(message.clone()))
-                        } else {
-                            Err(StreamError::Fatal(message.clone()))
-                        };
-                    }
-                    // These are handled by the accumulator or not needed as events
-                    StreamDelta::Done { .. }
-                    | StreamDelta::Usage(_)
-                    | StreamDelta::ToolUseStart { .. }
-                    | StreamDelta::ToolInputDelta { .. }
-                    | StreamDelta::SignatureDelta { .. }
-                    | StreamDelta::RedactedThinking { .. } => {}
-                }
+                handle_stream_delta_event(StreamDeltaEventParams {
+                    delta: &delta,
+                    tx,
+                    hooks,
+                    seq,
+                    message_id,
+                    thinking_id,
+                    channel_closed: &mut channel_closed,
+                    delta_count,
+                })
+                .await?;
             }
             Err(e) => {
                 log::error!("Stream iteration error delta_count={delta_count} error={e}");

@@ -33,6 +33,240 @@ struct ObservedTurnOutcome {
     total_usage: TokenUsage,
 }
 
+struct MaybeResumeRunLoopParams<'a, Ctx, H, M> {
+    resume_data: Option<ResumeData>,
+    turn: usize,
+    total_usage: &'a TokenUsage,
+    state: &'a AgentState,
+    thread_id: &'a ThreadId,
+    tool_context: &'a crate::tools::ToolContext<Ctx>,
+    tools: &'a Arc<crate::tools::ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    message_store: &'a Arc<M>,
+    execution_store: Option<&'a Arc<dyn crate::stores::ToolExecutionStore>>,
+}
+
+struct MaybeResumeSingleTurnParams<'a, Ctx, H, M, S> {
+    resume_data: Option<ResumeData>,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    thread_id: &'a ThreadId,
+    tool_context: &'a crate::tools::ToolContext<Ctx>,
+    tools: &'a Arc<crate::tools::ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    seq: &'a SequenceCounter,
+    message_store: &'a Arc<M>,
+    state_store: &'a Arc<S>,
+    execution_store: Option<&'a Arc<dyn crate::stores::ToolExecutionStore>>,
+}
+
+struct FinishRunLoopSuccessParams<'a, H, S> {
+    ctx: TurnContext,
+    state_store: &'a Arc<S>,
+    tx: &'a mpsc::Sender<AgentEventEnvelope>,
+    hooks: &'a Arc<H>,
+    seq: &'a SequenceCounter,
+    thread_id: ThreadId,
+}
+
+fn build_turn_context(
+    thread_id: &ThreadId,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    start_time: Instant,
+) -> TurnContext {
+    TurnContext {
+        thread_id: thread_id.clone(),
+        turn,
+        total_usage,
+        state,
+        start_time,
+        compaction_retries: 0,
+        pending_reminder: None,
+    }
+}
+
+async fn maybe_resume_run_loop<Ctx, H, M>(
+    MaybeResumeRunLoopParams {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        execution_store,
+    }: MaybeResumeRunLoopParams<'_, Ctx, H, M>,
+) -> Result<Option<ObservedRunLoopOutcome>, AgentError>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let Some(resume_data) = resume_data else {
+        return Ok(None);
+    };
+
+    let resume_result = handle_run_loop_resume(RunLoopResumeParams {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        execution_store,
+    })
+    .await;
+
+    match resume_result {
+        Ok(Some(outcome)) => {
+            #[cfg(feature = "otel")]
+            let observed_total_usage = match &outcome {
+                AgentRunState::Done { .. } | AgentRunState::Refusal { .. } => total_usage.clone(),
+                _ => TokenUsage::default(),
+            };
+            Ok(Some(ObservedRunLoopOutcome {
+                state: outcome,
+                #[cfg(feature = "otel")]
+                total_usage: observed_total_usage,
+            }))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            send_event(
+                tx,
+                hooks,
+                seq,
+                AgentEvent::error(&error.message, error.recoverable),
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+async fn maybe_resume_single_turn<Ctx, H, M, S>(
+    MaybeResumeSingleTurnParams {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id,
+        tool_context,
+        tools,
+        hooks,
+        tx,
+        seq,
+        message_store,
+        state_store,
+        execution_store,
+    }: MaybeResumeSingleTurnParams<'_, Ctx, H, M, S>,
+) -> Option<ObservedTurnOutcome>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    let resume_data = resume_data?;
+    let mut resume_tool_context = crate::tools::ToolContext::new(tool_context.app.clone());
+    resume_tool_context.metadata = tool_context.metadata.clone();
+    if let Some(event_tx) = tool_context.event_tx()
+        && let Some(event_seq) = tool_context.event_seq()
+    {
+        resume_tool_context = resume_tool_context.with_event_tx(event_tx, event_seq);
+    }
+    if let Some(cancel_token) = tool_context.cancel_token() {
+        resume_tool_context = resume_tool_context.with_cancel_token(cancel_token);
+    }
+    if let Some(semaphore) = tool_context.subagent_semaphore() {
+        resume_tool_context = resume_tool_context.with_subagent_semaphore(semaphore);
+    }
+
+    let outcome = handle_single_turn_resume(SingleTurnResumeParams {
+        resume_data,
+        turn,
+        total_usage: total_usage.clone(),
+        state,
+        thread_id: thread_id.clone(),
+        tool_context: resume_tool_context,
+        tools: tools.clone(),
+        hooks: hooks.clone(),
+        tx: tx.clone(),
+        seq: seq.clone(),
+        message_store: message_store.clone(),
+        state_store: state_store.clone(),
+        execution_store: execution_store.cloned(),
+    })
+    .await;
+    #[cfg(feature = "otel")]
+    let observed_total_usage = match &outcome {
+        TurnOutcome::Done { .. }
+        | TurnOutcome::Refusal { .. }
+        | TurnOutcome::NeedsMoreTurns { .. } => total_usage,
+        TurnOutcome::AwaitingConfirmation { .. }
+        | TurnOutcome::Cancelled { .. }
+        | TurnOutcome::Error(_) => TokenUsage::default(),
+    };
+    Some(ObservedTurnOutcome {
+        outcome,
+        #[cfg(feature = "otel")]
+        total_usage: observed_total_usage,
+    })
+}
+
+async fn finish_run_loop_success<H, S>(
+    FinishRunLoopSuccessParams {
+        ctx,
+        state_store,
+        tx,
+        hooks,
+        seq,
+        thread_id,
+    }: FinishRunLoopSuccessParams<'_, H, S>,
+) -> ObservedRunLoopOutcome
+where
+    H: AgentHooks,
+    S: StateStore,
+{
+    if let Err(error) = state_store.save(&ctx.state).await {
+        warn!("Failed to save final state: {error}");
+    }
+
+    let duration = ctx.start_time.elapsed();
+    send_event(
+        tx,
+        hooks,
+        seq,
+        AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
+    )
+    .await;
+
+    ObservedRunLoopOutcome {
+        state: AgentRunState::Done {
+            total_turns: turns_to_u32(ctx.turn),
+            input_tokens: u64::from(ctx.total_usage.input_tokens),
+            output_tokens: u64::from(ctx.total_usage.output_tokens),
+        },
+        #[cfg(feature = "otel")]
+        total_usage: ctx.total_usage.clone(),
+    }
+}
+
 /// Initialize agent state from the given input.
 ///
 /// Handles the three input variants:
@@ -772,65 +1006,34 @@ where
         resume_data,
     } = init_state;
 
-    if let Some(resume_data) = resume_data {
-        let resume_result = handle_run_loop_resume(RunLoopResumeParams {
-            resume_data,
-            turn,
-            total_usage: &total_usage,
-            state: &state,
-            thread_id: &thread_id,
-            tool_context: &tool_context,
-            tools: &tools,
-            hooks: &hooks,
-            tx: &tx,
-            seq: &seq,
-            message_store: &message_store,
-            execution_store: execution_store.as_ref(),
-        })
-        .await;
-
-        match resume_result {
-            Ok(Some(outcome)) => {
+    match maybe_resume_run_loop(MaybeResumeRunLoopParams {
+        resume_data,
+        turn,
+        total_usage: &total_usage,
+        state: &state,
+        thread_id: &thread_id,
+        tool_context: &tool_context,
+        tools: &tools,
+        hooks: &hooks,
+        tx: &tx,
+        seq: &seq,
+        message_store: &message_store,
+        execution_store: execution_store.as_ref(),
+    })
+    .await
+    {
+        Ok(Some(outcome)) => return outcome,
+        Ok(None) => {}
+        Err(error) => {
+            return ObservedRunLoopOutcome {
+                state: AgentRunState::Error(error),
                 #[cfg(feature = "otel")]
-                let observed_total_usage = match &outcome {
-                    AgentRunState::Done { .. } | AgentRunState::Refusal { .. } => {
-                        total_usage.clone()
-                    }
-                    _ => TokenUsage::default(),
-                };
-                return ObservedRunLoopOutcome {
-                    state: outcome,
-                    #[cfg(feature = "otel")]
-                    total_usage: observed_total_usage,
-                };
-            }
-            Ok(None) => {}
-            Err(error) => {
-                send_event(
-                    &tx,
-                    &hooks,
-                    &seq,
-                    AgentEvent::error(&error.message, error.recoverable),
-                )
-                .await;
-                return ObservedRunLoopOutcome {
-                    state: AgentRunState::Error(error),
-                    #[cfg(feature = "otel")]
-                    total_usage: TokenUsage::default(),
-                };
-            }
+                total_usage: TokenUsage::default(),
+            };
         }
     }
 
-    let mut ctx = TurnContext {
-        thread_id: thread_id.clone(),
-        turn,
-        total_usage,
-        state,
-        start_time,
-        compaction_retries: 0,
-        pending_reminder: None,
-    };
+    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
 
     if let Some(outcome) = run_loop_turns(RunLoopTurnsParams {
         ctx: &mut ctx,
@@ -862,28 +1065,15 @@ where
         };
     }
 
-    if let Err(e) = state_store.save(&ctx.state).await {
-        warn!("Failed to save final state: {e}");
-    }
-
-    let duration = ctx.start_time.elapsed();
-    send_event(
-        &tx,
-        &hooks,
-        &seq,
-        AgentEvent::done(thread_id, ctx.turn, ctx.total_usage.clone(), duration),
-    )
-    .await;
-
-    ObservedRunLoopOutcome {
-        state: AgentRunState::Done {
-            total_turns: turns_to_u32(ctx.turn),
-            input_tokens: u64::from(ctx.total_usage.input_tokens),
-            output_tokens: u64::from(ctx.total_usage.output_tokens),
-        },
-        #[cfg(feature = "otel")]
-        total_usage: ctx.total_usage.clone(),
-    }
+    finish_run_loop_success(FinishRunLoopSuccessParams {
+        ctx,
+        state_store: &state_store,
+        tx: &tx,
+        hooks: &hooks,
+        seq: &seq,
+        thread_id,
+    })
+    .await
 }
 
 /// Run a single turn of the agent loop.
@@ -1021,48 +1211,27 @@ where
         resume_data,
     } = init_state;
 
-    if let Some(resume_data) = resume_data {
-        let outcome = handle_single_turn_resume(SingleTurnResumeParams {
-            resume_data,
-            turn,
-            total_usage: total_usage.clone(),
-            state,
-            thread_id,
-            tool_context,
-            tools,
-            hooks,
-            tx,
-            seq,
-            message_store,
-            state_store,
-            execution_store,
-        })
-        .await;
-        #[cfg(feature = "otel")]
-        let observed_total_usage = match &outcome {
-            TurnOutcome::Done { .. }
-            | TurnOutcome::Refusal { .. }
-            | TurnOutcome::NeedsMoreTurns { .. } => total_usage,
-            TurnOutcome::AwaitingConfirmation { .. }
-            | TurnOutcome::Cancelled { .. }
-            | TurnOutcome::Error(_) => TokenUsage::default(),
-        };
-        return ObservedTurnOutcome {
-            outcome,
-            #[cfg(feature = "otel")]
-            total_usage: observed_total_usage,
-        };
+    if let Some(outcome) = maybe_resume_single_turn(MaybeResumeSingleTurnParams {
+        resume_data,
+        turn,
+        total_usage: total_usage.clone(),
+        state: state.clone(),
+        thread_id: &thread_id,
+        tool_context: &tool_context,
+        tools: &tools,
+        hooks: &hooks,
+        tx: &tx,
+        seq: &seq,
+        message_store: &message_store,
+        state_store: &state_store,
+        execution_store: execution_store.as_ref(),
+    })
+    .await
+    {
+        return outcome;
     }
 
-    let mut ctx = TurnContext {
-        thread_id: thread_id.clone(),
-        turn,
-        total_usage,
-        state,
-        start_time,
-        compaction_retries: 0,
-        pending_reminder: None,
-    };
+    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
 
     let result = execute_turn(ExecuteTurnParameters {
         tx: &tx,
