@@ -225,6 +225,7 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     });
     let stop_reason = accumulator.take_stop_reason();
     let content = accumulator.into_content_blocks();

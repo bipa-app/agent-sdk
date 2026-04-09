@@ -133,12 +133,22 @@ impl RetryConfig {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cached_input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 impl TokenUsage {
     pub const fn add(&mut self, other: &Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
     }
 }
 
@@ -287,15 +297,13 @@ pub enum AgentRunState {
     /// Agent completed successfully.
     Done {
         total_turns: u32,
-        input_tokens: u64,
-        output_tokens: u64,
+        total_usage: TokenUsage,
     },
 
     /// Agent was refused by the model (safety/policy).
     Refusal {
         total_turns: u32,
-        input_tokens: u64,
-        output_tokens: u64,
+        total_usage: TokenUsage,
     },
 
     /// Agent encountered an error.
@@ -321,8 +329,7 @@ pub enum AgentRunState {
     /// Agent run was cancelled via a cancellation token.
     Cancelled {
         total_turns: u32,
-        input_tokens: u64,
-        output_tokens: u64,
+        total_usage: TokenUsage,
     },
 }
 
@@ -753,10 +760,8 @@ pub enum TurnOutcome {
     Done {
         /// Total turns executed
         total_turns: u32,
-        /// Total input tokens consumed
-        input_tokens: u64,
-        /// Total output tokens consumed
-        output_tokens: u64,
+        /// Cumulative token usage
+        total_usage: TokenUsage,
         /// Structured server-facing outcome metadata.
         summary: TurnSummary,
     },
@@ -786,10 +791,8 @@ pub enum TurnOutcome {
     Refusal {
         /// Total turns executed
         total_turns: u32,
-        /// Total input tokens consumed
-        input_tokens: u64,
-        /// Total output tokens consumed
-        output_tokens: u64,
+        /// Cumulative token usage
+        total_usage: TokenUsage,
         /// Structured server-facing outcome metadata.
         summary: TurnSummary,
     },
@@ -798,10 +801,8 @@ pub enum TurnOutcome {
     Cancelled {
         /// Total turns executed before cancellation
         total_turns: u32,
-        /// Total input tokens consumed
-        input_tokens: u64,
-        /// Total output tokens consumed
-        output_tokens: u64,
+        /// Cumulative token usage
+        total_usage: TokenUsage,
         /// Structured server-facing outcome metadata.
         summary: TurnSummary,
     },
@@ -1029,10 +1030,12 @@ mod tests {
             turn_usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             total_usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 75,
+                ..Default::default()
             },
             provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
             response_id: Some("resp_123".into()),
@@ -1096,20 +1099,17 @@ mod tests {
             },
             TurnOutcome::Done {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
             TurnOutcome::Refusal {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
             TurnOutcome::Cancelled {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
         ];
@@ -1177,10 +1177,12 @@ mod tests {
             total_usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 80,
+                ..Default::default()
             },
             turn_usage: TokenUsage {
                 input_tokens: 50,
                 output_tokens: 40,
+                ..Default::default()
             },
             pending_tool_calls: vec![PendingToolCallInfo {
                 id: "call_1".into(),

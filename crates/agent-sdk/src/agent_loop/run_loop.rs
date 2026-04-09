@@ -1078,8 +1078,7 @@ fn cancelled_turn_outcome(
 ) -> TurnOutcome {
     TurnOutcome::Cancelled {
         total_turns: 0,
-        input_tokens: 0,
-        output_tokens: 0,
+        total_usage: TokenUsage::default(),
         summary: empty_turn_summary(thread_id, turn, provenance, turn_options),
     }
 }
@@ -1091,24 +1090,21 @@ const fn turn_outcome_keeps_turn_open(outcome: &TurnOutcome) -> bool {
 fn done_run_state(ctx: &TurnContext) -> AgentRunState {
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
+        total_usage: ctx.total_usage.clone(),
     }
 }
 
 fn cancelled_run_state(ctx: &TurnContext) -> AgentRunState {
     AgentRunState::Cancelled {
         total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
+        total_usage: ctx.total_usage.clone(),
     }
 }
 
 fn refusal_run_state(ctx: &TurnContext) -> AgentRunState {
     AgentRunState::Refusal {
         total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
+        total_usage: ctx.total_usage.clone(),
     }
 }
 
@@ -1330,8 +1326,7 @@ where
 
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
+        total_usage: ctx.total_usage.clone(),
     }
 }
 
@@ -1675,24 +1670,32 @@ where
     #[cfg(feature = "otel")]
     {
         use crate::observability::instrument::{end_root_span, run_state_outcome};
-        let (turns, inp, out) = match &result {
+
+        let (turns, total_usage) = match &result {
             AgentRunState::Done {
                 total_turns,
-                input_tokens,
-                output_tokens,
+                total_usage,
             }
             | AgentRunState::Refusal {
                 total_turns,
-                input_tokens,
-                output_tokens,
-            } => (
-                usize::try_from(*total_turns).unwrap_or(0),
-                *input_tokens,
-                *output_tokens,
-            ),
-            _ => (0, 0, 0),
+                total_usage,
+            } => (usize::try_from(*total_turns).unwrap_or(0), total_usage),
+            _ => {
+                static EMPTY: TokenUsage = TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                };
+                (0, &EMPTY)
+            }
         };
-        end_root_span(&mut root_span, turns, inp, out, run_state_outcome(&result));
+        end_root_span(
+            &mut root_span,
+            turns,
+            total_usage,
+            run_state_outcome(&result),
+        );
     }
 
     result
@@ -1862,33 +1865,42 @@ where
     #[cfg(feature = "otel")]
     {
         use crate::observability::instrument::{end_root_span, turn_outcome_str};
-        let (turns, inp, out) = match &outcome {
+
+        let (turns, total_usage) = match &outcome {
             TurnOutcome::Done {
                 total_turns,
-                input_tokens,
-                output_tokens,
+                total_usage,
                 ..
             }
             | TurnOutcome::Refusal {
                 total_turns,
-                input_tokens,
-                output_tokens,
+                total_usage,
                 ..
-            } => (
-                usize::try_from(*total_turns).unwrap_or(0),
-                *input_tokens,
-                *output_tokens,
-            ),
+            }
+            | TurnOutcome::Cancelled {
+                total_turns,
+                total_usage,
+                ..
+            } => (usize::try_from(*total_turns).unwrap_or(0), total_usage),
             TurnOutcome::NeedsMoreTurns {
                 turn, total_usage, ..
-            } => (
-                *turn,
-                u64::from(total_usage.input_tokens),
-                u64::from(total_usage.output_tokens),
-            ),
-            _ => (0, 0, 0),
+            } => (*turn, total_usage),
+            _ => {
+                static EMPTY: TokenUsage = TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                };
+                (0, &EMPTY)
+            }
         };
-        end_root_span(&mut root_span, turns, inp, out, turn_outcome_str(&outcome));
+        end_root_span(
+            &mut root_span,
+            turns,
+            total_usage,
+            turn_outcome_str(&outcome),
+        );
     }
 
     outcome
@@ -2189,8 +2201,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
             TurnOutcome::Done {
                 total_turns: turns_to_u32(ctx.turn),
-                input_tokens: u64::from(ctx.total_usage.input_tokens),
-                output_tokens: u64::from(ctx.total_usage.output_tokens),
+                total_usage: ctx.total_usage.clone(),
                 summary,
             }
         }
@@ -2199,8 +2210,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
             TurnOutcome::Refusal {
                 total_turns: turns_to_u32(ctx.turn),
-                input_tokens: u64::from(ctx.total_usage.input_tokens),
-                output_tokens: u64::from(ctx.total_usage.output_tokens),
+                total_usage: ctx.total_usage.clone(),
                 summary,
             }
         }

@@ -271,10 +271,12 @@ mod tests {
             total_usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             turn_usage: TokenUsage {
                 input_tokens: 30,
                 output_tokens: 20,
+                ..Default::default()
             },
             pending_tool_calls: vec![
                 PendingToolCallInfo {
@@ -518,10 +520,12 @@ mod tests {
             total_usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 100,
+                ..Default::default()
             },
             turn_usage: TokenUsage {
                 input_tokens: 40,
                 output_tokens: 30,
+                ..Default::default()
             },
             pending_tool_calls: vec![PendingToolCallInfo {
                 id: "call_1".into(),
@@ -643,10 +647,12 @@ mod tests {
             turn_usage: TokenUsage {
                 input_tokens: 150,
                 output_tokens: 75,
+                ..Default::default()
             },
             total_usage: TokenUsage {
                 input_tokens: 450,
                 output_tokens: 200,
+                ..Default::default()
             },
             provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
             response_id: Some("msg_abc123".into()),
@@ -728,13 +734,16 @@ mod tests {
     /// variant shape is stable.
     #[test]
     fn server_can_pattern_match_summary_off_done_outcome() {
-        use agent_sdk_core::TurnOutcome;
+        use agent_sdk_core::{TokenUsage, TurnOutcome};
 
         let summary = sample_turn_summary();
         let outcome = TurnOutcome::Done {
             total_turns: 3,
-            input_tokens: 450,
-            output_tokens: 200,
+            total_usage: TokenUsage {
+                input_tokens: 450,
+                output_tokens: 200,
+                ..Default::default()
+            },
             summary: summary.clone(),
         };
 
@@ -805,8 +814,7 @@ mod tests {
             },
             TurnOutcome::Done {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
             TurnOutcome::AwaitingConfirmation {
@@ -820,14 +828,12 @@ mod tests {
             },
             TurnOutcome::Refusal {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
             TurnOutcome::Cancelled {
                 total_turns: 1,
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: TokenUsage::default(),
                 summary: summary.clone(),
             },
             TurnOutcome::PendingToolCalls {

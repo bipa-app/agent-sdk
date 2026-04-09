@@ -1110,6 +1110,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 20,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 },
             })
         }
@@ -1129,6 +1130,7 @@ mod tests {
                     input_tokens: 15,
                     output_tokens: 25,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 },
             })
         }
@@ -1148,6 +1150,7 @@ mod tests {
                     input_tokens: 12,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 },
             })
         }
@@ -1438,6 +1441,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 1500,
                 output_tokens: 500,
+                ..Default::default()
             },
             success: true,
             duration_ms: 2500,

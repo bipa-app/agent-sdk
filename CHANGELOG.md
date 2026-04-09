@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cached token usage observability** - OpenTelemetry spans now emit `gen_ai.usage.cache_creation.input_tokens` and `gen_ai.usage.cache_read.input_tokens`, and provider usage mappings preserve cache-read and cache-creation token breakdowns.
+
 - **`TurnSummary` server-facing outcome contract (ENG-7914)** - Every `TurnOutcome` variant except `Error` now carries a structured `TurnSummary` alongside the legacy per-variant fields. The summary captures provider/model provenance, response ID, stop reason, tool-call count, wall-clock duration, and the `TurnOptions` used for the turn. This is the authoritative Phase 1 contract later server phases (journal, workers, transport, storage) build on. Use `TurnOutcome::summary()` to extract it, or pattern-match on the `summary` field directly.
 
   - `TurnSummary` is fully `Serialize + Deserialize` with a stable `snake_case` JSON wire format so servers can persist it directly as part of durable turn rows.

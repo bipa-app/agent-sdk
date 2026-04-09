@@ -19,6 +19,9 @@ pub const GEN_AI_REQUEST_MAX_OUTPUT_TOKENS: &str = "gen_ai.request.max_output_to
 
 pub const GEN_AI_USAGE_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
 pub const GEN_AI_USAGE_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+pub const GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS: &str =
+    "gen_ai.usage.cache_creation.input_tokens";
+pub const GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
 
 pub const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
 pub const GEN_AI_TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
@@ -46,6 +49,8 @@ pub const SDK_TURN_TOOL_CALL_COUNT: &str = "agent_sdk.turn.tool_call_count";
 pub const SDK_TURN_STOP_REASON: &str = "agent_sdk.turn.stop_reason";
 pub const SDK_TURN_INPUT_TOKENS: &str = "agent_sdk.turn.input_tokens";
 pub const SDK_TURN_OUTPUT_TOKENS: &str = "agent_sdk.turn.output_tokens";
+pub const SDK_TURN_CACHE_CREATION_INPUT_TOKENS: &str = "agent_sdk.turn.cache_creation_input_tokens";
+pub const SDK_TURN_CACHE_READ_INPUT_TOKENS: &str = "agent_sdk.turn.cache_read_input_tokens";
 
 pub const SDK_LLM_STREAMING: &str = "agent_sdk.llm.streaming";
 pub const SDK_LLM_HAD_TOOL_CALLS: &str = "agent_sdk.llm.had_tool_calls";

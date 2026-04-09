@@ -202,6 +202,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 },
                 |u| Usage {
                     input_tokens: u.input_tokens,
@@ -210,6 +211,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                         .input_tokens_details
                         .as_ref()
                         .map_or(0, |details| details.cached_tokens),
+                    cache_creation_input_tokens: 0,
                 },
             ),
         }))
@@ -398,6 +400,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                                             .input_tokens_details
                                             .as_ref()
                                             .map_or(0, |details| details.cached_tokens),
+                                        cache_creation_input_tokens: 0,
                                     });
                                 }
                             }

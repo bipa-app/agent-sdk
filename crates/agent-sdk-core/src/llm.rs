@@ -357,6 +357,9 @@ pub struct Usage {
     /// Portion of `input_tokens` billed at a cached-input rate, when reported.
     #[serde(default)]
     pub cached_input_tokens: u32,
+    /// Portion of `input_tokens` spent creating provider-side prompt cache entries.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Clone)]

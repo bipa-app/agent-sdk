@@ -268,6 +268,10 @@ impl ApiUsage {
     pub const fn cached_input_tokens(&self) -> u32 {
         self.cache_read_input
     }
+
+    pub const fn cache_creation_input_tokens(&self) -> u32 {
+        self.cache_creation_input
+    }
 }
 
 // ============================================================================
@@ -301,6 +305,10 @@ impl SseMessageStartUsage {
 
     pub const fn cached_input_tokens(&self) -> u32 {
         self.cache_read
+    }
+
+    pub const fn cache_creation_input_tokens(&self) -> u32 {
+        self.cache_creation
     }
 }
 
@@ -714,6 +722,7 @@ pub fn parse_sse_event(
     input_tokens: &mut u32,
     output_tokens: &mut u32,
     cached_input_tokens: &mut u32,
+    cache_creation_input_tokens: &mut u32,
     tool_ids: &mut std::collections::HashMap<usize, String>,
     pending_stop_reason: &mut Option<StopReason>,
 ) -> Option<StreamDelta> {
@@ -727,6 +736,8 @@ pub fn parse_sse_event(
             match serde_json::from_str::<SseMessageStart>(&data) {
                 Ok(event) => {
                     *cached_input_tokens = event.message.usage.cached_input_tokens();
+                    *cache_creation_input_tokens =
+                        event.message.usage.cache_creation_input_tokens();
                     *input_tokens = event.message.usage.total_input_tokens();
                 }
                 Err(error) => log_sse_parse_error(&event_type, &data, &error),
@@ -815,6 +826,7 @@ pub fn parse_sse_event(
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
                 cached_input_tokens: *cached_input_tokens,
+                cache_creation_input_tokens: *cache_creation_input_tokens,
             }))
         }
         _ => None,
@@ -1090,6 +1102,23 @@ mod tests {
     }
 
     #[test]
+    fn test_api_usage_deserializes_cache_breakdown() {
+        let usage: ApiUsage = serde_json::from_str(
+            r#"{
+                "input_tokens": 150,
+                "output_tokens": 30,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 20
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.total_input_tokens(), 180);
+        assert_eq!(usage.cached_input_tokens(), 20);
+        assert_eq!(usage.cache_creation_input_tokens(), 10);
+    }
+
+    #[test]
     fn test_api_response_with_tool_use_deserialization() {
         let json = r#"{
             "id": "msg_456",
@@ -1177,6 +1206,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1184,6 +1214,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1202,6 +1233,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1209,6 +1241,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1230,6 +1263,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         // Pre-populate tool_ids as if we received the tool_use_start event
         let mut tool_ids = std::collections::HashMap::new();
         tool_ids.insert(1, "toolu_123".to_string());
@@ -1240,6 +1274,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1255,11 +1290,12 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
     #[test]
     fn test_sse_message_start_captures_input_tokens() {
         let event = r#"event: message_start
-data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":150}}}"#;
+data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":150,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}}}"#;
 
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1267,12 +1303,15 @@ data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
 
         assert!(delta.is_none());
-        assert_eq!(input_tokens, 150);
+        assert_eq!(input_tokens, 180);
+        assert_eq!(cached_input_tokens, 20);
+        assert_eq!(cache_creation_input_tokens, 10);
     }
 
     #[test]
@@ -1283,6 +1322,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1290,6 +1330,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1306,9 +1347,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         let event = r#"event: message_stop
 data: {"type":"message_stop"}"#;
 
-        let mut input_tokens = 100;
+        let mut input_tokens = 180;
         let mut output_tokens = 50;
-        let mut cached_input_tokens = 0;
+        let mut cached_input_tokens = 20;
+        let mut cache_creation_input_tokens = 10;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1316,6 +1358,7 @@ data: {"type":"message_stop"}"#;
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1323,9 +1366,10 @@ data: {"type":"message_stop"}"#;
         assert!(matches!(
             delta,
             Some(StreamDelta::Usage(Usage {
-                input_tokens: 100,
+                input_tokens: 180,
                 output_tokens: 50,
-                ..
+                cached_input_tokens: 20,
+                cache_creation_input_tokens: 10,
             }))
         ));
     }
@@ -1348,6 +1392,7 @@ data: {"type":"message_stop"}"#;
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1355,6 +1400,7 @@ data: {"type":"message_stop"}"#;
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
@@ -1413,6 +1459,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut tool_ids = std::collections::HashMap::new();
         let mut pending_stop_reason = None;
         let delta = parse_sse_event(
@@ -1420,6 +1467,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
             &mut input_tokens,
             &mut output_tokens,
             &mut cached_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut tool_ids,
             &mut pending_stop_reason,
         );
