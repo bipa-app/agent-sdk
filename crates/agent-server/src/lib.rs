@@ -56,7 +56,7 @@ pub use agent_sdk_tools;
 pub use agent_sdk_providers;
 
 /// Convenience re-export of the server execution options and event-store types.
-pub use agent_sdk_core::{ToolRuntime, TurnOptions, TurnOutcome};
+pub use agent_sdk_core::{ExternalToolResult, ToolRuntime, TurnOptions, TurnOutcome};
 /// Durable reconstruction contract for worker-context recovery.
 pub use agent_sdk_tools::{
     DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
@@ -119,6 +119,79 @@ mod tests {
         let store = InMemoryEventStore::new();
         let _: &dyn EventStore = &store;
         let _: StoredTurnEvents = StoredTurnEvents::default();
+    }
+
+    /// Prove the external tool handoff types are reachable from the server
+    /// crate and round-trip through JSON for durable persistence.
+    #[test]
+    fn external_tool_handoff_types_are_reachable_and_serializable() -> anyhow::Result<()> {
+        use agent_sdk_core::{
+            AgentContinuation, AgentState, ExternalToolResult, PendingToolCallInfo, TokenUsage,
+            ToolResult,
+        };
+
+        // Construct a PendingToolCalls continuation (the handoff payload)
+        let thread = ThreadId::new();
+        let continuation = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 3,
+            total_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            turn_usage: TokenUsage {
+                input_tokens: 30,
+                output_tokens: 20,
+            },
+            pending_tool_calls: vec![
+                PendingToolCallInfo {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    display_name: "Read File".into(),
+                    input: serde_json::json!({"path": "/tmp/foo.txt"}),
+                    listen_context: None,
+                },
+                PendingToolCallInfo {
+                    id: "call_2".into(),
+                    name: "write_file".into(),
+                    display_name: "Write File".into(),
+                    input: serde_json::json!({"path": "/tmp/bar.txt", "content": "hello"}),
+                    listen_context: None,
+                },
+            ],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread.clone()),
+        };
+
+        // Round-trip the continuation through JSON (server persistence)
+        let json = serde_json::to_string(&continuation)?;
+        let recovered: AgentContinuation = serde_json::from_str(&json)?;
+        assert_eq!(recovered.thread_id, thread);
+        assert_eq!(recovered.turn, 3);
+        assert_eq!(recovered.pending_tool_calls.len(), 2);
+
+        // Construct the external results
+        let results = vec![
+            ExternalToolResult {
+                tool_call_id: "call_1".into(),
+                result: ToolResult::success("file contents here"),
+            },
+            ExternalToolResult {
+                tool_call_id: "call_2".into(),
+                result: ToolResult::success("written 5 bytes"),
+            },
+        ];
+
+        // Round-trip results through JSON
+        let results_json = serde_json::to_string(&results)?;
+        let recovered_results: Vec<ExternalToolResult> = serde_json::from_str(&results_json)?;
+        assert_eq!(recovered_results.len(), 2);
+        assert_eq!(recovered_results[0].tool_call_id, "call_1");
+        assert!(recovered_results[0].result.success);
+        assert_eq!(recovered_results[1].tool_call_id, "call_2");
+
+        Ok(())
     }
 
     /// Demonstrate that a server can seed an authority with an offset and

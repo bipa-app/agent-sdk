@@ -391,9 +391,9 @@ pub use authority::{EventAuthority, LocalEventAuthority};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
-    TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
-    TurnOutcome,
+    ExecutionStatus, ExternalToolResult, ListenExecutionContext, PendingToolCallInfo, RetryConfig,
+    ThreadId, TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier,
+    TurnOptions, TurnOutcome,
 };
 
 // agent-sdk-tools (via thin modules)

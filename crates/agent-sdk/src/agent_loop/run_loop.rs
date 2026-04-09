@@ -36,6 +36,7 @@ enum RunLoopTurnAction {
 /// - `Text`: Creates/loads state, appends user message
 /// - `Resume`: Restores from continuation state
 /// - `Continue`: Loads existing state to continue execution
+#[allow(clippy::too_many_lines)]
 pub(super) async fn initialize_from_input<M, S>(
     input: AgentInput,
     thread_id: &ThreadId,
@@ -129,6 +130,10 @@ where
                 }),
             })
         }
+        AgentInput::SubmitToolResults {
+            continuation,
+            results,
+        } => initialize_from_tool_results(continuation, results, thread_id, message_store).await,
         AgentInput::Continue => {
             // Load existing state to continue execution
             let state = match state_store.load(thread_id).await {
@@ -158,6 +163,39 @@ where
     }
 }
 
+/// Handle `AgentInput::SubmitToolResults`: validate, append results, return state.
+async fn initialize_from_tool_results<M: MessageStore>(
+    continuation: Box<AgentContinuation>,
+    results: Vec<crate::types::ExternalToolResult>,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+) -> Result<InitializedState, AgentError> {
+    if continuation.thread_id != *thread_id {
+        return Err(AgentError::new(
+            format!(
+                "Thread ID mismatch: continuation is for {}, but resuming on {}",
+                continuation.thread_id, thread_id
+            ),
+            false,
+        ));
+    }
+
+    validate_external_tool_results(&continuation, &results)?;
+
+    let tool_results: Vec<(String, crate::types::ToolResult)> = results
+        .into_iter()
+        .map(|r| (r.tool_call_id, r.result))
+        .collect();
+    append_tool_results(&tool_results, thread_id, message_store).await?;
+
+    Ok(InitializedState {
+        turn: continuation.turn,
+        total_usage: continuation.total_usage.clone(),
+        state: continuation.state.clone(),
+        resume_data: None,
+    })
+}
+
 fn validate_resume_continuation(
     cont: &AgentContinuation,
     tool_call_id: &str,
@@ -182,6 +220,51 @@ fn validate_resume_continuation(
             false,
         ));
     }
+    Ok(())
+}
+
+/// Validate that the caller provided exactly one result per pending tool call.
+fn validate_external_tool_results(
+    cont: &AgentContinuation,
+    results: &[crate::types::ExternalToolResult],
+) -> Result<(), AgentError> {
+    if cont.pending_tool_calls.is_empty() {
+        return Err(AgentError::new(
+            "Invalid continuation: no pending tool calls to resolve",
+            false,
+        ));
+    }
+
+    // Check for missing results.
+    for pending in &cont.pending_tool_calls {
+        if !results.iter().any(|r| r.tool_call_id == pending.id) {
+            return Err(AgentError::new(
+                format!(
+                    "Missing result for tool call '{}' (tool '{}')",
+                    pending.id, pending.name,
+                ),
+                false,
+            ));
+        }
+    }
+
+    // Check for unknown tool call IDs.
+    for result in results {
+        if !cont
+            .pending_tool_calls
+            .iter()
+            .any(|p| p.id == result.tool_call_id)
+        {
+            return Err(AgentError::new(
+                format!(
+                    "Unknown tool call ID '{}' — not in the pending tool calls",
+                    result.tool_call_id,
+                ),
+                false,
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1518,5 +1601,152 @@ mod tests {
             };
             assert_eq!(*is_error, Some(true));
         }
+    }
+
+    #[test]
+    fn test_validate_external_tool_results_ok() {
+        use crate::types::{
+            AgentContinuation, AgentState, ExternalToolResult, PendingToolCallInfo, TokenUsage,
+            ToolResult,
+        };
+
+        let thread = ThreadId::new();
+        let cont = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: "call_1".into(),
+                name: "echo".into(),
+                display_name: "Echo".into(),
+                input: serde_json::json!({}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+        };
+
+        let results = vec![ExternalToolResult {
+            tool_call_id: "call_1".into(),
+            result: ToolResult::success("ok"),
+        }];
+
+        assert!(validate_external_tool_results(&cont, &results).is_ok());
+    }
+
+    #[test]
+    fn test_validate_external_tool_results_missing() {
+        use crate::types::{AgentContinuation, AgentState, PendingToolCallInfo, TokenUsage};
+
+        let thread = ThreadId::new();
+        let cont = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![
+                PendingToolCallInfo {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    display_name: "Echo".into(),
+                    input: serde_json::json!({}),
+                    listen_context: None,
+                },
+                PendingToolCallInfo {
+                    id: "call_2".into(),
+                    name: "write".into(),
+                    display_name: "Write".into(),
+                    input: serde_json::json!({}),
+                    listen_context: None,
+                },
+            ],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+        };
+
+        // Only provide one result for two pending calls
+        let results = vec![crate::types::ExternalToolResult {
+            tool_call_id: "call_1".into(),
+            result: crate::types::ToolResult::success("ok"),
+        }];
+
+        let err = validate_external_tool_results(&cont, &results);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("call_2"),
+            "Error should mention missing call_2: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_external_tool_results_unknown_id() {
+        use crate::types::{
+            AgentContinuation, AgentState, ExternalToolResult, PendingToolCallInfo, TokenUsage,
+            ToolResult,
+        };
+
+        let thread = ThreadId::new();
+        let cont = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: "call_1".into(),
+                name: "echo".into(),
+                display_name: "Echo".into(),
+                input: serde_json::json!({}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+        };
+
+        // Provide the correct result AND an extra unknown one
+        let results = vec![
+            ExternalToolResult {
+                tool_call_id: "call_1".into(),
+                result: ToolResult::success("ok"),
+            },
+            ExternalToolResult {
+                tool_call_id: "bogus_id".into(),
+                result: ToolResult::success("extra"),
+            },
+        ];
+
+        let err = validate_external_tool_results(&cont, &results);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("bogus_id"),
+            "Error should mention bogus_id: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_external_tool_results_empty_continuation() {
+        use crate::types::{AgentContinuation, AgentState, TokenUsage};
+
+        let thread = ThreadId::new();
+        let cont = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+        };
+
+        let err = validate_external_tool_results(&cont, &[]);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("no pending tool calls"), "Error: {msg}");
     }
 }
