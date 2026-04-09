@@ -10,8 +10,8 @@
 
 use agent_sdk::{
     AgentEvent, AgentHooks, AgentInput, CancellationToken, DynamicToolName, EventStore,
-    InMemoryEventStore, InMemoryStore, ThreadId, Tool, ToolContext, ToolDecision, ToolRegistry,
-    ToolResult, ToolTier, builder, providers::AnthropicProvider,
+    InMemoryEventStore, InMemoryStore, ThreadId, Tool, ToolContext, ToolDecision, ToolInvocation,
+    ToolRegistry, ToolResult, ToolTier, builder, providers::AnthropicProvider,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -98,12 +98,14 @@ impl CustomHooks {
 
 #[async_trait]
 impl AgentHooks for CustomHooks {
-    async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
         let count = self.tool_call_count.fetch_add(1, Ordering::SeqCst);
 
         println!(
-            "[Hooks] pre_tool_use: {tool_name} (call #{}, tier: {tier:?})",
-            count + 1
+            "[Hooks] pre_tool_use: {} (call #{}, tier: {:?})",
+            invocation.tool_name,
+            count + 1,
+            invocation.tier,
         );
 
         // Rate limiting: block if too many tool calls
@@ -120,14 +122,17 @@ impl AgentHooks for CustomHooks {
 
         // For Confirm tier tools, we could prompt the user
         // For this example, we'll auto-approve with logging
-        match tier {
+        match invocation.tier {
             ToolTier::Observe => {
                 println!("[Hooks] ALLOWED: Observe tier tool");
                 ToolDecision::Allow
             }
             ToolTier::Confirm => {
                 // In a real app, you might prompt the user here
-                println!("[Hooks] AUTO-APPROVED: Confirm tier tool (input: {input})");
+                println!(
+                    "[Hooks] AUTO-APPROVED: Confirm tier tool (input: {})",
+                    invocation.requested_input,
+                );
                 ToolDecision::Allow
             }
         }

@@ -312,8 +312,8 @@ pub enum AgentRunState {
         input: serde_json::Value,
         /// Description of what confirmation is needed
         description: String,
-        /// Continuation state for resuming (boxed for enum size efficiency)
-        continuation: Box<AgentContinuation>,
+        /// Versioned continuation envelope for resuming.
+        continuation: Box<ContinuationEnvelope>,
     },
 
     /// Agent run was cancelled via a cancellation token.
@@ -333,10 +333,47 @@ pub struct PendingToolCallInfo {
     pub name: String,
     /// Human-readable display name
     pub display_name: String,
-    /// Tool input parameters
+    /// Tool input parameters as requested by the LLM.
     pub input: serde_json::Value,
+    /// Effective input after SDK preparation (e.g. listen-context enrichment).
+    ///
+    /// For most tools this equals `input`.  The server persists this for
+    /// execution while `input` stays as the audit trail.
+    #[serde(default)]
+    pub effective_input: serde_json::Value,
     /// Optional context for tools that prepare asynchronously and execute later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_context: Option<ListenExecutionContext>,
+}
+
+// ── Structured policy input ──────────────────────────────────────────
+
+/// Structured input passed to the `pre_tool_use` hook for policy
+/// evaluation.
+///
+/// Bundles every datum that a server-side policy engine needs to make an
+/// allow / block / confirm decision, replacing the earlier loose
+/// `(tool_name, input, tier)` triple.
+///
+/// The `AgentHooks` trait itself lives in `agent-sdk-tools` to avoid a
+/// dependency cycle; this struct is the stable contract they share.
+#[derive(Clone, Debug)]
+pub struct ToolInvocation {
+    /// Unique ID for this tool call (from LLM).
+    pub tool_call_id: String,
+    /// Tool name string (for LLM protocol).
+    pub tool_name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Permission tier of the tool.
+    pub tier: ToolTier,
+    /// Input parameters as requested by the LLM (the audit trail).
+    pub requested_input: serde_json::Value,
+    /// Input after SDK preparation — may differ from `requested_input`
+    /// for listen-tools that enrich input during the ready phase.
+    pub effective_input: serde_json::Value,
+    /// Optional listen-execution context, present when the tool uses
+    /// the listen/execute pattern.
     pub listen_context: Option<ListenExecutionContext>,
 }
 
@@ -382,6 +419,56 @@ pub struct AgentContinuation {
     pub state: AgentState,
 }
 
+// ── Versioned continuation envelope ──────────────────────────────────
+
+/// Current envelope version.
+pub const CONTINUATION_VERSION: u32 = 1;
+
+/// Versioned wrapper around [`AgentContinuation`].
+///
+/// This is the **public durable boundary** for server persistence.
+/// Servers serialise this envelope (not the raw `AgentContinuation`)
+/// so future SDK versions can evolve the inner payload while keeping
+/// a stable wire format.
+///
+/// Unknown versions are rejected at resume time, giving servers a
+/// clear upgrade signal instead of silent data corruption.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContinuationEnvelope {
+    /// Schema version — currently [`CONTINUATION_VERSION`].
+    pub version: u32,
+    /// The continuation payload.
+    pub payload: AgentContinuation,
+}
+
+impl ContinuationEnvelope {
+    /// Wrap a continuation in the current version envelope.
+    #[must_use]
+    pub const fn wrap(payload: AgentContinuation) -> Self {
+        Self {
+            version: CONTINUATION_VERSION,
+            payload,
+        }
+    }
+
+    /// Validate the envelope version, returning the inner continuation
+    /// or an error if the version is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `version` does not match
+    /// [`CONTINUATION_VERSION`].
+    pub fn unwrap_validated(self) -> Result<AgentContinuation, String> {
+        if self.version != CONTINUATION_VERSION {
+            return Err(format!(
+                "Unsupported continuation version {}: expected {}",
+                self.version, CONTINUATION_VERSION,
+            ));
+        }
+        Ok(self.payload)
+    }
+}
+
 /// A tool result provided by the external runtime for a specific tool call.
 ///
 /// This is the durable handoff payload: a root worker serialises these
@@ -408,8 +495,8 @@ pub enum AgentInput {
 
     /// Resume after a confirmation decision.
     Resume {
-        /// The continuation state from `AwaitingConfirmation` (boxed for enum size efficiency).
-        continuation: Box<AgentContinuation>,
+        /// The versioned continuation envelope from `AwaitingConfirmation`.
+        continuation: Box<ContinuationEnvelope>,
         /// ID of the tool call being confirmed/rejected.
         tool_call_id: String,
         /// Whether the user confirmed the action.
@@ -424,11 +511,11 @@ pub enum AgentInput {
     /// [`ToolRuntime::External`] is set.  The caller must provide a result
     /// for **every** pending tool call listed in the continuation.
     ///
-    /// The SDK validates the continuation, appends the tool results to
-    /// the message store, and continues to the next LLM turn.
+    /// The SDK validates the continuation envelope version, appends the
+    /// tool results to the message store, and continues to the next LLM turn.
     SubmitToolResults {
-        /// The continuation from [`TurnOutcome::PendingToolCalls`].
-        continuation: Box<AgentContinuation>,
+        /// The versioned continuation from [`TurnOutcome::PendingToolCalls`].
+        continuation: Box<ContinuationEnvelope>,
         /// One result per pending tool call.  The order does not matter,
         /// but every `tool_call_id` from the continuation must be covered.
         results: Vec<ExternalToolResult>,
@@ -623,8 +710,8 @@ pub enum TurnOutcome {
         input: serde_json::Value,
         /// Description of what confirmation is needed
         description: String,
-        /// Continuation state for resuming (boxed for enum size efficiency)
-        continuation: Box<AgentContinuation>,
+        /// Versioned continuation envelope for resuming.
+        continuation: Box<ContinuationEnvelope>,
     },
 
     /// Model refused the request (safety/policy).
@@ -669,8 +756,8 @@ pub enum TurnOutcome {
         total_usage: TokenUsage,
         /// Tool calls to execute externally
         tool_calls: Vec<PendingToolCallInfo>,
-        /// Continuation state for resuming after external tool execution
-        continuation: Box<AgentContinuation>,
+        /// Versioned continuation envelope for resuming after external tool execution.
+        continuation: Box<ContinuationEnvelope>,
     },
 }
 

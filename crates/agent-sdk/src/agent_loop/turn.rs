@@ -865,6 +865,7 @@ where
                 name: name.clone(),
                 display_name,
                 input: input.clone(),
+                effective_input: input.clone(),
                 listen_context: None,
             }
         })

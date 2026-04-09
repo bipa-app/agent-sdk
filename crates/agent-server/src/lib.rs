@@ -149,6 +149,7 @@ mod tests {
                     name: "read_file".into(),
                     display_name: "Read File".into(),
                     input: serde_json::json!({"path": "/tmp/foo.txt"}),
+                    effective_input: serde_json::json!({"path": "/tmp/foo.txt"}),
                     listen_context: None,
                 },
                 PendingToolCallInfo {
@@ -156,6 +157,7 @@ mod tests {
                     name: "write_file".into(),
                     display_name: "Write File".into(),
                     input: serde_json::json!({"path": "/tmp/bar.txt", "content": "hello"}),
+                    effective_input: serde_json::json!({"path": "/tmp/bar.txt", "content": "hello"}),
                     listen_context: None,
                 },
             ],
@@ -360,6 +362,92 @@ mod tests {
         let all = store.get_events(&thread).await?;
         let seqs: Vec<u64> = all.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![0, 1, 2]);
+        Ok(())
+    }
+    /// Verify the versioned continuation envelope round-trips through JSON
+    /// and validates version at unwrap time.
+    #[test]
+    fn continuation_envelope_round_trip_and_version_check() -> anyhow::Result<()> {
+        use agent_sdk_core::{
+            AgentContinuation, AgentState, CONTINUATION_VERSION, ContinuationEnvelope,
+            PendingToolCallInfo, TokenUsage,
+        };
+
+        let thread = ThreadId::new();
+        let continuation = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 5,
+            total_usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+            },
+            turn_usage: TokenUsage {
+                input_tokens: 40,
+                output_tokens: 30,
+            },
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                display_name: "Read File".into(),
+                input: serde_json::json!({"path": "/tmp/foo.txt"}),
+                effective_input: serde_json::json!({"path": "/tmp/foo.txt"}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread.clone()),
+        };
+
+        let envelope = ContinuationEnvelope::wrap(continuation);
+        assert_eq!(envelope.version, CONTINUATION_VERSION);
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&envelope)?;
+        let recovered: ContinuationEnvelope = serde_json::from_str(&json)?;
+        assert_eq!(recovered.version, CONTINUATION_VERSION);
+        assert_eq!(recovered.payload.thread_id, thread);
+        assert_eq!(recovered.payload.turn, 5);
+
+        // Unwrap validates version
+        let inner = recovered.unwrap_validated();
+        assert!(inner.is_ok());
+
+        // Unknown version is rejected
+        let bad = ContinuationEnvelope {
+            version: 99,
+            payload: inner.unwrap(),
+        };
+        let err = bad.unwrap_validated();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .contains("Unsupported continuation version 99")
+        );
+
+        Ok(())
+    }
+
+    /// Verify that `effective_input` is preserved through serialization.
+    #[test]
+    fn effective_input_survives_serialization() -> anyhow::Result<()> {
+        use agent_sdk_core::PendingToolCallInfo;
+
+        let info = PendingToolCallInfo {
+            id: "call_1".into(),
+            name: "tool".into(),
+            display_name: "Tool".into(),
+            input: serde_json::json!({"raw": true}),
+            effective_input: serde_json::json!({"raw": true, "enriched": "yes"}),
+            listen_context: None,
+        };
+
+        let json = serde_json::to_string(&info)?;
+        let recovered: PendingToolCallInfo = serde_json::from_str(&json)?;
+        assert_eq!(
+            recovered.effective_input,
+            serde_json::json!({"raw": true, "enriched": "yes"})
+        );
+        assert_ne!(recovered.input, recovered.effective_input);
         Ok(())
     }
 }
