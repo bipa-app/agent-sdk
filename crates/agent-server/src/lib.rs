@@ -29,6 +29,78 @@
 //! };
 //! ```
 //!
+//! ## Server-Facing Contract (Phase 1)
+//!
+//! After Phase 1 closes, every [`TurnOutcome`] the runtime hands back
+//! to a server carries a structured [`TurnSummary`] alongside the
+//! legacy per-variant fields. The summary is the **authoritative**
+//! server contract; the legacy fields (`total_turns`, `input_tokens`,
+//! `output_tokens`, `turn_usage`, …) remain only so existing local
+//! callers do not break.
+//!
+//! New server code should read summaries instead of the legacy fields:
+//!
+//! ```ignore
+//! use agent_server::{TurnOutcome, TurnSummary};
+//!
+//! match run_turn_outcome {
+//!     TurnOutcome::PendingToolCalls {
+//!         tool_calls,
+//!         continuation,
+//!         summary,
+//!         ..
+//!     } => {
+//!         persist_turn_row(&summary);            // <- authoritative
+//!         schedule_tool_tasks(tool_calls);        // <- caller's responsibility
+//!         store_continuation(*continuation);      // <- opaque handoff payload
+//!     }
+//!     other => {
+//!         if let Some(summary) = other.summary() {
+//!             persist_turn_row(summary);
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! [`TurnSummary`] captures:
+//!
+//! | Field | Purpose |
+//! |-------|---------|
+//! | `thread_id` / `turn` / `total_turns` | Self-describing identity |
+//! | `turn_usage` / `total_usage` | Token accounting for billing |
+//! | `provenance` (provider, model) | Audit rows survive provider rotations |
+//! | `response_id` | Join against raw provider response logs |
+//! | `stop_reason` | Branch on `end_turn` / `tool_use` / `refusal` without reparsing history |
+//! | `tool_call_count` | Tool-dispatch billing and runaway detection |
+//! | `duration_ms` | SLO dashboards and retry budget tuning |
+//! | `tool_runtime` / `strict_durability` | Execution profile recorded on the row |
+//!
+//! The summary format is serde-stable (`snake_case` discriminants,
+//! explicit field keys) so it can be persisted directly in durable
+//! turn rows.
+//!
+//! ## Authoritative vs Convenience Behaviour
+//!
+//! The split between **authoritative** server behaviour and local
+//! **convenience** wrapper behaviour is a deliberate Phase 1 outcome:
+//!
+//! | Area | Authoritative (server) | Convenience (local) |
+//! |------|------------------------|----------------------|
+//! | Outcome metadata | [`TurnSummary`] | Legacy variant fields on [`TurnOutcome`] (`input_tokens`, etc.) |
+//! | Event sink | Caller-supplied [`EventStore`] seeded by the server | In-memory store created by the builder |
+//! | Event sequencing | [`LocalEventAuthority`] seeded with the last offset via [`LocalEventAuthority::with_offset`] | Fresh counter per `run_turn` |
+//! | Tool execution | [`ToolRuntime::External`] — caller schedules tasks | [`ToolRuntime::Inline`] — SDK runs tools directly |
+//! | Durability | `strict_durability: true`, checkpoint on every boundary | `strict_durability: false`, best-effort checkpoints |
+//! | Continuation payload | Versioned [`agent_sdk_core::ContinuationEnvelope`] persisted by the server | Passed back in memory |
+//! | Tool audit | [`agent_sdk_tools::ToolAuditSink`] producing [`ToolAuditRecord`](agent_sdk_core::ToolAuditRecord) | `NoopAuditSink` |
+//!
+//! Anything in the "Authoritative" column is part of the server-facing
+//! Phase 1 contract and later phases (`journal`, `workers`, `transport`,
+//! `storage`) will build on it.  Anything in the "Convenience" column
+//! may change between SDK versions to preserve a good local-agent
+//! experience and should not be relied on for durable server
+//! semantics.
+//!
 //! ## Planned modules (not yet implemented)
 //!
 //! | Module | Purpose |
@@ -56,7 +128,10 @@ pub use agent_sdk_tools;
 pub use agent_sdk_providers;
 
 /// Convenience re-export of the server execution options and event-store types.
-pub use agent_sdk_core::{ExternalToolResult, ToolRuntime, TurnOptions, TurnOutcome};
+pub use agent_sdk_core::{
+    AuditProvenance, ExternalToolResult, StopReason, ToolRuntime, TurnOptions, TurnOutcome,
+    TurnSummary,
+};
 /// Durable reconstruction contract for worker-context recovery.
 pub use agent_sdk_tools::{
     DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
@@ -166,6 +241,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread.clone()),
+            response_id: None,
+            stop_reason: None,
         };
 
         // Round-trip the continuation through JSON (server persistence)
@@ -399,6 +476,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread.clone()),
+            response_id: None,
+            stop_reason: None,
         };
 
         let envelope = ContinuationEnvelope::wrap(continuation);
@@ -453,5 +532,263 @@ mod tests {
         );
         assert_ne!(recovered.input, recovered.effective_input);
         Ok(())
+    }
+
+    // ========================================================================
+    // Phase 1.7 — TurnSummary contract regression suite (ENG-7914)
+    // ========================================================================
+    //
+    // These tests validate the `TurnSummary` server-facing outcome
+    // contract from the *server* side of the dependency graph.  They
+    // check:
+    //
+    //   * reachability through the server crate's public re-exports,
+    //   * durable JSON serialization shape,
+    //   * version-stable snake_case discriminants,
+    //   * the accessor on `TurnOutcome` that extracts the summary,
+    //   * pattern matching on every variant without drift.
+    //
+    // They are intentionally data-only (no async runtime work, no
+    // `run_turn` execution) because `agent-server` does not depend on
+    // the `agent-sdk` runtime crate. End-to-end `TurnSummary` flow
+    // through `run_turn` is covered by the regression suite in
+    // `agent-sdk` (`test_turn_summary_*`).
+
+    /// Compile-time proof that `TurnSummary` and its friends are
+    /// reachable through `agent_server::*` without reaching into the
+    /// narrow SDK crates.
+    #[test]
+    fn turn_summary_is_reachable_through_server_reexports() {
+        use crate::{AuditProvenance, StopReason, ToolRuntime, TurnOptions, TurnSummary};
+
+        fn _assert_types(
+            _summary: TurnSummary,
+            _provenance: AuditProvenance,
+            _reason: StopReason,
+            _runtime: ToolRuntime,
+            _options: TurnOptions,
+        ) {
+        }
+    }
+
+    fn sample_turn_summary() -> agent_sdk_core::TurnSummary {
+        use agent_sdk_core::{
+            AuditProvenance, StopReason, ThreadId, TokenUsage, ToolRuntime, TurnSummary,
+        };
+
+        TurnSummary {
+            thread_id: ThreadId::from_string("t-server-summary"),
+            turn: 3,
+            total_turns: 3,
+            turn_usage: TokenUsage {
+                input_tokens: 150,
+                output_tokens: 75,
+            },
+            total_usage: TokenUsage {
+                input_tokens: 450,
+                output_tokens: 200,
+            },
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+            response_id: Some("msg_abc123".into()),
+            stop_reason: Some(StopReason::ToolUse),
+            tool_call_count: 2,
+            duration_ms: 1_842,
+            tool_runtime: ToolRuntime::External,
+            strict_durability: true,
+        }
+    }
+
+    /// The `TurnSummary` wire format is the **durable server
+    /// contract**.  Verify every field survives JSON round-trip so
+    /// future server phases can persist summaries directly.
+    #[test]
+    fn turn_summary_round_trips_through_json_from_server_crate() -> anyhow::Result<()> {
+        use agent_sdk_core::TurnSummary;
+
+        let original = sample_turn_summary();
+        let json = serde_json::to_string(&original)?;
+        let recovered: TurnSummary = serde_json::from_str(&json)?;
+        assert_eq!(recovered, original);
+        Ok(())
+    }
+
+    /// The JSON shape has to be stable — rename a field and this test
+    /// fails loudly instead of silently breaking a durable audit row.
+    #[test]
+    fn turn_summary_wire_format_is_stable() -> anyhow::Result<()> {
+        let summary = sample_turn_summary();
+        let value = serde_json::to_value(&summary)?;
+
+        // Top-level keys the server contract depends on.
+        for key in [
+            "thread_id",
+            "turn",
+            "total_turns",
+            "turn_usage",
+            "total_usage",
+            "provenance",
+            "response_id",
+            "stop_reason",
+            "tool_call_count",
+            "duration_ms",
+            "tool_runtime",
+            "strict_durability",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "TurnSummary wire format lost key `{key}` — this breaks the server contract"
+            );
+        }
+
+        // Nested provenance keys (identical shape to AuditProvenance).
+        assert_eq!(
+            value["provenance"]["provider"],
+            serde_json::json!("anthropic")
+        );
+        assert_eq!(
+            value["provenance"]["model"],
+            serde_json::json!("claude-sonnet-4-5-20250929")
+        );
+
+        // Snake-case tool-runtime and stop-reason discriminants match
+        // the provider wire formats so dashboards and joins line up.
+        assert_eq!(value["tool_runtime"], serde_json::json!("external"));
+        assert_eq!(value["stop_reason"], serde_json::json!("tool_use"));
+
+        // Response ID survives as a plain string (not wrapped in extra
+        // {"Some": ...} structure).
+        assert_eq!(value["response_id"], serde_json::json!("msg_abc123"));
+
+        Ok(())
+    }
+
+    /// A `TurnOutcome::Done` that a server would receive from
+    /// `run_turn` must carry the summary in a way pattern-matching can
+    /// extract.  This is a compile-time + runtime proof that the
+    /// variant shape is stable.
+    #[test]
+    fn server_can_pattern_match_summary_off_done_outcome() {
+        use agent_sdk_core::TurnOutcome;
+
+        let summary = sample_turn_summary();
+        let outcome = TurnOutcome::Done {
+            total_turns: 3,
+            input_tokens: 450,
+            output_tokens: 200,
+            summary: summary.clone(),
+        };
+
+        // Pattern match to pull the summary off without naming the
+        // legacy fields — this is how server code will read outcomes.
+        let TurnOutcome::Done {
+            summary: matched, ..
+        } = &outcome
+        else {
+            panic!("Expected Done");
+        };
+        assert_eq!(matched, &summary);
+
+        // Accessor is also available and hides the variant name.
+        assert_eq!(outcome.summary(), Some(&summary));
+    }
+
+    /// Server code should be able to build a new turn summary from
+    /// scratch for tests / fixtures without reaching into private
+    /// fields.
+    #[test]
+    fn server_can_construct_turn_summary_via_new() {
+        use agent_sdk_core::{AuditProvenance, ThreadId, ToolRuntime, TurnOptions, TurnSummary};
+
+        let options = TurnOptions {
+            tool_runtime: ToolRuntime::External,
+            strict_durability: true,
+        };
+        let provenance = AuditProvenance::new("openai", "gpt-5");
+        let summary = TurnSummary::new(ThreadId::from_string("t-new"), 4, provenance, &options);
+
+        assert_eq!(summary.turn, 4);
+        assert_eq!(summary.tool_runtime, ToolRuntime::External);
+        assert!(summary.strict_durability);
+    }
+
+    /// Every variant except `Error` carries a summary. Guard against
+    /// accidental variant additions by explicitly matching each one.
+    #[test]
+    fn every_terminal_variant_carries_a_summary() {
+        use agent_sdk_core::{
+            AgentContinuation, AgentError, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
+            TurnOutcome,
+        };
+
+        let summary = sample_turn_summary();
+        let thread = ThreadId::from_string("t-variants");
+        let empty_continuation = Box::new(ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
+        }));
+
+        let variants = vec![
+            TurnOutcome::NeedsMoreTurns {
+                turn: 1,
+                turn_usage: TokenUsage::default(),
+                total_usage: TokenUsage::default(),
+                summary: summary.clone(),
+            },
+            TurnOutcome::Done {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+            TurnOutcome::AwaitingConfirmation {
+                tool_call_id: "c".into(),
+                tool_name: "n".into(),
+                display_name: "D".into(),
+                input: serde_json::json!({}),
+                description: "d".into(),
+                continuation: empty_continuation.clone(),
+                summary: summary.clone(),
+            },
+            TurnOutcome::Refusal {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+            TurnOutcome::Cancelled {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+            TurnOutcome::PendingToolCalls {
+                turn: 1,
+                turn_usage: TokenUsage::default(),
+                total_usage: TokenUsage::default(),
+                tool_calls: Vec::new(),
+                continuation: empty_continuation,
+                summary: summary.clone(),
+            },
+        ];
+
+        for variant in &variants {
+            assert_eq!(
+                variant.summary(),
+                Some(&summary),
+                "variant {variant:?} dropped its summary",
+            );
+        }
+
+        // Error is the only variant without a summary.
+        let error_outcome = TurnOutcome::Error(AgentError::new("boom", false));
+        assert!(error_outcome.summary().is_none());
     }
 }

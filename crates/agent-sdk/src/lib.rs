@@ -391,6 +391,7 @@ pub use types::{
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
     ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
     ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
+    TurnSummary,
 };
 
 // agent-sdk-tools (via thin modules)

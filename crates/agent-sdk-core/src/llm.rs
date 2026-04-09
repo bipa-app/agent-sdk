@@ -318,7 +318,7 @@ impl ChatResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -327,6 +327,22 @@ pub enum StopReason {
     StopSequence,
     Refusal,
     ModelContextWindowExceeded,
+}
+
+impl StopReason {
+    /// Stable discriminant string used for durable rows, metrics, and
+    /// dashboards.  Matches the serde representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::Refusal => "refusal",
+            Self::ModelContextWindowExceeded => "model_context_window_exceeded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

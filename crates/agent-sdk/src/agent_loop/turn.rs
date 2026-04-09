@@ -760,6 +760,19 @@ pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -
     };
     ctx.total_usage.add(&turn_usage);
     ctx.state.total_usage = ctx.total_usage.clone();
+
+    // Capture provider-level provenance into the turn context so that
+    // the [`agent_sdk_core::TurnSummary`] emitted at outcome time
+    // reflects the real response metadata rather than the defaults.
+    //
+    // Response IDs are only recorded when the provider actually
+    // returned one; legacy mock providers that emit an empty string
+    // leave the field as `None`.
+    if !response.id.is_empty() {
+        ctx.response_id = Some(response.id.clone());
+    }
+    ctx.stop_reason = response.stop_reason;
+
     turn_usage
 }
 
@@ -894,6 +907,8 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         total_usage,
         turn_usage,
         state,
+        response_id,
+        stop_reason,
     }: ToolBatchExecutionParams<'_, Ctx, H>,
 ) -> Result<Vec<(String, ToolResult)>, InternalTurnResult>
 where
@@ -945,6 +960,8 @@ where
                     awaiting_index: pending_idx,
                     completed_results: tool_results,
                     state: state.clone(),
+                    response_id: response_id.clone(),
+                    stop_reason,
                 };
 
                 return Err(InternalTurnResult::AwaitingConfirmation {
@@ -1012,6 +1029,8 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         turn_usage,
         state,
         message_store,
+        response_id,
+        stop_reason,
     }: TurnToolPhaseParams<'_, Ctx, H, M>,
 ) -> Result<(), InternalTurnResult>
 where
@@ -1034,6 +1053,8 @@ where
         total_usage,
         turn_usage,
         state,
+        response_id,
+        stop_reason,
     })
     .await?;
 
@@ -1553,6 +1574,10 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
+    // Record how many tool calls the LLM asked for in this turn so
+    // the summary can report it without reparsing the message history.
+    ctx.tool_call_count = pending_tool_calls.len();
+
     let had_tool_calls = !pending_tool_calls.is_empty();
 
     // Strict durability: checkpoint after LLM response, before tool execution.
@@ -1576,6 +1601,8 @@ where
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: ctx.state.clone(),
+            response_id: ctx.response_id.clone(),
+            stop_reason: ctx.stop_reason,
         };
         return InternalTurnResult::PendingToolCalls {
             turn_usage,
@@ -1600,6 +1627,8 @@ where
         turn_usage: &turn_usage,
         state: &ctx.state,
         message_store,
+        response_id: ctx.response_id.clone(),
+        stop_reason: ctx.stop_reason,
     })
     .await
     {
