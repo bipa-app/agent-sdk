@@ -418,6 +418,17 @@ pub struct ListenExecutionContext {
 ///
 /// This contains all the internal state needed to continue execution
 /// after receiving a confirmation decision. Pass this back when resuming.
+///
+/// # Turn-summary fields
+///
+/// `response_id` and `stop_reason` capture the **turn-closing** LLM call
+/// that produced [`AgentContinuation::pending_tool_calls`] before the
+/// pause. They are carried across the pause boundary so the
+/// [`TurnSummary`] emitted on the resume path can report the same LLM
+/// metadata as the pre-pause summary for the same turn.
+///
+/// Both are `Option` and default to `None` for forward compatibility
+/// with continuations persisted before these fields existed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentContinuation {
     /// Thread ID (used for validation on resume)
@@ -436,6 +447,19 @@ pub struct AgentContinuation {
     pub completed_results: Vec<(String, ToolResult)>,
     /// Agent state snapshot
     pub state: AgentState,
+    /// Provider response ID from the LLM call that produced this turn's
+    /// pending tool calls.
+    ///
+    /// `None` for continuations persisted before this field was added,
+    /// or when the provider did not return an ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Stop reason from the LLM call that produced this turn's pending
+    /// tool calls.
+    ///
+    /// `None` for continuations persisted before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<crate::llm::StopReason>,
 }
 
 // ── Versioned continuation envelope ──────────────────────────────────
@@ -1132,5 +1156,110 @@ mod tests {
             let json = serde_json::to_value(variant).unwrap();
             assert_eq!(json, serde_json::json!(expected));
         }
+    }
+
+    fn sample_continuation() -> AgentContinuation {
+        let thread = ThreadId::from_string("t-continuation");
+        AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 4,
+            total_usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 80,
+            },
+            turn_usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 40,
+            },
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: "call_1".into(),
+                name: "echo".into(),
+                display_name: "Echo".into(),
+                tier: ToolTier::Confirm,
+                input: serde_json::json!({"message": "hi"}),
+                effective_input: serde_json::json!({"message": "hi"}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+            response_id: Some("resp_7914".into()),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    #[test]
+    fn agent_continuation_round_trips_llm_metadata() {
+        // ENG-7914: `response_id` and `stop_reason` travel through
+        // durable persistence so the resume-side `TurnSummary` reports
+        // the same LLM metadata as the pre-pause summary for the same
+        // turn. Guard the wire format so future renames break here
+        // rather than silently dropping the fields.
+        let original = sample_continuation();
+        let json = serde_json::to_string(&original).expect("serialize");
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("to value");
+        assert_eq!(value["response_id"], serde_json::json!("resp_7914"));
+        assert_eq!(value["stop_reason"], serde_json::json!("tool_use"));
+
+        let recovered: AgentContinuation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(recovered.response_id.as_deref(), Some("resp_7914"));
+        assert_eq!(recovered.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn agent_continuation_deserializes_legacy_payload_without_llm_metadata() {
+        // Servers that persisted continuations before ENG-7914 don't
+        // have `response_id` / `stop_reason` fields on disk. Those
+        // payloads must still deserialise so running servers do not
+        // break on SDK upgrade — the fields default to `None`.
+        let thread = ThreadId::from_string("t-legacy");
+        let legacy_json = serde_json::json!({
+            "thread_id": thread,
+            "turn": 1,
+            "total_usage": { "input_tokens": 10, "output_tokens": 5 },
+            "turn_usage": { "input_tokens": 10, "output_tokens": 5 },
+            "pending_tool_calls": [],
+            "awaiting_index": 0,
+            "completed_results": [],
+            "state": AgentState::new(thread.clone()),
+        });
+
+        let recovered: AgentContinuation =
+            serde_json::from_value(legacy_json).expect("legacy payload deserialises");
+        assert_eq!(recovered.thread_id, thread);
+        assert_eq!(recovered.turn, 1);
+        assert!(
+            recovered.response_id.is_none(),
+            "legacy payloads default to None",
+        );
+        assert!(
+            recovered.stop_reason.is_none(),
+            "legacy payloads default to None",
+        );
+    }
+
+    #[test]
+    fn agent_continuation_omits_llm_metadata_when_none() {
+        // `response_id` / `stop_reason` are `skip_serializing_if = None`
+        // so that payloads where the provider did not return IDs stay
+        // compact and look identical to the legacy wire format. This
+        // protects any downstream consumer that matches exact keys.
+        let thread = ThreadId::from_string("t-omit");
+        let cont = AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
+        };
+        let value = serde_json::to_value(&cont).unwrap();
+        assert!(value.get("response_id").is_none());
+        assert!(value.get("stop_reason").is_none());
     }
 }

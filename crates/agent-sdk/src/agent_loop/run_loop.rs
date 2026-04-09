@@ -4,9 +4,9 @@ use super::turn::execute_turn;
 use super::types::{
     ConfirmedToolExecutionContext, ConvertTurnResultParams, ExecuteTurnParameters,
     InitializedState, InternalTurnResult, PersistentDoneParams, ResumeData,
-    ResumeProcessingParameters, ResumeProcessingResult, RunLoopParameters, RunLoopResumeParams,
-    RunLoopTurnResultParams, RunLoopTurnsParams, SingleTurnResumeParams, ToolCallExecutionContext,
-    ToolExecutionOutcome, TurnContext, TurnParameters,
+    ResumeProcessingParameters, ResumeProcessingResult, ResumeSummaryMetrics, RunLoopParameters,
+    RunLoopResumeParams, RunLoopTurnResultParams, RunLoopTurnsParams, SingleTurnResumeParams,
+    ToolCallExecutionContext, ToolExecutionOutcome, TurnContext, TurnParameters,
 };
 
 use crate::types::TurnOptions;
@@ -15,11 +15,12 @@ use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
-use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
+use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role, StopReason};
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
+use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ContinuationEnvelope, ThreadId, TokenUsage, TurnOutcome, TurnSummary,
+    ContinuationEnvelope, ThreadId, TokenUsage, ToolResult, TurnOutcome, TurnSummary,
 };
 use agent_sdk_core::audit::AuditProvenance;
 use log::warn;
@@ -557,6 +558,17 @@ where
         rejection_reason,
     } = resume_data;
     validate_resume_continuation(&cont, &tool_call_id)?;
+    // Snapshot the turn-closing LLM metadata before we mutate `cont`.
+    // These describe the pre-pause LLM call (the one that produced
+    // `pending_tool_calls`) and must survive any nested
+    // `AwaitingConfirmation` hand-off so every resume branch reports
+    // the same values as the pre-pause summary for this turn.
+    let carried_metadata = CarriedTurnMetadata {
+        response_id: cont.response_id.clone(),
+        stop_reason: cont.stop_reason,
+        tool_call_count: cont.pending_tool_calls.len(),
+    };
+
     let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
     let mut tool_results = cont.completed_results.clone();
@@ -577,6 +589,115 @@ where
     let result = execute_confirmed_tool(awaiting_tool, rejection, &confirmed_ctx).await?;
     tool_results.push((awaiting_tool.id.clone(), result));
 
+    if let Some(result) = execute_remaining_pending_tools(ExecuteRemainingParams {
+        cont: &cont,
+        tool_results: &mut tool_results,
+        tool_context,
+        thread_id,
+        tools,
+        hooks,
+        event_store,
+        turn,
+        authority,
+        execution_store,
+        audit_sink,
+        provenance,
+        total_usage,
+        state,
+        carried: &carried_metadata,
+    })
+    .await?
+    {
+        return Ok(result);
+    }
+
+    append_tool_results(&tool_results, thread_id, message_store).await?;
+    send_event(
+        event_store,
+        thread_id,
+        turn,
+        hooks,
+        authority,
+        AgentEvent::TurnComplete {
+            turn,
+            usage: cont.turn_usage.clone(),
+        },
+    )
+    .await?;
+
+    Ok(ResumeProcessingResult::Completed {
+        turn_usage: cont.turn_usage.clone(),
+        metrics: ResumeSummaryMetrics {
+            response_id: carried_metadata.response_id,
+            stop_reason: carried_metadata.stop_reason,
+            tool_call_count: carried_metadata.tool_call_count,
+        },
+    })
+}
+
+/// Turn-closing LLM metadata threaded through [`process_resume`].
+///
+/// The resume path never calls the LLM, so every `TurnSummary` it
+/// emits has to re-use the values captured into the continuation at
+/// pause time. Keeping them in a small struct makes the plumbing
+/// self-documenting and stops any future resume branch from silently
+/// dropping them on the floor.
+struct CarriedTurnMetadata {
+    response_id: Option<String>,
+    stop_reason: Option<StopReason>,
+    tool_call_count: usize,
+}
+
+struct ExecuteRemainingParams<'a, Ctx, H> {
+    cont: &'a AgentContinuation,
+    tool_results: &'a mut Vec<(String, ToolResult)>,
+    tool_context: &'a ToolContext<Ctx>,
+    thread_id: &'a ThreadId,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    event_store: &'a Arc<dyn EventStore>,
+    turn: usize,
+    authority: &'a Arc<dyn EventAuthority>,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    audit_sink: &'a Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &'a AuditProvenance,
+    total_usage: &'a TokenUsage,
+    state: &'a AgentState,
+    carried: &'a CarriedTurnMetadata,
+}
+
+/// Execute every pending tool after the one that was just confirmed.
+///
+/// Returns `Ok(Some(AwaitingConfirmation))` if another tool needs
+/// user confirmation, `Ok(None)` if the whole batch completed, or an
+/// `Err` if any tool's event plumbing failed.
+///
+/// The nested continuation carries the same `response_id` /
+/// `stop_reason` that was threaded into this call, so the next resume
+/// still reports the original turn-closing LLM metadata.
+async fn execute_remaining_pending_tools<Ctx, H>(
+    ExecuteRemainingParams {
+        cont,
+        tool_results,
+        tool_context,
+        thread_id,
+        tools,
+        hooks,
+        event_store,
+        turn,
+        authority,
+        execution_store,
+        audit_sink,
+        provenance,
+        total_usage,
+        state,
+        carried,
+    }: ExecuteRemainingParams<'_, Ctx, H>,
+) -> Result<Option<ResumeProcessingResult>, AgentError>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
     let execution_ctx = ToolCallExecutionContext {
         tool_context,
         thread_id,
@@ -608,7 +729,7 @@ where
                     pending_tool_calls[pending_idx].listen_context = Some(context);
                 }
 
-                return Ok(ResumeProcessingResult::AwaitingConfirmation {
+                return Ok(Some(ResumeProcessingResult::AwaitingConfirmation {
                     tool_call_id: tool_id,
                     tool_name,
                     display_name,
@@ -621,32 +742,17 @@ where
                         turn_usage: cont.turn_usage.clone(),
                         pending_tool_calls,
                         awaiting_index: pending_idx,
-                        completed_results: tool_results,
+                        completed_results: std::mem::take(tool_results),
                         state: state.clone(),
+                        response_id: carried.response_id.clone(),
+                        stop_reason: carried.stop_reason,
                     }),
-                });
+                }));
             }
             ToolExecutionOutcome::Error(error) => return Err(error),
         }
     }
-
-    append_tool_results(&tool_results, thread_id, message_store).await?;
-    send_event(
-        event_store,
-        thread_id,
-        turn,
-        hooks,
-        authority,
-        AgentEvent::TurnComplete {
-            turn,
-            usage: cont.turn_usage.clone(),
-        },
-    )
-    .await?;
-
-    Ok(ResumeProcessingResult::Completed {
-        turn_usage: cont.turn_usage.clone(),
-    })
+    Ok(None)
 }
 
 pub(super) async fn handle_run_loop_resume<Ctx, H, M>(
@@ -865,29 +971,67 @@ fn build_turn_context(
 /// Build a structured [`TurnSummary`] from a [`TurnContext`] and the
 /// active turn options / provenance.
 ///
-/// Used by every `TurnOutcome` variant that carries a summary.  Duration
-/// is measured from `ctx.start_time` so every variant reports the same
-/// wall-clock interval from the start of `run_turn` to the outcome
-/// construction site.
+/// Used by every `TurnOutcome` variant that carries a summary on the
+/// regular turn path. Duration is measured from `ctx.start_time` so
+/// every variant reports the same wall-clock interval from the start
+/// of `run_turn` to the outcome construction site.
+///
+/// The resume path uses [`build_turn_summary_from_parts`] instead —
+/// it cannot synthesise a faithful [`TurnContext`] because it never
+/// called the LLM for this turn.
 fn build_turn_summary(
     ctx: &TurnContext,
     provenance: &AuditProvenance,
     turn_options: &TurnOptions,
     turn_usage: TokenUsage,
 ) -> TurnSummary {
-    TurnSummary {
-        thread_id: ctx.thread_id.clone(),
+    build_turn_summary_from_parts(TurnSummaryParts {
+        thread_id: &ctx.thread_id,
         turn: ctx.turn,
-        total_turns: turns_to_u32(ctx.turn),
         turn_usage,
-        total_usage: ctx.total_usage.clone(),
-        provenance: provenance.clone(),
-        response_id: ctx.response_id.clone(),
+        total_usage: &ctx.total_usage,
+        provenance,
+        response_id: ctx.response_id.as_deref(),
         stop_reason: ctx.stop_reason,
         tool_call_count: ctx.tool_call_count,
-        duration_ms: duration_ms_saturating(ctx.start_time.elapsed()),
-        tool_runtime: turn_options.tool_runtime.clone(),
-        strict_durability: turn_options.strict_durability,
+        start_time: ctx.start_time,
+        turn_options,
+    })
+}
+
+/// Flat inputs to [`build_turn_summary_from_parts`].
+///
+/// Used instead of [`TurnContext`] by call sites that do not own a
+/// full turn context — currently the resume handler, which relies on
+/// [`ResumeSummaryMetrics`] rehydrated from the continuation rather
+/// than from a live LLM call.
+struct TurnSummaryParts<'a> {
+    thread_id: &'a ThreadId,
+    turn: usize,
+    turn_usage: TokenUsage,
+    total_usage: &'a TokenUsage,
+    provenance: &'a AuditProvenance,
+    response_id: Option<&'a str>,
+    stop_reason: Option<agent_sdk_core::llm::StopReason>,
+    tool_call_count: usize,
+    start_time: Instant,
+    turn_options: &'a TurnOptions,
+}
+
+fn build_turn_summary_from_parts(parts: TurnSummaryParts<'_>) -> TurnSummary {
+    TurnSummary {
+        thread_id: parts.thread_id.clone(),
+        turn: parts.turn,
+        total_turns: turns_to_u32(parts.turn),
+        turn_usage: parts.turn_usage,
+        total_usage: parts.total_usage.clone(),
+        provenance: parts.provenance.clone(),
+        response_id: parts.response_id.map(str::to_string),
+        stop_reason: parts.stop_reason,
+        tool_call_count: parts.tool_call_count,
+        duration_ms: duration_ms_saturating(parts.start_time.elapsed()),
+        tool_runtime: parts.turn_options.tool_runtime.clone(),
+        strict_durability: parts.turn_options.strict_durability,
     }
 }
 
@@ -1323,31 +1467,32 @@ where
     .await;
 
     match resume_result {
-        Ok(ResumeProcessingResult::Completed { turn_usage }) => {
+        Ok(ResumeProcessingResult::Completed {
+            turn_usage,
+            metrics,
+        }) => {
             let mut updated_state = state;
             updated_state.turn_count = turn;
             if let Err(error) = state_store.save(&updated_state).await {
                 warn!("Failed to save state checkpoint: {error}");
             }
-            // Build a synthetic `TurnContext` so we can reuse
-            // `build_turn_summary` on the resume path. The resume
-            // handler does not otherwise need `TurnContext`, so
-            // constructing one here keeps the summary plumbing in a
-            // single place without widening the regular turn flow.
-            let resume_ctx = TurnContext {
-                thread_id: thread_id.clone(),
+            // Build the summary from real data threaded through
+            // `process_resume` — the metrics describe the pre-pause
+            // LLM call that produced this turn's tool calls, so the
+            // resume-side summary matches the pre-pause summary for
+            // the same turn.
+            let summary = build_turn_summary_from_parts(TurnSummaryParts {
+                thread_id: &thread_id,
                 turn,
-                total_usage: total_usage.clone(),
-                state: updated_state,
+                turn_usage: turn_usage.clone(),
+                total_usage: &total_usage,
+                provenance: &provenance,
+                response_id: metrics.response_id.as_deref(),
+                stop_reason: metrics.stop_reason,
+                tool_call_count: metrics.tool_call_count,
                 start_time,
-                compaction_retries: 0,
-                pending_reminder: None,
-                response_id: None,
-                stop_reason: None,
-                tool_call_count: 0,
-            };
-            let summary =
-                build_turn_summary(&resume_ctx, &provenance, &turn_options, turn_usage.clone());
+                turn_options: &turn_options,
+            });
             TurnOutcome::NeedsMoreTurns {
                 turn,
                 turn_usage,
@@ -1364,20 +1509,22 @@ where
             continuation,
         }) => {
             let turn_usage = continuation.turn_usage.clone();
-            let resume_ctx = TurnContext {
-                thread_id: thread_id.clone(),
+            // The nested continuation carries the same pre-pause LLM
+            // metadata that the resume read from the incoming
+            // continuation, so the summary stays consistent across
+            // every `AwaitingConfirmation` hop within this turn.
+            let summary = build_turn_summary_from_parts(TurnSummaryParts {
+                thread_id: &thread_id,
                 turn,
-                total_usage: total_usage.clone(),
-                state: state.clone(),
-                start_time,
-                compaction_retries: 0,
-                pending_reminder: None,
-                response_id: None,
-                stop_reason: None,
+                turn_usage,
+                total_usage: &total_usage,
+                provenance: &provenance,
+                response_id: continuation.response_id.as_deref(),
+                stop_reason: continuation.stop_reason,
                 tool_call_count: continuation.pending_tool_calls.len(),
-            };
-            let summary =
-                build_turn_summary(&resume_ctx, &provenance, &turn_options, turn_usage);
+                start_time,
+                turn_options: &turn_options,
+            });
             TurnOutcome::AwaitingConfirmation {
                 tool_call_id,
                 tool_name,
@@ -2196,6 +2343,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
         };
 
         let results = vec![ExternalToolResult {
@@ -2239,6 +2388,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
         };
 
         // Only provide one result for two pending calls
@@ -2281,6 +2432,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
         };
 
         // Provide the correct result AND an extra unknown one
@@ -2318,6 +2471,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
         };
 
         let err = validate_external_tool_results(&cont, &[]);

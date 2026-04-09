@@ -907,6 +907,8 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         total_usage,
         turn_usage,
         state,
+        response_id,
+        stop_reason,
     }: ToolBatchExecutionParams<'_, Ctx, H>,
 ) -> Result<Vec<(String, ToolResult)>, InternalTurnResult>
 where
@@ -958,6 +960,8 @@ where
                     awaiting_index: pending_idx,
                     completed_results: tool_results,
                     state: state.clone(),
+                    response_id: response_id.clone(),
+                    stop_reason,
                 };
 
                 return Err(InternalTurnResult::AwaitingConfirmation {
@@ -1025,6 +1029,8 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         turn_usage,
         state,
         message_store,
+        response_id,
+        stop_reason,
     }: TurnToolPhaseParams<'_, Ctx, H, M>,
 ) -> Result<(), InternalTurnResult>
 where
@@ -1047,6 +1053,8 @@ where
         total_usage,
         turn_usage,
         state,
+        response_id,
+        stop_reason,
     })
     .await?;
 
@@ -1593,6 +1601,8 @@ where
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: ctx.state.clone(),
+            response_id: ctx.response_id.clone(),
+            stop_reason: ctx.stop_reason,
         };
         return InternalTurnResult::PendingToolCalls {
             turn_usage,
@@ -1617,6 +1627,8 @@ where
         turn_usage: &turn_usage,
         state: &ctx.state,
         message_store,
+        response_id: ctx.response_id.clone(),
+        stop_reason: ctx.stop_reason,
     })
     .await
     {

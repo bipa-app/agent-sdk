@@ -194,9 +194,26 @@ pub(super) enum StreamError {
     Fatal(String),
 }
 
+/// Turn-summary metrics captured from the LLM call that preceded the
+/// pause, surfaced by [`process_resume`] so the resume handler can
+/// build a [`TurnSummary`] from real data instead of fabricating a
+/// [`TurnContext`].
+///
+/// These fields describe the **turn-closing** LLM call for the turn
+/// being summarised — the same call whose tool-use blocks produced the
+/// pending tool calls that the resume is now finishing. They are
+/// threaded through [`AgentContinuation`] so they survive the pause /
+/// resume boundary without needing a separate side-channel.
+pub(super) struct ResumeSummaryMetrics {
+    pub(super) response_id: Option<String>,
+    pub(super) stop_reason: Option<StopReason>,
+    pub(super) tool_call_count: usize,
+}
+
 pub(super) enum ResumeProcessingResult {
     Completed {
         turn_usage: TokenUsage,
+        metrics: ResumeSummaryMetrics,
     },
     AwaitingConfirmation {
         tool_call_id: String,
@@ -460,6 +477,14 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     pub(super) total_usage: &'a TokenUsage,
     pub(super) turn_usage: &'a TokenUsage,
     pub(super) state: &'a AgentState,
+    /// Response ID from the LLM call that produced `pending_tool_calls`.
+    /// Copied into any [`AgentContinuation`] this phase emits so the
+    /// resume-side [`TurnSummary`] can report the same value.
+    pub(super) response_id: Option<String>,
+    /// Stop reason from the LLM call that produced `pending_tool_calls`.
+    /// Copied into any [`AgentContinuation`] this phase emits so the
+    /// resume-side [`TurnSummary`] can report the same value.
+    pub(super) stop_reason: Option<StopReason>,
 }
 
 pub(super) struct TurnCompletionParams<'a, H, M> {
@@ -489,6 +514,12 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     pub(super) turn_usage: &'a TokenUsage,
     pub(super) state: &'a AgentState,
     pub(super) message_store: &'a Arc<M>,
+    /// Response ID from the LLM call that produced `pending_tool_calls`.
+    /// Forwarded into any [`AgentContinuation`] this phase emits.
+    pub(super) response_id: Option<String>,
+    /// Stop reason from the LLM call that produced `pending_tool_calls`.
+    /// Forwarded into any [`AgentContinuation`] this phase emits.
+    pub(super) stop_reason: Option<StopReason>,
 }
 
 pub(super) struct TurnStopReasonParams<'a, P, H, M> {

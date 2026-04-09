@@ -105,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
             continuation,
             ..
         } => {
-            println!("\n{} tool call(s) need external execution:", tool_calls.len());
+            println!(
+                "\n{} tool call(s) need external execution:",
+                tool_calls.len()
+            );
             for call in &tool_calls {
                 println!("  • {} ({}) — {}", call.display_name, call.name, call.id);
             }

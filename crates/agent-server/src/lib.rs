@@ -241,6 +241,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread.clone()),
+            response_id: None,
+            stop_reason: None,
         };
 
         // Round-trip the continuation through JSON (server persistence)
@@ -474,6 +476,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread.clone()),
+            response_id: None,
+            stop_reason: None,
         };
 
         let envelope = ContinuationEnvelope::wrap(continuation);
@@ -700,8 +704,7 @@ mod tests {
             strict_durability: true,
         };
         let provenance = AuditProvenance::new("openai", "gpt-5");
-        let summary =
-            TurnSummary::new(ThreadId::from_string("t-new"), 4, provenance, &options);
+        let summary = TurnSummary::new(ThreadId::from_string("t-new"), 4, provenance, &options);
 
         assert_eq!(summary.turn, 4);
         assert_eq!(summary.tool_runtime, ToolRuntime::External);
@@ -713,7 +716,7 @@ mod tests {
     #[test]
     fn every_terminal_variant_carries_a_summary() {
         use agent_sdk_core::{
-            AgentContinuation, AgentError, AgentState, ContinuationEnvelope, TokenUsage, ThreadId,
+            AgentContinuation, AgentError, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
             TurnOutcome,
         };
 
@@ -728,6 +731,8 @@ mod tests {
             awaiting_index: 0,
             completed_results: Vec::new(),
             state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
         }));
 
         let variants = vec![
