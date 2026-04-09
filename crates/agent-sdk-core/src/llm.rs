@@ -1,0 +1,364 @@
+//! LLM message and chat data types.
+//!
+//! These are the wire-format types shared between the runtime, providers,
+//! and the server.  The module intentionally contains **no** async traits
+//! or runtime-specific logic so it can be depended on from thin crates.
+
+use serde::{Deserialize, Serialize};
+
+// ── Thinking ──────────────────────────────────────────────────────────
+
+/// The mode of extended thinking.
+#[derive(Debug, Clone)]
+pub enum ThinkingMode {
+    /// Explicitly enabled with a token budget.
+    Enabled { budget_tokens: u32 },
+    /// Adaptive thinking — the model decides how much to think.
+    Adaptive,
+}
+
+/// Effort level for adaptive thinking via `output_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+/// Configuration for extended thinking.
+///
+/// When enabled, the model will show its reasoning process before
+/// generating the final response.
+#[derive(Debug, Clone)]
+pub struct ThinkingConfig {
+    /// Which thinking mode to use.
+    pub mode: ThinkingMode,
+    /// Optional effort level (sent via `output_config`).
+    pub effort: Option<Effort>,
+}
+
+impl ThinkingConfig {
+    /// Default budget: 10,000 tokens.
+    ///
+    /// This provides enough capacity for meaningful reasoning on most tasks
+    /// while keeping costs reasonable. Increase for complex multi-step problems.
+    pub const DEFAULT_BUDGET_TOKENS: u32 = 10_000;
+
+    /// Minimum budget required by the Anthropic API.
+    pub const MIN_BUDGET_TOKENS: u32 = 1_024;
+
+    /// Create a config with an explicit token budget (Enabled mode).
+    #[must_use]
+    pub const fn new(budget_tokens: u32) -> Self {
+        Self {
+            mode: ThinkingMode::Enabled { budget_tokens },
+            effort: None,
+        }
+    }
+
+    /// Create an adaptive thinking config.
+    #[must_use]
+    pub const fn adaptive() -> Self {
+        Self {
+            mode: ThinkingMode::Adaptive,
+            effort: None,
+        }
+    }
+
+    /// Create an adaptive thinking config with an effort level.
+    #[must_use]
+    pub const fn adaptive_with_effort(effort: Effort) -> Self {
+        Self {
+            mode: ThinkingMode::Adaptive,
+            effort: Some(effort),
+        }
+    }
+
+    /// Set the effort level on an existing config.
+    #[must_use]
+    pub const fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = Some(effort);
+        self
+    }
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_BUDGET_TOKENS)
+    }
+}
+
+// ── Request / Response ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ChatRequest {
+    pub system: String,
+    pub messages: Vec<Message>,
+    pub tools: Option<Vec<Tool>>,
+    pub max_tokens: u32,
+    /// Whether `max_tokens` was explicitly configured by the caller.
+    pub max_tokens_explicit: bool,
+    /// Optional session identifier for provider-side prompt caching or routing.
+    pub session_id: Option<String>,
+    /// Optional provider-managed cached content reference.
+    ///
+    /// This currently maps to Gemini / Vertex AI `cachedContent` handles.
+    pub cached_content: Option<String>,
+    /// Optional extended thinking configuration.
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub role: Role,
+    pub content: Content,
+}
+
+impl Message {
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: Content::Text(text.into()),
+        }
+    }
+
+    #[must_use]
+    pub const fn user_with_content(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: Content::Blocks(blocks),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Content::Text(text.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant_with_tool_use(
+        text: Option<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        let mut blocks = Vec::new();
+        if let Some(t) = text {
+            blocks.push(ContentBlock::Text { text: t });
+        }
+        blocks.push(ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+            thought_signature: None,
+        });
+        Self {
+            role: Role::Assistant,
+            content: Content::Blocks(blocks),
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            role: Role::User,
+            content: Content::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: content.into(),
+                is_error: if is_error { Some(true) } else { None },
+            }]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl Content {
+    #[must_use]
+    pub fn first_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s),
+            Self::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+        }
+    }
+}
+
+/// Source data for image and document content blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentSource {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ContentSource {
+    #[must_use]
+    pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        /// Opaque signature for round-tripping thinking blocks back to the API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        /// Gemini thought signature for preserving reasoning context.
+        /// Required for Gemini 3 models when sending function calls back.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+
+    #[serde(rename = "image")]
+    Image { source: ContentSource },
+
+    #[serde(rename = "document")]
+    Document { source: ContentSource },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    pub id: String,
+    pub content: Vec<ContentBlock>,
+    pub model: String,
+    pub stop_reason: Option<StopReason>,
+    pub usage: Usage,
+}
+
+impl ChatResponse {
+    #[must_use]
+    pub fn first_text(&self) -> Option<&str> {
+        self.content.iter().find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn first_thinking(&self) -> Option<&str> {
+        self.content.iter().find_map(|b| match b {
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &serde_json::Value)> {
+        self.content.iter().filter_map(|b| match b {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn has_tool_use(&self) -> bool {
+        self.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    StopSequence,
+    Refusal,
+    ModelContextWindowExceeded,
+}
+
+impl StopReason {
+    /// Stable discriminant string used for durable rows, metrics, and
+    /// dashboards.  Matches the serde representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::Refusal => "refusal",
+            Self::ModelContextWindowExceeded => "model_context_window_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Usage {
+    /// Total input tokens reported by the provider.
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Portion of `input_tokens` billed at a cached-input rate, when reported.
+    #[serde(default)]
+    pub cached_input_tokens: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChatOutcome {
+    Success(ChatResponse),
+    RateLimited,
+    InvalidRequest(String),
+    ServerError(String),
+}
