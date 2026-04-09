@@ -22,9 +22,22 @@ use crate::tools::{
     ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenStopReason, ToolContext,
 };
 use crate::types::{
-    AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolOutcome, ToolResult,
-    ToolTier,
+    AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolInvocation, ToolOutcome,
+    ToolResult, ToolTier,
 };
+
+/// Build a [`ToolInvocation`] from a pending tool call and its tier.
+fn build_invocation(pending: &PendingToolCallInfo, tier: ToolTier) -> ToolInvocation {
+    ToolInvocation {
+        tool_call_id: pending.id.clone(),
+        tool_name: pending.name.clone(),
+        display_name: pending.display_name.clone(),
+        tier,
+        requested_input: pending.input.clone(),
+        effective_input: pending.effective_input.clone(),
+        listen_context: pending.listen_context.clone(),
+    }
+}
 
 /// Execute a single tool call with hook checks.
 ///
@@ -234,7 +247,7 @@ where
 
     match ctx
         .hooks
-        .pre_tool_use(&pending.name, &pending.input, tier)
+        .pre_tool_use(&build_invocation(pending, tier))
         .await
     {
         ToolDecision::Allow => {
@@ -248,7 +261,6 @@ where
         }
     }
 }
-
 pub(super) async fn finish_listen_ready_failure<Ctx, H>(
     pending: &PendingToolCallInfo,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
@@ -624,7 +636,7 @@ where
 
     match ctx
         .hooks
-        .pre_tool_use(&pending.name, &pending.input, tier)
+        .pre_tool_use(&build_invocation(pending, tier))
         .await
     {
         ToolDecision::Allow => complete_async_tool_call(pending, async_tool, ctx).await,
@@ -651,7 +663,7 @@ where
 
     match ctx
         .hooks
-        .pre_tool_use(&pending.name, &pending.input, tier)
+        .pre_tool_use(&build_invocation(pending, tier))
         .await
     {
         ToolDecision::Allow => complete_sync_tool_call(pending, tool, ctx).await,
@@ -779,8 +791,8 @@ where
         return handle_confirmed_tool_rejection(awaiting_tool, ctx, reason).await;
     }
 
-    // Defense-in-depth: re-check pre_tool_use for audit logging.
-    // The user already confirmed, so we still execute even if the hook says Block.
+    // Resume-time policy re-evaluation: re-check pre_tool_use at resume
+    // so that policy changes since the original confirmation are respected.
     let tier = ctx
         .tools
         .get(&awaiting_tool.name)
@@ -791,13 +803,17 @@ where
 
     let hook_decision = ctx
         .hooks
-        .pre_tool_use(&awaiting_tool.name, &awaiting_tool.input, tier)
+        .pre_tool_use(&build_invocation(awaiting_tool, tier))
         .await;
+    // Resume-time policy re-evaluation is authoritative: if the hook
+    // now returns Block the tool is rejected instead of executing.
     if let ToolDecision::Block(reason) = &hook_decision {
         log::warn!(
-            "pre_tool_use returned Block for confirmed tool '{}': {reason} (executing anyway — user already confirmed)",
+            "pre_tool_use returned Block for confirmed tool '{}': {reason} -- rejecting at resume time",
             awaiting_tool.name
         );
+        let result = ToolResult::error(format!("Blocked at resume: {reason}"));
+        return finish_confirmed_tool(awaiting_tool, ctx, result).await;
     }
 
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await

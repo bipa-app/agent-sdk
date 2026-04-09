@@ -60,20 +60,24 @@ fn seed_and_factory_types() {
 #[test]
 fn core_turn_outcomes() {
     use agent_sdk::{
-        AgentContinuation, AgentError, AgentRunState, AgentState, ExecutionStatus, TokenUsage,
-        ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
+        AgentContinuation, AgentError, AgentRunState, AgentState, CONTINUATION_VERSION,
+        ContinuationEnvelope, ExecutionStatus, TokenUsage, ToolExecution, ToolInvocation,
+        ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
     };
 
     let _result = ToolResult::success("ok");
     let _usage = TokenUsage::default();
+    let _ = CONTINUATION_VERSION;
 
     fn _assert(
         _c: AgentContinuation,
+        _ce: ContinuationEnvelope,
         _e: AgentError,
         _rs: AgentRunState,
         _s: AgentState,
         _es: ExecutionStatus,
         _te: ToolExecution,
+        _ti: ToolInvocation,
         _to: ToolOutcome,
         _turn: TurnOutcome,
         _tier: ToolTier,

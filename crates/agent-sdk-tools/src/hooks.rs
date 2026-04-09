@@ -15,9 +15,8 @@
 
 use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::llm;
-use agent_sdk_core::types::{ToolResult, ToolTier};
+use agent_sdk_core::types::{ToolInvocation, ToolResult, ToolTier};
 use async_trait::async_trait;
-use serde_json::Value;
 
 /// Decision returned by pre-tool hooks
 #[derive(Debug, Clone)]
@@ -35,15 +34,19 @@ pub enum ToolDecision {
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
     /// Called before a tool is executed.
-    /// Return `ToolDecision::Allow` to proceed, or block/require confirmation.
-    async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
-        // Default: allow Observe tier, require confirmation for Confirm tier
-        // input is available for implementors but not used in default
-        let _ = input;
-        match tier {
+    ///
+    /// Receives a structured [`ToolInvocation`] that bundles tool identity,
+    /// tier, requested input, effective input, and listen-context — everything
+    /// a server-side policy engine needs for an allow / block / confirm decision.
+    ///
+    /// Return [`ToolDecision::Allow`] to proceed, [`ToolDecision::Block`] to
+    /// reject, or [`ToolDecision::RequiresConfirmation`] to yield for user
+    /// approval.
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        match invocation.tier {
             ToolTier::Observe => ToolDecision::Allow,
             ToolTier::Confirm => {
-                ToolDecision::RequiresConfirmation(format!("Confirm {tool_name}?"))
+                ToolDecision::RequiresConfirmation(format!("Confirm {}?", invocation.tool_name))
             }
         }
     }
@@ -87,12 +90,7 @@ pub struct AllowAllHooks;
 
 #[async_trait]
 impl AgentHooks for AllowAllHooks {
-    async fn pre_tool_use(
-        &self,
-        _tool_name: &str,
-        _input: &Value,
-        _tier: ToolTier,
-    ) -> ToolDecision {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
         ToolDecision::Allow
     }
 }
@@ -103,9 +101,14 @@ pub struct LoggingHooks;
 
 #[async_trait]
 impl AgentHooks for LoggingHooks {
-    async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
-        log::debug!("Pre-tool use tool={tool_name} input={input:?} tier={tier:?}");
-        DefaultHooks.pre_tool_use(tool_name, input, tier).await
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        log::debug!(
+            "Pre-tool use tool={} input={:?} tier={:?}",
+            invocation.tool_name,
+            invocation.requested_input,
+            invocation.tier,
+        );
+        DefaultHooks.pre_tool_use(invocation).await
     }
 
     async fn post_tool_use(&self, tool_name: &str, result: &ToolResult) {

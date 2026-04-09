@@ -7,7 +7,10 @@ use crate::stores::{
     EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StoredTurnEvents,
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, AgentRunState, ToolTier, TurnOptions, TurnOutcome};
+use crate::types::{
+    AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolTier,
+    TurnOptions, TurnOutcome,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
@@ -16,8 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn expected_turn_for_input(input: &AgentInput, existing_turns: &[StoredTurnEvents]) -> usize {
     match input {
-        AgentInput::Resume { continuation, .. } => continuation.turn,
-        AgentInput::SubmitToolResults { continuation, .. } => continuation.turn.saturating_add(1),
+        AgentInput::Resume { continuation, .. } => continuation.payload.turn,
+        AgentInput::SubmitToolResults { continuation, .. } => {
+            continuation.payload.turn.saturating_add(1)
+        }
         _ => existing_turns
             .last()
             .map_or(1, |turn| turn.turn.saturating_add(1)),
@@ -182,13 +187,8 @@ struct ConfirmAllHooks;
 
 #[async_trait]
 impl AgentHooks for ConfirmAllHooks {
-    async fn pre_tool_use(
-        &self,
-        tool_name: &str,
-        _input: &serde_json::Value,
-        _tier: ToolTier,
-    ) -> ToolDecision {
-        ToolDecision::RequiresConfirmation(format!("Confirm {tool_name}?"))
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        ToolDecision::RequiresConfirmation(format!("Confirm {}?", invocation.tool_name))
     }
 }
 
@@ -975,7 +975,7 @@ async fn test_run_turn_handles_multiple_confirmation_resumes_on_same_turn() -> a
         } => (continuation, tool_call_id),
         other => panic!("Expected first confirmation, got {other:?}"),
     };
-    assert_eq!(continuation_1.turn, 1);
+    assert_eq!(continuation_1.payload.turn, 1);
 
     let (outcome_2, _) = run_turn_recorded(
         &agent,
@@ -999,7 +999,7 @@ async fn test_run_turn_handles_multiple_confirmation_resumes_on_same_turn() -> a
         } => (continuation, tool_call_id),
         other => panic!("Expected second confirmation, got {other:?}"),
     };
-    assert_eq!(continuation_2.turn, 1);
+    assert_eq!(continuation_2.payload.turn, 1);
 
     let (outcome_3, _) = run_turn_recorded(
         &agent,
@@ -1866,7 +1866,7 @@ async fn test_external_tool_runtime_returns_pending_tool_calls() -> anyhow::Resu
             assert_eq!(tool_calls[0].name, "echo");
             assert_eq!(tool_calls[0].id, "tool_1");
             // Continuation should reference the same thread
-            assert!(!continuation.thread_id.to_string().is_empty());
+            assert!(!continuation.payload.thread_id.to_string().is_empty());
         }
         other => panic!("Expected PendingToolCalls, got {other:?}"),
     }
@@ -2361,10 +2361,10 @@ async fn test_submit_tool_results_continuation_serializes() -> anyhow::Result<()
 
     // Round-trip through JSON (simulates durable persistence)
     let json = serde_json::to_string(&continuation)?;
-    let recovered: Box<crate::types::AgentContinuation> = serde_json::from_str(&json)?;
-    assert_eq!(recovered.thread_id, continuation.thread_id);
-    assert_eq!(recovered.turn, continuation.turn);
-    assert_eq!(recovered.pending_tool_calls.len(), 1);
+    let recovered: Box<ContinuationEnvelope> = serde_json::from_str(&json)?;
+    assert_eq!(recovered.payload.thread_id, continuation.payload.thread_id);
+    assert_eq!(recovered.payload.turn, continuation.payload.turn);
+    assert_eq!(recovered.payload.pending_tool_calls.len(), 1);
 
     // Use the deserialized continuation to resume
     let (outcome2, _) = run_turn_recorded(
@@ -2518,5 +2518,335 @@ async fn test_submit_tool_results_duplicate_tool_call_id() -> anyhow::Result<()>
         matches!(outcome2, TurnOutcome::Error(_)),
         "Expected Error for duplicate tool call ID, got {outcome2:?}"
     );
+    Ok(())
+}
+
+// ===================
+// Phase 1.5 Tests: ToolInvocation, Versioned Continuations, Resume-time Policy
+// ===================
+
+/// Verify that `ToolInvocation` carries all expected fields to the hooks.
+#[tokio::test]
+#[allow(clippy::significant_drop_tightening)]
+async fn test_tool_invocation_carries_full_context() -> anyhow::Result<()> {
+    use std::sync::Mutex;
+
+    /// Hook that captures the `ToolInvocation` it receives.
+    #[derive(Clone)]
+    struct CapturingHooks {
+        captured: Arc<Mutex<Vec<ToolInvocation>>>,
+    }
+
+    #[async_trait]
+    impl AgentHooks for CapturingHooks {
+        async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+            self.captured.lock().unwrap().push(invocation.clone());
+            ToolDecision::Allow
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let hooks = CapturingHooks {
+        captured: Arc::new(Mutex::new(Vec::new())),
+    };
+    let captured_ref = Arc::clone(&hooks.captured);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(hooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let _ = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Run tool".into()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let captured = captured_ref.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let inv = &captured[0];
+    assert_eq!(inv.tool_call_id, "tool_1");
+    assert_eq!(inv.tool_name, "echo");
+    assert_eq!(inv.display_name, "Echo");
+    assert_eq!(inv.tier, ToolTier::Observe);
+    assert_eq!(inv.requested_input, json!({"message": "hi"}));
+    assert_eq!(inv.effective_input, json!({"message": "hi"}));
+    assert!(inv.listen_context.is_none());
+    Ok(())
+}
+
+/// Verify that continuations round-trip through JSON with version.
+#[tokio::test]
+async fn test_continuation_envelope_round_trip() -> anyhow::Result<()> {
+    use crate::types::CONTINUATION_VERSION;
+
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "hi"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let opts = TurnOptions {
+        tool_runtime: crate::types::ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Run tool".into()),
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    let envelope = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Verify version is set
+    assert_eq!(envelope.version, CONTINUATION_VERSION);
+
+    // Round-trip through JSON
+    let json = serde_json::to_string(&envelope)?;
+    let recovered: ContinuationEnvelope = serde_json::from_str(&json)?;
+    assert_eq!(recovered.version, CONTINUATION_VERSION);
+    assert_eq!(recovered.payload.pending_tool_calls.len(), 1);
+    assert_eq!(recovered.payload.pending_tool_calls[0].name, "echo");
+
+    // Validate unwrap succeeds
+    let payload = recovered.unwrap_validated();
+    assert!(payload.is_ok());
+    Ok(())
+}
+
+/// Verify that an unknown continuation version is rejected at resume time.
+#[tokio::test]
+async fn test_unknown_continuation_version_rejected() -> anyhow::Result<()> {
+    use crate::types::{
+        AgentContinuation, AgentState, CONTINUATION_VERSION, PendingToolCallInfo, TokenUsage,
+    };
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("Done")]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+
+    let thread = ThreadId::new();
+
+    // Construct an envelope with a future version
+    let bad_envelope = ContinuationEnvelope {
+        version: CONTINUATION_VERSION + 1,
+        payload: AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![PendingToolCallInfo {
+                id: "call_1".into(),
+                name: "echo".into(),
+                display_name: "Echo".into(),
+                input: serde_json::json!({}),
+                effective_input: serde_json::json!({}),
+                listen_context: None,
+            }],
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread.clone()),
+        },
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread,
+        AgentInput::Resume {
+            continuation: Box::new(bad_envelope),
+            tool_call_id: "call_1".into(),
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    match outcome {
+        TurnOutcome::Error(e) => {
+            assert!(
+                e.message.contains("Unsupported continuation version"),
+                "Expected version error, got: {}",
+                e.message,
+            );
+        }
+        other => panic!("Expected Error for bad version, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// Verify that resume-time Block from hooks authoritatively prevents execution.
+#[tokio::test]
+async fn test_resume_time_block_is_authoritative() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    /// Hooks that allow the first call (to get past the initial tool eval)
+    /// then block on resume.
+    struct BlockOnResumeHooks {
+        first_call_done: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentHooks for BlockOnResumeHooks {
+        async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+            if self.first_call_done.swap(true, Ordering::SeqCst) {
+                // Second call (resume) -> block
+                ToolDecision::Block("policy changed".into())
+            } else {
+                // First call -> require confirmation (so we get a continuation)
+                ToolDecision::RequiresConfirmation("confirm?".into())
+            }
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let hooks = BlockOnResumeHooks {
+        first_call_done: AtomicBool::new(false),
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(hooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+
+    // First turn: should yield AwaitingConfirmation
+    let (outcome1, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run echo".into()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let (continuation, tool_call_id) = match outcome1 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    // Resume with confirmation — but hooks now return Block
+    let (outcome2, events) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    // The turn should still complete (the blocked tool result is fed back to LLM)
+    // but the tool result should indicate it was blocked.
+    match outcome2 {
+        TurnOutcome::Done { .. } | TurnOutcome::NeedsMoreTurns { .. } => {
+            // Check that a ToolCallEnd event was emitted with a failure
+            let has_blocked_result = events.iter().any(|e| {
+                matches!(&e.event, AgentEvent::ToolCallEnd { result, .. } if !result.success && result.output.contains("Blocked at resume"))
+            });
+            assert!(
+                has_blocked_result,
+                "Expected a ToolCallEnd with 'Blocked at resume' message"
+            );
+        }
+        other => panic!("Expected Done/NeedsMoreTurns after blocked resume, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// Verify that `effective_input` on `PendingToolCallInfo` defaults to match `input`.
+#[tokio::test]
+async fn test_effective_input_defaults_to_requested() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "test"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let opts = TurnOptions {
+        tool_runtime: crate::types::ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Run tool".into()),
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    let tool_calls = match outcome {
+        TurnOutcome::PendingToolCalls { tool_calls, .. } => tool_calls,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].input, tool_calls[0].effective_input);
+    assert_eq!(tool_calls[0].input, json!({"message": "test"}));
     Ok(())
 }

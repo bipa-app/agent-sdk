@@ -17,8 +17,8 @@ use crate::hooks::AgentHooks;
 use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
 use crate::stores::{EventStore, MessageStore, StateStore};
 use crate::types::{
-    AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ThreadId, TokenUsage,
-    TurnOutcome,
+    AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ContinuationEnvelope,
+    ThreadId, TokenUsage, TurnOutcome,
 };
 use log::warn;
 use std::collections::HashSet;
@@ -58,11 +58,19 @@ where
             initialize_from_message(msg, thread_id, message_store, state_store).await
         }
         AgentInput::Resume {
-            continuation,
+            continuation: envelope,
             tool_call_id,
             confirmed,
             rejection_reason,
         } => {
+            // Validate continuation version
+            let continuation = Box::new(
+                envelope
+                    .unwrap_validated()
+                    .map_err(|msg| AgentError::new(msg, false))?,
+            );
+
+            // Validate thread_id matches
             if continuation.thread_id != *thread_id {
                 return Err(AgentError::new(
                     format!(
@@ -86,9 +94,16 @@ where
             })
         }
         AgentInput::SubmitToolResults {
-            continuation,
+            continuation: envelope,
             results,
-        } => initialize_from_tool_results(continuation, results, thread_id, message_store).await,
+        } => {
+            let continuation = Box::new(
+                envelope
+                    .unwrap_validated()
+                    .map_err(|msg| AgentError::new(msg, false))?,
+            );
+            initialize_from_tool_results(continuation, results, thread_id, message_store).await
+        }
         AgentInput::Continue => {
             let state = match state_store.load(thread_id).await {
                 Ok(Some(s)) => s,
@@ -433,7 +448,7 @@ where
             display_name,
             input,
             description,
-            continuation,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         })),
     }
 }
@@ -755,7 +770,7 @@ where
             display_name,
             input,
             description,
-            continuation,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         }),
         InternalTurnResult::PendingToolCalls { .. } => finish_turn_or_run_state(
             event_store,
@@ -971,7 +986,7 @@ where
             display_name,
             input,
             description,
-            continuation,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         },
         Err(error) => {
             if let Err(store_error) = send_event(
@@ -1507,7 +1522,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             display_name,
             input,
             description,
-            continuation,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         },
         InternalTurnResult::PendingToolCalls {
             turn_usage,
@@ -1518,7 +1533,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             turn_usage,
             total_usage: ctx.total_usage,
             tool_calls: pending_tool_calls,
-            continuation,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
         },
         InternalTurnResult::Error(e) => TurnOutcome::Error(e),
     }
@@ -1618,6 +1633,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 input: serde_json::json!({}),
+                effective_input: serde_json::json!({}),
                 listen_context: None,
             }],
             awaiting_index: 0,
@@ -1649,6 +1665,7 @@ mod tests {
                     name: "echo".into(),
                     display_name: "Echo".into(),
                     input: serde_json::json!({}),
+                    effective_input: serde_json::json!({}),
                     listen_context: None,
                 },
                 PendingToolCallInfo {
@@ -1656,6 +1673,7 @@ mod tests {
                     name: "write".into(),
                     display_name: "Write".into(),
                     input: serde_json::json!({}),
+                    effective_input: serde_json::json!({}),
                     listen_context: None,
                 },
             ],
@@ -1697,6 +1715,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo".into(),
                 input: serde_json::json!({}),
+                effective_input: serde_json::json!({}),
                 listen_context: None,
             }],
             awaiting_index: 0,
