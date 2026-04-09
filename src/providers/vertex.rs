@@ -167,6 +167,7 @@ impl VertexProvider {
                 input_tokens: api_response.usage.total_input_tokens(),
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
+                cache_creation_input_tokens: api_response.usage.cache_creation_input_tokens(),
             },
         }
     }
@@ -696,6 +697,7 @@ impl VertexProvider {
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
             let mut cached_input_tokens: u32 = 0;
+            let mut cache_creation_input_tokens: u32 = 0;
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
@@ -720,6 +722,7 @@ impl VertexProvider {
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut cached_input_tokens,
+                        &mut cache_creation_input_tokens,
                         &mut tool_ids,
                         &mut pending_stop_reason,
                     ) {
@@ -745,6 +748,7 @@ impl VertexProvider {
                     &mut input_tokens,
                     &mut output_tokens,
                     &mut cached_input_tokens,
+                    &mut cache_creation_input_tokens,
                     &mut tool_ids,
                     &mut pending_stop_reason,
                 ) {

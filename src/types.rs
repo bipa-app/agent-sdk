@@ -131,12 +131,22 @@ impl RetryConfig {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cached_input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 impl TokenUsage {
     pub const fn add(&mut self, other: &Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
     }
 }
 
@@ -618,4 +628,30 @@ pub enum TurnOutcome {
 
     /// An error occurred.
     Error(AgentError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn token_usage_add_accumulates_cache_breakdown() {
+        let mut total = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+        };
+        total.add(&TokenUsage {
+            input_tokens: 40,
+            output_tokens: 5,
+            cached_input_tokens: 7,
+            cache_creation_input_tokens: 3,
+        });
+
+        assert_eq!(total.input_tokens, 140);
+        assert_eq!(total.output_tokens, 55);
+        assert_eq!(total.cached_input_tokens, 27);
+        assert_eq!(total.cache_creation_input_tokens, 13);
+    }
 }

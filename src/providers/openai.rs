@@ -424,6 +424,7 @@ impl LlmProvider for OpenAIProvider {
                     .prompt_tokens_details
                     .as_ref()
                     .map_or(0, |details| details.cached_tokens),
+                cache_creation_input_tokens: 0,
             },
         }))
     }
@@ -675,6 +676,7 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens),
+            cache_creation_input_tokens: 0,
         }));
     }
 
@@ -1898,6 +1900,32 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 10);
+    }
+
+    #[test]
+    fn test_process_sse_data_maps_cached_tokens_to_cache_read_usage() {
+        let results = process_sse_data(
+            r#"{
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 42,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 10
+                    }
+                }
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::Usage(Usage {
+                input_tokens: 42,
+                output_tokens: 7,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 0,
+            })]
+        ));
     }
 
     #[test]

@@ -21,6 +21,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+struct ObservedRunLoopOutcome {
+    state: AgentRunState,
+    #[cfg(feature = "otel")]
+    total_usage: TokenUsage,
+}
+
+struct ObservedTurnOutcome {
+    outcome: TurnOutcome,
+    #[cfg(feature = "otel")]
+    total_usage: TokenUsage,
+}
+
 /// Initialize agent state from the given input.
 ///
 /// Handles the three input variants:
@@ -679,38 +691,33 @@ where
     };
 
     #[cfg(feature = "otel")]
-    let result = {
+    let observed = {
         use opentelemetry::trace::FutureExt;
 
         run_loop_inner(params).with_context(root_context).await
     };
     #[cfg(not(feature = "otel"))]
-    let result = run_loop_inner(params).await;
+    let observed = run_loop_inner(params).await;
 
     #[cfg(feature = "otel")]
     {
         use crate::observability::instrument::{end_root_span, run_state_outcome};
-        let (turns, inp, out) = match &result {
-            AgentRunState::Done {
-                total_turns,
-                input_tokens,
-                output_tokens,
+        let turns = match &observed.state {
+            AgentRunState::Done { total_turns, .. }
+            | AgentRunState::Refusal { total_turns, .. } => {
+                usize::try_from(*total_turns).unwrap_or(0)
             }
-            | AgentRunState::Refusal {
-                total_turns,
-                input_tokens,
-                output_tokens,
-            } => (
-                usize::try_from(*total_turns).unwrap_or(0),
-                *input_tokens,
-                *output_tokens,
-            ),
-            _ => (0, 0, 0),
+            _ => 0,
         };
-        end_root_span(&mut root_span, turns, inp, out, run_state_outcome(&result));
+        end_root_span(
+            &mut root_span,
+            turns,
+            &observed.total_usage,
+            run_state_outcome(&observed.state),
+        );
     }
 
-    result
+    observed.state
 }
 
 async fn run_loop_inner<Ctx, P, H, M, S>(
@@ -734,7 +741,7 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         #[cfg(feature = "otel")]
         observability_store,
     }: RunLoopParameters<Ctx, P, H, M, S>,
-) -> AgentRunState
+) -> ObservedRunLoopOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
     P: LlmProvider,
@@ -749,7 +756,13 @@ where
     let init_state =
         match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
             Ok(state) => state,
-            Err(error) => return AgentRunState::Error(error),
+            Err(error) => {
+                return ObservedRunLoopOutcome {
+                    state: AgentRunState::Error(error),
+                    #[cfg(feature = "otel")]
+                    total_usage: TokenUsage::default(),
+                };
+            }
         };
 
     let InitializedState {
@@ -777,7 +790,20 @@ where
         .await;
 
         match resume_result {
-            Ok(Some(outcome)) => return outcome,
+            Ok(Some(outcome)) => {
+                #[cfg(feature = "otel")]
+                let observed_total_usage = match &outcome {
+                    AgentRunState::Done { .. } | AgentRunState::Refusal { .. } => {
+                        total_usage.clone()
+                    }
+                    _ => TokenUsage::default(),
+                };
+                return ObservedRunLoopOutcome {
+                    state: outcome,
+                    #[cfg(feature = "otel")]
+                    total_usage: observed_total_usage,
+                };
+            }
             Ok(None) => {}
             Err(error) => {
                 send_event(
@@ -787,7 +813,11 @@ where
                     AgentEvent::error(&error.message, error.recoverable),
                 )
                 .await;
-                return AgentRunState::Error(error);
+                return ObservedRunLoopOutcome {
+                    state: AgentRunState::Error(error),
+                    #[cfg(feature = "otel")]
+                    total_usage: TokenUsage::default(),
+                };
             }
         }
     }
@@ -823,7 +853,13 @@ where
     })
     .await
     {
-        return outcome;
+        #[cfg(feature = "otel")]
+        let total_usage = ctx.total_usage.clone();
+        return ObservedRunLoopOutcome {
+            state: outcome,
+            #[cfg(feature = "otel")]
+            total_usage,
+        };
     }
 
     if let Err(e) = state_store.save(&ctx.state).await {
@@ -839,10 +875,14 @@ where
     )
     .await;
 
-    AgentRunState::Done {
-        total_turns: turns_to_u32(ctx.turn),
-        input_tokens: u64::from(ctx.total_usage.input_tokens),
-        output_tokens: u64::from(ctx.total_usage.output_tokens),
+    ObservedRunLoopOutcome {
+        state: AgentRunState::Done {
+            total_turns: turns_to_u32(ctx.turn),
+            input_tokens: u64::from(ctx.total_usage.input_tokens),
+            output_tokens: u64::from(ctx.total_usage.output_tokens),
+        },
+        #[cfg(feature = "otel")]
+        total_usage: ctx.total_usage.clone(),
     }
 }
 
@@ -878,7 +918,7 @@ where
     };
 
     #[cfg(feature = "otel")]
-    let outcome = {
+    let observed = {
         use opentelemetry::trace::FutureExt;
 
         run_single_turn_inner(params)
@@ -886,39 +926,27 @@ where
             .await
     };
     #[cfg(not(feature = "otel"))]
-    let outcome = run_single_turn_inner(params).await;
+    let observed = run_single_turn_inner(params).await;
 
     #[cfg(feature = "otel")]
     {
         use crate::observability::instrument::{end_root_span, turn_outcome_str};
-        let (turns, inp, out) = match &outcome {
-            TurnOutcome::Done {
-                total_turns,
-                input_tokens,
-                output_tokens,
+        let turns = match &observed.outcome {
+            TurnOutcome::Done { total_turns, .. } | TurnOutcome::Refusal { total_turns, .. } => {
+                usize::try_from(*total_turns).unwrap_or(0)
             }
-            | TurnOutcome::Refusal {
-                total_turns,
-                input_tokens,
-                output_tokens,
-            } => (
-                usize::try_from(*total_turns).unwrap_or(0),
-                *input_tokens,
-                *output_tokens,
-            ),
-            TurnOutcome::NeedsMoreTurns {
-                turn, total_usage, ..
-            } => (
-                *turn,
-                u64::from(total_usage.input_tokens),
-                u64::from(total_usage.output_tokens),
-            ),
-            _ => (0, 0, 0),
+            TurnOutcome::NeedsMoreTurns { turn, .. } => *turn,
+            _ => 0,
         };
-        end_root_span(&mut root_span, turns, inp, out, turn_outcome_str(&outcome));
+        end_root_span(
+            &mut root_span,
+            turns,
+            &observed.total_usage,
+            turn_outcome_str(&observed.outcome),
+        );
     }
 
-    outcome
+    observed.outcome
 }
 
 async fn run_single_turn_inner<Ctx, P, H, M, S>(
@@ -941,7 +969,7 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         #[cfg(feature = "otel")]
         observability_store,
     }: TurnParameters<Ctx, P, H, M, S>,
-) -> TurnOutcome
+) -> ObservedTurnOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
     P: LlmProvider,
@@ -952,10 +980,14 @@ where
     // Check for cancellation before starting any work
     if cancel_token.is_cancelled() {
         log::info!("Agent turn cancelled before execution started");
-        return TurnOutcome::Cancelled {
-            total_turns: 0,
-            input_tokens: 0,
-            output_tokens: 0,
+        return ObservedTurnOutcome {
+            outcome: TurnOutcome::Cancelled {
+                total_turns: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            #[cfg(feature = "otel")]
+            total_usage: TokenUsage::default(),
         };
     }
 
@@ -974,7 +1006,11 @@ where
                     AgentEvent::error(&error.message, error.recoverable),
                 )
                 .await;
-                return TurnOutcome::Error(error);
+                return ObservedTurnOutcome {
+                    outcome: TurnOutcome::Error(error),
+                    #[cfg(feature = "otel")]
+                    total_usage: TokenUsage::default(),
+                };
             }
         };
 
@@ -986,10 +1022,10 @@ where
     } = init_state;
 
     if let Some(resume_data) = resume_data {
-        return handle_single_turn_resume(SingleTurnResumeParams {
+        let outcome = handle_single_turn_resume(SingleTurnResumeParams {
             resume_data,
             turn,
-            total_usage,
+            total_usage: total_usage.clone(),
             state,
             thread_id,
             tool_context,
@@ -1002,6 +1038,20 @@ where
             execution_store,
         })
         .await;
+        #[cfg(feature = "otel")]
+        let observed_total_usage = match &outcome {
+            TurnOutcome::Done { .. }
+            | TurnOutcome::Refusal { .. }
+            | TurnOutcome::NeedsMoreTurns { .. } => total_usage,
+            TurnOutcome::AwaitingConfirmation { .. }
+            | TurnOutcome::Cancelled { .. }
+            | TurnOutcome::Error(_) => TokenUsage::default(),
+        };
+        return ObservedTurnOutcome {
+            outcome,
+            #[cfg(feature = "otel")]
+            total_usage: observed_total_usage,
+        };
     }
 
     let mut ctx = TurnContext {
@@ -1033,7 +1083,17 @@ where
     })
     .await;
 
-    convert_turn_result(result, ctx, &tx, &hooks, &seq, thread_id, &state_store).await
+    #[cfg(feature = "otel")]
+    let observed_total_usage = ctx.total_usage.clone();
+    let outcome =
+        convert_turn_result(result, ctx, &tx, &hooks, &seq, thread_id, &state_store).await;
+    #[cfg(feature = "otel")]
+    let total_usage = observed_total_usage;
+    ObservedTurnOutcome {
+        outcome,
+        #[cfg(feature = "otel")]
+        total_usage,
+    }
 }
 
 pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(

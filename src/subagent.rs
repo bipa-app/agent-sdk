@@ -867,6 +867,8 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 1500,
                 output_tokens: 500,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             success: true,
             duration_ms: 2500,

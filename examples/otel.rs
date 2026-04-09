@@ -29,11 +29,12 @@ impl LlmProvider for DemoProvider {
                 input_tokens: 8,
                 output_tokens: 12,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         }))
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &'static str {
         "demo-model"
     }
 

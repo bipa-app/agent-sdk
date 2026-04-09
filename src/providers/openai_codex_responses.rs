@@ -299,6 +299,7 @@ impl OpenAICodexResponsesProvider {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 },
                 |usage| Usage {
                     input_tokens: usage.input_tokens,
@@ -307,6 +308,7 @@ impl OpenAICodexResponsesProvider {
                         .input_tokens_details
                         .as_ref()
                         .map_or(0, |details| details.cached_tokens),
+                    cache_creation_input_tokens: 0,
                 },
             ),
         }
@@ -1572,6 +1574,7 @@ fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
             .input_tokens_details
             .as_ref()
             .map_or(0, |details| details.cached_tokens),
+        cache_creation_input_tokens: 0,
     }
 }
 

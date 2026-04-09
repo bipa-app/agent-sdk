@@ -683,6 +683,14 @@ fn finish_llm_span(
                 attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
                 i64::from(response.usage.output_tokens),
             ));
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                i64::from(response.usage.cached_input_tokens),
+            ));
+            span.set_attribute(attrs::kv_i64(
+                attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                i64::from(response.usage.cache_creation_input_tokens),
+            ));
             span.set_attribute(attrs::kv_bool(
                 attrs::SDK_LLM_HAD_TOOL_CALLS,
                 response.has_tool_use(),
@@ -718,10 +726,26 @@ pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cached_input_tokens: response.usage.cached_input_tokens,
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
     };
     ctx.total_usage.add(&turn_usage);
     ctx.state.total_usage = ctx.total_usage.clone();
     turn_usage
+}
+
+#[cfg(feature = "otel")]
+const fn token_usage_delta(current: &TokenUsage, baseline: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: current.input_tokens.saturating_sub(baseline.input_tokens),
+        output_tokens: current.output_tokens.saturating_sub(baseline.output_tokens),
+        cached_input_tokens: current
+            .cached_input_tokens
+            .saturating_sub(baseline.cached_input_tokens),
+        cache_creation_input_tokens: current
+            .cache_creation_input_tokens
+            .saturating_sub(baseline.cache_creation_input_tokens),
+    }
 }
 
 pub(super) async fn process_turn_response<Ctx, H, M>(
@@ -1238,10 +1262,47 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    #[cfg(feature = "otel")]
-    let turn_number = params.ctx.turn + 1; // begin_turn increments
+    let ExecuteTurnParameters {
+        tx,
+        seq,
+        ctx,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        config,
+        compaction_config,
+        compactor,
+        execution_store,
+        #[cfg(feature = "otel")]
+        observability_store,
+    } = params;
 
-    let result = execute_turn_inner(params).await;
+    #[cfg(feature = "otel")]
+    let turn_number = ctx.turn + 1; // begin_turn increments
+    #[cfg(feature = "otel")]
+    let usage_before_turn = ctx.total_usage.clone();
+
+    let result = execute_turn_inner(ExecuteTurnParameters {
+        tx,
+        seq,
+        ctx: &mut *ctx,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        config,
+        compaction_config,
+        compactor,
+        execution_store,
+        #[cfg(feature = "otel")]
+        observability_store,
+    })
+    .await;
 
     #[cfg(feature = "otel")]
     {
@@ -1251,6 +1312,7 @@ where
         use opentelemetry::KeyValue;
         use opentelemetry::trace::Span;
 
+        let turn_usage = token_usage_delta(&ctx.total_usage, &usage_before_turn);
         let mut turn_span = spans::start_internal_span(
             "agent.turn",
             vec![attrs::kv_i64(
@@ -1259,19 +1321,28 @@ where
             )],
         );
 
+        turn_span.set_attribute(attrs::kv_i64(
+            attrs::SDK_TURN_INPUT_TOKENS,
+            i64::from(turn_usage.input_tokens),
+        ));
+        turn_span.set_attribute(attrs::kv_i64(
+            attrs::SDK_TURN_OUTPUT_TOKENS,
+            i64::from(turn_usage.output_tokens),
+        ));
+        turn_span.set_attribute(attrs::kv_i64(
+            attrs::SDK_TURN_CACHE_READ_INPUT_TOKENS,
+            i64::from(turn_usage.cached_input_tokens),
+        ));
+        turn_span.set_attribute(attrs::kv_i64(
+            attrs::SDK_TURN_CACHE_CREATION_INPUT_TOKENS,
+            i64::from(turn_usage.cache_creation_input_tokens),
+        ));
+
         match &result {
             InternalTurnResult::Continue { turn_usage } => {
                 let had_tools = turn_usage.input_tokens > 0 || turn_usage.output_tokens > 0;
                 turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "continue"));
                 turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, had_tools));
-                turn_span.set_attribute(attrs::kv_i64(
-                    attrs::SDK_TURN_INPUT_TOKENS,
-                    i64::from(turn_usage.input_tokens),
-                ));
-                turn_span.set_attribute(attrs::kv_i64(
-                    attrs::SDK_TURN_OUTPUT_TOKENS,
-                    i64::from(turn_usage.output_tokens),
-                ));
             }
             InternalTurnResult::Done => {
                 turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "done"));

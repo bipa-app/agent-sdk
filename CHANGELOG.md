@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cached token usage observability** - OpenTelemetry spans now emit `gen_ai.usage.cache_creation.input_tokens` and `gen_ai.usage.cache_read.input_tokens`, and provider usage mappings preserve cache-read and cache-creation token breakdowns.
+
 - **Optional OpenTelemetry observability** - Added an `otel` feature with observability helpers, payload/context propagation, `ObservabilityStore` hooks, and instrumentation for agent runs, turns, LLM calls, tool execution, subagent invocations, MCP client calls, and context compaction spans.
 
 - **Stream progress logging** - Added periodic debug logging during stream processing to help diagnose issues:
