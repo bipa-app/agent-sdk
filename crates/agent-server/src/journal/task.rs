@@ -282,6 +282,15 @@ impl TaskStatus {
 /// Structural errors that can be raised when constructing, validating, or
 /// transitioning an [`AgentTask`].
 ///
+/// [`AgentTask::validate`] enforces **single-row** invariants only: identity
+/// consistency with respect to `depth` / `parent_id` / `root_id`, lease
+/// atomicity, status/child/terminal/error rules, retry budget, and
+/// kind × status. Cross-row invariants such as a child's `depth` or
+/// `thread_id` matching its parent are enforced at the construction boundary
+/// ([`AgentTask::new_child`]) and at the store boundary
+/// ([`super::store::AgentTaskStore::insert`]) rather than by `validate()`,
+/// because `validate()` takes `&self` and has no access to the parent row.
+///
 /// Every code path that mutates a task ends in a call to
 /// [`AgentTask::validate`], which returns the first violated invariant as
 /// one of these variants. Tests pattern-match on these variants for clear
@@ -296,10 +305,6 @@ pub enum TaskSchemaError {
     RootIdMismatchForRoot,
     #[error("child root_id must match parent root_id")]
     ChildRootIdMismatch,
-    #[error("child depth must be parent.depth + 1")]
-    InvalidDepth,
-    #[error("non-root task must inherit parent thread_id")]
-    ChildThreadIdMismatch,
     #[error("lease fields must all be set together or all be clear")]
     LeaseFieldsInconsistent,
     #[error("status {status:?} must not carry a worker lease")]
@@ -482,13 +487,24 @@ impl AgentTask {
         self.parent_id.is_none()
     }
 
-    /// Check every structural and state-machine invariant on this row.
+    /// Check every **single-row** invariant on this task.
     ///
     /// The first violation is returned as a [`TaskSchemaError`] so test
     /// failures point at a single clear problem. Call sites that mutate a
     /// task (state transitions, store writes) invoke `validate()` before
     /// committing the change, so no invariant-violating row is ever
     /// reachable through the public API.
+    ///
+    /// # Cross-row invariants are out of scope
+    ///
+    /// `validate()` only has access to `self`. Cross-row invariants such as
+    /// `child.depth == parent.depth + 1` or `child.thread_id ==
+    /// parent.thread_id` are enforced at the construction boundary
+    /// ([`AgentTask::new_child`]) and again at the store boundary
+    /// ([`super::store::AgentTaskStore::insert`]). Callers that bypass both
+    /// boundaries (e.g. by manually mutating public fields or
+    /// deserializing an untrusted row) must re-run the store insert to pick
+    /// up the cross-row checks.
     ///
     /// # Errors
     /// Returns the first violated invariant.
@@ -935,13 +951,15 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
+    use time::Duration;
 
     fn t0() -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid ts")
+        OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
     }
 
     fn t_plus(secs: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs).expect("valid ts")
+        t0() + Duration::seconds(secs)
     }
 
     fn thread() -> ThreadId {
@@ -955,32 +973,35 @@ mod tests {
     // ── construction / round-trip ─────────────────────────────────
 
     #[test]
-    fn root_task_round_trip_through_json() {
+    fn root_task_round_trip_through_json() -> Result<()> {
         let task = fresh_root();
-        task.validate().expect("fresh root must validate");
-        let json = serde_json::to_string(&task).expect("serializes");
-        let recovered: AgentTask = serde_json::from_str(&json).expect("deserializes");
-        recovered.validate().expect("round-trip must validate");
+        task.validate().context("fresh root must validate")?;
+        let json = serde_json::to_string(&task).context("serializes")?;
+        let recovered: AgentTask = serde_json::from_str(&json).context("deserializes")?;
+        recovered.validate().context("round-trip must validate")?;
         assert_eq!(task, recovered);
+        Ok(())
     }
 
     #[test]
-    fn child_task_inherits_root_id_thread_id_and_depth() {
+    fn child_task_inherits_root_id_thread_id_and_depth() -> Result<()> {
         let root = fresh_root();
-        let child = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).expect("child");
+        let child = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).context("child")?;
         assert_eq!(child.root_id, root.id);
         assert_eq!(child.thread_id, root.thread_id);
         assert_eq!(child.depth, root.depth + 1);
         assert!(!child.is_root());
-        child.validate().expect("child validates");
+        child.validate().context("child validates")?;
+        Ok(())
     }
 
     #[test]
-    fn tool_runtime_cannot_be_parent() {
+    fn tool_runtime_cannot_be_parent() -> Result<()> {
         let root = fresh_root();
-        let tool = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).expect("tool");
+        let tool = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).context("tool")?;
         let err = AgentTask::new_child(&tool, TaskKind::ToolRuntime, t0(), 1).unwrap_err();
         assert_eq!(err, TaskSchemaError::ToolRuntimeCannotSpawnChildren);
+        Ok(())
     }
 
     // ── validate() — identity ─────────────────────────────────────
@@ -993,27 +1014,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_root_without_parent() {
+    fn validate_rejects_non_root_without_parent() -> Result<()> {
         let root = fresh_root();
-        let mut child = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).expect("child");
+        let mut child =
+            AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).context("child")?;
         child.parent_id = None;
         assert_eq!(child.validate(), Err(TaskSchemaError::NonRootMissingParent));
+        Ok(())
     }
 
     #[test]
-    fn validate_rejects_mismatched_root_id() {
+    fn validate_rejects_mismatched_root_id() -> Result<()> {
         let root = fresh_root();
-        let mut child = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).expect("child");
+        let mut child =
+            AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).context("child")?;
         // Child id == root_id is forbidden on non-roots
         child.root_id = child.id.clone();
         assert_eq!(child.validate(), Err(TaskSchemaError::ChildRootIdMismatch));
+        Ok(())
     }
 
     #[test]
     fn validate_rejects_bad_depth() {
         // depth 0 with a parent_id is the RootHasParent guard, not depth —
-        // use depth 2 with root linkage to provoke the same branch via
-        // the depth==0 / parent mismatch path.
+        // depth > 0 with parent None is NonRootMissingParent. Both are
+        // structural invariants validate() can catch without a parent row.
         let mut task = fresh_root();
         task.depth = 1; // depth > 0 but parent is None
         assert_eq!(task.validate(), Err(TaskSchemaError::NonRootMissingParent));
@@ -1055,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_terminal_with_lease() {
+    fn validate_rejects_terminal_with_lease() -> Result<()> {
         let task = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1063,7 +1088,7 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("mark running");
+            .context("mark running")?;
         // Force terminal while keeping lease
         let mut bad = task;
         bad.status = TaskStatus::Completed;
@@ -1074,6 +1099,7 @@ mod tests {
                 status: TaskStatus::Completed
             })
         );
+        Ok(())
     }
 
     // ── validate() — terminal/error invariants ────────────────────
@@ -1150,20 +1176,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_queued_on_tool_runtime() {
+    fn validate_rejects_queued_on_tool_runtime() -> Result<()> {
         let root = fresh_root();
-        let mut child = AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).expect("child");
+        let mut child =
+            AgentTask::new_child(&root, TaskKind::ToolRuntime, t0(), 1).context("child")?;
         child.status = TaskStatus::Queued;
         assert_eq!(
             child.validate(),
             Err(TaskSchemaError::QueuedOnlyForRootTurns)
         );
+        Ok(())
     }
 
     // ── wire-format lock ──────────────────────────────────────────
 
     #[test]
-    fn all_task_kind_and_status_variants_round_trip_through_snake_case_json() {
+    fn all_task_kind_and_status_variants_round_trip_through_snake_case_json() -> Result<()> {
         let kinds = [
             TaskKind::RootTurn,
             TaskKind::ToolRuntime,
@@ -1171,9 +1199,9 @@ mod tests {
         ];
         let kind_wire = ["\"root_turn\"", "\"tool_runtime\"", "\"subagent\""];
         for (kind, wire) in kinds.iter().zip(kind_wire.iter()) {
-            let encoded = serde_json::to_string(kind).expect("kind serializes");
+            let encoded = serde_json::to_string(kind).context("kind serializes")?;
             assert_eq!(&encoded, wire);
-            let decoded: TaskKind = serde_json::from_str(&encoded).expect("kind round-trips");
+            let decoded: TaskKind = serde_json::from_str(&encoded).context("kind round-trips")?;
             assert_eq!(&decoded, kind);
         }
 
@@ -1198,21 +1226,23 @@ mod tests {
             "\"cancelled\"",
         ];
         for (status, wire) in statuses.iter().zip(status_wire.iter()) {
-            let encoded = serde_json::to_string(status).expect("status serializes");
+            let encoded = serde_json::to_string(status).context("status serializes")?;
             assert_eq!(&encoded, wire);
-            let decoded: TaskStatus = serde_json::from_str(&encoded).expect("status round-trips");
+            let decoded: TaskStatus =
+                serde_json::from_str(&encoded).context("status round-trips")?;
             assert_eq!(&decoded, status);
         }
+        Ok(())
     }
 
     // ── state-transition tests ────────────────────────────────────
 
     #[test]
-    fn queued_then_pending_then_running_round_trip() {
+    fn queued_then_pending_then_running_round_trip() -> Result<()> {
         let root = fresh_root();
-        let queued = root.admit_as_queued(t_plus(1)).expect("queue");
+        let queued = root.admit_as_queued(t_plus(1)).context("queue")?;
         assert_eq!(queued.status, TaskStatus::Queued);
-        let pending = queued.promote_to_pending(t_plus(2)).expect("pending");
+        let pending = queued.promote_to_pending(t_plus(2)).context("pending")?;
         assert_eq!(pending.status, TaskStatus::Pending);
         let running = pending
             .mark_running(
@@ -1221,16 +1251,17 @@ mod tests {
                 t_plus(60),
                 t_plus(3),
             )
-            .expect("running");
+            .context("running")?;
         assert_eq!(running.status, TaskStatus::Running);
         assert_eq!(running.attempt, 1);
         assert_eq!(running.worker_id, Some(WorkerId::from_string("w1")));
         assert_eq!(running.lease_id, Some(LeaseId::from_string("l1")));
         assert_eq!(running.lease_expires_at, Some(t_plus(60)));
+        Ok(())
     }
 
     #[test]
-    fn running_to_waiting_on_children_drops_lease() {
+    fn running_to_waiting_on_children_drops_lease() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1238,18 +1269,19 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let waiting = running.wait_on_children(2, t_plus(2)).expect("wait");
+            .context("running")?;
+        let waiting = running.wait_on_children(2, t_plus(2)).context("wait")?;
         assert_eq!(waiting.status, TaskStatus::WaitingOnChildren);
         assert_eq!(waiting.pending_child_count, 2);
         assert!(waiting.worker_id.is_none());
         assert!(waiting.lease_id.is_none());
         assert!(waiting.lease_expires_at.is_none());
         assert!(waiting.last_heartbeat_at.is_none());
+        Ok(())
     }
 
     #[test]
-    fn child_resolved_zero_children_returns_to_pending() {
+    fn child_resolved_zero_children_returns_to_pending() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1257,15 +1289,16 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let waiting = running.wait_on_children(1, t_plus(2)).expect("wait");
-        let resolved = waiting.child_resolved(t_plus(3)).expect("resolved");
+            .context("running")?;
+        let waiting = running.wait_on_children(1, t_plus(2)).context("wait")?;
+        let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::Pending);
         assert_eq!(resolved.pending_child_count, 0);
+        Ok(())
     }
 
     #[test]
-    fn child_resolved_non_zero_stays_waiting() {
+    fn child_resolved_non_zero_stays_waiting() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1273,15 +1306,16 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let waiting = running.wait_on_children(3, t_plus(2)).expect("wait");
-        let resolved = waiting.child_resolved(t_plus(3)).expect("resolved");
+            .context("running")?;
+        let waiting = running.wait_on_children(3, t_plus(2)).context("wait")?;
+        let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::WaitingOnChildren);
         assert_eq!(resolved.pending_child_count, 2);
+        Ok(())
     }
 
     #[test]
-    fn running_to_awaiting_confirmation_drops_lease() {
+    fn running_to_awaiting_confirmation_drops_lease() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1289,14 +1323,15 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let waiting = running.await_confirmation(t_plus(2)).expect("await");
+            .context("running")?;
+        let waiting = running.await_confirmation(t_plus(2)).context("await")?;
         assert_eq!(waiting.status, TaskStatus::AwaitingConfirmation);
         assert!(waiting.worker_id.is_none());
+        Ok(())
     }
 
     #[test]
-    fn awaiting_confirmation_to_pending() {
+    fn awaiting_confirmation_to_pending() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1304,16 +1339,17 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let awaiting = running.await_confirmation(t_plus(2)).expect("await");
+            .context("running")?;
+        let awaiting = running.await_confirmation(t_plus(2)).context("await")?;
         let resumed = awaiting
             .resume_from_confirmation(t_plus(3))
-            .expect("resume");
+            .context("resume")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
+        Ok(())
     }
 
     #[test]
-    fn complete_from_running_and_from_waiting() {
+    fn complete_from_running_and_from_waiting() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1321,20 +1357,23 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
-        let done = running.clone().complete(t_plus(2)).expect("complete");
+            .context("running")?;
+        let done = running.clone().complete(t_plus(2)).context("complete")?;
         assert_eq!(done.status, TaskStatus::Completed);
         assert_eq!(done.completed_at, Some(t_plus(2)));
         assert!(done.worker_id.is_none());
 
-        let waiting = running.wait_on_children(1, t_plus(2)).expect("wait");
-        let done2 = waiting.complete(t_plus(3)).expect("complete from waiting");
+        let waiting = running.wait_on_children(1, t_plus(2)).context("wait")?;
+        let done2 = waiting
+            .complete(t_plus(3))
+            .context("complete from waiting")?;
         assert_eq!(done2.status, TaskStatus::Completed);
         assert_eq!(done2.pending_child_count, 0);
+        Ok(())
     }
 
     #[test]
-    fn fail_requires_error_and_sets_completed_at() {
+    fn fail_requires_error_and_sets_completed_at() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1342,28 +1381,29 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
+            .context("running")?;
         let failed = running
             .fail("provider timeout".into(), t_plus(2))
-            .expect("fail");
+            .context("fail")?;
         assert_eq!(failed.status, TaskStatus::Failed);
         assert_eq!(failed.last_error.as_deref(), Some("provider timeout"));
         assert_eq!(failed.completed_at, Some(t_plus(2)));
         assert!(failed.worker_id.is_none());
+        Ok(())
     }
 
     #[test]
-    fn cancel_from_every_non_terminal_state() {
+    fn cancel_from_every_non_terminal_state() -> Result<()> {
         // Pending
-        let task = fresh_root().cancel(t_plus(1)).expect("cancel pending");
+        let task = fresh_root().cancel(t_plus(1)).context("cancel pending")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
 
         // Queued
         let task = fresh_root()
             .admit_as_queued(t_plus(1))
-            .expect("queue")
+            .context("queue")?
             .cancel(t_plus(2))
-            .expect("cancel queued");
+            .context("cancel queued")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
 
         // Running
@@ -1374,9 +1414,9 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running")
+            .context("running")?
             .cancel(t_plus(2))
-            .expect("cancel running");
+            .context("cancel running")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert!(task.worker_id.is_none());
 
@@ -1388,11 +1428,11 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running")
+            .context("running")?
             .wait_on_children(2, t_plus(2))
-            .expect("wait")
+            .context("wait")?
             .cancel(t_plus(3))
-            .expect("cancel waiting");
+            .context("cancel waiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert_eq!(task.pending_child_count, 0);
 
@@ -1404,15 +1444,15 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running")
+            .context("running")?
             .await_confirmation(t_plus(2))
-            .expect("await")
+            .context("await")?
             .cancel(t_plus(3))
-            .expect("cancel awaiting");
+            .context("cancel awaiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
 
         // Already-terminal is rejected
-        let terminal = fresh_root().cancel(t_plus(1)).expect("cancel");
+        let terminal = fresh_root().cancel(t_plus(1)).context("cancel")?;
         let err = terminal.cancel(t_plus(2)).unwrap_err();
         assert_eq!(
             err,
@@ -1421,10 +1461,11 @@ mod tests {
                 to: TaskStatus::Cancelled,
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn release_lease_returns_to_pending() {
+    fn release_lease_returns_to_pending() -> Result<()> {
         let running = fresh_root()
             .mark_running(
                 WorkerId::from_string("w1"),
@@ -1432,9 +1473,9 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
+            .context("running")?;
         assert_eq!(running.attempt, 1);
-        let released = running.release_lease(t_plus(2)).expect("released");
+        let released = running.release_lease(t_plus(2)).context("released")?;
         assert_eq!(released.status, TaskStatus::Pending);
         assert!(released.worker_id.is_none());
         assert!(released.lease_id.is_none());
@@ -1442,10 +1483,11 @@ mod tests {
         assert!(released.last_heartbeat_at.is_none());
         // Attempt counter is NOT rolled back.
         assert_eq!(released.attempt, 1);
+        Ok(())
     }
 
     #[test]
-    fn heartbeat_requires_matching_worker_and_running_state() {
+    fn heartbeat_requires_matching_worker_and_running_state() -> Result<()> {
         // Wrong state
         let mut pending = fresh_root();
         let err = pending
@@ -1461,7 +1503,7 @@ mod tests {
                 t_plus(60),
                 t_plus(1),
             )
-            .expect("running");
+            .context("running")?;
         let err = running
             .touch_heartbeat(&WorkerId::from_string("other"), t_plus(2))
             .unwrap_err();
@@ -1470,7 +1512,8 @@ mod tests {
         // Right state, right worker
         running
             .touch_heartbeat(&WorkerId::from_string("w1"), t_plus(3))
-            .expect("heartbeat ok");
+            .context("heartbeat ok")?;
         assert_eq!(running.last_heartbeat_at, Some(t_plus(3)));
+        Ok(())
     }
 }
