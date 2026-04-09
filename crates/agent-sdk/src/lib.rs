@@ -339,7 +339,7 @@
 //!
 //! When `otel` is enabled, the SDK emits OpenTelemetry spans for agent
 //! invocations, turns, LLM requests, tool execution, subagent runs, MCP
-//! operations, and context compaction. See [`observability`] for details.
+//! operations, and context compaction. See the `observability` module for details.
 
 #![forbid(unsafe_code)]
 
@@ -370,6 +370,7 @@ mod hooks;
 pub mod llm;
 pub mod model_capabilities;
 pub mod providers;
+mod seed;
 mod stores;
 mod tools;
 mod types;
@@ -398,6 +399,7 @@ pub use types::{
 // agent-sdk-tools (via thin modules)
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
+pub use seed::{DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed};
 pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
     StateStore, StoredTurnEvents, ToolExecutionStore,

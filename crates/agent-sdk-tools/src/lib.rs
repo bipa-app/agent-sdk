@@ -12,12 +12,14 @@
 //! | [`hooks`]       | Lifecycle hooks (pre/post tool, events, errors) |
 //! | [`stores`]      | Persistence traits for messages, state, events, and tool executions |
 //! | [`environment`] | Filesystem / process environment abstraction |
+//! | [`seed`]        | Durable reconstruction types (`ToolContextSeed`, `ExecutionContextFactory`) |
 
 #![forbid(unsafe_code)]
 
 pub mod authority;
 pub mod environment;
 pub mod hooks;
+pub mod seed;
 pub mod stores;
 pub mod tools;
 
@@ -25,6 +27,7 @@ pub mod tools;
 pub use authority::{EventAuthority, LocalEventAuthority};
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
+pub use seed::{DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed};
 pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
     StateStore, StoredTurnEvents, ToolExecutionStore,
