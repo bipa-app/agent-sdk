@@ -11,7 +11,7 @@ use super::types::{
 use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
 use crate::events::AgentEvent;
-use crate::hooks::AgentHooks;
+use crate::hooks::{AgentHooks, ToolAuditSink};
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
 };
@@ -21,6 +21,7 @@ use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
     ToolResult, ToolRuntime, TurnOptions,
 };
+use agent_sdk_core::audit::AuditProvenance;
 
 use log::{debug, info, warn};
 use std::sync::Arc;
@@ -845,25 +846,30 @@ where
     tool_uses
         .iter()
         .map(|(id, name, input)| {
-            let display_name = tools
+            // Resolve the tool metadata in one pass so `display_name`
+            // and `tier` stay in lockstep. Unknown tools fall back to
+            // the strictest tier so downstream audit/policy layers see
+            // a conservative default rather than silently observe.
+            let (display_name, tier) = tools
                 .get(name)
-                .map(|tool| tool.display_name().to_string())
+                .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 .or_else(|| {
                     tools
                         .get_async(name)
-                        .map(|tool| tool.display_name().to_string())
+                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 })
                 .or_else(|| {
                     tools
                         .get_listen(name)
-                        .map(|tool| tool.display_name().to_string())
+                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| (String::new(), crate::types::ToolTier::Confirm));
 
             PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 display_name,
+                tier,
                 input: input.clone(),
                 effective_input: input.clone(),
                 listen_context: None,
@@ -882,6 +888,8 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         event_store,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
         turn,
         total_usage,
         turn_usage,
@@ -903,6 +911,8 @@ where
         turn,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
     };
 
     for pending in pending_tool_calls.clone() {
@@ -995,6 +1005,8 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         event_store,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
         turn,
         total_usage,
         turn_usage,
@@ -1016,6 +1028,8 @@ where
         event_store,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
         turn,
         total_usage,
         turn_usage,
@@ -1382,6 +1396,8 @@ async fn execute_turn_inner<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        audit_sink,
+        provenance,
         turn_options,
         #[cfg(feature = "otel")]
         observability_store,
@@ -1477,6 +1493,8 @@ where
         compaction_config,
         compactor,
         execution_store,
+        audit_sink,
+        provenance,
         turn_options,
         event_store,
         authority,
@@ -1499,6 +1517,8 @@ async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     compaction_config: Option<&CompactionConfig>,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    audit_sink: &Arc<dyn ToolAuditSink>,
+    provenance: &AuditProvenance,
     turn_options: &TurnOptions,
     event_store: &Arc<dyn EventStore>,
     authority: &Arc<dyn EventAuthority>,
@@ -1573,6 +1593,8 @@ where
         event_store,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
         turn: ctx.turn,
         total_usage: &ctx.total_usage,
         turn_usage: &turn_usage,

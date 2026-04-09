@@ -134,6 +134,34 @@ fn hooks_and_stores() {
 }
 
 #[test]
+fn audit_sink_and_records() {
+    use agent_sdk::{
+        AuditProvenance, NoopAuditSink, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
+        ToolAuditSink, ToolResult, ToolTier,
+    };
+
+    // Trait object reachable from the facade.
+    let _sink: &dyn ToolAuditSink = &NoopAuditSink;
+
+    // Build a record so we cover every public constructor on the
+    // facade re-export surface, including the discriminant accessor.
+    let record = ToolAuditRecord::new(ToolAuditRecordParams {
+        tool_call_id: "tool_call_id".into(),
+        tool_name: "tool_name".into(),
+        display_name: "Tool Display".into(),
+        tier: ToolTier::Observe,
+        requested_input: serde_json::json!({}),
+        effective_input: serde_json::json!({}),
+        turn: 1,
+        provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5"),
+        outcome: ToolAuditOutcome::Completed {
+            result: ToolResult::success("ok"),
+        },
+    });
+    assert_eq!(record.outcome_kind(), "completed");
+}
+
+#[test]
 fn environment_types() {
     use agent_sdk::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 

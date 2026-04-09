@@ -351,17 +351,19 @@ events with the model's reasoning output.
 Hooks let you intercept and control agent behavior:
 
 ```rust
-use agent_sdk::{AgentHooks, AgentEvent, ToolDecision, ToolResult, ToolTier};
+use agent_sdk::{AgentEvent, AgentHooks, ToolDecision, ToolInvocation, ToolResult, ToolTier};
 use async_trait::async_trait;
-use serde_json::Value;
 
 struct MyHooks;
 
 #[async_trait]
 impl AgentHooks for MyHooks {
-    /// Called before each tool execution
-    async fn pre_tool_use(&self, tool_name: &str, input: &Value, tier: ToolTier) -> ToolDecision {
-        println!("[LOG] Tool call: {tool_name}");
+    /// Called before each tool execution.
+    ///
+    /// `invocation` carries the tool call ID, name, tier, requested input,
+    /// effective input (after SDK preparation), and any listen-tool context.
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        println!("[LOG] Tool call: {}", invocation.tool_name);
 
         // You could implement:
         // - User confirmation dialogs
@@ -369,17 +371,18 @@ impl AgentHooks for MyHooks {
         // - Input validation
         // - Audit logging
 
-        match tier {
+        match invocation.tier {
             ToolTier::Observe => ToolDecision::Allow,
             ToolTier::Confirm => {
-                // In a real app, prompt the user here
-                // The agent can yield and resume after user confirmation
+                // In a real app, prompt the user here.
+                // The agent can yield via `RequiresConfirmation` and resume
+                // after the user decides.
                 ToolDecision::Allow
             }
         }
     }
 
-    /// Called after each tool execution
+    /// Called after a tool returns a successful or failing result.
     async fn post_tool_use(&self, tool_name: &str, result: &ToolResult) {
         println!("[LOG] {tool_name} completed: success={}", result.success);
     }
@@ -395,6 +398,38 @@ let agent = builder::<()>()
     .hooks(MyHooks)
     .build();
 ```
+
+### Audit Sink
+
+`post_tool_use` only fires for successful tool completion. Servers that need
+to explain **every** lifecycle outcome — blocked, requires-confirmation,
+cached, replayed, invalidated, completed, persistence-failed — should attach
+a [`ToolAuditSink`] instead. The agent loop emits one [`ToolAuditRecord`] per
+lifecycle transition with provider/model provenance, tier, and the variant
+payload.
+
+```rust
+use agent_sdk::{NoopAuditSink, ToolAuditRecord, ToolAuditSink};
+use async_trait::async_trait;
+
+struct DurableAuditSink {
+    // your durable backend handle
+}
+
+#[async_trait]
+impl ToolAuditSink for DurableAuditSink {
+    async fn record(&self, record: ToolAuditRecord) {
+        // Persist to your audit log. The discriminant is `record.outcome_kind()`.
+    }
+}
+
+let agent = builder::<()>()
+    .provider(provider)
+    .audit_sink(DurableAuditSink { /* ... */ })
+    .build();
+```
+
+The default sink is [`NoopAuditSink`], which is appropriate for local/CLI use.
 
 ## Custom Context
 

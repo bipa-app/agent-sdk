@@ -1,5 +1,6 @@
 use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
+use crate::hooks::ToolAuditSink;
 use crate::llm::StopReason;
 use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
@@ -7,6 +8,7 @@ use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
     PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
 };
+use agent_sdk_core::audit::AuditProvenance;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -154,6 +156,8 @@ pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
     pub(super) turn: usize,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
@@ -165,6 +169,8 @@ pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
     pub(super) turn: usize,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 /// Error type for stream processing.
@@ -202,6 +208,7 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) cancel_token: CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
@@ -222,6 +229,8 @@ pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
@@ -237,6 +246,8 @@ pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
@@ -253,6 +264,8 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
     pub(super) cancel_token: &'a CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
@@ -299,6 +312,8 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: Arc<dyn ToolAuditSink>,
+    pub(super) provenance: AuditProvenance,
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
@@ -316,6 +331,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) cancel_token: CancellationToken,
     pub(super) turn_options: TurnOptions,
     #[cfg(feature = "otel")]
@@ -340,6 +356,8 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
     pub(super) turn_options: &'a TurnOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
@@ -414,6 +432,8 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
     pub(super) turn_usage: &'a TokenUsage,
@@ -440,6 +460,8 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
+    pub(super) provenance: &'a AuditProvenance,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
     pub(super) turn_usage: &'a TokenUsage,

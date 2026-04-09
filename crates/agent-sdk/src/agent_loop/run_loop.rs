@@ -12,13 +12,14 @@ use super::types::{
 use crate::types::TurnOptions;
 
 use crate::authority::EventAuthority;
+use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
-use crate::stores::{EventStore, MessageStore, StateStore};
+use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::types::{
-    AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ContinuationEnvelope,
-    ThreadId, TokenUsage, TurnOutcome,
+    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
+    ContinuationEnvelope, ThreadId, TokenUsage, TurnOutcome,
 };
 use log::warn;
 use std::collections::HashSet;
@@ -42,6 +43,9 @@ pub(super) async fn initialize_from_input<M, S>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &agent_sdk_core::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentError>
 where
     M: MessageStore,
@@ -102,7 +106,16 @@ where
                     .unwrap_validated()
                     .map_err(|msg| AgentError::new(msg, false))?,
             );
-            initialize_from_tool_results(continuation, results, thread_id, message_store).await
+            initialize_from_tool_results(
+                continuation,
+                results,
+                thread_id,
+                message_store,
+                execution_store,
+                audit_sink,
+                provenance,
+            )
+            .await
         }
         AgentInput::Continue => {
             let state = match state_store.load(thread_id).await {
@@ -165,13 +178,45 @@ where
     })
 }
 
-/// Handle `AgentInput::SubmitToolResults`: validate, append results, return state.
+/// Handle `AgentInput::SubmitToolResults`: validate, detect replay, append
+/// results, return state.
+///
+/// This is the **external tool runtime** audit point. For each submitted
+/// [`ExternalToolResult`] the SDK emits one of:
+///
+/// - [`ToolAuditOutcome::Replayed`] — the execution store already has a
+///   completed record for this `tool_call_id`, so the SDK served the
+///   previously recorded result instead of re-appending.
+/// - [`ToolAuditOutcome::Completed`] — the first-time submission; the
+///   SDK records the execution and appends the result.
+/// - [`ToolAuditOutcome::PersistenceFailed`] — the durable append failed
+///   after the `Completed` record was already emitted.
+///
+/// Replay detection uses the same execution store the inline path uses
+/// for idempotency. When no execution store is wired the SDK always
+/// treats submissions as first-time `Completed`.
+///
+/// ## Durability ordering
+///
+/// The SDK writes to the message store **first** and only then marks the
+/// execution store, so that if `append_tool_results` fails the caller can
+/// safely retry with the same continuation and have every submission
+/// re-evaluated as fresh (rather than short-circuited as a replay).
+/// Otherwise a transient append failure would permanently break the
+/// conversation: every subsequent retry would see a "completed"
+/// execution entry, skip the append, and leave the assistant message
+/// with dangling `ToolUse` blocks.
 async fn initialize_from_tool_results<M: MessageStore>(
     continuation: Box<AgentContinuation>,
     results: Vec<crate::types::ExternalToolResult>,
     thread_id: &ThreadId,
     message_store: &Arc<M>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &agent_sdk_core::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentError> {
+    use agent_sdk_core::audit::ToolAuditOutcome;
+
     if continuation.thread_id != *thread_id {
         return Err(AgentError::new(
             format!(
@@ -188,7 +233,108 @@ async fn initialize_from_tool_results<M: MessageStore>(
         .into_iter()
         .map(|r| (r.tool_call_id, r.result))
         .collect();
-    append_tool_results(&tool_results, thread_id, message_store).await?;
+
+    // Partition submissions into first-time and replays. A replay is a
+    // submission whose tool_call_id already has a completed entry in the
+    // execution store. Replays are audited as `Replayed` and do NOT get
+    // re-appended to the message store; first-time submissions are
+    // audited as `Completed` and persisted normally.
+    //
+    // NOTE: we do NOT write to the execution store here. The execution
+    // store is only updated AFTER `append_tool_results` succeeds, so
+    // that a transient message-store failure can be safely retried
+    // without leaving orphaned "completed" execution rows that would
+    // short-circuit the retry as a replay. See the durability ordering
+    // note on the function doc above.
+    let mut fresh_results: Vec<(String, crate::types::ToolResult)> =
+        Vec::with_capacity(tool_results.len());
+    for (tool_call_id, result) in tool_results {
+        let already_completed = match execution_store {
+            Some(store) => store
+                .get_execution(&tool_call_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|execution| execution.is_completed()),
+            None => false,
+        };
+        if already_completed {
+            emit_external_tool_audit(
+                audit_sink,
+                provenance,
+                &continuation,
+                &tool_call_id,
+                ToolAuditOutcome::Replayed {
+                    result: result.clone(),
+                },
+            )
+            .await;
+        } else {
+            // Audit `Completed` *before* the append. Sink consumers see
+            // the provider-reported outcome first; if the append then
+            // fails a follow-up `PersistenceFailed` record is emitted
+            // below so consumers can reconcile the durability gap.
+            emit_external_tool_audit(
+                audit_sink,
+                provenance,
+                &continuation,
+                &tool_call_id,
+                ToolAuditOutcome::Completed {
+                    result: result.clone(),
+                },
+            )
+            .await;
+            fresh_results.push((tool_call_id, result));
+        }
+    }
+
+    if fresh_results.is_empty() {
+        // All submissions were replays — nothing new to persist. The
+        // audit records already captured the outcome.
+        return Ok(InitializedState {
+            turn: continuation.turn,
+            total_usage: continuation.total_usage.clone(),
+            state: continuation.state.clone(),
+            resume_data: None,
+        });
+    }
+
+    if let Err(error) = append_tool_results(&fresh_results, thread_id, message_store).await {
+        // Persistence of the fresh external tool batch failed — emit one
+        // PersistenceFailed record per fresh result so consumers see
+        // both the intended outcome and the durability gap. The
+        // execution store has *not* been written yet, so the caller can
+        // safely retry the same continuation and every submission will
+        // be re-evaluated as fresh.
+        for (tool_call_id, result) in &fresh_results {
+            emit_external_tool_audit(
+                audit_sink,
+                provenance,
+                &continuation,
+                tool_call_id,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: Some(result.clone()),
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+        }
+        return Err(error);
+    }
+
+    // Message-store append succeeded — now it's safe to mark the
+    // execution store so the next submission of the same tool_call_id
+    // is detected as a replay.
+    for (tool_call_id, result) in &fresh_results {
+        record_external_tool_execution(
+            execution_store,
+            &continuation,
+            thread_id,
+            tool_call_id,
+            result,
+        )
+        .await;
+    }
 
     Ok(InitializedState {
         turn: continuation.turn,
@@ -196,6 +342,106 @@ async fn initialize_from_tool_results<M: MessageStore>(
         state: continuation.state.clone(),
         resume_data: None,
     })
+}
+
+/// Record a completed external-tool execution in the execution store.
+///
+/// This is the external-runtime analogue of the inline
+/// [`execute_with_idempotency`](super::idempotency::execute_with_idempotency)
+/// path: it writes the same `ToolExecution` row, only with `started_at`
+/// and `completed_at` both set to "now" because the SDK never observed
+/// the tool running. A subsequent submission of the same `tool_call_id`
+/// will be detected as a replay.
+async fn record_external_tool_execution(
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    continuation: &AgentContinuation,
+    thread_id: &ThreadId,
+    tool_call_id: &str,
+    result: &crate::types::ToolResult,
+) {
+    let Some(store) = execution_store else {
+        return;
+    };
+    let pending = continuation
+        .pending_tool_calls
+        .iter()
+        .find(|p| p.id == tool_call_id);
+    let (tool_name, display_name, input) = pending.map_or_else(
+        || (String::new(), String::new(), serde_json::Value::Null),
+        |p| (p.name.clone(), p.display_name.clone(), p.input.clone()),
+    );
+    let started_at = time::OffsetDateTime::now_utc();
+    let mut execution = crate::types::ToolExecution::new_in_flight(
+        tool_call_id,
+        thread_id.clone(),
+        tool_name,
+        display_name,
+        input,
+        started_at,
+    );
+    execution.complete(result.clone());
+    if let Err(e) = store.record_execution(execution).await {
+        warn!("Failed to record external tool execution (tool_call_id={tool_call_id}, error={e})",);
+    }
+}
+
+/// Emit one audit record for a submitted external tool result.
+///
+/// Looks the tool metadata up on the continuation's pending list so the
+/// record carries the correct tier, name, and input — the values the
+/// continuation already persisted at the moment the LLM requested the
+/// tool call, not a wildcard guess.
+///
+/// `validate_external_tool_results` rejects submissions whose
+/// `tool_call_id` is not in the pending list before this function runs,
+/// so the fallback identity arm exists only as a defensive
+/// belt-and-braces guard and should be unreachable in practice.
+async fn emit_external_tool_audit(
+    audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &agent_sdk_core::audit::AuditProvenance,
+    continuation: &AgentContinuation,
+    tool_call_id: &str,
+    outcome: agent_sdk_core::audit::ToolAuditOutcome,
+) {
+    use crate::types::ToolTier;
+    use agent_sdk_core::audit::{ToolAuditRecord, ToolAuditRecordParams};
+
+    let pending = continuation
+        .pending_tool_calls
+        .iter()
+        .find(|p| p.id == tool_call_id);
+    let (tool_name, display_name, tier, requested_input, effective_input) = pending.map_or_else(
+        || {
+            (
+                String::new(),
+                String::new(),
+                ToolTier::Confirm,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        },
+        |p| {
+            (
+                p.name.clone(),
+                p.display_name.clone(),
+                p.tier,
+                p.input.clone(),
+                p.effective_input.clone(),
+            )
+        },
+    );
+    let record = ToolAuditRecord::new(ToolAuditRecordParams {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name,
+        display_name,
+        tier,
+        requested_input,
+        effective_input,
+        turn: continuation.turn,
+        provenance: provenance.clone(),
+        outcome,
+    });
+    audit_sink.record(record).await;
 }
 
 fn validate_resume_continuation(
@@ -294,6 +540,8 @@ pub(super) async fn process_resume<Ctx, H, M>(
         authority,
         message_store,
         execution_store,
+        audit_sink,
+        provenance,
     }: ResumeProcessingParameters<'_, Ctx, H, M>,
 ) -> Result<ResumeProcessingResult, AgentError>
 where
@@ -322,6 +570,8 @@ where
         turn,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
     };
     let result = execute_confirmed_tool(awaiting_tool, rejection, &confirmed_ctx).await?;
     tool_results.push((awaiting_tool.id.clone(), result));
@@ -335,8 +585,9 @@ where
         turn,
         authority,
         execution_store,
+        audit_sink,
+        provenance,
     };
-
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
         match execute_tool_call(pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
@@ -411,6 +662,8 @@ pub(super) async fn handle_run_loop_resume<Ctx, H, M>(
         authority,
         message_store,
         execution_store,
+        audit_sink,
+        provenance,
     }: RunLoopResumeParams<'_, Ctx, H, M>,
 ) -> Result<Option<AgentRunState>, AgentError>
 where
@@ -431,6 +684,8 @@ where
         authority,
         message_store,
         execution_store,
+        audit_sink,
+        provenance,
     })
     .await?
     {
@@ -471,14 +726,25 @@ async fn initialize_run_loop_state<M, S>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &agent_sdk_core::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentRunState>
 where
     M: MessageStore,
     S: StateStore,
 {
-    initialize_from_input(input, thread_id, message_store, state_store)
-        .await
-        .map_err(AgentRunState::Error)
+    initialize_from_input(
+        input,
+        thread_id,
+        message_store,
+        state_store,
+        execution_store,
+        audit_sink,
+        provenance,
+    )
+    .await
+    .map_err(AgentRunState::Error)
 }
 
 async fn handle_run_loop_resume_state<Ctx, H, M>(
@@ -529,12 +795,25 @@ async fn initialize_single_turn_state<M, S>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
+    execution_store: Option<&Arc<dyn ToolExecutionStore>>,
+    audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &agent_sdk_core::audit::AuditProvenance,
 ) -> Result<InitializedState, TurnOutcome>
 where
     M: MessageStore,
     S: StateStore,
 {
-    match initialize_from_input(input, thread_id, message_store, state_store).await {
+    match initialize_from_input(
+        input,
+        thread_id,
+        message_store,
+        state_store,
+        execution_store,
+        audit_sink,
+        provenance,
+    )
+    .await
+    {
         Ok(state) => Ok(state),
         Err(error) => Err(TurnOutcome::Error(error)),
     }
@@ -853,6 +1132,8 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        audit_sink,
+        provenance,
         cancel_token,
         mut input_rx,
         turn_options,
@@ -894,6 +1175,8 @@ where
             compaction_config,
             compactor,
             execution_store,
+            audit_sink,
+            provenance,
             turn_options,
             #[cfg(feature = "otel")]
             observability_store,
@@ -936,6 +1219,8 @@ pub(super) async fn handle_single_turn_resume<Ctx, H, M, S>(
         message_store,
         state_store,
         execution_store,
+        audit_sink,
+        provenance,
     }: SingleTurnResumeParams<Ctx, H, M, S>,
 ) -> TurnOutcome
 where
@@ -957,6 +1242,8 @@ where
         authority: &authority,
         message_store: &message_store,
         execution_store: execution_store.as_ref(),
+        audit_sink: &audit_sink,
+        provenance: &provenance,
     })
     .await;
 
@@ -1166,6 +1453,7 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        audit_sink,
         cancel_token,
         mut input_rx,
         #[cfg(feature = "otel")]
@@ -1180,12 +1468,23 @@ where
     S: StateStore,
 {
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
+    let provenance =
+        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
-    let init_state =
-        match initialize_run_loop_state(input, &thread_id, &message_store, &state_store).await {
-            Ok(state) => state,
-            Err(error) => return error,
-        };
+    let init_state = match initialize_run_loop_state(
+        input,
+        &thread_id,
+        &message_store,
+        &state_store,
+        execution_store.as_ref(),
+        &audit_sink,
+        &provenance,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => return error,
+    };
 
     let InitializedState {
         turn,
@@ -1214,6 +1513,8 @@ where
             authority: &authority,
             message_store: &message_store,
             execution_store: execution_store.as_ref(),
+            audit_sink: &audit_sink,
+            provenance: &provenance,
         })
         .await
         {
@@ -1239,6 +1540,8 @@ where
         compaction_config: compaction_config.as_ref(),
         compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
+        audit_sink: &audit_sink,
+        provenance: &provenance,
         cancel_token: &cancel_token,
         input_rx: input_rx.as_mut(),
         turn_options: &default_turn_options,
@@ -1344,6 +1647,7 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         compaction_config,
         compactor,
         execution_store,
+        audit_sink,
         cancel_token,
         turn_options,
         #[cfg(feature = "otel")]
@@ -1364,12 +1668,23 @@ where
     }
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
+    let provenance =
+        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
-    let init_state =
-        match initialize_single_turn_state(input, &thread_id, &message_store, &state_store).await {
-            Ok(state) => state,
-            Err(outcome) => return outcome,
-        };
+    let init_state = match initialize_single_turn_state(
+        input,
+        &thread_id,
+        &message_store,
+        &state_store,
+        execution_store.as_ref(),
+        &audit_sink,
+        &provenance,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(outcome) => return outcome,
+    };
 
     let InitializedState {
         turn,
@@ -1399,10 +1714,103 @@ where
             message_store,
             state_store,
             execution_store,
+            audit_sink,
+            provenance,
         })
         .await;
     }
 
+    run_single_turn_execute(SingleTurnExecuteParams {
+        event_store,
+        authority,
+        thread_id,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        config,
+        compaction_config,
+        compactor,
+        execution_store,
+        audit_sink,
+        provenance,
+        turn_options,
+        turn,
+        total_usage,
+        state,
+        start_time,
+        #[cfg(feature = "otel")]
+        observability_store,
+    })
+    .await
+}
+
+/// Parameters for the non-resume single-turn execution path.
+///
+/// Split out of `run_single_turn_inner` so the top-level function stays
+/// under the clippy too-many-lines threshold. The resume path never
+/// hits this function — it branches earlier via
+/// `handle_single_turn_resume_state`.
+struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
+    event_store: Arc<dyn EventStore>,
+    authority: Arc<dyn EventAuthority>,
+    thread_id: ThreadId,
+    tool_context: crate::tools::ToolContext<Ctx>,
+    provider: Arc<P>,
+    tools: Arc<crate::tools::ToolRegistry<Ctx>>,
+    hooks: Arc<H>,
+    message_store: Arc<M>,
+    state_store: Arc<S>,
+    config: AgentConfig,
+    compaction_config: Option<CompactionConfig>,
+    compactor: Option<Arc<dyn ContextCompactor>>,
+    execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: agent_sdk_core::audit::AuditProvenance,
+    turn_options: TurnOptions,
+    turn: usize,
+    total_usage: TokenUsage,
+    state: AgentState,
+    start_time: Instant,
+    #[cfg(feature = "otel")]
+    observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
+}
+
+async fn run_single_turn_execute<Ctx, P, H, M, S>(
+    SingleTurnExecuteParams {
+        event_store,
+        authority,
+        thread_id,
+        tool_context,
+        provider,
+        tools,
+        hooks,
+        message_store,
+        state_store,
+        config,
+        compaction_config,
+        compactor,
+        execution_store,
+        audit_sink,
+        provenance,
+        turn_options,
+        turn,
+        total_usage,
+        state,
+        start_time,
+        #[cfg(feature = "otel")]
+        observability_store,
+    }: SingleTurnExecuteParams<Ctx, P, H, M, S>,
+) -> TurnOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
     let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
 
     let current_turn = ctx.turn.saturating_add(1);
@@ -1426,6 +1834,8 @@ where
         compaction_config: compaction_config.as_ref(),
         compactor: compactor.as_ref(),
         execution_store: execution_store.as_ref(),
+        audit_sink: &audit_sink,
+        provenance: &provenance,
         turn_options: &turn_options,
         #[cfg(feature = "otel")]
         observability_store: observability_store.as_ref(),
@@ -1632,6 +2042,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 display_name: "Echo".into(),
+                tier: crate::types::ToolTier::Observe,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,
@@ -1664,6 +2075,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "echo".into(),
                     display_name: "Echo".into(),
+                    tier: crate::types::ToolTier::Observe,
                     input: serde_json::json!({}),
                     effective_input: serde_json::json!({}),
                     listen_context: None,
@@ -1672,6 +2084,7 @@ mod tests {
                     id: "call_2".into(),
                     name: "write".into(),
                     display_name: "Write".into(),
+                    tier: crate::types::ToolTier::Confirm,
                     input: serde_json::json!({}),
                     effective_input: serde_json::json!({}),
                     listen_context: None,
@@ -1714,6 +2127,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 display_name: "Echo".into(),
+                tier: crate::types::ToolTier::Observe,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,

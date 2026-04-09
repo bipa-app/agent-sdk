@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod events;
 pub mod llm;
 pub mod types;
@@ -19,6 +20,7 @@ pub mod types;
 // Downstream crates can `use agent_sdk_core::ThreadId` without reaching
 // into sub-modules.
 
+pub use audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, Effort, Message,

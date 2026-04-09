@@ -381,6 +381,9 @@ pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;
 
 // agent-sdk-core (via thin modules)
+pub use agent_sdk_core::audit::{
+    AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
+};
 pub use authority::{EventAuthority, LocalEventAuthority};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
@@ -392,7 +395,10 @@ pub use types::{
 
 // agent-sdk-tools (via thin modules)
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
-pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
+pub use hooks::{
+    AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, NoopAuditSink, ToolAuditSink,
+    ToolDecision,
+};
 pub use seed::{DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed};
 pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
