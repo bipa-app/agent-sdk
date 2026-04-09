@@ -15,12 +15,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authority;
 pub mod environment;
 pub mod hooks;
 pub mod stores;
 pub mod tools;
 
 // Convenience re-exports
+pub use authority::{EventAuthority, LocalEventAuthority};
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use stores::{

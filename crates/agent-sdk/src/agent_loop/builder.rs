@@ -1,3 +1,4 @@
+use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
@@ -27,6 +28,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     message_store: Option<M>,
     state_store: Option<S>,
     event_store: Option<Arc<dyn EventStore>>,
+    event_authority: Option<Arc<dyn EventAuthority>>,
     config: Option<AgentConfig>,
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
@@ -46,6 +48,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             message_store: None,
             state_store: None,
             event_store: None,
+            event_authority: None,
             config: None,
             compaction_config: None,
             compactor: None,
@@ -73,6 +76,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: self.state_store,
             event_store: self.event_store,
+            event_authority: self.event_authority,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -99,6 +103,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: self.state_store,
             event_store: self.event_store,
+            event_authority: self.event_authority,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -121,6 +126,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: Some(message_store),
             state_store: self.state_store,
             event_store: self.event_store,
+            event_authority: self.event_authority,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -143,6 +149,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             message_store: self.message_store,
             state_store: Some(state_store),
             event_store: self.event_store,
+            event_authority: self.event_authority,
             config: self.config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -156,6 +163,21 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn event_store(mut self, store: Arc<dyn EventStore>) -> Self {
         self.event_store = Some(store);
+        self
+    }
+
+    /// Set the event authority for envelope creation.
+    ///
+    /// When set, the authority governs how events are wrapped in envelopes
+    /// (sequence numbers, event IDs, timestamps).  In server mode the
+    /// authority seeds sequences from durable storage so ordering is
+    /// continuous across turns within a thread.
+    ///
+    /// When not set, a fresh [`LocalEventAuthority`](crate::authority::LocalEventAuthority)
+    /// starting at sequence 0 is created for each run.
+    #[must_use]
+    pub fn event_authority(mut self, authority: Arc<dyn EventAuthority>) -> Self {
+        self.event_authority = Some(authority);
         self
     }
 
@@ -313,6 +335,7 @@ where
             message_store: Arc::new(InMemoryStore::new()),
             state_store: Arc::new(InMemoryStore::new()),
             event_store,
+            event_authority: self.event_authority,
             config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,
@@ -368,6 +391,7 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             event_store,
+            event_authority: self.event_authority,
             config,
             compaction_config: self.compaction_config,
             compactor: self.compactor,

@@ -846,7 +846,7 @@ where
 }
 
 #[cfg(not(feature = "otel"))]
-fn emit_subagent_observability<P, H, M, S>(
+const fn emit_subagent_observability<P, H, M, S>(
     _tool: &SubagentTool<P, H, M, S>,
     _result: &SubagentResult,
 ) where
@@ -1068,7 +1068,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use crate::authority::{EventAuthority, LocalEventAuthority};
+    use crate::events::{AgentEvent, AgentEventEnvelope};
     use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
     use crate::stores::{EventStore, InMemoryEventStore, StoredTurnEvents};
     use anyhow::{Context, Result, bail};
@@ -1496,7 +1497,7 @@ mod tests {
             event_store.clone(),
             parent_thread.clone(),
             1,
-            SequenceCounter::new(),
+            Arc::new(LocalEventAuthority::new()),
         );
 
         let result = tool
@@ -1605,7 +1606,7 @@ mod tests {
             Arc::new(AlwaysFailAppendEventStore),
             ThreadId::new(),
             1,
-            SequenceCounter::new(),
+            Arc::new(LocalEventAuthority::new()),
         );
 
         let result = tool
@@ -1765,31 +1766,25 @@ mod tests {
     async fn test_replay_subagent_events_stops_after_error() -> Result<()> {
         let event_store: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
         let thread_id = ThreadId::new();
-        let seq = SequenceCounter::new();
+        let authority = LocalEventAuthority::new();
         event_store
             .append(
                 &thread_id,
                 1,
-                AgentEventEnvelope::wrap(
-                    AgentEvent::Error {
-                        message: "subagent boom".to_string(),
-                        recoverable: false,
-                    },
-                    &seq,
-                ),
+                authority.wrap(AgentEvent::Error {
+                    message: "subagent boom".to_string(),
+                    recoverable: false,
+                }),
             )
             .await?;
         event_store
             .append(
                 &thread_id,
                 1,
-                AgentEventEnvelope::wrap(
-                    AgentEvent::Text {
-                        message_id: "msg_after_error".to_string(),
-                        text: "should not be appended".to_string(),
-                    },
-                    &seq,
-                ),
+                authority.wrap(AgentEvent::Text {
+                    message_id: "msg_after_error".to_string(),
+                    text: "should not be appended".to_string(),
+                }),
             )
             .await?;
 

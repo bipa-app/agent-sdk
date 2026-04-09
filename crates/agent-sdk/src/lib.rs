@@ -363,6 +363,7 @@ pub mod observability;
 // ── Re-export modules from workspace crates ──────────────────────────
 // These thin modules delegate to the extracted crates so that
 // `use agent_sdk::llm::*` etc. keep working for downstream users.
+mod authority;
 mod environment;
 mod events;
 mod hooks;
@@ -385,6 +386,7 @@ pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;
 
 // agent-sdk-core (via thin modules)
+pub use authority::{EventAuthority, LocalEventAuthority};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,

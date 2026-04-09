@@ -1,5 +1,5 @@
+use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
-use crate::events::SequenceCounter;
 use crate::llm::StopReason;
 use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
@@ -135,7 +135,7 @@ pub(super) struct ListenUpdateContext<'a, H> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
 }
 
 pub(super) struct ListenWaitParams<'a, Ctx, H> {
@@ -152,7 +152,7 @@ pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) turn: usize,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
 
@@ -163,7 +163,7 @@ pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) turn: usize,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
 
@@ -189,7 +189,7 @@ pub(super) enum ResumeProcessingResult {
 
 pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) event_store: Arc<dyn EventStore>,
-    pub(super) seq: SequenceCounter,
+    pub(super) authority: Arc<dyn EventAuthority>,
     pub(super) thread_id: ThreadId,
     pub(super) input: AgentInput,
     pub(super) tool_context: ToolContext<Ctx>,
@@ -219,7 +219,7 @@ pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
@@ -234,7 +234,7 @@ pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) message_store: &'a Arc<M>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
 }
@@ -248,7 +248,7 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) config: &'a AgentConfig,
     pub(super) compaction_config: Option<&'a CompactionConfig>,
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
@@ -267,7 +267,7 @@ pub(super) struct PersistentDoneParams<'a, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) current_turn: usize,
     pub(super) cancel_token: &'a CancellationToken,
 }
@@ -280,7 +280,7 @@ pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
     pub(super) state_store: &'a Arc<S>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) cancel_token: &'a CancellationToken,
     pub(super) current_turn: usize,
 }
@@ -295,7 +295,7 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     pub(super) tools: Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: Arc<H>,
     pub(super) event_store: Arc<dyn EventStore>,
-    pub(super) seq: SequenceCounter,
+    pub(super) authority: Arc<dyn EventAuthority>,
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
@@ -303,7 +303,7 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) event_store: Arc<dyn EventStore>,
-    pub(super) seq: SequenceCounter,
+    pub(super) authority: Arc<dyn EventAuthority>,
     pub(super) thread_id: ThreadId,
     pub(super) input: AgentInput,
     pub(super) tool_context: ToolContext<Ctx>,
@@ -328,7 +328,7 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
 /// and `run_single_turn` (single-turn mode).
 pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) ctx: &'a mut TurnContext,
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) provider: &'a Arc<P>,
@@ -354,7 +354,7 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
 }
 
 pub(super) struct LlmCallParams<'a, P, H> {
@@ -363,7 +363,7 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) config: &'a AgentConfig,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
     pub(super) message_id: &'a str,
@@ -375,7 +375,7 @@ pub(super) struct LlmCallParams<'a, P, H> {
 pub(super) struct LlmEventContext<'a, H> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
 }
@@ -402,7 +402,7 @@ pub(super) struct TurnResponseProcessingParams<'a, Ctx, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
 }
 
 pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
@@ -412,7 +412,7 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
@@ -428,7 +428,7 @@ pub(super) struct TurnCompletionParams<'a, H, M> {
     pub(super) message_store: &'a Arc<M>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
 }
 
 pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
@@ -438,7 +438,7 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
@@ -460,7 +460,7 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) compactor: Option<&'a Arc<dyn ContextCompactor>>,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
 }
 
 pub(super) struct ConvertTurnResultParams<'a, H, S> {
@@ -468,7 +468,7 @@ pub(super) struct ConvertTurnResultParams<'a, H, S> {
     pub(super) ctx: TurnContext,
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
-    pub(super) seq: &'a SequenceCounter,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) thread_id: ThreadId,
     pub(super) current_turn: usize,
     pub(super) state_store: &'a Arc<S>,

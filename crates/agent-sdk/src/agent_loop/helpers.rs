@@ -1,5 +1,6 @@
 use super::types::ExtractedContent;
-use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use crate::authority::EventAuthority;
+use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{ChatResponse, Content, ContentBlock, Message, Role};
 use crate::stores::EventStore;
@@ -107,7 +108,7 @@ pub(super) async fn send_event<H>(
     thread_id: &ThreadId,
     turn: usize,
     hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
     event: AgentEvent,
 ) -> Result<(), AgentError>
 where
@@ -115,7 +116,7 @@ where
 {
     hooks.on_event(&event).await;
 
-    let envelope = AgentEventEnvelope::wrap(event, seq);
+    let envelope = authority.wrap(event);
     event_store
         .append(thread_id, turn, envelope)
         .await
@@ -130,9 +131,9 @@ pub(super) async fn wrap_and_send(
     thread_id: &ThreadId,
     turn: usize,
     event: AgentEvent,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
 ) -> Result<(), AgentError> {
-    let envelope = AgentEventEnvelope::wrap(event, seq);
+    let envelope = authority.wrap(event);
     event_store
         .append(thread_id, turn, envelope)
         .await

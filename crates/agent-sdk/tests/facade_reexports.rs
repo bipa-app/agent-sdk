@@ -33,6 +33,16 @@ fn core_events() {
 }
 
 #[test]
+fn event_authority() {
+    use agent_sdk::{EventAuthority, LocalEventAuthority};
+
+    let auth = LocalEventAuthority::new();
+    let _: &dyn EventAuthority = &auth;
+
+    let _seeded = LocalEventAuthority::with_offset(42);
+}
+
+#[test]
 fn core_turn_outcomes() {
     use agent_sdk::{
         AgentContinuation, AgentError, AgentRunState, AgentState, ExecutionStatus, TokenUsage,

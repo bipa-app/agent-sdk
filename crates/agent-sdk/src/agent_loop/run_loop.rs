@@ -11,7 +11,8 @@ use super::types::{
 
 use crate::types::TurnOptions;
 
-use crate::events::{AgentEvent, SequenceCounter};
+use crate::authority::EventAuthority;
+use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
 use crate::stores::{EventStore, MessageStore, StateStore};
@@ -195,7 +196,7 @@ pub(super) async fn process_resume<Ctx, H, M>(
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         message_store,
         execution_store,
     }: ResumeProcessingParameters<'_, Ctx, H, M>,
@@ -224,7 +225,7 @@ where
         hooks,
         event_store,
         turn,
-        seq,
+        authority,
         execution_store,
     };
     let result = execute_confirmed_tool(awaiting_tool, rejection, &confirmed_ctx).await?;
@@ -237,7 +238,7 @@ where
         hooks,
         event_store,
         turn,
-        seq,
+        authority,
         execution_store,
     };
 
@@ -288,7 +289,7 @@ where
         thread_id,
         turn,
         hooks,
-        seq,
+        authority,
         AgentEvent::TurnComplete {
             turn,
             usage: cont.turn_usage.clone(),
@@ -312,7 +313,7 @@ pub(super) async fn handle_run_loop_resume<Ctx, H, M>(
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         message_store,
         execution_store,
     }: RunLoopResumeParams<'_, Ctx, H, M>,
@@ -332,7 +333,7 @@ where
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         message_store,
         execution_store,
     })
@@ -397,7 +398,7 @@ where
     let thread_id = params.thread_id;
     let event_store = params.event_store;
     let hooks = params.hooks;
-    let seq = params.seq;
+    let authority = params.authority;
 
     match handle_run_loop_resume(params).await {
         Ok(Some(outcome)) => Some(outcome),
@@ -413,7 +414,7 @@ where
                 thread_id,
                 turn,
                 hooks,
-                seq,
+                authority,
                 AgentEvent::error(&error.message, error.recoverable),
             )
             .await
@@ -523,7 +524,7 @@ async fn emit_persistent_turn_complete<H>(
     ctx: &TurnContext,
     event_store: &Arc<dyn EventStore>,
     hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
     current_turn: usize,
 ) -> Result<(), AgentRunState>
 where
@@ -534,7 +535,7 @@ where
         &ctx.thread_id,
         current_turn,
         hooks,
-        seq,
+        authority,
         AgentEvent::TurnComplete {
             turn: ctx.turn,
             usage: ctx.total_usage.clone(),
@@ -557,7 +558,7 @@ async fn handle_persistent_done<M, H>(
         message_store,
         event_store,
         hooks,
-        seq,
+        authority,
         current_turn,
         cancel_token,
     }: PersistentDoneParams<'_, H, M>,
@@ -567,7 +568,7 @@ where
     H: AgentHooks,
 {
     if let Err(state) =
-        emit_persistent_turn_complete(ctx, event_store, hooks, seq, current_turn).await
+        emit_persistent_turn_complete(ctx, event_store, hooks, authority, current_turn).await
     {
         return Some(state);
     }
@@ -617,7 +618,7 @@ async fn handle_run_loop_turn_result<H, M, S>(
         state_store,
         event_store,
         hooks,
-        seq,
+        authority,
         cancel_token,
         current_turn,
     }: RunLoopTurnResultParams<'_, H, M, S>,
@@ -644,7 +645,7 @@ where
                     message_store,
                     event_store,
                     hooks,
-                    seq,
+                    authority,
                     current_turn,
                     cancel_token,
                 })
@@ -703,7 +704,7 @@ async fn finish_run_loop_success<H, S>(
     state_store: &Arc<S>,
     event_store: &Arc<dyn EventStore>,
     hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
 ) -> AgentRunState
 where
     H: AgentHooks,
@@ -719,7 +720,7 @@ where
         &ctx.thread_id,
         ctx.turn,
         hooks,
-        seq,
+        authority,
         AgentEvent::done(
             ctx.thread_id.clone(),
             ctx.turn,
@@ -752,7 +753,7 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         message_store,
         state_store,
         event_store,
-        seq,
+        authority,
         config,
         compaction_config,
         compactor,
@@ -782,11 +783,11 @@ where
             Arc::clone(event_store),
             ctx.thread_id.clone(),
             current_turn,
-            seq.clone(),
+            Arc::clone(authority),
         );
         let result = execute_turn(ExecuteTurnParameters {
             event_store,
-            seq,
+            authority,
             ctx,
             tool_context: &turn_tool_context,
             provider,
@@ -812,7 +813,7 @@ where
             state_store,
             event_store,
             hooks,
-            seq,
+            authority,
             cancel_token,
             current_turn,
         })
@@ -836,7 +837,7 @@ pub(super) async fn handle_single_turn_resume<Ctx, H, M, S>(
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         message_store,
         state_store,
         execution_store,
@@ -858,7 +859,7 @@ where
         tools: &tools,
         hooks: &hooks,
         event_store: &event_store,
-        seq: &seq,
+        authority: &authority,
         message_store: &message_store,
         execution_store: execution_store.as_ref(),
     })
@@ -898,7 +899,7 @@ where
                 &thread_id,
                 turn,
                 &hooks,
-                &seq,
+                &authority,
                 AgentEvent::error(&error.message, error.recoverable),
             )
             .await
@@ -1057,7 +1058,7 @@ where
 async fn run_loop_inner<Ctx, P, H, M, S>(
     RunLoopParameters {
         event_store,
-        seq,
+        authority,
         thread_id,
         input,
         tool_context,
@@ -1103,7 +1104,7 @@ where
             Arc::clone(&event_store),
             thread_id.clone(),
             turn,
-            seq.clone(),
+            Arc::clone(&authority),
         );
         if let Some(outcome) = handle_run_loop_resume_state(RunLoopResumeParams {
             resume_data,
@@ -1115,7 +1116,7 @@ where
             tools: &tools,
             hooks: &hooks,
             event_store: &event_store,
-            seq: &seq,
+            authority: &authority,
             message_store: &message_store,
             execution_store: execution_store.as_ref(),
         })
@@ -1138,7 +1139,7 @@ where
         message_store: &message_store,
         state_store: &state_store,
         event_store: &event_store,
-        seq: &seq,
+        authority: &authority,
         config: &config,
         compaction_config: compaction_config.as_ref(),
         compactor: compactor.as_ref(),
@@ -1154,7 +1155,7 @@ where
         return outcome;
     }
 
-    finish_run_loop_success(ctx, &state_store, &event_store, &hooks, &seq).await
+    finish_run_loop_success(ctx, &state_store, &event_store, &hooks, &authority).await
 }
 
 /// Run a single turn of the agent loop.
@@ -1235,7 +1236,7 @@ where
 async fn run_single_turn_inner<Ctx, P, H, M, S>(
     TurnParameters {
         event_store,
-        seq,
+        authority,
         thread_id,
         input,
         tool_context,
@@ -1287,7 +1288,7 @@ where
             Arc::clone(&event_store),
             thread_id.clone(),
             turn,
-            seq.clone(),
+            Arc::clone(&authority),
         );
         return handle_single_turn_resume_state(SingleTurnResumeParams {
             resume_data,
@@ -1299,7 +1300,7 @@ where
             tools,
             hooks,
             event_store: Arc::clone(&event_store),
-            seq,
+            authority,
             message_store,
             state_store,
             execution_store,
@@ -1314,11 +1315,11 @@ where
         Arc::clone(&event_store),
         thread_id.clone(),
         current_turn,
-        seq.clone(),
+        Arc::clone(&authority),
     );
     let result = execute_turn(ExecuteTurnParameters {
         event_store: &event_store,
-        seq: &seq,
+        authority: &authority,
         ctx: &mut ctx,
         tool_context: &turn_tool_context,
         provider: &provider,
@@ -1341,7 +1342,7 @@ where
         ctx,
         event_store: &event_store,
         hooks: &hooks,
-        seq: &seq,
+        authority: &authority,
         thread_id: thread_id.clone(),
         current_turn,
         state_store: &state_store,
@@ -1363,7 +1364,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         ctx,
         event_store,
         hooks,
-        seq,
+        authority,
         thread_id,
         current_turn,
         state_store,
@@ -1390,7 +1391,7 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 &thread_id,
                 current_turn,
                 hooks,
-                seq,
+                authority,
                 AgentEvent::done(
                     thread_id.clone(),
                     ctx.turn,
