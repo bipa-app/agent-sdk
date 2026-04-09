@@ -63,6 +63,21 @@ pub(super) struct TurnContext {
     /// Set by `begin_turn` when approaching the turn limit, then consumed
     /// by `execute_turn_inner` to append a user message to the conversation.
     pub(super) pending_reminder: Option<String>,
+    // ── Turn summary accumulators ───────────────────────────────────
+    //
+    // These mirror fields on `agent_sdk_core::TurnSummary` and are
+    // populated incrementally as the turn progresses, then promoted to
+    // a full `TurnSummary` by `build_turn_summary` when the outcome is
+    // produced. Keeping the accumulators on `TurnContext` lets the
+    // existing flow populate them at the same spots where the legacy
+    // usage accounting already happens, without adding another
+    // parameter to every function along the path.
+    /// Provider response ID from the most recent LLM call in this turn.
+    pub(super) response_id: Option<String>,
+    /// Stop reason from the most recent LLM call in this turn.
+    pub(super) stop_reason: Option<StopReason>,
+    /// Number of tool calls the LLM requested in this turn.
+    pub(super) tool_call_count: usize,
 }
 
 /// Data extracted from `AgentInput::Resume` after validation.
@@ -314,6 +329,13 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
     pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) provenance: AuditProvenance,
+    /// Execution options selected by the caller, needed so the resume
+    /// path can carry [`TurnOptions`] through into the emitted
+    /// [`agent_sdk_core::TurnSummary`].
+    pub(super) turn_options: TurnOptions,
+    /// Wall-clock instant when the enclosing `run_turn` invocation
+    /// started — used to measure `duration_ms` for the summary.
+    pub(super) start_time: Instant,
 }
 
 pub(super) struct TurnParameters<Ctx, P, H, M, S> {
@@ -494,6 +516,12 @@ pub(super) struct ConvertTurnResultParams<'a, H, S> {
     pub(super) thread_id: ThreadId,
     pub(super) current_turn: usize,
     pub(super) state_store: &'a Arc<S>,
+    /// Provider / model provenance, captured once at the start of the
+    /// turn and promoted into every [`TurnSummary`] this conversion
+    /// produces.
+    pub(super) provenance: &'a AuditProvenance,
+    /// Execution options selected by the caller for this turn.
+    pub(super) turn_options: &'a TurnOptions,
 }
 
 /// Extracted content from an LLM response: (thinking, text, `tool_uses`).

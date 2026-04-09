@@ -19,8 +19,9 @@ use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ContinuationEnvelope, ThreadId, TokenUsage, TurnOutcome,
+    ContinuationEnvelope, ThreadId, TokenUsage, TurnOutcome, TurnSummary,
 };
+use agent_sdk_core::audit::AuditProvenance;
 use log::warn;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -855,14 +856,86 @@ fn build_turn_context(
         start_time,
         compaction_retries: 0,
         pending_reminder: None,
+        response_id: None,
+        stop_reason: None,
+        tool_call_count: 0,
     }
 }
 
-const fn cancelled_turn_outcome() -> TurnOutcome {
+/// Build a structured [`TurnSummary`] from a [`TurnContext`] and the
+/// active turn options / provenance.
+///
+/// Used by every `TurnOutcome` variant that carries a summary.  Duration
+/// is measured from `ctx.start_time` so every variant reports the same
+/// wall-clock interval from the start of `run_turn` to the outcome
+/// construction site.
+fn build_turn_summary(
+    ctx: &TurnContext,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+    turn_usage: TokenUsage,
+) -> TurnSummary {
+    TurnSummary {
+        thread_id: ctx.thread_id.clone(),
+        turn: ctx.turn,
+        total_turns: turns_to_u32(ctx.turn),
+        turn_usage,
+        total_usage: ctx.total_usage.clone(),
+        provenance: provenance.clone(),
+        response_id: ctx.response_id.clone(),
+        stop_reason: ctx.stop_reason,
+        tool_call_count: ctx.tool_call_count,
+        duration_ms: duration_ms_saturating(ctx.start_time.elapsed()),
+        tool_runtime: turn_options.tool_runtime.clone(),
+        strict_durability: turn_options.strict_durability,
+    }
+}
+
+/// Saturating conversion from [`Duration`] to milliseconds, clamped to
+/// [`u64::MAX`] on the unlikely overflow so the summary never panics on
+/// a pathological clock.
+fn duration_ms_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Build a synthetic summary for outcome paths that do not go through
+/// `TurnContext` — currently only the "cancelled before the first LLM
+/// call" path from [`cancelled_turn_outcome`]. All LLM-level fields
+/// (`response_id`, `stop_reason`, `tool_call_count`) are `None` / zero
+/// because the turn never reached the LLM.
+fn empty_turn_summary(
+    thread_id: &ThreadId,
+    turn: usize,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+) -> TurnSummary {
+    TurnSummary {
+        thread_id: thread_id.clone(),
+        turn,
+        total_turns: 0,
+        turn_usage: TokenUsage::default(),
+        total_usage: TokenUsage::default(),
+        provenance: provenance.clone(),
+        response_id: None,
+        stop_reason: None,
+        tool_call_count: 0,
+        duration_ms: 0,
+        tool_runtime: turn_options.tool_runtime.clone(),
+        strict_durability: turn_options.strict_durability,
+    }
+}
+
+fn cancelled_turn_outcome(
+    thread_id: &ThreadId,
+    turn: usize,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+) -> TurnOutcome {
     TurnOutcome::Cancelled {
         total_turns: 0,
         input_tokens: 0,
         output_tokens: 0,
+        summary: empty_turn_summary(thread_id, turn, provenance, turn_options),
     }
 }
 
@@ -1221,6 +1294,8 @@ pub(super) async fn handle_single_turn_resume<Ctx, H, M, S>(
         execution_store,
         audit_sink,
         provenance,
+        turn_options,
+        start_time,
     }: SingleTurnResumeParams<Ctx, H, M, S>,
 ) -> TurnOutcome
 where
@@ -1254,10 +1329,30 @@ where
             if let Err(error) = state_store.save(&updated_state).await {
                 warn!("Failed to save state checkpoint: {error}");
             }
+            // Build a synthetic `TurnContext` so we can reuse
+            // `build_turn_summary` on the resume path. The resume
+            // handler does not otherwise need `TurnContext`, so
+            // constructing one here keeps the summary plumbing in a
+            // single place without widening the regular turn flow.
+            let resume_ctx = TurnContext {
+                thread_id: thread_id.clone(),
+                turn,
+                total_usage: total_usage.clone(),
+                state: updated_state,
+                start_time,
+                compaction_retries: 0,
+                pending_reminder: None,
+                response_id: None,
+                stop_reason: None,
+                tool_call_count: 0,
+            };
+            let summary =
+                build_turn_summary(&resume_ctx, &provenance, &turn_options, turn_usage.clone());
             TurnOutcome::NeedsMoreTurns {
                 turn,
                 turn_usage,
                 total_usage,
+                summary,
             }
         }
         Ok(ResumeProcessingResult::AwaitingConfirmation {
@@ -1267,14 +1362,32 @@ where
             input,
             description,
             continuation,
-        }) => TurnOutcome::AwaitingConfirmation {
-            tool_call_id,
-            tool_name,
-            display_name,
-            input,
-            description,
-            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-        },
+        }) => {
+            let turn_usage = continuation.turn_usage.clone();
+            let resume_ctx = TurnContext {
+                thread_id: thread_id.clone(),
+                turn,
+                total_usage: total_usage.clone(),
+                state: state.clone(),
+                start_time,
+                compaction_retries: 0,
+                pending_reminder: None,
+                response_id: None,
+                stop_reason: None,
+                tool_call_count: continuation.pending_tool_calls.len(),
+            };
+            let summary =
+                build_turn_summary(&resume_ctx, &provenance, &turn_options, turn_usage);
+            TurnOutcome::AwaitingConfirmation {
+                tool_call_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+                continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
+                summary,
+            }
+        }
         Err(error) => {
             if let Err(store_error) = send_event(
                 &event_store,
@@ -1606,11 +1719,13 @@ where
                 total_turns,
                 input_tokens,
                 output_tokens,
+                ..
             }
             | TurnOutcome::Refusal {
                 total_turns,
                 input_tokens,
                 output_tokens,
+                ..
             } => (
                 usize::try_from(*total_turns).unwrap_or(0),
                 *input_tokens,
@@ -1661,15 +1776,18 @@ where
     M: MessageStore,
     S: StateStore,
 {
+    // Build provenance early so we can include it in the summary even
+    // when the turn is cancelled before the first LLM call.
+    let provenance =
+        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
+
     // Check for cancellation before starting any work
     if cancel_token.is_cancelled() {
         log::info!("Agent turn cancelled before execution started");
-        return cancelled_turn_outcome();
+        return cancelled_turn_outcome(&thread_id, 0, &provenance, &turn_options);
     }
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
-    let provenance =
-        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
     let init_state = match initialize_single_turn_state(
         input,
@@ -1716,6 +1834,8 @@ where
             execution_store,
             audit_sink,
             provenance,
+            turn_options: turn_options.clone(),
+            start_time,
         })
         .await;
     }
@@ -1851,6 +1971,8 @@ where
         thread_id: thread_id.clone(),
         current_turn,
         state_store: &state_store,
+        provenance: &provenance,
+        turn_options: &turn_options,
     })
     .await;
 
@@ -1873,6 +1995,8 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         thread_id,
         current_turn,
         state_store,
+        provenance,
+        turn_options,
     }: ConvertTurnResultParams<'_, H, S>,
 ) -> TurnOutcome {
     match result {
@@ -1880,10 +2004,12 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             if let Err(e) = state_store.save(&ctx.state).await {
                 warn!("Failed to save state checkpoint: {e}");
             }
+            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
             TurnOutcome::NeedsMoreTurns {
                 turn: ctx.turn,
                 turn_usage,
                 total_usage: ctx.total_usage,
+                summary,
             }
         }
         InternalTurnResult::Done => {
@@ -1908,17 +2034,28 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             {
                 return TurnOutcome::Error(error);
             }
+            // For terminal outcomes, the "turn usage" reported to the
+            // summary is the cumulative usage because we no longer have
+            // a distinct per-turn slice to expose.
+            let summary =
+                build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
             TurnOutcome::Done {
                 total_turns: turns_to_u32(ctx.turn),
                 input_tokens: u64::from(ctx.total_usage.input_tokens),
                 output_tokens: u64::from(ctx.total_usage.output_tokens),
+                summary,
             }
         }
-        InternalTurnResult::Refusal => TurnOutcome::Refusal {
-            total_turns: turns_to_u32(ctx.turn),
-            input_tokens: u64::from(ctx.total_usage.input_tokens),
-            output_tokens: u64::from(ctx.total_usage.output_tokens),
-        },
+        InternalTurnResult::Refusal => {
+            let summary =
+                build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
+            TurnOutcome::Refusal {
+                total_turns: turns_to_u32(ctx.turn),
+                input_tokens: u64::from(ctx.total_usage.input_tokens),
+                output_tokens: u64::from(ctx.total_usage.output_tokens),
+                summary,
+            }
+        }
         InternalTurnResult::AwaitingConfirmation {
             tool_call_id,
             tool_name,
@@ -1926,25 +2063,34 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             input,
             description,
             continuation,
-        } => TurnOutcome::AwaitingConfirmation {
-            tool_call_id,
-            tool_name,
-            display_name,
-            input,
-            description,
-            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-        },
+        } => {
+            let turn_usage = continuation.turn_usage.clone();
+            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage);
+            TurnOutcome::AwaitingConfirmation {
+                tool_call_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+                continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
+                summary,
+            }
+        }
         InternalTurnResult::PendingToolCalls {
             turn_usage,
             pending_tool_calls,
             continuation,
-        } => TurnOutcome::PendingToolCalls {
-            turn: ctx.turn,
-            turn_usage,
-            total_usage: ctx.total_usage,
-            tool_calls: pending_tool_calls,
-            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-        },
+        } => {
+            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
+            TurnOutcome::PendingToolCalls {
+                turn: ctx.turn,
+                turn_usage,
+                total_usage: ctx.total_usage,
+                tool_calls: pending_tool_calls,
+                continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
+                summary,
+            }
+        }
         InternalTurnResult::Error(e) => TurnOutcome::Error(e),
     }
 }

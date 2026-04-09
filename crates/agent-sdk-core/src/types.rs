@@ -9,10 +9,12 @@
 //! - [`ToolTier`]: Permission tiers for tools
 //! - [`AgentRunState`]: Outcome of running the agent loop (looping mode)
 //! - [`TurnOutcome`]: Outcome of running a single turn (single-turn mode)
+//! - [`TurnSummary`]: Structured server-facing outcome metadata
 //! - [`AgentInput`]: Input to start or resume an agent run
 //! - [`AgentContinuation`]: Opaque state for resuming after confirmation
 //! - [`AgentState`]: Checkpointable agent state
 
+use crate::audit::AuditProvenance;
 use crate::llm::{ContentBlock, ContentSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -127,7 +129,7 @@ impl RetryConfig {
 }
 
 /// Token usage statistics
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -687,6 +689,14 @@ impl ToolExecution {
 /// Outcome of running a single turn.
 ///
 /// This is returned by `run_turn` to indicate what happened and what to do next.
+///
+/// # Server-facing contract
+///
+/// Every terminal variant (everything except [`TurnOutcome::Error`]) carries
+/// a [`TurnSummary`] with the provider/model/stop-reason/response-id/usage
+/// provenance that later server phases need to durably persist. Matching by
+/// field name continues to work because the legacy variant fields are
+/// preserved alongside the new `summary` field.
 #[derive(Debug)]
 pub enum TurnOutcome {
     /// Turn completed successfully, but more turns are needed.
@@ -700,6 +710,8 @@ pub enum TurnOutcome {
         turn_usage: TokenUsage,
         /// Cumulative token usage so far
         total_usage: TokenUsage,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
 
     /// Agent completed successfully (no more tool calls).
@@ -710,6 +722,8 @@ pub enum TurnOutcome {
         input_tokens: u64,
         /// Total output tokens consumed
         output_tokens: u64,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
 
     /// A tool requires user confirmation.
@@ -729,6 +743,8 @@ pub enum TurnOutcome {
         description: String,
         /// Versioned continuation envelope for resuming.
         continuation: Box<ContinuationEnvelope>,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
 
     /// Model refused the request (safety/policy).
@@ -739,6 +755,8 @@ pub enum TurnOutcome {
         input_tokens: u64,
         /// Total output tokens consumed
         output_tokens: u64,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
 
     /// The turn was cancelled via a cancellation token.
@@ -749,9 +767,14 @@ pub enum TurnOutcome {
         input_tokens: u64,
         /// Total output tokens consumed
         output_tokens: u64,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
 
     /// An error occurred.
+    ///
+    /// No [`TurnSummary`] is attached because the error may have occurred
+    /// before the turn produced any durable LLM provenance.
     Error(AgentError),
 
     /// Tool calls are ready for external execution.
@@ -775,13 +798,162 @@ pub enum TurnOutcome {
         tool_calls: Vec<PendingToolCallInfo>,
         /// Versioned continuation envelope for resuming after external tool execution.
         continuation: Box<ContinuationEnvelope>,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
     },
+}
+
+impl TurnOutcome {
+    /// Returns the attached [`TurnSummary`], if the variant carries one.
+    ///
+    /// Present on every variant except [`TurnOutcome::Error`].
+    #[must_use]
+    pub const fn summary(&self) -> Option<&TurnSummary> {
+        match self {
+            Self::NeedsMoreTurns { summary, .. }
+            | Self::Done { summary, .. }
+            | Self::AwaitingConfirmation { summary, .. }
+            | Self::Refusal { summary, .. }
+            | Self::Cancelled { summary, .. }
+            | Self::PendingToolCalls { summary, .. } => Some(summary),
+            Self::Error(_) => None,
+        }
+    }
+}
+
+// ── Turn summary ─────────────────────────────────────────────────────
+
+/// Structured server-facing outcome metadata for a single turn.
+///
+/// Captures everything the server needs to durably persist about a
+/// turn's LLM-level provenance: thread/turn identity, provider and model
+/// identifiers, response ID and stop reason from the turn-closing LLM
+/// call, token usage, tool-call count, wall-clock duration, and the
+/// [`TurnOptions`] the caller requested.
+///
+/// # Why this exists
+///
+/// The original [`TurnOutcome`] only exposed token counts and turn
+/// numbers. Later server phases need:
+///
+/// - **Provider / model** — to correlate rows across provider rotations
+///   and to route audit streams by provider.
+/// - **Response ID** — to join durable turn rows against the raw
+///   provider response stored externally (observability pipelines,
+///   replay, support escalations).
+/// - **Stop reason** — to branch on `end_turn` vs `tool_use` vs
+///   `refusal` without re-parsing message history.
+/// - **Tool-call count** — to bill tool execution and detect runaway
+///   turns without walking the tool registry.
+/// - **Duration** — to feed SLO dashboards and auto-tune retry budgets.
+/// - **Tool runtime / strict durability flags** — to record which
+///   execution profile was in effect, so later replay can reconstruct
+///   the same decisions.
+///
+/// # Serialization
+///
+/// `TurnSummary` is fully serializable. Servers are expected to persist
+/// it alongside (or inside) their turn rows. Duration is exposed as
+/// `duration_ms` (milliseconds) to avoid a serde dance around
+/// [`std::time::Duration`].
+///
+/// # Authoritative vs convenience
+///
+/// Fields in `TurnSummary` are **authoritative** for server execution:
+/// they are produced by the same code path that writes the durable
+/// event store and are guaranteed to be consistent with the events the
+/// server observed on the wire. Convenience accessors on [`TurnOutcome`]
+/// (e.g. the legacy `input_tokens` / `output_tokens` fields on `Done`)
+/// are kept only so local callers do not have to break; new code should
+/// read from `summary` instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSummary {
+    /// Thread this turn belongs to.
+    ///
+    /// Duplicated from the call site so the summary is self-describing
+    /// when persisted alone (for durable audit rows).
+    pub thread_id: ThreadId,
+    /// Turn number that produced this outcome (1-indexed).
+    pub turn: usize,
+    /// Total number of turns executed in this run so far.
+    ///
+    /// For mid-run outcomes like `NeedsMoreTurns` / `PendingToolCalls`
+    /// this equals `turn`. For terminal outcomes (`Done`, `Refusal`,
+    /// `Cancelled`) it reflects the final total.
+    pub total_turns: u32,
+    /// Token usage for the LLM call(s) that produced this turn.
+    pub turn_usage: TokenUsage,
+    /// Cumulative token usage across every turn in this run so far.
+    pub total_usage: TokenUsage,
+    /// Provider / model provenance captured from the turn-closing
+    /// LLM call — identical shape to [`AuditProvenance`] so durable
+    /// audit rows stay consistent with turn rows.
+    pub provenance: AuditProvenance,
+    /// Provider response ID from the turn-closing LLM call.
+    ///
+    /// `None` when the provider did not return an ID or the turn
+    /// terminated before the LLM responded (e.g. cancelled before the
+    /// first call).
+    pub response_id: Option<String>,
+    /// Stop reason reported by the turn-closing LLM call.
+    ///
+    /// `None` when no response was produced for this turn (e.g. the
+    /// turn was cancelled before the LLM replied, or the turn was
+    /// resumed purely from external tool results without calling the
+    /// LLM again).
+    pub stop_reason: Option<crate::llm::StopReason>,
+    /// Number of tool calls the LLM requested in this turn.
+    ///
+    /// Zero for pure text turns.
+    pub tool_call_count: usize,
+    /// Wall-clock duration of this turn, in milliseconds.
+    ///
+    /// Measured from the start of `run_turn` to the moment the outcome
+    /// is returned. Clamped to `u64::MAX` on the unlikely overflow.
+    pub duration_ms: u64,
+    /// The [`ToolRuntime`] selected for this turn.
+    pub tool_runtime: ToolRuntime,
+    /// Whether strict durability was requested for this turn.
+    pub strict_durability: bool,
+}
+
+impl TurnSummary {
+    /// Construct an empty summary for a thread / provider / model.
+    ///
+    /// Used by the runtime as a starting point; it then updates
+    /// specific fields as the turn progresses. Tests and downstream
+    /// consumers should generally pattern-match on the outcome and
+    /// read fields from the populated summary rather than construct
+    /// one from scratch.
+    #[must_use]
+    pub fn new(
+        thread_id: ThreadId,
+        turn: usize,
+        provenance: AuditProvenance,
+        options: &TurnOptions,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn,
+            total_turns: 0,
+            turn_usage: TokenUsage::default(),
+            total_usage: TokenUsage::default(),
+            provenance,
+            response_id: None,
+            stop_reason: None,
+            tool_call_count: 0,
+            duration_ms: 0,
+            tool_runtime: options.tool_runtime.clone(),
+            strict_durability: options.strict_durability,
+        }
+    }
 }
 
 // ── Execution options ────────────────────────────────────────────────
 
 /// How tool calls should be handled during a turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolRuntime {
     /// Tools are executed inline by the SDK (the default local-agent behavior).
     #[default]
@@ -807,4 +979,158 @@ pub struct TurnOptions {
     /// (before LLM call, after LLM response, after tool execution).
     /// Provides crash-safe server semantics at the cost of extra writes.
     pub strict_durability: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::StopReason;
+
+    fn sample_summary() -> TurnSummary {
+        TurnSummary {
+            thread_id: ThreadId::from_string("t-summary"),
+            turn: 2,
+            total_turns: 2,
+            turn_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            total_usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 75,
+            },
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+            response_id: Some("resp_123".into()),
+            stop_reason: Some(StopReason::ToolUse),
+            tool_call_count: 3,
+            duration_ms: 1_234,
+            tool_runtime: ToolRuntime::External,
+            strict_durability: true,
+        }
+    }
+
+    #[test]
+    fn turn_summary_round_trips_through_json() {
+        let original = sample_summary();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let recovered: TurnSummary = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn turn_summary_json_has_expected_keys() {
+        let summary = sample_summary();
+        let value = serde_json::to_value(&summary).unwrap();
+
+        // The wire format is the durable server contract — assert
+        // every field is present so accidental renames break this
+        // test rather than silently corrupting persisted rows.
+        for key in [
+            "thread_id",
+            "turn",
+            "total_turns",
+            "turn_usage",
+            "total_usage",
+            "provenance",
+            "response_id",
+            "stop_reason",
+            "tool_call_count",
+            "duration_ms",
+            "tool_runtime",
+            "strict_durability",
+        ] {
+            assert!(value.get(key).is_some(), "missing key {key}");
+        }
+
+        // Snake-case tool-runtime variant is stable for server rows.
+        assert_eq!(value["tool_runtime"], serde_json::json!("external"));
+        // Snake-case stop-reason variant matches the provider wire format.
+        assert_eq!(value["stop_reason"], serde_json::json!("tool_use"));
+    }
+
+    #[test]
+    fn turn_outcome_summary_accessor_works_for_every_variant() {
+        let summary = sample_summary();
+
+        let outcomes = vec![
+            TurnOutcome::NeedsMoreTurns {
+                turn: 1,
+                turn_usage: TokenUsage::default(),
+                total_usage: TokenUsage::default(),
+                summary: summary.clone(),
+            },
+            TurnOutcome::Done {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+            TurnOutcome::Refusal {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+            TurnOutcome::Cancelled {
+                total_turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                summary: summary.clone(),
+            },
+        ];
+
+        for outcome in &outcomes {
+            let got = outcome.summary().expect("summary must be present");
+            assert_eq!(got, &summary);
+        }
+
+        // Error variant has no summary.
+        let error_outcome =
+            TurnOutcome::Error(AgentError::new("boom", /* recoverable */ false));
+        assert!(error_outcome.summary().is_none());
+    }
+
+    #[test]
+    fn empty_turn_summary_new_captures_options_and_provenance() {
+        let opts = TurnOptions {
+            tool_runtime: ToolRuntime::External,
+            strict_durability: true,
+        };
+        let provenance = AuditProvenance::new("openai", "gpt-5");
+        let summary =
+            TurnSummary::new(ThreadId::from_string("t-new"), 7, provenance.clone(), &opts);
+
+        assert_eq!(summary.thread_id, ThreadId::from_string("t-new"));
+        assert_eq!(summary.turn, 7);
+        assert_eq!(summary.total_turns, 0);
+        assert_eq!(summary.provenance, provenance);
+        assert_eq!(summary.tool_runtime, ToolRuntime::External);
+        assert!(summary.strict_durability);
+        assert!(summary.response_id.is_none());
+        assert!(summary.stop_reason.is_none());
+        assert_eq!(summary.tool_call_count, 0);
+        assert_eq!(summary.duration_ms, 0);
+    }
+
+    #[test]
+    fn stop_reason_as_str_matches_serde_representation() {
+        // The durable stop_reason discriminant used in TurnSummary and
+        // audit rows must match the serde wire format exactly.
+        let cases = [
+            (StopReason::EndTurn, "end_turn"),
+            (StopReason::ToolUse, "tool_use"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::StopSequence, "stop_sequence"),
+            (StopReason::Refusal, "refusal"),
+            (
+                StopReason::ModelContextWindowExceeded,
+                "model_context_window_exceeded",
+            ),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(variant.as_str(), expected);
+            let json = serde_json::to_value(variant).unwrap();
+            assert_eq!(json, serde_json::json!(expected));
+        }
+    }
 }

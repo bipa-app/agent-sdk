@@ -513,6 +513,15 @@ where
     /// A [`crate::types::TurnOutcome`] returned only after the configured event store's
     /// `finish_turn(thread_id, turn)` barrier has completed.
     ///
+    /// Every variant except [`crate::types::TurnOutcome::Error`] carries a
+    /// structured [`crate::types::TurnSummary`] in the `summary` field. This
+    /// summary is the **authoritative** server-facing outcome contract —
+    /// it contains the provider/model provenance, response ID, stop reason,
+    /// tool-call count, duration, and execution options for the turn. Server
+    /// code should read from `summary` rather than the legacy per-variant
+    /// fields (`total_turns`, `input_tokens`, `output_tokens`, …), which are
+    /// retained only for backwards compatibility with local callers.
+    ///
     /// # Turn Outcomes
     ///
     /// - `NeedsMoreTurns` - Turn completed, call again with `AgentInput::Continue`
@@ -520,7 +529,7 @@ where
     /// - `AwaitingConfirmation` - Tool needs confirmation, call again with `AgentInput::Resume`
     /// - `PendingToolCalls` - Tools need external execution (only with `ToolRuntime::External`)
     /// - `Cancelled` - Turn was cancelled via the token
-    /// - `Error` - An error occurred
+    /// - `Error` - An error occurred (no summary attached)
     ///
     /// # Example
     ///
@@ -540,7 +549,19 @@ where
     ///
     /// let events = event_store.get_events(&thread_id).await?;
     ///
-    /// // Check outcome
+    /// // Read server-facing metadata from the TurnSummary.
+    /// if let Some(summary) = outcome.summary() {
+    ///     println!(
+    ///         "turn={} provider={} model={} stop={:?} response_id={:?}",
+    ///         summary.turn,
+    ///         summary.provenance.provider,
+    ///         summary.provenance.model,
+    ///         summary.stop_reason,
+    ///         summary.response_id,
+    ///     );
+    /// }
+    ///
+    /// // Branch on the variant for flow control.
     /// match outcome {
     ///     TurnOutcome::NeedsMoreTurns { turn, .. } => {
     ///         // Dispatch another message to continue

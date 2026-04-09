@@ -760,6 +760,19 @@ pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -
     };
     ctx.total_usage.add(&turn_usage);
     ctx.state.total_usage = ctx.total_usage.clone();
+
+    // Capture provider-level provenance into the turn context so that
+    // the [`agent_sdk_core::TurnSummary`] emitted at outcome time
+    // reflects the real response metadata rather than the defaults.
+    //
+    // Response IDs are only recorded when the provider actually
+    // returned one; legacy mock providers that emit an empty string
+    // leave the field as `None`.
+    if !response.id.is_empty() {
+        ctx.response_id = Some(response.id.clone());
+    }
+    ctx.stop_reason = response.stop_reason;
+
     turn_usage
 }
 
@@ -1552,6 +1565,10 @@ where
         Ok(processed) => processed,
         Err(error) => return InternalTurnResult::Error(error),
     };
+
+    // Record how many tool calls the LLM asked for in this turn so
+    // the summary can report it without reparsing the message history.
+    ctx.tool_call_count = pending_tool_calls.len();
 
     let had_tool_calls = !pending_tool_calls.is_empty();
 

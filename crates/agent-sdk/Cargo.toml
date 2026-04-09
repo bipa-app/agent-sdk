@@ -64,6 +64,10 @@ name = "with_primitive_tools"
 path = "examples/with_primitive_tools.rs"
 
 [[example]]
+name = "server_turn_summary"
+path = "examples/server_turn_summary.rs"
+
+[[example]]
 name = "otel"
 path = "examples/otel.rs"
 required-features = ["otel"]

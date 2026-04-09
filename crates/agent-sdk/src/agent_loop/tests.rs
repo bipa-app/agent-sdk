@@ -3823,3 +3823,401 @@ async fn test_audit_external_append_failure_does_not_mark_execution_store() -> a
     );
     Ok(())
 }
+
+// ===================
+// TurnSummary Regression Suite (ENG-7914 — Phase 1.7)
+// ===================
+//
+// These tests close Phase 1 by exercising the full server-facing
+// `TurnSummary` contract on top of the boundary work landed by ENG-7908
+// through ENG-7913.  Each test builds an end-to-end `run_turn` call
+// with a `MockProvider` whose response fields are known, then asserts
+// the resulting `TurnSummary` carries the provenance, response id,
+// stop reason, usage, duration, tool-call count, and option flags that
+// later server phases depend on.
+
+#[tokio::test]
+async fn test_turn_summary_done_populates_provenance_and_response_id() -> anyhow::Result<()> {
+    use crate::llm::StopReason;
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("Done!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+
+    let options = TurnOptions {
+        tool_runtime: ToolRuntime::Inline,
+        strict_durability: false,
+    };
+    let thread_id = ThreadId::from_string("t-summary-done");
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        options,
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::Done { summary, .. } => summary,
+        other => panic!("Expected Done, got {other:?}"),
+    };
+
+    assert_eq!(summary.thread_id, thread_id);
+    assert_eq!(summary.provenance.provider, "mock");
+    assert_eq!(summary.provenance.model, "mock-model");
+    assert_eq!(summary.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(summary.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(summary.tool_call_count, 0);
+    assert_eq!(summary.turn_usage.input_tokens, 10);
+    assert_eq!(summary.turn_usage.output_tokens, 20);
+    assert_eq!(summary.total_usage.input_tokens, 10);
+    assert_eq!(summary.total_usage.output_tokens, 20);
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    assert!(!summary.strict_durability);
+    assert!(summary.turn >= 1);
+    assert!(summary.total_turns >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_needs_more_turns_reports_tool_call_count() -> anyhow::Result<()> {
+    use crate::llm::StopReason;
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    // Two LLM calls: first asks for an echo tool, second wraps up.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("All done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Echo please".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::NeedsMoreTurns { summary, .. } => summary,
+        other => panic!("Expected NeedsMoreTurns, got {other:?}"),
+    };
+
+    // Phase 1 contract: the tool-call count must match the LLM's request
+    // and the stop reason must reflect the turn-closing LLM call.
+    assert_eq!(summary.tool_call_count, 1);
+    assert_eq!(summary.stop_reason, Some(StopReason::ToolUse));
+    assert_eq!(summary.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(summary.provenance.provider, "mock");
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_pending_tool_calls_carries_external_runtime()
+-> anyhow::Result<()> {
+    use crate::llm::StopReason;
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![MockProvider::tool_uses_response(vec![
+        ("tool_1", "echo", json!({"message": "one"})),
+        ("tool_2", "echo", json!({"message": "two"})),
+    ])]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let options = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: true,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::from_string("t-pending-summary"),
+        AgentInput::Text("Run two echos".to_string()),
+        ToolContext::new(()),
+        options,
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::PendingToolCalls { summary, .. } => summary,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // The summary for an external-runtime handoff must carry every
+    // field later phases use to build a durable turn row.
+    assert_eq!(summary.tool_call_count, 2);
+    assert_eq!(summary.stop_reason, Some(StopReason::ToolUse));
+    assert_eq!(summary.tool_runtime, ToolRuntime::External);
+    assert!(summary.strict_durability);
+    assert_eq!(summary.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(summary.provenance.model, "mock-model");
+    assert_eq!(summary.turn_usage.input_tokens, 10);
+    assert_eq!(summary.turn_usage.output_tokens, 20);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_is_serializable_for_durable_persistence() -> anyhow::Result<()> {
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("Hello")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::Done { summary, .. } => summary,
+        other => panic!("Expected Done, got {other:?}"),
+    };
+
+    // Round-trip through JSON because the server persists summaries as
+    // part of durable turn rows.
+    let json = serde_json::to_string(&summary)?;
+    let recovered: TurnSummary = serde_json::from_str(&json)?;
+    assert_eq!(recovered, summary);
+
+    // Deserialize via serde_json::Value to make sure the wire contract
+    // uses the stable snake_case discriminants later phases will match on.
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    assert_eq!(value["tool_runtime"], serde_json::json!("inline"));
+    assert_eq!(value["stop_reason"], serde_json::json!("end_turn"));
+    assert_eq!(value["provenance"]["provider"], serde_json::json!("mock"));
+
+    // Sanity: this summary was produced by an inline-runtime turn.
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_awaiting_confirmation_carries_provenance() -> anyhow::Result<()> {
+    use crate::llm::StopReason;
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "confirm me"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(ConfirmAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::from_string("t-await-summary"),
+        AgentInput::Text("Echo please".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::AwaitingConfirmation { summary, .. } => summary,
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    // The yield path still needs provenance for durable confirmation rows.
+    assert_eq!(summary.provenance.provider, "mock");
+    assert_eq!(summary.provenance.model, "mock-model");
+    assert_eq!(summary.stop_reason, Some(StopReason::ToolUse));
+    assert_eq!(summary.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_cancelled_before_llm_still_records_provenance()
+-> anyhow::Result<()> {
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("unused")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+
+    // Pre-cancel the token so the turn trips the early-cancellation path.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = agent
+        .run_turn(
+            ThreadId::from_string("t-cancelled-summary"),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            cancel,
+            TurnOptions::default(),
+        )
+        .await;
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::Cancelled { summary, .. } => summary,
+        other => panic!("Expected Cancelled, got {other:?}"),
+    };
+
+    // Even the early-cancellation path has to emit a summary so the
+    // server can record a durable row for the cancelled turn.
+    assert_eq!(summary.provenance.provider, "mock");
+    assert_eq!(summary.provenance.model, "mock-model");
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    assert!(summary.response_id.is_none());
+    assert!(summary.stop_reason.is_none());
+    assert_eq!(summary.tool_call_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_duration_ms_reflects_turn_wall_clock() -> anyhow::Result<()> {
+    use crate::types::TurnSummary;
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("quick")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+
+    let start = std::time::Instant::now();
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hello".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let summary: TurnSummary = match outcome {
+        TurnOutcome::Done { summary, .. } => summary,
+        other => panic!("Expected Done, got {other:?}"),
+    };
+
+    // Allow a generous upper bound for flaky CI; the important
+    // property is that duration is recorded and bounded, not exact.
+    assert!(
+        summary.duration_ms <= elapsed_ms + 50,
+        "summary duration {} ms must not exceed observed elapsed {} ms",
+        summary.duration_ms,
+        elapsed_ms,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_turn_summary_resume_after_confirmation_carries_summary() -> anyhow::Result<()> {
+    use crate::types::{ToolRuntime, TurnSummary};
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "resume"})),
+        MockProvider::text_response("done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(ConfirmAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::from_string("t-resume-summary");
+
+    // Turn 1: yields for confirmation
+    let (outcome_1, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Echo please".to_string()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let (tool_call_id, continuation) = match outcome_1 {
+        TurnOutcome::AwaitingConfirmation {
+            tool_call_id,
+            continuation,
+            summary,
+            ..
+        } => {
+            // Yield summary should carry provenance already.
+            assert_eq!(summary.provenance.provider, "mock");
+            assert_eq!(summary.tool_call_count, 1);
+            (tool_call_id, continuation)
+        }
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    // Turn 2: resume with confirmation → NeedsMoreTurns (tool ran inline)
+    let (outcome_2, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let summary: TurnSummary = match outcome_2 {
+        TurnOutcome::NeedsMoreTurns { summary, .. } => summary,
+        other => panic!("Expected NeedsMoreTurns, got {other:?}"),
+    };
+
+    // The resume summary still has to carry provenance so server
+    // phases can join it to the original turn row.
+    assert_eq!(summary.provenance.provider, "mock");
+    assert_eq!(summary.provenance.model, "mock-model");
+    assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
+    Ok(())
+}
