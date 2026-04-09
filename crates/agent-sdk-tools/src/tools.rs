@@ -33,7 +33,8 @@
 //! }
 //! ```
 
-use crate::authority::EventAuthority;
+use crate::authority::{EventAuthority, LocalEventAuthority};
+use crate::seed::{HostDependencies, ToolContextSeed};
 use crate::stores::EventStore;
 use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::llm;
@@ -317,6 +318,34 @@ impl<Ctx> ToolContext<Ctx> {
             event_authority: None,
             cancel_token: None,
             subagent_semaphore: None,
+        }
+    }
+
+    /// Reconstruct a `ToolContext` from a durable seed and host-provided
+    /// runtime dependencies.
+    ///
+    /// This is the authoritative reconstruction path.  Workers should use
+    /// this (or a host's [`crate::seed::ExecutionContextFactory`]) instead
+    /// of chaining builder methods, so that the context shape is
+    /// deterministic and auditable.
+    ///
+    /// The event authority is constructed internally from
+    /// [`ToolContextSeed::sequence_offset`] to guarantee monotonic
+    /// sequencing — callers cannot accidentally supply a misaligned
+    /// authority.
+    #[must_use]
+    pub fn from_seed(seed: &ToolContextSeed, app: Ctx, deps: HostDependencies) -> Self {
+        let authority: Arc<dyn EventAuthority> =
+            Arc::new(LocalEventAuthority::with_offset(seed.sequence_offset));
+        Self {
+            app,
+            metadata: seed.metadata.clone(),
+            event_store: Some(deps.event_store),
+            event_thread_id: Some(seed.thread_id.clone()),
+            event_turn: Some(seed.turn),
+            event_authority: Some(authority),
+            cancel_token: Some(deps.cancel_token),
+            subagent_semaphore: deps.subagent_semaphore,
         }
     }
 

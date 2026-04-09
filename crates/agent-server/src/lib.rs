@@ -57,20 +57,28 @@ pub use agent_sdk_providers;
 
 /// Convenience re-export of the server execution options and event-store types.
 pub use agent_sdk_core::{ToolRuntime, TurnOptions, TurnOutcome};
+/// Durable reconstruction contract for worker-context recovery.
+pub use agent_sdk_tools::{
+    DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
+};
 pub use agent_sdk_tools::{
     EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority, StoredTurnEvents,
 };
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use agent_sdk_core::{
         AgentConfig, AgentEvent, Message, Role, ThreadId, ToolRuntime, TurnOptions, TurnOutcome,
     };
     use agent_sdk_providers::LlmProvider;
     use agent_sdk_tools::{
-        AgentHooks, EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority,
-        MessageStore, StateStore, StoredTurnEvents,
+        AgentHooks, EventAuthority, EventStore, HostDependencies, InMemoryEventStore,
+        LocalEventAuthority, MessageStore, StateStore, StoredTurnEvents, ToolContext,
+        ToolContextSeed,
     };
+    use tokio_util::sync::CancellationToken;
 
     /// Compile-time proof that the server crate can reach all three SDK
     /// sub-crates and name their key traits / types.
@@ -158,5 +166,127 @@ mod tests {
         let all = store.get_events(&thread).await.unwrap();
         let seqs: Vec<u64> = all.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3]);
+    }
+
+    /// Prove that a server worker can reconstruct a `ToolContext` from a
+    /// durable seed and fresh host dependencies, then emit events that
+    /// land in the store with correct thread/turn/sequence binding.
+    #[tokio::test]
+    async fn tool_context_reconstructed_from_seed_emits_events() -> anyhow::Result<()> {
+        let store = std::sync::Arc::new(InMemoryEventStore::new());
+        let thread = ThreadId::from_string("t-seed");
+
+        let seed = ToolContextSeed {
+            thread_id: thread.clone(),
+            turn: 3,
+            sequence_offset: 10,
+            metadata: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("user_id".into(), serde_json::json!("u-1"));
+                m
+            },
+        };
+
+        let deps = HostDependencies {
+            event_store: std::sync::Arc::clone(&store) as _,
+            cancel_token: CancellationToken::new(),
+            subagent_semaphore: None,
+        };
+
+        let ctx: ToolContext<()> = ToolContext::from_seed(&seed, (), deps);
+
+        // Metadata forwarded
+        assert_eq!(ctx.metadata.get("user_id"), Some(&serde_json::json!("u-1")));
+
+        // Emit two events
+        ctx.emit_event(AgentEvent::text("m1", "hello")).await?;
+        ctx.emit_event(AgentEvent::text("m2", "world")).await?;
+
+        // Events land in the right thread and turn
+        let turn = store
+            .get_turn(&thread, 3)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("turn 3 not found"))?;
+        assert_eq!(turn.events.len(), 2);
+        assert_eq!(turn.events[0].sequence, 10);
+        assert_eq!(turn.events[1].sequence, 11);
+        Ok(())
+    }
+
+    /// The seed must round-trip through JSON so the server can persist it
+    /// alongside task state and recover it on worker restart.
+    #[test]
+    fn seed_serialization_round_trip() -> anyhow::Result<()> {
+        let original = ToolContextSeed {
+            thread_id: ThreadId::from_string("t-persist"),
+            turn: 7,
+            sequence_offset: 99,
+            metadata: {
+                let mut m = HashMap::new();
+                m.insert("user_id".into(), serde_json::json!("u-42"));
+                m.insert("tags".into(), serde_json::json!(["a", "b"]));
+                m
+            },
+        };
+        let json = serde_json::to_string(&original)?;
+        let recovered: ToolContextSeed = serde_json::from_str(&json)?;
+        assert_eq!(recovered, original);
+        Ok(())
+    }
+
+    /// Prove that a second worker can pick up sequencing where the first
+    /// left off using the seed's `sequence_offset`.
+    #[tokio::test]
+    async fn worker_restart_preserves_sequence_continuity() -> anyhow::Result<()> {
+        let store = std::sync::Arc::new(InMemoryEventStore::new());
+        let thread = ThreadId::from_string("t-restart");
+
+        // ── Worker 1: turn 1 ─────────────────────────────────────────
+        let seed_1 = ToolContextSeed::first_turn(thread.clone());
+        let deps_1 = HostDependencies {
+            event_store: std::sync::Arc::clone(&store) as _,
+            cancel_token: CancellationToken::new(),
+            subagent_semaphore: None,
+        };
+        let ctx_1: ToolContext<()> = ToolContext::from_seed(&seed_1, (), deps_1);
+
+        ctx_1.emit_event(AgentEvent::text("m1", "first")).await?;
+        ctx_1.emit_event(AgentEvent::text("m2", "second")).await?;
+        store.finish_turn(&thread, 1).await?;
+
+        // Determine offset for next worker
+        let t1 = store
+            .get_turn(&thread, 1)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("turn 1 not found"))?;
+        let next_offset = t1
+            .events
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no events in turn 1"))?
+            .sequence
+            + 1;
+
+        // ── Worker 2: turn 2 (simulates restart) ─────────────────────
+        let seed_2 = ToolContextSeed {
+            thread_id: thread.clone(),
+            turn: 2,
+            sequence_offset: next_offset,
+            metadata: HashMap::default(),
+        };
+        let deps_2 = HostDependencies {
+            event_store: std::sync::Arc::clone(&store) as _,
+            cancel_token: CancellationToken::new(),
+            subagent_semaphore: None,
+        };
+        let ctx_2: ToolContext<()> = ToolContext::from_seed(&seed_2, (), deps_2);
+
+        ctx_2.emit_event(AgentEvent::text("m3", "third")).await?;
+        store.finish_turn(&thread, 2).await?;
+
+        // ── Verify continuous ordering ───────────────────────────────
+        let all = store.get_events(&thread).await?;
+        let seqs: Vec<u64> = all.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
+        Ok(())
     }
 }

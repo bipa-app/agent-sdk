@@ -43,6 +43,21 @@ fn event_authority() {
 }
 
 #[test]
+fn seed_and_factory_types() {
+    use agent_sdk::{
+        DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
+    };
+
+    let seed = ToolContextSeed::first_turn(agent_sdk::ThreadId::new());
+    let _ = seed.with_metadata("key", serde_json::json!("val"));
+
+    fn _assert_factory<F: ExecutionContextFactory<()>>(_f: &F) {}
+    _assert_factory(&DefaultContextFactory);
+
+    fn _assert_deps(_deps: HostDependencies) {}
+}
+
+#[test]
 fn core_turn_outcomes() {
     use agent_sdk::{
         AgentContinuation, AgentError, AgentRunState, AgentState, ExecutionStatus, TokenUsage,
