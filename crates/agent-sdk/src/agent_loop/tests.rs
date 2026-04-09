@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn expected_turn_for_input(input: &AgentInput, existing_turns: &[StoredTurnEvents]) -> usize {
     match input {
-        AgentInput::Resume { continuation, .. }
-        | AgentInput::SubmitToolResults { continuation, .. } => continuation.turn,
+        AgentInput::Resume { continuation, .. } => continuation.turn,
+        AgentInput::SubmitToolResults { continuation, .. } => continuation.turn.saturating_add(1),
         _ => existing_turns
             .last()
             .map_or(1, |turn| turn.turn.saturating_add(1)),
@@ -2448,6 +2448,75 @@ async fn test_submit_tool_results_with_failed_tool() -> anyhow::Result<()> {
     assert!(
         matches!(outcome2, TurnOutcome::Done { .. }),
         "Expected Done even with failed tool, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_duplicate_tool_call_id() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "test"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit the same tool_call_id twice → should error
+    let outcome2 = agent
+        .run_turn(
+            thread_id,
+            AgentInput::SubmitToolResults {
+                continuation,
+                results: vec![
+                    ExternalToolResult {
+                        tool_call_id: "tool_1".to_string(),
+                        result: ToolResult::success("first"),
+                    },
+                    ExternalToolResult {
+                        tool_call_id: "tool_1".to_string(),
+                        result: ToolResult::success("second"),
+                    },
+                ],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts,
+        )
+        .await;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Error(_)),
+        "Expected Error for duplicate tool call ID, got {outcome2:?}"
     );
     Ok(())
 }
