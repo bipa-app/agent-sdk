@@ -21,6 +21,7 @@ use crate::types::{
     TurnOutcome,
 };
 use log::warn;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,10 +34,9 @@ enum RunLoopTurnAction {
 /// Initialize agent state from the given input.
 ///
 /// Handles the three input variants:
-/// - `Text`: Creates/loads state, appends user message
+/// - `Text`/`Message`: Creates/loads state, appends user message
 /// - `Resume`: Restores from continuation state
 /// - `Continue`: Loads existing state to continue execution
-#[allow(clippy::too_many_lines)]
 pub(super) async fn initialize_from_input<M, S>(
     input: AgentInput,
     thread_id: &ThreadId,
@@ -49,57 +49,13 @@ where
 {
     match input {
         AgentInput::Text(user_message) => {
-            // Load or create state
-            let state = match state_store.load(thread_id).await {
-                Ok(Some(s)) => s,
-                Ok(None) => AgentState::new(thread_id.clone()),
-                Err(e) => {
-                    return Err(AgentError::new(format!("Failed to load state: {e}"), false));
-                }
-            };
-
-            // Recover from orphaned tool_use blocks (crash between persist and execution)
             recover_orphaned_tool_use(thread_id, message_store).await?;
-
-            // Add user message to history
-            let user_msg = Message::user(&user_message);
-            if let Err(e) = message_store.append(thread_id, user_msg).await {
-                return Err(AgentError::new(
-                    format!("Failed to append message: {e}"),
-                    false,
-                ));
-            }
-
-            Ok(InitializedState {
-                turn: 0,
-                total_usage: TokenUsage::default(),
-                state,
-                resume_data: None,
-            })
+            let msg = Message::user(&user_message);
+            initialize_from_message(msg, thread_id, message_store, state_store).await
         }
         AgentInput::Message(blocks) => {
-            let state = match state_store.load(thread_id).await {
-                Ok(Some(s)) => s,
-                Ok(None) => AgentState::new(thread_id.clone()),
-                Err(e) => {
-                    return Err(AgentError::new(format!("Failed to load state: {e}"), false));
-                }
-            };
-
-            let user_msg = Message::user_with_content(blocks);
-            if let Err(e) = message_store.append(thread_id, user_msg).await {
-                return Err(AgentError::new(
-                    format!("Failed to append message: {e}"),
-                    false,
-                ));
-            }
-
-            Ok(InitializedState {
-                turn: 0,
-                total_usage: TokenUsage::default(),
-                state,
-                resume_data: None,
-            })
+            let msg = Message::user_with_content(blocks);
+            initialize_from_message(msg, thread_id, message_store, state_store).await
         }
         AgentInput::Resume {
             continuation,
@@ -107,7 +63,6 @@ where
             confirmed,
             rejection_reason,
         } => {
-            // Validate thread_id matches
             if continuation.thread_id != *thread_id {
                 return Err(AgentError::new(
                     format!(
@@ -135,7 +90,6 @@ where
             results,
         } => initialize_from_tool_results(continuation, results, thread_id, message_store).await,
         AgentInput::Continue => {
-            // Load existing state to continue execution
             let state = match state_store.load(thread_id).await {
                 Ok(Some(s)) => s,
                 Ok(None) => {
@@ -149,10 +103,8 @@ where
                 }
             };
 
-            // Recover from orphaned tool_use blocks (crash between persist and execution)
             recover_orphaned_tool_use(thread_id, message_store).await?;
 
-            // Continue from where we left off
             Ok(InitializedState {
                 turn: state.turn_count,
                 total_usage: state.total_usage.clone(),
@@ -161,6 +113,41 @@ where
             })
         }
     }
+}
+
+/// Shared initialization for `Text` and `Message` inputs: load or create state,
+/// append the user message, and return a fresh turn-zero `InitializedState`.
+async fn initialize_from_message<M, S>(
+    user_msg: Message,
+    thread_id: &ThreadId,
+    message_store: &Arc<M>,
+    state_store: &Arc<S>,
+) -> Result<InitializedState, AgentError>
+where
+    M: MessageStore,
+    S: StateStore,
+{
+    let state = match state_store.load(thread_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => AgentState::new(thread_id.clone()),
+        Err(e) => {
+            return Err(AgentError::new(format!("Failed to load state: {e}"), false));
+        }
+    };
+
+    if let Err(e) = message_store.append(thread_id, user_msg).await {
+        return Err(AgentError::new(
+            format!("Failed to append message: {e}"),
+            false,
+        ));
+    }
+
+    Ok(InitializedState {
+        turn: 0,
+        total_usage: TokenUsage::default(),
+        state,
+        resume_data: None,
+    })
 }
 
 /// Handle `AgentInput::SubmitToolResults`: validate, append results, return state.
@@ -248,7 +235,8 @@ fn validate_external_tool_results(
         }
     }
 
-    // Check for unknown tool call IDs.
+    // Check for unknown or duplicate tool call IDs.
+    let mut seen = HashSet::with_capacity(results.len());
     for result in results {
         if !cont
             .pending_tool_calls
@@ -258,6 +246,15 @@ fn validate_external_tool_results(
             return Err(AgentError::new(
                 format!(
                     "Unknown tool call ID '{}' — not in the pending tool calls",
+                    result.tool_call_id,
+                ),
+                false,
+            ));
+        }
+        if !seen.insert(&result.tool_call_id) {
+            return Err(AgentError::new(
+                format!(
+                    "Duplicate result for tool call ID '{}'",
                     result.tool_call_id,
                 ),
                 false,
