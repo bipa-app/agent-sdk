@@ -348,12 +348,15 @@ pub struct PendingToolCallInfo {
 
 // ── Structured policy input ──────────────────────────────────────────
 
-/// Structured input passed to [`AgentHooks::pre_tool_use`] for policy
+/// Structured input passed to the `pre_tool_use` hook for policy
 /// evaluation.
 ///
 /// Bundles every datum that a server-side policy engine needs to make an
 /// allow / block / confirm decision, replacing the earlier loose
 /// `(tool_name, input, tier)` triple.
+///
+/// The `AgentHooks` trait itself lives in `agent-sdk-tools` to avoid a
+/// dependency cycle; this struct is the stable contract they share.
 #[derive(Clone, Debug)]
 pub struct ToolInvocation {
     /// Unique ID for this tool call (from LLM).

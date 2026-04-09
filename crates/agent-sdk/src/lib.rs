@@ -181,22 +181,16 @@
 //! Implement [`AgentHooks`] to intercept and control agent behavior:
 //!
 //! ```
-//! use agent_sdk::{AgentHooks, ToolDecision, ToolResult, ToolTier};
+//! use agent_sdk::{AgentHooks, ToolDecision, ToolInvocation, ToolResult, ToolTier};
 //! use async_trait::async_trait;
-//! use serde_json::Value;
 //!
 //! struct MyHooks;
 //!
 //! #[async_trait]
 //! impl AgentHooks for MyHooks {
-//!     async fn pre_tool_use(
-//!         &self,
-//!         tool_name: &str,
-//!         _input: &Value,
-//!         tier: ToolTier,
-//!     ) -> ToolDecision {
-//!         println!("Tool called: {tool_name}");
-//!         match tier {
+//!     async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+//!         println!("Tool called: {}", invocation.tool_name);
+//!         match invocation.tier {
 //!             ToolTier::Observe => ToolDecision::Allow,
 //!             ToolTier::Confirm => ToolDecision::RequiresConfirmation(
 //!                 "Please confirm this action".into()
