@@ -101,16 +101,28 @@
 //! experience and should not be relied on for durable server
 //! semantics.
 //!
+//! ## Modules
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`journal`] | Durable `agent_tasks` schema: [`AgentTask`], [`TaskKind`], [`TaskStatus`], identity types, and state-machine invariants (Phase 2.1) |
+//!
 //! ## Planned modules (not yet implemented)
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | `journal` | Durable turn-level event log |
 //! | `workers` | Background agent execution |
 //! | `transport` | HTTP / WebSocket ingress |
 //! | `storage` | Persistent message & state stores |
 
 #![forbid(unsafe_code)]
+
+pub mod journal;
+
+pub use journal::{
+    AgentTask, AgentTaskId, AgentTaskStore, InMemoryAgentTaskStore, LeaseId, TaskKind,
+    TaskSchemaError, TaskStatus, WorkerId,
+};
 
 // ── Re-exports that validate the dependency edges ────────────────────
 //
