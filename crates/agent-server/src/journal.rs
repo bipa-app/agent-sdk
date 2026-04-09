@@ -44,6 +44,8 @@
 //! | Retry budget + recovery workers | 2.5 |
 //! | Tool-runtime child orchestration | 2.6 |
 
+pub mod store;
 pub mod task;
 
+pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskSchemaError, TaskStatus, WorkerId};

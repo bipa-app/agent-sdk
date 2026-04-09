@@ -120,7 +120,8 @@
 pub mod journal;
 
 pub use journal::{
-    AgentTask, AgentTaskId, LeaseId, TaskKind, TaskSchemaError, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, AgentTaskStore, InMemoryAgentTaskStore, LeaseId, TaskKind,
+    TaskSchemaError, TaskStatus, WorkerId,
 };
 
 // ── Re-exports that validate the dependency edges ────────────────────
