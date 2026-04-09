@@ -33,6 +33,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     compaction_config: Option<CompactionConfig>,
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    audit_sink: Option<Arc<dyn crate::hooks::ToolAuditSink>>,
     #[cfg(feature = "otel")]
     observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -53,6 +54,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             compaction_config: None,
             compactor: None,
             execution_store: None,
+            audit_sink: None,
             #[cfg(feature = "otel")]
             observability_store: None,
         }
@@ -81,6 +83,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self.audit_sink,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -108,6 +111,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self.audit_sink,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -131,6 +135,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self.audit_sink,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -154,6 +159,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self.audit_sink,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -201,6 +207,34 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn execution_store(mut self, store: impl ToolExecutionStore + 'static) -> Self {
         self.execution_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Set the execution store from a shared `Arc`.
+    ///
+    /// Use this when the caller needs to retain a handle to the store
+    /// (for inspection, pre-population, or sharing across loops). See
+    /// [`Self::execution_store`] for the standard owned form.
+    #[must_use]
+    pub fn execution_store_shared(mut self, store: Arc<dyn ToolExecutionStore>) -> Self {
+        self.execution_store = Some(store);
+        self
+    }
+
+    /// Set the authoritative tool audit sink.
+    ///
+    /// When set, the agent loop emits a
+    /// [`ToolAuditRecord`](crate::ToolAuditRecord) at every tool
+    /// lifecycle transition — blocked, requires-confirmation, cached,
+    /// replayed, invalidated, completed, and persistence-failed. This
+    /// gives servers a complete audit trail without relying on the weaker
+    /// `post_tool_use` hook.
+    ///
+    /// Defaults to [`NoopAuditSink`](crate::hooks::NoopAuditSink) when
+    /// not set.
+    #[must_use]
+    pub fn audit_sink(mut self, sink: impl crate::hooks::ToolAuditSink + 'static) -> Self {
+        self.audit_sink = Some(Arc::new(sink));
         self
     }
 
@@ -340,6 +374,9 @@ where
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self
+                .audit_sink
+                .unwrap_or_else(|| Arc::new(crate::hooks::NoopAuditSink)),
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -396,6 +433,9 @@ where
             compaction_config: self.compaction_config,
             compactor: self.compactor,
             execution_store: self.execution_store,
+            audit_sink: self
+                .audit_sink
+                .unwrap_or_else(|| Arc::new(crate::hooks::NoopAuditSink)),
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }

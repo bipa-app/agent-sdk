@@ -15,7 +15,7 @@ use super::types::{
 };
 use crate::authority::EventAuthority;
 use crate::events::AgentEvent;
-use crate::hooks::{AgentHooks, ToolDecision};
+use crate::hooks::{AgentHooks, ToolAuditSink, ToolDecision};
 use crate::llm::{Content, ContentBlock, Message, Role};
 use crate::stores::{EventStore, MessageStore};
 use crate::tools::{
@@ -25,6 +25,7 @@ use crate::types::{
     AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolInvocation, ToolOutcome,
     ToolResult, ToolTier,
 };
+use agent_sdk_core::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
 
 /// Build a [`ToolInvocation`] from a pending tool call and its tier.
 fn build_invocation(pending: &PendingToolCallInfo, tier: ToolTier) -> ToolInvocation {
@@ -37,6 +38,50 @@ fn build_invocation(pending: &PendingToolCallInfo, tier: ToolTier) -> ToolInvoca
         effective_input: pending.effective_input.clone(),
         listen_context: pending.listen_context.clone(),
     }
+}
+
+/// Emit a single authoritative audit record for a tool lifecycle transition.
+///
+/// This is the replacement for the old "`post_tool_use`-only" audit path.
+/// Every lifecycle variant flows through this helper so provenance, tier,
+/// and identity are built the same way everywhere.
+async fn emit_audit(
+    sink: &Arc<dyn ToolAuditSink>,
+    provenance: &AuditProvenance,
+    pending: &PendingToolCallInfo,
+    tier: ToolTier,
+    turn: usize,
+    outcome: ToolAuditOutcome,
+) {
+    let record = ToolAuditRecord::new(
+        pending.id.clone(),
+        pending.name.clone(),
+        pending.display_name.clone(),
+        tier,
+        pending.input.clone(),
+        pending.effective_input.clone(),
+        turn,
+        provenance.clone(),
+        outcome,
+    );
+    sink.record(record).await;
+}
+
+/// Resolve a tool's tier by consulting the registry, falling back to
+/// [`ToolTier::Confirm`] when the tool is unknown (the strictest default).
+fn tier_for_pending<Ctx>(
+    tools: &crate::tools::ToolRegistry<Ctx>,
+    pending: &PendingToolCallInfo,
+) -> ToolTier
+where
+    Ctx: Send + Sync + 'static,
+{
+    tools
+        .get(&pending.name)
+        .map(|t| t.tier())
+        .or_else(|| tools.get_async(&pending.name).map(|t| t.tier()))
+        .or_else(|| tools.get_listen(&pending.name).map(|t| t.tier()))
+        .unwrap_or(ToolTier::Confirm)
 }
 
 /// Execute a single tool call with hook checks.
@@ -169,6 +214,18 @@ where
     H: AgentHooks,
 {
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &pending.id).await {
+        // Cached result from a prior in-flight attempt — audit before returning.
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier_for_pending(ctx.tools, pending),
+            ctx.turn,
+            ToolAuditOutcome::Cached {
+                result: cached_result.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Completed {
             tool_id: pending.id.clone(),
             result: cached_result,
@@ -184,9 +241,21 @@ where
     }
 
     let Some(tool) = ctx.tools.get(&pending.name) else {
+        let result = ToolResult::error(format!("Unknown tool: {}", pending.name));
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            ToolTier::Confirm,
+            ctx.turn,
+            ToolAuditOutcome::Completed {
+                result: result.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Completed {
             tool_id: pending.id.clone(),
-            result: ToolResult::error(format!("Unknown tool: {}", pending.name)),
+            result,
         };
     };
 
@@ -219,6 +288,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: None,
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
 
@@ -273,6 +354,24 @@ where
 {
     result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
     ctx.hooks.post_tool_use(&pending.name, &result).await;
+    // A listen tool that failed to become ready is an *invalidated*
+    // lifecycle outcome: no user confirmation ever happened because the
+    // operation snapshot expired or the stream ended before ready.
+    let tier = ctx
+        .tools
+        .get_listen(&pending.name)
+        .map_or(ToolTier::Confirm, |t| t.tier());
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Invalidated {
+            reason: result.output.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -288,6 +387,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -307,6 +418,7 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    let tier = listen_tool.tier();
     let result =
         match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
             Ok(
@@ -326,9 +438,34 @@ where
         .await
         {
             Ok(result) => result,
-            Err(error) => return ToolExecutionOutcome::Error(error),
+            Err(error) => {
+                emit_audit(
+                    ctx.audit_sink,
+                    ctx.provenance,
+                    pending,
+                    tier,
+                    ctx.turn,
+                    ToolAuditOutcome::PersistenceFailed {
+                        result: None,
+                        error: error.message.clone(),
+                    },
+                )
+                .await;
+                return ToolExecutionOutcome::Error(error);
+            }
         };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Completed {
+            result: result.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -344,6 +481,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -363,6 +512,7 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    let tier = listen_tool.tier();
     cancel_listen_with_warning(
         listen_tool,
         ctx.tool_context,
@@ -373,6 +523,17 @@ where
     )
     .await;
     let result = ToolResult::error(format!("Blocked: {reason}"));
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Blocked {
+            reason: reason.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -388,6 +549,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -406,7 +579,29 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    let tier = ctx
+        .tools
+        .get_listen(&pending.name)
+        .map_or(ToolTier::Confirm, |t| t.tier());
     let input = build_listen_confirmation_input(&pending.input, &ready);
+    let listen_context = ListenExecutionContext {
+        operation_id: ready.operation_id.clone(),
+        revision: ready.revision,
+        snapshot: ready.snapshot.clone(),
+        expires_at: ready.expires_at,
+    };
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::RequiresConfirmation {
+            description: description.clone(),
+            listen_context: Some(listen_context.clone()),
+        },
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -422,6 +617,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: None,
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::RequiresConfirmation {
@@ -430,12 +637,7 @@ where
         display_name: pending.display_name.clone(),
         input,
         description,
-        listen_context: Some(ListenExecutionContext {
-            operation_id: ready.operation_id,
-            revision: ready.revision,
-            snapshot: ready.snapshot,
-            expires_at: ready.expires_at,
-        }),
+        listen_context: Some(listen_context),
     }
 }
 
@@ -493,6 +695,7 @@ where
 async fn block_tool_call<Ctx, H>(
     pending: &PendingToolCallInfo,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    tier: ToolTier,
     reason: String,
 ) -> ToolExecutionOutcome
 where
@@ -500,7 +703,30 @@ where
     H: AgentHooks,
 {
     let result = ToolResult::error(format!("Blocked: {reason}"));
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Blocked {
+            reason: reason.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -512,12 +738,25 @@ where
 async fn require_tool_confirmation<Ctx, H>(
     pending: &PendingToolCallInfo,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    tier: ToolTier,
     description: String,
 ) -> ToolExecutionOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::RequiresConfirmation {
+            description: description.clone(),
+            listen_context: None,
+        },
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -533,6 +772,18 @@ where
     )
     .await
     {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: None,
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::RequiresConfirmation {
@@ -554,6 +805,7 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    let tier = async_tool.tier();
     let result =
         match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
             execute_async_tool(
@@ -570,10 +822,47 @@ where
         .await
         {
             Ok(result) => result,
-            Err(error) => return ToolExecutionOutcome::Error(error),
+            Err(error) => {
+                emit_audit(
+                    ctx.audit_sink,
+                    ctx.provenance,
+                    pending,
+                    tier,
+                    ctx.turn,
+                    ToolAuditOutcome::PersistenceFailed {
+                        result: None,
+                        error: error.message.clone(),
+                    },
+                )
+                .await;
+                return ToolExecutionOutcome::Error(error);
+            }
         };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Completed {
+            result: result.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -591,6 +880,7 @@ where
     Ctx: Send + Sync + Clone + 'static,
     H: AgentHooks,
 {
+    let tier = tool.tier();
     let tool_start = Instant::now();
     let result =
         match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
@@ -608,10 +898,47 @@ where
         .await
         {
             Ok(result) => result,
-            Err(error) => return ToolExecutionOutcome::Error(error),
+            Err(error) => {
+                emit_audit(
+                    ctx.audit_sink,
+                    ctx.provenance,
+                    pending,
+                    tier,
+                    ctx.turn,
+                    ToolAuditOutcome::PersistenceFailed {
+                        result: None,
+                        error: error.message.clone(),
+                    },
+                )
+                .await;
+                return ToolExecutionOutcome::Error(error);
+            }
         };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        pending,
+        tier,
+        ctx.turn,
+        ToolAuditOutcome::Completed {
+            result: result.clone(),
+        },
+    )
+    .await;
     if let Err(error) = send_tool_call_end_event(pending, &result, ctx).await {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
     ToolExecutionOutcome::Completed {
@@ -631,6 +958,18 @@ where
 {
     let tier = async_tool.tier();
     if let Err(error) = send_tool_call_start_event(pending, tier, ctx).await {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: None,
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
 
@@ -640,9 +979,9 @@ where
         .await
     {
         ToolDecision::Allow => complete_async_tool_call(pending, async_tool, ctx).await,
-        ToolDecision::Block(reason) => block_tool_call(pending, ctx, reason).await,
+        ToolDecision::Block(reason) => block_tool_call(pending, ctx, tier, reason).await,
         ToolDecision::RequiresConfirmation(description) => {
-            require_tool_confirmation(pending, ctx, description).await
+            require_tool_confirmation(pending, ctx, tier, description).await
         }
     }
 }
@@ -658,6 +997,18 @@ where
 {
     let tier = tool.tier();
     if let Err(error) = send_tool_call_start_event(pending, tier, ctx).await {
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            pending,
+            tier,
+            ctx.turn,
+            ToolAuditOutcome::PersistenceFailed {
+                result: None,
+                error: error.message.clone(),
+            },
+        )
+        .await;
         return ToolExecutionOutcome::Error(error);
     }
 
@@ -667,9 +1018,9 @@ where
         .await
     {
         ToolDecision::Allow => complete_sync_tool_call(pending, tool, ctx).await,
-        ToolDecision::Block(reason) => block_tool_call(pending, ctx, reason).await,
+        ToolDecision::Block(reason) => block_tool_call(pending, ctx, tier, reason).await,
         ToolDecision::RequiresConfirmation(description) => {
-            require_tool_confirmation(pending, ctx, description).await
+            require_tool_confirmation(pending, ctx, tier, description).await
         }
     }
 }
@@ -812,12 +1163,41 @@ where
             "pre_tool_use returned Block for confirmed tool '{}': {reason} -- rejecting at resume time",
             awaiting_tool.name
         );
+        let audit_record = ToolAuditRecord::new(
+            awaiting_tool.id.clone(),
+            awaiting_tool.name.clone(),
+            awaiting_tool.display_name.clone(),
+            tier,
+            awaiting_tool.input.clone(),
+            awaiting_tool.effective_input.clone(),
+            ctx.turn,
+            ctx.provenance.clone(),
+            ToolAuditOutcome::Blocked {
+                reason: reason.clone(),
+            },
+        );
+        ctx.audit_sink.record(audit_record).await;
         let result = ToolResult::error(format!("Blocked at resume: {reason}"));
         return finish_confirmed_tool(awaiting_tool, ctx, result).await;
     }
 
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await
     {
+        // Cached idempotent replay on the confirmed-resume path.
+        let audit_record = ToolAuditRecord::new(
+            awaiting_tool.id.clone(),
+            awaiting_tool.name.clone(),
+            awaiting_tool.display_name.clone(),
+            tier,
+            awaiting_tool.input.clone(),
+            awaiting_tool.effective_input.clone(),
+            ctx.turn,
+            ctx.provenance.clone(),
+            ToolAuditOutcome::Cached {
+                result: cached_result.clone(),
+            },
+        );
+        ctx.audit_sink.record(audit_record).await;
         return finish_confirmed_tool(awaiting_tool, ctx, cached_result).await;
     }
 
@@ -848,8 +1228,33 @@ where
         .await;
     }
 
+    // User rejection during confirmation is recorded as a Blocked
+    // lifecycle event — the tool never ran, and the rejection reason is
+    // the audit-facing explanation.
+    let tier = ctx
+        .tools
+        .get(&awaiting_tool.name)
+        .map(|t| t.tier())
+        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
+        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
+        .unwrap_or(ToolTier::Confirm);
+    let audit_record = ToolAuditRecord::new(
+        awaiting_tool.id.clone(),
+        awaiting_tool.name.clone(),
+        awaiting_tool.display_name.clone(),
+        tier,
+        awaiting_tool.input.clone(),
+        awaiting_tool.effective_input.clone(),
+        ctx.turn,
+        ctx.provenance.clone(),
+        ToolAuditOutcome::Blocked {
+            reason: reason.clone(),
+        },
+    );
+    ctx.audit_sink.record(audit_record).await;
+
     let result = ToolResult::error(format!("Rejected: {reason}"));
-    send_event(
+    if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
         ctx.turn,
@@ -862,7 +1267,25 @@ where
             result.clone(),
         ),
     )
-    .await?;
+    .await
+    {
+        let audit_record = ToolAuditRecord::new(
+            awaiting_tool.id.clone(),
+            awaiting_tool.name.clone(),
+            awaiting_tool.display_name.clone(),
+            tier,
+            awaiting_tool.input.clone(),
+            awaiting_tool.effective_input.clone(),
+            ctx.turn,
+            ctx.provenance.clone(),
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result.clone()),
+                error: error.message.clone(),
+            },
+        );
+        ctx.audit_sink.record(audit_record).await;
+        return Err(error);
+    }
     Ok(result)
 }
 
@@ -969,7 +1392,34 @@ where
     H: AgentHooks,
 {
     ctx.hooks.post_tool_use(&awaiting_tool.name, &result).await;
-    send_event(
+    let tier = ctx
+        .tools
+        .get(&awaiting_tool.name)
+        .map(|t| t.tier())
+        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
+        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
+        .unwrap_or(ToolTier::Confirm);
+    // Terminal Completed record for the confirmed-tool path. This
+    // covers tools that actually ran after user confirmation and tools
+    // that were turned into synthetic error results by upstream logic
+    // (e.g. "Blocked at resume: ..."). Callers that emitted a prior
+    // Blocked record are still visible because `ToolAuditRecord` is a
+    // stream, not a single row.
+    let audit_record = ToolAuditRecord::new(
+        awaiting_tool.id.clone(),
+        awaiting_tool.name.clone(),
+        awaiting_tool.display_name.clone(),
+        tier,
+        awaiting_tool.input.clone(),
+        awaiting_tool.effective_input.clone(),
+        ctx.turn,
+        ctx.provenance.clone(),
+        ToolAuditOutcome::Completed {
+            result: result.clone(),
+        },
+    );
+    ctx.audit_sink.record(audit_record).await;
+    if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
         ctx.turn,
@@ -982,7 +1432,25 @@ where
             result.clone(),
         ),
     )
-    .await?;
+    .await
+    {
+        let audit_record = ToolAuditRecord::new(
+            awaiting_tool.id.clone(),
+            awaiting_tool.name.clone(),
+            awaiting_tool.display_name.clone(),
+            tier,
+            awaiting_tool.input.clone(),
+            awaiting_tool.effective_input.clone(),
+            ctx.turn,
+            ctx.provenance.clone(),
+            ToolAuditOutcome::PersistenceFailed {
+                result: Some(result),
+                error: error.message.clone(),
+            },
+        );
+        ctx.audit_sink.record(audit_record).await;
+        return Err(error);
+    }
     Ok(result)
 }
 

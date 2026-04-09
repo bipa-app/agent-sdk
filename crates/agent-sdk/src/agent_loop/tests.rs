@@ -8,8 +8,8 @@ use crate::stores::{
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{
-    AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolTier,
-    TurnOptions, TurnOutcome,
+    AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolResult,
+    ToolTier, TurnOptions, TurnOutcome,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -1450,6 +1450,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         compaction_config: None,
         compactor: None,
         execution_store: None,
+        audit_sink: Arc::new(crate::hooks::NoopAuditSink),
         #[cfg(feature = "otel")]
         observability_store: None,
     };
@@ -2848,5 +2849,677 @@ async fn test_effective_input_defaults_to_requested() -> anyhow::Result<()> {
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].input, tool_calls[0].effective_input);
     assert_eq!(tool_calls[0].input, json!({"message": "test"}));
+    Ok(())
+}
+
+// ==========================================================================
+// Phase 1.6 Tests: ToolAuditSink and Full Lifecycle Audit Records
+//
+// Each test drives the agent loop through a specific lifecycle transition
+// and asserts that the recording audit sink captured exactly the expected
+// outcome variant(s). Tests favor explicit assertions on `outcome_kind()`
+// so a regression anywhere in the lifecycle wiring surfaces as a clean
+// failure.
+// ==========================================================================
+
+use agent_sdk_core::audit::{ToolAuditOutcome, ToolAuditRecord};
+use std::sync::Mutex;
+
+/// Test-only audit sink that captures every record in memory.
+#[derive(Default)]
+struct RecordingAuditSink {
+    records: Mutex<Vec<ToolAuditRecord>>,
+}
+
+#[async_trait]
+impl crate::hooks::ToolAuditSink for RecordingAuditSink {
+    async fn record(&self, record: ToolAuditRecord) {
+        self.records.lock().unwrap().push(record);
+    }
+}
+
+impl RecordingAuditSink {
+    fn kinds(&self) -> Vec<&'static str> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(ToolAuditRecord::outcome_kind)
+            .collect()
+    }
+
+    fn records(&self) -> Vec<ToolAuditRecord> {
+        self.records.lock().unwrap().clone()
+    }
+}
+
+/// Hook that returns a fixed decision for every invocation.
+struct FixedDecisionHooks {
+    decision: Mutex<ToolDecision>,
+}
+
+impl FixedDecisionHooks {
+    fn new(decision: ToolDecision) -> Self {
+        Self {
+            decision: Mutex::new(decision),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentHooks for FixedDecisionHooks {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+        self.decision.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn test_audit_emits_completed_on_local_sync_tool_success() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let _ = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert_eq!(
+        kinds,
+        vec!["completed"],
+        "Local sync tool success should emit exactly one Completed record"
+    );
+    let records = sink.records();
+    let record = &records[0];
+    assert_eq!(record.tool_call_id, "tool_1");
+    assert_eq!(record.tool_name, "echo");
+    assert_eq!(record.provenance.provider, "mock");
+    assert_eq!(record.provenance.model, "mock-model");
+    match &record.outcome {
+        ToolAuditOutcome::Completed { result } => assert!(result.success),
+        other => panic!("Expected Completed outcome, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_blocked_when_policy_blocks_tool() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+    let hooks = FixedDecisionHooks::new(ToolDecision::Block("policy denied".into()));
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(hooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build_with_stores();
+
+    let _ = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"blocked"),
+        "Expected a Blocked record, got {kinds:?}"
+    );
+    let records = sink.records();
+    let blocked = records
+        .iter()
+        .find(|r| matches!(r.outcome, ToolAuditOutcome::Blocked { .. }))
+        .expect("missing blocked record");
+    match &blocked.outcome {
+        ToolAuditOutcome::Blocked { reason } => assert_eq!(reason, "policy denied"),
+        other => panic!("Expected Blocked, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_requires_confirmation_when_policy_yields() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "hi"}),
+    )]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+    let hooks = FixedDecisionHooks::new(ToolDecision::RequiresConfirmation("please?".into()));
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(hooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build_with_stores();
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome, TurnOutcome::AwaitingConfirmation { .. }),
+        "Expected AwaitingConfirmation, got {outcome:?}"
+    );
+    let kinds = sink.kinds();
+    assert_eq!(
+        kinds,
+        vec!["requires_confirmation"],
+        "Expected exactly one RequiresConfirmation record"
+    );
+    let records = sink.records();
+    match &records[0].outcome {
+        ToolAuditOutcome::RequiresConfirmation { description, .. } => {
+            assert_eq!(description, "please?");
+        }
+        other => panic!("Expected RequiresConfirmation, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_cached_on_idempotent_replay() -> anyhow::Result<()> {
+    // Pre-seed the execution store with a completed record for tool_1 so
+    // that the next turn's execution short-circuits via the cached path.
+    use crate::stores::InMemoryExecutionStore;
+    use crate::types::ToolExecution;
+
+    let execution_store = Arc::new(InMemoryExecutionStore::new());
+    let thread_id = ThreadId::new();
+    let mut execution = ToolExecution::new_in_flight(
+        "tool_1",
+        thread_id.clone(),
+        "echo",
+        "Echo",
+        json!({"message": "hi"}),
+        time::OffsetDateTime::now_utc(),
+    );
+    execution.complete(ToolResult::success("cached output"));
+    execution_store.record_execution(execution).await?;
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .execution_store_shared(
+            Arc::clone(&execution_store) as Arc<dyn crate::stores::ToolExecutionStore>
+        )
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let _ = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"cached"),
+        "Expected a Cached record, got {kinds:?}"
+    );
+    let records = sink.records();
+    let cached = records
+        .iter()
+        .find(|r| matches!(r.outcome, ToolAuditOutcome::Cached { .. }))
+        .expect("missing cached record");
+    match &cached.outcome {
+        ToolAuditOutcome::Cached { result } => assert_eq!(result.output, "cached output"),
+        other => panic!("Expected Cached, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_invalidated_on_listen_tool_invalidation() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "listen_echo", json!({"message": "q"})),
+        MockProvider::text_response("After invalidation"),
+    ]);
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register_listen(ScenarioListenTool {
+        updates: vec![ListenToolUpdate::Invalidated {
+            operation_id: "listen-op-1".to_string(),
+            message: "quote expired".to_string(),
+            recoverable: true,
+        }],
+        execute_error: None,
+        cancel_calls: cancel_calls.clone(),
+    });
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let _ = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("run listen".into()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"invalidated"),
+        "Expected Invalidated record, got {kinds:?}"
+    );
+    let records = sink.records();
+    let invalidated = records
+        .iter()
+        .find(|r| matches!(r.outcome, ToolAuditOutcome::Invalidated { .. }))
+        .expect("missing invalidated record");
+    match &invalidated.outcome {
+        ToolAuditOutcome::Invalidated { reason } => assert!(reason.contains("invalidated")),
+        other => panic!("Expected Invalidated, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_completed_on_external_tool_submission() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Got the echo result"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    let _ = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("external"),
+            }],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"completed"),
+        "External submission should emit Completed, got {kinds:?}"
+    );
+    let records = sink.records();
+    let completed = records
+        .iter()
+        .find(|r| {
+            matches!(
+                &r.outcome,
+                ToolAuditOutcome::Completed { result } if result.output == "external"
+            )
+        })
+        .expect("missing completed record for external tool");
+    assert_eq!(completed.tool_call_id, "tool_1");
+    assert_eq!(completed.tool_name, "echo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_replayed_on_duplicate_external_submission() -> anyhow::Result<()> {
+    use crate::stores::InMemoryExecutionStore;
+    use crate::types::{ExternalToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done A"),
+        MockProvider::text_response("Done B"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+    let execution_store = Arc::new(InMemoryExecutionStore::new());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .execution_store_shared(
+            Arc::clone(&execution_store) as Arc<dyn crate::stores::ToolExecutionStore>
+        )
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    // Turn 1: LLM requests tool → pending
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Turn 2: submit result (first time → Completed)
+    let _ = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::SubmitToolResults {
+            continuation: continuation.clone(),
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("external"),
+            }],
+        },
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    // Turn 3: re-submit the same continuation + result → should be detected
+    // as a replay via the execution store.
+    let _ = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("external"),
+            }],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"replayed"),
+        "Duplicate external submission should emit Replayed, got {kinds:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_blocked_at_resume_when_policy_rejects() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    struct BlockOnResumeHooks {
+        first_call_done: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentHooks for BlockOnResumeHooks {
+        async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+            if self.first_call_done.swap(true, Ordering::SeqCst) {
+                ToolDecision::Block("policy changed".into())
+            } else {
+                ToolDecision::RequiresConfirmation("confirm?".into())
+            }
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let hooks = BlockOnResumeHooks {
+        first_call_done: AtomicBool::new(false),
+    };
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(hooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .audit_sink(Arc::clone(&sink))
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (outcome1, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+    let (continuation, tool_call_id) = match outcome1 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    let _ = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        TurnOptions::default(),
+    )
+    .await?;
+
+    let records = sink.records();
+    // We expect at least two lifecycle transitions for tool_1:
+    //   1. RequiresConfirmation (first turn)
+    //   2. Blocked (second turn, at resume time)
+    let kinds_for_tool_1: Vec<_> = records
+        .iter()
+        .filter(|r| r.tool_call_id == "tool_1")
+        .map(ToolAuditRecord::outcome_kind)
+        .collect();
+    assert!(
+        kinds_for_tool_1.contains(&"requires_confirmation"),
+        "Expected RequiresConfirmation record, got {kinds_for_tool_1:?}"
+    );
+    assert!(
+        kinds_for_tool_1.contains(&"blocked"),
+        "Expected Blocked record at resume, got {kinds_for_tool_1:?}"
+    );
+    let blocked = records
+        .iter()
+        .find(|r| matches!(r.outcome, ToolAuditOutcome::Blocked { .. }))
+        .expect("missing blocked record");
+    match &blocked.outcome {
+        ToolAuditOutcome::Blocked { reason } => assert_eq!(reason, "policy changed"),
+        other => panic!("Expected Blocked, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_audit_emits_persistence_failed_when_tool_event_append_fails() -> anyhow::Result<()> {
+    // A custom event store that lets the first N appends through and
+    // then fails. With N=1 the turn-start event succeeds but the
+    // first tool-related append (`tool_call_start`) fails, exercising
+    // the audit `PersistenceFailed` path inside the local tool runtime.
+    use std::sync::atomic::AtomicUsize;
+
+    struct FailAfterAppendStore {
+        inner: Arc<InMemoryEventStore>,
+        appends_seen: AtomicUsize,
+        appends_allowed: usize,
+    }
+
+    #[async_trait]
+    impl EventStore for FailAfterAppendStore {
+        async fn append(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+            envelope: AgentEventEnvelope,
+        ) -> anyhow::Result<()> {
+            let prior = self.appends_seen.fetch_add(1, Ordering::SeqCst);
+            if prior >= self.appends_allowed {
+                anyhow::bail!("synthetic append failure on call #{}", prior + 1);
+            }
+            self.inner.append(thread_id, turn, envelope).await
+        }
+        async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
+            self.inner.finish_turn(thread_id, turn).await
+        }
+        async fn get_turn(
+            &self,
+            thread_id: &ThreadId,
+            turn: usize,
+        ) -> anyhow::Result<Option<StoredTurnEvents>> {
+            self.inner.get_turn(thread_id, turn).await
+        }
+        async fn get_turns(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<StoredTurnEvents>> {
+            self.inner.get_turns(thread_id).await
+        }
+        async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+            self.inner.clear(thread_id).await
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    // Allow exactly 1 append (turn start), then fail. The next append is
+    // `tool_call_start`, which surfaces as an audit `PersistenceFailed`.
+    let event_store: Arc<dyn EventStore> = Arc::new(FailAfterAppendStore {
+        inner: Arc::new(InMemoryEventStore::new()),
+        appends_seen: AtomicUsize::new(0),
+        appends_allowed: 1,
+    });
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(event_store)
+        .audit_sink(Arc::clone(&sink))
+        .build();
+
+    let _ = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+    )
+    .await;
+
+    let kinds = sink.kinds();
+    assert!(
+        kinds.contains(&"persistence_failed"),
+        "Failing tool-event append should emit PersistenceFailed, got {kinds:?}"
+    );
+    let records = sink.records();
+    let pf = records
+        .iter()
+        .find(|r| matches!(r.outcome, ToolAuditOutcome::PersistenceFailed { .. }))
+        .expect("missing persistence_failed record");
+    match &pf.outcome {
+        ToolAuditOutcome::PersistenceFailed { error, .. } => {
+            assert!(error.contains("synthetic append failure"), "{error}");
+        }
+        other => panic!("Expected PersistenceFailed, got {other:?}"),
+    }
     Ok(())
 }

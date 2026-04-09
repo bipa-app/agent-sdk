@@ -142,6 +142,7 @@ where
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
     pub(super) execution_store: Option<Arc<dyn ToolExecutionStore>>,
+    pub(super) audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -183,6 +184,7 @@ where
             compaction_config: None,
             compactor: None,
             execution_store: None,
+            audit_sink: Arc::new(crate::hooks::NoopAuditSink),
             #[cfg(feature = "otel")]
             observability_store: None,
         }
@@ -215,9 +217,25 @@ where
             compaction_config: Some(compaction_config),
             compactor: None,
             execution_store: None,
+            audit_sink: Arc::new(crate::hooks::NoopAuditSink),
             #[cfg(feature = "otel")]
             observability_store: None,
         }
+    }
+
+    /// Set the authoritative tool audit sink.
+    ///
+    /// When set, the loop emits a [`ToolAuditRecord`](crate::ToolAuditRecord)
+    /// at every tool-lifecycle transition (blocked, requires-confirmation,
+    /// cached, replayed, invalidated, completed, persistence-failed).
+    ///
+    /// The default is [`NoopAuditSink`](crate::hooks::NoopAuditSink) which
+    /// discards every record — suitable for local/CLI usage. Servers should
+    /// swap in a durable sink.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: impl crate::hooks::ToolAuditSink + 'static) -> Self {
+        self.audit_sink = Arc::new(sink);
+        self
     }
 
     /// Set the observability store for `GenAI` payload capture.
@@ -344,6 +362,7 @@ where
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
+        let audit_sink = Arc::clone(&self.audit_sink);
         #[cfg(feature = "otel")]
         let observability_store = self.observability_store.clone();
         #[cfg(feature = "otel")]
@@ -365,6 +384,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                audit_sink,
                 cancel_token,
                 input_rx: None,
                 #[cfg(feature = "otel")]
@@ -421,6 +441,7 @@ where
         let compaction_config = self.compaction_config.clone();
         let compactor = self.compactor.clone();
         let execution_store = self.execution_store.clone();
+        let audit_sink = Arc::clone(&self.audit_sink);
         #[cfg(feature = "otel")]
         let observability_store = self.observability_store.clone();
         let cancel_handle = cancel_token.clone();
@@ -443,6 +464,7 @@ where
                 compaction_config,
                 compactor,
                 execution_store,
+                audit_sink,
                 cancel_token,
                 input_rx: Some(input_rx),
                 #[cfg(feature = "otel")]
@@ -560,6 +582,7 @@ where
             compaction_config: self.compaction_config.clone(),
             compactor: self.compactor.clone(),
             execution_store: self.execution_store.clone(),
+            audit_sink: Arc::clone(&self.audit_sink),
             cancel_token,
             turn_options: options,
             #[cfg(feature = "otel")]
