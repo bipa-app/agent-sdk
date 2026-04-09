@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'crates/*/Cargo.toml'
       - 'Cargo.toml'
 
 env:
@@ -24,8 +25,8 @@ jobs:
       - name: Check if version changed
         id: version
         run: |
-          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          git show HEAD~1:Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
+          CURRENT_VERSION=$(grep '^version' crates/agent-sdk/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          git show HEAD~1:crates/agent-sdk/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
           OLD_VERSION=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
@@ -60,11 +61,11 @@ jobs:
 
       - name: Run tests
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
-        run: cargo test
+        run: cargo test --workspace --all-features
 
       - name: Run clippy
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Get previous tag
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
@@ -109,8 +110,16 @@ jobs:
             --notes-file /tmp/changelog.md \
             --target ${{ github.sha }}
 
-      - name: Publish to crates.io
+      # Publish crates in dependency order.
+      # agent-server is `publish = false` and is skipped automatically.
+      - name: Publish crates
         if: steps.version.outputs.changed == 'true' && steps.tag.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        run: |
+          for crate in agent-sdk-core agent-sdk-tools agent-sdk-providers agent-sdk; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --no-verify
+            # crates.io needs time to index before dependents can resolve
+            sleep 30
+          done

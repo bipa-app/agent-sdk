@@ -1,0 +1,32 @@
+[package]
+name = "agent-sdk-providers"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLM provider trait, streaming primitives, and first-party provider implementations for the Agent SDK"
+
+[dependencies]
+agent-sdk-core = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+tokio-tungstenite = { workspace = true }
+html2text = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

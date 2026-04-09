@@ -1,0 +1,130 @@
+//! Agent lifecycle hooks for customization.
+//!
+//! Hooks allow you to intercept and customize agent behavior at key points:
+//!
+//! - [`AgentHooks::pre_tool_use`] - Control tool execution permissions
+//! - [`AgentHooks::post_tool_use`] - React to tool completion
+//! - [`AgentHooks::on_event`] - Log or process events
+//! - [`AgentHooks::on_error`] - Handle errors and decide recovery
+//!
+//! # Built-in Implementations
+//!
+//! - [`DefaultHooks`] - Tier-based permissions (default)
+//! - [`AllowAllHooks`] - Allow all tools without confirmation
+//! - [`LoggingHooks`] - Debug logging for all events
+
+use agent_sdk_core::events::AgentEvent;
+use agent_sdk_core::llm;
+use agent_sdk_core::types::{ToolInvocation, ToolResult, ToolTier};
+use async_trait::async_trait;
+
+/// Decision returned by pre-tool hooks
+#[derive(Debug, Clone)]
+pub enum ToolDecision {
+    /// Allow the tool to execute
+    Allow,
+    /// Block the tool execution with a message
+    Block(String),
+    /// Tool requires user confirmation.
+    RequiresConfirmation(String),
+}
+
+/// Lifecycle hooks for the agent loop.
+/// Implement this trait to customize agent behavior.
+#[async_trait]
+pub trait AgentHooks: Send + Sync {
+    /// Called before a tool is executed.
+    ///
+    /// Receives a structured [`ToolInvocation`] that bundles tool identity,
+    /// tier, requested input, effective input, and listen-context — everything
+    /// a server-side policy engine needs for an allow / block / confirm decision.
+    ///
+    /// Return [`ToolDecision::Allow`] to proceed, [`ToolDecision::Block`] to
+    /// reject, or [`ToolDecision::RequiresConfirmation`] to yield for user
+    /// approval.
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        match invocation.tier {
+            ToolTier::Observe => ToolDecision::Allow,
+            ToolTier::Confirm => {
+                ToolDecision::RequiresConfirmation(format!("Confirm {}?", invocation.tool_name))
+            }
+        }
+    }
+
+    /// Called after a tool completes execution.
+    async fn post_tool_use(&self, _tool_name: &str, _result: &ToolResult) {
+        // Default: no-op
+    }
+
+    /// Called when the agent emits an event.
+    /// Can be used for logging, metrics, or custom handling.
+    async fn on_event(&self, _event: &AgentEvent) {
+        // Default: no-op
+    }
+
+    /// Called when an error occurs.
+    /// Return true to attempt recovery, false to abort.
+    async fn on_error(&self, _error: &anyhow::Error) -> bool {
+        // Default: don't recover
+        false
+    }
+
+    /// Called when context is about to be compacted due to length.
+    /// Return a summary to use, or None to use default summarization.
+    async fn on_context_compact(&self, _messages: &[llm::Message]) -> Option<String> {
+        // Default: use built-in summarization
+        None
+    }
+}
+
+/// Default hooks implementation that uses tier-based decisions
+#[derive(Clone, Copy, Default)]
+pub struct DefaultHooks;
+
+#[async_trait]
+impl AgentHooks for DefaultHooks {}
+
+/// Hooks that allow all tools without confirmation
+#[derive(Clone, Copy, Default)]
+pub struct AllowAllHooks;
+
+#[async_trait]
+impl AgentHooks for AllowAllHooks {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+        ToolDecision::Allow
+    }
+}
+
+/// Hooks that log all events (useful for debugging)
+#[derive(Clone, Copy, Default)]
+pub struct LoggingHooks;
+
+#[async_trait]
+impl AgentHooks for LoggingHooks {
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        log::debug!(
+            "Pre-tool use tool={} input={:?} tier={:?}",
+            invocation.tool_name,
+            invocation.requested_input,
+            invocation.tier,
+        );
+        DefaultHooks.pre_tool_use(invocation).await
+    }
+
+    async fn post_tool_use(&self, tool_name: &str, result: &ToolResult) {
+        log::debug!(
+            "Post-tool use tool={tool_name} success={} duration_ms={:?}",
+            result.success,
+            result.duration_ms
+        );
+    }
+
+    async fn on_event(&self, event: &AgentEvent) {
+        log::debug!("Agent event {event:?}");
+    }
+
+    async fn on_error(&self, error: &anyhow::Error) -> bool {
+        log::error!("Agent error {error:?}");
+        false
+    }
+}

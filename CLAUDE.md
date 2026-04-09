@@ -96,38 +96,44 @@ pub async fn find_by_id(...)
 pub async fn find_active_thread(...)
 ```
 
-## Project Structure
+## Repository Layout
+
+This is a Cargo workspace. New crates go under `crates/`.
 
 ```
-src/
-├── lib.rs              # Public API exports
-├── agent_loop.rs       # Core agent orchestration
-├── events.rs           # AgentEvent enum
-├── types.rs            # Core types (ThreadId, Config, etc.)
-├── tools.rs            # Tool trait and registry
-├── hooks.rs            # Lifecycle hooks
-├── stores.rs           # Persistence traits
-├── environment.rs      # File/command abstraction
-├── capabilities.rs     # Security model
-├── filesystem.rs       # LocalFileSystem, InMemoryFileSystem
-├── llm.rs              # LLM module root
-├── llm/
-│   ├── types.rs        # Message, ChatRequest, etc.
-│   └── router.rs       # Model routing
-├── primitive_tools.rs  # Primitive tools module root
-├── primitive_tools/
-│   ├── read.rs
-│   ├── write.rs
-│   ├── edit.rs
-│   ├── bash.rs
-│   ├── glob.rs
-│   └── grep.rs
-├── providers.rs        # Providers module root
-└── providers/
-    ├── anthropic.rs
-    └── anthropic/
-        └── data.rs
+Cargo.toml              # Virtual workspace manifest (no [package])
+crates/
+├── agent-sdk/          # Main SDK crate (published)
+│   ├── Cargo.toml      # Inherits workspace deps, lints, metadata
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── agent_loop.rs
+│   │   ├── llm.rs
+│   │   ├── llm/
+│   │   │   ├── types.rs
+│   │   │   └── router.rs
+│   │   ├── providers.rs
+│   │   └── ...
+│   └── examples/
+└── (future crates added here during Phase 0 extraction)
 ```
+
+### Workspace Conventions
+
+* **Shared dependency versions** are declared in `[workspace.dependencies]` and
+  referenced from member crates via `{ workspace = true }`.
+* **Lint policy** lives in `[workspace.lints]` and members opt in with
+  `[lints] workspace = true`.
+* **Common package metadata** (`edition`, `license`, `repository`) is shared
+  through `[workspace.package]` and inherited with `field.workspace = true`.
+
+## sdk/v2 Rewrite Workflow
+
+All rewrite work targets the **`sdk/v2`** branch.
+
+* Base branch for every rewrite PR: **`sdk/v2`**
+* New crates go under `crates/`
+* The workspace root `Cargo.toml` is a virtual manifest — no `[package]` section
 
 ## Clippy Rules
 

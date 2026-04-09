@@ -1,15 +1,17 @@
-[package]
-name = "agent-sdk"
-version = "0.8.0"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 edition = "2024"
-description = "Rust Agent SDK for building LLM agents"
 license = "Apache-2.0"
 repository = "https://github.com/bipa-app/agent-sdk"
-readme = "README.md"
-keywords = ["agent", "llm", "ai", "anthropic", "tools"]
-categories = ["api-bindings", "asynchronous"]
 
-[dependencies]
+[workspace.dependencies]
+agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
+agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.8.0" }
+agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0" }
+agent-server = { path = "crates/agent-server", version = "0.8.0" }
 tokio = { version = "1.40", features = ["sync", "fs", "process", "time", "macros"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
@@ -32,43 +34,17 @@ tokio-util = "0.7"
 html2text = "0.14"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace"], optional = true }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 
-[features]
-default = []
-otel = ["opentelemetry"]
-
-[dev-dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
-env_logger = "0.11"
+# dev
 tempfile = "3"
+env_logger = "0.11"
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 
-[[example]]
-name = "basic_agent"
-path = "examples/basic_agent.rs"
-
-[[example]]
-name = "custom_tool"
-path = "examples/custom_tool.rs"
-
-[[example]]
-name = "custom_hooks"
-path = "examples/custom_hooks.rs"
-
-[[example]]
-name = "with_primitive_tools"
-path = "examples/with_primitive_tools.rs"
-
-[[example]]
-name = "otel"
-path = "examples/otel.rs"
-required-features = ["otel"]
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
 nursery = "warn"
