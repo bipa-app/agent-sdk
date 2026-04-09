@@ -57,7 +57,9 @@ pub use agent_sdk_providers;
 
 /// Convenience re-export of the server execution options and event-store types.
 pub use agent_sdk_core::{ToolRuntime, TurnOptions, TurnOutcome};
-pub use agent_sdk_tools::{EventStore, InMemoryEventStore, StoredTurnEvents};
+pub use agent_sdk_tools::{
+    EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority, StoredTurnEvents,
+};
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +68,8 @@ mod tests {
     };
     use agent_sdk_providers::LlmProvider;
     use agent_sdk_tools::{
-        AgentHooks, EventStore, InMemoryEventStore, MessageStore, StateStore, StoredTurnEvents,
+        AgentHooks, EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority,
+        MessageStore, StateStore, StoredTurnEvents,
     };
 
     /// Compile-time proof that the server crate can reach all three SDK
@@ -89,6 +92,9 @@ mod tests {
 
         // Event & outcome types
         fn _assert_event_types(_e: AgentEvent, _o: TurnOutcome) {}
+
+        // Event authority trait
+        fn _assert_event_authority(_a: &dyn EventAuthority) {}
     }
 
     /// Prove the server crate can name the new execution-option types
@@ -105,5 +111,52 @@ mod tests {
         let store = InMemoryEventStore::new();
         let _: &dyn EventStore = &store;
         let _: StoredTurnEvents = StoredTurnEvents::default();
+    }
+
+    /// Demonstrate that a server can seed an authority with an offset and
+    /// get continuous sequencing across multiple turns for the same thread.
+    #[tokio::test]
+    async fn seeded_authority_produces_continuous_sequences_across_turns() {
+        let store = InMemoryEventStore::new();
+        let thread = ThreadId::new();
+
+        // ── Turn 1: authority starts at 0 ───────────────────────────
+        let auth_t1 = LocalEventAuthority::new();
+        store
+            .append(&thread, 1, auth_t1.wrap(AgentEvent::text("m1", "hello")))
+            .await
+            .unwrap();
+        store
+            .append(&thread, 1, auth_t1.wrap(AgentEvent::text("m2", "world")))
+            .await
+            .unwrap();
+        store.finish_turn(&thread, 1).await.unwrap();
+
+        let turn_1 = store.get_turn(&thread, 1).await.unwrap().unwrap();
+        assert_eq!(turn_1.events.len(), 2);
+        assert_eq!(turn_1.events[0].sequence, 0);
+        assert_eq!(turn_1.events[1].sequence, 1);
+
+        // ── Turn 2: authority seeded at last_seq + 1 ────────────────
+        let last_seq = turn_1.events.last().unwrap().sequence;
+        let auth_t2 = LocalEventAuthority::with_offset(last_seq + 1);
+        store
+            .append(&thread, 2, auth_t2.wrap(AgentEvent::text("m3", "again")))
+            .await
+            .unwrap();
+        store
+            .append(&thread, 2, auth_t2.wrap(AgentEvent::text("m4", "!")))
+            .await
+            .unwrap();
+        store.finish_turn(&thread, 2).await.unwrap();
+
+        let turn_2 = store.get_turn(&thread, 2).await.unwrap().unwrap();
+        assert_eq!(turn_2.events[0].sequence, 2);
+        assert_eq!(turn_2.events[1].sequence, 3);
+
+        // ── Verify global ordering ──────────────────────────────────
+        let all = store.get_events(&thread).await.unwrap();
+        let seqs: Vec<u64> = all.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
     }
 }

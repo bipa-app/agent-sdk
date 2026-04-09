@@ -296,6 +296,16 @@ impl SequenceCounter {
         Self(Arc::new(AtomicU64::new(0)))
     }
 
+    /// Create a counter starting at the given offset.
+    ///
+    /// Used by server mode to resume sequencing across turns within
+    /// the same thread — the server seeds the counter with the last
+    /// known sequence value so numbering is continuous.
+    #[must_use]
+    pub fn with_offset(start: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(start)))
+    }
+
     /// Get the next sequence number, incrementing the counter.
     #[must_use]
     pub fn next(&self) -> u64 {
@@ -389,6 +399,21 @@ mod tests {
     fn sequence_counter_default_starts_at_zero() {
         let seq = SequenceCounter::default();
         assert_eq!(seq.next(), 0);
+    }
+
+    #[test]
+    fn sequence_counter_with_offset_starts_at_given_value() {
+        let seq = SequenceCounter::with_offset(42);
+        assert_eq!(seq.next(), 42);
+        assert_eq!(seq.next(), 43);
+        assert_eq!(seq.next(), 44);
+    }
+
+    #[test]
+    fn sequence_counter_with_offset_zero_same_as_new() {
+        let seq = SequenceCounter::with_offset(0);
+        assert_eq!(seq.next(), 0);
+        assert_eq!(seq.next(), 1);
     }
 
     #[tokio::test]

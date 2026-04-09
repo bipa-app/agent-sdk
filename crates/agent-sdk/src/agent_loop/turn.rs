@@ -8,8 +8,9 @@ use super::types::{
     TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
 
+use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor, LlmContextCompactor};
-use crate::events::{AgentEvent, SequenceCounter};
+use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
@@ -29,7 +30,7 @@ pub(super) async fn begin_turn<H>(
     max_turns: Option<usize>,
     event_store: &Arc<dyn EventStore>,
     hooks: &Arc<H>,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
 ) -> Result<(), AgentError>
 where
     H: AgentHooks,
@@ -64,7 +65,7 @@ where
             &ctx.thread_id,
             ctx.turn,
             hooks,
-            seq,
+            authority,
             AgentEvent::error(message.clone(), true),
         )
         .await?;
@@ -76,7 +77,7 @@ where
         &ctx.thread_id,
         ctx.turn,
         hooks,
-        seq,
+        authority,
         AgentEvent::start(ctx.thread_id.clone(), ctx.turn),
     )
     .await?;
@@ -93,7 +94,7 @@ pub(super) async fn load_turn_messages<P, H, M>(
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     }: TurnMessageLoadParams<'_, P, H, M>,
 ) -> Result<Vec<Message>, AgentError>
 where
@@ -109,7 +110,7 @@ where
                 thread_id,
                 turn,
                 hooks,
-                seq,
+                authority,
                 AgentEvent::error(format!("Failed to get history: {error}"), false),
             )
             .await?;
@@ -130,7 +131,7 @@ where
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     })
     .await
 }
@@ -145,7 +146,7 @@ struct MaybeCompactParams<'a, P, H, M> {
     compactor: Option<&'a Arc<dyn ContextCompactor>>,
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
-    seq: &'a SequenceCounter,
+    authority: &'a Arc<dyn EventAuthority>,
 }
 
 async fn maybe_compact_messages<P, H, M>(
@@ -159,7 +160,7 @@ async fn maybe_compact_messages<P, H, M>(
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     }: MaybeCompactParams<'_, P, H, M>,
 ) -> Result<Vec<Message>, AgentError>
 where
@@ -182,7 +183,7 @@ where
                 event_store,
                 turn,
                 hooks,
-                seq,
+                authority,
             })
             .await;
         }
@@ -207,7 +208,7 @@ where
                 event_store,
                 turn,
                 hooks,
-                seq,
+                authority,
             })
             .await;
         }
@@ -232,7 +233,7 @@ struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
     event_store: &'a Arc<dyn EventStore>,
     turn: usize,
     hooks: &'a Arc<H>,
-    seq: &'a SequenceCounter,
+    authority: &'a Arc<dyn EventAuthority>,
 }
 
 async fn compact_messages_for_threshold<C, H, M>(
@@ -244,7 +245,7 @@ async fn compact_messages_for_threshold<C, H, M>(
         event_store,
         turn,
         hooks,
-        seq,
+        authority,
     }: ThresholdCompactionParams<'_, C, H, M>,
 ) -> Result<Vec<Message>, AgentError>
 where
@@ -270,7 +271,7 @@ where
                 thread_id,
                 turn,
                 hooks,
-                seq,
+                authority,
                 AgentEvent::context_compacted(
                     result.original_count,
                     result.new_count,
@@ -534,7 +535,7 @@ pub(super) async fn request_llm_response<P, H>(
         config,
         event_store,
         hooks,
-        seq,
+        authority,
         thread_id,
         turn,
         message_id,
@@ -551,7 +552,7 @@ where
     let event_ctx = LlmEventContext {
         event_store,
         hooks,
-        seq,
+        authority,
         thread_id,
         turn,
     };
@@ -772,7 +773,7 @@ pub(super) async fn process_turn_response<Ctx, H, M>(
         message_store,
         event_store,
         hooks,
-        seq,
+        authority,
     }: TurnResponseProcessingParams<'_, Ctx, H, M>,
 ) -> Result<ProcessedTurnResponse, AgentError>
 where
@@ -789,7 +790,7 @@ where
             thread_id,
             turn,
             hooks,
-            seq,
+            authority,
             AgentEvent::thinking(thinking_id, thinking.clone()),
         )
         .await?;
@@ -801,7 +802,7 @@ where
             thread_id,
             turn,
             hooks,
-            seq,
+            authority,
             AgentEvent::text(message_id, text.clone()),
         )
         .await?;
@@ -814,7 +815,7 @@ where
             thread_id,
             turn,
             hooks,
-            seq,
+            authority,
             AgentEvent::error(
                 format!("Failed to append assistant message: {error}"),
                 false,
@@ -878,7 +879,7 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         execution_store,
         turn,
         total_usage,
@@ -899,7 +900,7 @@ where
         hooks,
         event_store,
         turn,
-        seq,
+        authority,
         execution_store,
     };
 
@@ -960,7 +961,7 @@ pub(super) async fn append_tool_results_and_emit_turn_complete<H, M>(
         message_store,
         event_store,
         hooks,
-        seq,
+        authority,
     }: TurnCompletionParams<'_, H, M>,
 ) -> Result<(), AgentError>
 where
@@ -973,7 +974,7 @@ where
         thread_id,
         turn,
         hooks,
-        seq,
+        authority,
         AgentEvent::TurnComplete {
             turn,
             usage: turn_usage.clone(),
@@ -991,7 +992,7 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         execution_store,
         turn,
         total_usage,
@@ -1012,7 +1013,7 @@ where
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         execution_store,
         turn,
         total_usage,
@@ -1029,7 +1030,7 @@ where
         message_store,
         event_store,
         hooks,
-        seq,
+        authority,
     })
     .await
     {
@@ -1108,7 +1109,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     }: TurnStopReasonParams<'_, P, H, M>,
 ) -> InternalTurnResult
 where
@@ -1135,7 +1136,7 @@ where
                 &ctx.thread_id,
                 ctx.turn,
                 hooks,
-                seq,
+                authority,
                 AgentEvent::refusal(message_id, text_content),
             )
             .await
@@ -1368,7 +1369,7 @@ where
 async fn execute_turn_inner<Ctx, P, H, M, S>(
     ExecuteTurnParameters {
         event_store,
-        seq,
+        authority,
         ctx,
         tool_context,
         provider,
@@ -1392,7 +1393,7 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    if let Err(error) = begin_turn(ctx, config.max_turns, event_store, hooks, seq).await {
+    if let Err(error) = begin_turn(ctx, config.max_turns, event_store, hooks, authority).await {
         return InternalTurnResult::Error(error);
     }
 
@@ -1405,7 +1406,7 @@ where
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     })
     .await
     {
@@ -1433,7 +1434,7 @@ where
         config,
         event_store,
         hooks,
-        seq,
+        authority,
         thread_id: &ctx.thread_id,
         turn: ctx.turn,
         message_id: &message_id,
@@ -1477,7 +1478,7 @@ where
         execution_store,
         turn_options,
         event_store,
-        seq,
+        authority,
     )
     .await
 }
@@ -1499,7 +1500,7 @@ async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     turn_options: &TurnOptions,
     event_store: &Arc<dyn EventStore>,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
 ) -> InternalTurnResult
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1523,7 +1524,7 @@ where
         message_store,
         event_store,
         hooks,
-        seq,
+        authority,
     })
     .await
     {
@@ -1569,7 +1570,7 @@ where
         tools,
         hooks,
         event_store,
-        seq,
+        authority,
         execution_store,
         turn: ctx.turn,
         total_usage: &ctx.total_usage,
@@ -1602,7 +1603,7 @@ where
         compactor,
         event_store,
         hooks,
-        seq,
+        authority,
     })
     .await
 }

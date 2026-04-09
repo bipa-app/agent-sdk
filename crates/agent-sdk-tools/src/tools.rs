@@ -33,8 +33,9 @@
 //! }
 //! ```
 
+use crate::authority::EventAuthority;
 use crate::stores::EventStore;
-use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::llm;
 use agent_sdk_core::types::{ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
@@ -296,8 +297,8 @@ pub struct ToolContext<Ctx> {
     event_thread_id: Option<agent_sdk_core::types::ThreadId>,
     /// Turn associated with the bound event store.
     event_turn: Option<usize>,
-    /// Optional sequence counter for wrapping events in envelopes
-    event_seq: Option<SequenceCounter>,
+    /// Optional event authority for wrapping events in envelopes
+    event_authority: Option<Arc<dyn EventAuthority>>,
     /// Optional cancellation token for propagating cancellation to subtasks
     cancel_token: Option<CancellationToken>,
     /// Optional semaphore for limiting concurrent subagent threads.
@@ -313,7 +314,7 @@ impl<Ctx> ToolContext<Ctx> {
             event_store: None,
             event_thread_id: None,
             event_turn: None,
-            event_seq: None,
+            event_authority: None,
             cancel_token: None,
             subagent_semaphore: None,
         }
@@ -332,18 +333,18 @@ impl<Ctx> ToolContext<Ctx> {
         store: Arc<dyn EventStore>,
         thread_id: agent_sdk_core::types::ThreadId,
         turn: usize,
-        seq: SequenceCounter,
+        authority: Arc<dyn EventAuthority>,
     ) -> Self {
         self.event_store = Some(store);
         self.event_thread_id = Some(thread_id);
         self.event_turn = Some(turn);
-        self.event_seq = Some(seq);
+        self.event_authority = Some(authority);
         self
     }
 
     /// Emit an event through the configured event store (if set).
     ///
-    /// The event is wrapped in an [`AgentEventEnvelope`] with a unique ID,
+    /// The event is wrapped in an [`agent_sdk_core::AgentEventEnvelope`] with a unique ID,
     /// sequence number, and timestamp before publishing.
     ///
     /// # Errors
@@ -352,27 +353,28 @@ impl<Ctx> ToolContext<Ctx> {
     where
         Ctx: Sync,
     {
-        if let Some((store, seq, thread_id, turn)) = self
+        if let Some((store, authority, thread_id, turn)) = self
             .event_store
             .as_ref()
-            .zip(self.event_seq.as_ref())
+            .zip(self.event_authority.as_ref())
             .zip(self.event_thread_id.as_ref())
             .zip(self.event_turn)
-            .map(|(((store, seq), thread_id), turn)| (store, seq, thread_id, turn))
+            .map(|(((store, authority), thread_id), turn)| (store, authority, thread_id, turn))
         {
-            let envelope = AgentEventEnvelope::wrap(event, seq);
+            let envelope = authority.wrap(event);
             store.append(thread_id, turn, envelope).await?;
         }
         Ok(())
     }
 
-    /// Get a clone of the sequence counter (if set).
+    /// Get a clone of the event authority (if set).
     ///
     /// This is useful for tools that spawn subprocesses (like subagents)
-    /// and need to assign sequence numbers to events sent to the parent's turn log.
+    /// and need to wrap events with the same sequencing authority as the
+    /// parent's turn log.
     #[must_use]
-    pub fn event_seq(&self) -> Option<SequenceCounter> {
-        self.event_seq.clone()
+    pub fn event_authority(&self) -> Option<Arc<dyn EventAuthority>> {
+        self.event_authority.clone()
     }
 
     /// Set the cancellation token for propagating cancellation to subtasks.

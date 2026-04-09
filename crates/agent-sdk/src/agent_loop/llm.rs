@@ -181,7 +181,7 @@ where
                             event_ctx.thread_id,
                             event_ctx.turn,
                             event_ctx.hooks,
-                            event_ctx.seq,
+                            event_ctx.authority,
                             AgentEvent::text_delta(message_id, delta.clone()),
                         )
                         .await
@@ -195,7 +195,7 @@ where
                             event_ctx.thread_id,
                             event_ctx.turn,
                             event_ctx.hooks,
-                            event_ctx.seq,
+                            event_ctx.authority,
                             AgentEvent::thinking_delta(thinking_id, delta.clone()),
                         )
                         .await
@@ -270,7 +270,7 @@ where
         event_ctx.thread_id,
         event_ctx.turn,
         event_ctx.hooks,
-        event_ctx.seq,
+        event_ctx.authority,
         AgentEvent::error(error_msg, true),
     )
     .await

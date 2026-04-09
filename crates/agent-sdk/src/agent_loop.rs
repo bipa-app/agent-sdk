@@ -48,8 +48,8 @@ use crate::types::TurnOptions;
 
 pub use self::builder::AgentLoopBuilder;
 
+use crate::authority::{EventAuthority, LocalEventAuthority};
 use crate::context::{CompactionConfig, ContextCompactor};
-use crate::events::SequenceCounter;
 use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
@@ -137,6 +137,7 @@ where
     pub(super) message_store: Arc<M>,
     pub(super) state_store: Arc<S>,
     pub(super) event_store: Arc<dyn EventStore>,
+    pub(super) event_authority: Option<Arc<dyn EventAuthority>>,
     pub(super) config: AgentConfig,
     pub(super) compaction_config: Option<CompactionConfig>,
     pub(super) compactor: Option<Arc<dyn ContextCompactor>>,
@@ -177,6 +178,7 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             event_store,
+            event_authority: None,
             config,
             compaction_config: None,
             compactor: None,
@@ -208,6 +210,7 @@ where
             message_store: Arc::new(message_store),
             state_store: Arc::new(state_store),
             event_store,
+            event_authority: None,
             config: agent_config,
             compaction_config: Some(compaction_config),
             compactor: None,
@@ -229,6 +232,17 @@ where
     ) -> Self {
         self.observability_store = Some(Arc::new(store));
         self
+    }
+
+    /// Resolve the event authority for this run.
+    ///
+    /// If an external authority was configured via the builder, use it.
+    /// Otherwise create a fresh [`LocalEventAuthority`] that starts at 0
+    /// (the pre-existing local/CLI behaviour).
+    fn resolve_authority(&self) -> Arc<dyn EventAuthority> {
+        self.event_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(LocalEventAuthority::new()))
     }
 
     /// Run the agent loop.
@@ -318,7 +332,7 @@ where
         Ctx: Clone,
     {
         let (state_tx, state_rx) = oneshot::channel();
-        let seq = SequenceCounter::new();
+        let authority = self.resolve_authority();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -338,7 +352,7 @@ where
         let task = async move {
             let result = run_loop(RunLoopParameters {
                 event_store,
-                seq,
+                authority,
                 thread_id,
                 input,
                 tool_context,
@@ -395,7 +409,7 @@ where
     {
         let (state_tx, state_rx) = oneshot::channel();
         let (input_tx, input_rx) = mpsc::channel(32);
-        let seq = SequenceCounter::new();
+        let authority = self.resolve_authority();
 
         let provider = Arc::clone(&self.provider);
         let tools = Arc::clone(&self.tools);
@@ -416,7 +430,7 @@ where
         let task = async move {
             let result = run_loop(RunLoopParameters {
                 event_store,
-                seq,
+                authority,
                 thread_id,
                 input,
                 tool_context,
@@ -529,11 +543,11 @@ where
     where
         Ctx: Clone,
     {
-        let seq = SequenceCounter::new();
+        let authority = self.resolve_authority();
 
         run_single_turn(TurnParameters {
             event_store: Arc::clone(&self.event_store),
-            seq,
+            authority,
             thread_id,
             input,
             tool_context,

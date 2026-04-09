@@ -1444,6 +1444,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         message_store,
         state_store: Arc::new(InMemoryStore::new()),
         event_store: new_event_store(),
+        event_authority: None,
         config: AgentConfig::default(),
         compaction_config: None,
         compactor: None,

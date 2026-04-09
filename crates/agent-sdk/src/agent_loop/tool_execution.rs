@@ -13,7 +13,8 @@ use super::types::{
     ConfirmedToolExecutionContext, ListenReady, ListenUpdateContext, ListenWaitParams,
     ToolCallExecutionContext, ToolExecutionOutcome,
 };
-use crate::events::{AgentEvent, SequenceCounter};
+use crate::authority::EventAuthority;
+use crate::events::AgentEvent;
 use crate::hooks::{AgentHooks, ToolDecision};
 use crate::llm::{Content, ContentBlock, Message, Role};
 use crate::stores::{EventStore, MessageStore};
@@ -194,7 +195,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_start(
             &pending.id,
             &pending.name,
@@ -219,7 +220,7 @@ where
             event_store: ctx.event_store,
             thread_id: ctx.thread_id,
             turn: ctx.turn,
-            seq: ctx.seq,
+            authority: ctx.authority,
         },
     })
     .await
@@ -265,7 +266,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &pending.id,
             &pending.name,
@@ -321,7 +322,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &pending.id,
             &pending.name,
@@ -365,7 +366,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &pending.id,
             &pending.name,
@@ -399,7 +400,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::ToolRequiresConfirmation {
             id: pending.id.clone(),
             name: pending.name.clone(),
@@ -440,7 +441,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_start(
             &pending.id,
             &pending.name,
@@ -466,7 +467,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &pending.id,
             &pending.name,
@@ -510,7 +511,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::ToolRequiresConfirmation {
             id: pending.id.clone(),
             name: pending.name.clone(),
@@ -550,7 +551,7 @@ where
                 ctx.event_store,
                 ctx.thread_id,
                 ctx.turn,
-                ctx.seq,
+                ctx.authority,
             )
             .await
         })
@@ -673,7 +674,7 @@ pub(super) async fn execute_async_tool<Ctx>(
     event_store: &Arc<dyn EventStore>,
     thread_id: &ThreadId,
     turn: usize,
-    seq: &SequenceCounter,
+    authority: &Arc<dyn EventAuthority>,
 ) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone,
@@ -714,7 +715,7 @@ where
                     &message,
                     None,
                 ),
-                seq,
+                authority,
             )
             .await?;
 
@@ -740,7 +741,7 @@ where
                                 message,
                                 data,
                             ),
-                            seq,
+                            authority,
                         )
                         .await?;
                     }
@@ -837,7 +838,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &awaiting_tool.id,
             &awaiting_tool.name,
@@ -902,7 +903,7 @@ where
                     ctx.event_store,
                     ctx.thread_id,
                     ctx.turn,
-                    ctx.seq,
+                    ctx.authority,
                 )
                 .await
             },
@@ -957,7 +958,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_call_end(
             &awaiting_tool.id,
             &awaiting_tool.name,

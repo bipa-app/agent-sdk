@@ -148,7 +148,7 @@ where
         ctx.thread_id,
         ctx.turn,
         ctx.hooks,
-        ctx.seq,
+        ctx.authority,
         AgentEvent::tool_progress(
             &ctx.pending.id,
             &ctx.pending.name,
