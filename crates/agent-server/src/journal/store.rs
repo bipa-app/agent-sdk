@@ -616,8 +616,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let admitted = if inner.thread_has_blocking_root(&task.thread_id) {
             // Convert the incoming row from `Pending` to `Queued` so it
             // lives on the same-thread FIFO queue behind the blocking
-            // root. `admit_as_queued` uses the row's `created_at` as
-            // `updated_at` so FIFO ordering stays grounded in wall time.
+            // root. Pass `created_at` as `now` so the queued row's
+            // `updated_at` equals its `created_at`, preserving the
+            // original submission timestamp in the audit field rather
+            // than recording the queuing-decision time. FIFO ordering is
+            // unaffected by this choice — the queue index is keyed on
+            // `(created_at, id)` and `created_at` is immutable.
             let created_at = task.created_at;
             task.admit_as_queued(created_at)
                 .context("submit_root_turn rejected: cannot admit as queued")?
@@ -1897,7 +1901,10 @@ mod tests {
         let done = running.complete(t_plus(5)).context("complete")?;
         store.update(done).await.context("update done")?;
 
-        // Both root indexes should now be empty.
+        // The active-root slot is now free; the queued index still holds
+        // the second root. Queued rows persist until promotion is
+        // explicitly triggered (via `promote_next_queued_root` or via
+        // `update` rebalancing in this test).
         let active = store
             .active_root_for_thread(&thread("t1"))
             .await

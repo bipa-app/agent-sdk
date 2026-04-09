@@ -666,9 +666,14 @@ impl AgentTask {
     /// calls this when a new root lands on a thread whose active-root
     /// slot is already held, so the row becomes durably queued behind
     /// the blocking root and the store's queue index can surface it via
-    /// [`super::store::AgentTaskStore::list_queued_roots`]. The
-    /// per-row `created_at` stays at the original submission time so
-    /// FIFO ordering remains grounded in wall time.
+    /// [`super::store::AgentTaskStore::list_queued_roots`]. The store's
+    /// FIFO index is keyed on the immutable `(created_at, id)` pair, so
+    /// queue ordering is determined entirely by `created_at` and is
+    /// unaffected by the `now` argument here.
+    ///
+    /// `now` is written into [`Self::updated_at`]; callers that want the
+    /// audit trail to show the original submission time (rather than the
+    /// queuing-decision time) should pass `self.created_at`.
     ///
     /// Accepts `Pending` (freshly constructed) or `Queued` (idempotent)
     /// as the source status. Only valid for [`TaskKind::RootTurn`].
