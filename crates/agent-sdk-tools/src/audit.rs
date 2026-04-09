@@ -86,9 +86,13 @@ mod tests {
     use super::*;
     use agent_sdk_core::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
     use agent_sdk_core::types::{ToolResult, ToolTier};
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
     /// A test sink that captures every record it receives.
+    ///
+    /// Uses `tokio::sync::Mutex` so `.lock().await` is infallible and the
+    /// sink never needs a panic path — per `CLAUDE.md` no `.unwrap()` is
+    /// allowed even in tests.
     #[derive(Default)]
     pub struct VecSink {
         pub records: Mutex<Vec<ToolAuditRecord>>,
@@ -97,22 +101,22 @@ mod tests {
     #[async_trait]
     impl ToolAuditSink for VecSink {
         async fn record(&self, record: ToolAuditRecord) {
-            self.records.lock().unwrap().push(record);
+            self.records.lock().await.push(record);
         }
     }
 
     fn sample_record(outcome: ToolAuditOutcome) -> ToolAuditRecord {
-        ToolAuditRecord::new(
-            "call_x",
-            "tool_x",
-            "Tool X",
-            ToolTier::Observe,
-            serde_json::json!({}),
-            serde_json::json!({}),
-            1,
-            AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+        ToolAuditRecord::new(agent_sdk_core::audit::ToolAuditRecordParams {
+            tool_call_id: "call_x".into(),
+            tool_name: "tool_x".into(),
+            display_name: "Tool X".into(),
+            tier: ToolTier::Observe,
+            requested_input: serde_json::json!({}),
+            effective_input: serde_json::json!({}),
+            turn: 1,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
             outcome,
-        )
+        })
     }
 
     #[tokio::test]
@@ -143,10 +147,13 @@ mod tests {
         }))
         .await;
 
-        let kinds: Vec<&'static str> = {
-            let records = inner.records.lock().unwrap();
-            records.iter().map(ToolAuditRecord::outcome_kind).collect()
-        };
+        let kinds: Vec<&'static str> = inner
+            .records
+            .lock()
+            .await
+            .iter()
+            .map(ToolAuditRecord::outcome_kind)
+            .collect();
         assert_eq!(kinds, vec!["cached"]);
     }
 
@@ -178,10 +185,13 @@ mod tests {
             sink.record(sample_record(outcome)).await;
         }
 
-        let kinds: Vec<&'static str> = {
-            let records = sink.records.lock().unwrap();
-            records.iter().map(ToolAuditRecord::outcome_kind).collect()
-        };
+        let kinds: Vec<&'static str> = sink
+            .records
+            .lock()
+            .await
+            .iter()
+            .map(ToolAuditRecord::outcome_kind)
+            .collect();
         assert_eq!(
             kinds,
             vec![

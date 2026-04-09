@@ -333,6 +333,16 @@ pub struct PendingToolCallInfo {
     pub name: String,
     /// Human-readable display name
     pub display_name: String,
+    /// Permission tier of the tool, captured at the moment the LLM
+    /// requested the call.
+    ///
+    /// Persisted on the continuation so that authoritative audit records
+    /// on the externalized tool-runtime path can attribute the correct
+    /// tier even though the registry is no longer reachable at resume
+    /// time. Defaults to [`ToolTier::Confirm`] (the strictest default)
+    /// when deserialized from a continuation that predates this field.
+    #[serde(default = "default_pending_tier")]
+    pub tier: ToolTier,
     /// Tool input parameters as requested by the LLM.
     pub input: serde_json::Value,
     /// Effective input after SDK preparation (e.g. listen-context enrichment).
@@ -344,6 +354,13 @@ pub struct PendingToolCallInfo {
     /// Optional context for tools that prepare asynchronously and execute later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_context: Option<ListenExecutionContext>,
+}
+
+/// Default tier used when deserializing a continuation that predates
+/// the `tier` field — the strictest default so legacy continuations
+/// surface as confirm-tier rather than silently observe-tier.
+const fn default_pending_tier() -> ToolTier {
+    ToolTier::Confirm
 }
 
 // ── Structured policy input ──────────────────────────────────────────

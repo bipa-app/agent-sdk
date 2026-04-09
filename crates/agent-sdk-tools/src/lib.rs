@@ -43,4 +43,6 @@ pub use tools::{
 };
 
 // Core audit record re-exports for downstream convenience.
-pub use agent_sdk_core::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
+pub use agent_sdk_core::audit::{
+    AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
+};

@@ -846,25 +846,30 @@ where
     tool_uses
         .iter()
         .map(|(id, name, input)| {
-            let display_name = tools
+            // Resolve the tool metadata in one pass so `display_name`
+            // and `tier` stay in lockstep. Unknown tools fall back to
+            // the strictest tier so downstream audit/policy layers see
+            // a conservative default rather than silently observe.
+            let (display_name, tier) = tools
                 .get(name)
-                .map(|tool| tool.display_name().to_string())
+                .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 .or_else(|| {
                     tools
                         .get_async(name)
-                        .map(|tool| tool.display_name().to_string())
+                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 })
                 .or_else(|| {
                     tools
                         .get_listen(name)
-                        .map(|tool| tool.display_name().to_string())
+                        .map(|tool| (tool.display_name().to_string(), tool.tier()))
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| (String::new(), crate::types::ToolTier::Confirm));
 
             PendingToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 display_name,
+                tier,
                 input: input.clone(),
                 effective_input: input.clone(),
                 listen_context: None,

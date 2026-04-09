@@ -238,6 +238,22 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
         self
     }
 
+    /// Set the audit sink from a shared `Arc`.
+    ///
+    /// Use this when the caller needs to retain a handle to the sink
+    /// (e.g. to inspect captured records from tests, or to share a
+    /// single durable sink across multiple agent loops). Passing an
+    /// `Arc<dyn ToolAuditSink>` here avoids the `Arc<Arc<S>>` double
+    /// wrap that happens when callers `Arc::clone(&sink)` a sink they
+    /// already wrapped and hand it to [`Self::audit_sink`].
+    ///
+    /// See [`Self::audit_sink`] for the standard owned form.
+    #[must_use]
+    pub fn audit_sink_shared(mut self, sink: Arc<dyn crate::hooks::ToolAuditSink>) -> Self {
+        self.audit_sink = Some(sink);
+        self
+    }
+
     /// Set the observability store for `GenAI` payload capture.
     #[cfg(feature = "otel")]
     #[must_use]

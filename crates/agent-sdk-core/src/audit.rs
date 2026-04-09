@@ -225,25 +225,59 @@ pub struct ToolAuditRecord {
     pub recorded_at: OffsetDateTime,
 }
 
+/// Arguments for building a [`ToolAuditRecord`] via [`ToolAuditRecord::new`].
+///
+/// Replaces a 9-parameter positional constructor so each field is named
+/// at the call site — three of the positional parameters were
+/// `impl Into<String>` and two were `serde_json::Value`, which made
+/// positional confusion a real risk for a struct that lands in the
+/// durable audit log.
+///
+/// Every field is required; the timestamp (`recorded_at`) is the only
+/// value [`ToolAuditRecord::new`] fills in automatically.
+#[derive(Clone, Debug)]
+pub struct ToolAuditRecordParams {
+    /// Unique tool call ID (from the LLM's `tool_use`).
+    pub tool_call_id: String,
+    /// Wire-format tool name.
+    pub tool_name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Permission tier of the tool at the moment the record was emitted.
+    pub tier: ToolTier,
+    /// Input as requested by the LLM (audit trail).
+    pub requested_input: serde_json::Value,
+    /// Effective input after SDK preparation (may differ for listen-tools).
+    pub effective_input: serde_json::Value,
+    /// Turn number this record belongs to.
+    pub turn: usize,
+    /// Provider / model provenance for this turn's LLM call.
+    pub provenance: AuditProvenance,
+    /// Lifecycle outcome carrying the variant-specific payload.
+    pub outcome: ToolAuditOutcome,
+}
+
 impl ToolAuditRecord {
     /// Build a record using the current wall-clock time.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// See [`ToolAuditRecordParams`] for the field list.
     #[must_use]
-    pub fn new(
-        tool_call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        display_name: impl Into<String>,
-        tier: ToolTier,
-        requested_input: serde_json::Value,
-        effective_input: serde_json::Value,
-        turn: usize,
-        provenance: AuditProvenance,
-        outcome: ToolAuditOutcome,
-    ) -> Self {
+    pub fn new(params: ToolAuditRecordParams) -> Self {
+        let ToolAuditRecordParams {
+            tool_call_id,
+            tool_name,
+            display_name,
+            tier,
+            requested_input,
+            effective_input,
+            turn,
+            provenance,
+            outcome,
+        } = params;
         Self {
-            tool_call_id: tool_call_id.into(),
-            tool_name: tool_name.into(),
-            display_name: display_name.into(),
+            tool_call_id,
+            tool_name,
+            display_name,
             tier,
             requested_input,
             effective_input,
@@ -266,17 +300,17 @@ mod tests {
     use super::*;
 
     fn sample_record(outcome: ToolAuditOutcome) -> ToolAuditRecord {
-        ToolAuditRecord::new(
-            "call_1",
-            "read_file",
-            "Read File",
-            ToolTier::Observe,
-            serde_json::json!({"path": "/tmp/x"}),
-            serde_json::json!({"path": "/tmp/x"}),
-            2,
-            AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+        ToolAuditRecord::new(ToolAuditRecordParams {
+            tool_call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            display_name: "Read File".into(),
+            tier: ToolTier::Observe,
+            requested_input: serde_json::json!({"path": "/tmp/x"}),
+            effective_input: serde_json::json!({"path": "/tmp/x"}),
+            turn: 2,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
             outcome,
-        )
+        })
     }
 
     #[test]

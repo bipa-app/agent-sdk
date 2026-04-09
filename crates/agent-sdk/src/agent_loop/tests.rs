@@ -2673,6 +2673,7 @@ async fn test_unknown_continuation_version_rejected() -> anyhow::Result<()> {
                 id: "call_1".into(),
                 name: "echo".into(),
                 display_name: "Echo".into(),
+                tier: ToolTier::Observe,
                 input: serde_json::json!({}),
                 effective_input: serde_json::json!({}),
                 listen_context: None,
@@ -2863,9 +2864,12 @@ async fn test_effective_input_defaults_to_requested() -> anyhow::Result<()> {
 // ==========================================================================
 
 use agent_sdk_core::audit::{ToolAuditOutcome, ToolAuditRecord};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 /// Test-only audit sink that captures every record in memory.
+///
+/// Uses `tokio::sync::Mutex` so `.lock().await` is infallible. Per
+/// `CLAUDE.md` no `.unwrap()` is allowed, even in tests.
 #[derive(Default)]
 struct RecordingAuditSink {
     records: Mutex<Vec<ToolAuditRecord>>,
@@ -2874,22 +2878,22 @@ struct RecordingAuditSink {
 #[async_trait]
 impl crate::hooks::ToolAuditSink for RecordingAuditSink {
     async fn record(&self, record: ToolAuditRecord) {
-        self.records.lock().unwrap().push(record);
+        self.records.lock().await.push(record);
     }
 }
 
 impl RecordingAuditSink {
-    fn kinds(&self) -> Vec<&'static str> {
+    async fn kinds(&self) -> Vec<&'static str> {
         self.records
             .lock()
-            .unwrap()
+            .await
             .iter()
             .map(ToolAuditRecord::outcome_kind)
             .collect()
     }
 
-    fn records(&self) -> Vec<ToolAuditRecord> {
-        self.records.lock().unwrap().clone()
+    async fn records(&self) -> Vec<ToolAuditRecord> {
+        self.records.lock().await.clone()
     }
 }
 
@@ -2909,7 +2913,56 @@ impl FixedDecisionHooks {
 #[async_trait]
 impl AgentHooks for FixedDecisionHooks {
     async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
-        self.decision.lock().unwrap().clone()
+        self.decision.lock().await.clone()
+    }
+}
+
+/// Message store that fails the Nth call to `append`, then succeeds.
+///
+/// Used by audit-durability regression tests that need to exercise a
+/// transient message-store failure at a specific call site (for
+/// example, "fail only the external tool-result append").
+struct FailAtAppendStore {
+    inner: Arc<crate::stores::InMemoryStore>,
+    appends_seen: std::sync::atomic::AtomicUsize,
+    fail_on: usize,
+}
+
+impl FailAtAppendStore {
+    fn new(fail_on: usize) -> Self {
+        Self {
+            inner: Arc::new(crate::stores::InMemoryStore::new()),
+            appends_seen: std::sync::atomic::AtomicUsize::new(0),
+            fail_on,
+        }
+    }
+}
+
+#[async_trait]
+impl MessageStore for FailAtAppendStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        message: crate::llm::Message,
+    ) -> anyhow::Result<()> {
+        let idx = self.appends_seen.fetch_add(1, Ordering::SeqCst);
+        if idx == self.fail_on {
+            anyhow::bail!("synthetic message store failure at append #{idx}");
+        }
+        self.inner.append(thread_id, message).await
+    }
+    async fn get_history(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<crate::llm::Message>> {
+        self.inner.get_history(thread_id).await
+    }
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<crate::llm::Message>,
+    ) -> anyhow::Result<()> {
+        self.inner.replace_history(thread_id, messages).await
+    }
+    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
+        self.inner.clear(thread_id).await
     }
 }
 
@@ -2927,7 +2980,7 @@ async fn test_audit_emits_completed_on_local_sync_tool_success() -> anyhow::Resu
         .provider(provider)
         .tools(tools)
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let _ = run_recorded(
@@ -2938,13 +2991,13 @@ async fn test_audit_emits_completed_on_local_sync_tool_success() -> anyhow::Resu
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert_eq!(
         kinds,
         vec!["completed"],
         "Local sync tool success should emit exactly one Completed record"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let record = &records[0];
     assert_eq!(record.tool_call_id, "tool_1");
     assert_eq!(record.tool_name, "echo");
@@ -2975,7 +3028,7 @@ async fn test_audit_emits_blocked_when_policy_blocks_tool() -> anyhow::Result<()
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build_with_stores();
 
     let _ = run_recorded(
@@ -2986,12 +3039,12 @@ async fn test_audit_emits_blocked_when_policy_blocks_tool() -> anyhow::Result<()
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"blocked"),
         "Expected a Blocked record, got {kinds:?}"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let blocked = records
         .iter()
         .find(|r| matches!(r.outcome, ToolAuditOutcome::Blocked { .. }))
@@ -3022,7 +3075,7 @@ async fn test_audit_emits_requires_confirmation_when_policy_yields() -> anyhow::
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build_with_stores();
 
     let (outcome, _) = run_turn_recorded(
@@ -3038,13 +3091,13 @@ async fn test_audit_emits_requires_confirmation_when_policy_yields() -> anyhow::
         matches!(outcome, TurnOutcome::AwaitingConfirmation { .. }),
         "Expected AwaitingConfirmation, got {outcome:?}"
     );
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert_eq!(
         kinds,
         vec!["requires_confirmation"],
         "Expected exactly one RequiresConfirmation record"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     match &records[0].outcome {
         ToolAuditOutcome::RequiresConfirmation { description, .. } => {
             assert_eq!(description, "please?");
@@ -3089,7 +3142,7 @@ async fn test_audit_emits_cached_on_idempotent_replay() -> anyhow::Result<()> {
         .execution_store_shared(
             Arc::clone(&execution_store) as Arc<dyn crate::stores::ToolExecutionStore>
         )
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let _ = run_recorded(
@@ -3100,12 +3153,12 @@ async fn test_audit_emits_cached_on_idempotent_replay() -> anyhow::Result<()> {
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"cached"),
         "Expected a Cached record, got {kinds:?}"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let cached = records
         .iter()
         .find(|r| matches!(r.outcome, ToolAuditOutcome::Cached { .. }))
@@ -3140,7 +3193,7 @@ async fn test_audit_emits_invalidated_on_listen_tool_invalidation() -> anyhow::R
         .provider(provider)
         .tools(tools)
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let _ = run_recorded(
@@ -3151,12 +3204,12 @@ async fn test_audit_emits_invalidated_on_listen_tool_invalidation() -> anyhow::R
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"invalidated"),
         "Expected Invalidated record, got {kinds:?}"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let invalidated = records
         .iter()
         .find(|r| matches!(r.outcome, ToolAuditOutcome::Invalidated { .. }))
@@ -3184,7 +3237,7 @@ async fn test_audit_emits_completed_on_external_tool_submission() -> anyhow::Res
         .provider(provider)
         .tools(tools)
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let thread_id = ThreadId::new();
@@ -3222,12 +3275,12 @@ async fn test_audit_emits_completed_on_external_tool_submission() -> anyhow::Res
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"completed"),
         "External submission should emit Completed, got {kinds:?}"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let completed = records
         .iter()
         .find(|r| {
@@ -3239,6 +3292,123 @@ async fn test_audit_emits_completed_on_external_tool_submission() -> anyhow::Res
         .expect("missing completed record for external tool");
     assert_eq!(completed.tool_call_id, "tool_1");
     assert_eq!(completed.tool_name, "echo");
+    // Tier must be the echo tool's actual tier (Observe), not a
+    // hardcoded fallback. Previously this path always emitted Observe
+    // regardless of the tool's real tier.
+    assert_eq!(completed.tier, ToolTier::Observe);
+    Ok(())
+}
+
+/// Regression test for the critical bug where
+/// `emit_external_tool_audit` hardcoded `ToolTier::Observe` for every
+/// external-runtime audit record.
+///
+/// A confirm-tier tool flows through the external submit path and the
+/// resulting `Completed` record MUST carry `ToolTier::Confirm` — not
+/// a silently downgraded `Observe` — so that servers enforcing
+/// tier-based compliance invariants see the authoritative tier.
+#[tokio::test]
+async fn test_audit_external_submission_preserves_confirm_tier() -> anyhow::Result<()> {
+    use crate::tools::Tool;
+    use crate::types::{ExternalToolResult, ToolRuntime};
+
+    /// Confirm-tier tool for regression testing the external-path tier
+    /// propagation. Not shared via `test_utils` because no other test
+    /// needs a confirm-tier tool.
+    struct WriteFileTool;
+
+    impl Tool<()> for WriteFileTool {
+        type Name = TestToolName;
+
+        fn name(&self) -> TestToolName {
+            TestToolName::Echo
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Write File"
+        }
+
+        fn description(&self) -> &'static str {
+            "Confirm-tier tool for tier-propagation regression tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Confirm
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::success("wrote"))
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"path": "/tmp/x"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(WriteFileTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    let _ = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("wrote"),
+            }],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    let records = sink.records().await;
+    let completed = records
+        .iter()
+        .find(|r| matches!(&r.outcome, ToolAuditOutcome::Completed { .. }))
+        .expect("missing completed record");
+    assert_eq!(
+        completed.tier,
+        ToolTier::Confirm,
+        "External path must preserve the tool's actual tier, got {:?}",
+        completed.tier
+    );
     Ok(())
 }
 
@@ -3264,7 +3434,7 @@ async fn test_audit_emits_replayed_on_duplicate_external_submission() -> anyhow:
         .execution_store_shared(
             Arc::clone(&execution_store) as Arc<dyn crate::stores::ToolExecutionStore>
         )
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let thread_id = ThreadId::new();
@@ -3320,7 +3490,7 @@ async fn test_audit_emits_replayed_on_duplicate_external_submission() -> anyhow:
     )
     .await?;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"replayed"),
         "Duplicate external submission should emit Replayed, got {kinds:?}"
@@ -3365,7 +3535,7 @@ async fn test_audit_emits_blocked_at_resume_when_policy_rejects() -> anyhow::Res
         .message_store(InMemoryStore::new())
         .state_store(InMemoryStore::new())
         .event_store(new_event_store())
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build_with_stores();
 
     let thread_id = ThreadId::new();
@@ -3400,7 +3570,7 @@ async fn test_audit_emits_blocked_at_resume_when_policy_rejects() -> anyhow::Res
     )
     .await?;
 
-    let records = sink.records();
+    let records = sink.records().await;
     // We expect at least two lifecycle transitions for tool_1:
     //   1. RequiresConfirmation (first turn)
     //   2. Blocked (second turn, at resume time)
@@ -3494,7 +3664,7 @@ async fn test_audit_emits_persistence_failed_when_tool_event_append_fails() -> a
         .provider(provider)
         .tools(tools)
         .event_store(event_store)
-        .audit_sink(Arc::clone(&sink))
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
         .build();
 
     let _ = run_recorded(
@@ -3505,12 +3675,12 @@ async fn test_audit_emits_persistence_failed_when_tool_event_append_fails() -> a
     )
     .await;
 
-    let kinds = sink.kinds();
+    let kinds = sink.kinds().await;
     assert!(
         kinds.contains(&"persistence_failed"),
         "Failing tool-event append should emit PersistenceFailed, got {kinds:?}"
     );
-    let records = sink.records();
+    let records = sink.records().await;
     let pf = records
         .iter()
         .find(|r| matches!(r.outcome, ToolAuditOutcome::PersistenceFailed { .. }))
@@ -3521,5 +3691,135 @@ async fn test_audit_emits_persistence_failed_when_tool_event_append_fails() -> a
         }
         other => panic!("Expected PersistenceFailed, got {other:?}"),
     }
+    Ok(())
+}
+
+/// Regression test for the critical durability-ordering bug: if the
+/// message store `append_tool_results` fails on the external runtime
+/// path, a retry with the same continuation must re-evaluate every
+/// submission as fresh (Completed) rather than short-circuit as
+/// Replayed — otherwise the conversation is permanently broken because
+/// the message store would never get the tool result.
+#[tokio::test]
+async fn test_audit_external_append_failure_does_not_mark_execution_store() -> anyhow::Result<()> {
+    use crate::stores::InMemoryExecutionStore;
+    use crate::types::{ExternalToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let sink = Arc::new(RecordingAuditSink::default());
+    let execution_store = Arc::new(InMemoryExecutionStore::new());
+
+    // append sequence on the external path:
+    //   0: Text("run") on turn 1
+    //   1: assistant ToolUse message (persisted by agent loop)
+    //   2: tool results batch on SubmitToolResults (this is the one we fail)
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(FailAtAppendStore::new(2))
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .execution_store_shared(
+            Arc::clone(&execution_store) as Arc<dyn crate::stores::ToolExecutionStore>
+        )
+        .audit_sink_shared(Arc::clone(&sink) as Arc<dyn crate::hooks::ToolAuditSink>)
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    // Turn 1: LLM requests tool → pending
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("run".into()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+    let continuation: Box<ContinuationEnvelope> = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Snapshot the continuation so we can retry the same logical
+    // submission twice without the envelope being consumed.
+    let retry_continuation = continuation.clone();
+
+    // Turn 2: submit results — the first message-store append fails,
+    // which should emit Completed + PersistenceFailed audit records and
+    // leave the execution store clean.
+    let outcome2 = agent
+        .run_turn(
+            thread_id.clone(),
+            AgentInput::SubmitToolResults {
+                continuation,
+                results: vec![ExternalToolResult {
+                    tool_call_id: "tool_1".to_string(),
+                    result: ToolResult::success("external"),
+                }],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts.clone(),
+        )
+        .await;
+    assert!(
+        matches!(outcome2, TurnOutcome::Error(_)),
+        "Expected Error from failed append, got {outcome2:?}"
+    );
+
+    // The execution store must NOT have been marked completed, so a
+    // retry is re-evaluated as fresh.
+    let exec =
+        <dyn crate::stores::ToolExecutionStore>::get_execution(&*execution_store, "tool_1").await?;
+    assert!(
+        !exec.is_some_and(|e| e.is_completed()),
+        "Execution store must not mark tool_1 as completed before append succeeds"
+    );
+
+    // Retry turn: the same continuation and same result, but this
+    // time the message store succeeds. The audit sink must emit a
+    // *fresh* Completed record (not Replayed) because the first
+    // attempt never persisted.
+    let _ = agent
+        .run_turn(
+            thread_id,
+            AgentInput::SubmitToolResults {
+                continuation: retry_continuation,
+                results: vec![ExternalToolResult {
+                    tool_call_id: "tool_1".to_string(),
+                    result: ToolResult::success("external"),
+                }],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts,
+        )
+        .await;
+
+    let kinds = sink.kinds().await;
+    // Expected sequence over both attempts:
+    //   attempt 1: Completed, PersistenceFailed
+    //   attempt 2: Completed (NOT Replayed)
+    let completed_count = kinds.iter().filter(|k| **k == "completed").count();
+    let replayed_count = kinds.iter().filter(|k| **k == "replayed").count();
+    assert!(
+        completed_count >= 2,
+        "Expected at least two Completed records across attempts, got {kinds:?}"
+    );
+    assert_eq!(
+        replayed_count, 0,
+        "Retry after failure must not emit Replayed, got {kinds:?}"
+    );
     Ok(())
 }

@@ -25,7 +25,9 @@ use crate::types::{
     AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolInvocation, ToolOutcome,
     ToolResult, ToolTier,
 };
-use agent_sdk_core::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
+use agent_sdk_core::audit::{
+    AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
+};
 
 /// Build a [`ToolInvocation`] from a pending tool call and its tier.
 fn build_invocation(pending: &PendingToolCallInfo, tier: ToolTier) -> ToolInvocation {
@@ -45,6 +47,11 @@ fn build_invocation(pending: &PendingToolCallInfo, tier: ToolTier) -> ToolInvoca
 /// This is the replacement for the old "`post_tool_use`-only" audit path.
 /// Every lifecycle variant flows through this helper so provenance, tier,
 /// and identity are built the same way everywhere.
+///
+/// The `tier` argument is passed explicitly rather than read from
+/// `pending.tier` because some callers need to override it — e.g. the
+/// "unknown tool" path falls back to [`ToolTier::Confirm`] even if the
+/// continuation happens to carry a stale observe-tier value.
 async fn emit_audit(
     sink: &Arc<dyn ToolAuditSink>,
     provenance: &AuditProvenance,
@@ -53,35 +60,18 @@ async fn emit_audit(
     turn: usize,
     outcome: ToolAuditOutcome,
 ) {
-    let record = ToolAuditRecord::new(
-        pending.id.clone(),
-        pending.name.clone(),
-        pending.display_name.clone(),
+    let record = ToolAuditRecord::new(ToolAuditRecordParams {
+        tool_call_id: pending.id.clone(),
+        tool_name: pending.name.clone(),
+        display_name: pending.display_name.clone(),
         tier,
-        pending.input.clone(),
-        pending.effective_input.clone(),
+        requested_input: pending.input.clone(),
+        effective_input: pending.effective_input.clone(),
         turn,
-        provenance.clone(),
+        provenance: provenance.clone(),
         outcome,
-    );
+    });
     sink.record(record).await;
-}
-
-/// Resolve a tool's tier by consulting the registry, falling back to
-/// [`ToolTier::Confirm`] when the tool is unknown (the strictest default).
-fn tier_for_pending<Ctx>(
-    tools: &crate::tools::ToolRegistry<Ctx>,
-    pending: &PendingToolCallInfo,
-) -> ToolTier
-where
-    Ctx: Send + Sync + 'static,
-{
-    tools
-        .get(&pending.name)
-        .map(|t| t.tier())
-        .or_else(|| tools.get_async(&pending.name).map(|t| t.tier()))
-        .or_else(|| tools.get_listen(&pending.name).map(|t| t.tier()))
-        .unwrap_or(ToolTier::Confirm)
 }
 
 /// Execute a single tool call with hook checks.
@@ -219,7 +209,7 @@ where
             ctx.audit_sink,
             ctx.provenance,
             pending,
-            tier_for_pending(ctx.tools, pending),
+            pending.tier,
             ctx.turn,
             ToolAuditOutcome::Cached {
                 result: cached_result.clone(),
@@ -1143,14 +1133,12 @@ where
     }
 
     // Resume-time policy re-evaluation: re-check pre_tool_use at resume
-    // so that policy changes since the original confirmation are respected.
-    let tier = ctx
-        .tools
-        .get(&awaiting_tool.name)
-        .map(|t| t.tier())
-        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
-        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
-        .unwrap_or(ToolTier::Confirm);
+    // so that policy changes since the original confirmation are
+    // respected. The tier is read from the continuation's pending
+    // metadata (`awaiting_tool.tier`) rather than re-resolved from the
+    // registry because the continuation is the authoritative source at
+    // this point.
+    let tier = awaiting_tool.tier;
 
     let hook_decision = ctx
         .hooks
@@ -1163,20 +1151,17 @@ where
             "pre_tool_use returned Block for confirmed tool '{}': {reason} -- rejecting at resume time",
             awaiting_tool.name
         );
-        let audit_record = ToolAuditRecord::new(
-            awaiting_tool.id.clone(),
-            awaiting_tool.name.clone(),
-            awaiting_tool.display_name.clone(),
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            awaiting_tool,
             tier,
-            awaiting_tool.input.clone(),
-            awaiting_tool.effective_input.clone(),
             ctx.turn,
-            ctx.provenance.clone(),
             ToolAuditOutcome::Blocked {
                 reason: reason.clone(),
             },
-        );
-        ctx.audit_sink.record(audit_record).await;
+        )
+        .await;
         let result = ToolResult::error(format!("Blocked at resume: {reason}"));
         return finish_confirmed_tool(awaiting_tool, ctx, result).await;
     }
@@ -1184,20 +1169,17 @@ where
     if let Some(cached_result) = try_get_cached_result(ctx.execution_store, &awaiting_tool.id).await
     {
         // Cached idempotent replay on the confirmed-resume path.
-        let audit_record = ToolAuditRecord::new(
-            awaiting_tool.id.clone(),
-            awaiting_tool.name.clone(),
-            awaiting_tool.display_name.clone(),
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            awaiting_tool,
             tier,
-            awaiting_tool.input.clone(),
-            awaiting_tool.effective_input.clone(),
             ctx.turn,
-            ctx.provenance.clone(),
             ToolAuditOutcome::Cached {
                 result: cached_result.clone(),
             },
-        );
-        ctx.audit_sink.record(audit_record).await;
+        )
+        .await;
         return finish_confirmed_tool(awaiting_tool, ctx, cached_result).await;
     }
 
@@ -1231,27 +1213,23 @@ where
     // User rejection during confirmation is recorded as a Blocked
     // lifecycle event — the tool never ran, and the rejection reason is
     // the audit-facing explanation.
-    let tier = ctx
-        .tools
-        .get(&awaiting_tool.name)
-        .map(|t| t.tier())
-        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
-        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
-        .unwrap_or(ToolTier::Confirm);
-    let audit_record = ToolAuditRecord::new(
-        awaiting_tool.id.clone(),
-        awaiting_tool.name.clone(),
-        awaiting_tool.display_name.clone(),
+    //
+    // Read the tier from the continuation's pending-call metadata
+    // rather than re-looking it up from the registry — the registry
+    // lookup pattern was a pre-Phase-1.6 artifact from when
+    // `PendingToolCallInfo` didn't carry `tier`.
+    let tier = awaiting_tool.tier;
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        awaiting_tool,
         tier,
-        awaiting_tool.input.clone(),
-        awaiting_tool.effective_input.clone(),
         ctx.turn,
-        ctx.provenance.clone(),
         ToolAuditOutcome::Blocked {
             reason: reason.clone(),
         },
-    );
-    ctx.audit_sink.record(audit_record).await;
+    )
+    .await;
 
     let result = ToolResult::error(format!("Rejected: {reason}"));
     if let Err(error) = send_event(
@@ -1269,21 +1247,18 @@ where
     )
     .await
     {
-        let audit_record = ToolAuditRecord::new(
-            awaiting_tool.id.clone(),
-            awaiting_tool.name.clone(),
-            awaiting_tool.display_name.clone(),
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            awaiting_tool,
             tier,
-            awaiting_tool.input.clone(),
-            awaiting_tool.effective_input.clone(),
             ctx.turn,
-            ctx.provenance.clone(),
             ToolAuditOutcome::PersistenceFailed {
                 result: Some(result.clone()),
                 error: error.message.clone(),
             },
-        );
-        ctx.audit_sink.record(audit_record).await;
+        )
+        .await;
         return Err(error);
     }
     Ok(result)
@@ -1392,33 +1367,24 @@ where
     H: AgentHooks,
 {
     ctx.hooks.post_tool_use(&awaiting_tool.name, &result).await;
-    let tier = ctx
-        .tools
-        .get(&awaiting_tool.name)
-        .map(|t| t.tier())
-        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
-        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
-        .unwrap_or(ToolTier::Confirm);
+    let tier = awaiting_tool.tier;
     // Terminal Completed record for the confirmed-tool path. This
     // covers tools that actually ran after user confirmation and tools
     // that were turned into synthetic error results by upstream logic
     // (e.g. "Blocked at resume: ..."). Callers that emitted a prior
     // Blocked record are still visible because `ToolAuditRecord` is a
     // stream, not a single row.
-    let audit_record = ToolAuditRecord::new(
-        awaiting_tool.id.clone(),
-        awaiting_tool.name.clone(),
-        awaiting_tool.display_name.clone(),
+    emit_audit(
+        ctx.audit_sink,
+        ctx.provenance,
+        awaiting_tool,
         tier,
-        awaiting_tool.input.clone(),
-        awaiting_tool.effective_input.clone(),
         ctx.turn,
-        ctx.provenance.clone(),
         ToolAuditOutcome::Completed {
             result: result.clone(),
         },
-    );
-    ctx.audit_sink.record(audit_record).await;
+    )
+    .await;
     if let Err(error) = send_event(
         ctx.event_store,
         ctx.thread_id,
@@ -1434,21 +1400,18 @@ where
     )
     .await
     {
-        let audit_record = ToolAuditRecord::new(
-            awaiting_tool.id.clone(),
-            awaiting_tool.name.clone(),
-            awaiting_tool.display_name.clone(),
+        emit_audit(
+            ctx.audit_sink,
+            ctx.provenance,
+            awaiting_tool,
             tier,
-            awaiting_tool.input.clone(),
-            awaiting_tool.effective_input.clone(),
             ctx.turn,
-            ctx.provenance.clone(),
             ToolAuditOutcome::PersistenceFailed {
-                result: Some(result),
+                result: Some(result.clone()),
                 error: error.message.clone(),
             },
-        );
-        ctx.audit_sink.record(audit_record).await;
+        )
+        .await;
         return Err(error);
     }
     Ok(result)
