@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn expected_turn_for_input(input: &AgentInput, existing_turns: &[StoredTurnEvents]) -> usize {
     match input {
-        AgentInput::Resume { continuation, .. } => continuation.turn,
+        AgentInput::Resume { continuation, .. }
+        | AgentInput::SubmitToolResults { continuation, .. } => continuation.turn,
         _ => existing_turns
             .last()
             .map_or(1, |turn| turn.turn.saturating_add(1)),
@@ -1972,5 +1973,481 @@ async fn test_run_still_works_as_convenience_wrapper() -> anyhow::Result<()> {
 
     assert!(matches!(state, crate::types::AgentRunState::Done { .. }));
 
+    Ok(())
+}
+
+// =========================================================================
+// External tool handoff: SubmitToolResults regression tests (ENG-7911)
+// =========================================================================
+
+#[tokio::test]
+async fn test_submit_tool_results_round_trip() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    // Turn 1: LLM requests a tool call → PendingToolCalls
+    // Turn 2: We submit the result → LLM sees it → Done
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "hello"})),
+        MockProvider::text_response("Got the echo result"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let external_opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    // Turn 1: get PendingToolCalls
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        external_opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls {
+            tool_calls,
+            continuation,
+            ..
+        } => {
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].id, "tool_1");
+            assert_eq!(tool_calls[0].name, "echo");
+            continuation
+        }
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Turn 2: submit external results → should produce Done
+    let (outcome2, _) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("echo: hello"),
+            }],
+        },
+        ToolContext::new(()),
+        external_opts,
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Done { .. }),
+        "Expected Done after submitting tool results, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_batch() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    // LLM requests two tool calls in one turn → submit both results
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("call_a", "echo", json!({"message": "first"})),
+            ("call_b", "echo", json!({"message": "second"})),
+        ]),
+        MockProvider::text_response("Both results received"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run two tools".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls {
+            tool_calls,
+            continuation,
+            ..
+        } => {
+            assert_eq!(tool_calls.len(), 2);
+            continuation
+        }
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit results (deliberately in reverse order to prove ordering doesn't matter)
+    let (outcome2, _) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![
+                ExternalToolResult {
+                    tool_call_id: "call_b".to_string(),
+                    result: ToolResult::success("second result"),
+                },
+                ExternalToolResult {
+                    tool_call_id: "call_a".to_string(),
+                    result: ToolResult::success("first result"),
+                },
+            ],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Done { .. }),
+        "Expected Done after batch submit, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_thread_id_mismatch() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "test"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit on a DIFFERENT thread_id → should error
+    let wrong_thread = ThreadId::new();
+    let outcome2 = agent
+        .run_turn(
+            wrong_thread,
+            AgentInput::SubmitToolResults {
+                continuation,
+                results: vec![ExternalToolResult {
+                    tool_call_id: "tool_1".to_string(),
+                    result: ToolResult::success("echo"),
+                }],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts,
+        )
+        .await;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Error(_)),
+        "Expected Error for thread mismatch, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_missing_result() -> anyhow::Result<()> {
+    use crate::types::ToolRuntime;
+
+    let provider = MockProvider::new(vec![MockProvider::tool_uses_response(vec![
+        ("call_a", "echo", json!({"message": "first"})),
+        ("call_b", "echo", json!({"message": "second"})),
+    ])]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run two tools".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit only one result for two tool calls → should error
+    let outcome2 = agent
+        .run_turn(
+            thread_id,
+            AgentInput::SubmitToolResults {
+                continuation,
+                results: vec![crate::types::ExternalToolResult {
+                    tool_call_id: "call_a".to_string(),
+                    result: crate::types::ToolResult::success("only one"),
+                }],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts,
+        )
+        .await;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Error(_)),
+        "Expected Error for missing result, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_unknown_tool_call_id() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    let provider = MockProvider::new(vec![MockProvider::tool_use_response(
+        "tool_1",
+        "echo",
+        json!({"message": "test"}),
+    )]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit with wrong tool_call_id → should error
+    let outcome2 = agent
+        .run_turn(
+            thread_id,
+            AgentInput::SubmitToolResults {
+                continuation,
+                results: vec![ExternalToolResult {
+                    tool_call_id: "unknown_id".to_string(),
+                    result: ToolResult::success("echo"),
+                }],
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+            opts,
+        )
+        .await;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Error(_)),
+        "Expected Error for unknown tool call ID, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_continuation_serializes() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    // Verify the continuation round-trips through JSON — the durable contract.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "test"})),
+        MockProvider::text_response("Got it"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Round-trip through JSON (simulates durable persistence)
+    let json = serde_json::to_string(&continuation)?;
+    let recovered: Box<crate::types::AgentContinuation> = serde_json::from_str(&json)?;
+    assert_eq!(recovered.thread_id, continuation.thread_id);
+    assert_eq!(recovered.turn, continuation.turn);
+    assert_eq!(recovered.pending_tool_calls.len(), 1);
+
+    // Use the deserialized continuation to resume
+    let (outcome2, _) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation: recovered,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("echo: test"),
+            }],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Done { .. }),
+        "Expected Done after deserialized continuation resume, got {outcome2:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_tool_results_with_failed_tool() -> anyhow::Result<()> {
+    use crate::types::{ExternalToolResult, ToolResult, ToolRuntime};
+
+    // External runtime may report a tool failure — the SDK should still pass
+    // it through to the LLM as an error result.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "echo", json!({"message": "crash"})),
+        MockProvider::text_response("I see the tool failed"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let opts = TurnOptions {
+        tool_runtime: ToolRuntime::External,
+        strict_durability: false,
+    };
+
+    let (outcome, _) = run_turn_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("Run tool".to_string()),
+        ToolContext::new(()),
+        opts.clone(),
+    )
+    .await?;
+
+    let continuation = match outcome {
+        TurnOutcome::PendingToolCalls { continuation, .. } => continuation,
+        other => panic!("Expected PendingToolCalls, got {other:?}"),
+    };
+
+    // Submit a *failed* tool result
+    let (outcome2, _) = run_turn_recorded(
+        &agent,
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::error("tool crashed"),
+            }],
+        },
+        ToolContext::new(()),
+        opts,
+    )
+    .await?;
+
+    assert!(
+        matches!(outcome2, TurnOutcome::Done { .. }),
+        "Expected Done even with failed tool, got {outcome2:?}"
+    );
     Ok(())
 }

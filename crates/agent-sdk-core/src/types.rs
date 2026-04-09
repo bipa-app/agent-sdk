@@ -382,6 +382,21 @@ pub struct AgentContinuation {
     pub state: AgentState,
 }
 
+/// A tool result provided by the external runtime for a specific tool call.
+///
+/// This is the durable handoff payload: a root worker serialises these
+/// alongside the [`AgentContinuation`] and provides them on resume via
+/// [`AgentInput::SubmitToolResults`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalToolResult {
+    /// The tool call ID this result corresponds to (must match a
+    /// [`PendingToolCallInfo::id`] from the original
+    /// [`TurnOutcome::PendingToolCalls`]).
+    pub tool_call_id: String,
+    /// The execution result.
+    pub result: ToolResult,
+}
+
 /// Input to start or resume an agent run.
 #[derive(Debug)]
 pub enum AgentInput {
@@ -401,6 +416,22 @@ pub enum AgentInput {
         confirmed: bool,
         /// Optional reason if rejected.
         rejection_reason: Option<String>,
+    },
+
+    /// Resume after external tool execution.
+    ///
+    /// Use this after [`TurnOutcome::PendingToolCalls`] when
+    /// [`ToolRuntime::External`] is set.  The caller must provide a result
+    /// for **every** pending tool call listed in the continuation.
+    ///
+    /// The SDK validates the continuation, appends the tool results to
+    /// the message store, and continues to the next LLM turn.
+    SubmitToolResults {
+        /// The continuation from [`TurnOutcome::PendingToolCalls`].
+        continuation: Box<AgentContinuation>,
+        /// One result per pending tool call.  The order does not matter,
+        /// but every `tool_call_id` from the continuation must be covered.
+        results: Vec<ExternalToolResult>,
     },
 
     /// Continue to the next turn (for single-turn mode).
@@ -623,8 +654,12 @@ pub enum TurnOutcome {
     ///
     /// Only returned when [`ToolRuntime::External`] is set in [`TurnOptions`].
     /// The caller is responsible for executing the tool calls and resuming
-    /// with `AgentInput::Continue` (after appending tool results to the
-    /// message store).
+    /// with [`AgentInput::SubmitToolResults`], providing one
+    /// [`ExternalToolResult`] for each pending tool call.
+    ///
+    /// The `continuation` must be passed back unmodified — it carries the
+    /// turn identity, token usage, and agent state needed to validate and
+    /// apply the results.
     PendingToolCalls {
         /// The turn number that produced these tool calls
         turn: usize,

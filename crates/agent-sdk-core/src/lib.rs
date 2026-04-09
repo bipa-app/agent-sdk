@@ -26,7 +26,7 @@ pub use llm::{
 };
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ExecutionStatus, ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId,
-    TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
-    TurnOutcome,
+    ExecutionStatus, ExternalToolResult, ListenExecutionContext, PendingToolCallInfo, RetryConfig,
+    ThreadId, TokenUsage, ToolExecution, ToolOutcome, ToolResult, ToolRuntime, ToolTier,
+    TurnOptions, TurnOutcome,
 };

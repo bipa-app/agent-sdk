@@ -102,6 +102,7 @@ pub const fn input_kind_str(input: &crate::types::AgentInput) -> &'static str {
         crate::types::AgentInput::Message(_) => "message",
         crate::types::AgentInput::Continue => "continue",
         crate::types::AgentInput::Resume { .. } => "resume",
+        crate::types::AgentInput::SubmitToolResults { .. } => "submit_tool_results",
     }
 }
 
