@@ -287,6 +287,30 @@
 //!   implementation, following the same `Arc<RwLock<Inner>>` pattern
 //!   as [`store::InMemoryAgentTaskStore`].
 //!
+//! # Phase 3.2 — Message projection and transactional `replace_history` (ENG-7923)
+//!
+//! Phase 3.2 adds the **message projection** — a durable ordered
+//! record of committed conversation messages per thread. The key
+//! design properties:
+//!
+//! 1. **No mid-turn writes** — message projection writes happen
+//!    exclusively at turn completion, so a crash can never leave the
+//!    projection ahead of the latest completed checkpoint.
+//! 2. **Atomic `replace_history`** — context compaction swaps the
+//!    entire history under the store's write lock, so readers never
+//!    see a partially replaced history.
+//! 3. **Versioned rows** — every mutation bumps a monotonic `version`
+//!    counter, enabling future optimistic concurrency control.
+//!
+//! - [`message::MessageProjection`] is the durable row: thread id,
+//!   ordered message history, version, and timestamps.
+//! - [`message_store::MessageProjectionStore`] is the narrow trait
+//!   surface: `get_or_create`, `get`, `get_history`,
+//!   `commit_messages`, `replace_history`.
+//! - [`message_store::InMemoryMessageProjectionStore`] is the
+//!   reference in-memory implementation, following the same
+//!   `Arc<RwLock<Inner>>` pattern as [`thread_store::InMemoryThreadStore`].
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
@@ -295,6 +319,8 @@
 //! | Subagent runtime | 3+ |
 //! | Confirmation transport APIs | post-2.4 |
 
+pub mod message;
+pub mod message_store;
 pub mod recovery;
 pub mod store;
 pub mod task;
@@ -302,6 +328,8 @@ pub mod task_state;
 pub mod thread;
 pub mod thread_store;
 
+pub use message::{MessageProjection, MessageProjectionError};
+pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
