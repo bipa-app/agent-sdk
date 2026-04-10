@@ -65,7 +65,7 @@ impl LlmProvider for MockTextProvider {
         }))
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &'static str {
         "mock-model"
     }
 
@@ -353,7 +353,7 @@ async fn tool_call_response_is_rejected() -> Result<()> {
             }))
         }
 
-        fn model(&self) -> &str {
+        fn model(&self) -> &'static str {
             "mock-model"
         }
 
@@ -400,7 +400,7 @@ async fn llm_error_propagates() -> Result<()> {
             Ok(ChatOutcome::ServerError("internal error".into()))
         }
 
-        fn model(&self) -> &str {
+        fn model(&self) -> &'static str {
             "mock-model"
         }
 
