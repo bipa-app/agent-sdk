@@ -97,12 +97,12 @@ pub trait CheckpointStore: Send + Sync {
 #[derive(Default)]
 struct Inner {
     /// Primary key index.
-    id_map: HashMap<CheckpointId, Checkpoint>,
+    checkpoints: HashMap<CheckpointId, Checkpoint>,
     /// Secondary index: thread → checkpoint ids (sorted at query time
     /// by `turn_number`).
-    thread_map: HashMap<ThreadId, Vec<CheckpointId>>,
+    thread_index: HashMap<ThreadId, Vec<CheckpointId>>,
     /// Uniqueness index: `(thread_id, turn_number)` → checkpoint id.
-    thread_turn_map: HashMap<(ThreadId, u32), CheckpointId>,
+    turn_uniqueness: HashMap<(ThreadId, u32), CheckpointId>,
 }
 
 /// In-memory reference implementation of [`CheckpointStore`].
@@ -130,7 +130,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
 
         let mut inner = self.inner.write().await;
         let key = (checkpoint.thread_id.clone(), checkpoint.turn_number);
-        if inner.thread_turn_map.contains_key(&key) {
+        if inner.turn_uniqueness.contains_key(&key) {
             return Err(anyhow!(
                 "duplicate checkpoint for thread {} turn {}",
                 checkpoint.thread_id,
@@ -138,14 +138,14 @@ impl CheckpointStore for InMemoryCheckpointStore {
             ));
         }
 
-        inner.thread_turn_map.insert(key, checkpoint.id.clone());
+        inner.turn_uniqueness.insert(key, checkpoint.id.clone());
         inner
-            .thread_map
+            .thread_index
             .entry(checkpoint.thread_id.clone())
             .or_default()
             .push(checkpoint.id.clone());
         inner
-            .id_map
+            .checkpoints
             .insert(checkpoint.id.clone(), checkpoint.clone());
         drop(inner);
 
@@ -154,7 +154,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
 
     async fn get(&self, id: &CheckpointId) -> Result<Option<Checkpoint>> {
         let inner = self.inner.read().await;
-        let result = inner.id_map.get(id).cloned();
+        let result = inner.checkpoints.get(id).cloned();
         drop(inner);
         Ok(result)
     }
@@ -167,9 +167,9 @@ impl CheckpointStore for InMemoryCheckpointStore {
         let inner = self.inner.read().await;
         let key = (thread_id.clone(), turn_number);
         let result = inner
-            .thread_turn_map
+            .turn_uniqueness
             .get(&key)
-            .and_then(|id| inner.id_map.get(id))
+            .and_then(|id| inner.checkpoints.get(id))
             .cloned();
         drop(inner);
         Ok(result)
@@ -177,12 +177,12 @@ impl CheckpointStore for InMemoryCheckpointStore {
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>> {
         let inner = self.inner.read().await;
-        let Some(ids) = inner.thread_map.get(thread_id) else {
+        let Some(ids) = inner.thread_index.get(thread_id) else {
             return Ok(Vec::new());
         };
         let mut checkpoints: Vec<Checkpoint> = ids
             .iter()
-            .filter_map(|id| inner.id_map.get(id).cloned())
+            .filter_map(|id| inner.checkpoints.get(id).cloned())
             .collect();
         drop(inner);
         checkpoints.sort_by_key(|c| c.turn_number);
