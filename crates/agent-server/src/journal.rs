@@ -104,7 +104,7 @@
 //!   paused-state transitions. (Phase 2.4 also shipped a one-shot
 //!   `resolve_child(parent_id)` decrement helper — it was retired in
 //!   Phase 2.6 when the parent counter became journal-derived, see
-//!   [`AgentTaskStore::complete_child`] / [`AgentTaskStore::fail_child`]
+//!   [`AgentTaskStore::complete_task`] / [`AgentTaskStore::fail_task`]
 //!   for the replacement.)
 //! - The state ↔ status invariant is enforced by
 //!   [`AgentTask::validate`] (rejecting any row whose typed payload
@@ -154,8 +154,8 @@
 //!   transitions the parent to [`TaskStatus::WaitingOnChildren`] with
 //!   a typed continuation, and drops the parent's lease — all under
 //!   the same write lock so no partial batch can ever be observed.
-//! - [`AgentTaskStore::complete_child`] and
-//!   [`AgentTaskStore::fail_child`] drive a running child to its
+//! - [`AgentTaskStore::complete_task`] and
+//!   [`AgentTaskStore::fail_task`] drive a running child to its
 //!   terminal state (`Completed` / `Failed`) and, under the same
 //!   write lock, recompute the parent's `pending_child_count`
 //!   authoritatively from the `by_parent` live-children index via
@@ -177,11 +177,99 @@
 //!   outcomes, and `recompute_pending_children` re-derives the
 //!   counter from scratch on every terminal child transition.
 //!
+//! # Phase 2.7 — CAS contract, lifecycle model, and worker call sequences (ENG-7921)
+//!
+//! Phase 2.7 finalizes the journal API surface for worker consumption.
+//! Every mutation is now CAS-guarded — `insert` / `update` / `clear`
+//! are reserved for store rehydration and test scaffolding only.
+//!
+//! ## Task lifecycle state machine
+//!
+//! ```text
+//! ┌──────────┐  submit_root_turn   ┌──────────┐
+//! │ (new)    ├────────────────────►│ Pending  │◄──────────────────────┐
+//! └──────────┘  (slot free)        └────┬─────┘                      │
+//!       │                               │ try_acquire / scan         │
+//!       │  submit_root_turn             ▼                            │
+//!       │  (slot busy)           ┌──────────┐  heartbeat_task        │
+//!       ▼                        │ Running  ├───────► (extends lease) │
+//! ┌──────────┐  promote          └─┬──┬──┬──┘                        │
+//! │ Queued   ├──────────────────►  │  │  │                           │
+//! └──────────┘  (slot free)        │  │  │   pause_on_children /     │
+//!                                  │  │  │   spawn_tool_children     │
+//!                                  │  │  ▼                           │
+//!                                  │  │ ┌────────────────────┐       │
+//!                                  │  │ │ WaitingOnChildren  ├───────┘
+//!                                  │  │ └────────────────────┘
+//!                                  │  │   (last child terminal →
+//!                                  │  │    recompute → Pending)
+//!                                  │  │
+//!                                  │  │  pause_on_confirmation
+//!                                  │  ▼
+//!                                  │ ┌─────────────────────────┐
+//!                                  │ │ AwaitingConfirmation    ├─────┘
+//!                                  │ └─────────────────────────┘
+//!                                  │   (resume_from_confirmation
+//!                                  │    → Pending)
+//!                                  │
+//!           complete_task ─────────┤
+//!           fail_task ─────────────┤
+//!           cancel_tree ───────────┤
+//!                                  ▼
+//!                          ┌──────────────────┐
+//!                          │ Completed / Failed│
+//!                          │ / Cancelled       │
+//!                          └──────────────────┘
+//! ```
+//!
+//! ## CAS guards summary
+//!
+//! | Entry point | Status guard | Worker/Lease CAS | Recovery matrix |
+//! |-------------|-------------|------------------|-----------------|
+//! | `submit_root_turn` | kind=root, status=Pending | — | — |
+//! | `promote_next_queued_root` | slot free, queue non-empty | — | — |
+//! | `try_acquire_task` | Pending | — | budget check |
+//! | `acquire_next_runnable` | Pending (scan) | — | budget check, skip-on-exhaust |
+//! | `heartbeat_task` | Running | ✓ worker + lease | — |
+//! | `pause_on_children` | Running | ✓ worker + lease | — |
+//! | `pause_on_confirmation` | Running | ✓ worker + lease | — |
+//! | `spawn_tool_children` | Running, non-leaf | ✓ worker + lease | — |
+//! | `complete_task` | Running | ✓ worker + lease | parent recompute |
+//! | `fail_task` | Running | ✓ worker + lease | parent recompute |
+//! | `resume_from_confirmation` | `AwaitingConfirmation` | — | — |
+//! | `cancel_tree` | exists | — | subtree walk |
+//! | `release_expired_leases` | Running, expired | — | budget + prepared-op check |
+//!
+//! ## Happy-path call sequences
+//!
+//! **Root turn:**
+//! ```text
+//! submit_root_turn → try_acquire_task → heartbeat_task* →
+//!   (complete_task | fail_task | pause_on_children → ... → complete_task)
+//! promote_next_queued_root  (fires after terminal root frees slot)
+//! ```
+//!
+//! **Tool-runtime child:**
+//! ```text
+//! spawn_tool_children  (under parent's lease — parent → WaitingOnChildren)
+//!   → acquire_next_runnable → heartbeat_task* → complete_task | fail_task
+//!   (last child terminal → parent recompute → parent Pending)
+//! ```
+//!
+//! **Recovery path:**
+//! ```text
+//! release_expired_leases → classify_recovery →
+//!   Requeue (budget ok)  →  row returns to Pending
+//!   FailClosed (exhausted / unsafe prepared op)  →  row → Failed
+//! Stale worker's next heartbeat / complete_task / fail_task →
+//!   CAS mismatch → clean rejection
+//! ```
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Actual tool-runtime worker | 2.7+ |
+//! | Actual tool-runtime worker | 3+ |
 //! | Subagent runtime | 3+ |
 //! | Confirmation transport APIs | post-2.4 |
 
