@@ -105,7 +105,8 @@ pub trait TurnAttemptStore: Send + Sync {
 struct Inner {
     /// Primary key index.
     by_id: HashMap<TurnAttemptId, TurnAttempt>,
-    /// Secondary index: task → attempt ids, ordered by `attempt_number`.
+    /// Secondary index: task → attempt ids, in insertion order
+    /// (sorted at query time by `attempt_number`).
     by_task: HashMap<AgentTaskId, Vec<TurnAttemptId>>,
 }
 
@@ -190,6 +191,7 @@ mod tests {
     use super::super::turn_attempt::TurnAttemptSchemaError;
     use super::*;
     use agent_sdk_core::audit::AuditProvenance;
+    use anyhow::{Context, Result};
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -227,70 +229,80 @@ mod tests {
     // ── Open ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn open_attempt_persists_and_is_readable() {
+    async fn open_attempt_persists_and_is_readable() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let attempt = store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open");
+            .context("open")?;
 
         assert!(attempt.is_open());
-        let fetched = store.get(&attempt.id).await.expect("get");
-        assert!(fetched.is_some());
-        assert_eq!(fetched.expect("some").id, attempt.id);
+        let fetched = store
+            .get(&attempt.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(fetched.id, attempt.id);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn open_multiple_attempts_for_same_task() {
+    async fn open_multiple_attempts_for_same_task() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let a1 = store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open 1");
+            .context("open 1")?;
         let a2 = store
             .open_attempt(open_params("task_1", 2))
             .await
-            .expect("open 2");
+            .context("open 2")?;
 
         assert_ne!(a1.id, a2.id);
         assert_eq!(a1.attempt_number, 1);
         assert_eq!(a2.attempt_number, 2);
+        Ok(())
     }
 
     // ── Close ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn close_attempt_fills_response_fields() {
+    async fn close_attempt_fills_response_fields() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let attempt = store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open");
+            .context("open")?;
         let closed = store
             .close_attempt(&attempt.id, close_params(), t_plus(5))
             .await
-            .expect("close");
+            .context("close")?;
 
         assert!(closed.is_closed());
         assert_eq!(closed.duration_ms, Some(5_000));
         assert_eq!(closed.response_id, Some("msg_1".into()));
 
         // Verify the stored row is also closed.
-        let fetched = store.get(&attempt.id).await.expect("get").expect("exists");
+        let fetched = store
+            .get(&attempt.id)
+            .await
+            .context("get")?
+            .context("exists")?;
         assert!(fetched.is_closed());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn close_already_closed_returns_error() {
+    async fn close_already_closed_returns_error() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let attempt = store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open");
+            .context("open")?;
         store
             .close_attempt(&attempt.id, close_params(), t_plus(1))
             .await
-            .expect("close");
+            .context("close")?;
 
         let err = store
             .close_attempt(&attempt.id, close_params(), t_plus(2))
@@ -298,6 +310,7 @@ mod tests {
             .expect_err("should reject double close");
         let schema_err = err.downcast_ref::<TurnAttemptSchemaError>();
         assert_eq!(schema_err, Some(&TurnAttemptSchemaError::AlreadyClosed));
+        Ok(())
     }
 
     #[tokio::test]
@@ -320,107 +333,112 @@ mod tests {
     // ── List ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn list_by_task_returns_ordered_attempts() {
+    async fn list_by_task_returns_ordered_attempts() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         // Insert out of order to verify sorting.
         store
             .open_attempt(open_params("task_1", 3))
             .await
-            .expect("open 3");
+            .context("open 3")?;
         store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open 1");
+            .context("open 1")?;
         store
             .open_attempt(open_params("task_1", 2))
             .await
-            .expect("open 2");
+            .context("open 2")?;
 
         let list = store
             .list_by_task(&AgentTaskId::from_string("task_1"))
             .await
-            .expect("list");
+            .context("list")?;
         assert_eq!(list.len(), 3);
         let numbers: Vec<u32> = list.iter().map(|a| a.attempt_number).collect();
         assert_eq!(numbers, vec![1, 2, 3]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_by_task_returns_empty_for_unknown_task() {
+    async fn list_by_task_returns_empty_for_unknown_task() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let list = store
             .list_by_task(&AgentTaskId::from_string("task_unknown"))
             .await
-            .expect("list");
+            .context("list")?;
         assert!(list.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_by_task_does_not_mix_tasks() {
+    async fn list_by_task_does_not_mix_tasks() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         store
             .open_attempt(open_params("task_a", 1))
             .await
-            .expect("open a1");
+            .context("open a1")?;
         store
             .open_attempt(open_params("task_b", 1))
             .await
-            .expect("open b1");
+            .context("open b1")?;
         store
             .open_attempt(open_params("task_a", 2))
             .await
-            .expect("open a2");
+            .context("open a2")?;
 
         let list_a = store
             .list_by_task(&AgentTaskId::from_string("task_a"))
             .await
-            .expect("list a");
+            .context("list a")?;
         assert_eq!(list_a.len(), 2);
         assert!(list_a.iter().all(|a| a.task_id.as_str() == "task_a"));
 
         let list_b = store
             .list_by_task(&AgentTaskId::from_string("task_b"))
             .await
-            .expect("list b");
+            .context("list b")?;
         assert_eq!(list_b.len(), 1);
+        Ok(())
     }
 
     // ── Get ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn get_nonexistent_returns_none() {
+    async fn get_nonexistent_returns_none() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let result = store
             .get(&TurnAttemptId::from_string("attempt_nope"))
             .await
-            .expect("get");
+            .context("get")?;
         assert!(result.is_none());
+        Ok(())
     }
 
     // ── Mixed open/closed ────────────────────────────────────────
 
     #[tokio::test]
-    async fn list_includes_both_open_and_closed_attempts() {
+    async fn list_includes_both_open_and_closed_attempts() -> Result<()> {
         let store = InMemoryTurnAttemptStore::new();
         let a1 = store
             .open_attempt(open_params("task_1", 1))
             .await
-            .expect("open 1");
+            .context("open 1")?;
         store
             .close_attempt(&a1.id, close_params(), t_plus(2))
             .await
-            .expect("close 1");
+            .context("close 1")?;
         store
             .open_attempt(open_params("task_1", 2))
             .await
-            .expect("open 2");
+            .context("open 2")?;
 
         let list = store
             .list_by_task(&AgentTaskId::from_string("task_1"))
             .await
-            .expect("list");
+            .context("list")?;
         assert_eq!(list.len(), 2);
         assert!(list[0].is_closed());
         assert!(list[1].is_open());
+        Ok(())
     }
 }

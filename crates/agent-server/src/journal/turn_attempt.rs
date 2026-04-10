@@ -137,10 +137,6 @@ pub enum TurnAttemptSchemaError {
     #[error("open attempt must not have an outcome")]
     OutcomeOnOpenAttempt,
 
-    /// A closed attempt has no `closed_at` timestamp.
-    #[error("closed attempt must have a closed_at timestamp")]
-    ClosedWithoutTimestamp,
-
     /// An open attempt has response fields set.
     #[error("open attempt must not have response fields")]
     ResponseOnOpenAttempt,
@@ -338,7 +334,9 @@ impl TurnAttempt {
     /// # Invariants
     ///
     /// - **Open** rows must not have: `outcome`, `response_blob`,
-    ///   `response_model`, `duration_ms`, `closed_at`.
+    ///   `response_model`, `response_id`, `stop_reason`,
+    ///   `input_tokens`, `output_tokens`, `cached_input_tokens`,
+    ///   `duration_ms`, `closed_at`.
     /// - **Closed** rows must have: `outcome`, `duration_ms`,
     ///   `closed_at`.
     ///
@@ -360,7 +358,14 @@ impl TurnAttempt {
             if self.outcome.is_some() {
                 return Err(TurnAttemptSchemaError::OutcomeOnOpenAttempt);
             }
-            if self.response_blob.is_some() || self.response_model.is_some() {
+            if self.response_blob.is_some()
+                || self.response_model.is_some()
+                || self.response_id.is_some()
+                || self.stop_reason.is_some()
+                || self.input_tokens.is_some()
+                || self.output_tokens.is_some()
+                || self.cached_input_tokens.is_some()
+            {
                 return Err(TurnAttemptSchemaError::ResponseOnOpenAttempt);
             }
             if self.duration_ms.is_some() {
@@ -425,6 +430,7 @@ pub struct CloseAttemptParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -482,17 +488,18 @@ mod tests {
     }
 
     #[test]
-    fn attempt_id_round_trips_through_json() {
+    fn attempt_id_round_trips_through_json() -> Result<()> {
         let id = TurnAttemptId::from_string("attempt_rnd");
-        let json = serde_json::to_string(&id).expect("serialize");
-        let back: TurnAttemptId = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&id).context("serialize")?;
+        let back: TurnAttemptId = serde_json::from_str(&json).context("deserialize")?;
         assert_eq!(back, id);
+        Ok(())
     }
 
     // ── Outcome ──────────────────────────────────────────────────
 
     #[test]
-    fn outcome_as_str_matches_serde() {
+    fn outcome_as_str_matches_serde() -> Result<()> {
         for (outcome, expected) in [
             (TurnAttemptOutcome::Success, "success"),
             (TurnAttemptOutcome::RateLimited, "rate_limited"),
@@ -501,9 +508,10 @@ mod tests {
             (TurnAttemptOutcome::Cancelled, "cancelled"),
         ] {
             assert_eq!(outcome.as_str(), expected);
-            let json = serde_json::to_value(&outcome).expect("serialize");
-            assert_eq!(json.as_str().expect("string"), expected);
+            let json = serde_json::to_value(&outcome).context("serialize")?;
+            assert_eq!(json.as_str().context("string")?, expected);
         }
+        Ok(())
     }
 
     // ── Open ─────────────────────────────────────────────────────
@@ -526,11 +534,11 @@ mod tests {
     // ── Close ────────────────────────────────────────────────────
 
     #[test]
-    fn close_attempt_fills_response_fields() {
+    fn close_attempt_fills_response_fields() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(sample_close_params(), t_plus(5))
-            .expect("close");
+            .context("close")?;
 
         assert!(closed.is_closed());
         assert!(!closed.is_open());
@@ -548,31 +556,36 @@ mod tests {
         assert_eq!(closed.output_tokens, Some(50));
         assert_eq!(closed.cached_input_tokens, Some(10));
         assert_eq!(closed.duration_ms, Some(5_000));
-        assert!(closed.validate().is_ok());
+        closed.validate().context("validate")?;
+        Ok(())
     }
 
     #[test]
-    fn close_on_already_closed_returns_error() {
+    fn close_on_already_closed_returns_error() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(sample_close_params(), t_plus(1))
-            .expect("close");
+            .context("close")?;
         let err = closed
             .close(sample_close_params(), t_plus(2))
             .expect_err("should reject double close");
         assert_eq!(err, TurnAttemptSchemaError::AlreadyClosed);
+        Ok(())
     }
 
     #[test]
-    fn close_with_clock_skew_clamps_to_zero() {
+    fn close_with_clock_skew_clamps_to_zero() -> Result<()> {
         let params = OpenAttemptParams {
             now: t_plus(10),
             ..sample_open_params()
         };
         let attempt = TurnAttempt::open(params);
         // Close *before* open time → duration should clamp to 0
-        let closed = attempt.close(sample_close_params(), t0()).expect("close");
+        let closed = attempt
+            .close(sample_close_params(), t0())
+            .context("close")?;
         assert_eq!(closed.duration_ms, Some(0));
+        Ok(())
     }
 
     // ── Validation edge cases ────────────────────────────────────
@@ -582,8 +595,8 @@ mod tests {
         let mut attempt = TurnAttempt::open(sample_open_params());
         attempt.outcome = Some(TurnAttemptOutcome::Success);
         assert_eq!(
-            attempt.validate().expect_err("should fail"),
-            TurnAttemptSchemaError::OutcomeOnOpenAttempt,
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::OutcomeOnOpenAttempt),
         );
     }
 
@@ -592,8 +605,52 @@ mod tests {
         let mut attempt = TurnAttempt::open(sample_open_params());
         attempt.response_blob = Some(serde_json::json!({}));
         assert_eq!(
-            attempt.validate().expect_err("should fail"),
-            TurnAttemptSchemaError::ResponseOnOpenAttempt,
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
+        );
+    }
+
+    #[test]
+    fn open_with_response_id_fails_validation() {
+        let mut attempt = TurnAttempt::open(sample_open_params());
+        attempt.response_id = Some("msg_01".into());
+        assert_eq!(
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
+        );
+    }
+
+    #[test]
+    fn open_with_stop_reason_fails_validation() {
+        let mut attempt = TurnAttempt::open(sample_open_params());
+        attempt.stop_reason = Some(agent_sdk_core::llm::StopReason::EndTurn);
+        assert_eq!(
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
+        );
+    }
+
+    #[test]
+    fn open_with_usage_tokens_fails_validation() {
+        let mut attempt = TurnAttempt::open(sample_open_params());
+        attempt.input_tokens = Some(100);
+        assert_eq!(
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
+        );
+
+        let mut attempt = TurnAttempt::open(sample_open_params());
+        attempt.output_tokens = Some(50);
+        assert_eq!(
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
+        );
+
+        let mut attempt = TurnAttempt::open(sample_open_params());
+        attempt.cached_input_tokens = Some(10);
+        assert_eq!(
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),
         );
     }
 
@@ -602,8 +659,8 @@ mod tests {
         let mut attempt = TurnAttempt::open(sample_open_params());
         attempt.duration_ms = Some(123);
         assert_eq!(
-            attempt.validate().expect_err("should fail"),
-            TurnAttemptSchemaError::DurationOnOpenAttempt,
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::DurationOnOpenAttempt),
         );
     }
 
@@ -614,8 +671,8 @@ mod tests {
         attempt.closed_at = Some(t_plus(1));
         attempt.duration_ms = Some(1_000);
         assert_eq!(
-            attempt.validate().expect_err("should fail"),
-            TurnAttemptSchemaError::ClosedWithoutOutcome,
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ClosedWithoutOutcome),
         );
     }
 
@@ -625,18 +682,18 @@ mod tests {
         attempt.closed_at = Some(t_plus(1));
         attempt.outcome = Some(TurnAttemptOutcome::Success);
         assert_eq!(
-            attempt.validate().expect_err("should fail"),
-            TurnAttemptSchemaError::ClosedWithoutDuration,
+            attempt.validate(),
+            Err(TurnAttemptSchemaError::ClosedWithoutDuration),
         );
     }
 
     // ── JSON round-trip ──────────────────────────────────────────
 
     #[test]
-    fn open_attempt_round_trips_through_json() {
+    fn open_attempt_round_trips_through_json() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
-        let json = serde_json::to_string(&attempt).expect("serialize");
-        let back: TurnAttempt = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&attempt).context("serialize")?;
+        let back: TurnAttempt = serde_json::from_str(&json).context("deserialize")?;
 
         assert_eq!(back.id, attempt.id);
         assert_eq!(back.task_id, attempt.task_id);
@@ -644,33 +701,35 @@ mod tests {
         assert_eq!(back.provider, attempt.provider);
         assert_eq!(back.requested_model, attempt.requested_model);
         assert!(back.is_open());
-        assert!(back.validate().is_ok());
+        back.validate().context("validate")?;
+        Ok(())
     }
 
     #[test]
-    fn closed_attempt_round_trips_through_json() {
+    fn closed_attempt_round_trips_through_json() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(sample_close_params(), t_plus(3))
-            .expect("close");
-        let json = serde_json::to_string(&closed).expect("serialize");
-        let back: TurnAttempt = serde_json::from_str(&json).expect("deserialize");
+            .context("close")?;
+        let json = serde_json::to_string(&closed).context("serialize")?;
+        let back: TurnAttempt = serde_json::from_str(&json).context("deserialize")?;
 
         assert_eq!(back.id, closed.id);
         assert!(back.is_closed());
         assert_eq!(back.outcome, closed.outcome);
         assert_eq!(back.duration_ms, closed.duration_ms);
         assert_eq!(back.response_id, closed.response_id);
-        assert!(back.validate().is_ok());
+        back.validate().context("validate")?;
+        Ok(())
     }
 
     #[test]
-    fn closed_attempt_json_contains_expected_fields() {
+    fn closed_attempt_json_contains_expected_fields() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(sample_close_params(), t_plus(2))
-            .expect("close");
-        let json = serde_json::to_value(&closed).expect("serialize");
+            .context("close")?;
+        let json = serde_json::to_value(&closed).context("serialize")?;
 
         // Verify provenance fields are present
         assert_eq!(json["provider"], "anthropic");
@@ -689,6 +748,7 @@ mod tests {
 
         // Verify timing
         assert_eq!(json["duration_ms"], 2_000);
+        Ok(())
     }
 
     // ── Multiple attempts ────────────────────────────────────────
@@ -707,7 +767,7 @@ mod tests {
     // ── Non-success outcomes ─────────────────────────────────────
 
     #[test]
-    fn rate_limited_attempt_closes_with_empty_response() {
+    fn rate_limited_attempt_closes_with_empty_response() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(
@@ -723,14 +783,15 @@ mod tests {
                 },
                 t_plus(1),
             )
-            .expect("close");
+            .context("close")?;
         assert_eq!(closed.outcome, Some(TurnAttemptOutcome::RateLimited));
         assert!(closed.response_id.is_none());
-        assert!(closed.validate().is_ok());
+        closed.validate().context("validate")?;
+        Ok(())
     }
 
     #[test]
-    fn cancelled_attempt_closes_successfully() {
+    fn cancelled_attempt_closes_successfully() -> Result<()> {
         let attempt = TurnAttempt::open(sample_open_params());
         let closed = attempt
             .close(
@@ -746,8 +807,9 @@ mod tests {
                 },
                 t_plus(1),
             )
-            .expect("close");
+            .context("close")?;
         assert_eq!(closed.outcome, Some(TurnAttemptOutcome::Cancelled));
-        assert!(closed.validate().is_ok());
+        closed.validate().context("validate")?;
+        Ok(())
     }
 }
