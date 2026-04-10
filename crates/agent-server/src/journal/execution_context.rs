@@ -123,8 +123,8 @@ pub async fn build_root_worker_inputs(
         .await
         .context("build_root_worker_inputs: recover thread")?;
 
-    // 2. Validate thread binding.
-    ensure_thread_match(&bootstrap.thread_id, &recovery_view.thread.thread_id)?;
+    // 2. Validate task is bound to the bootstrap thread.
+    ensure_thread_match(&bootstrap.thread_id, &bootstrap.task.thread_id)?;
 
     // 3. Seed staged stores from the recovery view.
     let staged_stores = StagedStores::from_recovery_view(&recovery_view)
@@ -506,15 +506,30 @@ mod tests {
     // ── Thread mismatch guard ────────────────────────────────────
 
     #[tokio::test]
-    async fn build_rejects_thread_mismatch() {
-        let wrong_thread = ThreadId::from_string("t-wrong");
-        let right_thread = ThreadId::from_string("t-right");
+    async fn build_rejects_thread_mismatch() -> Result<()> {
+        let s = Stores::new();
 
-        let err = ensure_thread_match(&wrong_thread, &right_thread).unwrap_err();
+        // Construct a bootstrap where thread_id != task.thread_id.
+        let task = AgentTask::new_root_turn(ThreadId::from_string("t-task-thread"), t0(), 3);
+        let bootstrap = WorkerBootstrapContext {
+            thread_id: ThreadId::from_string("t-bootstrap-thread"),
+            task_id: task.id.clone(),
+            worker_id: WorkerId::from_string("worker_test"),
+            lease_id: LeaseId::from_string("lease_test"),
+            definition: sample_definition(),
+            task,
+        };
+
+        let err = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
+            .await
+            .err()
+            .expect("should reject mismatched thread_id");
         assert!(
             err.to_string().contains("does not match"),
             "expected mismatch error, got: {err}",
         );
+
+        Ok(())
     }
 
     // ── Definition is preserved ──────────────────────────────────
