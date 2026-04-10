@@ -268,6 +268,7 @@ mod tests {
             state: AgentState::new(thread.clone()),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         // Round-trip the continuation through JSON (server persistence)
@@ -503,6 +504,7 @@ mod tests {
             state: AgentState::new(thread.clone()),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         let envelope = ContinuationEnvelope::wrap(continuation);
@@ -758,6 +760,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         }));
 
         let variants = vec![

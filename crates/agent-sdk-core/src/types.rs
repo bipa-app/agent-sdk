@@ -460,6 +460,17 @@ pub struct AgentContinuation {
     /// `None` for continuations persisted before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<crate::llm::StopReason>,
+    /// Full content blocks from the LLM response that produced this
+    /// turn's pending tool calls (text, thinking, and tool-use blocks).
+    ///
+    /// When the LLM emits text before tool calls (e.g. "I will run
+    /// that." followed by a `tool_use` block), those text blocks must be
+    /// preserved so Phase 5 can reconstruct the complete assistant
+    /// message in the conversation history.
+    ///
+    /// Empty for continuations persisted before this field was added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_content: Vec<crate::llm::ContentBlock>,
 }
 
 // ── Versioned continuation envelope ──────────────────────────────────
@@ -1185,6 +1196,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: Some("resp_7914".into()),
             stop_reason: Some(StopReason::ToolUse),
+            response_content: Vec::new(),
         }
     }
 
@@ -1257,9 +1269,11 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
         let value = serde_json::to_value(&cont).unwrap();
         assert!(value.get("response_id").is_none());
         assert!(value.get("stop_reason").is_none());
+        assert!(value.get("response_content").is_none());
     }
 }

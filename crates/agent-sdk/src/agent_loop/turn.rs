@@ -962,6 +962,7 @@ where
                     state: state.clone(),
                     response_id: response_id.clone(),
                     stop_reason,
+                    response_content: Vec::new(),
                 };
 
                 return Err(InternalTurnResult::AwaitingConfirmation {
@@ -1603,6 +1604,7 @@ where
             state: ctx.state.clone(),
             response_id: ctx.response_id.clone(),
             stop_reason: ctx.stop_reason,
+            response_content: Vec::new(),
         };
         return InternalTurnResult::PendingToolCalls {
             turn_usage,

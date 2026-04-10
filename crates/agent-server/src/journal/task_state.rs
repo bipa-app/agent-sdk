@@ -251,6 +251,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         })
     }
 
