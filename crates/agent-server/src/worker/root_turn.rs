@@ -1,35 +1,42 @@
-//! Text-only root turn execution and completed-turn commit.
+//! Root turn execution: text-only commit and tool-boundary suspension.
 //!
-//! This is the Phase 4.3 tracer bullet: the first end-to-end root worker
-//! path that acquires a task, runs one model-side turn (no tool calls),
-//! and atomically commits the result.
+//! This module drives a single root-turn attempt from LLM call through
+//! to either a completed-turn commit (text-only) or a tool-boundary
+//! suspension that spawns child tasks (tool calls present).
 //!
 //! # Execution flow
 //!
 //! 1. **Open turn attempt** — audit record via [`TurnAttemptStore`].
 //! 2. **Build chat request** — system prompt + staged messages + user
 //!    prompt from [`AgentDefinition`] and [`RootWorkerInputs`].
-//! 3. **Call LLM** — `LlmProvider::chat()` directly (no full SDK agent
-//!    loop needed for a single text-only turn).
-//! 4. **Buffer response** — append user + assistant messages to staged
-//!    stores and update agent state.
-//! 5. **Commit** — drain staged stores → [`commit_completed_turn`].
-//! 6. **Complete task** — [`AgentTaskStore::complete_task`].
-//!
-//! # Scope
-//!
-//! This module handles **text-only** turns only. Tool-call suspension,
-//! child-task creation, and resume flows are out of scope (Phase 4.4+).
+//! 3. **Call LLM** — `LlmProvider::chat()`.
+//! 4. **Branch on response content:**
+//!    - **Text-only** (Phase 4.3): buffer messages, drain staged stores,
+//!      [`commit_completed_turn`], advance task to `Completed`.
+//!    - **Tool calls** (Phase 4.4): build [`ContinuationEnvelope`],
+//!      close the turn attempt, [`spawn_tool_children`] to atomically
+//!      create `tool_runtime` children and park the parent in
+//!      `WaitingOnChildren`. No checkpoint is created.
 //!
 //! # Guarantees
 //!
-//! - No durable writes before the commit path succeeds.
-//! - Turn attempt is closed atomically as part of the commit.
-//! - Task advances to `Completed` only after commit succeeds.
+//! - No durable writes before the commit path succeeds (text-only).
+//! - Turn attempt is closed atomically as part of the commit (text-only)
+//!   or explicitly before child spawn (tool suspension).
+//! - Task advances to `Completed` only after commit succeeds (text-only).
+//! - On the suspension path, the parent task holds a
+//!   [`ContinuationEnvelope`] in its [`TaskState::WaitingOnChildren`]
+//!   payload — enough for Phase 5 to resume.
+//!
+//! [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+//! [`spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
+//! [`TaskState::WaitingOnChildren`]: crate::journal::task_state::TaskState::WaitingOnChildren
 
 use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::llm::{self, ChatOutcome, ChatRequest};
-use agent_sdk_core::{AgentState, TokenUsage};
+use agent_sdk_core::{
+    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage, ToolTier,
+};
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail};
@@ -41,6 +48,7 @@ use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_complete
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::AgentTaskStore;
+use crate::journal::task::{AgentTask, ChildSpawnSpec};
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
@@ -69,36 +77,65 @@ pub struct RootTurnDeps<'a> {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Result of a successful [`execute_root_turn`].
+///
+/// The two variants correspond to the text-only (Phase 4.3) and
+/// tool-suspension (Phase 4.4) paths.
 #[derive(Debug)]
-pub struct RootTurnOutcome {
-    /// The commit outcome (thread, checkpoint, closed attempt).
-    pub commit: CommitOutcome,
-    /// The completed task after advancing.
-    pub completed_task: crate::journal::task::AgentTask,
-    /// The assistant's text response.
-    pub response_text: String,
+pub enum RootTurnOutcome {
+    /// Text-only turn completed and committed.
+    ///
+    /// A checkpoint was created, the message projection was updated,
+    /// and the task is now `Completed`.
+    Completed {
+        /// The commit outcome (thread, checkpoint, closed attempt).
+        ///
+        /// Boxed to keep the enum size small (the `Suspended` variant
+        /// is much smaller).
+        commit: Box<CommitOutcome>,
+        /// The completed task after advancing.
+        completed_task: AgentTask,
+        /// The assistant's text response.
+        response_text: String,
+    },
+
+    /// Turn suspended at the tool boundary.
+    ///
+    /// The parent task is now `WaitingOnChildren` with a
+    /// [`ContinuationEnvelope`] persisted on its [`TaskState`].
+    /// One `tool_runtime` child task was created per tool call.
+    /// No checkpoint or message-projection write occurred.
+    ///
+    /// [`TaskState`]: crate::journal::task_state::TaskState
+    Suspended {
+        /// The parent task after transitioning to `WaitingOnChildren`.
+        parent_task: AgentTask,
+        /// The child tasks created, one per tool call.
+        child_tasks: Vec<AgentTask>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────
 
-/// Execute a text-only root turn end to end.
+/// Execute a root turn end to end.
 ///
-/// This is the Phase 4.3 happy-path tracer bullet. It:
+/// Depending on the LLM response this either:
 ///
-/// 1. Opens a turn attempt for audit.
-/// 2. Calls the LLM with the staged message history + user prompt.
-/// 3. Buffers the response in staged stores.
-/// 4. Atomically commits via [`commit_completed_turn`].
-/// 5. Advances the root task to `Completed`.
+/// - **Text-only** (no tool calls): buffers messages, commits the turn,
+///   and advances the task to `Completed`.
+/// - **Tool calls present**: builds a [`ContinuationEnvelope`], spawns
+///   one `tool_runtime` child per tool call, and parks the parent task
+///   in `WaitingOnChildren`.
 ///
 /// # Errors
 ///
 /// - LLM returns a non-success outcome (rate limit, server error, etc.)
-/// - LLM response contains tool calls (not supported in this phase)
-/// - Commit path fails
-/// - Task completion fails
+/// - Commit path fails (text-only)
+/// - Task completion fails (text-only)
+/// - Child spawn fails (tool suspension)
+///
+/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
 pub async fn execute_root_turn(
     inputs: RootWorkerInputs,
     user_prompt: &str,
@@ -132,9 +169,16 @@ pub async fn execute_root_turn(
     // reflects actual wall-clock latency instead of always being 0.
     let commit_now = OffsetDateTime::now_utc();
 
+    // 3. Branch: tool calls → suspend; text-only → commit.
+    if response.has_tool_use() {
+        return suspend_at_tool_boundary(inputs, response, attempt, deps, now).await;
+    }
+
+    // ── Text-only path (Phase 4.3) ──────────────────────────────
+
     let response_text = response.first_text().unwrap_or("").to_owned();
 
-    // 3. Buffer in staged stores.
+    // 4. Buffer in staged stores.
     buffer_turn_messages(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
@@ -218,8 +262,8 @@ pub async fn execute_root_turn(
         .await
         .context("complete root task")?;
 
-    Ok(RootTurnOutcome {
-        commit,
+    Ok(RootTurnOutcome::Completed {
+        commit: Box::new(commit),
         completed_task,
         response_text,
     })
@@ -305,6 +349,10 @@ async fn build_chat_request(
 
 /// Call the LLM and resolve the outcome, closing the turn attempt on
 /// any non-success path before returning an error.
+///
+/// On success the response is returned as-is — it may contain tool-use
+/// blocks. The caller is responsible for branching on text-only vs
+/// tool-call paths.
 async fn call_llm(
     provider: &dyn LlmProvider,
     request: ChatRequest,
@@ -335,16 +383,6 @@ async fn call_llm(
             bail!("LLM server error: {msg}");
         }
     };
-
-    // Validate text-only (no tool calls in Phase 4.3).
-    let tool_count = response.tool_uses().count();
-    if tool_count > 0 {
-        close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
-        bail!(
-            "Phase 4.3 text-only path received {tool_count} tool call(s); \
-             tool-call suspension is not yet implemented (Phase 4.4+)"
-        );
-    }
 
     Ok(response)
 }
@@ -463,4 +501,176 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
         output_tokens: response.usage.output_tokens,
         cached_input_tokens: response.usage.cached_input_tokens,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tool-boundary suspension (Phase 4.4)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Suspend execution at the tool boundary.
+///
+/// Called when the LLM response contains tool-use blocks. This path:
+///
+/// 1. Closes the turn attempt with `Success` (the LLM call succeeded).
+/// 2. Builds a [`ContinuationEnvelope`] capturing the agent state,
+///    pending tool calls, and LLM response metadata.
+/// 3. Creates one [`ChildSpawnSpec`] per tool call.
+/// 4. Atomically spawns children and parks the parent via
+///    [`AgentTaskStore::spawn_tool_children`].
+///
+/// No checkpoint or message-projection write occurs on this path.
+///
+/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+async fn suspend_at_tool_boundary(
+    inputs: RootWorkerInputs,
+    response: llm::ChatResponse,
+    attempt: TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let task_id = &inputs.bootstrap.task_id;
+
+    // 1. Close the turn attempt — the LLM call itself succeeded.
+    let close_params = build_close_params(&response, &attempt);
+    deps.attempt_store
+        .close_attempt(&attempt.id, close_params, now)
+        .await
+        .context("close attempt on tool suspension")?;
+
+    // 2. Build the continuation envelope from current state + response.
+    let continuation = build_continuation(&inputs, &response)
+        .await
+        .context("build continuation for tool suspension")?;
+
+    // 3. One child task per tool call.
+    let tool_call_count = response.tool_uses().count();
+    let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
+        .map(|_| ChildSpawnSpec::default())
+        .collect();
+
+    // 4. Atomically spawn children and park the parent.
+    let (parent_task, child_tasks) = deps
+        .task_store
+        .spawn_tool_children(
+            task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            specs,
+            continuation,
+            now,
+        )
+        .await
+        .context("spawn tool children")?;
+
+    Ok(RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+    })
+}
+
+/// Build a [`ContinuationEnvelope`] capturing the state at the tool
+/// boundary.
+///
+/// The continuation includes:
+/// - Thread/turn identity
+/// - Cumulative and per-turn token usage
+/// - The pending tool calls extracted from the LLM response
+/// - The agent state snapshot (turn count and usage updated)
+/// - LLM response metadata (response ID, stop reason)
+///
+/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+async fn build_continuation(
+    inputs: &RootWorkerInputs,
+    response: &llm::ChatResponse,
+) -> Result<ContinuationEnvelope> {
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    // Load current agent state from staged stores (seeded from the
+    // latest checkpoint during recovery).
+    let current_state = inputs
+        .staged_stores
+        .state
+        .load(thread_id)
+        .await?
+        .unwrap_or_else(|| AgentState::new(thread_id.clone()));
+
+    let turn_usage = TokenUsage {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+    };
+
+    let total_usage = TokenUsage {
+        input_tokens: current_state
+            .total_usage
+            .input_tokens
+            .saturating_add(turn_usage.input_tokens),
+        output_tokens: current_state
+            .total_usage
+            .output_tokens
+            .saturating_add(turn_usage.output_tokens),
+    };
+
+    let updated_state = AgentState {
+        turn_count: current_state.turn_count + 1,
+        total_usage: total_usage.clone(),
+        ..current_state
+    };
+
+    let pending_tool_calls =
+        extract_pending_tool_calls(response, &inputs.bootstrap.definition.tools);
+    let turn_number =
+        usize::try_from(inputs.recovery_view.next_turn_number).context("turn number overflow")?;
+
+    // `awaiting_index` and `completed_results` are artifacts of the
+    // SDK's inline confirmation flow (sequential tool processing with
+    // mid-batch pauses). The server dispatches all tool calls as child
+    // tasks simultaneously, so neither field is meaningful here. They
+    // are set to their zero values so the struct is well-formed.
+    let continuation = AgentContinuation {
+        thread_id: thread_id.clone(),
+        turn: turn_number,
+        total_usage,
+        turn_usage,
+        pending_tool_calls,
+        awaiting_index: 0,
+        completed_results: Vec::new(),
+        state: updated_state,
+        response_id: Some(response.id.clone()),
+        stop_reason: response.stop_reason,
+    };
+
+    Ok(ContinuationEnvelope::wrap(continuation))
+}
+
+/// Extract [`PendingToolCallInfo`] from each tool-use block in the
+/// LLM response, resolving `tier` and `display_name` from the
+/// authoritative tool definitions on the [`AgentDefinition`].
+///
+/// [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
+/// [`AgentDefinition`]: super::definition::AgentDefinition
+fn extract_pending_tool_calls(
+    response: &llm::ChatResponse,
+    tool_defs: &[llm::Tool],
+) -> Vec<PendingToolCallInfo> {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                let def = tool_defs.iter().find(|t| t.name == *name);
+                Some(PendingToolCallInfo {
+                    id: id.clone(),
+                    name: name.clone(),
+                    display_name: def.map_or_else(|| name.clone(), |d| d.display_name.clone()),
+                    tier: def.map_or(ToolTier::Confirm, |d| d.tier),
+                    input: input.clone(),
+                    effective_input: input.clone(),
+                    listen_context: None,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }

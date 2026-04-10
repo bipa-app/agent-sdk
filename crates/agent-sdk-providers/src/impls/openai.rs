@@ -1707,6 +1707,8 @@ mod tests {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            display_name: "Test Tool".to_string(),
+            tier: agent_sdk_core::ToolTier::Observe,
         };
 
         let api_tool = convert_tool(tool);
@@ -1937,6 +1939,8 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
+                display_name: "Read File".to_string(),
+                tier: agent_sdk_core::ToolTier::Observe,
             }]),
             max_tokens: 1024,
             max_tokens_explicit: true,
