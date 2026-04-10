@@ -157,10 +157,12 @@ pub use agent_sdk_tools::{
     EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority, StoredTurnEvents,
 };
 
-/// Phase 4 worker types: definition, registry, and bootstrap context.
+/// Phase 4 worker types: definition, registry, bootstrap context,
+/// and root turn execution.
 pub use worker::{
-    AgentDefinition, AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry, RuntimePolicy,
-    ThinkingPolicy, WorkerBootstrapContext, resolve_bootstrap_context,
+    AgentDefinition, AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry, RootTurnDeps,
+    RootTurnOutcome, RuntimePolicy, ThinkingPolicy, WorkerBootstrapContext, execute_root_turn,
+    resolve_bootstrap_context,
 };
 
 #[cfg(test)]
