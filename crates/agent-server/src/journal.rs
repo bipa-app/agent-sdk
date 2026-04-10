@@ -13,7 +13,7 @@
 //!   structural / state-machine invariants
 //! - Pure state-transition helpers every later phase can build on
 //!
-//! Phase 2.2 (ENG-7916) layers same-thread FIFO root queueing on top:
+//! Phase 2.2 (ENG-7916) layered same-thread FIFO root queueing on top:
 //!
 //! - [`AgentTaskStore::submit_root_turn`] durably admits a new root as
 //!   `Pending` when the thread's active-root slot is free, or converts
@@ -29,15 +29,38 @@
 //!   `Queued` rows do not occupy the slot and may coexist with the
 //!   blocking root.
 //!
-//! Later phases layer acquisition, retries, and tool execution on top
-//! without re-modelling the state machine.
+//! Phase 2.3 (ENG-7917) layers guarded acquisition, lease ownership,
+//! and heartbeat plumbing on top of the schema:
+//!
+//! - [`AgentTaskStore::try_acquire_task`] performs a targeted CAS
+//!   claim on a single task id and returns `None` if the row is not
+//!   runnable. Two workers racing on the same id are serialised by
+//!   the store's write lock so exactly one wins.
+//! - [`AgentTaskStore::acquire_next_runnable`] scans the global
+//!   runnable index (oldest `created_at` first) and atomically claims
+//!   the head. Root turns and tool-runtime children share the same
+//!   lease path, which is the "one acquisition and lease model that
+//!   prevents double ownership across task kinds" the issue requires.
+//! - [`AgentTaskStore::heartbeat_task`] refreshes the lease under a
+//!   `(worker_id, lease_id)` CAS guard so a stale worker that lost
+//!   its lease cannot extend a row it no longer owns.
+//! - [`AgentTaskStore::release_expired_leases`] walks the global
+//!   lease-expiry index and returns every leased row whose
+//!   `lease_expires_at <= now` to `Pending`, leaving still-live
+//!   leases untouched.
+//! - Waiting (`WaitingOnChildren`, `AwaitingConfirmation`), terminal,
+//!   and `Queued` rows are deliberately invisible to both the
+//!   targeted and scanning acquire paths.
+//!
+//! Later phases layer retries, recovery matrices, and tool execution
+//! on top without re-modelling the state machine.
 //!
 //! # Required store indexes
 //!
 //! The [`AgentTaskStore`] trait is deliberately thin, but every
 //! production implementation is expected to expose the indexes listed
 //! below. The in-memory reference implementation enforces them directly
-//! so Phase 2.2+ can rely on their semantics.
+//! so Phase 2.3+ can rely on their semantics.
 //!
 //! 1. Primary key on `id`
 //! 2. `(thread_id)` — for listing a thread's history and for 2.2 FIFO
@@ -52,14 +75,18 @@
 //!    `kind = root_turn AND status = queued` — powers
 //!    [`AgentTaskStore::list_queued_roots`] and
 //!    [`AgentTaskStore::promote_next_queued_root`].
-//! 7. `(worker_id, lease_expires_at)` — for 2.3 lease-expiry sweeping
-//!    (the fields live on the row in 2.1; the index itself lands in 2.3)
+//! 7. Global runnable FIFO index on `(created_at, id)` where
+//!    `status = pending` — powers
+//!    [`AgentTaskStore::acquire_next_runnable`] across both root
+//!    turns and tool-runtime children.
+//! 8. Global lease-expiry index on `(lease_expires_at, id)` where
+//!    `status = running` — powers
+//!    [`AgentTaskStore::release_expired_leases`].
 //!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Lease acquisition / expiry sweep API | 2.3 |
 //! | Confirmation / resume wiring | 2.4 |
 //! | Retry budget + recovery workers | 2.5 |
 //! | Tool-runtime child orchestration | 2.6 |

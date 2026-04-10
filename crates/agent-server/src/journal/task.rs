@@ -12,6 +12,13 @@
 //! to key its partial-unique "one active root per thread" index — the
 //! queue itself lives in [`super::store`].
 //!
+//! Phase 2.3 (ENG-7917) extends [`AgentTask::touch_heartbeat`] to CAS
+//! on **both** the worker id and the lease id (a fresh
+//! [`TaskSchemaError::HeartbeatLeaseMismatch`] variant covers the
+//! lease half) and to bump `lease_expires_at` alongside the heartbeat
+//! timestamp. The acquisition / scan / sweep wiring lives in
+//! [`super::store`].
+//!
 //! Later phases layer on top:
 //!
 //! | Phase | What it adds |
@@ -382,6 +389,8 @@ pub enum TaskSchemaError {
     InvalidTransition { from: TaskStatus, to: TaskStatus },
     #[error("heartbeat worker_id does not match the task's current lease")]
     HeartbeatWorkerMismatch,
+    #[error("heartbeat lease_id does not match the task's current lease")]
+    HeartbeatLeaseMismatch,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -981,14 +990,31 @@ impl AgentTask {
 
     /// Refresh the heartbeat timestamp on a running lease.
     ///
+    /// The caller must identify the current lease holder on **both**
+    /// dimensions — the `worker` and `lease` arguments are checked against
+    /// [`Self::worker_id`] and [`Self::lease_id`] so that a stale worker
+    /// that still has the right `WorkerId` but an older `LeaseId` (for
+    /// example after its lease expired and was re-acquired) cannot refresh
+    /// the row it no longer owns.
+    ///
+    /// In addition to stamping `last_heartbeat_at = now`, this helper also
+    /// bumps `lease_expires_at = expires_at`, because heartbeats are the
+    /// mechanism workers use to extend their exclusive window on a row.
+    /// Pass `now` for both if the caller wants to keep the existing
+    /// expiry; Phase 2.3's store wrapper supplies the bumped value.
+    ///
     /// # Errors
     /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
     ///   [`TaskStatus::Running`].
     /// - [`TaskSchemaError::HeartbeatWorkerMismatch`] if the `worker`
     ///   argument does not match the current lease holder.
+    /// - [`TaskSchemaError::HeartbeatLeaseMismatch`] if the `lease`
+    ///   argument does not match the current `lease_id`.
     pub fn touch_heartbeat(
         &mut self,
         worker: &WorkerId,
+        lease: &LeaseId,
+        expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -1001,7 +1027,12 @@ impl AgentTask {
             Some(current) if current == worker => {}
             _ => return Err(TaskSchemaError::HeartbeatWorkerMismatch),
         }
+        match &self.lease_id {
+            Some(current) if current == lease => {}
+            _ => return Err(TaskSchemaError::HeartbeatLeaseMismatch),
+        }
         self.last_heartbeat_at = Some(now);
+        self.lease_expires_at = Some(expires_at);
         self.updated_at = now;
         self.validate()?;
         Ok(())
@@ -1604,11 +1635,16 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_requires_matching_worker_and_running_state() -> Result<()> {
+    fn heartbeat_requires_matching_worker_lease_and_running_state() -> Result<()> {
         // Wrong state
         let mut pending = fresh_root();
         let err = pending
-            .touch_heartbeat(&WorkerId::from_string("w1"), t_plus(1))
+            .touch_heartbeat(
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
             .unwrap_err();
         assert!(matches!(err, TaskSchemaError::InvalidTransition { .. }));
 
@@ -1622,15 +1658,38 @@ mod tests {
             )
             .context("running")?;
         let err = running
-            .touch_heartbeat(&WorkerId::from_string("other"), t_plus(2))
+            .touch_heartbeat(
+                &WorkerId::from_string("other"),
+                &LeaseId::from_string("l1"),
+                t_plus(120),
+                t_plus(2),
+            )
             .unwrap_err();
         assert_eq!(err, TaskSchemaError::HeartbeatWorkerMismatch);
 
-        // Right state, right worker
+        // Right state, right worker, wrong lease
+        let err = running
+            .touch_heartbeat(
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l-stale"),
+                t_plus(120),
+                t_plus(2),
+            )
+            .unwrap_err();
+        assert_eq!(err, TaskSchemaError::HeartbeatLeaseMismatch);
+
+        // Right state, right worker, right lease: bumps both heartbeat
+        // and expiry timestamps.
         running
-            .touch_heartbeat(&WorkerId::from_string("w1"), t_plus(3))
+            .touch_heartbeat(
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(180),
+                t_plus(3),
+            )
             .context("heartbeat ok")?;
         assert_eq!(running.last_heartbeat_at, Some(t_plus(3)));
+        assert_eq!(running.lease_expires_at, Some(t_plus(180)));
         Ok(())
     }
 }
