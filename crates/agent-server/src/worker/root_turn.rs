@@ -51,7 +51,7 @@ use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_complete
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, ChildSpawnSpec, SuspensionPayload};
+use crate::journal::task::{AgentTask, ChildSpawnSpec, SuspensionPayload, TaskStatus};
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
@@ -549,6 +549,24 @@ async fn suspend_at_tool_boundary(
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
 
+    // Idempotency guard: re-read the task from the durable store to
+    // detect if a prior worker already completed this suspension (e.g.
+    // our lease expired between spawn_tool_children and returning the
+    // result, and another worker re-acquired and completed the flow).
+    let current_task = deps
+        .task_store
+        .get(task_id)
+        .await
+        .context("re-read task for suspension idempotency check")?
+        .context("task disappeared during suspension")?;
+
+    if current_task.status == TaskStatus::WaitingOnChildren {
+        bail!(
+            "task {task_id} already transitioned to WaitingOnChildren; \
+             skipping duplicate suspension",
+        );
+    }
+
     // 1. Close the turn attempt — the LLM call itself succeeded.
     let close_params = build_close_params(&response, &attempt);
     deps.attempt_store
@@ -570,9 +588,11 @@ async fn suspend_at_tool_boundary(
     ];
 
     // 4. One child task per tool call.
+    // 3. One child task per tool call, inheriting the configured retry budget.
     let tool_call_count = response.tool_uses().count();
+    let child_max_attempts = inputs.bootstrap.definition.policy.max_attempts;
     let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
-        .map(|_| ChildSpawnSpec::default())
+        .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
 
     // 5. Atomically spawn children and park the parent.
@@ -667,6 +687,7 @@ async fn build_continuation(
         state: updated_state,
         response_id: Some(response.id.clone()),
         stop_reason: response.stop_reason,
+        response_content: response.content.clone(),
     };
 
     Ok(ContinuationEnvelope::wrap(continuation))
@@ -1174,6 +1195,7 @@ fn build_resume_continuation(
         state: updated_state,
         response_id: Some(response.id.clone()),
         stop_reason: response.stop_reason,
+        response_content: response.content.clone(),
     };
 
     Ok(ContinuationEnvelope::wrap(continuation))

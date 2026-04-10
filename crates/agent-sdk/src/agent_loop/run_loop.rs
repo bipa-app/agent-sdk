@@ -746,6 +746,7 @@ where
                         state: state.clone(),
                         response_id: carried.response_id.clone(),
                         stop_reason: carried.stop_reason,
+                        response_content: Vec::new(),
                     }),
                 }));
             }
@@ -2345,6 +2346,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         let results = vec![ExternalToolResult {
@@ -2390,6 +2392,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         // Only provide one result for two pending calls
@@ -2434,6 +2437,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         // Provide the correct result AND an extra unknown one
@@ -2473,6 +2477,7 @@ mod tests {
             state: AgentState::new(thread),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         };
 
         let err = validate_external_tool_results(&cont, &[]);

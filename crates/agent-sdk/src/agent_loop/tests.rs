@@ -2683,6 +2683,7 @@ async fn test_unknown_continuation_version_rejected() -> anyhow::Result<()> {
             state: AgentState::new(thread.clone()),
             response_id: None,
             stop_reason: None,
+            response_content: Vec::new(),
         },
     };
 
