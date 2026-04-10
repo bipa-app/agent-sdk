@@ -128,6 +128,10 @@ pub async fn execute_root_turn(
 
     let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
 
+    // Capture a post-LLM timestamp so the turn attempt's duration_ms
+    // reflects actual wall-clock latency instead of always being 0.
+    let commit_now = OffsetDateTime::now_utc();
+
     let response_text = response.first_text().unwrap_or("").to_owned();
 
     // 3. Buffer in staged stores.
@@ -141,7 +145,28 @@ pub async fn execute_root_turn(
     .await
     .context("buffer staged messages")?;
 
-    // 4. Drain staged stores and commit.
+    // 4. Idempotency guard: re-read the thread from the durable store
+    //    to detect if a prior worker already committed the turn we're
+    //    targeting (e.g. our lease expired between commit and
+    //    complete_task, and another worker re-acquired the task).
+    let expected_turn = inputs.recovery_view.next_turn_number;
+    let current_thread = deps
+        .thread_store
+        .get(thread_id)
+        .await
+        .context("re-read thread for idempotency check")?
+        .context("thread disappeared during turn execution")?;
+
+    if current_thread.committed_turns >= expected_turn {
+        bail!(
+            "turn {expected_turn} was already committed on thread {} \
+             (committed_turns={}); skipping duplicate commit",
+            thread_id,
+            current_thread.committed_turns,
+        );
+    }
+
+    // 5. Drain staged stores and commit.
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -171,7 +196,7 @@ pub async fn execute_root_turn(
             messages: drained_messages,
             turn_usage,
             agent_state_snapshot,
-            now,
+            now: commit_now,
         },
         deps.thread_store,
         deps.message_store,
@@ -181,14 +206,14 @@ pub async fn execute_root_turn(
     .await
     .context("commit completed turn")?;
 
-    // 5. Advance the root task to Completed.
+    // 6. Advance the root task to Completed.
     let (completed_task, _parent) = deps
         .task_store
         .complete_task(
             task_id,
             &inputs.bootstrap.worker_id,
             &inputs.bootstrap.lease_id,
-            now,
+            commit_now,
         )
         .await
         .context("complete root task")?;
@@ -266,11 +291,8 @@ async fn build_chat_request(
     Ok(ChatRequest {
         system: definition.system_prompt.clone(),
         messages,
-        tools: if definition.tools.is_empty() {
-            None
-        } else {
-            Some(definition.tools.clone())
-        },
+        // Text-only path — never advertise tools to the LLM (Phase 4.4+).
+        tools: None,
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
         // Not yet wired — session/cache affinity requires provider-side
