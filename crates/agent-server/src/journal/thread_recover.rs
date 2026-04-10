@@ -8,10 +8,11 @@
 //! it:
 //!
 //! 1. Loads the thread aggregate (or bootstraps a fresh one).
-//! 2. If the thread has committed turns, loads the latest completed
+//! 2. Rejects completed threads — no new turns can be committed.
+//! 3. If the thread has committed turns, loads the latest completed
 //!    checkpoint and validates that its `turn_number` matches
 //!    `thread.committed_turns`.
-//! 3. Returns a [`ThreadRecoveryView`] containing the committed
+//! 4. Returns a [`ThreadRecoveryView`] containing the committed
 //!    message history, agent-state snapshot, and next turn number
 //!    — everything a caller needs to resume the conversation.
 //!
@@ -114,6 +115,7 @@ pub struct ThreadRecoveryView {
 /// # Errors
 ///
 /// - Store-level read errors.
+/// - Thread is already completed.
 /// - Missing checkpoint for a thread with committed turns.
 /// - Checkpoint turn number ≠ `thread.committed_turns`.
 pub async fn recover_thread(
@@ -128,7 +130,12 @@ pub async fn recover_thread(
         .await
         .context("recover: load thread aggregate")?;
 
-    // 2. Fresh thread — no checkpoints to load.
+    // 2. Completed thread — no new turns can be committed.
+    if thread.status.is_completed() {
+        bail!("recover: thread {thread_id} is already completed, no new turns can be committed");
+    }
+
+    // 3. Fresh thread — no checkpoints to load.
     if thread.committed_turns == 0 {
         return Ok(ThreadRecoveryView {
             thread,
@@ -139,7 +146,7 @@ pub async fn recover_thread(
         });
     }
 
-    // 3. Load the latest completed checkpoint.
+    // 4. Load the latest completed checkpoint.
     let checkpoint = checkpoint_store
         .get_latest_by_thread(thread_id)
         .await
@@ -153,7 +160,7 @@ pub async fn recover_thread(
         );
     };
 
-    // 4. Consistency guard: checkpoint turn_number must match the
+    // 5. Consistency guard: checkpoint turn_number must match the
     //    thread's committed_turns.
     if checkpoint.turn_number != thread.committed_turns {
         bail!(
@@ -253,7 +260,7 @@ mod tests {
             &self,
             task_id: &AgentTaskId,
             attempt_number: u32,
-        ) -> super::super::turn_attempt::TurnAttemptId {
+        ) -> Result<super::super::turn_attempt::TurnAttemptId> {
             let attempt = self
                 .attempts
                 .open_attempt(OpenAttemptParams {
@@ -264,8 +271,8 @@ mod tests {
                     now: t0(),
                 })
                 .await
-                .expect("open attempt");
-            attempt.id
+                .context("open attempt")?;
+            Ok(attempt.id)
         }
 
         /// Commit a turn end-to-end through the atomic commit path.
@@ -277,7 +284,7 @@ mod tests {
             state_snapshot: serde_json::Value,
             at: OffsetDateTime,
         ) -> Result<super::super::commit::CommitOutcome> {
-            let attempt_id = self.open_attempt(task_id, 1).await;
+            let attempt_id = self.open_attempt(task_id, 1).await?;
             commit_completed_turn(
                 CompletedTurnCommit {
                     thread_id: thread_id.clone(),
@@ -344,7 +351,10 @@ mod tests {
         assert_eq!(view.agent_state_snapshot, snapshot);
         assert_eq!(view.next_turn_number, 2);
 
-        let ckpt = view.latest_checkpoint.as_ref().unwrap();
+        let ckpt = view
+            .latest_checkpoint
+            .as_ref()
+            .context("checkpoint should be present")?;
         assert_eq!(ckpt.turn_number, 1);
         assert_eq!(ckpt.task_id, task);
         Ok(())
@@ -400,7 +410,10 @@ mod tests {
         assert_eq!(view.messages.len(), 3);
         assert_eq!(view.agent_state_snapshot, serde_json::json!({"turn": 3}));
 
-        let ckpt = view.latest_checkpoint.as_ref().unwrap();
+        let ckpt = view
+            .latest_checkpoint
+            .as_ref()
+            .context("checkpoint should be present")?;
         assert_eq!(ckpt.turn_number, 3);
         assert_eq!(ckpt.task_id, task3);
         Ok(())
@@ -468,7 +481,10 @@ mod tests {
         assert_eq!(view2.next_turn_number, 4);
         assert_eq!(view2.messages.len(), 3);
 
-        let ckpt = view2.latest_checkpoint.as_ref().unwrap();
+        let ckpt = view2
+            .latest_checkpoint
+            .as_ref()
+            .context("checkpoint should be present")?;
         assert_eq!(ckpt.task_id, task_b);
         Ok(())
     }
@@ -494,7 +510,7 @@ mod tests {
 
         // Open an attempt for task_fail but never commit it —
         // simulates a failed or cancelled turn.
-        let _failed_attempt_id = s.open_attempt(&task_fail, 1).await;
+        let _failed_attempt_id = s.open_attempt(&task_fail, 1).await?;
 
         // Recovery should still see only the good turn.
         let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
@@ -506,7 +522,10 @@ mod tests {
         assert_eq!(view.messages.len(), 1);
         assert_eq!(view.agent_state_snapshot, serde_json::json!({"good": true}));
 
-        let ckpt = view.latest_checkpoint.as_ref().unwrap();
+        let ckpt = view
+            .latest_checkpoint
+            .as_ref()
+            .context("checkpoint should be present")?;
         assert_eq!(ckpt.turn_number, 1);
         assert_eq!(ckpt.task_id, task1);
         Ok(())
@@ -558,6 +577,38 @@ mod tests {
         assert_eq!(view_b.thread.committed_turns, 1);
         assert_eq!(view_b.next_turn_number, 2);
         assert_eq!(view_b.messages.len(), 1);
+        Ok(())
+    }
+
+    // ── Completed thread guard ────────────────────────────────────
+
+    #[tokio::test]
+    async fn recover_rejects_completed_thread() -> Result<()> {
+        let s = Stores::new();
+        let task = AgentTaskId::from_string("task_done");
+
+        s.commit_turn(
+            &thread_a(),
+            &task,
+            vec![llm::Message::user("final turn")],
+            serde_json::json!({"done": true}),
+            t_plus(1),
+        )
+        .await
+        .context("commit")?;
+
+        s.threads
+            .mark_completed(&thread_a(), t_plus(2))
+            .await
+            .context("mark completed")?;
+
+        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already completed"),
+            "expected completed error, got: {err}",
+        );
         Ok(())
     }
 
@@ -656,8 +707,14 @@ mod tests {
         assert_eq!(v1.messages.len(), v2.messages.len());
         assert_eq!(v1.agent_state_snapshot, v2.agent_state_snapshot);
 
-        let c1 = v1.latest_checkpoint.as_ref().unwrap();
-        let c2 = v2.latest_checkpoint.as_ref().unwrap();
+        let c1 = v1
+            .latest_checkpoint
+            .as_ref()
+            .context("v1 checkpoint should be present")?;
+        let c2 = v2
+            .latest_checkpoint
+            .as_ref()
+            .context("v2 checkpoint should be present")?;
         assert_eq!(c1.id, c2.id);
         Ok(())
     }
