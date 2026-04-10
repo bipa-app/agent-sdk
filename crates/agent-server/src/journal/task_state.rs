@@ -195,12 +195,6 @@ impl TaskState {
         }
     }
 
-    /// Borrow the prepared listen/execute operation embedded in an
-    /// [`TaskState::AwaitingConfirmation`] payload, if any.
-    ///
-    /// Returns `None` for [`TaskState::None`],
-    /// [`TaskState::WaitingOnChildren`], and confirmations that did
-    /// not stage a listen-tier operation.
     /// Borrow the suspended messages embedded in a
     /// [`TaskState::WaitingOnChildren`] or [`TaskState::ReadyToResume`]
     /// payload, if any. Returns an empty slice for
@@ -218,6 +212,12 @@ impl TaskState {
         }
     }
 
+    /// Borrow the prepared listen/execute operation embedded in an
+    /// [`TaskState::AwaitingConfirmation`] payload, if any.
+    ///
+    /// Returns `None` for [`TaskState::None`],
+    /// [`TaskState::WaitingOnChildren`], [`TaskState::ReadyToResume`],
+    /// and confirmations that did not stage a listen-tier operation.
     #[must_use]
     pub const fn prepared_operation(&self) -> Option<&ListenExecutionContext> {
         match self {
@@ -376,6 +376,21 @@ mod tests {
             serde_json::to_value(&awaiting_no_op)?
         );
         assert!(recovered.prepared_operation().is_none());
+
+        // ReadyToResume — durably persisted on Pending parents after
+        // all children reach terminal states (Phase 4.5).
+        let ready = TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+        };
+        let json = serde_json::to_string(&ready)?;
+        let recovered: TaskState = serde_json::from_str(&json)?;
+        assert_eq!(
+            serde_json::to_value(&recovered)?,
+            serde_json::to_value(&ready)?
+        );
+        assert_eq!(recovered.required_status(), None);
+        assert!(recovered.continuation().is_some());
         Ok(())
     }
 
@@ -406,6 +421,13 @@ mod tests {
             awaiting_value["kind"],
             serde_json::json!("awaiting_confirmation")
         );
+
+        let ready_value = serde_json::to_value(TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+        })?;
+        assert_eq!(ready_value["kind"], serde_json::json!("ready_to_resume"));
+        assert!(ready_value.get("continuation").is_some());
         Ok(())
     }
 }

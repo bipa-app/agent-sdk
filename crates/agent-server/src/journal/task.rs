@@ -1048,12 +1048,12 @@ impl AgentTask {
     /// Record that one child task has reached a terminal state.
     ///
     /// Decrements `pending_child_count`. When the counter hits zero, the
-    /// task transitions back to [`TaskStatus::Pending`] and the typed
-    /// [`TaskState::WaitingOnChildren`] payload is cleared so a worker
-    /// can pick it up and re-enter the loop. While there are still
-    /// outstanding children, the typed payload is preserved so the
-    /// resume path on the eventual zero-child transition still has the
-    /// continuation it captured at pause time.
+    /// task transitions back to [`TaskStatus::Pending`] with
+    /// [`TaskState::ReadyToResume`] — the continuation and suspended
+    /// messages are preserved so a worker that acquires the parent can
+    /// resume the turn from durable state alone. While there are still
+    /// outstanding children, the [`TaskState::WaitingOnChildren`]
+    /// payload is kept intact.
     ///
     /// Prefer [`Self::recompute_pending_children`] for Phase 2.6 and
     /// later call sites: it derives the counter from the journal's
@@ -1103,8 +1103,9 @@ impl AgentTask {
 
     /// Authoritatively replace the parent's `pending_child_count` with
     /// `live_children` and, when the count hits zero, flip the row back
-    /// to [`TaskStatus::Pending`] with [`TaskState::None`] so a worker
-    /// can pick it up and re-enter the loop.
+    /// to [`TaskStatus::Pending`] with [`TaskState::ReadyToResume`] so
+    /// the continuation and suspended messages survive the transition
+    /// and a worker can resume the turn from durable state.
     ///
     /// This is the Phase 2.6 replacement for [`Self::child_resolved`]'s
     /// saturating subtraction: the store passes the live child count
@@ -1118,12 +1119,6 @@ impl AgentTask {
     /// [`TaskState::WaitingOnChildren`] payload intact so the eventual
     /// resume transition still has the continuation it was paused
     /// with.
-    ///
-    /// The caller is responsible for reading the embedded continuation
-    /// **before** the final zero-children call because the pure
-    /// transition wipes the typed payload to satisfy the state ↔
-    /// status invariant — exactly the same discipline
-    /// [`Self::child_resolved`] already requires.
     ///
     /// # Errors
     /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
