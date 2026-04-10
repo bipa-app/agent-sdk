@@ -410,6 +410,8 @@ pub mod checkpoint_store;
 pub mod commit;
 pub mod message;
 pub mod message_store;
+#[cfg(test)]
+mod persistence_regression;
 pub mod recovery;
 pub mod store;
 pub mod task;
