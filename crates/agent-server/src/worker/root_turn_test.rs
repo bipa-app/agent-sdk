@@ -1310,7 +1310,7 @@ async fn suspension_captures_messages_for_resume() -> Result<()> {
         agent_sdk_core::llm::Content::Blocks(blocks) => blocks
             .iter()
             .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. })),
-        _ => false,
+        agent_sdk_core::llm::Content::Text(_) => false,
     };
     assert!(
         has_tool_use,
