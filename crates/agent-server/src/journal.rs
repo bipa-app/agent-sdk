@@ -311,10 +311,39 @@
 //!   reference in-memory implementation, following the same
 //!   `Arc<RwLock<Inner>>` pattern as [`thread_store::InMemoryThreadStore`].
 //!
+//! # Phase 3.3 — Turn-attempt schema and append-only audit repository (ENG-7924)
+//!
+//! Phase 3.3 adds the **turn-attempt audit table** — an append-only
+//! execution log for LLM request/response cycles. Every attempt
+//! records full model/provider provenance so the audit trail survives
+//! retries, failovers, and provider rotations. The key design
+//! properties:
+//!
+//! 1. **Append-only apart from close** — rows are inserted via
+//!    [`turn_attempt_store::TurnAttemptStore::open_attempt`] and the
+//!    only mutation is
+//!    [`turn_attempt_store::TurnAttemptStore::close_attempt`]. There
+//!    is no `update()` or `delete()`.
+//! 2. **No continuation state** — the table records what happened
+//!    during an LLM call, not what should happen next. Scheduler and
+//!    continuation state stay on [`task::AgentTask`] /
+//!    [`task_state::TaskState`].
+//! 3. **Full provenance** — every row carries provider, requested
+//!    model, response model, response id, and request/response blobs.
+//!
+//! - [`turn_attempt::TurnAttempt`] is the durable row with open/close
+//!   lifecycle and structural validation.
+//! - [`turn_attempt_store::TurnAttemptStore`] is the narrow trait
+//!   surface: `open_attempt`, `close_attempt`, `get`, `list_by_task`.
+//! - [`turn_attempt_store::InMemoryTurnAttemptStore`] is the
+//!   reference in-memory implementation.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
+//! | Checkpoint storage | 3+ |
+//! | Event replay | 3+ |
 //! | Actual tool-runtime worker | 3+ |
 //! | Subagent runtime | 3+ |
 //! | Confirmation transport APIs | post-2.4 |
@@ -327,6 +356,8 @@ pub mod task;
 pub mod task_state;
 pub mod thread;
 pub mod thread_store;
+pub mod turn_attempt;
+pub mod turn_attempt_store;
 
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
@@ -341,3 +372,8 @@ pub use task::{
 pub use task_state::TaskState;
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
+pub use turn_attempt::{
+    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,
+    TurnAttemptSchemaError,
+};
+pub use turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
