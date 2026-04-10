@@ -19,6 +19,14 @@
 //!    recoverable from storage; runtime dependencies (`HostDependencies`)
 //!    are created fresh by the orchestration layer each time.
 //!
+//! # Relationship to Phase 4.1
+//!
+//! Phase 4.1 defines [`crate::worker::AgentDefinition`] and the
+//! [`crate::worker::WorkerBootstrapContext`] that validates task
+//! preconditions and resolves the definition. This module picks up
+//! *after* bootstrap: it takes the validated bootstrap context, recovers
+//! thread state, and seeds the staged stores.
+//!
 //! # What this module does **not** own
 //!
 //! - Text-only turn execution (Phase 4.3).
@@ -26,59 +34,16 @@
 //! - Commit orchestration (Phase 3.4).
 //! - Turn-attempt audit lifecycle (Phase 3.3).
 
-use agent_sdk_core::{AgentConfig, ThreadId};
+use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use super::checkpoint_store::CheckpointStore;
 use super::staged::StagedStores;
-use super::task::AgentTask;
 use super::thread_recover::{ThreadRecoveryView, recover_thread};
 use super::thread_store::ThreadStore;
-
-// ─────────────────────────────────────────────────────────────────────
-// AgentDefinition
-// ─────────────────────────────────────────────────────────────────────
-
-/// Resolved agent configuration the root worker needs for execution.
-///
-/// Wraps [`AgentConfig`] alongside execution-time overrides that the
-/// server resolves before handing a task to a worker. Future phases
-/// will expand this with tool registry references, hook configuration,
-/// and provider routing tables.
-#[derive(Clone, Debug)]
-pub struct AgentDefinition {
-    /// Core agent configuration (model, system prompt, limits).
-    pub config: AgentConfig,
-
-    /// Server-side execution options.
-    pub execution: ExecutionOptions,
-}
-
-/// Server-side execution options resolved alongside the agent definition.
-///
-/// These are not part of `AgentConfig` because they are
-/// server-infrastructure concerns that a local SDK caller never sets.
-#[derive(Clone, Debug)]
-pub struct ExecutionOptions {
-    /// Maximum number of retry attempts for the LLM call within a
-    /// single turn attempt (distinct from the task-level retry budget
-    /// managed by the journal).
-    pub max_llm_retries: u32,
-
-    /// Whether to enable strict durability checkpoints at every
-    /// critical boundary.
-    pub strict_durability: bool,
-}
-
-impl Default for ExecutionOptions {
-    fn default() -> Self {
-        Self {
-            max_llm_retries: 3,
-            strict_durability: true,
-        }
-    }
-}
+use crate::worker::bootstrap::WorkerBootstrapContext;
+use crate::worker::definition::AgentDefinition;
 
 // ─────────────────────────────────────────────────────────────────────
 // RootWorkerInputs
@@ -87,32 +52,29 @@ impl Default for ExecutionOptions {
 /// Everything the root worker needs to begin (or resume) a turn.
 ///
 /// This is the "factory input" struct the orchestration layer constructs
-/// from durable storage before handing control to the worker. All
-/// fields are deterministic — given the same task and thread state the
-/// same inputs are produced.
+/// from durable storage before handing control to the worker. It builds
+/// on the Phase 4.1 [`WorkerBootstrapContext`] by adding the recovered
+/// thread state and staged stores.
 ///
 /// # Fields
 ///
 /// | Group | Fields |
 /// |-------|--------|
-/// | Task identity | `task` |
+/// | Bootstrap | `bootstrap` |
 /// | Thread state | `recovery_view` |
-/// | Agent definition | `definition` |
 /// | Staged adapters | `staged_stores` |
 ///
 /// The worker uses `staged_stores` for all message/state reads and
 /// writes during the turn. At commit time the staged data is drained
 /// and fed into [`super::commit::commit_completed_turn`].
 pub struct RootWorkerInputs {
-    /// The runnable task the worker is executing.
-    pub task: AgentTask,
+    /// The validated bootstrap context from Phase 4.1 (task, definition,
+    /// lease identifiers).
+    pub bootstrap: WorkerBootstrapContext,
 
     /// Thread recovery view with committed messages, agent-state
     /// snapshot, and next turn number.
     pub recovery_view: ThreadRecoveryView,
-
-    /// Resolved agent definition (config + execution options).
-    pub definition: AgentDefinition,
 
     /// Staged message and state stores seeded from the recovery view.
     ///
@@ -121,12 +83,20 @@ pub struct RootWorkerInputs {
     pub staged_stores: StagedStores,
 }
 
+impl RootWorkerInputs {
+    /// Convenience accessor for the resolved agent definition.
+    #[must_use]
+    pub const fn definition(&self) -> &AgentDefinition {
+        &self.bootstrap.definition
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Builder
 // ─────────────────────────────────────────────────────────────────────
 
-/// Reconstruct trusted execution context for a root worker from durable
-/// task and thread state.
+/// Reconstruct trusted execution context for a root worker from a
+/// validated bootstrap context and durable thread state.
 ///
 /// This is the primary entry point for Phase 4.2 context reconstruction.
 /// It:
@@ -143,28 +113,26 @@ pub struct RootWorkerInputs {
 /// - Task `thread_id` does not match the recovery view.
 /// - Agent-state snapshot deserialization fails.
 pub async fn build_root_worker_inputs(
-    task: AgentTask,
-    definition: AgentDefinition,
+    bootstrap: WorkerBootstrapContext,
     thread_store: &dyn ThreadStore,
     checkpoint_store: &dyn CheckpointStore,
     now: OffsetDateTime,
 ) -> Result<RootWorkerInputs> {
     // 1. Recover thread state from the latest checkpoint.
-    let recovery_view = recover_thread(&task.thread_id, thread_store, checkpoint_store, now)
+    let recovery_view = recover_thread(&bootstrap.thread_id, thread_store, checkpoint_store, now)
         .await
         .context("build_root_worker_inputs: recover thread")?;
 
     // 2. Validate thread binding.
-    ensure_thread_match(&task.thread_id, &recovery_view.thread.thread_id)?;
+    ensure_thread_match(&bootstrap.thread_id, &recovery_view.thread.thread_id)?;
 
     // 3. Seed staged stores from the recovery view.
     let staged_stores = StagedStores::from_recovery_view(&recovery_view)
         .context("build_root_worker_inputs: seed staged stores")?;
 
     Ok(RootWorkerInputs {
-        task,
+        bootstrap,
         recovery_view,
-        definition,
         staged_stores,
     })
 }
@@ -185,13 +153,13 @@ fn ensure_thread_match(task_thread: &ThreadId, recovered_thread: &ThreadId) -> R
 mod tests {
     use super::super::checkpoint_store::InMemoryCheckpointStore;
     use super::super::commit::{CompletedTurnCommit, commit_completed_turn};
-    use super::super::message_store::InMemoryMessageProjectionStore;
-    use super::super::message_store::MessageProjectionStore;
-    use super::super::task::{AgentTask, AgentTaskId};
+    use super::super::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
+    use super::super::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
     use super::super::thread_store::InMemoryThreadStore;
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
+    use crate::worker::definition::{RuntimePolicy, ThinkingPolicy};
     use agent_sdk_core::audit::AuditProvenance;
     use agent_sdk_core::{TokenUsage, llm};
     use agent_sdk_tools::stores::{MessageStore, StateStore};
@@ -218,12 +186,31 @@ mod tests {
 
     fn sample_definition() -> AgentDefinition {
         AgentDefinition {
-            config: AgentConfig {
-                system_prompt: "You are a helpful assistant.".into(),
-                model: "claude-sonnet-4-5-20250929".into(),
-                ..AgentConfig::default()
-            },
-            execution: ExecutionOptions::default(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            system_prompt: "You are a helpful assistant.".into(),
+            max_tokens: 4096,
+            tools: Vec::new(),
+            thinking: ThinkingPolicy::default(),
+            policy: RuntimePolicy::server_default(),
+        }
+    }
+
+    /// Build a `WorkerBootstrapContext` for testing.
+    ///
+    /// In production this comes from `resolve_bootstrap_context` which
+    /// requires a Running task. For unit tests of the staged-store
+    /// seeding path we construct it directly.
+    fn sample_bootstrap(task: AgentTask) -> WorkerBootstrapContext {
+        let thread_id = task.thread_id.clone();
+        let task_id = task.id.clone();
+        WorkerBootstrapContext {
+            task,
+            definition: sample_definition(),
+            thread_id,
+            task_id,
+            worker_id: WorkerId::from_string("worker_test"),
+            lease_id: LeaseId::from_string("lease_test"),
         }
     }
 
@@ -240,10 +227,6 @@ mod tests {
         }
     }
 
-    /// Build a minimal root task for the given thread.
-    ///
-    /// The task is `Pending` — the builder does not check task status
-    /// (that is the orchestrator's responsibility).
     fn root_task(thread_id: &ThreadId) -> AgentTask {
         AgentTask::new_root_turn(thread_id.clone(), t0(), 3)
     }
@@ -310,11 +293,11 @@ mod tests {
     async fn build_inputs_for_fresh_thread() -> Result<()> {
         let s = Stores::new();
         let task = root_task(&thread_a());
+        let bootstrap = sample_bootstrap(task);
 
-        let inputs =
-            build_root_worker_inputs(task, sample_definition(), &s.threads, &s.checkpoints, t0())
-                .await
-                .context("build")?;
+        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
+            .await
+            .context("build")?;
 
         // Recovery view is for a fresh thread.
         assert_eq!(inputs.recovery_view.next_turn_number, 1);
@@ -339,7 +322,7 @@ mod tests {
         assert_eq!(state.turn_count, 0);
 
         // Definition forwarded.
-        assert_eq!(inputs.definition.config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(inputs.definition().model, "claude-sonnet-4-5-20250929");
 
         Ok(())
     }
@@ -382,15 +365,10 @@ mod tests {
 
         // Build inputs for a new task on the same thread.
         let task = root_task(&thread_a());
-        let inputs = build_root_worker_inputs(
-            task,
-            sample_definition(),
-            &s.threads,
-            &s.checkpoints,
-            t_plus(3),
-        )
-        .await
-        .context("build")?;
+        let bootstrap = sample_bootstrap(task);
+        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t_plus(3))
+            .await
+            .context("build")?;
 
         // Recovery view has the committed state.
         assert_eq!(inputs.recovery_view.next_turn_number, 3);
@@ -443,15 +421,10 @@ mod tests {
         .context("commit")?;
 
         let task = root_task(&thread_a());
-        let inputs = build_root_worker_inputs(
-            task,
-            sample_definition(),
-            &s.threads,
-            &s.checkpoints,
-            t_plus(2),
-        )
-        .await
-        .context("build")?;
+        let bootstrap = sample_bootstrap(task);
+        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t_plus(2))
+            .await
+            .context("build")?;
 
         // Mutate staged stores.
         inputs
@@ -489,10 +462,10 @@ mod tests {
     async fn drain_yields_staged_data_for_commit() -> Result<()> {
         let s = Stores::new();
         let task = root_task(&thread_a());
-        let inputs =
-            build_root_worker_inputs(task, sample_definition(), &s.threads, &s.checkpoints, t0())
-                .await
-                .context("build")?;
+        let bootstrap = sample_bootstrap(task);
+        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
+            .await
+            .context("build")?;
 
         // Simulate turn work.
         inputs
@@ -534,9 +507,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_rejects_thread_mismatch() {
-        // This test verifies the guard works at the function level.
-        // In practice, task.thread_id always matches because the task
-        // is created for the thread, but the guard catches bugs.
         let wrong_thread = ThreadId::from_string("t-wrong");
         let right_thread = ThreadId::from_string("t-right");
 
@@ -555,26 +525,38 @@ mod tests {
         let task = root_task(&thread_a());
 
         let def = AgentDefinition {
-            config: AgentConfig {
-                max_turns: Some(10),
-                system_prompt: "test prompt".into(),
-                model: "claude-opus-4-6-20250925".into(),
-                ..AgentConfig::default()
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            system_prompt: "test prompt".into(),
+            max_tokens: 8192,
+            tools: Vec::new(),
+            thinking: ThinkingPolicy::Enabled {
+                budget_tokens: 1000,
             },
-            execution: ExecutionOptions {
-                max_llm_retries: 5,
+            policy: RuntimePolicy {
+                max_attempts: 5,
                 strict_durability: false,
+                ..RuntimePolicy::server_default()
             },
         };
 
-        let inputs = build_root_worker_inputs(task, def, &s.threads, &s.checkpoints, t0())
+        let bootstrap = WorkerBootstrapContext {
+            thread_id: task.thread_id.clone(),
+            task_id: task.id.clone(),
+            worker_id: WorkerId::from_string("worker_test"),
+            lease_id: LeaseId::from_string("lease_test"),
+            definition: def,
+            task,
+        };
+
+        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
             .await
             .context("build")?;
 
-        assert_eq!(inputs.definition.config.max_turns, Some(10));
-        assert_eq!(inputs.definition.config.system_prompt, "test prompt");
-        assert_eq!(inputs.definition.execution.max_llm_retries, 5);
-        assert!(!inputs.definition.execution.strict_durability);
+        assert_eq!(inputs.definition().model, "gpt-5");
+        assert_eq!(inputs.definition().system_prompt, "test prompt");
+        assert_eq!(inputs.definition().policy.max_attempts, 5);
+        assert!(!inputs.definition().policy.strict_durability);
 
         Ok(())
     }

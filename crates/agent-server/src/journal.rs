@@ -408,11 +408,9 @@
 //!   [`agent_sdk_tools::stores::StateStore`] traits while keeping all
 //!   writes in-memory. Seeded from the latest completed checkpoint (or
 //!   empty for fresh threads).
-//! - [`execution_context::AgentDefinition`] captures the resolved
-//!   agent configuration the root worker needs for execution.
-//! - [`execution_context::RootWorkerInputs`] bundles the task,
-//!   recovery view, definition, and staged stores into a single
-//!   "factory input" struct.
+//! - [`execution_context::RootWorkerInputs`] bundles the Phase 4.1
+//!   bootstrap context, recovery view, and staged stores into a
+//!   single "factory input" struct.
 //! - [`execution_context::build_root_worker_inputs`] is the primary
 //!   entry point: it recovers thread state, seeds staged stores, and
 //!   returns everything the worker needs to begin a turn.
@@ -449,9 +447,7 @@ pub mod turn_attempt_store;
 pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
-pub use execution_context::{
-    AgentDefinition, ExecutionOptions, RootWorkerInputs, build_root_worker_inputs,
-};
+pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
