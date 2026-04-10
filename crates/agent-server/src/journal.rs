@@ -369,11 +369,37 @@
 //! - [`commit::CompletedTurnCommit`] / [`commit::CommitOutcome`] are
 //!   the input/output types for the commit path.
 //!
+//! # Phase 3.5 — Thread-scoped checkpoint recovery and rebuild API (ENG-7926)
+//!
+//! Phase 3.5 adds the **recovery loader** — given a thread, it loads
+//! the latest completed checkpoint and rebuilds the next-turn view.
+//! The key design properties:
+//!
+//! 1. **Checkpoint-only recovery** — the recovered view comes
+//!    exclusively from the latest completed checkpoint. Failed or
+//!    in-progress attempts that never called
+//!    [`commit::commit_completed_turn`] do not pollute the state.
+//! 2. **Sequential root-task continuity** — checkpoints are
+//!    task-agnostic at recovery time. A new root task on the same
+//!    thread picks up from the last committed turn regardless of
+//!    which task produced it.
+//! 3. **Consistency invariant** — if the thread has committed turns,
+//!    the latest checkpoint's `turn_number` must equal
+//!    `thread.committed_turns`. A mismatch is a journal-level data
+//!    corruption error.
+//!
+//! - [`thread_recover::recover_thread`] is the single entry point
+//!   for thread recovery.
+//! - [`thread_recover::ThreadRecoveryView`] is the output type
+//!   containing messages, agent-state snapshot, and next turn number.
+//! - [`checkpoint_store::CheckpointStore::get_latest_by_thread`] is
+//!   the new store method that returns the highest-turn checkpoint
+//!   for a thread.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Recovery loaders | 3+ |
 //! | Event replay | 3+ |
 //! | Actual tool-runtime worker | 3+ |
 //! | Subagent runtime | 3+ |
@@ -389,6 +415,7 @@ pub mod store;
 pub mod task;
 pub mod task_state;
 pub mod thread;
+pub mod thread_recover;
 pub mod thread_store;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
@@ -408,6 +435,7 @@ pub use task::{
 };
 pub use task_state::TaskState;
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,

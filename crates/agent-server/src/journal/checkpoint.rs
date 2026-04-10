@@ -23,7 +23,7 @@
 //! - Thread aggregate counters → [`super::thread::Thread`]
 //! - Committed message projection → [`super::message::MessageProjection`]
 //! - Turn-attempt audit records → [`super::turn_attempt::TurnAttempt`]
-//! - Recovery loaders → out of scope (future phase)
+//! - Recovery loaders → [`super::thread_recover`]
 
 use agent_sdk_core::{ThreadId, TokenUsage, llm};
 use serde::{Deserialize, Serialize};
