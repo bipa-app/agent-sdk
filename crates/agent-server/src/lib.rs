@@ -106,18 +106,19 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resume_from_confirmation`, Phase 2.5's retry budget / fail-closed recovery matrix shared across acquisition and expiry paths, Phase 2.6's tool-runtime child-task orchestration (`spawn_tool_children` / `complete_task` / `fail_task`) plus deterministic cancellation tree, and Phase 3.1's **threads projection** — durable thread-level aggregates (`committed_turns`, `total_usage`) owned exclusively by the completed-turn commit path |on cascade (`cancel_tree`) with journal-driven parent resume triggers |
+//! | [`worker`] | Phase 4 worker bootstrapping: server-owned [`AgentDefinition`] resolution, [`AgentDefinitionRegistry`] lookup surface, and [`WorkerBootstrapContext`] construction for root-turn tasks |
 //!
 //! ## Planned modules (not yet implemented)
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | `workers` | Background agent execution |
 //! | `transport` | HTTP / WebSocket ingress |
 //! | `storage` | Persistent message & state stores |
 
 #![forbid(unsafe_code)]
 
 pub mod journal;
+pub mod worker;
 
 pub use journal::{
     AgentTask, AgentTaskId, AgentTaskStore, ChildSpawnSpec, FailureReason, InMemoryAgentTaskStore,
@@ -153,6 +154,12 @@ pub use agent_sdk_tools::{
 };
 pub use agent_sdk_tools::{
     EventAuthority, EventStore, InMemoryEventStore, LocalEventAuthority, StoredTurnEvents,
+};
+
+/// Phase 4 worker types: definition, registry, and bootstrap context.
+pub use worker::{
+    AgentDefinition, AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry, RuntimePolicy,
+    ThinkingPolicy, WorkerBootstrapContext, resolve_bootstrap_context,
 };
 
 #[cfg(test)]

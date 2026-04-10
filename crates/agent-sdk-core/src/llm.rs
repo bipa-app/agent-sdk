@@ -268,7 +268,7 @@ pub enum ContentBlock {
     Document { source: ContentSource },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     pub description: String,
