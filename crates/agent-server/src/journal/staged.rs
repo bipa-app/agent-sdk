@@ -65,19 +65,30 @@ use super::thread_recover::ThreadRecoveryView;
 pub struct StagedMessageStore {
     thread_id: ThreadId,
     messages: RwLock<Vec<llm::Message>>,
+    /// Number of seed messages from the checkpoint. `drain_messages`
+    /// returns only messages appended *after* the seed so the commit
+    /// path can safely append the delta to the durable projection.
+    seed_len: usize,
 }
 
 impl StagedMessageStore {
     /// Create a new staged store seeded with the given messages.
     #[must_use]
     pub const fn new(thread_id: ThreadId, seed_messages: Vec<llm::Message>) -> Self {
+        let seed_len = seed_messages.len();
         Self {
             thread_id,
             messages: RwLock::new(seed_messages),
+            seed_len,
         }
     }
 
-    /// Drain the buffered message history for the commit path.
+    /// Drain only the **newly appended** messages for the commit path.
+    ///
+    /// The returned vec excludes the seed messages that were provided
+    /// at construction time, so the caller can safely pass the result
+    /// to [`super::commit::commit_completed_turn`] which *appends* to
+    /// the durable projection.
     ///
     /// After this call the internal buffer is empty and the store
     /// should not be reused.
@@ -86,8 +97,8 @@ impl StagedMessageStore {
     ///
     /// Returns an error if the internal lock is poisoned.
     pub fn drain_messages(&self) -> Result<Vec<llm::Message>> {
-        let mut guard = self.messages.write().ok().context("lock poisoned")?;
-        Ok(std::mem::take(&mut *guard))
+        let all = std::mem::take(&mut *self.messages.write().ok().context("lock poisoned")?);
+        Ok(all.into_iter().skip(self.seed_len).collect())
     }
 
     /// Snapshot the current buffered messages without consuming them.
@@ -283,7 +294,13 @@ impl StagedStores {
         // Seed agent state from the checkpoint snapshot or create a
         // fresh one for new threads.
         let seed_state = if view.agent_state_snapshot.is_null() {
-            AgentState::new(thread_id.clone())
+            AgentState {
+                thread_id: thread_id.clone(),
+                turn_count: 0,
+                total_usage: agent_sdk_core::TokenUsage::default(),
+                metadata: std::collections::HashMap::new(),
+                created_at: view.thread.created_at,
+            }
         } else {
             serde_json::from_value(view.agent_state_snapshot.clone())
                 .context("deserialize agent_state_snapshot from checkpoint")?
@@ -360,8 +377,9 @@ mod tests {
             .append(&thread_a(), llm::Message::user("extra"))
             .await?;
 
+        // drain_messages returns only the delta (appended after seed).
         let drained = store.drain_messages()?;
-        assert_eq!(drained.len(), 3);
+        assert_eq!(drained.len(), 1);
 
         // After drain, store is empty.
         let history = store.get_history(&thread_a()).await?;
