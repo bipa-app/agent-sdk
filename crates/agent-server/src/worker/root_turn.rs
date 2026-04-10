@@ -171,7 +171,7 @@ pub async fn execute_root_turn(
 
     // 3. Branch: tool calls → suspend; text-only → commit.
     if response.has_tool_use() {
-        return suspend_at_tool_boundary(inputs, response, attempt, deps, now).await;
+        return suspend_at_tool_boundary(inputs, response, attempt, deps, commit_now).await;
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
@@ -189,7 +189,7 @@ pub async fn execute_root_turn(
     .await
     .context("buffer staged messages")?;
 
-    // 4. Idempotency guard: re-read the thread from the durable store
+    // 5. Idempotency guard: re-read the thread from the durable store
     //    to detect if a prior worker already committed the turn we're
     //    targeting (e.g. our lease expired between commit and
     //    complete_task, and another worker re-acquired the task).
@@ -210,7 +210,7 @@ pub async fn execute_root_turn(
         );
     }
 
-    // 5. Drain staged stores and commit.
+    // 6. Drain staged stores and commit.
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -250,7 +250,7 @@ pub async fn execute_root_turn(
     .await
     .context("commit completed turn")?;
 
-    // 6. Advance the root task to Completed.
+    // 7. Advance the root task to Completed.
     let (completed_task, _parent) = deps
         .task_store
         .complete_task(
