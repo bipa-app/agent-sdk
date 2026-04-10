@@ -39,10 +39,14 @@
 pub mod bootstrap;
 pub mod definition;
 pub mod registry;
+pub mod root_turn;
 
 #[cfg(test)]
 mod bootstrap_test;
+#[cfg(test)]
+mod root_turn_test;
 
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
+pub use root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
