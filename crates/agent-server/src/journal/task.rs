@@ -57,6 +57,7 @@ use std::fmt;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::recovery::FailureReason;
 use super::task_state::TaskState;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -584,6 +585,40 @@ impl AgentTask {
         self.parent_id.is_none()
     }
 
+    /// `true` if this row has already used every attempt in its
+    /// retry budget.
+    ///
+    /// Phase 2.5 (ENG-7919) uses this predicate in
+    /// [`super::recovery::classify_recovery`] to decide whether an
+    /// acquisition-time or expiry-sweep classification should
+    /// requeue the row or fail it closed. A row with
+    /// `attempt == max_attempts` has either just finished its final
+    /// attempt (if it was leased) or has nothing left to spend on
+    /// another acquire — either way, another `mark_running` would
+    /// overflow the budget and [`TaskSchemaError::AttemptExceedsMax`]
+    /// would bubble back up, which Phase 2.5 wants to replace with
+    /// a single deterministic fail-closed transition.
+    #[must_use]
+    pub const fn is_budget_exhausted(&self) -> bool {
+        self.attempt >= self.max_attempts
+    }
+
+    /// `true` if this row carries a prepared listen/execute
+    /// operation on its [`TaskState`].
+    ///
+    /// Only [`TaskState::AwaitingConfirmation`] can embed a prepared
+    /// operation, and only if the tool that staged the confirmation
+    /// used the listen/execute tier. Phase 2.5 uses this predicate
+    /// to identify rows that must fail closed on recovery — a
+    /// tool-runtime child with a staged external side-effect has no
+    /// safe resume contract in the rewrite yet, and blindly
+    /// re-running it would risk double-executing the external
+    /// operation.
+    #[must_use]
+    pub const fn has_prepared_operation(&self) -> bool {
+        self.state.prepared_operation().is_some()
+    }
+
     /// Check every **single-row** invariant on this task.
     ///
     /// The first violation is returned as a [`TaskSchemaError`] so test
@@ -1099,6 +1134,33 @@ impl AgentTask {
         self.updated_at = now;
         self.validate()?;
         Ok(self)
+    }
+
+    /// Fail-closed transition driven by a Phase 2.5 [`FailureReason`].
+    ///
+    /// This is a thin wrapper around [`Self::fail`] that writes a
+    /// canonical `last_error` string built from the reason and the
+    /// row's retry budget so every Phase 2.5 call site (acquisition
+    /// fail-closed, expiry-sweep fail-closed, recovery matrix)
+    /// produces the same wire format. Downstream tools can
+    /// pattern-match on [`FailureReason::error_prefix`] without
+    /// reparsing free-form text.
+    ///
+    /// The underlying state transition, lease drop, and
+    /// `last_error` / `completed_at` bookkeeping are all inherited
+    /// from [`Self::fail`] — this helper exists purely to keep the
+    /// error-message shape in one place.
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::InvalidTransition`] if the task is
+    /// already in a terminal state.
+    pub fn fail_with_reason(
+        self,
+        reason: FailureReason,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        let error = reason.error_message(&self);
+        self.fail(error, now)
     }
 
     /// Mark the task [`TaskStatus::Cancelled`].
@@ -1920,6 +1982,138 @@ mod tests {
             .context("heartbeat ok")?;
         assert_eq!(running.last_heartbeat_at, Some(t_plus(3)));
         assert_eq!(running.lease_expires_at, Some(t_plus(180)));
+        Ok(())
+    }
+
+    // ── Phase 2.5 helpers ─────────────────────────────────────────
+
+    #[test]
+    fn is_budget_exhausted_tracks_attempt_vs_max_attempts() -> Result<()> {
+        // Fresh row: attempt == 0 < max == 3, not exhausted.
+        let fresh = fresh_root();
+        assert!(!fresh.is_budget_exhausted());
+
+        // After one attempt: still room.
+        let running = fresh
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("mark running")?;
+        assert_eq!(running.attempt, 1);
+        assert!(!running.is_budget_exhausted());
+
+        // After three attempts: exhausted.
+        let mut row = fresh_root();
+        for i in 0..3u32 {
+            let offset = i64::from(i);
+            let running = row
+                .mark_running(
+                    WorkerId::from_string(format!("w-{i}")),
+                    LeaseId::from_string(format!("l-{i}")),
+                    t_plus(60),
+                    t_plus(1 + offset),
+                )
+                .context("mark running")?;
+            row = running
+                .release_lease(t_plus(2 + offset))
+                .context("release")?;
+        }
+        assert_eq!(row.attempt, 3);
+        assert_eq!(row.max_attempts, 3);
+        assert!(row.is_budget_exhausted());
+        Ok(())
+    }
+
+    #[test]
+    fn has_prepared_operation_is_true_only_for_awaiting_confirmation_with_op() -> Result<()> {
+        // Fresh row: none.
+        let fresh = fresh_root();
+        assert!(!fresh.has_prepared_operation());
+
+        // Waiting on children: none, even with a continuation.
+        let running = fresh
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("mark running")?;
+        let waiting = running
+            .clone()
+            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .context("wait")?;
+        assert!(!waiting.has_prepared_operation());
+
+        // Awaiting confirmation with None prepared_operation: still
+        // false — the field is None.
+        let awaiting_none = running
+            .clone()
+            .await_confirmation(sample_continuation(), None, t_plus(2))
+            .context("await none")?;
+        assert!(!awaiting_none.has_prepared_operation());
+
+        // Awaiting confirmation with Some(prepared): true.
+        let awaiting_op = running
+            .await_confirmation(sample_continuation(), Some(sample_prepared_op()), t_plus(2))
+            .context("await some")?;
+        assert!(awaiting_op.has_prepared_operation());
+        Ok(())
+    }
+
+    #[test]
+    fn fail_with_reason_writes_canonical_error_message() -> Result<()> {
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let failed = running
+            .fail_with_reason(FailureReason::RetryBudgetExhausted, t_plus(2))
+            .context("fail with reason")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        let message = failed.last_error.as_deref().expect("last_error set");
+        assert!(
+            message.starts_with("retry_budget_exhausted:"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("attempt=1"), "missing attempt: {message}");
+        assert!(message.contains("max=3"), "missing max: {message}");
+        assert!(failed.completed_at.is_some());
+        assert!(failed.worker_id.is_none());
+        assert!(failed.lease_id.is_none());
+        assert!(failed.state.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fail_with_reason_rejects_already_terminal_rows() -> Result<()> {
+        let completed = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?
+            .complete(t_plus(2))
+            .context("complete")?;
+        let err = completed
+            .fail_with_reason(FailureReason::RetryBudgetExhausted, t_plus(3))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TaskSchemaError::InvalidTransition {
+                from: TaskStatus::Completed,
+                to: TaskStatus::Failed,
+            }
+        );
         Ok(())
     }
 }
