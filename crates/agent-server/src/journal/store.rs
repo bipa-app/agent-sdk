@@ -1543,8 +1543,14 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         // Decide the admission target atomically under the write lock so
         // two concurrent submissions on the same thread always serialize
-        // and end up in a deterministic FIFO order.
-        let admitted = if inner.thread_has_blocking_root(&task.thread_id) {
+        // and end up in a deterministic FIFO order.  We must check both
+        // the active-root slot *and* the queued-roots index: a new
+        // submission arriving between a root completing and
+        // `promote_next_queued_root` being called would otherwise skip
+        // the queue and claim the active slot, violating FIFO.
+        let admitted = if inner.thread_has_blocking_root(&task.thread_id)
+            || inner.queued_roots_by_thread.contains_key(&task.thread_id)
+        {
             // Convert the incoming row from `Pending` to `Queued` so it
             // lives on the same-thread FIFO queue behind the blocking
             // root. Pass `created_at` as `now` so the queued row's
@@ -2886,6 +2892,68 @@ mod tests {
             .await
             .context("queued after")?;
         assert!(queued.is_empty());
+        Ok(())
+    }
+
+    /// Regression test for the FIFO queue-jump bug: a new root submitted
+    /// after the active root completes but *before* `promote_next_queued_root`
+    /// is called must be queued behind any already-waiting roots — not
+    /// admitted directly as Pending (which would jump the queue).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_after_active_completes_does_not_jump_queue() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        // Submit two roots: first is active/Pending, second is Queued.
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+
+        // Complete the first root — this frees the active-root slot but
+        // does NOT auto-promote queued roots.
+        let running = running_root(&store, first.clone())
+            .await
+            .context("drive running")?;
+        let done = running.complete(t_plus(10)).context("complete")?;
+        store.update(done).await.context("update done")?;
+
+        // Submit a third root *before* promote is called.
+        // Without the fix, thread_has_blocking_root returns false (slot
+        // is free) and the newcomer would be admitted as Pending, jumping
+        // ahead of `second`.
+        let third = fresh_root_at("t1", 11);
+        let admitted_third = store
+            .submit_root_turn(third.clone())
+            .await
+            .context("third")?;
+        assert_eq!(
+            admitted_third.status,
+            TaskStatus::Queued,
+            "third must be queued behind second, not admitted as Pending"
+        );
+
+        // Verify FIFO order: second is still first in the queue.
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].id, second.id, "second must be ahead of third");
+        assert_eq!(queued[1].id, third.id);
+
+        // Promote should yield `second`, not `third`.
+        let promoted = store
+            .promote_next_queued_root(&thread("t1"), t_plus(12))
+            .await
+            .context("promote")?
+            .context("promotion fired")?;
+        assert_eq!(promoted.id, second.id);
         Ok(())
     }
 
