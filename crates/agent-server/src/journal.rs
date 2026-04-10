@@ -83,16 +83,43 @@
 //!    `status = running` — powers
 //!    [`AgentTaskStore::release_expired_leases`].
 //!
+//! Phase 2.4 (ENG-7918) layers typed durable pause-state on top:
+//!
+//! - The previously-untyped `state` field on [`AgentTask`] is now a
+//!   strongly typed [`TaskState`] enum, with one variant per pause
+//!   status. Active and terminal rows carry [`TaskState::None`] and
+//!   pay zero per-row metadata.
+//! - [`AgentTask::wait_on_children`] and [`AgentTask::await_confirmation`]
+//!   take their typed payload at the call site so the row's status and
+//!   state can never drift apart. The pure transitions drop the lease,
+//!   so a paused parent never looks runnable to
+//!   [`AgentTaskStore::acquire_next_runnable`] or
+//!   [`AgentTaskStore::try_acquire_task`].
+//! - [`AgentTaskStore::pause_on_children`],
+//!   [`AgentTaskStore::pause_on_confirmation`],
+//!   [`AgentTaskStore::resolve_child`], and
+//!   [`AgentTaskStore::resume_from_confirmation`] are the journal-guarded
+//!   pause / resume entry points. They run the row's status CAS, the
+//!   typed-state mutation, and the index rebalance under one write
+//!   lock so the journal is the single source of truth for the
+//!   paused-state transitions.
+//! - The state ↔ status invariant is enforced by
+//!   [`AgentTask::validate`] (rejecting any row whose typed payload
+//!   disagrees with its status) and is round-tripped through JSON for
+//!   every variant by the schema regression suite.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Confirmation / resume wiring | 2.4 |
 //! | Retry budget + recovery workers | 2.5 |
 //! | Tool-runtime child orchestration | 2.6 |
+//! | Confirmation transport APIs | post-2.4 |
 
 pub mod store;
 pub mod task;
+pub mod task_state;
 
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskSchemaError, TaskStatus, WorkerId};
+pub use task_state::TaskState;

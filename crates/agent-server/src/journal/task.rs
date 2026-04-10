@@ -19,26 +19,45 @@
 //! timestamp. The acquisition / scan / sweep wiring lives in
 //! [`super::store`].
 //!
+//! Phase 2.4 (ENG-7918) replaces the Phase 2.1 untyped `state` field
+//! with the strongly typed [`TaskState`] enum and reshapes the pause
+//! transitions to take their typed payload at the call site:
+//!
+//! - [`AgentTask::wait_on_children`] now takes a
+//!   [`agent_sdk_core::ContinuationEnvelope`] alongside the child
+//!   count, so a parent that pauses on children can never lose the
+//!   continuation it needs to resume.
+//! - [`AgentTask::await_confirmation`] now takes the same envelope and
+//!   an optional [`agent_sdk_core::ListenExecutionContext`] for
+//!   prepared listen/execute operations.
+//! - [`AgentTask::child_resolved`] and
+//!   [`AgentTask::resume_from_confirmation`] clear the typed payload
+//!   when the row leaves a paused state.
+//! - [`AgentTask::validate`] enforces the **state ↔ status invariant**
+//!   so a row whose status disagrees with its [`TaskState`] cannot
+//!   round-trip through the store.
+//!
 //! Later phases layer on top:
 //!
 //! | Phase | What it adds |
 //! |-------|--------------|
 //! | 2.2 | Same-thread FIFO queue admission (`Queued` promotion) |
 //! | 2.3 | Lease acquisition API, CAS guards, expiry sweeps |
-//! | 2.4 | Confirmation / resume wiring |
+//! | 2.4 | Typed pause-state, journal-guarded pause / resume transitions |
 //! | 2.5 | Retry budget + recovery workers |
 //! | 2.6 | Tool-runtime child-task orchestration |
 //!
-//! Phase 2.1 is **schema-only**: no acquisition API, no workers, no tool
-//! execution logic. Everything here is pure data, pure invariants, and pure
-//! state-transition helpers that the later phases can build on without
-//! re-modelling the state machine.
+//! Phase 2.1 was schema-only; Phase 2.4 keeps that flavour by limiting
+//! its surface to typed data, pure transitions, and `validate()` rules
+//! that the store can rely on without re-implementing them.
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use super::task_state::TaskState;
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity newtypes
@@ -391,6 +410,16 @@ pub enum TaskSchemaError {
     HeartbeatWorkerMismatch,
     #[error("heartbeat lease_id does not match the task's current lease")]
     HeartbeatLeaseMismatch,
+    #[error("task state {state_kind} requires status {required_status:?}, found {actual_status:?}")]
+    StateStatusMismatch {
+        state_kind: &'static str,
+        required_status: TaskStatus,
+        actual_status: TaskStatus,
+    },
+    #[error(
+        "paused status {status:?} requires a matching TaskState payload, found TaskState::None"
+    )]
+    PausedStatusMissingPayload { status: TaskStatus },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -404,7 +433,14 @@ pub enum TaskSchemaError {
 /// budget, and a typed state blob owned by the task kind. Phase 2.1 only
 /// defines the shape and invariants; later phases fill in the state blob
 /// per kind and wire in the acquisition / retry / children orchestration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `AgentTask` deliberately does **not** derive `PartialEq` / `Eq`:
+/// the [`TaskState`] payload it carries embeds upstream
+/// `agent-sdk-core` types that do not impl `PartialEq`, and the
+/// canonical equality contract for a durable row is its serialized
+/// JSON form. Tests use [`serde_json::to_value`] for round-trip
+/// comparisons.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTask {
     // ── identity ────────────────────────────────────────────
     pub id: AgentTaskId,
@@ -433,10 +469,17 @@ pub struct AgentTask {
     pub last_heartbeat_at: Option<OffsetDateTime>,
 
     // ── typed durable state blob ────────────────────────────
-    /// Opaque JSON payload owned by the task kind. Phase 2.1 only reserves
-    /// the field; later phases type it per kind.
+    /// Strongly typed pause-state owned by the task kind.
+    ///
+    /// Phase 2.1 reserved this field as a `serde_json::Value`; Phase 2.4
+    /// promotes it to [`TaskState`] so the row's pause status and the
+    /// payload it carries cannot drift apart. Active and terminal rows
+    /// hold [`TaskState::None`]; paused rows carry the matching variant
+    /// (`WaitingOnChildren { continuation }` or
+    /// `AwaitingConfirmation { continuation, prepared_operation }`).
+    /// The state ↔ status invariant is enforced by [`Self::validate`].
     #[serde(default)]
-    pub state: serde_json::Value,
+    pub state: TaskState,
 
     // ── retry / failure (stubs, real logic in 2.5) ──────────
     pub attempt: u32,
@@ -482,7 +525,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
-            state: serde_json::Value::Null,
+            state: TaskState::None,
             attempt: 0,
             max_attempts,
             last_error: None,
@@ -522,7 +565,7 @@ impl AgentTask {
             lease_id: None,
             lease_expires_at: None,
             last_heartbeat_at: None,
-            state: serde_json::Value::Null,
+            state: TaskState::None,
             attempt: 0,
             max_attempts,
             last_error: None,
@@ -661,7 +704,54 @@ impl AgentTask {
             }
         }
 
+        self.validate_state_status_invariant()?;
+
         Ok(())
+    }
+
+    /// Check the Phase 2.4 state ↔ status invariant.
+    ///
+    /// Split out of [`Self::validate`] both for readability and to keep
+    /// `validate()` under clippy's `too_many_lines` budget. The
+    /// invariant is symmetric:
+    ///
+    /// - A paused status that carries [`TaskState::None`] is rejected
+    ///   with [`TaskSchemaError::PausedStatusMissingPayload`] so a
+    ///   worker can never look at the row, see the paused status,
+    ///   and find no continuation to resume.
+    /// - A non-paused status that carries a paused payload is
+    ///   rejected with [`TaskSchemaError::StateStatusMismatch`] so
+    ///   the row can never claim to be runnable while still holding
+    ///   stale resume state.
+    ///
+    /// The mismatch returns the variant name as a `&'static str` for
+    /// clean error messages without coupling the schema to the wire
+    /// format.
+    fn validate_state_status_invariant(&self) -> Result<(), TaskSchemaError> {
+        let state_kind: &'static str = match &self.state {
+            TaskState::None => "none",
+            TaskState::WaitingOnChildren { .. } => "waiting_on_children",
+            TaskState::AwaitingConfirmation { .. } => "awaiting_confirmation",
+        };
+        match self.state.required_status() {
+            Some(required) if required != self.status => {
+                Err(TaskSchemaError::StateStatusMismatch {
+                    state_kind,
+                    required_status: required,
+                    actual_status: self.status,
+                })
+            }
+            None if matches!(
+                self.status,
+                TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
+            ) =>
+            {
+                Err(TaskSchemaError::PausedStatusMissingPayload {
+                    status: self.status,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -801,7 +891,14 @@ impl AgentTask {
     }
 
     /// Pause a running task until `child_count` children reach terminal
-    /// states. Drops the lease.
+    /// states. Drops the lease and stores the typed
+    /// [`TaskState::WaitingOnChildren`] payload that the resume path
+    /// will read back on the way out of the pause.
+    ///
+    /// The `continuation` argument is the same versioned envelope the
+    /// SDK already persists for `TurnOutcome::PendingToolCalls`. It is
+    /// boxed in [`TaskState::WaitingOnChildren`] so callers do not pay
+    /// the size of `AgentContinuation` on every active row.
     ///
     /// # Errors
     /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -810,6 +907,7 @@ impl AgentTask {
     pub fn wait_on_children(
         mut self,
         child_count: u32,
+        continuation: ContinuationEnvelope,
         now: OffsetDateTime,
     ) -> Result<Self, TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -827,6 +925,9 @@ impl AgentTask {
         self.lease_id = None;
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
+        self.state = TaskState::WaitingOnChildren {
+            continuation: Box::new(continuation),
+        };
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -835,8 +936,12 @@ impl AgentTask {
     /// Record that one child task has reached a terminal state.
     ///
     /// Decrements `pending_child_count`. When the counter hits zero, the
-    /// task transitions back to [`TaskStatus::Pending`] so a worker can
-    /// pick it up and re-enter the loop.
+    /// task transitions back to [`TaskStatus::Pending`] and the typed
+    /// [`TaskState::WaitingOnChildren`] payload is cleared so a worker
+    /// can pick it up and re-enter the loop. While there are still
+    /// outstanding children, the typed payload is preserved so the
+    /// resume path on the eventual zero-child transition still has the
+    /// continuation it captured at pause time.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -851,18 +956,38 @@ impl AgentTask {
         self.pending_child_count = self.pending_child_count.saturating_sub(1);
         if self.pending_child_count == 0 {
             self.status = TaskStatus::Pending;
+            // The status ↔ state invariant requires us to clear the
+            // typed payload alongside the status flip; the resume path
+            // is responsible for reading the continuation **before**
+            // calling this helper.
+            self.state = TaskState::None;
         }
         self.updated_at = now;
         self.validate()?;
         Ok(self)
     }
 
-    /// Pause a running task on an out-of-band confirmation. Drops the lease.
+    /// Pause a running task on an out-of-band confirmation. Drops the
+    /// lease and stores the typed [`TaskState::AwaitingConfirmation`]
+    /// payload that the resume path will read back on the way out of
+    /// the pause.
+    ///
+    /// `continuation` is the versioned envelope captured at pause time,
+    /// matching the value the SDK already persists for
+    /// `TurnOutcome::AwaitingConfirmation`. `prepared_operation` is the
+    /// optional listen/execute context for tools that staged a
+    /// long-running operation before the pause; pass `None` for the
+    /// common case where the awaited tool is not in the listen tier.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
     /// [`TaskStatus::Running`].
-    pub fn await_confirmation(mut self, now: OffsetDateTime) -> Result<Self, TaskSchemaError> {
+    pub fn await_confirmation(
+        mut self,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
         if self.status != TaskStatus::Running {
             return Err(TaskSchemaError::InvalidTransition {
                 from: self.status,
@@ -874,6 +999,10 @@ impl AgentTask {
         self.lease_id = None;
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
+        self.state = TaskState::AwaitingConfirmation {
+            continuation: Box::new(continuation),
+            prepared_operation,
+        };
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -881,6 +1010,11 @@ impl AgentTask {
 
     /// Resume from [`TaskStatus::AwaitingConfirmation`] back to
     /// [`TaskStatus::Pending`].
+    ///
+    /// Clears the typed [`TaskState::AwaitingConfirmation`] payload so
+    /// the resumed row passes the state ↔ status invariant. The
+    /// resume path is responsible for reading the continuation and
+    /// the prepared operation **before** calling this helper.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -896,6 +1030,7 @@ impl AgentTask {
             });
         }
         self.status = TaskStatus::Pending;
+        self.state = TaskState::None;
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -908,6 +1043,8 @@ impl AgentTask {
     /// whose last child resolves *and* requires no further work can finish
     /// directly; call sites generally go through `child_resolved` first,
     /// but the schema accepts both for symmetry with `fail`/`cancel`).
+    /// Either way the typed [`TaskState`] payload is cleared, since
+    /// terminal rows must hold [`TaskState::None`].
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] from any other source.
@@ -927,6 +1064,7 @@ impl AgentTask {
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
+        self.state = TaskState::None;
         self.completed_at = Some(now);
         self.updated_at = now;
         self.validate()?;
@@ -935,8 +1073,9 @@ impl AgentTask {
 
     /// Mark the task [`TaskStatus::Failed`] with the given error.
     ///
-    /// Accepted from any non-terminal source. Drops the lease and sets
-    /// `last_error` / `completed_at`.
+    /// Accepted from any non-terminal source. Drops the lease, clears
+    /// the typed [`TaskState`] payload, and sets `last_error` /
+    /// `completed_at`.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is
@@ -954,6 +1093,7 @@ impl AgentTask {
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
+        self.state = TaskState::None;
         self.last_error = Some(error);
         self.completed_at = Some(now);
         self.updated_at = now;
@@ -963,8 +1103,8 @@ impl AgentTask {
 
     /// Mark the task [`TaskStatus::Cancelled`].
     ///
-    /// Accepted from any non-terminal source. Drops the lease and sets
-    /// `completed_at`.
+    /// Accepted from any non-terminal source. Drops the lease, clears
+    /// the typed [`TaskState`] payload, and sets `completed_at`.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is
@@ -982,6 +1122,7 @@ impl AgentTask {
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
         self.pending_child_count = 0;
+        self.state = TaskState::None;
         self.completed_at = Some(now);
         self.updated_at = now;
         self.validate()?;
@@ -1046,6 +1187,7 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_core::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use anyhow::{Context, Result};
     use time::Duration;
 
@@ -1065,6 +1207,37 @@ mod tests {
         AgentTask::new_root_turn(thread(), t0(), 3)
     }
 
+    /// Build a sample [`ContinuationEnvelope`] for the Phase 2.4 typed
+    /// pause-state tests. The exact contents do not matter — what
+    /// matters is that the envelope round-trips through JSON and
+    /// surfaces back through [`TaskState::continuation`] on resume.
+    fn sample_continuation() -> ContinuationEnvelope {
+        let thread = thread();
+        ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
+        })
+    }
+
+    /// Build a sample [`ListenExecutionContext`] for the Phase 2.4
+    /// typed pause-state tests that exercise the listen/execute path.
+    fn sample_prepared_op() -> ListenExecutionContext {
+        ListenExecutionContext {
+            operation_id: "op-test".into(),
+            revision: 3,
+            snapshot: serde_json::json!({"preview": "yes"}),
+            expires_at: None,
+        }
+    }
+
     // ── construction / round-trip ─────────────────────────────────
 
     #[test]
@@ -1074,7 +1247,15 @@ mod tests {
         let json = serde_json::to_string(&task).context("serializes")?;
         let recovered: AgentTask = serde_json::from_str(&json).context("deserializes")?;
         recovered.validate().context("round-trip must validate")?;
-        assert_eq!(task, recovered);
+        // AgentTask intentionally does not impl PartialEq because the
+        // typed [`TaskState`] payload embeds upstream SDK types
+        // without `PartialEq`. Compare via the canonical JSON wire
+        // form instead — that is also the durable contract a future
+        // SQL store will use.
+        assert_eq!(
+            serde_json::to_value(&recovered).context("recovered to value")?,
+            serde_json::to_value(&task).context("task to value")?
+        );
         Ok(())
     }
 
@@ -1418,13 +1599,24 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?;
-        let waiting = running.wait_on_children(2, t_plus(2)).context("wait")?;
+        let waiting = running
+            .wait_on_children(2, sample_continuation(), t_plus(2))
+            .context("wait")?;
         assert_eq!(waiting.status, TaskStatus::WaitingOnChildren);
         assert_eq!(waiting.pending_child_count, 2);
         assert!(waiting.worker_id.is_none());
         assert!(waiting.lease_id.is_none());
         assert!(waiting.lease_expires_at.is_none());
         assert!(waiting.last_heartbeat_at.is_none());
+        // Phase 2.4: typed payload is now stored on the row.
+        assert_eq!(
+            waiting.state.required_status(),
+            Some(TaskStatus::WaitingOnChildren)
+        );
+        assert!(
+            waiting.state.continuation().is_some(),
+            "WaitingOnChildren must persist the continuation envelope"
+        );
         Ok(())
     }
 
@@ -1438,10 +1630,18 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?;
-        let waiting = running.wait_on_children(1, t_plus(2)).context("wait")?;
+        let waiting = running
+            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .context("wait")?;
         let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::Pending);
         assert_eq!(resolved.pending_child_count, 0);
+        // Resuming back to Pending must clear the typed payload so the
+        // state ↔ status invariant holds.
+        assert!(
+            resolved.state.is_none(),
+            "Pending row must hold TaskState::None after children drain"
+        );
         Ok(())
     }
 
@@ -1455,10 +1655,18 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?;
-        let waiting = running.wait_on_children(3, t_plus(2)).context("wait")?;
+        let waiting = running
+            .wait_on_children(3, sample_continuation(), t_plus(2))
+            .context("wait")?;
         let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::WaitingOnChildren);
         assert_eq!(resolved.pending_child_count, 2);
+        // While children are still outstanding the typed payload stays
+        // in place so a future resolve can fire the resume transition.
+        assert!(
+            resolved.state.continuation().is_some(),
+            "continuation must survive partial child resolution"
+        );
         Ok(())
     }
 
@@ -1472,9 +1680,19 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?;
-        let waiting = running.await_confirmation(t_plus(2)).context("await")?;
+        let waiting = running
+            .await_confirmation(sample_continuation(), Some(sample_prepared_op()), t_plus(2))
+            .context("await")?;
         assert_eq!(waiting.status, TaskStatus::AwaitingConfirmation);
         assert!(waiting.worker_id.is_none());
+        // Typed payload survives — both the continuation and the
+        // prepared listen/execute operation must be reachable.
+        assert!(waiting.state.continuation().is_some());
+        let op = waiting
+            .state
+            .prepared_operation()
+            .expect("prepared op present");
+        assert_eq!(op.operation_id, "op-test");
         Ok(())
     }
 
@@ -1488,11 +1706,15 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?;
-        let awaiting = running.await_confirmation(t_plus(2)).context("await")?;
+        let awaiting = running
+            .await_confirmation(sample_continuation(), None, t_plus(2))
+            .context("await")?;
         let resumed = awaiting
             .resume_from_confirmation(t_plus(3))
             .context("resume")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
+        // Phase 2.4 invariant: resume must clear the typed payload.
+        assert!(resumed.state.is_none());
         Ok(())
     }
 
@@ -1510,13 +1732,19 @@ mod tests {
         assert_eq!(done.status, TaskStatus::Completed);
         assert_eq!(done.completed_at, Some(t_plus(2)));
         assert!(done.worker_id.is_none());
+        assert!(done.state.is_none());
 
-        let waiting = running.wait_on_children(1, t_plus(2)).context("wait")?;
+        let waiting = running
+            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .context("wait")?;
         let done2 = waiting
             .complete(t_plus(3))
             .context("complete from waiting")?;
         assert_eq!(done2.status, TaskStatus::Completed);
         assert_eq!(done2.pending_child_count, 0);
+        // Terminal rows must hold TaskState::None even when reached
+        // directly from a waiting state.
+        assert!(done2.state.is_none());
         Ok(())
     }
 
@@ -1577,12 +1805,13 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?
-            .wait_on_children(2, t_plus(2))
+            .wait_on_children(2, sample_continuation(), t_plus(2))
             .context("wait")?
             .cancel(t_plus(3))
             .context("cancel waiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert_eq!(task.pending_child_count, 0);
+        assert!(task.state.is_none());
 
         // AwaitingConfirmation
         let task = fresh_root()
@@ -1593,11 +1822,12 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?
-            .await_confirmation(t_plus(2))
+            .await_confirmation(sample_continuation(), Some(sample_prepared_op()), t_plus(2))
             .context("await")?
             .cancel(t_plus(3))
             .context("cancel awaiting")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(task.state.is_none());
 
         // Already-terminal is rejected
         let terminal = fresh_root().cancel(t_plus(1)).context("cancel")?;

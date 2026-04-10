@@ -58,11 +58,49 @@
 //!   returns each one to `Pending`, and leaves still-live leases
 //!   untouched. The sweep cost is proportional to the number of expired
 //!   leases, not the size of the live worker pool.
+//!
+//! # Pause / resume entry points (Phase 2.4)
+//!
+//! Phase 2.4 layers two paused statuses on top of the lease model:
+//! [`TaskStatus::WaitingOnChildren`] (root parent waiting on
+//! tool-runtime children) and [`TaskStatus::AwaitingConfirmation`]
+//! (task waiting for a user confirmation). Both are reachable
+//! through journal-guarded pause / resume helpers on the trait:
+//!
+//! - [`AgentTaskStore::pause_on_children`] CAS-checks `(worker,
+//!   lease)` ownership, transitions the row to
+//!   [`TaskStatus::WaitingOnChildren`] with a typed
+//!   [`crate::journal::TaskState::WaitingOnChildren`] payload, and **drops the
+//!   lease** atomically. The paused parent is invisible to
+//!   `try_acquire_task`, `acquire_next_runnable`, and the
+//!   lease-expiry sweep so it cannot pretend to still own a
+//!   worker slot.
+//! - [`AgentTaskStore::pause_on_confirmation`] does the same for
+//!   [`TaskStatus::AwaitingConfirmation`], persisting both the
+//!   continuation and the optional listen/execute prepared
+//!   operation.
+//! - [`AgentTaskStore::resolve_child`] decrements the parent's
+//!   outstanding-child counter; on the final decrement it flips
+//!   the row back to [`TaskStatus::Pending`] and clears the typed
+//!   payload so a worker can re-acquire it.
+//! - [`AgentTaskStore::resume_from_confirmation`] flips a
+//!   confirmation-paused row back to [`TaskStatus::Pending`] and
+//!   clears the typed payload after the caller has read its
+//!   continuation and prepared operation.
+//!
+//! All four entry points run their CAS check, the typed-state
+//! mutation, and the index rebalance under a single write lock,
+//! so the journal is the single source of truth for the
+//! paused-state transitions. The schema layer
+//! ([`super::task::AgentTask::validate`]) refuses to round-trip
+//! any row whose `status` and `state` disagree, so a buggy
+//! caller cannot leave a paused row without a continuation or
+//! leak a stale continuation onto a runnable row.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -328,6 +366,146 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if a release transition or the underlying
     /// store write fails.
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<AgentTaskId>>;
+
+    /// Pause a running task on outstanding child work, dropping the
+    /// lease atomically with the typed-state mutation.
+    ///
+    /// This is one of Phase 2.4's two journal-guarded pause entry
+    /// points. A successful call:
+    ///
+    /// 1. CAS-checks that the row exists, is in
+    ///    [`TaskStatus::Running`], and is owned by `(worker, lease)`.
+    /// 2. Transitions the row to [`TaskStatus::WaitingOnChildren`]
+    ///    via [`AgentTask::wait_on_children`], stamping the typed
+    ///    [`crate::journal::TaskState::WaitingOnChildren`] payload with the supplied
+    ///    `continuation`.
+    /// 3. Drops the lease (`worker_id` / `lease_id` /
+    ///    `lease_expires_at` / `last_heartbeat_at` all cleared) so the
+    ///    row is no longer reachable from the lease-expiry index and
+    ///    cannot be re-acquired by [`AgentTaskStore::try_acquire_task`]
+    ///    or [`AgentTaskStore::acquire_next_runnable`].
+    /// 4. Persists the row under the same write lock.
+    ///
+    /// Returns the persisted paused row on success.
+    ///
+    /// `child_count` must be `> 0`. The caller is responsible for
+    /// having spawned (or about to spawn) that many child tasks; this
+    /// method only updates the parent and does not insert the
+    /// children — Phase 2.6 will own the child orchestration.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `id` is stored.
+    /// - `pause rejected: not running` — if the row is in any
+    ///   non-`Running` status.
+    /// - `pause rejected: worker mismatch` — if `worker` does not
+    ///   match the current `worker_id`.
+    /// - `pause rejected: lease mismatch` — if `lease` does not
+    ///   match the current `lease_id`.
+    /// - Row-level errors from [`AgentTask::wait_on_children`]
+    ///   (e.g. zero `child_count`).
+    async fn pause_on_children(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        child_count: u32,
+        continuation: ContinuationEnvelope,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
+    /// Pause a running task on a user confirmation, dropping the
+    /// lease atomically with the typed-state mutation.
+    ///
+    /// This is the second of Phase 2.4's two journal-guarded pause
+    /// entry points. A successful call:
+    ///
+    /// 1. CAS-checks that the row exists, is in
+    ///    [`TaskStatus::Running`], and is owned by `(worker, lease)`.
+    /// 2. Transitions the row to [`TaskStatus::AwaitingConfirmation`]
+    ///    via [`AgentTask::await_confirmation`], stamping the typed
+    ///    [`crate::journal::TaskState::AwaitingConfirmation`] payload with the
+    ///    supplied `continuation` and (optional) `prepared_operation`.
+    /// 3. Drops the lease so the row is no longer reachable from the
+    ///    lease-expiry index and cannot be re-acquired by either
+    ///    acquisition path.
+    /// 4. Persists the row under the same write lock.
+    ///
+    /// Returns the persisted paused row on success. The pause is
+    /// **idempotent through the durable layer** — workers may safely
+    /// retry on transient store errors because the CAS guard rejects
+    /// any retry whose lease no longer owns the row.
+    ///
+    /// `prepared_operation` is `None` for non-listen tools (the common
+    /// case) and `Some(...)` when the awaited tool staged a
+    /// long-running listen/execute operation that the resume path
+    /// will need to either execute or cancel.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `id` is stored.
+    /// - `pause rejected: not running` — if the row is in any
+    ///   non-`Running` status.
+    /// - `pause rejected: worker mismatch` — if `worker` does not
+    ///   match the current `worker_id`.
+    /// - `pause rejected: lease mismatch` — if `lease` does not
+    ///   match the current `lease_id`.
+    async fn pause_on_confirmation(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
+    /// Decrement a [`TaskStatus::WaitingOnChildren`] parent's
+    /// outstanding-child counter and, when it hits zero, atomically
+    /// flip the row back to [`TaskStatus::Pending`] so a worker can
+    /// pick it up and re-enter the loop.
+    ///
+    /// This is the resume entry point that Phase 2.6's child-task
+    /// orchestrator will call once a child reaches a terminal state.
+    /// While there are still outstanding children, the parent stays
+    /// in `WaitingOnChildren` and the typed [`crate::journal::TaskState`] payload
+    /// remains in place; the resume transition fires only on the
+    /// final decrement.
+    ///
+    /// Returns the persisted parent row after the mutation.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `parent_id` is stored.
+    /// - `resolve rejected: not waiting on children` — if the row is
+    ///   in any status other than [`TaskStatus::WaitingOnChildren`].
+    async fn resolve_child(
+        &self,
+        parent_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
+    /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
+    /// [`TaskStatus::Pending`], clearing the typed
+    /// [`crate::journal::TaskState::AwaitingConfirmation`] payload atomically with
+    /// the status flip.
+    ///
+    /// This is the resume entry point a confirmation transport will
+    /// call once it receives the user's decision (Phase 2.4 leaves
+    /// the transport itself out of scope). The caller is responsible
+    /// for reading the embedded [`ContinuationEnvelope`] and any
+    /// prepared listen/execute operation **before** calling this
+    /// method, because the resume transition wipes the typed payload
+    /// to satisfy the state ↔ status invariant.
+    ///
+    /// Returns the persisted resumed row.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `id` is stored.
+    /// - `resume rejected: not awaiting confirmation` — if the row is
+    ///   in any status other than [`TaskStatus::AwaitingConfirmation`].
+    async fn resume_from_confirmation(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
 
     /// Remove every stored task. Used by tests.
     ///
@@ -1049,6 +1227,149 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(released)
     }
 
+    async fn pause_on_children(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        child_count: u32,
+        continuation: ContinuationEnvelope,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+
+        // CAS guard: only the worker that holds the lease may pause.
+        // Status check first so the error message is friendliest when
+        // the row is in the wrong state for any reason.
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "pause rejected: task {id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
+        }
+
+        let paused = old
+            .clone()
+            .wait_on_children(child_count, continuation, now)
+            .context("pause rejected: wait_on_children transition failed")?;
+        inner.rebalance_after_row_change(&old, &paused);
+        inner.by_id.insert(paused.id.clone(), paused.clone());
+        drop(inner);
+        Ok(paused)
+    }
+
+    async fn pause_on_confirmation(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "pause rejected: task {id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
+        }
+
+        let paused = old
+            .clone()
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
+        inner.rebalance_after_row_change(&old, &paused);
+        inner.by_id.insert(paused.id.clone(), paused.clone());
+        drop(inner);
+        Ok(paused)
+    }
+
+    async fn resolve_child(
+        &self,
+        parent_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("resolve rejected: task {parent_id} does not exist"))?;
+
+        if old.status != TaskStatus::WaitingOnChildren {
+            let status = old.status;
+            return Err(anyhow!(
+                "resolve rejected: task {parent_id} is not waiting on children (status {status:?})"
+            ));
+        }
+
+        let resolved = old
+            .clone()
+            .child_resolved(now)
+            .context("resolve rejected: child_resolved transition failed")?;
+        inner.rebalance_after_row_change(&old, &resolved);
+        inner.by_id.insert(resolved.id.clone(), resolved.clone());
+        drop(inner);
+        Ok(resolved)
+    }
+
+    async fn resume_from_confirmation(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("resume rejected: task {id} does not exist"))?;
+
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "resume rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
+        }
+
+        let resumed = old
+            .clone()
+            .resume_from_confirmation(now)
+            .context("resume rejected: resume_from_confirmation transition failed")?;
+        inner.rebalance_after_row_change(&old, &resumed);
+        inner.by_id.insert(resumed.id.clone(), resumed.clone());
+        drop(inner);
+        Ok(resumed)
+    }
+
     async fn clear(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
         *inner = Inner::default();
@@ -1064,7 +1385,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::task::{LeaseId, WorkerId};
+    use crate::journal::task::{LeaseId, TaskSchemaError, WorkerId};
+    use crate::journal::task_state::TaskState;
+    use agent_sdk_core::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
@@ -1082,6 +1405,38 @@ mod tests {
 
     fn fresh_root(name: &str) -> AgentTask {
         AgentTask::new_root_turn(thread(name), t0(), 3)
+    }
+
+    /// Sample [`ContinuationEnvelope`] used by every Phase 2.4 pause /
+    /// resume test in this module. The exact contents do not matter —
+    /// we only care that the envelope round-trips through the typed
+    /// [`TaskState`] payload and survives writes to the store.
+    fn sample_continuation(name: &str) -> ContinuationEnvelope {
+        let thread = thread(name);
+        ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread),
+            response_id: None,
+            stop_reason: None,
+        })
+    }
+
+    /// Sample listen/execute prepared operation paired with the
+    /// confirmation continuation in tests that exercise the typed
+    /// [`TaskState::AwaitingConfirmation`] payload.
+    fn sample_prepared_op() -> agent_sdk_core::ListenExecutionContext {
+        agent_sdk_core::ListenExecutionContext {
+            operation_id: "op-store".into(),
+            revision: 1,
+            snapshot: serde_json::json!({"preview": true}),
+            expires_at: None,
+        }
     }
 
     /// Build a fresh root turn on `thread` with `created_at` at `t0 +
@@ -1102,7 +1457,12 @@ mod tests {
             .await
             .context("get")?
             .context("task exists")?;
-        assert_eq!(got, task);
+        // AgentTask does not impl PartialEq; the canonical equality
+        // contract is the JSON wire form (Phase 2.4 typed-state move).
+        assert_eq!(
+            serde_json::to_value(&got).context("got to value")?,
+            serde_json::to_value(&task).context("task to value")?
+        );
         Ok(())
     }
 
@@ -1648,7 +2008,7 @@ mod tests {
                         .await
                         .context("drive running")?;
                     let waiting = running
-                        .wait_on_children(2, t_plus(2))
+                        .wait_on_children(2, sample_continuation("t1"), t_plus(2))
                         .context("wait_on_children")?;
                     store.update(waiting).await.context("update waiting")?;
                 }
@@ -1657,7 +2017,7 @@ mod tests {
                         .await
                         .context("drive running")?;
                     let awaiting = running
-                        .await_confirmation(t_plus(2))
+                        .await_confirmation(sample_continuation("t1"), None, t_plus(2))
                         .context("await_confirmation")?;
                     store.update(awaiting).await.context("update awaiting")?;
                 }
@@ -2282,7 +2642,9 @@ mod tests {
 
         // Exercise Pending → WaitingOnChildren → Pending.
         let running2 = running_root(&store, active).await.context("running 2")?;
-        let waiting = running2.wait_on_children(1, t_plus(7)).context("wait")?;
+        let waiting = running2
+            .wait_on_children(1, sample_continuation("t1"), t_plus(7))
+            .context("wait")?;
         store
             .update(waiting.clone())
             .await
@@ -2451,7 +2813,7 @@ mod tests {
             .await
             .context("update running")?;
         let waiting = running
-            .wait_on_children(2, t_plus(2))
+            .wait_on_children(2, sample_continuation("t-wait"), t_plus(2))
             .context("wait_on_children")?;
         store.update(waiting).await.context("update waiting")?;
 
@@ -2494,7 +2856,7 @@ mod tests {
             .await
             .context("update running")?;
         let awaiting = running
-            .await_confirmation(t_plus(2))
+            .await_confirmation(sample_continuation("t-await"), None, t_plus(2))
             .context("await_confirmation")?;
         store.update(awaiting).await.context("update awaiting")?;
 
@@ -2747,7 +3109,7 @@ mod tests {
             .await
             .context("insert child")?;
         let b_waiting = b_running
-            .wait_on_children(1, t_plus(3))
+            .wait_on_children(1, sample_continuation("b"), t_plus(3))
             .context("wait_on_children")?;
         store.update(b_waiting).await.context("update waiting")?;
 
@@ -3244,7 +3606,7 @@ mod tests {
         // we want the sweep below to act on the tool child only, not
         // accidentally on an expired root lease.
         let waiting_root = running
-            .wait_on_children(1, t_plus(3))
+            .wait_on_children(1, sample_continuation("t1"), t_plus(3))
             .context("root waiting")?;
         store
             .update(waiting_root)
@@ -3322,6 +3684,711 @@ mod tests {
             .context("fresh claim")?;
         assert_eq!(reclaimed.id, child_id);
         assert_eq!(reclaimed.attempt, 2);
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.4 — Parent waiting states, confirmation pause/resume,
+    // and typed durable task state (ENG-7918)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // Acceptance criteria these tests pin down:
+    //
+    // * A paused parent **releases its lease** and is invisible to
+    //   `try_acquire_task` / `acquire_next_runnable` and to the
+    //   lease-expiry sweep.
+    // * Confirmation-paused tasks persist the typed
+    //   [`TaskState::AwaitingConfirmation`] payload (continuation +
+    //   optional prepared listen/execute operation) so the resume
+    //   path has everything it needs to either execute or cancel the
+    //   staged operation.
+    // * Pause / resume transitions are journal-guarded: only the
+    //   worker that holds the lease may pause, and resume from
+    //   confirmation rejects rows in any other status.
+    // * Typed-state round-trips through the store (insert / update /
+    //   get / list_by_status) without losing the embedded continuation
+    //   on either pause variant.
+
+    /// Helper: drive a fresh root through `submit_root_turn`,
+    /// acquire its lease via `try_acquire_task`, and return the
+    /// claimed row alongside its `(WorkerId, LeaseId)` tuple. Used
+    /// by the pause-path tests so the journal-guarded pause helper
+    /// is exercised against a row that is genuinely owned by a
+    /// worker, not just hand-crafted.
+    async fn submitted_and_claimed_root(
+        store: &InMemoryAgentTaskStore,
+        thread_name: &str,
+        worker: &str,
+        lease: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        let root = AgentTask::new_root_turn(thread(thread_name), t_plus(0), 5);
+        let id = root.id.clone();
+        store
+            .submit_root_turn(root)
+            .await
+            .context("submit root for pause test")?;
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string(worker),
+                LeaseId::from_string(lease),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire root for pause test")?
+            .context("acquire returned None")?;
+        Ok((
+            claimed,
+            WorkerId::from_string(worker),
+            LeaseId::from_string(lease),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_children_drops_lease_and_persists_typed_state() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-pause-children", "w1", "l1").await?;
+        let id = claimed.id.clone();
+
+        let paused = store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                2,
+                sample_continuation("t-pause-children"),
+                t_plus(2),
+            )
+            .await
+            .context("pause_on_children")?;
+
+        // Status flipped, lease dropped, typed payload populated.
+        assert_eq!(paused.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(paused.pending_child_count, 2);
+        assert!(paused.worker_id.is_none(), "lease must be dropped");
+        assert!(paused.lease_id.is_none());
+        assert!(paused.lease_expires_at.is_none());
+        assert!(paused.last_heartbeat_at.is_none());
+        assert!(matches!(paused.state, TaskState::WaitingOnChildren { .. }));
+        assert!(paused.state.continuation().is_some());
+
+        // The persisted row matches what `pause_on_children` returned.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::WaitingOnChildren);
+        assert!(persisted.worker_id.is_none());
+        assert!(persisted.state.continuation().is_some());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_confirmation_drops_lease_and_persists_typed_state() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-pause-confirm", "w1", "l1").await?;
+        let id = claimed.id.clone();
+
+        let paused = store
+            .pause_on_confirmation(
+                &id,
+                &worker,
+                &lease,
+                sample_continuation("t-pause-confirm"),
+                Some(sample_prepared_op()),
+                t_plus(2),
+            )
+            .await
+            .context("pause_on_confirmation")?;
+
+        assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
+        assert!(paused.worker_id.is_none(), "lease must be dropped");
+        assert!(paused.lease_id.is_none());
+        assert!(paused.lease_expires_at.is_none());
+        assert!(matches!(
+            paused.state,
+            TaskState::AwaitingConfirmation { .. }
+        ));
+        assert!(paused.state.continuation().is_some());
+        let op = paused
+            .state
+            .prepared_operation()
+            .expect("prepared op present");
+        assert_eq!(op.operation_id, "op-store");
+
+        // Persisted row carries both the continuation and the
+        // prepared operation.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert!(persisted.state.continuation().is_some());
+        assert!(persisted.state.prepared_operation().is_some());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_parent_is_invisible_to_targeted_acquire() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-invisible-target", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                1,
+                sample_continuation("t-invisible-target"),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        // A fresh worker tries to claim the same id directly. The
+        // CAS guard inside `try_acquire_task` must refuse because
+        // the row is no longer `Pending`.
+        let claim = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("targeted acquire")?;
+        assert!(
+            claim.is_none(),
+            "paused parent must not be acquirable by id"
+        );
+
+        // Same check for the AwaitingConfirmation pause path.
+        let (claimed2, worker2, lease2) =
+            submitted_and_claimed_root(&store, "t-invisible-conf", "w2", "l2").await?;
+        let id2 = claimed2.id.clone();
+        store
+            .pause_on_confirmation(
+                &id2,
+                &worker2,
+                &lease2,
+                sample_continuation("t-invisible-conf"),
+                None,
+                t_plus(3),
+            )
+            .await
+            .context("pause confirm")?;
+        let claim = store
+            .try_acquire_task(
+                &id2,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(180),
+                t_plus(4),
+            )
+            .await
+            .context("targeted acquire confirm")?;
+        assert!(
+            claim.is_none(),
+            "confirmation-paused row must not be acquirable by id"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_parent_is_invisible_to_scan_acquire_and_expiry_sweep() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-scan-invisible", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                1,
+                sample_continuation("t-scan-invisible"),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        // The runnable scan must observe an empty pool — the paused
+        // parent is the only row in the store and it must not be
+        // visible to `acquire_next_runnable`.
+        let scanned = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-scan"),
+                LeaseId::from_string("l-scan"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("scan")?;
+        assert!(
+            scanned.is_none(),
+            "paused parent must not appear in runnable scan"
+        );
+
+        // The expiry sweep walks the lease-expiry index, which only
+        // contains `Running` rows. A paused row dropped its lease, so
+        // even at `now = t+1_000_000` the sweep must not touch it.
+        let swept = store
+            .release_expired_leases(t_plus(1_000_000))
+            .await
+            .context("sweep")?;
+        assert!(
+            swept.is_empty(),
+            "paused parent must not be in lease-expiry index"
+        );
+
+        // The row is still WaitingOnChildren after the sweep.
+        let after = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(after.status, TaskStatus::WaitingOnChildren);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_children_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-cas", "w1", "l1").await?;
+        let id = claimed.id.clone();
+
+        // Wrong worker.
+        let err = store
+            .pause_on_children(
+                &id,
+                &WorkerId::from_string("w-imposter"),
+                &lease,
+                1,
+                sample_continuation("t-cas"),
+                t_plus(2),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("worker mismatch"), "unexpected: {message}");
+
+        // Wrong lease.
+        let err = store
+            .pause_on_children(
+                &id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                1,
+                sample_continuation("t-cas"),
+                t_plus(3),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("lease mismatch"), "unexpected: {message}");
+
+        // Persisted row is still Running and unchanged.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert_eq!(
+            persisted.worker_id.as_ref().map(WorkerId::as_str),
+            Some("w1")
+        );
+        assert!(
+            persisted.state.is_none(),
+            "failed pause must not stamp typed state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_confirmation_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-cas-conf", "w1", "l1").await?;
+        let id = claimed.id.clone();
+
+        let err = store
+            .pause_on_confirmation(
+                &id,
+                &WorkerId::from_string("w-imposter"),
+                &lease,
+                sample_continuation("t-cas-conf"),
+                None,
+                t_plus(2),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("worker mismatch"), "unexpected: {message}");
+
+        let err = store
+            .pause_on_confirmation(
+                &id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                sample_continuation("t-cas-conf"),
+                None,
+                t_plus(3),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("lease mismatch"), "unexpected: {message}");
+
+        // Row is still Running.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(persisted.state.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_children_rejects_non_running_rows() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-pending"), t_plus(0), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        // Row is Pending — pause must refuse.
+        let err = store
+            .pause_on_children(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                1,
+                sample_continuation("t-pending"),
+                t_plus(1),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("not running"), "unexpected: {message}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_on_confirmation_rejects_non_running_rows() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-pending-conf"), t_plus(0), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        let err = store
+            .pause_on_confirmation(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                sample_continuation("t-pending-conf"),
+                None,
+                t_plus(1),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("not running"), "unexpected: {message}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_child_drains_counter_and_resumes_parent() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-resolve", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                3,
+                sample_continuation("t-resolve"),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        // First two resolves keep the parent in WaitingOnChildren and
+        // preserve the typed payload.
+        let after_one = store
+            .resolve_child(&id, t_plus(3))
+            .await
+            .context("resolve 1")?;
+        assert_eq!(after_one.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(after_one.pending_child_count, 2);
+        assert!(after_one.state.continuation().is_some());
+
+        let after_two = store
+            .resolve_child(&id, t_plus(4))
+            .await
+            .context("resolve 2")?;
+        assert_eq!(after_two.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(after_two.pending_child_count, 1);
+        assert!(after_two.state.continuation().is_some());
+
+        // Final resolve flips the parent back to Pending and clears
+        // the typed payload to satisfy the state ↔ status invariant.
+        let after_three = store
+            .resolve_child(&id, t_plus(5))
+            .await
+            .context("resolve 3")?;
+        assert_eq!(after_three.status, TaskStatus::Pending);
+        assert_eq!(after_three.pending_child_count, 0);
+        assert!(after_three.state.is_none());
+
+        // The runnable scan must now observe the resumed parent.
+        let scanned = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-resume"),
+                LeaseId::from_string("l-resume"),
+                t_plus(120),
+                t_plus(6),
+            )
+            .await
+            .context("scan resumed")?
+            .context("scan returned row")?;
+        assert_eq!(scanned.id, id);
+        assert_eq!(scanned.status, TaskStatus::Running);
+        // Resumed row is on its second attempt because the original
+        // claim consumed attempt #1 and the recovery scan consumes
+        // attempt #2.
+        assert_eq!(scanned.attempt, 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_child_rejects_non_waiting_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-not-waiting"), t_plus(0), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        let err = store.resolve_child(&id, t_plus(1)).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not waiting on children"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_from_confirmation_clears_typed_state_and_returns_to_pending() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-resume-conf", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        store
+            .pause_on_confirmation(
+                &id,
+                &worker,
+                &lease,
+                sample_continuation("t-resume-conf"),
+                Some(sample_prepared_op()),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        let resumed = store
+            .resume_from_confirmation(&id, t_plus(3))
+            .await
+            .context("resume")?;
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert!(resumed.state.is_none(), "resume must clear typed state");
+
+        // The persisted row is now Pending and runnable.
+        let scanned = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-resume"),
+                LeaseId::from_string("l-resume"),
+                t_plus(120),
+                t_plus(4),
+            )
+            .await
+            .context("scan resumed")?
+            .context("scan returned row")?;
+        assert_eq!(scanned.id, id);
+        assert_eq!(scanned.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_from_confirmation_rejects_non_awaiting_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-not-awaiting"), t_plus(0), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        let err = store
+            .resume_from_confirmation(&id, t_plus(1))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not awaiting confirmation"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_parent_round_trips_through_get_and_list_by_status() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-round-trip", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        let paused = store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                1,
+                sample_continuation("t-round-trip"),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        // `get` returns the same typed payload.
+        let fetched = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(fetched.id, paused.id);
+        assert_eq!(fetched.status, TaskStatus::WaitingOnChildren);
+        assert!(fetched.state.continuation().is_some());
+
+        // `list_by_status(WaitingOnChildren)` returns the row.
+        let rows = store
+            .list_by_status(TaskStatus::WaitingOnChildren)
+            .await
+            .context("list waiting")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+
+        // The status indexes do **not** double-count the row.
+        let pending_rows = store
+            .list_by_status(TaskStatus::Pending)
+            .await
+            .context("list pending")?;
+        assert!(
+            pending_rows.iter().all(|r| r.id != id),
+            "paused parent must not show up under Pending"
+        );
+        let running_rows = store
+            .list_by_status(TaskStatus::Running)
+            .await
+            .context("list running")?;
+        assert!(
+            running_rows.iter().all(|r| r.id != id),
+            "paused parent must not show up under Running"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn awaiting_confirmation_payload_round_trips_through_json() -> Result<()> {
+        // The Phase 2.4 acceptance criterion "Confirmation-paused
+        // tasks persist the state needed for later resume" must hold
+        // through the durable wire form too: a paused row that gets
+        // serialised and deserialised must still carry the
+        // continuation envelope and prepared operation it was paused
+        // with.
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-json-round", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        let paused = store
+            .pause_on_confirmation(
+                &id,
+                &worker,
+                &lease,
+                sample_continuation("t-json-round"),
+                Some(sample_prepared_op()),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        let json = serde_json::to_string(&paused).context("serialize paused row")?;
+        let recovered: AgentTask = serde_json::from_str(&json).context("deserialize paused row")?;
+        recovered
+            .validate()
+            .context("recovered paused row must validate")?;
+        assert_eq!(recovered.status, TaskStatus::AwaitingConfirmation);
+        assert!(matches!(
+            recovered.state,
+            TaskState::AwaitingConfirmation { .. }
+        ));
+        assert!(recovered.state.continuation().is_some());
+        assert_eq!(
+            recovered
+                .state
+                .prepared_operation()
+                .map(|op| op.operation_id.clone()),
+            Some("op-store".into())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_on_children_payload_round_trips_through_json() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-json-children", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        let paused = store
+            .pause_on_children(
+                &id,
+                &worker,
+                &lease,
+                4,
+                sample_continuation("t-json-children"),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        let json = serde_json::to_string(&paused).context("serialize")?;
+        let recovered: AgentTask = serde_json::from_str(&json).context("deserialize")?;
+        recovered.validate().context("recovered must validate")?;
+        assert_eq!(recovered.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(recovered.pending_child_count, 4);
+        assert!(matches!(
+            recovered.state,
+            TaskState::WaitingOnChildren { .. }
+        ));
+        assert!(recovered.state.continuation().is_some());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_paused_status_with_none_payload() -> Result<()> {
+        // Defense in depth: the schema layer must reject any row
+        // whose status is paused but whose state field is `None`.
+        // This is the durable form of the "no continuation, no
+        // resume" guarantee — even a hand-crafted row that bypasses
+        // the typed transition helpers cannot land in the journal.
+        let mut bad = AgentTask::new_root_turn(thread("t-bad"), t_plus(0), 3);
+        bad.status = TaskStatus::WaitingOnChildren;
+        bad.pending_child_count = 1;
+        bad.state = TaskState::None;
+        let err = bad.validate().unwrap_err();
+        assert!(
+            matches!(err, TaskSchemaError::PausedStatusMissingPayload { .. }),
+            "unexpected: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rejects_non_paused_status_with_payload() -> Result<()> {
+        // The opposite half of the invariant: a Pending or Running
+        // row that carries a paused payload is also rejected, so a
+        // resume bug that forgets to clear the state cannot leak a
+        // stale continuation onto a runnable row.
+        let mut bad = AgentTask::new_root_turn(thread("t-bad-2"), t_plus(0), 3);
+        bad.state = TaskState::WaitingOnChildren {
+            continuation: Box::new(sample_continuation("t-bad-2")),
+        };
+        let err = bad.validate().unwrap_err();
+        assert!(
+            matches!(err, TaskSchemaError::StateStatusMismatch { .. }),
+            "unexpected: {err:?}"
+        );
         Ok(())
     }
 }
