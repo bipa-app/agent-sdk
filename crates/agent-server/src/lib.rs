@@ -122,9 +122,9 @@ pub mod journal;
 pub use journal::{
     AgentTask, AgentTaskId, AgentTaskStore, ChildSpawnSpec, FailureReason, InMemoryAgentTaskStore,
     InMemoryMessageProjectionStore, InMemoryThreadStore, LeaseId, MessageProjection,
-    MessageProjectionError, MessageProjectionStore, RecoveryAction, RecoveryContext, RecoveryRecord,
-    TaskKind, TaskSchemaError, TaskState, TaskStatus, Thread, ThreadSchemaError, ThreadStatus,
-    ThreadStore, WorkerId, classify_recovery,
+    MessageProjectionError, MessageProjectionStore, RecoveryAction, RecoveryContext,
+    RecoveryRecord, TaskKind, TaskSchemaError, TaskState, TaskStatus, Thread, ThreadSchemaError,
+    ThreadStatus, ThreadStore, WorkerId, classify_recovery,
 };
 
 // ── Re-exports that validate the dependency edges ────────────────────

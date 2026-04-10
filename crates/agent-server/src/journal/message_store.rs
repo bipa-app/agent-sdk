@@ -424,11 +424,7 @@ mod tests {
     async fn replace_history_creates_projection_if_absent() {
         let store = InMemoryMessageProjectionStore::new();
         let p = store
-            .replace_history(
-                &thread_a(),
-                vec![llm::Message::user("bootstrapped")],
-                t0(),
-            )
+            .replace_history(&thread_a(), vec![llm::Message::user("bootstrapped")], t0())
             .await
             .unwrap();
         assert_eq!(p.message_count(), 1);

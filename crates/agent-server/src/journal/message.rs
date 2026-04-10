@@ -74,7 +74,7 @@ pub struct MessageProjection {
 impl MessageProjection {
     /// Create a fresh, empty projection for the given thread.
     #[must_use]
-    pub fn new(thread_id: ThreadId, now: OffsetDateTime) -> Self {
+    pub const fn new(thread_id: ThreadId, now: OffsetDateTime) -> Self {
         Self {
             thread_id,
             messages: Vec::new(),
@@ -124,7 +124,7 @@ impl MessageProjection {
 
     /// Number of messages in the committed history.
     #[must_use]
-    pub fn message_count(&self) -> usize {
+    pub const fn message_count(&self) -> usize {
         self.messages.len()
     }
 }
@@ -223,7 +223,7 @@ mod tests {
             .iter()
             .filter_map(|m| match &m.content {
                 llm::Content::Text(t) => Some(t.as_str()),
-                _ => None,
+                llm::Content::Blocks(_) => None,
             })
             .collect();
         assert_eq!(texts, vec!["first", "second"]);
