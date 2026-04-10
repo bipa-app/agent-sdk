@@ -338,16 +338,50 @@
 //! - [`turn_attempt_store::InMemoryTurnAttemptStore`] is the
 //!   reference in-memory implementation.
 //!
+//! # Phase 3.4 — Completed-turn checkpoints and atomic commit path (ENG-7925)
+//!
+//! Phase 3.4 adds the **completed-turn checkpoint** — an immutable
+//! snapshot of conversation state at the instant a turn commits
+//! successfully — and the **atomic commit path** that ties all
+//! projections together.
+//!
+//! 1. **Thread-scoped uniqueness** — exactly one checkpoint exists
+//!    per `(thread_id, turn_number)`. The store enforces this with a
+//!    partial-unique index and rejects duplicates.
+//! 2. **Full snapshot for v1 recovery** — each checkpoint carries the
+//!    complete message history and an opaque agent-state blob, so
+//!    recovery can restore a thread to any committed turn without
+//!    replaying from epoch.
+//! 3. **Atomic commit path** — [`commit::commit_completed_turn`] is
+//!    the single entry point that advances the turn-attempt audit,
+//!    thread aggregate, message projection, and checkpoint table
+//!    together. Failed or cancelled turns that never call this
+//!    function do not create checkpoints.
+//!
+//! - [`checkpoint::Checkpoint`] is the immutable snapshot row.
+//! - [`checkpoint_store::CheckpointStore`] is the narrow trait
+//!   surface: `commit_checkpoint`, `get`, `get_by_turn`,
+//!   `list_by_thread`.
+//! - [`checkpoint_store::InMemoryCheckpointStore`] is the reference
+//!   in-memory implementation.
+//! - [`commit::commit_completed_turn`] is the atomic commit
+//!   orchestrator.
+//! - [`commit::CompletedTurnCommit`] / [`commit::CommitOutcome`] are
+//!   the input/output types for the commit path.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Checkpoint storage | 3+ |
+//! | Recovery loaders | 3+ |
 //! | Event replay | 3+ |
 //! | Actual tool-runtime worker | 3+ |
 //! | Subagent runtime | 3+ |
 //! | Confirmation transport APIs | post-2.4 |
 
+pub mod checkpoint;
+pub mod checkpoint_store;
+pub mod commit;
 pub mod message;
 pub mod message_store;
 pub mod recovery;
@@ -359,6 +393,9 @@ pub mod thread_store;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
 
+pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
+pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
+pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
