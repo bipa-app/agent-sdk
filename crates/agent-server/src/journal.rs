@@ -396,23 +396,45 @@
 //!   the new store method that returns the highest-turn checkpoint
 //!   for a thread.
 //!
+//! # Phase 4.2 — `ExecutionContextFactory`, checkpoint-seeding, and staged stores (ENG-7935)
+//!
+//! Phase 4.2 adds the **staged execution model** — the root worker
+//! reconstructs trusted execution context from durable task, thread,
+//! and checkpoint state, and keeps all message/state mutations buffered
+//! in memory until commit time.
+//!
+//! - [`staged::StagedMessageStore`] and [`staged::StagedStateStore`]
+//!   implement the SDK's [`agent_sdk_tools::stores::MessageStore`] and
+//!   [`agent_sdk_tools::stores::StateStore`] traits while keeping all
+//!   writes in-memory. Seeded from the latest completed checkpoint (or
+//!   empty for fresh threads).
+//! - [`execution_context::RootWorkerInputs`] bundles the Phase 4.1
+//!   bootstrap context, recovery view, and staged stores into a
+//!   single "factory input" struct.
+//! - [`execution_context::build_root_worker_inputs`] is the primary
+//!   entry point: it recovers thread state, seeds staged stores, and
+//!   returns everything the worker needs to begin a turn.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Event replay | 3+ |
-//! | Actual tool-runtime worker | 3+ |
-//! | Subagent runtime | 3+ |
+//! | Text-only turn execution | 4.3 |
+//! | Tool-batch suspension | 4.4+ |
+//! | Event replay | future |
+//! | Subagent runtime | future |
 //! | Confirmation transport APIs | post-2.4 |
 
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
+pub mod execution_context;
 pub mod message;
 pub mod message_store;
 #[cfg(test)]
 mod persistence_regression;
 pub mod recovery;
+pub mod staged;
 pub mod store;
 pub mod task;
 pub mod task_state;
@@ -425,11 +447,13 @@ pub mod turn_attempt_store;
 pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
+pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
+pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskKind, TaskSchemaError, TaskStatus,
