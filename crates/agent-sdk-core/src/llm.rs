@@ -273,6 +273,10 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Human-readable display name shown in UI and audit records.
+    pub display_name: String,
+    /// Permission tier for this tool.
+    pub tier: super::types::ToolTier,
 }
 
 #[derive(Debug, Clone)]

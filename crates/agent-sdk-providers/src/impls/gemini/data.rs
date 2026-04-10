@@ -805,6 +805,8 @@ mod tests {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            display_name: "Test Tool".to_string(),
+            tier: agent_sdk_core::ToolTier::Observe,
         }];
 
         let api_tools = convert_tools_to_config(tools);

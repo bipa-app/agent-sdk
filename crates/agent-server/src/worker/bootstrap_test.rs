@@ -48,6 +48,8 @@ fn sample_tools() -> Vec<Tool> {
                 },
                 "required": ["path"]
             }),
+            display_name: "Read File".into(),
+            tier: agent_sdk_core::ToolTier::Observe,
         },
         Tool {
             name: "write_file".into(),
@@ -60,6 +62,8 @@ fn sample_tools() -> Vec<Tool> {
                 },
                 "required": ["path", "content"]
             }),
+            display_name: "Write File".into(),
+            tier: agent_sdk_core::ToolTier::Confirm,
         },
     ]
 }

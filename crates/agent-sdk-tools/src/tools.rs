@@ -1111,6 +1111,8 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
                 name: tool.name_str().to_string(),
                 description: tool.description().to_string(),
                 input_schema: tool.input_schema(),
+                display_name: tool.display_name().to_string(),
+                tier: tool.tier(),
             })
             .collect();
 
@@ -1118,12 +1120,16 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             name: tool.name_str().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
+            display_name: tool.display_name().to_string(),
+            tier: tool.tier(),
         }));
 
         tools.extend(self.listen_tools.values().map(|tool| llm::Tool {
             name: tool.name_str().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
+            display_name: tool.display_name().to_string(),
+            tier: tool.tier(),
         }));
 
         tools
