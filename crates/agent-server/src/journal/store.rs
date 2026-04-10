@@ -9,9 +9,29 @@
 //! Every `insert` / `update` calls [`AgentTask::validate`] before committing
 //! the row, so no invariant-violating task can ever be reached through the
 //! public API — not even in-memory during tests. The in-memory store also
-//! enforces the **partial-unique "one active root per thread"** invariant,
+//! enforces the **partial-unique "one blocking root per thread"** invariant,
 //! which is the single most important durability guarantee the acquisition
 //! API (Phase 2.3) will rely on.
+//!
+//! # Root admission and FIFO queueing (Phase 2.2)
+//!
+//! Phase 2.2 splits the "one active root per thread" rule along a finer
+//! boundary than Phase 2.1's `is_active`: the slot is held only by
+//! [`TaskStatus`]es that satisfy [`TaskStatus::blocks_root_admission`], which
+//! excludes the `Queued` state. Concretely:
+//!
+//! - At most one [`TaskKind::RootTurn`] per thread may sit in
+//!   `Pending | Running | WaitingOnChildren | AwaitingConfirmation`.
+//! - Any number of additional root turns may coexist in [`TaskStatus::Queued`]
+//!   while that slot is held. They promote in deterministic FIFO order
+//!   (`created_at`, tiebroken by `id`) as the slot frees up.
+//! - Tool-runtime children are never gated by this slot — they are leaf
+//!   tasks under whatever root currently holds the slot.
+//!
+//! The Phase 2.2 admission entry points are [`AgentTaskStore::submit_root_turn`]
+//! and [`AgentTaskStore::promote_next_queued_root`]. Callers should use
+//! `submit_root_turn` instead of `insert` for every externally-submitted
+//! root turn so queueing is applied automatically.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -19,6 +39,7 @@ use std::sync::Arc;
 use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
@@ -34,14 +55,46 @@ pub trait AgentTaskStore: Send + Sync {
     /// Insert a new task row.
     ///
     /// The row must pass [`AgentTask::validate`] and, if it is a
-    /// [`TaskKind::RootTurn`] in a non-terminal status, must not collide
-    /// with an existing active root on the same thread.
+    /// [`TaskKind::RootTurn`] in a status that satisfies
+    /// [`TaskStatus::blocks_root_admission`], must not collide with an
+    /// existing blocking root on the same thread.
     ///
     /// # Errors
     /// Returns an error if the row fails validation, if a row with the
-    /// same `id` already exists, or if the active-root invariant would
+    /// same `id` already exists, or if the blocking-root invariant would
     /// be violated.
+    ///
+    /// Prefer [`AgentTaskStore::submit_root_turn`] when inserting
+    /// externally-submitted root turns: it applies the FIFO queue rule
+    /// automatically instead of rejecting the submission when the slot
+    /// is busy.
     async fn insert(&self, task: AgentTask) -> Result<()>;
+
+    /// Durably admit a new root turn on a thread, respecting the
+    /// same-thread FIFO queue.
+    ///
+    /// The supplied task must be a freshly-constructed
+    /// [`TaskKind::RootTurn`] in [`TaskStatus::Pending`] — i.e. the output
+    /// of [`AgentTask::new_root_turn`] (possibly with a custom retry budget
+    /// but not yet mutated by any other state-transition helper). The store
+    /// decides, atomically, whether to admit it as `Pending` (if the thread
+    /// has no blocking root yet) or convert it to `Queued` (if a blocking
+    /// root already holds the slot).
+    ///
+    /// Returns the admitted row **as persisted**, so callers can observe the
+    /// final status without a second `get`. This is how Phase 2.2's
+    /// admission contract is expressed in the trait surface:
+    ///
+    /// - If `task.thread_id` has no [`TaskStatus::blocks_root_admission`]
+    ///   root, the row lands in [`TaskStatus::Pending`].
+    /// - Otherwise, the row lands in [`TaskStatus::Queued`] behind every
+    ///   previously queued root on the same thread. `created_at` (and, as a
+    ///   tie-breaker, `id`) define the FIFO order.
+    ///
+    /// # Errors
+    /// Returns an error if the task is not a freshly-constructed root turn,
+    /// if the row fails validation, or if the underlying store write fails.
+    async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask>;
 
     /// Look up a task by id.
     ///
@@ -56,7 +109,7 @@ pub trait AgentTaskStore: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if the row fails validation, does not exist, or
-    /// if the active-root invariant would be violated after the update.
+    /// if the blocking-root invariant would be violated after the update.
     async fn update(&self, task: AgentTask) -> Result<()>;
 
     /// List every task (root and descendants) bound to a thread.
@@ -77,16 +130,53 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if the store cannot be queried.
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>>;
 
-    /// Return the currently active [`TaskKind::RootTurn`] for a thread, if
-    /// one exists.
+    /// Return the currently blocking [`TaskKind::RootTurn`] for a thread,
+    /// if one exists.
     ///
-    /// "Active" means the row is in any non-terminal status. This is the
-    /// primary consumer of the partial-unique "one active root per thread"
-    /// invariant.
+    /// "Blocking" means the row is a root turn whose status satisfies
+    /// [`TaskStatus::blocks_root_admission`] (i.e. `Pending`, `Running`,
+    /// `WaitingOnChildren`, or `AwaitingConfirmation`). This is the primary
+    /// consumer of the partial-unique "one blocking root per thread"
+    /// invariant. Queued roots are explicitly **not** returned here — use
+    /// [`AgentTaskStore::list_queued_roots`] to see them.
     ///
     /// # Errors
     /// Returns an error if the store cannot be queried.
     async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>>;
+
+    /// Return the queued root turns on a thread in strict FIFO order.
+    ///
+    /// Rows are ordered by `created_at` ascending, tiebroken by `id` so the
+    /// order is deterministic even at sub-microsecond time resolution. The
+    /// returned vector is empty if the thread has no queued roots.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be queried.
+    async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>>;
+
+    /// Promote the FIFO head of the thread's queued-root list into
+    /// [`TaskStatus::Pending`], if the thread has no blocking root.
+    ///
+    /// Returns `Some(task)` with the newly-promoted row when a promotion
+    /// fired. Returns `None` if the thread has no queued roots to promote,
+    /// or if the thread's active-root slot is still held by a blocking root
+    /// (so no promotion is legal yet).
+    ///
+    /// This method is a no-op idempotent operation: callers may invoke it
+    /// every time a root completes, fails, or cancels, without needing to
+    /// know whether another queued root is waiting. Retries of the active
+    /// root that release the lease back to `Pending` do **not** fire a
+    /// promotion, because the active-root slot is still held — queued
+    /// roots cannot overtake a retry.
+    ///
+    /// # Errors
+    /// Returns an error if the promotion transition or the store write
+    /// fails.
+    async fn promote_next_queued_root(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>>;
 
     /// Remove every stored task. Used by tests.
     ///
@@ -110,8 +200,17 @@ struct Inner {
     /// `(status)` index: rows currently in each lifecycle state.
     by_status: HashMap<TaskStatus, BTreeSet<AgentTaskId>>,
     /// Partial unique index on `(thread_id)` where
-    /// `kind = root_turn AND status NOT IN (completed, failed, cancelled)`.
+    /// `kind = root_turn AND status.blocks_root_admission()`. Holds the
+    /// id of whichever root currently occupies the thread's single
+    /// active-root slot, if any. Queued roots are **not** stored here —
+    /// they live in `queued_roots_by_thread` instead.
     active_root_by_thread: HashMap<ThreadId, AgentTaskId>,
+    /// Per-thread FIFO queue of root turns waiting behind the active-root
+    /// slot. Entries are stored as `(created_at, id)` so iteration is
+    /// deterministic even if two roots share a timestamp. A `BTreeSet`
+    /// gives ordered insert / iterate / remove in `O(log n)` without
+    /// needing a custom priority queue.
+    queued_roots_by_thread: HashMap<ThreadId, BTreeSet<(OffsetDateTime, AgentTaskId)>>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -152,9 +251,16 @@ impl Inner {
             .or_default()
             .insert(task.id.clone());
 
-        if task.kind == TaskKind::RootTurn && task.status.is_active() {
-            self.active_root_by_thread
-                .insert(task.thread_id.clone(), task.id.clone());
+        if task.kind == TaskKind::RootTurn {
+            if task.status.blocks_root_admission() {
+                self.active_root_by_thread
+                    .insert(task.thread_id.clone(), task.id.clone());
+            } else if task.status == TaskStatus::Queued {
+                self.queued_roots_by_thread
+                    .entry(task.thread_id.clone())
+                    .or_default()
+                    .insert((task.created_at, task.id.clone()));
+            }
         }
     }
 
@@ -176,6 +282,25 @@ impl Inner {
         {
             self.active_root_by_thread.remove(&task.thread_id);
         }
+    }
+
+    /// Remove a task from the per-thread queued-root FIFO index, if it is
+    /// a queued root.
+    fn remove_queued_root_if_match(&mut self, task: &AgentTask) {
+        if task.kind != TaskKind::RootTurn {
+            return;
+        }
+        if let Some(queue) = self.queued_roots_by_thread.get_mut(&task.thread_id) {
+            queue.remove(&(task.created_at, task.id.clone()));
+            if queue.is_empty() {
+                self.queued_roots_by_thread.remove(&task.thread_id);
+            }
+        }
+    }
+
+    /// Is the thread's active-root slot currently held by a blocking root?
+    fn thread_has_blocking_root(&self, thread_id: &ThreadId) -> bool {
+        self.active_root_by_thread.contains_key(thread_id)
     }
 }
 
@@ -236,9 +361,17 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             }
         }
 
-        // Partial-unique: one active root per thread.
+        // Partial-unique: one *blocking* root per thread.
+        //
+        // `blocks_root_admission()` excludes [`TaskStatus::Queued`], so a
+        // fresh root turn may be inserted in [`TaskStatus::Queued`] even
+        // when another root already holds the slot — that is how
+        // [`AgentTaskStore::submit_root_turn`] persists queued
+        // submissions. A caller that bypasses `submit_root_turn` and
+        // tries to insert a *blocking* root while the slot is already
+        // held is rejected here.
         if task.kind == TaskKind::RootTurn
-            && task.status.is_active()
+            && task.status.blocks_root_admission()
             && let Some(existing) = inner.active_root_by_thread.get(&task.thread_id)
         {
             let thread_id = &task.thread_id;
@@ -322,11 +455,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        // Partial-unique check: if the new row is still an active root, make
-        // sure no *other* row already holds the active-root slot on the same
-        // thread.
+        // Partial-unique check: if the new row is a blocking root, make
+        // sure no *other* row already holds the active-root slot on the
+        // same thread. Queued roots skip this check because they don't
+        // occupy the slot.
         if task.kind == TaskKind::RootTurn
-            && task.status.is_active()
+            && task.status.blocks_root_admission()
             && let Some(current) = inner.active_root_by_thread.get(&task.thread_id)
             && *current != task.id
         {
@@ -339,9 +473,6 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // Drop the old row from every secondary index; the primary-key
         // entry will be overwritten below.
         inner.remove_from_status_index(&old);
-        if old.kind == TaskKind::RootTurn && !task.status.is_active() {
-            inner.remove_active_root_if_match(&old);
-        }
 
         // Thread / parent indexes are append-only and keyed by `id`, so the
         // old entries stay in place and still point at the (now-updated)
@@ -354,14 +485,37 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .or_default()
             .insert(task.id.clone());
 
+        // Rebalance the per-thread root indexes. The invariants we need:
+        //
+        // * `active_root_by_thread[thread]` is set ⇔ the new row is a
+        //   root turn in a `blocks_root_admission` state.
+        // * `queued_roots_by_thread[thread]` contains `(created_at, id)`
+        //   ⇔ the new row is a queued root turn.
+        //
+        // `kind` and `thread_id` are row invariants (guarded above), so
+        // the old row can only mutate between root-turn statuses here.
         if task.kind == TaskKind::RootTurn {
-            if task.status.is_active() {
+            // Drop the old classification first so we don't leave a stale
+            // entry behind on any transition.
+            if old.status.blocks_root_admission() {
+                inner.remove_active_root_if_match(&old);
+            } else if old.status == TaskStatus::Queued {
+                inner.remove_queued_root_if_match(&old);
+            }
+
+            // Re-register under the new classification.
+            if task.status.blocks_root_admission() {
                 inner
                     .active_root_by_thread
                     .insert(task.thread_id.clone(), task.id.clone());
-            } else {
-                inner.remove_active_root_if_match(&old);
+            } else if task.status == TaskStatus::Queued {
+                inner
+                    .queued_roots_by_thread
+                    .entry(task.thread_id.clone())
+                    .or_default()
+                    .insert((task.created_at, task.id.clone()));
             }
+            // Terminal statuses simply drop out of both indexes.
         }
 
         inner.by_id.insert(task.id.clone(), task);
@@ -418,6 +572,144 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(result)
     }
 
+    async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask> {
+        // Shape gate: only Phase 2.2 root admission flows through here,
+        // and only with freshly-constructed rows. Everything else must
+        // go through `insert` / `update` and pays for the tighter
+        // per-call invariants there.
+        if task.kind != TaskKind::RootTurn {
+            let kind = task.kind;
+            return Err(anyhow!(
+                "submit_root_turn rejected: expected root_turn, got {kind:?}"
+            ));
+        }
+        if task.status != TaskStatus::Pending {
+            let status = task.status;
+            return Err(anyhow!(
+                "submit_root_turn rejected: new root must start in Pending (got {status:?})"
+            ));
+        }
+        if task.attempt != 0 {
+            let attempt = task.attempt;
+            return Err(anyhow!(
+                "submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"
+            ));
+        }
+        if !task.is_root() {
+            return Err(anyhow!("submit_root_turn rejected: task must be a root"));
+        }
+        task.validate()
+            .context("submit_root_turn rejected: task failed schema validation")?;
+
+        let mut inner = self.inner.write().await;
+
+        if inner.by_id.contains_key(&task.id) {
+            let id = &task.id;
+            return Err(anyhow!(
+                "submit_root_turn rejected: task id {id} already exists"
+            ));
+        }
+
+        // Decide the admission target atomically under the write lock so
+        // two concurrent submissions on the same thread always serialize
+        // and end up in a deterministic FIFO order.
+        let admitted = if inner.thread_has_blocking_root(&task.thread_id) {
+            // Convert the incoming row from `Pending` to `Queued` so it
+            // lives on the same-thread FIFO queue behind the blocking
+            // root. Pass `created_at` as `now` so the queued row's
+            // `updated_at` equals its `created_at`, preserving the
+            // original submission timestamp in the audit field rather
+            // than recording the queuing-decision time. FIFO ordering is
+            // unaffected by this choice — the queue index is keyed on
+            // `(created_at, id)` and `created_at` is immutable.
+            let created_at = task.created_at;
+            task.admit_as_queued(created_at)
+                .context("submit_root_turn rejected: cannot admit as queued")?
+        } else {
+            task
+        };
+
+        inner.add_to_indexes(&admitted);
+        inner.by_id.insert(admitted.id.clone(), admitted.clone());
+        drop(inner);
+        Ok(admitted)
+    }
+
+    async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
+        let inner = self.inner.read().await;
+        let result: Vec<AgentTask> = inner
+            .queued_roots_by_thread
+            .get(thread_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, id)| inner.by_id.get(id).cloned())
+            .collect();
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn promote_next_queued_root(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut inner = self.inner.write().await;
+
+        // If the slot is still held, the active root is retrying or
+        // waiting on something and no promotion may fire — retries of
+        // the active root must never be overtaken by queued roots.
+        if inner.thread_has_blocking_root(thread_id) {
+            return Ok(None);
+        }
+
+        // Pop the FIFO head. `BTreeSet` iterates in ascending key order,
+        // and the key is `(created_at, id)` so the earliest submission
+        // wins, with `id` breaking ties deterministically.
+        let head_key = inner
+            .queued_roots_by_thread
+            .get(thread_id)
+            .and_then(|q| q.iter().next().cloned());
+        let Some((created_at, id)) = head_key else {
+            return Ok(None);
+        };
+
+        // Load the row, run the pure promotion transition, and commit.
+        let queued_row = inner
+            .by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("promote rejected: queue head {id} missing from by_id"))?;
+        let promoted = queued_row
+            .promote_to_pending(now)
+            .context("promote rejected: promotion transition failed")?;
+
+        // Reindex: drop from the queued index, add to the active-root
+        // slot, swap the status bucket.
+        if let Some(queue) = inner.queued_roots_by_thread.get_mut(thread_id) {
+            queue.remove(&(created_at, id.clone()));
+            if queue.is_empty() {
+                inner.queued_roots_by_thread.remove(thread_id);
+            }
+        }
+        if let Some(set) = inner.by_status.get_mut(&TaskStatus::Queued) {
+            set.remove(&id);
+            if set.is_empty() {
+                inner.by_status.remove(&TaskStatus::Queued);
+            }
+        }
+        inner
+            .by_status
+            .entry(TaskStatus::Pending)
+            .or_default()
+            .insert(id.clone());
+        inner
+            .active_root_by_thread
+            .insert(thread_id.clone(), id.clone());
+        inner.by_id.insert(id, promoted.clone());
+        drop(inner);
+        Ok(Some(promoted))
+    }
+
     async fn clear(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
         *inner = Inner::default();
@@ -451,6 +743,13 @@ mod tests {
 
     fn fresh_root(name: &str) -> AgentTask {
         AgentTask::new_root_turn(thread(name), t0(), 3)
+    }
+
+    /// Build a fresh root turn on `thread` with `created_at` at `t0 +
+    /// secs` seconds. Used by Phase 2.2 FIFO tests that need two roots
+    /// with deterministic, distinct wall-clock timestamps.
+    fn fresh_root_at(name: &str, secs: i64) -> AgentTask {
+        AgentTask::new_root_turn(thread(name), t_plus(secs), 3)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -885,6 +1184,790 @@ mod tests {
         child.depth = 42;
         let err = store.insert(child).await.unwrap_err();
         assert!(err.to_string().contains("depth"), "unexpected: {err}");
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.2 — Root submission queue and FIFO promotion (ENG-7916)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // These tests exercise the queue admission contract across every
+    // blocking active-root state (`Pending`, `Running`,
+    // `WaitingOnChildren`, `AwaitingConfirmation`), FIFO promotion order,
+    // retry safety, and tool-child isolation. They form the acceptance
+    // suite for Phase 2.2 and should cover every rule in the Linear
+    // issue.
+
+    /// Helper: mark a task Running via the legal transition path and
+    /// persist the resulting row. Used to put a thread's active root
+    /// into a blocking non-Pending state in tests.
+    async fn running_root(store: &InMemoryAgentTaskStore, root: AgentTask) -> Result<AgentTask> {
+        let running = root
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        store.update(running.clone()).await.context("update")?;
+        Ok(running)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_root_turn_admits_first_root_as_pending() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root("t1");
+        let admitted = store
+            .submit_root_turn(first.clone())
+            .await
+            .context("submit")?;
+        assert_eq!(admitted.status, TaskStatus::Pending);
+        assert_eq!(admitted.id, first.id);
+
+        // The active-root slot is now held and queued list is empty.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, first.id);
+        assert_eq!(active.status, TaskStatus::Pending);
+
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert!(queued.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_root_turn_queues_second_root_behind_pending() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        let admitted = store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+        assert_eq!(admitted.status, TaskStatus::Queued);
+        assert_eq!(admitted.id, second.id);
+
+        // The active-root slot is still held by the first root.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, first.id);
+
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, second.id);
+        assert_eq!(queued[0].status, TaskStatus::Queued);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_root_turn_queues_behind_every_blocking_state() -> Result<()> {
+        for &(label, setup) in &[
+            ("Pending", 0i64),
+            ("Running", 1),
+            ("WaitingOnChildren", 2),
+            ("AwaitingConfirmation", 3),
+        ] {
+            let store = InMemoryAgentTaskStore::new();
+            let first = fresh_root_at("t1", 0);
+            store
+                .submit_root_turn(first.clone())
+                .await
+                .context("first")?;
+
+            // Drive `first` into the blocking state under test. Each
+            // branch ends with the active root in a non-Pending blocking
+            // status, so a second submission must queue.
+            match setup {
+                0 => {
+                    // Already Pending — no-op.
+                }
+                1 => {
+                    running_root(&store, first.clone())
+                        .await
+                        .context("drive running")?;
+                }
+                2 => {
+                    let running = running_root(&store, first.clone())
+                        .await
+                        .context("drive running")?;
+                    let waiting = running
+                        .wait_on_children(2, t_plus(2))
+                        .context("wait_on_children")?;
+                    store.update(waiting).await.context("update waiting")?;
+                }
+                3 => {
+                    let running = running_root(&store, first.clone())
+                        .await
+                        .context("drive running")?;
+                    let awaiting = running
+                        .await_confirmation(t_plus(2))
+                        .context("await_confirmation")?;
+                    store.update(awaiting).await.context("update awaiting")?;
+                }
+                _ => unreachable!(),
+            }
+
+            let second = fresh_root_at("t1", 10);
+            let admitted = store
+                .submit_root_turn(second.clone())
+                .await
+                .context("second submit")?;
+            assert_eq!(
+                admitted.status,
+                TaskStatus::Queued,
+                "second root did not queue behind blocking state {label}",
+            );
+
+            let queued = store
+                .list_queued_roots(&thread("t1"))
+                .await
+                .context("queued")?;
+            assert_eq!(queued.len(), 1, "queue length wrong for state {label}");
+            assert_eq!(
+                queued[0].id, second.id,
+                "queue head wrong for state {label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_roots_promote_in_fifo_order_after_active_completes() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+        let third = fresh_root_at("t1", 2);
+
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+        store
+            .submit_root_turn(third.clone())
+            .await
+            .context("third")?;
+
+        // Walk the first root to Completed.
+        let running = running_root(&store, first.clone())
+            .await
+            .context("drive running")?;
+        let done = running.complete(t_plus(10)).context("complete")?;
+        store.update(done).await.context("update done")?;
+
+        // Queued roots still in FIFO order in `list_queued_roots`.
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].id, second.id);
+        assert_eq!(queued[1].id, third.id);
+
+        // Promote the head: it must be the *oldest* queued root.
+        let promoted = store
+            .promote_next_queued_root(&thread("t1"), t_plus(11))
+            .await
+            .context("promote")?
+            .context("promotion fired")?;
+        assert_eq!(promoted.id, second.id);
+        assert_eq!(promoted.status, TaskStatus::Pending);
+
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, second.id);
+
+        // The second promotion must not fire while the slot is held.
+        let no_promotion = store
+            .promote_next_queued_root(&thread("t1"), t_plus(12))
+            .await
+            .context("promote blocked")?;
+        assert!(no_promotion.is_none());
+
+        // Walk `second` to Completed, then promote `third`.
+        let running2 = running_root(&store, promoted.clone())
+            .await
+            .context("drive running 2")?;
+        let done2 = running2.complete(t_plus(20)).context("complete 2")?;
+        store.update(done2).await.context("update done 2")?;
+
+        let promoted2 = store
+            .promote_next_queued_root(&thread("t1"), t_plus(21))
+            .await
+            .context("promote 2")?
+            .context("promotion 2 fired")?;
+        assert_eq!(promoted2.id, third.id);
+
+        // Queue is now drained.
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued after")?;
+        assert!(queued.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn promote_is_noop_when_queue_is_empty() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root("t1");
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+
+        // Complete without any queued roots behind.
+        let running = running_root(&store, first.clone())
+            .await
+            .context("drive running")?;
+        let done = running.complete(t_plus(10)).context("complete")?;
+        store.update(done).await.context("update done")?;
+
+        let nothing = store
+            .promote_next_queued_root(&thread("t1"), t_plus(11))
+            .await
+            .context("promote empty")?;
+        assert!(nothing.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn promote_is_noop_while_active_root_is_still_blocking() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        store.submit_root_turn(first).await.context("first")?;
+        store.submit_root_turn(second).await.context("second")?;
+
+        // Slot still held by `first` in Pending: promotion must refuse.
+        let nothing = store
+            .promote_next_queued_root(&thread("t1"), t_plus(2))
+            .await
+            .context("promote while blocking")?;
+        assert!(nothing.is_none());
+
+        // Queued list is still intact.
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_of_active_root_does_not_let_queued_roots_overtake() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        let admitted_first = store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+
+        // Lease the first, then release it back to Pending (a retry).
+        // `release_lease` keeps `attempt` at 1 but clears the lease.
+        let running = running_root(&store, admitted_first.clone())
+            .await
+            .context("drive running")?;
+        let released = running.release_lease(t_plus(5)).context("release")?;
+        assert_eq!(released.status, TaskStatus::Pending);
+        assert_eq!(released.attempt, 1);
+        store.update(released).await.context("update released")?;
+
+        // The active-root slot is still held by the first root — the
+        // promotion attempt must be a no-op so queued roots cannot
+        // overtake a retry.
+        let nothing = store
+            .promote_next_queued_root(&thread("t1"), t_plus(6))
+            .await
+            .context("promote during retry")?;
+        assert!(nothing.is_none());
+
+        // And the second root is still queued, not promoted.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, first.id);
+        assert_eq!(active.status, TaskStatus::Pending);
+
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, second.id);
+
+        // Running → complete the first; now the second must promote.
+        let running2 = running_root(&store, active)
+            .await
+            .context("drive running again")?;
+        let done = running2.complete(t_plus(7)).context("complete")?;
+        store.update(done).await.context("update done")?;
+
+        let promoted = store
+            .promote_next_queued_root(&thread("t1"), t_plus(8))
+            .await
+            .context("promote after complete")?
+            .context("promotion fired")?;
+        assert_eq!(promoted.id, second.id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_roots_promote_after_failure_and_cancellation() -> Result<()> {
+        // Failure.
+        {
+            let store = InMemoryAgentTaskStore::new();
+            let first = fresh_root_at("t1", 0);
+            let second = fresh_root_at("t1", 1);
+            store.submit_root_turn(first.clone()).await.context("f1")?;
+            store.submit_root_turn(second.clone()).await.context("q1")?;
+
+            let running = running_root(&store, first.clone())
+                .await
+                .context("running")?;
+            let failed = running.fail("boom".into(), t_plus(10)).context("fail")?;
+            store.update(failed).await.context("update failed")?;
+
+            let promoted = store
+                .promote_next_queued_root(&thread("t1"), t_plus(11))
+                .await
+                .context("promote after fail")?
+                .context("promotion fired")?;
+            assert_eq!(promoted.id, second.id);
+        }
+
+        // Cancellation (straight from Pending).
+        {
+            let store = InMemoryAgentTaskStore::new();
+            let first = fresh_root_at("t1", 0);
+            let second = fresh_root_at("t1", 1);
+            store.submit_root_turn(first.clone()).await.context("f2")?;
+            store.submit_root_turn(second.clone()).await.context("q2")?;
+
+            let cancelled = first.cancel(t_plus(10)).context("cancel")?;
+            store.update(cancelled).await.context("update cancelled")?;
+
+            let promoted = store
+                .promote_next_queued_root(&thread("t1"), t_plus(11))
+                .await
+                .context("promote after cancel")?
+                .context("promotion fired")?;
+            assert_eq!(promoted.id, second.id);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_runtime_children_never_block_root_admission() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = fresh_root("t1");
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit root")?;
+
+        // Drive root to Running and spawn a tool-runtime child under it.
+        let running = running_root(&store, root.clone())
+            .await
+            .context("drive running")?;
+        let tool =
+            AgentTask::new_child(&running, TaskKind::ToolRuntime, t_plus(2), 1).context("tool")?;
+        store.insert(tool.clone()).await.context("insert tool")?;
+
+        // A second root submission must queue behind `running`, not the
+        // tool child — tool children do not participate in root
+        // admission.
+        let second = fresh_root_at("t1", 3);
+        let admitted = store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+        assert_eq!(admitted.status, TaskStatus::Queued);
+
+        // The active-root slot is exactly the root, not the tool.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, running.id);
+        assert_eq!(active.kind, TaskKind::RootTurn);
+
+        // Now complete the tool child. Tool children completing must
+        // not by themselves promote queued roots — the root is still
+        // running. We drive the tool to Running + Completed to prove
+        // the full tool lifecycle doesn't leak into root admission.
+        let tool_running = tool
+            .mark_running(
+                WorkerId::from_string("w-tool"),
+                LeaseId::from_string("l-tool"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .context("tool running")?;
+        store
+            .update(tool_running.clone())
+            .await
+            .context("update tool running")?;
+        let tool_done = tool_running.complete(t_plus(4)).context("tool done")?;
+        store.update(tool_done).await.context("update tool done")?;
+
+        // Queued list still holds the second root; the active slot is
+        // still held by the running root.
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, second.id);
+
+        // Promotion attempt still a no-op while the root itself is
+        // blocking.
+        let nothing = store
+            .promote_next_queued_root(&thread("t1"), t_plus(5))
+            .await
+            .context("promote blocked")?;
+        assert!(nothing.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_roots_do_not_cross_thread_boundaries() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        // Thread A: blocking root + one queued root.
+        let a_first = fresh_root_at("a", 0);
+        let a_second = fresh_root_at("a", 1);
+        store
+            .submit_root_turn(a_first.clone())
+            .await
+            .context("a1")?;
+        store
+            .submit_root_turn(a_second.clone())
+            .await
+            .context("a2")?;
+
+        // Thread B: its first root must admit as Pending, not queue
+        // behind thread A's root.
+        let b_first = fresh_root_at("b", 0);
+        let b_admitted = store
+            .submit_root_turn(b_first.clone())
+            .await
+            .context("b1")?;
+        assert_eq!(b_admitted.status, TaskStatus::Pending);
+
+        // Each thread sees only its own queue.
+        let a_queued = store
+            .list_queued_roots(&thread("a"))
+            .await
+            .context("a queue")?;
+        assert_eq!(a_queued.len(), 1);
+        assert_eq!(a_queued[0].id, a_second.id);
+
+        let b_queued = store
+            .list_queued_roots(&thread("b"))
+            .await
+            .context("b queue")?;
+        assert!(b_queued.is_empty());
+
+        // Completing thread B's root must not fire a promotion on A.
+        let b_running = running_root(&store, b_first.clone())
+            .await
+            .context("b running")?;
+        let b_done = b_running.complete(t_plus(10)).context("b done")?;
+        store.update(b_done).await.context("update b done")?;
+
+        let a_active = store
+            .active_root_for_thread(&thread("a"))
+            .await
+            .context("a active")?
+            .context("still held")?;
+        assert_eq!(a_active.id, a_first.id);
+        let a_queued = store
+            .list_queued_roots(&thread("a"))
+            .await
+            .context("a queue after")?;
+        assert_eq!(a_queued.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_root_turn_rejects_non_root_or_non_pending_input() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+
+        // Wrong kind: tool runtime.
+        let root = fresh_root("t1");
+        store.insert(root.clone()).await.context("root")?;
+        let tool =
+            AgentTask::new_child(&root, TaskKind::ToolRuntime, t_plus(1), 1).context("tool")?;
+        let err = store.submit_root_turn(tool).await.unwrap_err();
+        assert!(
+            err.to_string().contains("expected root_turn"),
+            "unexpected: {err}"
+        );
+
+        // Wrong status: Queued (caller trying to pre-queue).
+        let mut queued = fresh_root_at("t2", 0);
+        queued.status = TaskStatus::Queued;
+        queued.updated_at = queued.created_at;
+        let err = store.submit_root_turn(queued).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must start in Pending"),
+            "unexpected: {err}"
+        );
+
+        // Wrong attempt counter: pretending to re-submit.
+        let mut retried = fresh_root("t3");
+        retried.attempt = 1;
+        let err = store.submit_root_turn(retried).await.unwrap_err();
+        assert!(
+            err.to_string().contains("attempt == 0"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_queued_roots_is_deterministic_even_with_same_timestamp() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let blocker = fresh_root_at("t1", 0);
+        store.submit_root_turn(blocker).await.context("blocker")?;
+
+        // Submit two roots with the exact same `created_at` — FIFO
+        // order must still be deterministic, tie-broken by `id`.
+        let a = fresh_root_at("t1", 5);
+        let b = fresh_root_at("t1", 5);
+        store.submit_root_turn(a.clone()).await.context("a")?;
+        store.submit_root_turn(b.clone()).await.context("b")?;
+
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 2);
+        // Order must match the ascending `id` order for reproducible
+        // scheduling at sub-microsecond tiebreaks.
+        let (lo, hi) = if a.id <= b.id { (&a, &b) } else { (&b, &a) };
+        assert_eq!(queued[0].id, lo.id);
+        assert_eq!(queued[1].id, hi.id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_root_cancellation_removes_it_from_queue() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let blocker = fresh_root_at("t1", 0);
+        let queued = fresh_root_at("t1", 1);
+        store.submit_root_turn(blocker).await.context("blocker")?;
+        let admitted = store
+            .submit_root_turn(queued.clone())
+            .await
+            .context("queued")?;
+        assert_eq!(admitted.status, TaskStatus::Queued);
+
+        // Cancel the queued row directly: the queue index must drop it.
+        let cancelled = admitted.cancel(t_plus(2)).context("cancel")?;
+        store
+            .update(cancelled.clone())
+            .await
+            .context("update cancelled")?;
+
+        let remaining = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queue after cancel")?;
+        assert!(remaining.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_rejects_adding_another_blocking_root_bypassing_submit() -> Result<()> {
+        // `submit_root_turn` is the FIFO admission entry point, but the
+        // raw `insert` path must still enforce the partial-unique
+        // invariant so callers that bypass `submit_root_turn` can't
+        // accidentally push two blocking roots onto the same thread.
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root("t1");
+        store
+            .submit_root_turn(first)
+            .await
+            .context("submit first")?;
+
+        let second = fresh_root("t1");
+        let err = store.insert(second).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already has active root"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_allows_raw_queued_root_next_to_blocking_root() -> Result<()> {
+        // Even outside `submit_root_turn`, a caller with a pre-queued
+        // row must be able to insert it alongside a blocking root,
+        // because `Queued` does not occupy the slot. This is how
+        // recovery paths will rehydrate queued roots from durable
+        // storage after a crash.
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        store
+            .submit_root_turn(first)
+            .await
+            .context("submit first")?;
+
+        // Build a queued row by hand (mirrors the shape after
+        // `admit_as_queued`): Pending → Queued.
+        let raw_second = fresh_root_at("t1", 1);
+        let queued_second = raw_second
+            .admit_as_queued(t_plus(1))
+            .context("admit queued")?;
+        store
+            .insert(queued_second.clone())
+            .await
+            .context("insert queued")?;
+
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("list queue")?;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, queued_second.id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_rebalances_indexes_across_queued_and_pending() -> Result<()> {
+        // Cover every transition that mutates a root-turn row's
+        // classification across the two Phase 2.2 indexes:
+        //
+        //   1. Pending (active slot) → Completed (drops both)
+        //   2. Queued → Pending (via update, after slot freed)
+        //   3. Pending → WaitingOnChildren → Pending (slot stays held)
+        //
+        // This is a smoke test for the update() rebalancing logic; the
+        // higher-level tests above already prove the queue behaviour
+        // end-to-end.
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("submit first")?;
+        let admitted_second = store
+            .submit_root_turn(second.clone())
+            .await
+            .context("submit second")?;
+        assert_eq!(admitted_second.status, TaskStatus::Queued);
+
+        // Drive the first to Completed.
+        let running = running_root(&store, first.clone())
+            .await
+            .context("running")?;
+        let done = running.complete(t_plus(5)).context("complete")?;
+        store.update(done).await.context("update done")?;
+
+        // The active-root slot is now free; the queued index still holds
+        // the second root. Queued rows persist until promotion is
+        // explicitly triggered (via `promote_next_queued_root` or via
+        // `update` rebalancing in this test).
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?;
+        assert!(active.is_none());
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued")?;
+        assert_eq!(queued.len(), 1);
+
+        // Now manually promote the queued row via `update` (rather than
+        // `promote_next_queued_root`). This exercises the same index
+        // rebalancing that the dedicated promotion path uses.
+        let promoted_row = admitted_second
+            .promote_to_pending(t_plus(6))
+            .context("promote to pending")?;
+        store
+            .update(promoted_row.clone())
+            .await
+            .context("update promoted")?;
+
+        // After the manual promotion, the slot must be held and the
+        // queue must be empty.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active after")?
+            .context("slot held")?;
+        assert_eq!(active.id, second.id);
+        let queued = store
+            .list_queued_roots(&thread("t1"))
+            .await
+            .context("queued after")?;
+        assert!(queued.is_empty());
+
+        // Exercise Pending → WaitingOnChildren → Pending.
+        let running2 = running_root(&store, active).await.context("running 2")?;
+        let waiting = running2.wait_on_children(1, t_plus(7)).context("wait")?;
+        store
+            .update(waiting.clone())
+            .await
+            .context("update waiting")?;
+
+        // The slot is still held (WaitingOnChildren is blocking).
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active waiting")?
+            .context("still held")?;
+        assert_eq!(active.status, TaskStatus::WaitingOnChildren);
+
+        let resolved = waiting.child_resolved(t_plus(8)).context("resolved")?;
+        assert_eq!(resolved.status, TaskStatus::Pending);
+        store.update(resolved).await.context("update resolved")?;
+
+        // And the slot is *still* held — Pending blocks admission.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active final")?
+            .context("still held")?;
+        assert_eq!(active.status, TaskStatus::Pending);
         Ok(())
     }
 }

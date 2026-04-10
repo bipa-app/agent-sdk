@@ -6,6 +6,12 @@
 //! and the structural / state-machine invariants every persisted row must
 //! satisfy.
 //!
+//! Phase 2.2 (ENG-7916) builds directly on top of this module without
+//! changing any of its rows. The only new surface it adds here is the
+//! [`TaskStatus::blocks_root_admission`] predicate, which the store uses
+//! to key its partial-unique "one active root per thread" index — the
+//! queue itself lives in [`super::store`].
+//!
 //! Later phases layer on top:
 //!
 //! | Phase | What it adds |
@@ -261,11 +267,50 @@ impl TaskStatus {
 
     /// `true` if this row is still in the active lifecycle (any non-terminal
     /// status, including `Queued`, `Pending`, `Running`, and both waiting
-    /// states). Used by Phase 2.2 root admission to enforce "one active
-    /// root per thread".
+    /// states).
+    ///
+    /// Use this for "is this row still alive?" questions (e.g. whether to
+    /// include it in a thread's current work). To answer the narrower
+    /// question of "does this row occupy the thread's single active-root
+    /// slot?" use [`TaskStatus::blocks_root_admission`] instead.
     #[must_use]
     pub const fn is_active(self) -> bool {
         !self.is_terminal()
+    }
+
+    /// `true` if a [`TaskKind::RootTurn`] in this status is holding the
+    /// thread's **active-root slot** and therefore blocks new root-turn
+    /// submissions from admitting directly as [`TaskStatus::Pending`].
+    ///
+    /// The blocking states are exactly:
+    ///
+    /// - [`TaskStatus::Pending`] — a root that has been admitted but is
+    ///   still waiting for a worker to pick it up.
+    /// - [`TaskStatus::Running`] — a root that a worker has leased.
+    /// - [`TaskStatus::WaitingOnChildren`] — a root that is paused on its
+    ///   spawned tool-runtime children.
+    /// - [`TaskStatus::AwaitingConfirmation`] — a root that is paused on
+    ///   an out-of-band confirmation.
+    ///
+    /// [`TaskStatus::Queued`] is deliberately **not** blocking: a queued
+    /// root has been durably admitted to the same-thread FIFO queue and is
+    /// waiting behind whichever root currently holds the slot. Multiple
+    /// queued roots may coexist; they promote in FIFO order as the slot
+    /// frees up. Terminal states never block admission because the row is
+    /// closed out.
+    ///
+    /// This is the predicate the Phase 2.2 "one active root per thread"
+    /// partial-unique index is keyed on, and the predicate
+    /// [`super::store::AgentTaskStore::submit_root_turn`] uses to decide
+    /// whether to admit a new root as `Pending` or `Queued`.
+    ///
+    /// [`TaskKind::RootTurn`]: crate::journal::task::TaskKind::RootTurn
+    #[must_use]
+    pub const fn blocks_root_admission(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Running | Self::WaitingOnChildren | Self::AwaitingConfirmation,
+        )
     }
 
     /// Alias for [`TaskStatus::is_runnable`] used by Phase 2.3's CAS guard.
@@ -615,10 +660,23 @@ impl AgentTask {
     // ─────────────────────────────────────────────────────────
 
     /// Transition a root turn into the same-thread FIFO [`TaskStatus::Queued`]
-    /// state, used by Phase 2.2's admission logic.
+    /// state.
     ///
-    /// Accepts `Pending` (freshly constructed) or `Queued` (idempotent) as
-    /// the source status. Only valid for [`TaskKind::RootTurn`].
+    /// Phase 2.2's [`super::store::AgentTaskStore::submit_root_turn`]
+    /// calls this when a new root lands on a thread whose active-root
+    /// slot is already held, so the row becomes durably queued behind
+    /// the blocking root and the store's queue index can surface it via
+    /// [`super::store::AgentTaskStore::list_queued_roots`]. The store's
+    /// FIFO index is keyed on the immutable `(created_at, id)` pair, so
+    /// queue ordering is determined entirely by `created_at` and is
+    /// unaffected by the `now` argument here.
+    ///
+    /// `now` is written into [`Self::updated_at`]; callers that want the
+    /// audit trail to show the original submission time (rather than the
+    /// queuing-decision time) should pass `self.created_at`.
+    ///
+    /// Accepts `Pending` (freshly constructed) or `Queued` (idempotent)
+    /// as the source status. Only valid for [`TaskKind::RootTurn`].
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if called from any
@@ -641,6 +699,12 @@ impl AgentTask {
     }
 
     /// Promote a queued root turn into [`TaskStatus::Pending`].
+    ///
+    /// Phase 2.2's [`super::store::AgentTaskStore::promote_next_queued_root`]
+    /// invokes this on the FIFO head of a thread's queue when the
+    /// active-root slot is free. The `created_at` timestamp is
+    /// deliberately unchanged so the queue head on a retry of the same
+    /// row still sorts back to its original submission moment.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -1186,6 +1250,59 @@ mod tests {
             Err(TaskSchemaError::QueuedOnlyForRootTurns)
         );
         Ok(())
+    }
+
+    // ── blocks_root_admission classification ──────────────────────
+    //
+    // Phase 2.2's "one active root per thread" partial-unique invariant
+    // is keyed on `blocks_root_admission`, so drift here would silently
+    // corrupt the root queue. Lock every variant in a single table test
+    // so any future TaskStatus addition forces an explicit classification.
+
+    #[test]
+    fn blocks_root_admission_classification_is_stable() {
+        let table = [
+            (TaskStatus::Queued, false),
+            (TaskStatus::Pending, true),
+            (TaskStatus::Running, true),
+            (TaskStatus::WaitingOnChildren, true),
+            (TaskStatus::AwaitingConfirmation, true),
+            (TaskStatus::Completed, false),
+            (TaskStatus::Failed, false),
+            (TaskStatus::Cancelled, false),
+        ];
+        for (status, expected) in table {
+            assert_eq!(
+                status.blocks_root_admission(),
+                expected,
+                "blocks_root_admission classification drifted for {status:?}"
+            );
+        }
+
+        // is_active must still cover both Queued (blocks_root_admission =
+        // false) and every blocking non-terminal state, otherwise the
+        // Phase 2.1 "row is alive" checks fall out of sync with the
+        // Phase 2.2 slot semantics.
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::WaitingOnChildren,
+            TaskStatus::AwaitingConfirmation,
+        ] {
+            assert!(status.is_active(), "{status:?} must still be is_active");
+        }
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            assert!(!status.is_active(), "{status:?} must not be is_active");
+            assert!(
+                !status.blocks_root_admission(),
+                "terminal {status:?} must not block root admission"
+            );
+        }
     }
 
     // ── wire-format lock ──────────────────────────────────────────
