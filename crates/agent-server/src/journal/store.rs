@@ -11,7 +11,7 @@
 //! public API — not even in-memory during tests. The in-memory store also
 //! enforces the **partial-unique "one blocking root per thread"** invariant,
 //! which is the single most important durability guarantee the acquisition
-//! API (Phase 2.3) will rely on.
+//! API (Phase 2.3) relies on.
 //!
 //! # Root admission and FIFO queueing (Phase 2.2)
 //!
@@ -32,6 +32,32 @@
 //! and [`AgentTaskStore::promote_next_queued_root`]. Callers should use
 //! `submit_root_turn` instead of `insert` for every externally-submitted
 //! root turn so queueing is applied automatically.
+//!
+//! # Acquisition, lease ownership, and heartbeats (Phase 2.3)
+//!
+//! Phase 2.3 layers a single guarded acquisition / lease / heartbeat
+//! model on top of the schema, shared by every task kind:
+//!
+//! - [`AgentTaskStore::try_acquire_task`] is a targeted CAS claim by id:
+//!   it succeeds when the row is [`TaskStatus::Pending`] and silently
+//!   returns `None` for every other status (waiting, queued, running,
+//!   terminal). Two workers racing on the same id are serialised by the
+//!   store's write lock so exactly one observes `Some(task)`.
+//! - [`AgentTaskStore::acquire_next_runnable`] is a scan-and-claim that
+//!   walks the global runnable index in `(created_at, id)` ascending
+//!   order and atomically leases the head. Root turns and tool-runtime
+//!   children share the same scan, which is the "one acquisition and
+//!   lease model that prevents double ownership across task kinds" the
+//!   issue requires.
+//! - [`AgentTaskStore::heartbeat_task`] CAS-checks **both** the
+//!   `WorkerId` and the `LeaseId` before bumping `last_heartbeat_at`
+//!   and `lease_expires_at`. A stale worker that lost its lease cannot
+//!   refresh a row it no longer owns.
+//! - [`AgentTaskStore::release_expired_leases`] sweeps the global
+//!   lease-expiry index for every row whose `lease_expires_at <= now`,
+//!   returns each one to `Pending`, and leaves still-live leases
+//!   untouched. The sweep cost is proportional to the number of expired
+//!   leases, not the size of the live worker pool.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -42,7 +68,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
-use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
+use super::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 
 /// Persistent store for [`AgentTask`] rows.
 ///
@@ -178,6 +204,131 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>>;
 
+    /// Atomically acquire a lease on a specific [`TaskStatus::Pending`]
+    /// task by id.
+    ///
+    /// This is the single guarded admission point for worker ownership
+    /// in Phase 2.3: a successful call transitions the row from
+    /// `Pending` to [`TaskStatus::Running`], stamps `(worker, lease,
+    /// expires_at)`, and increments `attempt`. Two workers racing to
+    /// claim the same `id` are serialised by the store's write lock, so
+    /// exactly one observes `Ok(Some(task))` and the other observes
+    /// `Ok(None)` because the row's status is no longer runnable.
+    ///
+    /// The method is intentionally **narrow**:
+    ///
+    /// - Returns `Ok(Some(task))` on a successful claim, where `task`
+    ///   is the row as persisted (status `Running`, lease fields set).
+    /// - Returns `Ok(None)` if the task exists but is not runnable
+    ///   (any non-`Pending` status, including waiting / terminal /
+    ///   already-running), or if the task does not exist at all.
+    /// - Returns `Err` only on true store-level failures: validation
+    ///   errors, retry-budget exhaustion, or downstream write errors.
+    ///
+    /// Callers who want scan-and-claim semantics should use
+    /// [`AgentTaskStore::acquire_next_runnable`] instead.
+    ///
+    /// # Errors
+    /// - Row-level state transitions that [`AgentTask::mark_running`]
+    ///   rejects (e.g. retry budget exceeded).
+    /// - Store-level write errors.
+    async fn try_acquire_task(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>>;
+
+    /// Scan for the oldest runnable task across every kind and thread,
+    /// then atomically claim it for `worker`.
+    ///
+    /// Runnable means status [`TaskStatus::Pending`]. Waiting states
+    /// (`WaitingOnChildren`, `AwaitingConfirmation`), the `Queued`
+    /// submission queue, and terminal states are never visible to this
+    /// scan — callers that drive the worker loop can call this method
+    /// in a loop and never accidentally lease a paused task.
+    ///
+    /// FIFO order is `(created_at, id)` ascending, so the oldest
+    /// submission wins and ties are broken deterministically by `id`.
+    /// Root turns and tool-runtime children share the same scan, which
+    /// is exactly the "one acquisition and lease model that prevents
+    /// double ownership across task kinds" Phase 2.3 requires.
+    ///
+    /// Returns `Ok(Some(task))` on a successful claim, `Ok(None)` if
+    /// the runnable pool is empty.
+    ///
+    /// # Errors
+    /// - Row-level state transitions that [`AgentTask::mark_running`]
+    ///   rejects for the scanned head (e.g. retry budget exceeded on
+    ///   the oldest row). Callers that want skip-on-budget-exhaustion
+    ///   semantics should tune `max_attempts` up-front; Phase 2.5 will
+    ///   layer retry-budget handling on top of this API.
+    /// - Store-level write errors.
+    async fn acquire_next_runnable(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>>;
+
+    /// Refresh the lease on a running task, guarded by the caller's
+    /// `(worker, lease)` ownership tuple.
+    ///
+    /// The CAS check covers **both** the `WorkerId` and the `LeaseId`:
+    /// a stale worker that re-used the same `WorkerId` but whose lease
+    /// has been re-acquired by another worker cannot extend the row it
+    /// no longer owns. This is the guard the acceptance criterion
+    /// "heartbeats from the wrong worker fail" relies on.
+    ///
+    /// On success the row's `last_heartbeat_at` becomes `now` and its
+    /// `lease_expires_at` becomes `expires_at`. Pass the existing expiry
+    /// in if the caller does not want to extend it; passing a later
+    /// expiry is how workers hold their lease open across a long-running
+    /// tool call.
+    ///
+    /// Returns the refreshed row on success.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `id` is stored.
+    /// - `task is not running` — if the row is in any non-`Running`
+    ///   status. A heartbeat against a terminal / waiting / queued /
+    ///   pending row fails rather than silently succeeding.
+    /// - `heartbeat rejected: worker mismatch` — if `worker` does not
+    ///   match the current `worker_id`.
+    /// - `heartbeat rejected: lease mismatch` — if `lease` does not
+    ///   match the current `lease_id`.
+    async fn heartbeat_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
+    /// Release every lease whose `lease_expires_at <= now`, sending
+    /// each row back to [`TaskStatus::Pending`].
+    ///
+    /// This is the recovery sweep that guarantees a crashed worker's
+    /// rows never stay leased forever. It walks the lease-expiry index
+    /// in ascending order and stops as soon as it hits a row whose
+    /// expiry is still in the future, so the cost is proportional to
+    /// the number of actually-expired leases rather than the size of
+    /// the live worker pool.
+    ///
+    /// Released rows retain their current `attempt` counter: the failed
+    /// attempt counts against the retry budget, and Phase 2.5 will layer
+    /// retry-limit enforcement on top. Returns the list of task ids that
+    /// were swept, in expiry order.
+    ///
+    /// # Errors
+    /// Returns an error if a release transition or the underlying
+    /// store write fails.
+    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<AgentTaskId>>;
+
     /// Remove every stored task. Used by tests.
     ///
     /// # Errors
@@ -211,6 +362,18 @@ struct Inner {
     /// gives ordered insert / iterate / remove in `O(log n)` without
     /// needing a custom priority queue.
     queued_roots_by_thread: HashMap<ThreadId, BTreeSet<(OffsetDateTime, AgentTaskId)>>,
+    /// Phase 2.3 global runnable index: `(created_at, id)` of every row
+    /// whose status is [`TaskStatus::Pending`], across all kinds and
+    /// threads. This is the scan target for
+    /// [`AgentTaskStore::acquire_next_runnable`] and gives
+    /// deterministic oldest-first FIFO ordering (tiebroken by `id`) for
+    /// the work pool.
+    runnable_by_created_at: BTreeSet<(OffsetDateTime, AgentTaskId)>,
+    /// Phase 2.3 global lease-expiry index: `(lease_expires_at, id)` of
+    /// every row whose status is [`TaskStatus::Running`]. Ordered
+    /// ascending so [`AgentTaskStore::release_expired_leases`] can walk
+    /// the head of the set until it hits a still-live lease and stop.
+    leased_by_expiry: BTreeSet<(OffsetDateTime, AgentTaskId)>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -262,6 +425,49 @@ impl Inner {
                     .insert((task.created_at, task.id.clone()));
             }
         }
+
+        // Phase 2.3 global runnable / lease-expiry indexes are
+        // status-driven and apply to every kind. A `Pending` row
+        // (runnable) and a `Running` row (leased) always carry
+        // exactly one entry in the relevant index.
+        self.register_runnable_lease_indexes(task);
+    }
+
+    /// Add `task` to the `runnable_by_created_at` index if it is
+    /// [`TaskStatus::Pending`], or to `leased_by_expiry` if it is
+    /// [`TaskStatus::Running`]. Other statuses are ignored.
+    ///
+    /// The two indexes are disjoint by construction because a row's
+    /// status is a single enum variant, and the index maintenance path
+    /// always removes the row from both indexes before re-inserting.
+    fn register_runnable_lease_indexes(&mut self, task: &AgentTask) {
+        match task.status {
+            TaskStatus::Pending => {
+                self.runnable_by_created_at
+                    .insert((task.created_at, task.id.clone()));
+            }
+            TaskStatus::Running => {
+                if let Some(expires_at) = task.lease_expires_at {
+                    self.leased_by_expiry.insert((expires_at, task.id.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drop `task` from the runnable and lease-expiry indexes if it was
+    /// present. Called before re-registering under a new status so the
+    /// two indexes never hold stale entries.
+    fn unregister_runnable_lease_indexes(&mut self, task: &AgentTask) {
+        if task.status == TaskStatus::Pending {
+            self.runnable_by_created_at
+                .remove(&(task.created_at, task.id.clone()));
+        }
+        if task.status == TaskStatus::Running
+            && let Some(expires_at) = task.lease_expires_at
+        {
+            self.leased_by_expiry.remove(&(expires_at, task.id.clone()));
+        }
     }
 
     fn remove_from_status_index(&mut self, task: &AgentTask) {
@@ -301,6 +507,53 @@ impl Inner {
     /// Is the thread's active-root slot currently held by a blocking root?
     fn thread_has_blocking_root(&self, thread_id: &ThreadId) -> bool {
         self.active_root_by_thread.contains_key(thread_id)
+    }
+
+    /// Rebalance every secondary index after mutating a row from `old`
+    /// into `new`. Assumes both rows share the same row invariants
+    /// (`id`, `kind`, `parent_id`, `root_id`, `depth`, `thread_id`,
+    /// `created_at`, `max_attempts`) — the [`AgentTaskStore::update`]
+    /// path checks this up-front, and internal Phase 2.3 call sites
+    /// (`try_acquire_task`, `heartbeat_task`, expiry sweeps) only ever
+    /// mutate lease fields and status.
+    ///
+    /// This helper does **not** touch `by_id`; callers must overwrite
+    /// the primary key themselves.
+    fn rebalance_after_row_change(&mut self, old: &AgentTask, new: &AgentTask) {
+        // Status bucket.
+        self.remove_from_status_index(old);
+        self.by_status
+            .entry(new.status)
+            .or_default()
+            .insert(new.id.clone());
+
+        // Runnable / leased indexes: always drop the old classification
+        // first so we never leave a stale entry behind, then re-register
+        // under the new classification. A no-op on statuses that don't
+        // participate in either index.
+        self.unregister_runnable_lease_indexes(old);
+        self.register_runnable_lease_indexes(new);
+
+        // Root-turn-specific indexes (active-root slot + queued FIFO).
+        // `kind` and `thread_id` are row invariants, so the old row's
+        // classification can only mutate between root-turn statuses.
+        if new.kind == TaskKind::RootTurn {
+            if old.status.blocks_root_admission() {
+                self.remove_active_root_if_match(old);
+            } else if old.status == TaskStatus::Queued {
+                self.remove_queued_root_if_match(old);
+            }
+
+            if new.status.blocks_root_admission() {
+                self.active_root_by_thread
+                    .insert(new.thread_id.clone(), new.id.clone());
+            } else if new.status == TaskStatus::Queued {
+                self.queued_roots_by_thread
+                    .entry(new.thread_id.clone())
+                    .or_default()
+                    .insert((new.created_at, new.id.clone()));
+            }
+        }
     }
 }
 
@@ -470,54 +723,16 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        // Drop the old row from every secondary index; the primary-key
-        // entry will be overwritten below.
-        inner.remove_from_status_index(&old);
-
         // Thread / parent indexes are append-only and keyed by `id`, so the
         // old entries stay in place and still point at the (now-updated)
         // row in `by_id`. This is safe because `thread_id` / `parent_id` are
         // row invariants enforced above and never mutate across updates.
-
-        inner
-            .by_status
-            .entry(task.status)
-            .or_default()
-            .insert(task.id.clone());
-
-        // Rebalance the per-thread root indexes. The invariants we need:
         //
-        // * `active_root_by_thread[thread]` is set ⇔ the new row is a
-        //   root turn in a `blocks_root_admission` state.
-        // * `queued_roots_by_thread[thread]` contains `(created_at, id)`
-        //   ⇔ the new row is a queued root turn.
-        //
-        // `kind` and `thread_id` are row invariants (guarded above), so
-        // the old row can only mutate between root-turn statuses here.
-        if task.kind == TaskKind::RootTurn {
-            // Drop the old classification first so we don't leave a stale
-            // entry behind on any transition.
-            if old.status.blocks_root_admission() {
-                inner.remove_active_root_if_match(&old);
-            } else if old.status == TaskStatus::Queued {
-                inner.remove_queued_root_if_match(&old);
-            }
-
-            // Re-register under the new classification.
-            if task.status.blocks_root_admission() {
-                inner
-                    .active_root_by_thread
-                    .insert(task.thread_id.clone(), task.id.clone());
-            } else if task.status == TaskStatus::Queued {
-                inner
-                    .queued_roots_by_thread
-                    .entry(task.thread_id.clone())
-                    .or_default()
-                    .insert((task.created_at, task.id.clone()));
-            }
-            // Terminal statuses simply drop out of both indexes.
-        }
-
+        // Everything else — status bucket, runnable/lease indexes, and the
+        // per-thread root indexes — is handled by the shared rebalance
+        // helper so that Phase 2.3's acquire / heartbeat / sweep call
+        // sites can share the same logic with `update()`.
+        inner.rebalance_after_row_change(&old, &task);
         inner.by_id.insert(task.id.clone(), task);
         drop(inner);
         Ok(())
@@ -669,45 +884,169 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .queued_roots_by_thread
             .get(thread_id)
             .and_then(|q| q.iter().next().cloned());
-        let Some((created_at, id)) = head_key else {
+        let Some((_, id)) = head_key else {
             return Ok(None);
         };
 
-        // Load the row, run the pure promotion transition, and commit.
+        // Load the row, run the pure promotion transition, and commit
+        // via the shared rebalance helper so the runnable index picks
+        // up the newly-Pending row.
         let queued_row = inner
             .by_id
             .get(&id)
             .cloned()
             .ok_or_else(|| anyhow!("promote rejected: queue head {id} missing from by_id"))?;
         let promoted = queued_row
+            .clone()
             .promote_to_pending(now)
             .context("promote rejected: promotion transition failed")?;
 
-        // Reindex: drop from the queued index, add to the active-root
-        // slot, swap the status bucket.
-        if let Some(queue) = inner.queued_roots_by_thread.get_mut(thread_id) {
-            queue.remove(&(created_at, id.clone()));
-            if queue.is_empty() {
-                inner.queued_roots_by_thread.remove(thread_id);
-            }
-        }
-        if let Some(set) = inner.by_status.get_mut(&TaskStatus::Queued) {
-            set.remove(&id);
-            if set.is_empty() {
-                inner.by_status.remove(&TaskStatus::Queued);
-            }
-        }
-        inner
-            .by_status
-            .entry(TaskStatus::Pending)
-            .or_default()
-            .insert(id.clone());
-        inner
-            .active_root_by_thread
-            .insert(thread_id.clone(), id.clone());
+        inner.rebalance_after_row_change(&queued_row, &promoted);
         inner.by_id.insert(id, promoted.clone());
         drop(inner);
         Ok(Some(promoted))
+    }
+
+    async fn try_acquire_task(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut inner = self.inner.write().await;
+        let Some(old) = inner.by_id.get(id).cloned() else {
+            return Ok(None);
+        };
+        // CAS guard: only `Pending` rows are runnable. Every other
+        // status (`Queued`, waiting states, `Running`, terminal states)
+        // silently returns `None` so callers can loop on scan-and-claim
+        // without caring about lost races.
+        if !old.status.can_be_leased() {
+            return Ok(None);
+        }
+        let claimed = old
+            .clone()
+            .mark_running(worker, lease, expires_at, now)
+            .context("try_acquire_task rejected: mark_running transition failed")?;
+        inner.rebalance_after_row_change(&old, &claimed);
+        inner.by_id.insert(claimed.id.clone(), claimed.clone());
+        drop(inner);
+        Ok(Some(claimed))
+    }
+
+    async fn acquire_next_runnable(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let mut inner = self.inner.write().await;
+
+        // Pop the oldest runnable row. `BTreeSet` iterates ascending,
+        // so `(created_at, id)` pulls the FIFO head. The index is
+        // populated across every kind and thread, so this single scan
+        // covers root turns and tool-runtime children — workers never
+        // need to double-check the kind and never accidentally lease a
+        // waiting / terminal / queued row (those statuses are absent
+        // from the index by construction).
+        let Some((_, id)) = inner.runnable_by_created_at.iter().next().cloned() else {
+            return Ok(None);
+        };
+        let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
+            anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
+        })?;
+        // Defense in depth: the index should only contain `Pending`
+        // rows. If somehow we see a non-runnable row here, it is an
+        // internal bookkeeping bug and we surface it rather than
+        // silently leasing the wrong kind of row.
+        if !old.status.can_be_leased() {
+            let status = old.status;
+            return Err(anyhow!(
+                "acquire_next_runnable: runnable index held non-pending row {id} in status {status:?}"
+            ));
+        }
+        let claimed = old
+            .clone()
+            .mark_running(worker, lease, expires_at, now)
+            .context("acquire_next_runnable rejected: mark_running transition failed")?;
+        inner.rebalance_after_row_change(&old, &claimed);
+        inner.by_id.insert(claimed.id.clone(), claimed.clone());
+        drop(inner);
+        Ok(Some(claimed))
+    }
+
+    async fn heartbeat_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("heartbeat rejected: task {id} does not exist"))?;
+
+        // Drive the row through the pure transition helper: it enforces
+        // `status == Running`, the worker CAS, and the lease CAS, and
+        // bumps `last_heartbeat_at` / `lease_expires_at` together.
+        let mut refreshed = old.clone();
+        refreshed
+            .touch_heartbeat(worker, lease, expires_at, now)
+            .context("heartbeat rejected")?;
+
+        inner.rebalance_after_row_change(&old, &refreshed);
+        inner.by_id.insert(refreshed.id.clone(), refreshed.clone());
+        drop(inner);
+        Ok(refreshed)
+    }
+
+    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<AgentTaskId>> {
+        let mut inner = self.inner.write().await;
+
+        // Walk the lease-expiry index in ascending order, collecting
+        // every row whose expiry is `<= now`. Iteration stops on the
+        // first still-live lease, so the sweep cost is O(expired).
+        // Collecting up-front lets us mutate `inner` inside the loop
+        // without fighting the borrow checker.
+        let expired_keys: Vec<(OffsetDateTime, AgentTaskId)> = inner
+            .leased_by_expiry
+            .iter()
+            .take_while(|(expires_at, _)| *expires_at <= now)
+            .cloned()
+            .collect();
+
+        let mut released = Vec::with_capacity(expired_keys.len());
+        for (_, id) in expired_keys {
+            let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
+                anyhow!("release_expired_leases: leased index held missing row {id}")
+            })?;
+            // Defense in depth: only `Running` rows belong in the
+            // expiry index. A non-Running row here is an internal
+            // bookkeeping bug.
+            if old.status != TaskStatus::Running {
+                let status = old.status;
+                return Err(anyhow!(
+                    "release_expired_leases: expiry index held non-running row {id} in status {status:?}"
+                ));
+            }
+            let released_row = old
+                .clone()
+                .release_lease(now)
+                .context("release_expired_leases: release transition failed")?;
+            inner.rebalance_after_row_change(&old, &released_row);
+            inner.by_id.insert(id.clone(), released_row);
+            released.push(id);
+        }
+
+        drop(inner);
+        Ok(released)
     }
 
     async fn clear(&self) -> Result<()> {
@@ -1968,6 +2307,1021 @@ mod tests {
             .context("active final")?
             .context("still held")?;
         assert_eq!(active.status, TaskStatus::Pending);
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.3 — Runnable acquisition, lease ownership, heartbeats
+    // (ENG-7917)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // These tests pin down Phase 2.3's acceptance criteria:
+    //
+    // * Two workers cannot acquire the same task, either by id or via
+    //   the scan-and-claim `acquire_next_runnable` path.
+    // * Heartbeats from the wrong worker / wrong lease fail and do
+    //   not mutate the row.
+    // * Waiting, queued, and terminal tasks are never treated as
+    //   runnable work — neither by targeted `try_acquire_task` nor by
+    //   the scanning path.
+    // * The expiry sweep releases leases whose `lease_expires_at <=
+    //   now`, leaves still-live leases alone, and restores the row to
+    //   `Pending` so a new worker can acquire it.
+
+    /// Build a fresh root turn with a generous retry budget so the
+    /// acquisition tests can exercise the CAS path without fighting
+    /// the retry-budget guard.
+    fn acquirable_root(name: &str, secs: i64) -> AgentTask {
+        AgentTask::new_root_turn(thread(name), t_plus(secs), 5)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_claims_pending_row_and_stamps_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claim should succeed")?;
+        assert_eq!(claimed.status, TaskStatus::Running);
+        assert_eq!(claimed.worker_id.as_ref().map(WorkerId::as_str), Some("w1"));
+        assert_eq!(claimed.lease_id.as_ref().map(LeaseId::as_str), Some("l1"));
+        assert_eq!(claimed.lease_expires_at, Some(t_plus(60)));
+        assert_eq!(claimed.last_heartbeat_at, Some(t_plus(1)));
+        assert_eq!(claimed.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_is_exclusive_across_two_workers() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        // Worker A wins the race.
+        let a = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-a"),
+                LeaseId::from_string("l-a"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("claim a")?
+            .context("a claims")?;
+        assert_eq!(a.worker_id.as_ref().map(WorkerId::as_str), Some("w-a"));
+
+        // Worker B tries to claim the same row and must observe None,
+        // because the row is no longer Pending.
+        let b = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-b"),
+                LeaseId::from_string("l-b"),
+                t_plus(60),
+                t_plus(2),
+            )
+            .await
+            .context("claim b")?;
+        assert!(b.is_none(), "second worker should not claim: {b:?}");
+
+        // The persisted row is still owned by worker A.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(
+            persisted.worker_id.as_ref().map(WorkerId::as_str),
+            Some("w-a")
+        );
+        assert_eq!(
+            persisted.lease_id.as_ref().map(LeaseId::as_str),
+            Some("l-a")
+        );
+        assert_eq!(persisted.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_returns_none_for_missing_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let ghost = AgentTaskId::new();
+        let result = store
+            .try_acquire_task(
+                &ghost,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_refuses_waiting_on_children_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t-wait", 0);
+        let id = root.id.clone();
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit")?;
+        let running = root
+            .mark_running(
+                WorkerId::from_string("w-setup"),
+                LeaseId::from_string("l-setup"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("setup running")?;
+        store
+            .update(running.clone())
+            .await
+            .context("update running")?;
+        let waiting = running
+            .wait_on_children(2, t_plus(2))
+            .context("wait_on_children")?;
+        store.update(waiting).await.context("update waiting")?;
+
+        let claim = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("acquire waiting")?;
+        assert!(
+            claim.is_none(),
+            "WaitingOnChildren must never be treated as runnable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_refuses_awaiting_confirmation_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t-await", 0);
+        let id = root.id.clone();
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit")?;
+        let running = root
+            .mark_running(
+                WorkerId::from_string("w-setup"),
+                LeaseId::from_string("l-setup"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("setup running")?;
+        store
+            .update(running.clone())
+            .await
+            .context("update running")?;
+        let awaiting = running
+            .await_confirmation(t_plus(2))
+            .context("await_confirmation")?;
+        store.update(awaiting).await.context("update awaiting")?;
+
+        let claim = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("acquire awaiting")?;
+        assert!(
+            claim.is_none(),
+            "AwaitingConfirmation must never be treated as runnable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_refuses_terminal_rows() -> Result<()> {
+        for (name, secs) in [("t-done", 0i64), ("t-failed", 1), ("t-cancelled", 2)] {
+            let store = InMemoryAgentTaskStore::new();
+            let root = acquirable_root(name, secs);
+            let id = root.id.clone();
+            store
+                .submit_root_turn(root.clone())
+                .await
+                .context("submit")?;
+            let running = root
+                .mark_running(
+                    WorkerId::from_string("w-setup"),
+                    LeaseId::from_string("l-setup"),
+                    t_plus(60),
+                    t_plus(secs + 1),
+                )
+                .context("setup running")?;
+            store
+                .update(running.clone())
+                .await
+                .context("update running")?;
+            let terminal = match name {
+                "t-done" => running.complete(t_plus(secs + 2)).context("complete")?,
+                "t-failed" => running
+                    .fail("boom".into(), t_plus(secs + 2))
+                    .context("fail")?,
+                "t-cancelled" => running.cancel(t_plus(secs + 2)).context("cancel")?,
+                _ => unreachable!(),
+            };
+            store.update(terminal).await.context("update terminal")?;
+            let claim = store
+                .try_acquire_task(
+                    &id,
+                    WorkerId::from_string("w-new"),
+                    LeaseId::from_string("l-new"),
+                    t_plus(300),
+                    t_plus(secs + 3),
+                )
+                .await
+                .context("acquire terminal")?;
+            assert!(
+                claim.is_none(),
+                "{name}: terminal status must never be treated as runnable"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_refuses_queued_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = acquirable_root("t-queued", 0);
+        let second = acquirable_root("t-queued", 1);
+        let second_id = second.id.clone();
+        store
+            .submit_root_turn(first)
+            .await
+            .context("submit first")?;
+        store
+            .submit_root_turn(second)
+            .await
+            .context("submit second")?;
+
+        let claim = store
+            .try_acquire_task(
+                &second_id,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(300),
+                t_plus(2),
+            )
+            .await
+            .context("acquire queued")?;
+        assert!(claim.is_none(), "Queued must never be treated as runnable");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_acquire_task_exhausted_retry_budget_is_a_hard_error() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        // max_attempts = 1: a single acquire is legal, the second
+        // attempt (after release) would overflow the budget.
+        let root = AgentTask::new_root_turn(thread("t1"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("first claim")?
+            .context("first claim exists")?;
+
+        let released = claimed.release_lease(t_plus(2)).context("release")?;
+        store.update(released).await.context("update released")?;
+
+        // attempt == 1, max == 1 → next mark_running overflows. The
+        // store surfaces that as an anyhow error, not a silent None,
+        // because retry-budget exhaustion is Phase 2.5 territory and
+        // Phase 2.3 wants loud failure.
+        let err = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("exceeds max_attempts") || message.contains("AttemptExceedsMax"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_picks_oldest_pending_first() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        // Three roots on different threads so they can all be Pending
+        // simultaneously (the same-thread FIFO queue only allows one
+        // active root per thread).
+        let a = acquirable_root("a", 0);
+        let b = acquirable_root("b", 1);
+        let c = acquirable_root("c", 2);
+        store.submit_root_turn(a.clone()).await.context("a")?;
+        store.submit_root_turn(b.clone()).await.context("b")?;
+        store.submit_root_turn(c.clone()).await.context("c")?;
+
+        let first = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(5),
+            )
+            .await
+            .context("acquire 1")?
+            .context("first claim")?;
+        assert_eq!(first.id, a.id, "oldest created_at should win");
+
+        let second = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(60),
+                t_plus(6),
+            )
+            .await
+            .context("acquire 2")?
+            .context("second claim")?;
+        assert_eq!(second.id, b.id);
+
+        let third = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w3"),
+                LeaseId::from_string("l3"),
+                t_plus(60),
+                t_plus(7),
+            )
+            .await
+            .context("acquire 3")?
+            .context("third claim")?;
+        assert_eq!(third.id, c.id);
+
+        // Pool drained: a fourth scan returns None.
+        let none = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w4"),
+                LeaseId::from_string("l4"),
+                t_plus(60),
+                t_plus(8),
+            )
+            .await
+            .context("acquire 4")?;
+        assert!(none.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_skips_queued_waiting_and_terminal_rows() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+
+        // Blocking root on thread A (Pending, will be acquired).
+        let a_root = acquirable_root("a", 0);
+        let a_id = a_root.id.clone();
+        store.submit_root_turn(a_root).await.context("submit a")?;
+
+        // Queue a second root behind A — it is Queued, must not be
+        // scanned.
+        let a_queued = acquirable_root("a", 1);
+        store
+            .submit_root_turn(a_queued.clone())
+            .await
+            .context("submit a-queued")?;
+
+        // Thread B: put its root into WaitingOnChildren so the whole
+        // tree is a waiting root + a runnable child. The child must
+        // be acquired by the scan, the root must be skipped.
+        let b_root = acquirable_root("b", 0);
+        store
+            .submit_root_turn(b_root.clone())
+            .await
+            .context("submit b")?;
+        let b_running = b_root
+            .mark_running(
+                WorkerId::from_string("w-setup"),
+                LeaseId::from_string("l-setup"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("setup running")?;
+        store
+            .update(b_running.clone())
+            .await
+            .context("update b running")?;
+        let b_child = AgentTask::new_child(&b_running, TaskKind::ToolRuntime, t_plus(2), 1)
+            .context("child")?;
+        let b_child_id = b_child.id.clone();
+        store
+            .insert(b_child.clone())
+            .await
+            .context("insert child")?;
+        let b_waiting = b_running
+            .wait_on_children(1, t_plus(3))
+            .context("wait_on_children")?;
+        store.update(b_waiting).await.context("update waiting")?;
+
+        // Thread C: a terminal root, must not be scanned.
+        let c_root = acquirable_root("c", 0);
+        store
+            .submit_root_turn(c_root.clone())
+            .await
+            .context("submit c")?;
+        let c_running = c_root
+            .mark_running(
+                WorkerId::from_string("w-setup"),
+                LeaseId::from_string("l-setup"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("c running")?;
+        store.update(c_running.clone()).await.context("update c")?;
+        let c_done = c_running.complete(t_plus(2)).context("complete")?;
+        store.update(c_done).await.context("update c done")?;
+
+        // First scan-and-claim: the oldest runnable row is thread A's
+        // root (created_at = 0). Queued / waiting / terminal must all
+        // be invisible.
+        let first = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-1"),
+                LeaseId::from_string("l-1"),
+                t_plus(60),
+                t_plus(10),
+            )
+            .await
+            .context("acquire 1")?
+            .context("first claim")?;
+        assert_eq!(first.id, a_id);
+        assert_eq!(first.kind, TaskKind::RootTurn);
+
+        // Second scan-and-claim: next runnable row is the tool child
+        // (created_at = 2). Root turn and tool child share the same
+        // acquire path, as the issue requires.
+        let second = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-2"),
+                LeaseId::from_string("l-2"),
+                t_plus(60),
+                t_plus(11),
+            )
+            .await
+            .context("acquire 2")?
+            .context("second claim")?;
+        assert_eq!(second.id, b_child_id);
+        assert_eq!(second.kind, TaskKind::ToolRuntime);
+
+        // Third scan-and-claim: nothing left. The queued A row, the
+        // waiting B root, and the terminal C row are all invisible.
+        let none = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-3"),
+                LeaseId::from_string("l-3"),
+                t_plus(60),
+                t_plus(12),
+            )
+            .await
+            .context("acquire 3")?;
+        assert!(none.is_none(), "non-runnable rows must not be scanned");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_two_workers_one_task_yields_exactly_one_winner() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        // The trait's write lock serialises the two calls. The first
+        // wins, the second observes `None`.
+        let a = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-a"),
+                LeaseId::from_string("l-a"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire a")?
+            .context("a wins")?;
+        assert_eq!(a.id, id);
+        assert_eq!(a.worker_id.as_ref().map(WorkerId::as_str), Some("w-a"));
+
+        let b = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-b"),
+                LeaseId::from_string("l-b"),
+                t_plus(60),
+                t_plus(2),
+            )
+            .await
+            .context("acquire b")?;
+        assert!(b.is_none(), "second worker must not claim: {b:?}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_task_bumps_timestamps_under_owner_cas() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claim")?;
+        assert_eq!(claimed.last_heartbeat_at, Some(t_plus(1)));
+        assert_eq!(claimed.lease_expires_at, Some(t_plus(60)));
+
+        let refreshed = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(180),
+                t_plus(30),
+            )
+            .await
+            .context("heartbeat")?;
+        assert_eq!(refreshed.last_heartbeat_at, Some(t_plus(30)));
+        assert_eq!(refreshed.lease_expires_at, Some(t_plus(180)));
+
+        // Heartbeat mutates the persisted row, not just the return
+        // value.
+        let persisted = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(persisted.lease_expires_at, Some(t_plus(180)));
+        assert_eq!(persisted.last_heartbeat_at, Some(t_plus(30)));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_task_rejects_wrong_worker_or_wrong_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claim")?;
+
+        // Wrong worker: imposter tries to heartbeat a row it does not
+        // own. The call fails loud, and the persisted row is
+        // unchanged.
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w-imposter"),
+                &LeaseId::from_string("l1"),
+                t_plus(120),
+                t_plus(10),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("worker_id") || message.contains("WorkerMismatch"),
+            "unexpected: {message}"
+        );
+
+        let after_wrong_worker = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(after_wrong_worker.lease_expires_at, Some(t_plus(60)));
+        assert_eq!(after_wrong_worker.last_heartbeat_at, Some(t_plus(1)));
+
+        // Wrong lease: original worker id, but the lease has been
+        // rotated (e.g. after an expiry sweep re-acquired the row).
+        // CAS must fail on the lease dimension too.
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l-stale"),
+                t_plus(120),
+                t_plus(10),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("lease_id") || message.contains("LeaseMismatch"),
+            "unexpected: {message}"
+        );
+
+        let after_wrong_lease = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(after_wrong_lease.lease_expires_at, Some(t_plus(60)));
+        assert_eq!(after_wrong_lease.last_heartbeat_at, Some(t_plus(1)));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_task_rejects_non_running_and_missing_rows() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+
+        // Missing row.
+        let ghost = AgentTaskId::new();
+        let err = store
+            .heartbeat_task(
+                &ghost,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(120),
+                t_plus(10),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("does not exist"), "unexpected: {message}");
+
+        // Pending row (never acquired).
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(120),
+                t_plus(10),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("invalid transition") || message.contains("InvalidTransition"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_expired_leases_sweeps_expired_rows_and_leaves_live_ones() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+
+        // Three roots on three threads, each with a different lease
+        // expiry: 10, 20, 30.
+        let a = acquirable_root("a", 0);
+        let b = acquirable_root("b", 0);
+        let c = acquirable_root("c", 0);
+        let (a_id, b_id, c_id) = (a.id.clone(), b.id.clone(), c.id.clone());
+        store.submit_root_turn(a).await.context("a")?;
+        store.submit_root_turn(b).await.context("b")?;
+        store.submit_root_turn(c).await.context("c")?;
+
+        store
+            .try_acquire_task(
+                &a_id,
+                WorkerId::from_string("w-a"),
+                LeaseId::from_string("l-a"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire a")?
+            .context("a claimed")?;
+        store
+            .try_acquire_task(
+                &b_id,
+                WorkerId::from_string("w-b"),
+                LeaseId::from_string("l-b"),
+                t_plus(20),
+                t_plus(1),
+            )
+            .await
+            .context("acquire b")?
+            .context("b claimed")?;
+        store
+            .try_acquire_task(
+                &c_id,
+                WorkerId::from_string("w-c"),
+                LeaseId::from_string("l-c"),
+                t_plus(30),
+                t_plus(1),
+            )
+            .await
+            .context("acquire c")?
+            .context("c claimed")?;
+
+        // Sweep at `now = t+15`: `a` expired, `b` and `c` still live.
+        let released = store
+            .release_expired_leases(t_plus(15))
+            .await
+            .context("sweep 15")?;
+        assert_eq!(released, vec![a_id.clone()]);
+
+        // `a` is now Pending and has no lease fields, but retains its
+        // attempt counter.
+        let a_row = store
+            .get(&a_id)
+            .await
+            .context("get a")?
+            .context("a exists")?;
+        assert_eq!(a_row.status, TaskStatus::Pending);
+        assert!(a_row.worker_id.is_none());
+        assert!(a_row.lease_id.is_none());
+        assert!(a_row.lease_expires_at.is_none());
+        assert!(a_row.last_heartbeat_at.is_none());
+        assert_eq!(a_row.attempt, 1, "failed attempt counts against budget");
+
+        // `b` and `c` are still Running and still owned by their
+        // original workers.
+        let b_row = store
+            .get(&b_id)
+            .await
+            .context("get b")?
+            .context("b exists")?;
+        assert_eq!(b_row.status, TaskStatus::Running);
+        assert_eq!(b_row.worker_id.as_ref().map(WorkerId::as_str), Some("w-b"));
+        let c_row = store
+            .get(&c_id)
+            .await
+            .context("get c")?
+            .context("c exists")?;
+        assert_eq!(c_row.status, TaskStatus::Running);
+        assert_eq!(c_row.worker_id.as_ref().map(WorkerId::as_str), Some("w-c"));
+
+        // A second sweep at `now = t+25` catches only `b`.
+        let released = store
+            .release_expired_leases(t_plus(25))
+            .await
+            .context("sweep 25")?;
+        assert_eq!(released, vec![b_id.clone()]);
+
+        // Empty sweep: still-live `c` survives.
+        let released = store
+            .release_expired_leases(t_plus(25))
+            .await
+            .context("sweep idempotent")?;
+        assert!(released.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_expired_leases_lets_a_new_worker_reacquire_the_row() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        // Give the row two attempts so we can prove the sweep path
+        // leaves the row runnable for a fresh worker.
+        let root = AgentTask::new_root_turn(thread("t1"), t0(), 2);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("first acquire")?
+            .context("dead worker claims")?;
+
+        // The dead worker never heartbeats. Sweep at `t+15` boots it.
+        let swept = store
+            .release_expired_leases(t_plus(15))
+            .await
+            .context("sweep")?;
+        assert_eq!(swept.len(), 1);
+
+        // A fresh worker acquires the row and bumps the attempt
+        // counter.
+        let reclaimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-new"),
+                LeaseId::from_string("l-new"),
+                t_plus(120),
+                t_plus(20),
+            )
+            .await
+            .context("second acquire")?
+            .context("new worker claims")?;
+        assert_eq!(
+            reclaimed.worker_id.as_ref().map(WorkerId::as_str),
+            Some("w-new")
+        );
+        assert_eq!(
+            reclaimed.lease_id.as_ref().map(LeaseId::as_str),
+            Some("l-new")
+        );
+        assert_eq!(reclaimed.attempt, 2);
+
+        // The original worker's stale heartbeat now fails with a lease
+        // mismatch — the acceptance-criterion scenario from the issue.
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w-dead"),
+                &LeaseId::from_string("l-dead"),
+                t_plus(300),
+                t_plus(21),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("worker_id") || message.contains("WorkerMismatch"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_extends_lease_past_previous_expiry() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claim")?;
+
+        // Heartbeat bumps expiry to t+100 before the sweep fires.
+        store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                t_plus(100),
+                t_plus(5),
+            )
+            .await
+            .context("heartbeat")?;
+
+        // The sweep at t+15 now treats the lease as live.
+        let released = store
+            .release_expired_leases(t_plus(15))
+            .await
+            .context("sweep")?;
+        assert!(released.is_empty(), "heartbeat should extend lease");
+
+        // The row is still Running and still owned by w1.
+        let row = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.lease_expires_at, Some(t_plus(100)));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_runtime_children_share_the_same_lease_path_as_roots() -> Result<()> {
+        // Phase 2.3 requires one acquisition and lease model that
+        // prevents double ownership across task kinds. This test
+        // drives a tool-runtime child through try_acquire /
+        // heartbeat / release_expired so any divergence between the
+        // root and child paths would show up here.
+        let store = InMemoryAgentTaskStore::new();
+        let root = acquirable_root("t1", 0);
+        store.submit_root_turn(root.clone()).await.context("root")?;
+        let running = root
+            .mark_running(
+                WorkerId::from_string("w-root"),
+                LeaseId::from_string("l-root"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("root running")?;
+        store.update(running.clone()).await.context("update root")?;
+        let child =
+            AgentTask::new_child(&running, TaskKind::ToolRuntime, t_plus(2), 2).context("child")?;
+        let child_id = child.id.clone();
+        store.insert(child.clone()).await.context("insert child")?;
+
+        // Park the root in WaitingOnChildren so its lease is dropped —
+        // we want the sweep below to act on the tool child only, not
+        // accidentally on an expired root lease.
+        let waiting_root = running
+            .wait_on_children(1, t_plus(3))
+            .context("root waiting")?;
+        store
+            .update(waiting_root)
+            .await
+            .context("update root waiting")?;
+
+        // Targeted claim of the child.
+        let claimed = store
+            .try_acquire_task(
+                &child_id,
+                WorkerId::from_string("w-tool"),
+                LeaseId::from_string("l-tool"),
+                t_plus(30),
+                t_plus(4),
+            )
+            .await
+            .context("acquire child")?
+            .context("child claimed")?;
+        assert_eq!(claimed.kind, TaskKind::ToolRuntime);
+        assert_eq!(claimed.status, TaskStatus::Running);
+
+        // A second worker cannot claim the same tool child.
+        let b = store
+            .try_acquire_task(
+                &child_id,
+                WorkerId::from_string("w-imposter"),
+                LeaseId::from_string("l-imposter"),
+                t_plus(30),
+                t_plus(5),
+            )
+            .await
+            .context("second child acquire")?;
+        assert!(b.is_none());
+
+        // Heartbeat CAS applies the same way.
+        let refreshed = store
+            .heartbeat_task(
+                &child_id,
+                &WorkerId::from_string("w-tool"),
+                &LeaseId::from_string("l-tool"),
+                t_plus(200),
+                t_plus(6),
+            )
+            .await
+            .context("heartbeat child")?;
+        assert_eq!(refreshed.lease_expires_at, Some(t_plus(200)));
+
+        // Expire the heartbeat by advancing the sweep past it. The
+        // child returns to Pending so a new worker can pick it up.
+        let expired = store
+            .release_expired_leases(t_plus(300))
+            .await
+            .context("sweep child")?;
+        assert_eq!(expired, vec![child_id.clone()]);
+        let after = store
+            .get(&child_id)
+            .await
+            .context("get child")?
+            .context("child exists")?;
+        assert_eq!(after.status, TaskStatus::Pending);
+        assert!(after.worker_id.is_none());
+        assert_eq!(after.attempt, 1);
+
+        // Scan-and-claim picks the child up again (the root is still
+        // WaitingOnChildren, so only the child is runnable).
+        let reclaimed = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-fresh"),
+                LeaseId::from_string("l-fresh"),
+                t_plus(500),
+                t_plus(301),
+            )
+            .await
+            .context("scan child")?
+            .context("fresh claim")?;
+        assert_eq!(reclaimed.id, child_id);
+        assert_eq!(reclaimed.attempt, 2);
         Ok(())
     }
 }
