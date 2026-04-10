@@ -209,6 +209,17 @@ impl fmt::Display for LeaseId {
 // ChildSpawnSpec (Phase 2.6)
 // ─────────────────────────────────────────────────────────────────────
 
+/// Suspension state captured at a tool-boundary pause point.
+///
+/// The continuation carries the agent state at suspension time, and the
+/// messages carry the conversation that was not yet committed. These
+/// two are always paired.
+#[derive(Clone, Debug)]
+pub struct SuspensionPayload {
+    pub continuation: ContinuationEnvelope,
+    pub suspended_messages: Vec<agent_sdk_core::llm::Message>,
+}
+
 /// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
 ///
 /// Phase 2.6 (ENG-7920) adds the store-level entry point that atomically
@@ -831,6 +842,7 @@ impl AgentTask {
             TaskState::None => "none",
             TaskState::WaitingOnChildren { .. } => "waiting_on_children",
             TaskState::AwaitingConfirmation { .. } => "awaiting_confirmation",
+            TaskState::ReadyToResume { .. } => "ready_to_resume",
         };
         match self.state.required_status() {
             Some(required) if required != self.status => {
@@ -1006,7 +1018,7 @@ impl AgentTask {
     pub fn wait_on_children(
         mut self,
         child_count: u32,
-        continuation: ContinuationEnvelope,
+        payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<Self, TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -1025,7 +1037,8 @@ impl AgentTask {
         self.lease_expires_at = None;
         self.last_heartbeat_at = None;
         self.state = TaskState::WaitingOnChildren {
-            continuation: Box::new(continuation),
+            continuation: Box::new(payload.continuation),
+            suspended_messages: payload.suspended_messages,
         };
         self.updated_at = now;
         self.validate()?;
@@ -1035,12 +1048,12 @@ impl AgentTask {
     /// Record that one child task has reached a terminal state.
     ///
     /// Decrements `pending_child_count`. When the counter hits zero, the
-    /// task transitions back to [`TaskStatus::Pending`] and the typed
-    /// [`TaskState::WaitingOnChildren`] payload is cleared so a worker
-    /// can pick it up and re-enter the loop. While there are still
-    /// outstanding children, the typed payload is preserved so the
-    /// resume path on the eventual zero-child transition still has the
-    /// continuation it captured at pause time.
+    /// task transitions back to [`TaskStatus::Pending`] with
+    /// [`TaskState::ReadyToResume`] — the continuation and suspended
+    /// messages are preserved so a worker that acquires the parent can
+    /// resume the turn from durable state alone. While there are still
+    /// outstanding children, the [`TaskState::WaitingOnChildren`]
+    /// payload is kept intact.
     ///
     /// Prefer [`Self::recompute_pending_children`] for Phase 2.6 and
     /// later call sites: it derives the counter from the journal's
@@ -1064,11 +1077,24 @@ impl AgentTask {
         self.pending_child_count = self.pending_child_count.saturating_sub(1);
         if self.pending_child_count == 0 {
             self.status = TaskStatus::Pending;
-            // The status ↔ state invariant requires us to clear the
-            // typed payload alongside the status flip; the resume path
-            // is responsible for reading the continuation **before**
-            // calling this helper.
-            self.state = TaskState::None;
+            // Phase 4.5: move the continuation and suspended messages
+            // from WaitingOnChildren into ReadyToResume so the worker
+            // that acquires this parent can resume the turn from
+            // durable state. The old approach wiped the payload here;
+            // now we preserve it through the Pending transition.
+            self.state = match self.state {
+                TaskState::WaitingOnChildren {
+                    continuation,
+                    suspended_messages,
+                } => TaskState::ReadyToResume {
+                    continuation,
+                    suspended_messages,
+                },
+                // Defensive: if state is somehow not WaitingOnChildren,
+                // clear it. This shouldn't happen because the status
+                // guard above ensures we are in WaitingOnChildren.
+                other => other,
+            };
         }
         self.updated_at = now;
         self.validate()?;
@@ -1077,8 +1103,9 @@ impl AgentTask {
 
     /// Authoritatively replace the parent's `pending_child_count` with
     /// `live_children` and, when the count hits zero, flip the row back
-    /// to [`TaskStatus::Pending`] with [`TaskState::None`] so a worker
-    /// can pick it up and re-enter the loop.
+    /// to [`TaskStatus::Pending`] with [`TaskState::ReadyToResume`] so
+    /// the continuation and suspended messages survive the transition
+    /// and a worker can resume the turn from durable state.
     ///
     /// This is the Phase 2.6 replacement for [`Self::child_resolved`]'s
     /// saturating subtraction: the store passes the live child count
@@ -1092,12 +1119,6 @@ impl AgentTask {
     /// [`TaskState::WaitingOnChildren`] payload intact so the eventual
     /// resume transition still has the continuation it was paused
     /// with.
-    ///
-    /// The caller is responsible for reading the embedded continuation
-    /// **before** the final zero-children call because the pure
-    /// transition wipes the typed payload to satisfy the state ↔
-    /// status invariant — exactly the same discipline
-    /// [`Self::child_resolved`] already requires.
     ///
     /// # Errors
     /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -1116,7 +1137,19 @@ impl AgentTask {
         self.pending_child_count = live_children;
         if live_children == 0 {
             self.status = TaskStatus::Pending;
-            self.state = TaskState::None;
+            // Phase 4.5: preserve the continuation and suspended
+            // messages so the resume path can rebuild the turn from
+            // durable state. See `child_resolved` for the same logic.
+            self.state = match self.state {
+                TaskState::WaitingOnChildren {
+                    continuation,
+                    suspended_messages,
+                } => TaskState::ReadyToResume {
+                    continuation,
+                    suspended_messages,
+                },
+                other => other,
+            };
         }
         self.updated_at = now;
         self.validate()?;
@@ -1783,7 +1816,14 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(2, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                2,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         assert_eq!(waiting.status, TaskStatus::WaitingOnChildren);
         assert_eq!(waiting.pending_child_count, 2);
@@ -1814,16 +1854,23 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::Pending);
         assert_eq!(resolved.pending_child_count, 0);
-        // Resuming back to Pending must clear the typed payload so the
-        // state ↔ status invariant holds.
+        // Phase 4.5: resuming back to Pending preserves the continuation
+        // in a ReadyToResume payload so the worker can resume the turn.
         assert!(
-            resolved.state.is_none(),
-            "Pending row must hold TaskState::None after children drain"
+            matches!(resolved.state, TaskState::ReadyToResume { .. }),
+            "Pending row must hold TaskState::ReadyToResume after children drain"
         );
         Ok(())
     }
@@ -1839,7 +1886,14 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(3, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                3,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let resolved = waiting.child_resolved(t_plus(3)).context("resolved")?;
         assert_eq!(resolved.status, TaskStatus::WaitingOnChildren);
@@ -1869,7 +1923,14 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(3, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                3,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let recomputed = waiting
             .recompute_pending_children(1, t_plus(3))
@@ -1897,7 +1958,14 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(2, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                2,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let recomputed = waiting
             .recompute_pending_children(0, t_plus(3))
@@ -1905,8 +1973,8 @@ mod tests {
         assert_eq!(recomputed.status, TaskStatus::Pending);
         assert_eq!(recomputed.pending_child_count, 0);
         assert!(
-            recomputed.state.is_none(),
-            "Pending row must hold TaskState::None after recompute resume"
+            matches!(recomputed.state, TaskState::ReadyToResume { .. }),
+            "Pending row must hold TaskState::ReadyToResume after recompute resume"
         );
         Ok(())
     }
@@ -1927,7 +1995,14 @@ mod tests {
             )
             .context("running")?;
         let waiting = running
-            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let recomputed = waiting
             .recompute_pending_children(0, t_plus(3))
@@ -2026,7 +2101,14 @@ mod tests {
         assert!(done.state.is_none());
 
         let waiting = running
-            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         let done2 = waiting
             .complete(t_plus(3))
@@ -2096,7 +2178,14 @@ mod tests {
                 t_plus(1),
             )
             .context("running")?
-            .wait_on_children(2, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                2,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?
             .cancel(t_plus(3))
             .context("cancel waiting")?;
@@ -2273,7 +2362,14 @@ mod tests {
             .context("mark running")?;
         let waiting = running
             .clone()
-            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait")?;
         assert!(!waiting.has_prepared_operation());
 

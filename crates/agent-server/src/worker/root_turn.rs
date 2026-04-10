@@ -1,8 +1,10 @@
-//! Root turn execution: text-only commit and tool-boundary suspension.
+//! Root turn execution: text-only commit, tool-boundary suspension, and
+//! journal-driven resume from completed child tool results.
 //!
 //! This module drives a single root-turn attempt from LLM call through
-//! to either a completed-turn commit (text-only) or a tool-boundary
-//! suspension that spawns child tasks (tool calls present).
+//! to either a completed-turn commit (text-only), a tool-boundary
+//! suspension that spawns child tasks (tool calls present), or a
+//! resumed turn after child tool tasks reach terminal states.
 //!
 //! # Execution flow
 //!
@@ -35,7 +37,8 @@
 use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::llm::{self, ChatOutcome, ChatRequest};
 use agent_sdk_core::{
-    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage, ToolTier,
+    AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage,
+    ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::{MessageStore, StateStore};
@@ -48,7 +51,7 @@ use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_complete
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, ChildSpawnSpec};
+use crate::journal::task::{AgentTask, ChildSpawnSpec, SuspensionPayload};
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
@@ -171,7 +174,8 @@ pub async fn execute_root_turn(
 
     // 3. Branch: tool calls → suspend; text-only → commit.
     if response.has_tool_use() {
-        return suspend_at_tool_boundary(inputs, response, attempt, deps, commit_now).await;
+        return suspend_at_tool_boundary(inputs, user_prompt, response, attempt, deps, commit_now)
+            .await;
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
@@ -490,6 +494,17 @@ fn build_assistant_message(response: &llm::ChatResponse) -> llm::Message {
     }
 }
 
+/// Build an assistant message from a chat response, preserving ALL
+/// content blocks including tool-use. Used by the suspension path to
+/// capture the full response for later resume.
+fn build_full_assistant_message(response: &llm::ChatResponse) -> llm::Message {
+    let blocks: Vec<llm::ContentBlock> = response.content.clone();
+    llm::Message {
+        role: llm::Role::Assistant,
+        content: llm::Content::Blocks(blocks),
+    }
+}
+
 fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> CloseAttemptParams {
     CloseAttemptParams {
         response_blob: serde_json::json!({
@@ -526,6 +541,7 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
 /// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
+    user_prompt: &str,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
@@ -545,13 +561,21 @@ async fn suspend_at_tool_boundary(
         .await
         .context("build continuation for tool suspension")?;
 
-    // 3. One child task per tool call.
+    // 3. Capture the suspended messages (user prompt + full assistant
+    //    response including tool-use blocks) so the resume path can
+    //    reconstruct the conversation from durable state alone.
+    let suspended_messages = vec![
+        llm::Message::user(user_prompt),
+        build_full_assistant_message(&response),
+    ];
+
+    // 4. One child task per tool call.
     let tool_call_count = response.tool_uses().count();
     let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
         .map(|_| ChildSpawnSpec::default())
         .collect();
 
-    // 4. Atomically spawn children and park the parent.
+    // 5. Atomically spawn children and park the parent.
     let (parent_task, child_tasks) = deps
         .task_store
         .spawn_tool_children(
@@ -559,7 +583,10 @@ async fn suspend_at_tool_boundary(
             &inputs.bootstrap.worker_id,
             &inputs.bootstrap.lease_id,
             specs,
-            continuation,
+            SuspensionPayload {
+                continuation,
+                suspended_messages,
+            },
             now,
         )
         .await
@@ -676,4 +703,478 @@ fn extract_pending_tool_calls(
             _ => None,
         })
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Resume from completed child tool results (Phase 4.5)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Prior suspension state passed to the resume path so the LLM sees the
+/// full conversation that led to the tool calls whose results are now
+/// available.
+struct ResumeContext<'a> {
+    continuation: &'a AgentContinuation,
+    suspended_messages: &'a [llm::Message],
+    child_results: &'a [(String, ToolResult)],
+}
+
+/// Resume a suspended root turn after all child tool tasks have
+/// reached terminal states.
+///
+/// This is the journal-driven resume path: the caller provides:
+///
+/// - `inputs`: execution context recovered from the latest checkpoint
+///   (same as a fresh turn — the checkpoint is still at the pre-
+///   suspension point because the suspension path does not commit).
+/// - `continuation`: the [`AgentContinuation`] extracted from the
+///   parent's [`TaskState::ReadyToResume`] payload before the worker
+///   acquired the task.
+/// - `suspended_messages`: the user prompt and full assistant response
+///   (including tool-use blocks) captured at the original suspension
+///   point, also from the [`TaskState::ReadyToResume`] payload.
+/// - `child_results`: completed tool results, one per pending tool
+///   call, keyed by tool-call ID.
+///
+/// # Execution flow
+///
+/// 1. Open a new turn attempt (audit record).
+/// 2. Buffer suspended messages (user prompt + assistant with tool-use)
+///    and tool-result messages into staged stores.
+/// 3. Build a chat request from the full staged history.
+/// 4. Call the LLM.
+/// 5. Branch on response:
+///    - **Text-only**: buffer the final response, drain staged stores,
+///      commit via the same path as Phase 4.3, advance to `Completed`.
+///    - **Tool calls**: re-suspend at the tool boundary (Phase 4.4
+///      path), spawning new child tasks.
+///
+/// # Errors
+///
+/// - Staged store operations fail.
+/// - LLM returns a non-success outcome.
+/// - Commit path or task completion fails.
+///
+/// [`AgentContinuation`]: agent_sdk_core::AgentContinuation
+/// [`TaskState::ReadyToResume`]: crate::journal::task_state::TaskState::ReadyToResume
+pub async fn resume_root_turn(
+    inputs: RootWorkerInputs,
+    continuation: AgentContinuation,
+    suspended_messages: Vec<llm::Message>,
+    child_results: Vec<(String, ToolResult)>,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let definition = inputs.definition();
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    // 1. Open a new turn attempt for the resume LLM call.
+    let attempt = open_attempt(&inputs, definition, "<resume>", deps.attempt_store, now)
+        .await
+        .context("open resume turn attempt")?;
+
+    // 2. Buffer the suspended messages (user prompt + assistant with
+    //    tool calls) and tool-result messages into the staged stores.
+    buffer_resume_messages(
+        &inputs.staged_stores.messages,
+        &inputs.staged_stores.state,
+        thread_id,
+        &continuation,
+        &suspended_messages,
+        &child_results,
+    )
+    .await
+    .context("buffer resume messages")?;
+
+    // 3. Build the chat request from staged history — no extra user
+    //    prompt to append because everything is already buffered.
+    let chat_request =
+        build_resume_chat_request(definition, &inputs.staged_stores.messages, thread_id)
+            .await
+            .context("build resume chat request")?;
+
+    // 4. Call the LLM.
+    let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
+    let commit_now = OffsetDateTime::now_utc();
+
+    let prior = ResumeContext {
+        continuation: &continuation,
+        suspended_messages: &suspended_messages,
+        child_results: &child_results,
+    };
+
+    // 5. Branch: tool calls → re-suspend; text-only → commit.
+    if response.has_tool_use() {
+        return suspend_resumed_turn(inputs, &prior, response, attempt, deps, commit_now).await;
+    }
+
+    commit_resumed_turn(inputs, &continuation, &response, &attempt, deps, commit_now).await
+}
+
+/// Buffer the final assistant message and update the staged agent state
+/// with accumulated LLM usage from the resume response.
+async fn buffer_resumed_assistant(
+    inputs: &RootWorkerInputs,
+    continuation: &AgentContinuation,
+    response: &llm::ChatResponse,
+) -> Result<()> {
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    let assistant_msg = build_assistant_message(response);
+    inputs
+        .staged_stores
+        .messages
+        .append(thread_id, assistant_msg)
+        .await
+        .context("append resumed assistant message")?;
+
+    // Add resume LLM usage to the continuation's running total.
+    // Do NOT increment turn_count — it was already counted at the
+    // original suspension point.
+    let updated_state = AgentState {
+        total_usage: TokenUsage {
+            input_tokens: continuation
+                .state
+                .total_usage
+                .input_tokens
+                .saturating_add(response.usage.input_tokens),
+            output_tokens: continuation
+                .state
+                .total_usage
+                .output_tokens
+                .saturating_add(response.usage.output_tokens),
+        },
+        ..continuation.state.clone()
+    };
+    inputs
+        .staged_stores
+        .state
+        .save(&updated_state)
+        .await
+        .context("save resumed agent state")?;
+
+    Ok(())
+}
+
+/// Commit a resumed turn whose LLM response is text-only.
+///
+/// Buffers the final assistant message, updates agent state, runs
+/// the idempotency guard, drains staged stores, commits, and
+/// advances the task to `Completed`.
+async fn commit_resumed_turn(
+    inputs: RootWorkerInputs,
+    continuation: &AgentContinuation,
+    response: &llm::ChatResponse,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let thread_id = &inputs.bootstrap.thread_id;
+    let task_id = &inputs.bootstrap.task_id;
+
+    let response_text = response.first_text().unwrap_or("").to_owned();
+
+    buffer_resumed_assistant(&inputs, continuation, response).await?;
+
+    // Idempotency guard (same as text-only path).
+    let expected_turn = inputs.recovery_view.next_turn_number;
+    let current_thread = deps
+        .thread_store
+        .get(thread_id)
+        .await
+        .context("re-read thread for resume idempotency check")?
+        .context("thread disappeared during resume")?;
+
+    if current_thread.committed_turns >= expected_turn {
+        bail!(
+            "turn {expected_turn} was already committed on thread {} \
+             (committed_turns={}); skipping duplicate resume commit",
+            thread_id,
+            current_thread.committed_turns,
+        );
+    }
+
+    // Drain staged stores and commit.
+    let close_params = build_close_params(response, attempt);
+    let turn_usage = TokenUsage {
+        input_tokens: continuation
+            .turn_usage
+            .input_tokens
+            .saturating_add(response.usage.input_tokens),
+        output_tokens: continuation
+            .turn_usage
+            .output_tokens
+            .saturating_add(response.usage.output_tokens),
+    };
+
+    let drained_messages = inputs
+        .staged_stores
+        .messages
+        .drain_messages()
+        .context("drain resumed staged messages")?;
+    let drained_state = inputs
+        .staged_stores
+        .state
+        .drain_state()
+        .context("drain resumed staged state")?
+        .context("staged state was None after resume")?;
+    let agent_state_snapshot =
+        serde_json::to_value(&drained_state).context("serialize resumed agent state")?;
+
+    let commit = commit_completed_turn(
+        CompletedTurnCommit {
+            thread_id: thread_id.clone(),
+            task_id: task_id.clone(),
+            turn_attempt_id: attempt.id.clone(),
+            close_attempt_params: close_params,
+            messages: drained_messages,
+            turn_usage,
+            agent_state_snapshot,
+            now,
+        },
+        deps.thread_store,
+        deps.message_store,
+        deps.attempt_store,
+        deps.checkpoint_store,
+    )
+    .await
+    .context("commit resumed turn")?;
+
+    // Advance the root task to Completed.
+    let (completed_task, _parent) = deps
+        .task_store
+        .complete_task(
+            task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            now,
+        )
+        .await
+        .context("complete resumed root task")?;
+
+    Ok(RootTurnOutcome::Completed {
+        commit: Box::new(commit),
+        completed_task,
+        response_text,
+    })
+}
+
+/// Buffer the suspended messages, tool results, and agent state into
+/// staged stores for the resume LLM call.
+///
+/// After this function, the staged message store contains:
+/// `[checkpoint messages] + [user prompt] + [assistant with tool calls] + [tool results]`
+async fn buffer_resume_messages(
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    staged_state: &crate::journal::staged::StagedStateStore,
+    thread_id: &agent_sdk_core::ThreadId,
+    continuation: &AgentContinuation,
+    suspended_messages: &[llm::Message],
+    child_results: &[(String, ToolResult)],
+) -> Result<()> {
+    // Append the suspended messages (user prompt + assistant response
+    // with tool-use blocks) captured at the original suspension point.
+    for msg in suspended_messages {
+        staged_messages
+            .append(thread_id, msg.clone())
+            .await
+            .context("append suspended message")?;
+    }
+
+    // Build and append the tool-result user message from child results.
+    let tool_result_msg = build_tool_results_message(child_results);
+    staged_messages
+        .append(thread_id, tool_result_msg)
+        .await
+        .context("append tool results message")?;
+
+    // Seed the agent state from the continuation's snapshot so the
+    // staged state store reflects the state at the suspension point.
+    staged_state
+        .save(&continuation.state)
+        .await
+        .context("save continuation agent state")?;
+
+    Ok(())
+}
+
+/// Build a user message containing tool-result blocks for each
+/// completed child task.
+fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Message {
+    let blocks: Vec<llm::ContentBlock> = child_results
+        .iter()
+        .map(|(tool_use_id, result)| llm::ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: result.output.clone(),
+            is_error: if result.success { None } else { Some(true) },
+        })
+        .collect();
+
+    llm::Message::user_with_content(blocks)
+}
+
+/// Build a chat request for the resume path. Unlike the fresh-turn
+/// `build_chat_request`, this uses the staged history as-is (no
+/// additional user prompt to append).
+async fn build_resume_chat_request(
+    definition: &AgentDefinition,
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    thread_id: &agent_sdk_core::ThreadId,
+) -> Result<ChatRequest> {
+    let messages = staged_messages
+        .get_history(thread_id)
+        .await
+        .context("get staged history for resume")?;
+
+    let thinking = match &definition.thinking {
+        ThinkingPolicy::Disabled => None,
+        ThinkingPolicy::Enabled { budget_tokens } => Some(llm::ThinkingConfig::new(*budget_tokens)),
+        ThinkingPolicy::Adaptive { effort } => {
+            let mut cfg = llm::ThinkingConfig::adaptive();
+            if let Some(e) = effort {
+                cfg = cfg.with_effort(*e);
+            }
+            Some(cfg)
+        }
+    };
+
+    Ok(ChatRequest {
+        system: definition.system_prompt.clone(),
+        messages,
+        tools: if definition.tools.is_empty() {
+            None
+        } else {
+            Some(definition.tools.clone())
+        },
+        max_tokens: definition.max_tokens,
+        max_tokens_explicit: true,
+        session_id: None,
+        cached_content: None,
+        thinking,
+    })
+}
+
+/// Re-suspend a resumed turn when the LLM responds with more tool
+/// calls. Buffers the full conversation (original suspended messages +
+/// tool results + new assistant response) into the new suspension's
+/// `suspended_messages` so a subsequent resume can reconstruct the
+/// complete history.
+async fn suspend_resumed_turn(
+    inputs: RootWorkerInputs,
+    prior: &ResumeContext<'_>,
+    response: llm::ChatResponse,
+    attempt: TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let task_id = &inputs.bootstrap.task_id;
+
+    // Close the turn attempt — the LLM call succeeded.
+    let close_params = build_close_params(&response, &attempt);
+    deps.attempt_store
+        .close_attempt(&attempt.id, close_params, now)
+        .await
+        .context("close attempt on resumed tool suspension")?;
+
+    // Build a new continuation that accumulates usage from the prior
+    // continuation plus the new response.
+    let new_continuation = build_resume_continuation(&inputs, prior.continuation, &response)
+        .context("build resume continuation")?;
+
+    // Build suspended messages that capture the FULL conversation
+    // through this point: original user prompt + original assistant +
+    // tool results + new assistant response.
+    let mut new_suspended = Vec::with_capacity(prior.suspended_messages.len() + 2);
+    // Original user prompt + original assistant response (tool calls).
+    new_suspended.extend_from_slice(prior.suspended_messages);
+    // Tool results from child tasks.
+    new_suspended.push(build_tool_results_message(prior.child_results));
+    // New assistant response (with new tool-use blocks).
+    new_suspended.push(build_full_assistant_message(&response));
+
+    // One child task per new tool call.
+    let tool_call_count = response.tool_uses().count();
+    let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
+        .map(|_| ChildSpawnSpec::default())
+        .collect();
+
+    let (parent_task, child_tasks) = deps
+        .task_store
+        .spawn_tool_children(
+            task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            specs,
+            SuspensionPayload {
+                continuation: new_continuation,
+                suspended_messages: new_suspended,
+            },
+            now,
+        )
+        .await
+        .context("re-spawn tool children on resume")?;
+
+    Ok(RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+    })
+}
+
+/// Build a [`ContinuationEnvelope`] for a re-suspension during resume,
+/// accumulating usage from the prior continuation plus the new response.
+fn build_resume_continuation(
+    inputs: &RootWorkerInputs,
+    prior: &AgentContinuation,
+    response: &llm::ChatResponse,
+) -> Result<ContinuationEnvelope> {
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    let new_turn_usage = TokenUsage {
+        input_tokens: prior
+            .turn_usage
+            .input_tokens
+            .saturating_add(response.usage.input_tokens),
+        output_tokens: prior
+            .turn_usage
+            .output_tokens
+            .saturating_add(response.usage.output_tokens),
+    };
+
+    let new_total_usage = TokenUsage {
+        input_tokens: prior
+            .state
+            .total_usage
+            .input_tokens
+            .saturating_add(response.usage.input_tokens),
+        output_tokens: prior
+            .state
+            .total_usage
+            .output_tokens
+            .saturating_add(response.usage.output_tokens),
+    };
+
+    let updated_state = AgentState {
+        total_usage: new_total_usage.clone(),
+        ..prior.state.clone()
+    };
+
+    let pending_tool_calls =
+        extract_pending_tool_calls(response, &inputs.bootstrap.definition.tools);
+    let turn_number =
+        usize::try_from(inputs.recovery_view.next_turn_number).context("turn number overflow")?;
+
+    let continuation = AgentContinuation {
+        thread_id: thread_id.clone(),
+        turn: turn_number,
+        total_usage: new_total_usage,
+        turn_usage: new_turn_usage,
+        pending_tool_calls,
+        awaiting_index: 0,
+        completed_results: Vec::new(),
+        state: updated_state,
+        response_id: Some(response.id.clone()),
+        stop_reason: response.stop_reason,
+    };
+
+    Ok(ContinuationEnvelope::wrap(continuation))
 }

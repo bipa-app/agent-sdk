@@ -59,7 +59,7 @@
 //! introduce, the same forward-compatibility rule
 //! [`agent_sdk_core::ContinuationEnvelope`] follows.
 
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext};
+use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, llm};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -102,6 +102,13 @@ pub enum TaskState {
         /// parent paused. Wrapped in `Box` so the enum stays small and
         /// matches [`agent_sdk_core::AgentRunState::AwaitingConfirmation`].
         continuation: Box<ContinuationEnvelope>,
+        /// Messages buffered at the suspension point but not yet
+        /// committed: the user prompt + the assistant response
+        /// (including tool-use blocks). Stored here so the resume path
+        /// can reconstruct the full conversation without reading
+        /// side-channel state.
+        #[serde(default)]
+        suspended_messages: Vec<llm::Message>,
     },
 
     /// Durable state for a task that has paused on
@@ -127,6 +134,32 @@ pub enum TaskState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepared_operation: Option<ListenExecutionContext>,
     },
+
+    /// Durable state for a task whose tool-runtime children have all
+    /// reached terminal states and is ready for the resume path.
+    ///
+    /// Created by [`super::AgentTask::recompute_pending_children`]
+    /// (Phase 4.5) when the live-child count hits zero. Carries the
+    /// [`ContinuationEnvelope`] and suspended messages from the
+    /// preceding [`TaskState::WaitingOnChildren`] payload so the
+    /// worker that acquires the now-`Pending` parent can rebuild the
+    /// conversation and call the LLM again.
+    ///
+    /// Unlike [`TaskState::None`], this variant is **not** a "blank
+    /// slate" — the worker must inspect it and branch into the resume
+    /// path rather than starting a fresh turn.
+    ReadyToResume {
+        /// Versioned continuation envelope from the original
+        /// suspension. Contains pending tool calls, usage, and agent
+        /// state at the suspension point.
+        continuation: Box<ContinuationEnvelope>,
+        /// Messages buffered at the original suspension point: the
+        /// user prompt and the assistant response (including
+        /// tool-use blocks). The resume path appends tool-result
+        /// messages and rebuilds the full conversation from these.
+        #[serde(default)]
+        suspended_messages: Vec<llm::Message>,
+    },
 }
 
 impl TaskState {
@@ -138,7 +171,7 @@ impl TaskState {
     #[must_use]
     pub const fn required_status(&self) -> Option<TaskStatus> {
         match self {
-            Self::None => None,
+            Self::None | Self::ReadyToResume { .. } => None,
             Self::WaitingOnChildren { .. } => Some(TaskStatus::WaitingOnChildren),
             Self::AwaitingConfirmation { .. } => Some(TaskStatus::AwaitingConfirmation),
         }
@@ -156,8 +189,26 @@ impl TaskState {
     pub fn continuation(&self) -> Option<&ContinuationEnvelope> {
         match self {
             Self::None => None,
-            Self::WaitingOnChildren { continuation }
-            | Self::AwaitingConfirmation { continuation, .. } => Some(continuation),
+            Self::WaitingOnChildren { continuation, .. }
+            | Self::AwaitingConfirmation { continuation, .. }
+            | Self::ReadyToResume { continuation, .. } => Some(continuation),
+        }
+    }
+
+    /// Borrow the suspended messages embedded in a
+    /// [`TaskState::WaitingOnChildren`] or [`TaskState::ReadyToResume`]
+    /// payload, if any. Returns an empty slice for
+    /// [`TaskState::None`] and [`TaskState::AwaitingConfirmation`].
+    #[must_use]
+    pub fn suspended_messages(&self) -> &[llm::Message] {
+        match self {
+            Self::WaitingOnChildren {
+                suspended_messages, ..
+            }
+            | Self::ReadyToResume {
+                suspended_messages, ..
+            } => suspended_messages,
+            _ => &[],
         }
     }
 
@@ -165,8 +216,8 @@ impl TaskState {
     /// [`TaskState::AwaitingConfirmation`] payload, if any.
     ///
     /// Returns `None` for [`TaskState::None`],
-    /// [`TaskState::WaitingOnChildren`], and confirmations that did
-    /// not stage a listen-tier operation.
+    /// [`TaskState::WaitingOnChildren`], [`TaskState::ReadyToResume`],
+    /// and confirmations that did not stage a listen-tier operation.
     #[must_use]
     pub const fn prepared_operation(&self) -> Option<&ListenExecutionContext> {
         match self {
@@ -226,6 +277,7 @@ mod tests {
         let envelope = sample_continuation();
         let state = TaskState::WaitingOnChildren {
             continuation: Box::new(envelope.clone()),
+            suspended_messages: Vec::new(),
         };
         assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
         let inner = state.continuation().expect("continuation present");
@@ -275,6 +327,7 @@ mod tests {
         // WaitingOnChildren.
         let waiting = TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
         };
         let json = serde_json::to_string(&waiting)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -323,6 +376,21 @@ mod tests {
             serde_json::to_value(&awaiting_no_op)?
         );
         assert!(recovered.prepared_operation().is_none());
+
+        // ReadyToResume — durably persisted on Pending parents after
+        // all children reach terminal states (Phase 4.5).
+        let ready = TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+        };
+        let json = serde_json::to_string(&ready)?;
+        let recovered: TaskState = serde_json::from_str(&json)?;
+        assert_eq!(
+            serde_json::to_value(&recovered)?,
+            serde_json::to_value(&ready)?
+        );
+        assert_eq!(recovered.required_status(), None);
+        assert!(recovered.continuation().is_some());
         Ok(())
     }
 
@@ -337,6 +405,7 @@ mod tests {
 
         let waiting_value = serde_json::to_value(TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
         })?;
         assert_eq!(
             waiting_value["kind"],
@@ -352,6 +421,13 @@ mod tests {
             awaiting_value["kind"],
             serde_json::json!("awaiting_confirmation")
         );
+
+        let ready_value = serde_json::to_value(TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+        })?;
+        assert_eq!(ready_value["kind"], serde_json::json!("ready_to_resume"));
+        assert!(ready_value.get("continuation").is_some());
         Ok(())
     }
 }

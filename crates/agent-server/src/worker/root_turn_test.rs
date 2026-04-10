@@ -1,9 +1,10 @@
 //! Integration tests for root turn execution.
 //!
-//! Covers the Phase 4.3 text-only commit path and the Phase 4.4
-//! tool-boundary suspension path.
+//! Covers the Phase 4.3 text-only commit path, the Phase 4.4
+//! tool-boundary suspension path, and the Phase 4.5 resume from
+//! completed child tool results.
 
-use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
+use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_root_turn};
 use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
@@ -644,7 +645,7 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
 
     // The parent's state should be WaitingOnChildren with a continuation.
     let continuation = match &parent.state {
-        TaskState::WaitingOnChildren { continuation } => continuation,
+        TaskState::WaitingOnChildren { continuation, .. } => continuation,
         other => panic!("Expected WaitingOnChildren state, got: {other:?}"),
     };
 
@@ -732,6 +733,647 @@ async fn tool_suspension_children_are_runnable() -> Result<()> {
 
     assert_eq!(acquired.status, TaskStatus::Running);
     assert_eq!(acquired.kind, TaskKind::ToolRuntime);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 4.5 — resume from completed child tool results
+// ─────────────────────────────────────────────────────────────────────
+
+/// Suspend a root turn (tool call), complete all children, then
+/// return the parent and continuation for the resume path.
+///
+/// This helper sets up the full Phase 4.4 fixture: execute root turn
+/// through suspension, acquire and complete each child, then return
+/// the parent task (now in Pending/ReadyToResume) with its
+/// continuation and suspended messages extracted.
+async fn suspend_and_complete_children(
+    stores: &TestStores,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    _child_results: &[(String, agent_sdk_core::ToolResult)],
+) -> Result<(
+    AgentTask,
+    agent_sdk_core::AgentContinuation,
+    Vec<agent_sdk_core::llm::Message>,
+)> {
+    let provider = MockToolCallProvider::new(tool_calls);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let outcome =
+        execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
+
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+    } = outcome
+    else {
+        panic!("Expected Suspended variant");
+    };
+
+    // Extract continuation and messages BEFORE children complete
+    // (they will be preserved in ReadyToResume state).
+    let (continuation, suspended_messages) = match &parent_task.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            suspended_messages,
+        } => (continuation.payload.clone(), suspended_messages.clone()),
+        other => panic!("Expected WaitingOnChildren state, got: {other:?}"),
+    };
+
+    // Complete all child tasks.
+    for child in &child_tasks {
+        let child_id = &child.id;
+        let acquired = stores
+            .tasks
+            .try_acquire_task(
+                child_id,
+                WorkerId::from_string("child_worker"),
+                LeaseId::from_string("child_lease"),
+                t_plus(600),
+                t_plus(10),
+            )
+            .await?
+            .context("acquire child")?;
+        assert_eq!(acquired.status, TaskStatus::Running);
+
+        stores
+            .tasks
+            .complete_task(
+                child_id,
+                &WorkerId::from_string("child_worker"),
+                &LeaseId::from_string("child_lease"),
+                t_plus(15),
+            )
+            .await
+            .context("complete child")?;
+    }
+
+    // Reload the parent — it should now be Pending with ReadyToResume.
+    let parent = stores
+        .tasks
+        .get(&parent_task.id)
+        .await?
+        .context("parent after children complete")?;
+    assert_eq!(parent.status, TaskStatus::Pending);
+    assert!(
+        matches!(parent.state, TaskState::ReadyToResume { .. }),
+        "parent should be ReadyToResume after all children complete"
+    );
+
+    Ok((parent, continuation, suspended_messages))
+}
+
+#[tokio::test]
+async fn resume_text_only_end_to_end() -> Result<()> {
+    let stores = TestStores::new();
+
+    // Phase 4.4: suspend with a single tool call.
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "file1.txt\nfile2.txt".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: Some(50),
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire the parent for the resume path.
+    let parent_id = parent.id.clone();
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire parent")?;
+    assert_eq!(acquired.status, TaskStatus::Running);
+
+    // Build resume inputs.
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    // Resume with text-only response.
+    let resume_provider = MockTextProvider::new("Here are your files: file1.txt, file2.txt");
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await
+    .context("resume_root_turn")?;
+
+    // ── Assertions ──────────────────────────────────────────────
+    let RootTurnOutcome::Completed {
+        commit,
+        completed_task,
+        response_text,
+    } = outcome
+    else {
+        panic!("Expected Completed variant, got Suspended");
+    };
+
+    // Response text captured.
+    assert_eq!(response_text, "Here are your files: file1.txt, file2.txt");
+
+    // Task completed.
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+
+    // Turn committed.
+    assert_eq!(commit.thread.committed_turns, 1);
+
+    // Checkpoint created with full message history:
+    // [user prompt] + [assistant with tool calls] + [tool results] + [final assistant]
+    assert_eq!(commit.checkpoint.turn_number, 1);
+    assert!(
+        commit.checkpoint.messages.len() >= 4,
+        "checkpoint should contain at least 4 messages (user + assistant/tools + results + final), got {}",
+        commit.checkpoint.messages.len()
+    );
+
+    // Durable message projection updated.
+    let durable_msgs = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        durable_msgs.len() >= 4,
+        "durable messages should contain the full conversation"
+    );
+
+    // Turn attempt opened and closed.
+    let attempts = stores.attempts.list_by_task(&parent_id).await?;
+    // 2 attempts: one from the original suspension, one from the resume.
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[0].is_closed());
+    assert!(attempts[1].is_closed());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "done".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "echo done"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire and resume.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    let resume_provider = MockTextProvider::new("completed");
+    resume_root_turn(
+        inputs,
+        continuation.clone(),
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    // Verify checkpoint agent state.
+    let checkpoint = stores
+        .checkpoints
+        .get_by_turn(&thread_a(), 1)
+        .await?
+        .context("checkpoint")?;
+
+    let state: agent_sdk_core::AgentState =
+        serde_json::from_value(checkpoint.agent_state_snapshot)?;
+
+    // turn_count was set at suspension time (1) and should NOT be
+    // double-incremented by the resume path.
+    assert_eq!(state.turn_count, 1);
+
+    // Usage should be the sum of the suspension LLM call (120/60)
+    // plus the resume LLM call (100/50).
+    assert_eq!(state.total_usage.input_tokens, 220);
+    assert_eq!(state.total_usage.output_tokens, 110);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_with_tool_calls_re_suspends() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "result".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire for resume.
+    let parent_id = parent.id.clone();
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    // Resume with a response that contains MORE tool calls.
+    let resume_provider = MockToolCallProvider::single(
+        "call_2",
+        "bash",
+        serde_json::json!({"command": "cat file1.txt"}),
+    );
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await
+    .context("resume_root_turn")?;
+
+    // ── Must re-suspend ────────────────────────────────────────
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+    } = outcome
+    else {
+        panic!("Expected Suspended after resume with tool calls");
+    };
+
+    // Parent back in WaitingOnChildren.
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(parent_task.pending_child_count, 1);
+
+    // New child created for the second tool call.
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].kind, TaskKind::ToolRuntime);
+    assert_eq!(child_tasks[0].status, TaskStatus::Pending);
+
+    // No checkpoint created (still suspended).
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty(),
+        "re-suspended path must not create a checkpoint"
+    );
+
+    // The new suspension carries the full conversation in
+    // suspended_messages.
+    let new_state = match &parent_task.state {
+        TaskState::WaitingOnChildren {
+            suspended_messages, ..
+        } => suspended_messages,
+        other => panic!("Expected WaitingOnChildren state, got: {other:?}"),
+    };
+    // Should contain: user prompt + original assistant + tool results + new assistant
+    assert!(
+        new_state.len() >= 4,
+        "re-suspended messages should contain the full conversation, got {}",
+        new_state.len()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_with_failed_tool_result() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: false,
+            output: "permission denied".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: Some(10),
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "rm -rf /"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire and resume.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    let resume_provider = MockTextProvider::new("The command failed with permission denied.");
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("Expected Completed");
+    };
+
+    assert_eq!(response_text, "The command failed with permission denied.");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_multiple_tool_results() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![
+        (
+            "call_a".to_owned(),
+            agent_sdk_core::ToolResult {
+                success: true,
+                output: "/home/user".to_owned(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            },
+        ),
+        (
+            "call_b".to_owned(),
+            agent_sdk_core::ToolResult {
+                success: true,
+                output: "contents of /x".to_owned(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            },
+        ),
+    ];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![
+            (
+                "call_a".into(),
+                "bash".into(),
+                serde_json::json!({"command": "pwd"}),
+            ),
+            (
+                "call_b".into(),
+                "read_file".into(),
+                serde_json::json!({"path": "/x"}),
+            ),
+        ],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire and resume.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    let resume_provider =
+        MockTextProvider::new("You are in /home/user, file contains: contents of /x");
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed {
+        commit,
+        response_text,
+        ..
+    } = outcome
+    else {
+        panic!("Expected Completed");
+    };
+
+    assert_eq!(
+        response_text,
+        "You are in /home/user, file contains: contents of /x"
+    );
+    assert_eq!(commit.thread.committed_turns, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn suspension_captures_messages_for_resume() -> Result<()> {
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    execute_root_turn(inputs, "List files", &provider, &stores.deps(), t_plus(5)).await?;
+
+    // Reload and inspect the suspended messages.
+    let parent = stores.tasks.get(&task_id).await?.context("parent")?;
+
+    let messages = match &parent.state {
+        TaskState::WaitingOnChildren {
+            suspended_messages, ..
+        } => suspended_messages,
+        other => panic!("Expected WaitingOnChildren state, got: {other:?}"),
+    };
+
+    // Must have exactly 2 messages: user prompt + assistant with tool calls.
+    assert_eq!(messages.len(), 2);
+
+    // First message is the user prompt.
+    assert_eq!(messages[0].role, agent_sdk_core::llm::Role::User);
+
+    // Second message is the assistant response with tool-use blocks.
+    assert_eq!(messages[1].role, agent_sdk_core::llm::Role::Assistant);
+    let has_tool_use = match &messages[1].content {
+        agent_sdk_core::llm::Content::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. })),
+        agent_sdk_core::llm::Content::Text(_) => false,
+    };
+    assert!(
+        has_tool_use,
+        "assistant message must contain tool-use blocks"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "ok".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, _continuation, _messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "echo ok"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Parent is Pending with ReadyToResume.
+    assert_eq!(parent.status, TaskStatus::Pending);
+    assert!(matches!(parent.state, TaskState::ReadyToResume { .. }));
+
+    // Acquire the task — it goes to Running.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("acquire")?;
+
+    assert_eq!(acquired.status, TaskStatus::Running);
+    // ReadyToResume state must survive the acquisition.
+    assert!(
+        matches!(acquired.state, TaskState::ReadyToResume { .. }),
+        "ReadyToResume must survive task acquisition"
+    );
+
+    // The continuation and messages are still accessible.
+    let continuation = acquired.state.continuation();
+    assert!(continuation.is_some(), "continuation must be present");
+    let messages = acquired.state.suspended_messages();
+    assert!(!messages.is_empty(), "suspended messages must be present");
 
     Ok(())
 }

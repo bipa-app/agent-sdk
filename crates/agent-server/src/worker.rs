@@ -49,4 +49,4 @@ mod root_turn_test;
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
-pub use root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
+pub use root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_root_turn};
