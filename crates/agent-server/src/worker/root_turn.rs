@@ -335,8 +335,11 @@ async fn build_chat_request(
     Ok(ChatRequest {
         system: definition.system_prompt.clone(),
         messages,
-        // Text-only path — never advertise tools to the LLM (Phase 4.4+).
-        tools: None,
+        tools: if definition.tools.is_empty() {
+            None
+        } else {
+            Some(definition.tools.clone())
+        },
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
         // Not yet wired — session/cache affinity requires provider-side
