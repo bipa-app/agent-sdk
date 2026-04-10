@@ -364,6 +364,7 @@ async fn tool_call_response_is_rejected() -> Result<()> {
 
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
     let inputs =
         build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
@@ -386,6 +387,14 @@ async fn tool_call_response_is_rejected() -> Result<()> {
         .context("thread from recovery")?;
     assert_eq!(thread.committed_turns, 0);
     assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+
+    // Turn attempt was opened and closed (cancelled) on tool-call rejection.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0].is_closed(),
+        "attempt should be closed on tool-call rejection"
+    );
 
     Ok(())
 }
@@ -411,6 +420,7 @@ async fn llm_error_propagates() -> Result<()> {
 
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
     let inputs =
         build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
@@ -432,6 +442,14 @@ async fn llm_error_propagates() -> Result<()> {
         .await?
         .context("thread from recovery")?;
     assert_eq!(thread.committed_turns, 0);
+
+    // Turn attempt was opened and closed with the error outcome.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0].is_closed(),
+        "attempt should be closed on error path"
+    );
 
     Ok(())
 }

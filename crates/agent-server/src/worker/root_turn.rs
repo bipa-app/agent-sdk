@@ -115,7 +115,8 @@ pub async fn execute_root_turn(
         .await
         .context("open turn attempt")?;
 
-    // 2. Build and send LLM request.
+    // 2. Build, send LLM request, and resolve the outcome — closing
+    //    the attempt on any non-success path.
     let chat_request = build_chat_request(
         definition,
         &inputs.staged_stores.messages,
@@ -125,14 +126,11 @@ pub async fn execute_root_turn(
     .await
     .context("build chat request")?;
 
-    let response = call_llm(provider, chat_request).await.context("LLM call")?;
-
-    // 3. Validate text-only (no tool calls).
-    ensure_no_tool_calls(&response)?;
+    let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
 
     let response_text = response.first_text().unwrap_or("").to_owned();
 
-    // 4. Buffer in staged stores.
+    // 3. Buffer in staged stores.
     buffer_turn_messages(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
@@ -143,7 +141,7 @@ pub async fn execute_root_turn(
     .await
     .context("buffer staged messages")?;
 
-    // 5. Drain staged stores and commit.
+    // 4. Drain staged stores and commit.
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -183,7 +181,7 @@ pub async fn execute_root_turn(
     .await
     .context("commit completed turn")?;
 
-    // 6. Advance the root task to Completed.
+    // 5. Advance the root task to Completed.
     let (completed_task, _parent) = deps
         .task_store
         .complete_task(
@@ -213,16 +211,23 @@ async fn open_attempt(
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
 ) -> Result<TurnAttempt> {
+    let task_id = &inputs.bootstrap.task_id;
     let provenance = AuditProvenance::new(&definition.provider, &definition.model);
     let request_blob = serde_json::json!({
         "user_prompt": user_prompt,
         "system_prompt_len": definition.system_prompt.len(),
     });
 
+    let existing = attempt_store
+        .list_by_task(task_id)
+        .await
+        .context("list existing attempts")?;
+    let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
+
     attempt_store
         .open_attempt(OpenAttemptParams {
-            task_id: inputs.bootstrap.task_id.clone(),
-            attempt_number: 1,
+            task_id: task_id.clone(),
+            attempt_number,
             provenance,
             request_blob,
             now,
@@ -268,30 +273,79 @@ async fn build_chat_request(
         },
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
+        // Not yet wired — session/cache affinity requires provider-side
+        // state that the server doesn't manage in Phase 4.3.
         session_id: None,
         cached_content: None,
         thinking,
     })
 }
 
-async fn call_llm(provider: &dyn LlmProvider, request: ChatRequest) -> Result<llm::ChatResponse> {
-    match provider.chat(request).await? {
-        ChatOutcome::Success(response) => Ok(response),
-        ChatOutcome::RateLimited => bail!("LLM rate limited"),
-        ChatOutcome::InvalidRequest(msg) => bail!("LLM invalid request: {msg}"),
-        ChatOutcome::ServerError(msg) => bail!("LLM server error: {msg}"),
-    }
-}
+/// Call the LLM and resolve the outcome, closing the turn attempt on
+/// any non-success path before returning an error.
+async fn call_llm(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    attempt: &TurnAttempt,
+    attempt_store: &dyn TurnAttemptStore,
+    now: OffsetDateTime,
+) -> Result<llm::ChatResponse> {
+    let outcome = provider.chat(request).await.context("LLM provider call")?;
 
-fn ensure_no_tool_calls(response: &llm::ChatResponse) -> Result<()> {
+    let response = match outcome {
+        ChatOutcome::Success(r) => r,
+        ChatOutcome::RateLimited => {
+            close_attempt_with(attempt, TurnAttemptOutcome::RateLimited, attempt_store, now).await;
+            bail!("LLM rate limited");
+        }
+        ChatOutcome::InvalidRequest(msg) => {
+            close_attempt_with(
+                attempt,
+                TurnAttemptOutcome::InvalidRequest,
+                attempt_store,
+                now,
+            )
+            .await;
+            bail!("LLM invalid request: {msg}");
+        }
+        ChatOutcome::ServerError(msg) => {
+            close_attempt_with(attempt, TurnAttemptOutcome::ServerError, attempt_store, now).await;
+            bail!("LLM server error: {msg}");
+        }
+    };
+
+    // Validate text-only (no tool calls in Phase 4.3).
     let tool_count = response.tool_uses().count();
     if tool_count > 0 {
+        close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
         bail!(
             "Phase 4.3 text-only path received {tool_count} tool call(s); \
              tool-call suspension is not yet implemented (Phase 4.4+)"
         );
     }
-    Ok(())
+
+    Ok(response)
+}
+
+/// Best-effort close of a turn attempt with a failure outcome.
+async fn close_attempt_with(
+    attempt: &TurnAttempt,
+    outcome: TurnAttemptOutcome,
+    attempt_store: &dyn TurnAttemptStore,
+    now: OffsetDateTime,
+) {
+    let params = CloseAttemptParams {
+        response_blob: serde_json::json!(null),
+        response_id: None,
+        response_model: None,
+        stop_reason: None,
+        outcome,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+    };
+    // Best-effort: if closing fails, the primary error is more important.
+    let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
 }
 
 async fn buffer_turn_messages(
