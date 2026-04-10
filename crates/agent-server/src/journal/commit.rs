@@ -26,7 +26,7 @@
 //!
 //! # What this module does **not** own
 //!
-//! - Recovery loaders — out of scope (future phase).
+//! - Recovery loaders — see [`super::thread_recover`].
 //! - Task state transitions — the caller is responsible for calling
 //!   [`super::store::AgentTaskStore::complete_task`] separately.
 //! - Event persistence — out of scope (future phase).

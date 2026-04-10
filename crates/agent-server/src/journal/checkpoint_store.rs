@@ -22,6 +22,7 @@
 //! | [`CheckpointStore::commit_checkpoint`] | Inserts a new checkpoint | `(thread_id, turn_number)` unique |
 //! | [`CheckpointStore::get`] | Reads a single row by id | — |
 //! | [`CheckpointStore::get_by_turn`] | Reads a row by `(thread_id, turn_number)` | — |
+//! | [`CheckpointStore::get_latest_by_thread`] | Returns the highest-turn checkpoint for a thread | — |
 //! | [`CheckpointStore::list_by_thread`] | Lists all checkpoints for a thread | Ordered by `turn_number` |
 
 use std::collections::HashMap;
@@ -79,6 +80,21 @@ pub trait CheckpointStore: Send + Sync {
         thread_id: &ThreadId,
         turn_number: u32,
     ) -> Result<Option<Checkpoint>>;
+
+    /// Return the checkpoint with the highest `turn_number` for a
+    /// thread, or `None` if no checkpoints exist.
+    ///
+    /// This is the primary entry point for thread recovery: the
+    /// latest completed checkpoint contains the full message history
+    /// and agent-state snapshot needed to rebuild the next-turn view.
+    ///
+    /// A database backend can implement this as
+    /// `ORDER BY turn_number DESC LIMIT 1` rather than loading all
+    /// rows.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying store cannot be queried.
+    async fn get_latest_by_thread(&self, thread_id: &ThreadId) -> Result<Option<Checkpoint>>;
 
     /// List all checkpoints for a thread, ordered by `turn_number`
     /// ascending.
@@ -173,6 +189,20 @@ impl CheckpointStore for InMemoryCheckpointStore {
             .cloned();
         drop(inner);
         Ok(result)
+    }
+
+    async fn get_latest_by_thread(&self, thread_id: &ThreadId) -> Result<Option<Checkpoint>> {
+        let inner = self.inner.read().await;
+        let Some(ids) = inner.thread_index.get(thread_id) else {
+            return Ok(None);
+        };
+        let latest = ids
+            .iter()
+            .filter_map(|id| inner.checkpoints.get(id))
+            .max_by_key(|c| c.turn_number)
+            .cloned();
+        drop(inner);
+        Ok(latest)
     }
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>> {
@@ -509,6 +539,98 @@ mod tests {
         };
         let ckpt = store.commit_checkpoint(params).await.context("commit")?;
         assert_eq!(ckpt.created_at, t_plus(42));
+        Ok(())
+    }
+
+    // ── get_latest_by_thread ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_latest_returns_none_for_fresh_thread() -> Result<()> {
+        let store = InMemoryCheckpointStore::new();
+        let result = store
+            .get_latest_by_thread(&thread_a())
+            .await
+            .context("latest")?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_returns_single_checkpoint() -> Result<()> {
+        let store = InMemoryCheckpointStore::new();
+        let ckpt = store
+            .commit_checkpoint(sample_params(thread_a(), 1))
+            .await
+            .context("commit")?;
+
+        let latest = store
+            .get_latest_by_thread(&thread_a())
+            .await
+            .context("latest")?
+            .context("not found")?;
+        assert_eq!(latest.id, ckpt.id);
+        assert_eq!(latest.turn_number, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_returns_highest_turn_number() -> Result<()> {
+        let store = InMemoryCheckpointStore::new();
+
+        // Insert out of order.
+        store
+            .commit_checkpoint(sample_params(thread_a(), 2))
+            .await
+            .context("turn 2")?;
+        store
+            .commit_checkpoint(sample_params(thread_a(), 1))
+            .await
+            .context("turn 1")?;
+        let c3 = store
+            .commit_checkpoint(sample_params(thread_a(), 3))
+            .await
+            .context("turn 3")?;
+
+        let latest = store
+            .get_latest_by_thread(&thread_a())
+            .await
+            .context("latest")?
+            .context("not found")?;
+        assert_eq!(latest.id, c3.id);
+        assert_eq!(latest.turn_number, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_isolates_threads() -> Result<()> {
+        let store = InMemoryCheckpointStore::new();
+        store
+            .commit_checkpoint(sample_params(thread_a(), 1))
+            .await
+            .context("a-1")?;
+        store
+            .commit_checkpoint(sample_params(thread_a(), 2))
+            .await
+            .context("a-2")?;
+        let b1 = store
+            .commit_checkpoint(sample_params(thread_b(), 1))
+            .await
+            .context("b-1")?;
+
+        let latest_a = store
+            .get_latest_by_thread(&thread_a())
+            .await
+            .context("a")?
+            .context("not found")?;
+        let latest_b = store
+            .get_latest_by_thread(&thread_b())
+            .await
+            .context("b")?
+            .context("not found")?;
+
+        assert_eq!(latest_a.turn_number, 2);
+        assert_eq!(latest_b.id, b1.id);
+        assert_eq!(latest_b.turn_number, 1);
         Ok(())
     }
 }
