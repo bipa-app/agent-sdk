@@ -79,16 +79,12 @@
 //!   [`TaskStatus::AwaitingConfirmation`], persisting both the
 //!   continuation and the optional listen/execute prepared
 //!   operation.
-//! - [`AgentTaskStore::resolve_child`] decrements the parent's
-//!   outstanding-child counter; on the final decrement it flips
-//!   the row back to [`TaskStatus::Pending`] and clears the typed
-//!   payload so a worker can re-acquire it.
 //! - [`AgentTaskStore::resume_from_confirmation`] flips a
 //!   confirmation-paused row back to [`TaskStatus::Pending`] and
 //!   clears the typed payload after the caller has read its
 //!   continuation and prepared operation.
 //!
-//! All four entry points run their CAS check, the typed-state
+//! All three entry points run their CAS check, the typed-state
 //! mutation, and the index rebalance under a single write lock,
 //! so the journal is the single source of truth for the
 //! paused-state transitions. The schema layer
@@ -96,6 +92,13 @@
 //! any row whose `status` and `state` disagree, so a buggy
 //! caller cannot leave a paused row without a continuation or
 //! leak a stale continuation onto a runnable row.
+//!
+//! The Phase 2.4 [`AgentTaskStore`] previously exposed a
+//! `resolve_child(parent_id)` helper that decremented the
+//! outstanding-child counter by one. Phase 2.6 replaced it with
+//! the journal-driven [`AgentTaskStore::complete_child`] /
+//! [`AgentTaskStore::fail_child`] pair — see the Phase 2.6
+//! section below for why the decrement had to move.
 //!
 //! # Retry budget, failure handling, and the recovery matrix (Phase 2.5)
 //!
@@ -136,6 +139,61 @@
 //!   2.5 adds explicit regression coverage in the test module
 //!   below to prove an old worker cannot heartbeat or re-lease a
 //!   row that has been released or failed-closed by the sweep.
+//!
+//! # Tool-runtime child tasks and cancellation tree (Phase 2.6)
+//!
+//! Phase 2.6 (ENG-7920) takes the child-task story from schema
+//! placeholder to a real orchestration contract on top of the
+//! Phase 2.1–2.5 foundation. Four new entry points land on the
+//! trait and one placeholder is retired:
+//!
+//! - [`AgentTaskStore::spawn_tool_children`] is the single atomic
+//!   entry point for creating tool-runtime child tasks. A successful
+//!   call CAS-checks `(worker, lease)` against the parent, builds
+//!   one fresh [`TaskKind::ToolRuntime`] row per
+//!   [`super::ChildSpawnSpec`] via [`AgentTask::new_child`],
+//!   transitions the parent to [`TaskStatus::WaitingOnChildren`]
+//!   with a typed continuation and drops the parent's lease, and
+//!   commits every child to the primary key and secondary indexes
+//!   under the same write lock. No partial batch is ever
+//!   observable because the transition, the inserts, and the
+//!   index updates all run inside a single
+//!   `inner.write().await` scope.
+//! - [`AgentTaskStore::complete_child`] and
+//!   [`AgentTaskStore::fail_child`] drive a running child to its
+//!   terminal state (`Completed` / `Failed`) and, under the same
+//!   write lock, recompute the parent's `pending_child_count`
+//!   from the `by_parent` live-children index via
+//!   [`AgentTask::recompute_pending_children`]. The parent's
+//!   counter is derived from the journal every time, so a
+//!   double-complete or a dropped-complete cannot corrupt it —
+//!   the recompute always produces the correct live count.
+//! - [`AgentTaskStore::cancel_tree`] walks the `by_parent` index
+//!   transitively from `root_id` and atomically cancels every
+//!   non-terminal descendant (and the root itself) via
+//!   [`AgentTask::cancel`]. Leases on `Running` rows are dropped
+//!   as part of the transition, so a stale worker's next
+//!   heartbeat / [`AgentTaskStore::complete_child`] /
+//!   [`AgentTaskStore::fail_child`] call fails the
+//!   Phase 2.3 `(worker_id, lease_id)` CAS on the way out.
+//!   Already-terminal rows are skipped so repeat sweeps are
+//!   idempotent.
+//! - The Phase 2.4 `resolve_child(parent_id)` entry point is
+//!   **removed**. It was a placeholder that subtracted one from
+//!   a parent's counter on every call, incompatible with Phase
+//!   2.6's journal-driven recompute. Its role is now served by
+//!   `complete_child` / `fail_child`, which both take a child id
+//!   and a worker / lease CAS.
+//!
+//! The result is that a completed child batch makes the parent
+//! runnable **through journal state alone**: there is no channel,
+//! no in-memory queue, and no caller-maintained counter. A
+//! crashed worker can restart mid-batch by reading the parent's
+//! typed [`super::TaskState::WaitingOnChildren`] payload (which
+//! carries the continuation envelope) plus the
+//! `list_children(parent_id)` snapshot (which carries the
+//! aggregated success / failure outcomes). The counter is
+//! re-derived the next time any child reaches a terminal state.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -149,7 +207,9 @@ use tokio::sync::RwLock;
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
-use super::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
+use super::task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskKind, TaskStatus, WorkerId,
+};
 
 /// Persistent store for [`AgentTask`] rows.
 ///
@@ -537,29 +597,194 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
-    /// Decrement a [`TaskStatus::WaitingOnChildren`] parent's
-    /// outstanding-child counter and, when it hits zero, atomically
-    /// flip the row back to [`TaskStatus::Pending`] so a worker can
-    /// pick it up and re-enter the loop.
+    /// Atomically persist a batch of [`TaskKind::ToolRuntime`] children
+    /// under a running parent and transition the parent to
+    /// [`TaskStatus::WaitingOnChildren`] in a single store write.
     ///
-    /// This is the resume entry point that Phase 2.6's child-task
-    /// orchestrator will call once a child reaches a terminal state.
-    /// While there are still outstanding children, the parent stays
-    /// in `WaitingOnChildren` and the typed [`crate::journal::TaskState`] payload
-    /// remains in place; the resume transition fires only on the
-    /// final decrement.
+    /// This is the Phase 2.6 child-creation entry point. A successful
+    /// call:
     ///
-    /// Returns the persisted parent row after the mutation.
+    /// 1. CAS-checks that the parent exists, is in
+    ///    [`TaskStatus::Running`], is owned by `(worker, lease)`, and
+    ///    is not a leaf kind.
+    /// 2. Builds one fresh [`TaskKind::ToolRuntime`] row per entry in
+    ///    `specs` via [`AgentTask::new_child`]. Each child inherits
+    ///    the parent's `thread_id` and `root_id`, sets `depth =
+    ///    parent.depth + 1`, starts in [`TaskStatus::Pending`] with
+    ///    `attempt = 0`, and takes its retry budget from
+    ///    [`ChildSpawnSpec::max_attempts`].
+    /// 3. Inserts every child into the store under the same write
+    ///    lock the parent transition will run on, so a crash between
+    ///    children cannot leave a partially-spawned batch behind.
+    /// 4. Transitions the parent to
+    ///    [`TaskStatus::WaitingOnChildren`] with
+    ///    `pending_child_count = specs.len()` and a typed
+    ///    [`crate::journal::TaskState::WaitingOnChildren`] payload carrying
+    ///    `continuation`. The parent's lease is dropped atomically
+    ///    with the transition, so the row is invisible to every
+    ///    acquisition / heartbeat / sweep call site the moment the
+    ///    children become runnable.
+    /// 5. Registers every child on the Phase 2.3 runnable index so
+    ///    `acquire_next_runnable` picks them up in
+    ///    `(created_at, id)` order alongside every other runnable
+    ///    row.
+    ///
+    /// Returns `(parent, children)` with the rows as persisted.
+    /// Callers can rely on the returned `children` vector matching
+    /// the order of the input `specs`.
+    ///
+    /// `specs` must be non-empty. Zero-child spawns are rejected the
+    /// same way [`AgentTask::wait_on_children`] rejects a zero
+    /// `child_count`, because there is nothing to wait on and the
+    /// parent would be stuck in [`TaskStatus::WaitingOnChildren`]
+    /// forever.
     ///
     /// # Errors
-    /// - `task does not exist` — if no row with `parent_id` is stored.
-    /// - `resolve rejected: not waiting on children` — if the row is
-    ///   in any status other than [`TaskStatus::WaitingOnChildren`].
-    async fn resolve_child(
+    /// - `spawn rejected: task ... does not exist` — no parent row
+    ///   with the supplied id.
+    /// - `spawn rejected: task ... is not running` — parent in any
+    ///   non-`Running` status.
+    /// - `spawn rejected: worker mismatch` — `worker` does not match
+    ///   the parent's current `worker_id`.
+    /// - `spawn rejected: lease mismatch` — `lease` does not match
+    ///   the parent's current `lease_id`.
+    /// - `spawn rejected: parent ... is a leaf kind ...` — parent
+    ///   is a [`TaskKind::ToolRuntime`] (leaf) and cannot have
+    ///   children.
+    /// - `spawn rejected: specs must be non-empty` — zero-child
+    ///   spawn.
+    /// - Schema errors from [`AgentTask::new_child`],
+    ///   [`AgentTask::wait_on_children`], or [`AgentTask::validate`].
+    async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        specs: Vec<ChildSpawnSpec>,
+        continuation: ContinuationEnvelope,
         now: OffsetDateTime,
-    ) -> Result<AgentTask>;
+    ) -> Result<(AgentTask, Vec<AgentTask>)>;
+
+    /// Transition a running child to [`TaskStatus::Completed`] and,
+    /// under the same write lock, recompute the parent's
+    /// `pending_child_count` from the live-children index so the
+    /// parent can resume as soon as its last live child reaches a
+    /// terminal state.
+    ///
+    /// This is the Phase 2.6 successful-child resume trigger. A
+    /// successful call:
+    ///
+    /// 1. CAS-checks that the child exists, is in
+    ///    [`TaskStatus::Running`], and is owned by `(worker, lease)`.
+    /// 2. Transitions the child via [`AgentTask::complete`] and
+    ///    drops its lease.
+    /// 3. If the child has a parent row (it always does for Phase
+    ///    2.6 — tool-runtime rows are leaves spawned under a parent),
+    ///    walks the parent's `by_parent` bucket, counts the live
+    ///    (non-terminal) children, and calls
+    ///    [`AgentTask::recompute_pending_children`] on the parent.
+    ///    When the live count hits zero the parent flips back to
+    ///    [`TaskStatus::Pending`] and its typed
+    ///    [`crate::journal::TaskState::WaitingOnChildren`] payload is
+    ///    cleared so a worker can re-acquire it.
+    /// 4. Leaves the parent alone if it is terminal (e.g. a
+    ///    [`AgentTaskStore::cancel_tree`] sweep ran between the
+    ///    worker's start and finish). The child's own terminal
+    ///    transition still runs so stale workers can still report
+    ///    their last result on the way out.
+    ///
+    /// Returns `(child, parent)` where `parent` is `None` if the
+    /// child is a root (Phase 2.6 tool-runtime children always have
+    /// a parent, but the signature is kept symmetric with
+    /// [`AgentTaskStore::fail_child`] so a future phase can reuse
+    /// the entry point for any kind of leaf).
+    ///
+    /// # Errors
+    /// - `complete_child rejected: task ... does not exist` — no
+    ///   row with the supplied id.
+    /// - `complete_child rejected: task ... is not running` — row
+    ///   is in any non-`Running` status.
+    /// - `complete_child rejected: worker mismatch` — `worker`
+    ///   does not match the row's current `worker_id`.
+    /// - `complete_child rejected: lease mismatch` — `lease` does
+    ///   not match the row's current `lease_id`.
+    /// - Schema errors from [`AgentTask::complete`] or
+    ///   [`AgentTask::recompute_pending_children`].
+    async fn complete_child(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
+
+    /// Transition a running child to [`TaskStatus::Failed`] with
+    /// `error` and recompute the parent's `pending_child_count` the
+    /// same way [`AgentTaskStore::complete_child`] does.
+    ///
+    /// Phase 2.6 treats child failures exactly like child completions
+    /// at the **journal** layer: a failed child still counts as a
+    /// terminal child, so the parent's counter decrements and the
+    /// parent becomes runnable as soon as the last live child reaches
+    /// any terminal state. The parent's agent loop is responsible for
+    /// inspecting [`AgentTaskStore::list_children`] on resume and
+    /// deciding how to aggregate mixed success / failure outcomes —
+    /// that decision belongs in the agent layer, not the journal.
+    ///
+    /// # Errors
+    /// Same error envelope as
+    /// [`AgentTaskStore::complete_child`] but routed through
+    /// [`AgentTask::fail`] instead of [`AgentTask::complete`].
+    async fn fail_child(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
+
+    /// Cancel `root_id` and every descendant in its subtree under a
+    /// single store write, producing a fully-terminal subtree in
+    /// deterministic depth-first order.
+    ///
+    /// This is the Phase 2.6 cancellation-tree entry point. A
+    /// successful call:
+    ///
+    /// 1. Walks the `by_parent` index transitively from `root_id`
+    ///    to collect every live descendant id.
+    /// 2. Transitions each non-terminal row via [`AgentTask::cancel`]
+    ///    in the order `[root, child_1, child_2, ..., grandchildren,
+    ///    ...]`. Each cancel drops the row's lease (if any), removes
+    ///    the row from the runnable / lease-expiry / queued / active-root
+    ///    indexes, and clears the typed
+    ///    [`crate::journal::TaskState`] payload so the state ↔ status
+    ///    invariant holds.
+    /// 3. Skips rows that are already terminal, so repeated calls on
+    ///    the same subtree are idempotent.
+    ///
+    /// Because every transition is a pure in-memory state change
+    /// running under the store's write lock, cancellation is
+    /// observable atomically: a worker that reads any row in the
+    /// subtree after this call sees the final terminal status, and
+    /// any worker whose lease was dropped fails the Phase 2.3
+    /// `(worker_id, lease_id)` CAS on its next heartbeat / complete
+    /// / fail attempt.
+    ///
+    /// Returns the ids that were actually transitioned, in
+    /// transition order. Rows that were already terminal before the
+    /// call are not included in the result.
+    ///
+    /// # Errors
+    /// - `cancel_tree rejected: task ... does not exist` — no row
+    ///   with the supplied id.
+    /// - Schema errors from [`AgentTask::cancel`] or
+    ///   [`AgentTask::validate`].
+    async fn cancel_tree(
+        &self,
+        root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTaskId>>;
 
     /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
     /// [`TaskStatus::Pending`], clearing the typed
@@ -836,6 +1061,183 @@ impl Inner {
         self.rebalance_after_row_change(old, &failed);
         self.by_id.insert(failed.id.clone(), failed);
         Ok(())
+    }
+
+    /// Count the direct children of `parent_id` whose status is
+    /// non-terminal, used by Phase 2.6's `complete_child` /
+    /// `fail_child` to recompute the parent's outstanding-child
+    /// counter from the journal's `by_parent` index instead of a
+    /// caller-maintained running total.
+    ///
+    /// A row that no longer exists in `by_id` (e.g. because a later
+    /// phase introduces a hard-delete) is treated as terminal — the
+    /// parent's counter should never count a ghost.
+    fn count_live_children(&self, parent_id: &AgentTaskId) -> u32 {
+        let Some(children) = self.by_parent.get(parent_id) else {
+            return 0;
+        };
+        let live = children
+            .iter()
+            .filter_map(|id| self.by_id.get(id))
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        u32::try_from(live).unwrap_or(u32::MAX)
+    }
+
+    /// Collect the ids of `root_id` and every descendant in its
+    /// subtree in breadth-first order, used by Phase 2.6's
+    /// `cancel_tree`.
+    ///
+    /// The returned vector always starts with `root_id` so the
+    /// caller can iterate it linearly and cancel the root last if
+    /// the walk order matters — Phase 2.6's sweep cancels in BFS
+    /// order (root first) because the cancellation is idempotent
+    /// and the order only drives the returned transitioned-id
+    /// slice.
+    ///
+    /// Depth is bounded by the actual journal tree, and `by_parent`
+    /// is append-only within a root's lifetime, so the walk
+    /// terminates naturally without needing a visited set — but
+    /// defense-in-depth, we still dedupe via a `BTreeSet` so a
+    /// corrupted journal cannot hang the walk.
+    fn collect_subtree(&self, root_id: &AgentTaskId) -> Vec<AgentTaskId> {
+        let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
+        let mut out: Vec<AgentTaskId> = Vec::new();
+        let mut frontier: std::collections::VecDeque<AgentTaskId> =
+            std::collections::VecDeque::new();
+        frontier.push_back(root_id.clone());
+        while let Some(id) = frontier.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if !self.by_id.contains_key(&id) {
+                continue;
+            }
+            out.push(id.clone());
+            if let Some(children) = self.by_parent.get(&id) {
+                for child_id in children {
+                    if !visited.contains(child_id) {
+                        frontier.push_back(child_id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Cancel a single row in place under the store write lock,
+    /// rebalancing every secondary index. A no-op on rows that are
+    /// already terminal (the caller decides whether that should
+    /// show up in the returned transitioned-id slice).
+    ///
+    /// Returns `true` if the row was actually transitioned.
+    fn cancel_row_in_place(&mut self, id: &AgentTaskId, now: OffsetDateTime) -> Result<bool> {
+        let Some(old) = self.by_id.get(id).cloned() else {
+            return Ok(false);
+        };
+        if old.status.is_terminal() {
+            return Ok(false);
+        }
+        let cancelled = old
+            .clone()
+            .cancel(now)
+            .context("cancel_tree: cancel transition failed")?;
+        self.rebalance_after_row_change(&old, &cancelled);
+        self.by_id.insert(cancelled.id.clone(), cancelled);
+        Ok(true)
+    }
+
+    /// Drive a terminal child transition (complete / fail) and, under
+    /// the same write lock, recompute the parent's
+    /// `pending_child_count` from the live-children index so the
+    /// parent can resume as soon as its last live child reaches a
+    /// terminal state.
+    ///
+    /// `transition` takes the old child row and returns the new
+    /// terminal row, so the caller can choose between
+    /// [`AgentTask::complete`] and [`AgentTask::fail`] without
+    /// duplicating the CAS / rebalance / recompute plumbing.
+    fn apply_child_terminal_transition(
+        &mut self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+        error_prefix: &'static str,
+        transition: impl FnOnce(AgentTask) -> Result<AgentTask, super::task::TaskSchemaError>,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let old_child =
+            self.by_id.get(child_id).cloned().ok_or_else(|| {
+                anyhow!("{error_prefix} rejected: task {child_id} does not exist")
+            })?;
+
+        if old_child.status != TaskStatus::Running {
+            let status = old_child.status;
+            return Err(anyhow!(
+                "{error_prefix} rejected: task {child_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_child.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "{error_prefix} rejected: worker mismatch on task {child_id}"
+                ));
+            }
+        }
+        match &old_child.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "{error_prefix} rejected: lease mismatch on task {child_id}"
+                ));
+            }
+        }
+
+        let new_child = transition(old_child.clone())
+            .with_context(|| format!("{error_prefix}: terminal transition failed"))?;
+        self.rebalance_after_row_change(&old_child, &new_child);
+        self.by_id.insert(new_child.id.clone(), new_child.clone());
+
+        // Phase 2.6 recompute: the parent's counter is derived from
+        // the `by_parent` index so a double-complete or a dropped
+        // complete cannot silently corrupt it. If the parent has
+        // already been cancelled out-of-band (e.g. by a
+        // `cancel_tree` sweep between the worker's start and
+        // finish), we still let the child's terminal transition
+        // land but leave the parent alone — the parent has already
+        // been moved to a terminal status and must not be reopened.
+        let parent = if let Some(parent_id) = &new_child.parent_id {
+            let Some(old_parent) = self.by_id.get(parent_id).cloned() else {
+                // A missing parent row is an internal bookkeeping
+                // bug — the cross-row insert guard refuses to accept
+                // a child with an unknown parent. Surface it loud.
+                return Err(anyhow!(
+                    "{error_prefix}: child {child_id} references missing parent {parent_id}"
+                ));
+            };
+            if old_parent.status == TaskStatus::WaitingOnChildren {
+                let live = self.count_live_children(parent_id);
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .with_context(|| {
+                        format!("{error_prefix}: recompute_pending_children transition failed")
+                    })?;
+                self.rebalance_after_row_change(&old_parent, &new_parent);
+                self.by_id.insert(new_parent.id.clone(), new_parent.clone());
+                Some(new_parent)
+            } else {
+                // Parent has already left the waiting state — e.g. a
+                // tree-cancel, an earlier recompute that resumed it,
+                // or a manual transition. Leave it alone.
+                Some(old_parent)
+            }
+        } else {
+            None
+        };
+
+        Ok((new_child, parent))
     }
 }
 
@@ -1494,33 +1896,176 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(paused)
     }
 
-    async fn resolve_child(
+    async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        specs: Vec<ChildSpawnSpec>,
+        continuation: ContinuationEnvelope,
         now: OffsetDateTime,
-    ) -> Result<AgentTask> {
+    ) -> Result<(AgentTask, Vec<AgentTask>)> {
+        if specs.is_empty() {
+            return Err(anyhow!("spawn rejected: specs must be non-empty"));
+        }
+
         let mut inner = self.inner.write().await;
-        let old = inner
+
+        // CAS + structural guards on the parent.
+        let old_parent = inner
             .by_id
             .get(parent_id)
             .cloned()
-            .ok_or_else(|| anyhow!("resolve rejected: task {parent_id} does not exist"))?;
-
-        if old.status != TaskStatus::WaitingOnChildren {
-            let status = old.status;
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
             return Err(anyhow!(
-                "resolve rejected: task {parent_id} is not waiting on children (status {status:?})"
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
             ));
         }
 
-        let resolved = old
+        // Build every child row **before** mutating any index so a
+        // schema error on child N rolls back the whole batch cleanly.
+        // Each child passes through `AgentTask::new_child` which
+        // calls `validate()` on the way out, so the children are
+        // invariant-safe by construction. We still assert no id
+        // collision because `AgentTaskId::new` is UUIDv4 and a
+        // hand-crafted test that uses fixed ids could otherwise slip
+        // a duplicate into the batch.
+        let mut children: Vec<AgentTask> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let child =
+                AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts)
+                    .context("spawn rejected: new_child failed")?;
+            if inner.by_id.contains_key(&child.id)
+                || children.iter().any(|existing| existing.id == child.id)
+            {
+                let id = &child.id;
+                return Err(anyhow!("spawn rejected: child id {id} already exists"));
+            }
+            children.push(child);
+        }
+
+        // Transition the parent to WaitingOnChildren first so the
+        // typed state carries the continuation before the children
+        // become visible to the acquisition path. The pure
+        // transition takes `child_count` so we pass the freshly
+        // computed batch size, not a caller-supplied number.
+        let child_count = u32::try_from(children.len())
+            .context("spawn rejected: child count exceeds u32::MAX")?;
+        let new_parent = old_parent
             .clone()
-            .child_resolved(now)
-            .context("resolve rejected: child_resolved transition failed")?;
-        inner.rebalance_after_row_change(&old, &resolved);
-        inner.by_id.insert(resolved.id.clone(), resolved.clone());
+            .wait_on_children(child_count, continuation, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        inner.rebalance_after_row_change(&old_parent, &new_parent);
+        inner
+            .by_id
+            .insert(new_parent.id.clone(), new_parent.clone());
+
+        // Commit every child to the primary key and secondary
+        // indexes under the same write lock as the parent transition.
+        // `add_to_indexes` keeps `by_thread`, `by_parent`,
+        // `by_status`, and the Phase 2.3 runnable index in sync.
+        for child in &children {
+            inner.add_to_indexes(child);
+            inner.by_id.insert(child.id.clone(), child.clone());
+        }
+
         drop(inner);
-        Ok(resolved)
+        Ok((new_parent, children))
+    }
+
+    async fn complete_child(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut inner = self.inner.write().await;
+        let result = inner.apply_child_terminal_transition(
+            child_id,
+            worker,
+            lease,
+            now,
+            "complete_child",
+            |child| child.complete(now),
+        )?;
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn fail_child(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut inner = self.inner.write().await;
+        let result = inner.apply_child_terminal_transition(
+            child_id,
+            worker,
+            lease,
+            now,
+            "fail_child",
+            move |child| child.fail(error, now),
+        )?;
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn cancel_tree(
+        &self,
+        root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTaskId>> {
+        let mut inner = self.inner.write().await;
+
+        if !inner.by_id.contains_key(root_id) {
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
+        }
+
+        // Snapshot the subtree ids under the write lock and then
+        // walk them in BFS order. The cancel transition is pure and
+        // does not mutate `by_parent`, so the snapshot stays
+        // consistent for the duration of the sweep even though we
+        // are holding a mutable borrow of `inner`.
+        let subtree = inner.collect_subtree(root_id);
+        let mut transitioned = Vec::with_capacity(subtree.len());
+        for id in subtree {
+            if inner.cancel_row_in_place(&id, now)? {
+                transitioned.push(id);
+            }
+        }
+
+        drop(inner);
+        Ok(transitioned)
     }
 
     async fn resume_from_confirmation(
@@ -4283,88 +4828,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_child_drains_counter_and_resumes_parent() -> Result<()> {
-        let store = InMemoryAgentTaskStore::new();
-        let (claimed, worker, lease) =
-            submitted_and_claimed_root(&store, "t-resolve", "w1", "l1").await?;
-        let id = claimed.id.clone();
-        store
-            .pause_on_children(
-                &id,
-                &worker,
-                &lease,
-                3,
-                sample_continuation("t-resolve"),
-                t_plus(2),
-            )
-            .await
-            .context("pause")?;
-
-        // First two resolves keep the parent in WaitingOnChildren and
-        // preserve the typed payload.
-        let after_one = store
-            .resolve_child(&id, t_plus(3))
-            .await
-            .context("resolve 1")?;
-        assert_eq!(after_one.status, TaskStatus::WaitingOnChildren);
-        assert_eq!(after_one.pending_child_count, 2);
-        assert!(after_one.state.continuation().is_some());
-
-        let after_two = store
-            .resolve_child(&id, t_plus(4))
-            .await
-            .context("resolve 2")?;
-        assert_eq!(after_two.status, TaskStatus::WaitingOnChildren);
-        assert_eq!(after_two.pending_child_count, 1);
-        assert!(after_two.state.continuation().is_some());
-
-        // Final resolve flips the parent back to Pending and clears
-        // the typed payload to satisfy the state ↔ status invariant.
-        let after_three = store
-            .resolve_child(&id, t_plus(5))
-            .await
-            .context("resolve 3")?;
-        assert_eq!(after_three.status, TaskStatus::Pending);
-        assert_eq!(after_three.pending_child_count, 0);
-        assert!(after_three.state.is_none());
-
-        // The runnable scan must now observe the resumed parent.
-        let scanned = store
-            .acquire_next_runnable(
-                WorkerId::from_string("w-resume"),
-                LeaseId::from_string("l-resume"),
-                t_plus(120),
-                t_plus(6),
-            )
-            .await
-            .context("scan resumed")?
-            .context("scan returned row")?;
-        assert_eq!(scanned.id, id);
-        assert_eq!(scanned.status, TaskStatus::Running);
-        // Resumed row is on its second attempt because the original
-        // claim consumed attempt #1 and the recovery scan consumes
-        // attempt #2.
-        assert_eq!(scanned.attempt, 2);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_child_rejects_non_waiting_row() -> Result<()> {
-        let store = InMemoryAgentTaskStore::new();
-        let root = AgentTask::new_root_turn(thread("t-not-waiting"), t_plus(0), 3);
-        let id = root.id.clone();
-        store.submit_root_turn(root).await.context("submit")?;
-
-        let err = store.resolve_child(&id, t_plus(1)).await.unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("not waiting on children"),
-            "unexpected: {message}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn resume_from_confirmation_clears_typed_state_and_returns_to_pending() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (claimed, worker, lease) =
@@ -5151,6 +5614,1374 @@ mod tests {
             .await
             .context("scan 2")?;
         assert!(scan.is_none());
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.6 — Tool-runtime child tasks, cancellation tree, and
+    // journal-driven parent resume triggers (ENG-7920)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // Acceptance criteria these tests pin down:
+    //
+    // * `spawn_tool_children` atomically persists a batch of
+    //   tool-runtime children under a running parent and pauses the
+    //   parent on them, dropping the parent's lease in the same
+    //   write.
+    // * Child rows are real `ToolRuntime` rows with the correct
+    //   `parent_id` / `root_id` / `thread_id` / `depth` — they share
+    //   the Phase 2.3 acquisition path and never accidentally
+    //   duplicate or re-acquire.
+    // * `complete_child` / `fail_child` recompute the parent's
+    //   `pending_child_count` from the live `by_parent` index so a
+    //   double-complete is a no-op and a mixed success/failure batch
+    //   still resumes the parent deterministically.
+    // * `cancel_tree` cascades cancellation through every descendant
+    //   in `by_parent` and drops leases along the way, and the
+    //   resulting terminal subtree plays nicely with the Phase 2.2
+    //   FIFO queue.
+    // * A completed child batch makes the parent resumable through
+    //   **journal state alone** — no channels, no caller-tracked
+    //   counters, and the parent's resume envelope survives a
+    //   round-trip through the serialized wire form.
+
+    use crate::journal::task::ChildSpawnSpec;
+
+    /// Spawn a parent root, lease it, and return
+    /// `(parent, worker, lease)` so Phase 2.6 tests can exercise
+    /// `spawn_tool_children` against a genuinely running parent.
+    async fn running_root_for_spawn(
+        store: &InMemoryAgentTaskStore,
+        thread_name: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        submitted_and_claimed_root(store, thread_name, "w-parent", "l-parent").await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_creates_batch_and_parks_parent() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-spawn").await?;
+        let parent_id = parent.id.clone();
+
+        let specs = vec![
+            ChildSpawnSpec::new(2),
+            ChildSpawnSpec::new(2),
+            ChildSpawnSpec::new(2),
+        ];
+        let (parked_parent, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                specs,
+                sample_continuation("t-spawn"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Parent is paused on exactly the spawned batch.
+        assert_eq!(parked_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked_parent.pending_child_count, 3);
+        assert!(parked_parent.worker_id.is_none(), "lease dropped");
+        assert!(parked_parent.lease_id.is_none());
+        assert!(parked_parent.lease_expires_at.is_none());
+        assert!(parked_parent.last_heartbeat_at.is_none());
+        assert!(matches!(
+            parked_parent.state,
+            TaskState::WaitingOnChildren { .. }
+        ));
+
+        // Children inherit the parent's identity fields and start
+        // Pending with attempt == 0.
+        assert_eq!(children.len(), 3);
+        for child in &children {
+            assert_eq!(child.kind, TaskKind::ToolRuntime);
+            assert_eq!(child.status, TaskStatus::Pending);
+            assert_eq!(child.parent_id.as_ref(), Some(&parent_id));
+            assert_eq!(child.root_id, parent.root_id);
+            assert_eq!(child.thread_id, parent.thread_id);
+            assert_eq!(child.depth, parent.depth + 1);
+            assert_eq!(child.attempt, 0);
+            assert_eq!(child.max_attempts, 2);
+            assert!(child.state.is_none());
+        }
+
+        // The persisted rows match what `spawn_tool_children` returned.
+        let fetched_parent = store
+            .get(&parent_id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(fetched_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(fetched_parent.pending_child_count, 3);
+        let listed_children = store
+            .list_children(&parent_id)
+            .await
+            .context("list children")?;
+        assert_eq!(listed_children.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-spawn-cas").await?;
+        let parent_id = parent.id.clone();
+
+        let err = store
+            .spawn_tool_children(
+                &parent_id,
+                &WorkerId::from_string("w-imposter"),
+                &lease,
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-spawn-cas"),
+                t_plus(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("worker mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        let err = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-spawn-cas"),
+                t_plus(3),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("lease mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        // Parent must still be Running with its original lease.
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert_eq!(
+            persisted.worker_id.as_ref().map(WorkerId::as_str),
+            Some("w-parent")
+        );
+        // No children were created.
+        let children = store.list_children(&parent_id).await.context("list")?;
+        assert!(children.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_rejects_non_running_parent() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-spawn-pending"), t_plus(0), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+
+        // Row is Pending — spawn must refuse with "not running".
+        let err = store
+            .spawn_tool_children(
+                &id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-spawn-pending"),
+                t_plus(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not running"),
+            "unexpected: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_rejects_leaf_parent() -> Result<()> {
+        // A tool-runtime row is a leaf. Trying to spawn children
+        // under one must fail with the same "parent is a leaf" shape
+        // that `insert` already enforces.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-leaf").await?;
+        let parent_id = parent.id.clone();
+
+        // Spawn one tool child under the root so we have a real
+        // leaf to try to reparent onto.
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-leaf"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn first")?;
+        let leaf = &children[0];
+        let leaf_id = leaf.id.clone();
+
+        // Lease the leaf so it satisfies the running + CAS guards,
+        // then try to spawn grandchildren under it.
+        let claimed = store
+            .try_acquire_task(
+                &leaf_id,
+                WorkerId::from_string("w-leaf"),
+                LeaseId::from_string("l-leaf"),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await
+            .context("acquire leaf")?
+            .context("leaf claimed")?;
+        assert_eq!(claimed.kind, TaskKind::ToolRuntime);
+
+        let err = store
+            .spawn_tool_children(
+                &leaf_id,
+                &WorkerId::from_string("w-leaf"),
+                &LeaseId::from_string("l-leaf"),
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-leaf"),
+                t_plus(4),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("leaf kind"),
+            "unexpected: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_rejects_empty_specs() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-empty").await?;
+        let parent_id = parent.id.clone();
+
+        let err = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                Vec::new(),
+                sample_continuation("t-empty"),
+                t_plus(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("specs must be non-empty"),
+            "unexpected: {err:#}"
+        );
+
+        // The parent must still be Running — a zero-child spawn is
+        // a caller error, not a legal pause.
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tool_children_indexes_children_as_runnable() -> Result<()> {
+        // After the spawn, the children must be on the runnable
+        // index and the parent must **not** be. The scan picks the
+        // children in FIFO order and skips the paused parent.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-scan-children").await?;
+        let parent_id = parent.id.clone();
+
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-scan-children"),
+                t_plus(10),
+            )
+            .await
+            .context("spawn")?;
+        let child_ids: std::collections::HashSet<_> =
+            children.iter().map(|c| c.id.clone()).collect();
+
+        for i in 0..2 {
+            let offset = i64::from(i);
+            let claimed = store
+                .acquire_next_runnable(
+                    WorkerId::from_string(format!("w-scan-{i}")),
+                    LeaseId::from_string(format!("l-scan-{i}")),
+                    t_plus(60),
+                    t_plus(20 + offset),
+                )
+                .await
+                .context("scan")?
+                .context("scan returned row")?;
+            assert_eq!(claimed.kind, TaskKind::ToolRuntime);
+            assert!(
+                child_ids.contains(&claimed.id),
+                "scan returned unexpected row {id:?}",
+                id = claimed.id
+            );
+        }
+
+        // Third scan drains.
+        let none = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-scan-drain"),
+                LeaseId::from_string("l-scan-drain"),
+                t_plus(60),
+                t_plus(30),
+            )
+            .await
+            .context("scan drain")?;
+        assert!(
+            none.is_none(),
+            "paused parent must not appear in runnable scan"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_child_resumes_parent_on_final_decrement() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-complete").await?;
+        let parent_id = parent.id.clone();
+
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-complete"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Lease and complete each child via the Phase 2.6 path.
+        for (i, child) in children.iter().enumerate() {
+            let offset = i64::try_from(i).context("enumerate fits i64")?;
+            let claimed = store
+                .try_acquire_task(
+                    &child.id,
+                    WorkerId::from_string(format!("w-c-{i}")),
+                    LeaseId::from_string(format!("l-c-{i}")),
+                    t_plus(60),
+                    t_plus(10 + offset),
+                )
+                .await
+                .context("acquire child")?
+                .context("child claimed")?;
+            let (done, observed_parent) = store
+                .complete_child(
+                    &claimed.id,
+                    &WorkerId::from_string(format!("w-c-{i}")),
+                    &LeaseId::from_string(format!("l-c-{i}")),
+                    t_plus(20 + offset),
+                )
+                .await
+                .context("complete child")?;
+            assert_eq!(done.status, TaskStatus::Completed);
+            let observed = observed_parent.context("parent returned")?;
+            if i == children.len() - 1 {
+                assert_eq!(observed.status, TaskStatus::Pending);
+                assert_eq!(observed.pending_child_count, 0);
+                assert!(observed.state.is_none());
+            } else {
+                assert_eq!(observed.status, TaskStatus::WaitingOnChildren);
+                assert!(observed.state.continuation().is_some());
+            }
+        }
+
+        // The parent now scans as runnable again.
+        let resumed = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-resume"),
+                LeaseId::from_string("l-resume"),
+                t_plus(200),
+                t_plus(100),
+            )
+            .await
+            .context("scan resumed")?
+            .context("resumed parent found")?;
+        assert_eq!(resumed.id, parent_id);
+        assert_eq!(resumed.status, TaskStatus::Running);
+        // The resumed parent is on its second attempt — the first
+        // claim consumed attempt 1 and this scan consumed attempt 2.
+        assert_eq!(resumed.attempt, 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_child_stays_waiting_until_last() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-partial").await?;
+        let parent_id = parent.id.clone();
+
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                ],
+                sample_continuation("t-partial"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Complete only the first child.
+        let first = &children[0];
+        store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-c0"),
+                LeaseId::from_string("l-c0"),
+                t_plus(60),
+                t_plus(10),
+            )
+            .await
+            .context("acquire c0")?
+            .context("c0 claimed")?;
+        let (_, observed) = store
+            .complete_child(
+                &first.id,
+                &WorkerId::from_string("w-c0"),
+                &LeaseId::from_string("l-c0"),
+                t_plus(11),
+            )
+            .await
+            .context("complete c0")?;
+        let observed = observed.context("parent returned")?;
+        assert_eq!(observed.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(observed.pending_child_count, 2);
+        assert!(observed.state.continuation().is_some());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_child_recomputes_from_index_not_caller_counter() -> Result<()> {
+        // Phase 2.6 derives the parent's counter from the live
+        // `by_parent` index, not a caller-maintained running total.
+        // Drive a child to Completed out-of-band through `update()`
+        // (simulating an older buggy path), then call
+        // `complete_child` on a sibling. The recompute must see the
+        // pre-completed child as terminal and report the parent's
+        // new live count as 1, not 2.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-recompute").await?;
+        let parent_id = parent.id.clone();
+
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                ],
+                sample_continuation("t-recompute"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Drive child[0] to Completed out-of-band.
+        let c0 = children[0].clone();
+        let c0_running = c0
+            .mark_running(
+                WorkerId::from_string("w-oob"),
+                LeaseId::from_string("l-oob"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .context("oob running")?;
+        store
+            .update(c0_running.clone())
+            .await
+            .context("update oob")?;
+        let c0_done = c0_running.complete(t_plus(4)).context("oob complete")?;
+        store.update(c0_done).await.context("update oob complete")?;
+
+        // Now complete child[1] through the real path. The
+        // recompute must see 1 live child (child[2]), not 2.
+        let c1 = &children[1];
+        store
+            .try_acquire_task(
+                &c1.id,
+                WorkerId::from_string("w-c1"),
+                LeaseId::from_string("l-c1"),
+                t_plus(60),
+                t_plus(5),
+            )
+            .await
+            .context("acquire c1")?
+            .context("c1 claimed")?;
+        let (_, observed) = store
+            .complete_child(
+                &c1.id,
+                &WorkerId::from_string("w-c1"),
+                &LeaseId::from_string("l-c1"),
+                t_plus(6),
+            )
+            .await
+            .context("complete c1")?;
+        let observed = observed.context("parent returned")?;
+        assert_eq!(
+            observed.pending_child_count, 1,
+            "counter must be derived from live-children index, not subtraction"
+        );
+        assert_eq!(observed.status, TaskStatus::WaitingOnChildren);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_child_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-cc-cas").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::default()],
+                sample_continuation("t-cc-cas"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+        let child = &children[0];
+        store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::from_string("w-c"),
+                LeaseId::from_string("l-c"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let err = store
+            .complete_child(
+                &child.id,
+                &WorkerId::from_string("w-imposter"),
+                &LeaseId::from_string("l-c"),
+                t_plus(4),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("worker mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        let err = store
+            .complete_child(
+                &child.id,
+                &WorkerId::from_string("w-c"),
+                &LeaseId::from_string("l-stale"),
+                t_plus(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("lease mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        // Child is still Running with its original lease; parent
+        // still waiting.
+        let persisted_child = store
+            .get(&child.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted_child.status, TaskStatus::Running);
+        let persisted_parent = store
+            .get(&parent.id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(persisted_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(persisted_parent.pending_child_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_child_mirrors_complete_child_but_stamps_last_error() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-fail").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-fail"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Complete one, fail the other.
+        let first = &children[0];
+        store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-a"),
+                LeaseId::from_string("l-a"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await
+            .context("acquire a")?
+            .context("a claimed")?;
+        store
+            .complete_child(
+                &first.id,
+                &WorkerId::from_string("w-a"),
+                &LeaseId::from_string("l-a"),
+                t_plus(4),
+            )
+            .await
+            .context("complete a")?;
+
+        let second = &children[1];
+        store
+            .try_acquire_task(
+                &second.id,
+                WorkerId::from_string("w-b"),
+                LeaseId::from_string("l-b"),
+                t_plus(60),
+                t_plus(5),
+            )
+            .await
+            .context("acquire b")?
+            .context("b claimed")?;
+        let (failed, observed_parent) = store
+            .fail_child(
+                &second.id,
+                &WorkerId::from_string("w-b"),
+                &LeaseId::from_string("l-b"),
+                "tool timed out".into(),
+                t_plus(6),
+            )
+            .await
+            .context("fail b")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.last_error.as_deref(), Some("tool timed out"));
+        let observed_parent = observed_parent.context("parent returned")?;
+        // Second child is the last live one → parent resumes.
+        assert_eq!(observed_parent.status, TaskStatus::Pending);
+        assert_eq!(observed_parent.pending_child_count, 0);
+
+        // `list_children` still returns the full batch with their
+        // terminal statuses so the agent loop can aggregate.
+        let listed = store.list_children(&parent.id).await.context("list")?;
+        assert_eq!(listed.len(), 2);
+        let statuses: std::collections::HashSet<_> = listed.iter().map(|c| c.status).collect();
+        assert!(statuses.contains(&TaskStatus::Completed));
+        assert!(statuses.contains(&TaskStatus::Failed));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_success_failure_batch_resumes_parent() -> Result<()> {
+        // Three children: success, failure, success. The parent
+        // resumes after the last child reaches a terminal state,
+        // regardless of which child failed.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-mixed").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                ],
+                sample_continuation("t-mixed"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Claim + terminate each child in a different way.
+        for (i, child) in children.iter().enumerate() {
+            let offset = i64::try_from(i).context("enumerate fits i64")?;
+            let worker_id = WorkerId::from_string(format!("w-m-{i}"));
+            let lease_id = LeaseId::from_string(format!("l-m-{i}"));
+            store
+                .try_acquire_task(
+                    &child.id,
+                    worker_id.clone(),
+                    lease_id.clone(),
+                    t_plus(60 + offset),
+                    t_plus(10 + offset),
+                )
+                .await
+                .context("acquire")?
+                .context("claimed")?;
+            let (_, observed) = if i == 1 {
+                store
+                    .fail_child(
+                        &child.id,
+                        &worker_id,
+                        &lease_id,
+                        format!("child {i} failed"),
+                        t_plus(20 + offset),
+                    )
+                    .await
+                    .context("fail")?
+            } else {
+                store
+                    .complete_child(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
+                    .await
+                    .context("complete")?
+            };
+            let observed = observed.context("parent returned")?;
+            if i == children.len() - 1 {
+                assert_eq!(observed.status, TaskStatus::Pending);
+            } else {
+                assert_eq!(observed.status, TaskStatus::WaitingOnChildren);
+            }
+        }
+
+        // The agent loop can now inspect the aggregated outcome via
+        // `list_children`.
+        let listed = store.list_children(&parent.id).await.context("list")?;
+        assert_eq!(listed.len(), 3);
+        let success_count = listed
+            .iter()
+            .filter(|c| c.status == TaskStatus::Completed)
+            .count();
+        let failure_count = listed
+            .iter()
+            .filter(|c| c.status == TaskStatus::Failed)
+            .count();
+        assert_eq!(success_count, 2);
+        assert_eq!(failure_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_child_on_already_cancelled_parent_is_silent() -> Result<()> {
+        // Edge case: a tree cancel lands between the worker's
+        // mark_running and its complete_child call. The child's
+        // terminal transition still runs (so the stale worker can
+        // report its outcome), but the parent is already Cancelled
+        // and must be left alone.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-late-complete").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-late-complete"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        let child = &children[0];
+        store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::from_string("w-late"),
+                LeaseId::from_string("l-late"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await
+            .context("acquire late")?
+            .context("late claimed")?;
+
+        // Tree cancel lands while the child is still Running.
+        let cancelled_ids = store
+            .cancel_tree(&parent.id, t_plus(4))
+            .await
+            .context("cancel tree")?;
+        assert!(cancelled_ids.contains(&parent.id));
+        assert!(cancelled_ids.contains(&child.id));
+
+        // The late complete_child call now fails because the child
+        // is no longer Running (tree cancel already transitioned it).
+        let err = store
+            .complete_child(
+                &child.id,
+                &WorkerId::from_string("w-late"),
+                &LeaseId::from_string("l-late"),
+                t_plus(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not running"),
+            "unexpected: {err:#}"
+        );
+
+        // Parent and every child are terminal.
+        let persisted_parent = store
+            .get(&parent.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted_parent.status, TaskStatus::Cancelled);
+        for child in &children {
+            let row = store
+                .get(&child.id)
+                .await
+                .context("get child")?
+                .context("child exists")?;
+            assert_eq!(row.status, TaskStatus::Cancelled);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_cancels_root_and_all_tool_children() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-tree").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                ],
+                sample_continuation("t-tree"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        let transitioned = store
+            .cancel_tree(&parent.id, t_plus(3))
+            .await
+            .context("cancel tree")?;
+        // Root first, then every child.
+        assert_eq!(transitioned.len(), 4);
+        assert_eq!(transitioned[0], parent.id);
+        for child in &children {
+            assert!(
+                transitioned.contains(&child.id),
+                "child {child_id} missing from transitioned list",
+                child_id = child.id
+            );
+        }
+
+        // Root and children are Cancelled.
+        let persisted_parent = store
+            .get(&parent.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted_parent.status, TaskStatus::Cancelled);
+        assert_eq!(persisted_parent.pending_child_count, 0);
+        assert!(persisted_parent.state.is_none());
+        for child in &children {
+            let row = store
+                .get(&child.id)
+                .await
+                .context("get child")?
+                .context("child exists")?;
+            assert_eq!(row.status, TaskStatus::Cancelled);
+            assert!(row.worker_id.is_none());
+            assert!(row.state.is_none());
+        }
+
+        // Runnable index is empty; a fresh scan returns None.
+        let scanned = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-scan"),
+                LeaseId::from_string("l-scan"),
+                t_plus(60),
+                t_plus(4),
+            )
+            .await
+            .context("scan empty")?;
+        assert!(scanned.is_none());
+
+        // `list_children` still returns the rows for audit.
+        let listed = store
+            .list_children(&parent.id)
+            .await
+            .context("list after cancel")?;
+        assert_eq!(listed.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_cancels_running_children_and_drops_leases() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-tree-live").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-tree-live"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Lease one child — it is now Running with a real lease.
+        let leased_child = &children[0];
+        store
+            .try_acquire_task(
+                &leased_child.id,
+                WorkerId::from_string("w-live"),
+                LeaseId::from_string("l-live"),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let transitioned = store
+            .cancel_tree(&parent.id, t_plus(4))
+            .await
+            .context("cancel tree")?;
+        assert_eq!(transitioned.len(), 3);
+
+        // The leased child is now Cancelled with no lease.
+        let row = store
+            .get(&leased_child.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        assert!(row.worker_id.is_none());
+        assert!(row.lease_id.is_none());
+        assert!(row.lease_expires_at.is_none());
+
+        // Heartbeat from the stale worker now fails.
+        let err = store
+            .heartbeat_task(
+                &leased_child.id,
+                &WorkerId::from_string("w-live"),
+                &LeaseId::from_string("l-live"),
+                t_plus(60),
+                t_plus(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid transition"),
+            "unexpected: {err:#}"
+        );
+
+        // complete_child from the stale worker also fails — the row
+        // is no longer Running.
+        let err = store
+            .complete_child(
+                &leased_child.id,
+                &WorkerId::from_string("w-live"),
+                &LeaseId::from_string("l-live"),
+                t_plus(6),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not running"),
+            "unexpected: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_is_idempotent_on_already_terminal_rows() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-tree-idem").await?;
+        store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::default(), ChildSpawnSpec::default()],
+                sample_continuation("t-tree-idem"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        let first = store
+            .cancel_tree(&parent.id, t_plus(3))
+            .await
+            .context("cancel first")?;
+        assert_eq!(first.len(), 3);
+
+        let second = store
+            .cancel_tree(&parent.id, t_plus(4))
+            .await
+            .context("cancel second")?;
+        assert!(
+            second.is_empty(),
+            "second cancel_tree must be a no-op on terminal rows"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_on_waiting_root_clears_typed_state_and_counter() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-tree-waiting").await?;
+        let (parked_parent, _) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                    ChildSpawnSpec::new(2),
+                ],
+                sample_continuation("t-tree-waiting"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+        assert_eq!(parked_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked_parent.pending_child_count, 3);
+
+        store
+            .cancel_tree(&parent.id, t_plus(3))
+            .await
+            .context("cancel")?;
+
+        let persisted = store
+            .get(&parent.id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(persisted.status, TaskStatus::Cancelled);
+        assert_eq!(persisted.pending_child_count, 0);
+        assert!(persisted.state.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_on_queued_root_removes_it_from_queue_index() -> Result<()> {
+        // A queued root is a legitimate cancel target — calling
+        // cancel_tree on it must drop it out of the per-thread
+        // queue index so `list_queued_roots` stops returning it.
+        let store = InMemoryAgentTaskStore::new();
+        let blocker = fresh_root_at("t-tree-queue", 0);
+        let queued = fresh_root_at("t-tree-queue", 1);
+        store
+            .submit_root_turn(blocker.clone())
+            .await
+            .context("blocker")?;
+        let queued_admitted = store
+            .submit_root_turn(queued.clone())
+            .await
+            .context("queued")?;
+        assert_eq!(queued_admitted.status, TaskStatus::Queued);
+
+        store
+            .cancel_tree(&queued.id, t_plus(2))
+            .await
+            .context("cancel queued")?;
+
+        let queue = store
+            .list_queued_roots(&thread("t-tree-queue"))
+            .await
+            .context("list queue")?;
+        assert!(queue.is_empty(), "queue should drop cancelled entry");
+
+        // The blocker is untouched.
+        let active = store
+            .active_root_for_thread(&thread("t-tree-queue"))
+            .await
+            .context("active")?
+            .context("blocker still active")?;
+        assert_eq!(active.id, blocker.id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_frees_the_active_root_slot_on_a_thread() -> Result<()> {
+        // Phase 2.2 interaction: cancelling the blocking root via
+        // `cancel_tree` must free the active-root slot so the next
+        // queued root can promote.
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t-tree-promote", 0);
+        let second = fresh_root_at("t-tree-promote", 1);
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+
+        store
+            .cancel_tree(&first.id, t_plus(2))
+            .await
+            .context("cancel tree")?;
+
+        // The slot is free: `promote_next_queued_root` fires.
+        let promoted = store
+            .promote_next_queued_root(&thread("t-tree-promote"), t_plus(3))
+            .await
+            .context("promote")?
+            .context("promotion fired")?;
+        assert_eq!(promoted.id, second.id);
+        assert_eq!(promoted.status, TaskStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_rejects_missing_root() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let ghost = AgentTaskId::new();
+        let err = store.cancel_tree(&ghost, t_plus(1)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "unexpected: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_child_batch_is_resumable_from_journal_alone() -> Result<()> {
+        // Acceptance criterion: "Completed child-task batches can
+        // make the parent resumable through journal state alone."
+        // Spawn two children, complete both, then rehydrate the row
+        // set into a **fresh** store instance via the serialized
+        // wire form. The parent must still be runnable and its
+        // typed state still cleared, matching the live store
+        // exactly.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-journal").await?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-journal"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        for (i, child) in children.iter().enumerate() {
+            let offset = i64::try_from(i).context("enumerate fits i64")?;
+            let worker_id = WorkerId::from_string(format!("w-j-{i}"));
+            let lease_id = LeaseId::from_string(format!("l-j-{i}"));
+            store
+                .try_acquire_task(
+                    &child.id,
+                    worker_id.clone(),
+                    lease_id.clone(),
+                    t_plus(60),
+                    t_plus(10 + offset),
+                )
+                .await
+                .context("acquire")?
+                .context("claimed")?;
+            store
+                .complete_child(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
+                .await
+                .context("complete")?;
+        }
+
+        let live_parent = store
+            .get(&parent.id)
+            .await
+            .context("live parent")?
+            .context("parent exists")?;
+        assert_eq!(live_parent.status, TaskStatus::Pending);
+        assert!(live_parent.state.is_none());
+
+        // Round-trip every row through JSON and rebuild a fresh
+        // store from the persisted bytes alone.
+        let mut rows: Vec<AgentTask> = Vec::new();
+        rows.push(live_parent.clone());
+        for child in &children {
+            let row = store
+                .get(&child.id)
+                .await
+                .context("get live child")?
+                .context("child exists")?;
+            rows.push(row);
+        }
+        // Snapshot the rows as their wire form so the "journal
+        // alone" claim is really about the durable shape.
+        let mut serialized: Vec<String> = Vec::new();
+        for row in &rows {
+            serialized.push(serde_json::to_string(row).context("serialize")?);
+        }
+        let rehydrated_store = InMemoryAgentTaskStore::new();
+        // Children must be inserted after the parent so the
+        // cross-row parent-exists guard is satisfied.
+        let mut rehydrated_rows: Vec<AgentTask> = Vec::with_capacity(serialized.len());
+        for json in &serialized {
+            rehydrated_rows.push(serde_json::from_str(json).context("deserialize")?);
+        }
+        for row in &rehydrated_rows {
+            rehydrated_store
+                .insert(row.clone())
+                .await
+                .context("rehydrate insert")?;
+        }
+
+        let rehydrated_parent = rehydrated_store
+            .get(&parent.id)
+            .await
+            .context("rehydrate get parent")?
+            .context("parent exists in rehydrated store")?;
+        assert_eq!(rehydrated_parent.status, TaskStatus::Pending);
+        assert!(rehydrated_parent.state.is_none());
+        // The parent is runnable in the rehydrated store too.
+        let scanned = rehydrated_store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-rehydrate"),
+                LeaseId::from_string("l-rehydrate"),
+                t_plus(200),
+                t_plus(100),
+            )
+            .await
+            .context("scan rehydrated")?
+            .context("scan returned row")?;
+        assert_eq!(scanned.id, parent.id);
+        assert_eq!(scanned.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_child_with_no_live_siblings_has_empty_parent_counter() -> Result<()> {
+        // Acceptance-criterion pin for the recompute edge case where
+        // the parent's `by_parent` index still holds entries but
+        // every one of them is already terminal. The
+        // journal-derived counter must read as zero and the parent
+        // must flip back to `Pending` with `TaskState::None` — exactly
+        // the behavior `completed_child_batch_is_resumable_from_journal_alone`
+        // relies on, but driven through the recompute path itself
+        // so a regression in `count_live_children` would surface
+        // here before it broke the resumability story.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-empty-counter").await?;
+        let parent_id = parent.id.clone();
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                sample_continuation("t-empty-counter"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        // Drive **every** child to Completed out-of-band via
+        // `update()` so the Phase 2.6 recompute path has never run
+        // but `by_parent` still holds both entries. The parent is
+        // left in `WaitingOnChildren{2}` with a stale counter.
+        for (i, child) in children.iter().enumerate() {
+            let offset = i64::try_from(i).context("fits i64")?;
+            let running = child
+                .clone()
+                .mark_running(
+                    WorkerId::from_string(format!("w-oob-{i}")),
+                    LeaseId::from_string(format!("l-oob-{i}")),
+                    t_plus(60),
+                    t_plus(10 + offset),
+                )
+                .context("oob running")?;
+            store
+                .update(running.clone())
+                .await
+                .context("update oob running")?;
+            let done = running.complete(t_plus(20 + offset)).context("oob done")?;
+            store.update(done).await.context("update oob done")?;
+        }
+
+        // Confirm the setup: parent still in WaitingOnChildren{2}
+        // and every child present in `by_parent` but terminal.
+        let stale_parent = store
+            .get(&parent_id)
+            .await
+            .context("get stale parent")?
+            .context("parent exists")?;
+        assert_eq!(stale_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(stale_parent.pending_child_count, 2);
+        let still_children = store
+            .list_children(&parent_id)
+            .await
+            .context("list children")?;
+        assert_eq!(still_children.len(), 2);
+        assert!(
+            still_children.iter().all(|c| c.status.is_terminal()),
+            "every child must be terminal before the recompute"
+        );
+
+        // Recompute the parent's counter directly via the pure
+        // transition helper so the edge case is exercised without a
+        // new child-terminal call site. Live count is zero because
+        // every `by_parent` entry is already terminal.
+        let recomputed = stale_parent
+            .clone()
+            .recompute_pending_children(0, t_plus(30))
+            .context("recompute")?;
+        assert_eq!(recomputed.status, TaskStatus::Pending);
+        assert_eq!(recomputed.pending_child_count, 0);
+        assert!(
+            recomputed.state.is_none(),
+            "terminal-count-zero must clear the typed state"
+        );
+        store
+            .update(recomputed)
+            .await
+            .context("persist recompute")?;
+
+        // The store now reflects the resumed parent via the
+        // journal-derived counter alone — no complete_child call,
+        // no caller-maintained counter.
+        let final_parent = store
+            .get(&parent_id)
+            .await
+            .context("get resumed parent")?
+            .context("parent exists")?;
+        assert_eq!(final_parent.status, TaskStatus::Pending);
+        assert_eq!(final_parent.pending_child_count, 0);
+        assert!(final_parent.state.is_none());
         Ok(())
     }
 }
