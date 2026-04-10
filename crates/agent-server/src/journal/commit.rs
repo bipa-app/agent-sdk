@@ -143,18 +143,20 @@ pub async fn commit_completed_turn(
         .context("commit: advance thread aggregate")?;
 
     // 3. Append messages to the message projection.
-    message_store
-        .commit_messages(&params.thread_id, params.messages.clone(), params.now)
+    let updated_projection = message_store
+        .commit_messages(&params.thread_id, params.messages, params.now)
         .await
         .context("commit: append messages")?;
 
-    // 4. Create the checkpoint.
+    // 4. Create the checkpoint with the *full* accumulated history,
+    //    not the delta — recovery must be able to restore the thread
+    //    to this turn without replaying prior turns.
     let checkpoint = checkpoint_store
         .commit_checkpoint(NewCheckpointParams {
             thread_id: params.thread_id,
             turn_number: thread.committed_turns,
             task_id: params.task_id,
-            messages: params.messages,
+            messages: updated_projection.messages,
             agent_state_snapshot: params.agent_state_snapshot,
             turn_usage: params.turn_usage,
             now: params.now,
@@ -384,6 +386,18 @@ mod tests {
         // Messages accumulated.
         let history = s.messages.get_history(&thread_a()).await?;
         assert_eq!(history.len(), 2);
+
+        // Checkpoints capture full history, not just the delta.
+        assert_eq!(
+            o1.checkpoint.messages.len(),
+            1,
+            "turn 1 checkpoint: 1 message"
+        );
+        assert_eq!(
+            o2.checkpoint.messages.len(),
+            2,
+            "turn 2 checkpoint: full history"
+        );
 
         Ok(())
     }
