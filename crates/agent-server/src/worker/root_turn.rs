@@ -561,6 +561,15 @@ async fn suspend_at_tool_boundary(
         .context("task disappeared during suspension")?;
 
     if current_task.status == TaskStatus::WaitingOnChildren {
+        // Close the attempt opened at the start of execute_root_turn so
+        // it doesn't remain permanently unclosed in the audit trail.
+        close_attempt_with(
+            &attempt,
+            TurnAttemptOutcome::Cancelled,
+            deps.attempt_store,
+            now,
+        )
+        .await;
         bail!(
             "task {task_id} already transitioned to WaitingOnChildren; \
              skipping duplicate suspension",
