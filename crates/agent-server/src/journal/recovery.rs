@@ -53,10 +53,10 @@
 //! | Any              | `Queued`                                          | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Any              | `Completed` / `Failed` / `Cancelled`              | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //!
-//! The table is locked by
-//! [`tests::classify_recovery_matrix_is_exhaustive`] so any future
-//! status / kind addition forces an explicit classification rather
-//! than silently inheriting `NoAction`.
+//! The table is locked by the
+//! `classify_recovery_matrix_is_exhaustive` test in this module so
+//! any future status / kind addition forces an explicit
+//! classification rather than silently inheriting `NoAction`.
 //!
 //! # Integration with the store
 //!
@@ -127,7 +127,8 @@ impl FailureReason {
     /// [`AgentTask::last_error`] whenever Phase 2.5 fails a row
     /// closed.
     ///
-    /// Wire-format locked by [`tests::failure_reason_error_prefix_is_stable`].
+    /// Wire-format locked by the `failure_reason_error_prefix_is_stable`
+    /// test in this module.
     #[must_use]
     pub const fn error_prefix(self) -> &'static str {
         match self {
