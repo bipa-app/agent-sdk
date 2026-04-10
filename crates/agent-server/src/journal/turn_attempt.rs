@@ -311,10 +311,7 @@ impl TurnAttempt {
         let dur = now - self.opened_at;
         // max(0) ensures we clamp negative durations (clock skew) to zero.
         // try_from is safe after clamping to [0, u64::MAX].
-        let ms = dur
-            .whole_milliseconds()
-            .max(0)
-            .min(i128::from(u64::MAX));
+        let ms = dur.whole_milliseconds().max(0).min(i128::from(u64::MAX));
         self.duration_ms = Some(u64::try_from(ms).unwrap_or(u64::MAX));
 
         self.validate()?;
@@ -531,7 +528,9 @@ mod tests {
     #[test]
     fn close_attempt_fills_response_fields() {
         let attempt = TurnAttempt::open(sample_open_params());
-        let closed = attempt.close(sample_close_params(), t_plus(5)).expect("close");
+        let closed = attempt
+            .close(sample_close_params(), t_plus(5))
+            .expect("close");
 
         assert!(closed.is_closed());
         assert!(!closed.is_open());
@@ -555,7 +554,9 @@ mod tests {
     #[test]
     fn close_on_already_closed_returns_error() {
         let attempt = TurnAttempt::open(sample_open_params());
-        let closed = attempt.close(sample_close_params(), t_plus(1)).expect("close");
+        let closed = attempt
+            .close(sample_close_params(), t_plus(1))
+            .expect("close");
         let err = closed
             .close(sample_close_params(), t_plus(2))
             .expect_err("should reject double close");
@@ -649,7 +650,9 @@ mod tests {
     #[test]
     fn closed_attempt_round_trips_through_json() {
         let attempt = TurnAttempt::open(sample_open_params());
-        let closed = attempt.close(sample_close_params(), t_plus(3)).expect("close");
+        let closed = attempt
+            .close(sample_close_params(), t_plus(3))
+            .expect("close");
         let json = serde_json::to_string(&closed).expect("serialize");
         let back: TurnAttempt = serde_json::from_str(&json).expect("deserialize");
 
@@ -664,7 +667,9 @@ mod tests {
     #[test]
     fn closed_attempt_json_contains_expected_fields() {
         let attempt = TurnAttempt::open(sample_open_params());
-        let closed = attempt.close(sample_close_params(), t_plus(2)).expect("close");
+        let closed = attempt
+            .close(sample_close_params(), t_plus(2))
+            .expect("close");
         let json = serde_json::to_value(&closed).expect("serialize");
 
         // Verify provenance fields are present

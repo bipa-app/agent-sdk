@@ -37,9 +37,7 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use super::task::AgentTaskId;
-use super::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
-};
+use super::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId};
 
 /// Storage trait for [`TurnAttempt`] audit rows.
 ///
@@ -70,7 +68,7 @@ pub trait TurnAttemptStore: Send + Sync {
     /// marks the row as closed.
     ///
     /// # Errors
-    /// - [`TurnAttemptSchemaError::AlreadyClosed`] if the row is
+    /// - [`super::TurnAttemptSchemaError::AlreadyClosed`] if the row is
     ///   already closed.
     /// - `attempt not found` if the id does not exist.
     /// - Store-level write errors.
@@ -189,8 +187,8 @@ impl TurnAttemptStore for InMemoryTurnAttemptStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::turn_attempt::TurnAttemptSchemaError;
+    use super::*;
     use agent_sdk_core::audit::AuditProvenance;
     use time::Duration;
 
@@ -278,11 +276,7 @@ mod tests {
         assert_eq!(closed.response_id, Some("msg_1".into()));
 
         // Verify the stored row is also closed.
-        let fetched = store
-            .get(&attempt.id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let fetched = store.get(&attempt.id).await.expect("get").expect("exists");
         assert!(fetched.is_closed());
     }
 
