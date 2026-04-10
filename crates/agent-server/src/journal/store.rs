@@ -208,7 +208,8 @@ use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 use super::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskKind, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
+    WorkerId,
 };
 
 /// Persistent store for [`AgentTask`] rows.
@@ -578,7 +579,7 @@ pub trait AgentTaskStore: Send + Sync {
         worker: &WorkerId,
         lease: &LeaseId,
         child_count: u32,
-        continuation: ContinuationEnvelope,
+        payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
@@ -691,7 +692,7 @@ pub trait AgentTaskStore: Send + Sync {
         worker: &WorkerId,
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
-        continuation: ContinuationEnvelope,
+        payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)>;
 
@@ -1855,7 +1856,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         child_count: u32,
-        continuation: ContinuationEnvelope,
+        payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut inner = self.inner.write().await;
@@ -1885,7 +1886,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let paused = old
             .clone()
-            .wait_on_children(child_count, continuation, now)
+            .wait_on_children(child_count, payload, now)
             .context("pause rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.by_id.insert(paused.id.clone(), paused.clone());
@@ -1940,7 +1941,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         worker: &WorkerId,
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
-        continuation: ContinuationEnvelope,
+        payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -2015,7 +2016,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .context("spawn rejected: child count exceeds u32::MAX")?;
         let new_parent = old_parent
             .clone()
-            .wait_on_children(child_count, continuation, now)
+            .wait_on_children(child_count, payload, now)
             .context("spawn rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old_parent, &new_parent);
         inner
@@ -2773,7 +2774,14 @@ mod tests {
                         .await
                         .context("drive running")?;
                     let waiting = running
-                        .wait_on_children(2, sample_continuation("t1"), t_plus(2))
+                        .wait_on_children(
+                            2,
+                            SuspensionPayload {
+                                continuation: sample_continuation("t1"),
+                                suspended_messages: Vec::new(),
+                            },
+                            t_plus(2),
+                        )
                         .context("wait_on_children")?;
                     store.update(waiting).await.context("update waiting")?;
                 }
@@ -3470,7 +3478,14 @@ mod tests {
         // Exercise Pending → WaitingOnChildren → Pending.
         let running2 = running_root(&store, active).await.context("running 2")?;
         let waiting = running2
-            .wait_on_children(1, sample_continuation("t1"), t_plus(7))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation("t1"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(7),
+            )
             .context("wait")?;
         store
             .update(waiting.clone())
@@ -3640,7 +3655,14 @@ mod tests {
             .await
             .context("update running")?;
         let waiting = running
-            .wait_on_children(2, sample_continuation("t-wait"), t_plus(2))
+            .wait_on_children(
+                2,
+                SuspensionPayload {
+                    continuation: sample_continuation("t-wait"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
             .context("wait_on_children")?;
         store.update(waiting).await.context("update waiting")?;
 
@@ -3951,7 +3973,14 @@ mod tests {
             .await
             .context("insert child")?;
         let b_waiting = b_running
-            .wait_on_children(1, sample_continuation("b"), t_plus(3))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation("b"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(3),
+            )
             .context("wait_on_children")?;
         store.update(b_waiting).await.context("update waiting")?;
 
@@ -4448,7 +4477,14 @@ mod tests {
         // we want the sweep below to act on the tool child only, not
         // accidentally on an expired root lease.
         let waiting_root = running
-            .wait_on_children(1, sample_continuation("t1"), t_plus(3))
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation("t1"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(3),
+            )
             .context("root waiting")?;
         store
             .update(waiting_root)
@@ -4600,7 +4636,10 @@ mod tests {
                 &worker,
                 &lease,
                 2,
-                sample_continuation("t-pause-children"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-pause-children"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -4678,7 +4717,10 @@ mod tests {
                 &worker,
                 &lease,
                 1,
-                sample_continuation("t-invisible-target"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-invisible-target"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -4746,7 +4788,10 @@ mod tests {
                 &worker,
                 &lease,
                 1,
-                sample_continuation("t-scan-invisible"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-scan-invisible"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -4801,7 +4846,10 @@ mod tests {
                 &WorkerId::from_string("w-imposter"),
                 &lease,
                 1,
-                sample_continuation("t-cas"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-cas"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -4816,7 +4864,10 @@ mod tests {
                 &worker,
                 &LeaseId::from_string("l-stale"),
                 1,
-                sample_continuation("t-cas"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-cas"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(3),
             )
             .await
@@ -4894,7 +4945,10 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 1,
-                sample_continuation("t-pending"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-pending"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(1),
             )
             .await
@@ -4999,7 +5053,10 @@ mod tests {
                 &worker,
                 &lease,
                 1,
-                sample_continuation("t-round-trip"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-round-trip"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -5096,7 +5153,10 @@ mod tests {
                 &worker,
                 &lease,
                 4,
-                sample_continuation("t-json-children"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-json-children"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -5143,6 +5203,7 @@ mod tests {
         let mut bad = AgentTask::new_root_turn(thread("t-bad-2"), t_plus(0), 3);
         bad.state = TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation("t-bad-2")),
+            suspended_messages: Vec::new(),
         };
         let err = bad.validate().unwrap_err();
         assert!(
@@ -5774,7 +5835,10 @@ mod tests {
                 &worker,
                 &lease,
                 specs,
-                sample_continuation("t-spawn"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-spawn"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -5835,7 +5899,10 @@ mod tests {
                 &WorkerId::from_string("w-imposter"),
                 &lease,
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-spawn-cas"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-spawn-cas"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -5851,7 +5918,10 @@ mod tests {
                 &worker,
                 &LeaseId::from_string("l-stale"),
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-spawn-cas"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-spawn-cas"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(3),
             )
             .await
@@ -5892,7 +5962,10 @@ mod tests {
                 &WorkerId::from_string("w1"),
                 &LeaseId::from_string("l1"),
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-spawn-pending"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-spawn-pending"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(1),
             )
             .await
@@ -5921,7 +5994,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-leaf"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-leaf"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -5950,7 +6026,10 @@ mod tests {
                 &WorkerId::from_string("w-leaf"),
                 &LeaseId::from_string("l-leaf"),
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-leaf"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-leaf"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(4),
             )
             .await
@@ -5974,7 +6053,10 @@ mod tests {
                 &worker,
                 &lease,
                 Vec::new(),
-                sample_continuation("t-empty"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-empty"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6010,7 +6092,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-scan-children"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-scan-children"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(10),
             )
             .await
@@ -6067,7 +6152,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-complete"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-complete"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6101,7 +6189,7 @@ mod tests {
             if i == children.len() - 1 {
                 assert_eq!(observed.status, TaskStatus::Pending);
                 assert_eq!(observed.pending_child_count, 0);
-                assert!(observed.state.is_none());
+                assert!(matches!(observed.state, TaskState::ReadyToResume { .. }));
             } else {
                 assert_eq!(observed.status, TaskStatus::WaitingOnChildren);
                 assert!(observed.state.continuation().is_some());
@@ -6143,7 +6231,10 @@ mod tests {
                     ChildSpawnSpec::new(2),
                     ChildSpawnSpec::new(2),
                 ],
-                sample_continuation("t-partial"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-partial"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6201,7 +6292,10 @@ mod tests {
                     ChildSpawnSpec::new(2),
                     ChildSpawnSpec::new(2),
                 ],
-                sample_continuation("t-recompute"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-recompute"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6266,7 +6360,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::default()],
-                sample_continuation("t-cc-cas"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-cc-cas"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6340,7 +6437,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-fail"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-fail"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6425,7 +6525,10 @@ mod tests {
                     ChildSpawnSpec::new(2),
                     ChildSpawnSpec::new(2),
                 ],
-                sample_continuation("t-mixed"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-mixed"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6504,7 +6607,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-late-complete"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-late-complete"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6579,7 +6685,10 @@ mod tests {
                     ChildSpawnSpec::new(2),
                     ChildSpawnSpec::new(2),
                 ],
-                sample_continuation("t-tree"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-tree"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6651,7 +6760,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-tree-live"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-tree-live"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6732,7 +6844,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::default(), ChildSpawnSpec::default()],
-                sample_continuation("t-tree-idem"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-tree-idem"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6769,7 +6884,10 @@ mod tests {
                     ChildSpawnSpec::new(2),
                     ChildSpawnSpec::new(2),
                 ],
-                sample_continuation("t-tree-waiting"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-tree-waiting"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6894,7 +7012,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-journal"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-journal"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -6927,7 +7048,7 @@ mod tests {
             .context("live parent")?
             .context("parent exists")?;
         assert_eq!(live_parent.status, TaskStatus::Pending);
-        assert!(live_parent.state.is_none());
+        assert!(matches!(live_parent.state, TaskState::ReadyToResume { .. }));
 
         // Round-trip every row through JSON and rebuild a fresh
         // store from the persisted bytes alone.
@@ -6967,7 +7088,10 @@ mod tests {
             .context("rehydrate get parent")?
             .context("parent exists in rehydrated store")?;
         assert_eq!(rehydrated_parent.status, TaskStatus::Pending);
-        assert!(rehydrated_parent.state.is_none());
+        assert!(matches!(
+            rehydrated_parent.state,
+            TaskState::ReadyToResume { .. }
+        ));
         // The parent is runnable in the rehydrated store too.
         let scanned = rehydrated_store
             .acquire_next_runnable(
@@ -7004,7 +7128,10 @@ mod tests {
                 &worker,
                 &lease,
                 vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
-                sample_continuation("t-empty-counter"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-empty-counter"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -7063,8 +7190,8 @@ mod tests {
         assert_eq!(recomputed.status, TaskStatus::Pending);
         assert_eq!(recomputed.pending_child_count, 0);
         assert!(
-            recomputed.state.is_none(),
-            "terminal-count-zero must clear the typed state"
+            matches!(recomputed.state, TaskState::ReadyToResume { .. }),
+            "terminal-count-zero must transition to ReadyToResume"
         );
         store
             .update(recomputed)
@@ -7081,7 +7208,10 @@ mod tests {
             .context("parent exists")?;
         assert_eq!(final_parent.status, TaskStatus::Pending);
         assert_eq!(final_parent.pending_child_count, 0);
-        assert!(final_parent.state.is_none());
+        assert!(matches!(
+            final_parent.state,
+            TaskState::ReadyToResume { .. }
+        ));
         Ok(())
     }
 
@@ -7401,7 +7531,10 @@ mod tests {
                 &worker,
                 &lease,
                 specs,
-                sample_continuation("t-conc-batch"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-conc-batch"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await
@@ -7446,7 +7579,10 @@ mod tests {
             .context("exists")?;
         assert_eq!(final_parent.status, TaskStatus::Pending);
         assert_eq!(final_parent.pending_child_count, 0);
-        assert!(final_parent.state.is_none());
+        assert!(matches!(
+            final_parent.state,
+            TaskState::ReadyToResume { .. }
+        ));
         Ok(())
     }
 
@@ -7463,7 +7599,10 @@ mod tests {
                 &worker,
                 &lease,
                 specs,
-                sample_continuation("t-conc-mix"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-conc-mix"),
+                    suspended_messages: Vec::new(),
+                },
                 t_plus(2),
             )
             .await

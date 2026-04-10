@@ -321,7 +321,7 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::task::{LeaseId, WorkerId};
+    use crate::journal::task::{LeaseId, SuspensionPayload, WorkerId};
     use crate::journal::task_state::TaskState;
     use agent_sdk_core::{
         AgentContinuation, AgentState, ContinuationEnvelope, ListenExecutionContext, ThreadId,
@@ -403,7 +403,14 @@ mod tests {
                     t_plus(200),
                     t_plus(150),
                 )?;
-                running.wait_on_children(1, sample_continuation(), t_plus(160))
+                running.wait_on_children(
+                    1,
+                    SuspensionPayload {
+                        continuation: sample_continuation(),
+                        suspended_messages: Vec::new(),
+                    },
+                    t_plus(160),
+                )
             }
             TaskStatus::AwaitingConfirmation => {
                 let running = root.mark_running(

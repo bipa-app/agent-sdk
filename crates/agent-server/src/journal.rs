@@ -456,8 +456,8 @@ pub use recovery::{
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskKind, TaskSchemaError, TaskStatus,
-    WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
+    TaskStatus, WorkerId,
 };
 pub use task_state::TaskState;
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
