@@ -105,7 +105,7 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`journal`] | Durable `agent_tasks` schema: [`AgentTask`], [`TaskKind`], [`TaskStatus`], identity types, and state-machine invariants (Phase 2.1) |
+//! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, and Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resolve_child` / `resume_from_confirmation` entry points |
 //!
 //! ## Planned modules (not yet implemented)
 //!
@@ -121,7 +121,7 @@ pub mod journal;
 
 pub use journal::{
     AgentTask, AgentTaskId, AgentTaskStore, InMemoryAgentTaskStore, LeaseId, TaskKind,
-    TaskSchemaError, TaskStatus, WorkerId,
+    TaskSchemaError, TaskState, TaskStatus, WorkerId,
 };
 
 // ── Re-exports that validate the dependency edges ────────────────────
