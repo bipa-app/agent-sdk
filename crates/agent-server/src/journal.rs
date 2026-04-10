@@ -96,13 +96,16 @@
 //!   [`AgentTaskStore::acquire_next_runnable`] or
 //!   [`AgentTaskStore::try_acquire_task`].
 //! - [`AgentTaskStore::pause_on_children`],
-//!   [`AgentTaskStore::pause_on_confirmation`],
-//!   [`AgentTaskStore::resolve_child`], and
+//!   [`AgentTaskStore::pause_on_confirmation`], and
 //!   [`AgentTaskStore::resume_from_confirmation`] are the journal-guarded
 //!   pause / resume entry points. They run the row's status CAS, the
 //!   typed-state mutation, and the index rebalance under one write
 //!   lock so the journal is the single source of truth for the
-//!   paused-state transitions.
+//!   paused-state transitions. (Phase 2.4 also shipped a one-shot
+//!   `resolve_child(parent_id)` decrement helper — it was retired in
+//!   Phase 2.6 when the parent counter became journal-derived, see
+//!   [`AgentTaskStore::complete_child`] / [`AgentTaskStore::fail_child`]
+//!   for the replacement.)
 //! - The state ↔ status invariant is enforced by
 //!   [`AgentTask::validate`] (rejecting any row whose typed payload
 //!   disagrees with its status) and is round-tripped through JSON for
@@ -140,11 +143,46 @@
 //!   worker can never heartbeat a row that the sweep has released
 //!   back to `Pending` or failed closed.
 //!
+//! Phase 2.6 (ENG-7920) layers tool-runtime child orchestration,
+//! cancellation cascade, and fully journal-driven parent resume
+//! triggers on top:
+//!
+//! - [`AgentTaskStore::spawn_tool_children`] is the single atomic
+//!   entry point for creating tool-runtime child tasks. A successful
+//!   call CAS-checks the parent's lease, persists one fresh
+//!   [`TaskKind::ToolRuntime`] row per [`task::ChildSpawnSpec`],
+//!   transitions the parent to [`TaskStatus::WaitingOnChildren`] with
+//!   a typed continuation, and drops the parent's lease — all under
+//!   the same write lock so no partial batch can ever be observed.
+//! - [`AgentTaskStore::complete_child`] and
+//!   [`AgentTaskStore::fail_child`] drive a running child to its
+//!   terminal state (`Completed` / `Failed`) and, under the same
+//!   write lock, recompute the parent's `pending_child_count`
+//!   authoritatively from the `by_parent` live-children index via
+//!   [`AgentTask::recompute_pending_children`]. The parent becomes
+//!   runnable the moment its last live child reaches any terminal
+//!   state — there is no channel, no in-memory queue, and no
+//!   caller-maintained counter involved.
+//! - [`AgentTaskStore::cancel_tree`] cascades cancellation through
+//!   the `by_parent` index. It walks `root_id` and every descendant
+//!   in BFS order under the store write lock, runs
+//!   [`AgentTask::cancel`] on each non-terminal row, and drops any
+//!   live leases along the way. Stale workers that held those
+//!   leases fail their next Phase 2.3 `(worker_id, lease_id)` CAS
+//!   and cannot mutate the row on the way out.
+//! - The journal-driven resume contract means a crashed worker can
+//!   restart mid-batch entirely from the durable row set: the
+//!   parent's typed [`TaskState::WaitingOnChildren`] carries the
+//!   continuation, `list_children(parent_id)` carries the aggregated
+//!   outcomes, and `recompute_pending_children` re-derives the
+//!   counter from scratch on every terminal child transition.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Tool-runtime child orchestration | 2.6 |
+//! | Actual tool-runtime worker | 2.7+ |
+//! | Subagent runtime | 3+ |
 //! | Confirmation transport APIs | post-2.4 |
 
 pub mod recovery;
@@ -156,5 +194,8 @@ pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
-pub use task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskSchemaError, TaskStatus, WorkerId};
+pub use task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, TaskKind, TaskSchemaError, TaskStatus,
+    WorkerId,
+};
 pub use task_state::TaskState;

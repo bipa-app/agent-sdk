@@ -37,6 +37,23 @@
 //!   so a row whose status disagrees with its [`TaskState`] cannot
 //!   round-trip through the store.
 //!
+//! Phase 2.6 (ENG-7920) adds two new surfaces on top of the schema
+//! without changing any of the existing invariants:
+//!
+//! - [`ChildSpawnSpec`] — the per-child input struct the store's new
+//!   `spawn_tool_children` entry point consumes. Phase 2.6 keeps the
+//!   struct deliberately narrow (just `max_attempts`) so the schema
+//!   layer does not accrete tool-runtime payloads that belong on a
+//!   later phase's typed task-state.
+//! - [`AgentTask::recompute_pending_children`] — a pure helper that
+//!   authoritatively replaces the parent's `pending_child_count`
+//!   from a live-children count and, when the count hits zero, flips
+//!   the row back to [`TaskStatus::Pending`] with [`TaskState::None`].
+//!   The store calls this from `complete_child` / `fail_child` so the
+//!   parent's counter is derived from the journal (`by_parent` +
+//!   status) every time instead of drifting through saturating
+//!   arithmetic.
+//!
 //! Later phases layer on top:
 //!
 //! | Phase | What it adds |
@@ -45,11 +62,14 @@
 //! | 2.3 | Lease acquisition API, CAS guards, expiry sweeps |
 //! | 2.4 | Typed pause-state, journal-guarded pause / resume transitions |
 //! | 2.5 | Retry budget + recovery workers |
-//! | 2.6 | Tool-runtime child-task orchestration |
+//! | 2.6 | Tool-runtime child-task orchestration and cancellation tree |
 //!
 //! Phase 2.1 was schema-only; Phase 2.4 keeps that flavour by limiting
 //! its surface to typed data, pure transitions, and `validate()` rules
-//! that the store can rely on without re-implementing them.
+//! that the store can rely on without re-implementing them. Phase 2.6
+//! follows the same rule — it adds one pure transition helper and one
+//! narrow input struct, and leaves cross-row orchestration to the
+//! store.
 
 use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
 use serde::{Deserialize, Serialize};
@@ -182,6 +202,50 @@ impl Default for LeaseId {
 impl fmt::Display for LeaseId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ChildSpawnSpec (Phase 2.6)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
+///
+/// Phase 2.6 (ENG-7920) adds the store-level entry point that atomically
+/// persists a batch of [`TaskKind::ToolRuntime`] children under a running
+/// parent and transitions the parent to [`TaskStatus::WaitingOnChildren`].
+/// Each child row is built from a `ChildSpawnSpec` via
+/// [`AgentTask::new_child`], inheriting the parent's `thread_id`,
+/// `root_id`, and `depth + 1` the same way the Phase 2.1 constructor
+/// already does.
+///
+/// The struct is deliberately narrow: the only per-child knob is
+/// [`ChildSpawnSpec::max_attempts`]. Tool-specific payload (name,
+/// input, tier, listen/execute staging, etc.) lives on the typed
+/// task-state a later phase's tool-runtime worker owns — it does not
+/// belong on the schema row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildSpawnSpec {
+    /// Per-child retry budget. Independent of the parent's budget
+    /// because child retries do not count against the parent's
+    /// attempt counter.
+    pub max_attempts: u32,
+}
+
+impl ChildSpawnSpec {
+    /// Construct a spec with the given retry budget.
+    #[must_use]
+    pub const fn new(max_attempts: u32) -> Self {
+        Self { max_attempts }
+    }
+}
+
+impl Default for ChildSpawnSpec {
+    /// Default spec uses [`AgentTask::DEFAULT_MAX_ATTEMPTS`] — matching
+    /// the retry budget a freshly constructed root turn would start
+    /// with in Phase 2.1.
+    fn default() -> Self {
+        Self::new(AgentTask::DEFAULT_MAX_ATTEMPTS)
     }
 }
 
@@ -978,6 +1042,15 @@ impl AgentTask {
     /// resume path on the eventual zero-child transition still has the
     /// continuation it captured at pause time.
     ///
+    /// Prefer [`Self::recompute_pending_children`] for Phase 2.6 and
+    /// later call sites: it derives the counter from the journal's
+    /// live-children index instead of trusting a caller-maintained
+    /// running total, so a double-complete or dropped-complete cannot
+    /// silently corrupt the parent. This helper is kept because the
+    /// pure transition is a useful building block for the recompute
+    /// path and for tests that want to exercise the counter
+    /// semantics in isolation.
+    ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
     /// [`TaskStatus::WaitingOnChildren`].
@@ -995,6 +1068,54 @@ impl AgentTask {
             // typed payload alongside the status flip; the resume path
             // is responsible for reading the continuation **before**
             // calling this helper.
+            self.state = TaskState::None;
+        }
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Authoritatively replace the parent's `pending_child_count` with
+    /// `live_children` and, when the count hits zero, flip the row back
+    /// to [`TaskStatus::Pending`] with [`TaskState::None`] so a worker
+    /// can pick it up and re-enter the loop.
+    ///
+    /// This is the Phase 2.6 replacement for [`Self::child_resolved`]'s
+    /// saturating subtraction: the store passes the live child count
+    /// derived from the `by_parent` index so a double-complete or a
+    /// dropped-complete cannot silently drift the parent's counter.
+    ///
+    /// `live_children` is the number of children still in a
+    /// non-terminal state. When the caller passes zero the parent
+    /// resumes; when the caller passes a positive number the parent
+    /// stays in [`TaskStatus::WaitingOnChildren`] with its typed
+    /// [`TaskState::WaitingOnChildren`] payload intact so the eventual
+    /// resume transition still has the continuation it was paused
+    /// with.
+    ///
+    /// The caller is responsible for reading the embedded continuation
+    /// **before** the final zero-children call because the pure
+    /// transition wipes the typed payload to satisfy the state ↔
+    /// status invariant — exactly the same discipline
+    /// [`Self::child_resolved`] already requires.
+    ///
+    /// # Errors
+    /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
+    ///   [`TaskStatus::WaitingOnChildren`].
+    pub fn recompute_pending_children(
+        mut self,
+        live_children: u32,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::WaitingOnChildren {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        }
+        self.pending_child_count = live_children;
+        if live_children == 0 {
+            self.status = TaskStatus::Pending;
             self.state = TaskState::None;
         }
         self.updated_at = now;
@@ -1730,6 +1851,114 @@ mod tests {
             "continuation must survive partial child resolution"
         );
         Ok(())
+    }
+
+    // ── Phase 2.6 pure transition: recompute_pending_children ─────
+
+    #[test]
+    fn recompute_pending_children_with_live_count_preserves_state() -> Result<()> {
+        // Derive-from-index semantics: passing a non-zero live count
+        // overwrites the counter but preserves the typed payload so
+        // the eventual zero-children transition can still read it.
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(3, sample_continuation(), t_plus(2))
+            .context("wait")?;
+        let recomputed = waiting
+            .recompute_pending_children(1, t_plus(3))
+            .context("recompute")?;
+        assert_eq!(recomputed.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(recomputed.pending_child_count, 1);
+        assert!(
+            recomputed.state.continuation().is_some(),
+            "continuation must survive non-terminal recompute"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recompute_pending_children_with_zero_live_count_resumes_parent() -> Result<()> {
+        // Zero live children is the resume trigger — status flips back
+        // to Pending and the typed payload is cleared to satisfy the
+        // state ↔ status invariant.
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(2, sample_continuation(), t_plus(2))
+            .context("wait")?;
+        let recomputed = waiting
+            .recompute_pending_children(0, t_plus(3))
+            .context("recompute")?;
+        assert_eq!(recomputed.status, TaskStatus::Pending);
+        assert_eq!(recomputed.pending_child_count, 0);
+        assert!(
+            recomputed.state.is_none(),
+            "Pending row must hold TaskState::None after recompute resume"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recompute_pending_children_is_idempotent_after_resume() -> Result<()> {
+        // A second recompute on an already-resumed parent is not
+        // legal through the pure transition — the row is no longer
+        // WaitingOnChildren so the helper refuses. This pins the
+        // invariant that "once the parent is Pending, only the normal
+        // acquisition path can move it".
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(1, sample_continuation(), t_plus(2))
+            .context("wait")?;
+        let recomputed = waiting
+            .recompute_pending_children(0, t_plus(3))
+            .context("recompute")?;
+        assert_eq!(recomputed.status, TaskStatus::Pending);
+
+        let err = recomputed
+            .recompute_pending_children(0, t_plus(4))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TaskSchemaError::InvalidTransition {
+                from: TaskStatus::Pending,
+                to: TaskStatus::Pending,
+            }
+        );
+        Ok(())
+    }
+
+    // ── Phase 2.6 ChildSpawnSpec ───────────────────────────────────
+
+    #[test]
+    fn child_spawn_spec_default_matches_default_max_attempts() {
+        let spec = ChildSpawnSpec::default();
+        assert_eq!(spec.max_attempts, AgentTask::DEFAULT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn child_spawn_spec_new_carries_the_given_budget() {
+        let spec = ChildSpawnSpec::new(5);
+        assert_eq!(spec.max_attempts, 5);
     }
 
     #[test]
