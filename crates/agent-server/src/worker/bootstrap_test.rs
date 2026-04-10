@@ -93,7 +93,7 @@ fn pending_root(thread_name: &str) -> AgentTask {
     AgentTask::new_root_turn(thread(thread_name), t0(), 3)
 }
 
-/// Build a ToolRuntime child task in Running status.
+/// Build a `ToolRuntime` child task in Running status.
 fn running_tool_child(parent: &AgentTask) -> AgentTask {
     let child = AgentTask::new_child(parent, TaskKind::ToolRuntime, t_plus(2), 3)
         .expect("child creation should succeed");
