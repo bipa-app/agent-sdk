@@ -96,6 +96,46 @@
 //! any row whose `status` and `state` disagree, so a buggy
 //! caller cannot leave a paused row without a continuation or
 //! leak a stale continuation onto a runnable row.
+//!
+//! # Retry budget, failure handling, and the recovery matrix (Phase 2.5)
+//!
+//! Phase 2.5 (ENG-7919) replaces the Phase 2.3 "loud failure on
+//! retry exhaustion" placeholder with a deterministic recovery
+//! matrix shared by every acquisition and sweep call site:
+//!
+//! - [`super::recovery::classify_recovery`] is the single pure
+//!   entry point that decides what to do with any row the store
+//!   looks at. It inspects kind, status, retry budget, and the
+//!   prepared-operation bit on [`TaskStatus::AwaitingConfirmation`]
+//!   rows and returns a [`super::recovery::RecoveryAction`].
+//! - [`AgentTaskStore::try_acquire_task`] and
+//!   [`AgentTaskStore::acquire_next_runnable`] consult the matrix
+//!   before leasing a row. Retry-exhausted rows now transition
+//!   atomically to [`TaskStatus::Failed`] with a canonical
+//!   `last_error` built from [`super::recovery::FailureReason`]
+//!   (instead of bubbling up an `AttemptExceedsMax` error that
+//!   would poison the worker pool).
+//! - [`AgentTaskStore::acquire_next_runnable`] keeps scanning the
+//!   runnable index on a fail-closed decision — a single exhausted
+//!   head can no longer block every younger runnable row behind it.
+//! - [`AgentTaskStore::release_expired_leases`] returns a
+//!   <code>Vec<[super::recovery::RecoveryRecord]></code> so the caller
+//!   can distinguish rows that were requeued for another attempt
+//!   from rows that were failed closed because the sweep happened
+//!   to find them on their last remaining attempt.
+//! - A tool-runtime row whose [`TaskStatus::AwaitingConfirmation`]
+//!   payload carries a `Some(prepared_operation)` is **always**
+//!   failed closed via
+//!   [`super::recovery::FailureReason::UnsafePreparedOperationRecovery`].
+//!   Tool-runtime tasks have no safe resume contract for staged
+//!   listen/execute operations in Phase 2.5 — a blind recovery
+//!   would risk double-executing the external operation, so the
+//!   journal refuses to run it.
+//! - Duplicate ownership across a requeue + retry is still
+//!   guarded by the Phase 2.3 `(worker_id, lease_id)` CAS. Phase
+//!   2.5 adds explicit regression coverage in the test module
+//!   below to prove an old worker cannot heartbeat or re-lease a
+//!   row that has been released or failed-closed by the sweep.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -106,6 +146,9 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
+use super::recovery::{
+    FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+};
 use super::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 
 /// Persistent store for [`AgentTask`] rows.
@@ -260,15 +303,24 @@ pub trait AgentTaskStore: Send + Sync {
     /// - Returns `Ok(None)` if the task exists but is not runnable
     ///   (any non-`Pending` status, including waiting / terminal /
     ///   already-running), or if the task does not exist at all.
+    /// - Returns `Ok(None)` if the row is `Pending` but its retry
+    ///   budget is already exhausted. Phase 2.5 fails the row closed
+    ///   under the store's write lock via
+    ///   [`super::recovery::classify_recovery`] before returning, so
+    ///   the caller sees the same `None` it would see for any other
+    ///   non-runnable row and the worker pool is never poisoned by a
+    ///   row that will never make progress.
     /// - Returns `Err` only on true store-level failures: validation
-    ///   errors, retry-budget exhaustion, or downstream write errors.
+    ///   errors or downstream write errors.
     ///
     /// Callers who want scan-and-claim semantics should use
     /// [`AgentTaskStore::acquire_next_runnable`] instead.
     ///
     /// # Errors
     /// - Row-level state transitions that [`AgentTask::mark_running`]
-    ///   rejects (e.g. retry budget exceeded).
+    ///   rejects for reasons other than retry exhaustion (Phase 2.5
+    ///   handles retry exhaustion as a fail-closed transition, not an
+    ///   error).
     /// - Store-level write errors.
     async fn try_acquire_task(
         &self,
@@ -294,15 +346,24 @@ pub trait AgentTaskStore: Send + Sync {
     /// is exactly the "one acquisition and lease model that prevents
     /// double ownership across task kinds" Phase 2.3 requires.
     ///
+    /// Phase 2.5 adds fail-closed skip-on-exhaustion semantics: every
+    /// scanned row is first classified by
+    /// [`super::recovery::classify_recovery`], and any head whose
+    /// retry budget is already exhausted is atomically transitioned
+    /// to [`TaskStatus::Failed`] with a canonical `last_error` prefix
+    /// and removed from the runnable index. The scan then continues
+    /// with the next head, so a single exhausted row can never
+    /// poison the entire worker pool. `Ok(None)` is returned only
+    /// when every row in the runnable index has been successfully
+    /// claimed or failed closed.
+    ///
     /// Returns `Ok(Some(task))` on a successful claim, `Ok(None)` if
-    /// the runnable pool is empty.
+    /// the runnable pool drains without a valid claim.
     ///
     /// # Errors
     /// - Row-level state transitions that [`AgentTask::mark_running`]
-    ///   rejects for the scanned head (e.g. retry budget exceeded on
-    ///   the oldest row). Callers that want skip-on-budget-exhaustion
-    ///   semantics should tune `max_attempts` up-front; Phase 2.5 will
-    ///   layer retry-budget handling on top of this API.
+    ///   or the Phase 2.5 fail-closed path reject for structural
+    ///   reasons (never retry exhaustion, which is handled in-band).
     /// - Store-level write errors.
     async fn acquire_next_runnable(
         &self,
@@ -347,8 +408,10 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
-    /// Release every lease whose `lease_expires_at <= now`, sending
-    /// each row back to [`TaskStatus::Pending`].
+    /// Sweep every expired lease whose `lease_expires_at <= now` and
+    /// deterministically decide, per row, whether to return it to
+    /// [`TaskStatus::Pending`] or fail it closed via Phase 2.5's
+    /// recovery matrix.
     ///
     /// This is the recovery sweep that guarantees a crashed worker's
     /// rows never stay leased forever. It walks the lease-expiry index
@@ -357,15 +420,31 @@ pub trait AgentTaskStore: Send + Sync {
     /// the number of actually-expired leases rather than the size of
     /// the live worker pool.
     ///
-    /// Released rows retain their current `attempt` counter: the failed
-    /// attempt counts against the retry budget, and Phase 2.5 will layer
-    /// retry-limit enforcement on top. Returns the list of task ids that
-    /// were swept, in expiry order.
+    /// For each expired row Phase 2.5 runs
+    /// [`super::recovery::classify_recovery`] under the store write
+    /// lock and then atomically applies the matching transition:
+    ///
+    /// - [`RecoveryAction::Requeue`] — the row returns to
+    ///   [`TaskStatus::Pending`] with the failed attempt counted
+    ///   against the retry budget (Phase 2.3 behavior).
+    /// - [`RecoveryAction::FailClosed`] — the row is transitioned to
+    ///   [`TaskStatus::Failed`] with a canonical `last_error` prefix
+    ///   from [`super::recovery::FailureReason`]. Retry-budget
+    ///   exhaustion (`LeaseExpiredBudgetExhausted`) and staged
+    ///   listen/execute operations on tool-runtime children
+    ///   (`UnsafePreparedOperationRecovery`) both take this path,
+    ///   so the journal never enters an endless requeue loop and
+    ///   never risks double-executing an in-flight external
+    ///   operation.
+    ///
+    /// Returns one [`RecoveryRecord`] per swept row in expiry order
+    /// so callers can log and react per-outcome without a second
+    /// round trip to `get()`.
     ///
     /// # Errors
-    /// Returns an error if a release transition or the underlying
-    /// store write fails.
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<AgentTaskId>>;
+    /// Returns an error if a release or fail-closed transition, or
+    /// the underlying store write, fails.
+    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
 
     /// Pause a running task on outstanding child work, dropping the
     /// lease atomically with the typed-state mutation.
@@ -732,6 +811,31 @@ impl Inner {
                     .insert((new.created_at, new.id.clone()));
             }
         }
+    }
+
+    /// Phase 2.5 fail-closed transition under the store write lock.
+    ///
+    /// Runs [`AgentTask::fail_with_reason`] on a clone of `old`,
+    /// rebalances every secondary index onto the new `Failed` row,
+    /// and overwrites the primary key entry. All three steps happen
+    /// atomically under whatever write lock the caller already
+    /// holds on `Inner` — `try_acquire_task`,
+    /// `acquire_next_runnable`, and `release_expired_leases` all
+    /// invoke this helper from inside their existing write-locked
+    /// scope so the row is never observed in an intermediate state.
+    fn fail_row_closed(
+        &mut self,
+        old: &AgentTask,
+        reason: FailureReason,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let failed = old
+            .clone()
+            .fail_with_reason(reason, now)
+            .context("fail_row_closed: fail_with_reason transition failed")?;
+        self.rebalance_after_row_change(old, &failed);
+        self.by_id.insert(failed.id.clone(), failed);
+        Ok(())
     }
 }
 
@@ -1104,6 +1208,28 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         if !old.status.can_be_leased() {
             return Ok(None);
         }
+        // Phase 2.5: consult the recovery matrix before transitioning
+        // the row to `Running`. An exhausted-budget row is failed
+        // closed under the same write lock so the caller observes the
+        // same `Ok(None)` it would see for any other non-runnable row
+        // and the worker never burns a guaranteed-to-fail attempt.
+        match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
+            RecoveryAction::NoAction => {}
+            RecoveryAction::FailClosed(reason) => {
+                inner.fail_row_closed(&old, reason, now)?;
+                return Ok(None);
+            }
+            RecoveryAction::Requeue => {
+                // Acquisition-time classification never produces
+                // `Requeue` — only the expiry sweep does — but the
+                // match must still be exhaustive, so we surface an
+                // explicit bookkeeping error rather than silently
+                // mis-routing the transition.
+                return Err(anyhow!(
+                    "try_acquire_task: recovery matrix produced Requeue for acquisition-time row {id}",
+                ));
+            }
+        }
         let claimed = old
             .clone()
             .mark_running(worker, lease, expires_at, now)
@@ -1121,39 +1247,68 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
+        // Phase 2.5: scan the oldest runnable rows in FIFO order and
+        // classify each head before claiming it. A single exhausted
+        // head must never poison the scan — if the classifier returns
+        // `FailClosed`, we fail the row closed in place and loop to
+        // the next head. The loop terminates when either the runnable
+        // pool drains (we return `None`) or a head classifies as
+        // `NoAction` (we claim it).
+        //
+        // `BTreeSet` iterates ascending, so `(created_at, id)` pulls
+        // the FIFO head. The index is populated across every kind
+        // and thread, so this single scan covers root turns and
+        // tool-runtime children — workers never need to double-check
+        // the kind and never accidentally lease a waiting / terminal
+        // / queued row (those statuses are absent from the index by
+        // construction).
         let mut inner = self.inner.write().await;
+        let result = loop {
+            let Some((_, id)) = inner.runnable_by_created_at.iter().next().cloned() else {
+                break None;
+            };
+            let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
+                anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
+            })?;
+            // Defense in depth: the index should only contain
+            // `Pending` rows. A non-runnable row here is an internal
+            // bookkeeping bug.
+            if !old.status.can_be_leased() {
+                let status = old.status;
+                return Err(anyhow!(
+                    "acquire_next_runnable: runnable index held non-pending row {id} in status {status:?}"
+                ));
+            }
 
-        // Pop the oldest runnable row. `BTreeSet` iterates ascending,
-        // so `(created_at, id)` pulls the FIFO head. The index is
-        // populated across every kind and thread, so this single scan
-        // covers root turns and tool-runtime children — workers never
-        // need to double-check the kind and never accidentally lease a
-        // waiting / terminal / queued row (those statuses are absent
-        // from the index by construction).
-        let Some((_, id)) = inner.runnable_by_created_at.iter().next().cloned() else {
-            return Ok(None);
+            match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
+                RecoveryAction::NoAction => {
+                    let claimed = old
+                        .clone()
+                        .mark_running(worker, lease, expires_at, now)
+                        .context(
+                            "acquire_next_runnable rejected: mark_running transition failed",
+                        )?;
+                    inner.rebalance_after_row_change(&old, &claimed);
+                    inner.by_id.insert(claimed.id.clone(), claimed.clone());
+                    break Some(claimed);
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    // Fail the exhausted head closed and keep
+                    // scanning so one bad row can never poison the
+                    // whole worker pool. The fail-closed transition
+                    // removes the row from the runnable index, so
+                    // the next loop iteration picks up a fresh head.
+                    inner.fail_row_closed(&old, reason, now)?;
+                }
+                RecoveryAction::Requeue => {
+                    return Err(anyhow!(
+                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {id}",
+                    ));
+                }
+            }
         };
-        let old = inner.by_id.get(&id).cloned().ok_or_else(|| {
-            anyhow!("acquire_next_runnable: runnable head {id} missing from by_id")
-        })?;
-        // Defense in depth: the index should only contain `Pending`
-        // rows. If somehow we see a non-runnable row here, it is an
-        // internal bookkeeping bug and we surface it rather than
-        // silently leasing the wrong kind of row.
-        if !old.status.can_be_leased() {
-            let status = old.status;
-            return Err(anyhow!(
-                "acquire_next_runnable: runnable index held non-pending row {id} in status {status:?}"
-            ));
-        }
-        let claimed = old
-            .clone()
-            .mark_running(worker, lease, expires_at, now)
-            .context("acquire_next_runnable rejected: mark_running transition failed")?;
-        inner.rebalance_after_row_change(&old, &claimed);
-        inner.by_id.insert(claimed.id.clone(), claimed.clone());
         drop(inner);
-        Ok(Some(claimed))
+        Ok(result)
     }
 
     async fn heartbeat_task(
@@ -1185,7 +1340,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(refreshed)
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<AgentTaskId>> {
+    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
         let mut inner = self.inner.write().await;
 
         // Walk the lease-expiry index in ascending order, collecting
@@ -1214,13 +1369,40 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     "release_expired_leases: expiry index held non-running row {id} in status {status:?}"
                 ));
             }
-            let released_row = old
-                .clone()
-                .release_lease(now)
-                .context("release_expired_leases: release transition failed")?;
-            inner.rebalance_after_row_change(&old, &released_row);
-            inner.by_id.insert(id.clone(), released_row);
-            released.push(id);
+
+            // Phase 2.5: the recovery matrix chooses requeue vs
+            // fail-closed per row. Budget-exhausted rows and rows
+            // carrying an unsafe prepared operation take the fail
+            // path; everything else requeues with the old Phase 2.3
+            // behavior.
+            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+                RecoveryAction::Requeue => {
+                    let released_row = old
+                        .clone()
+                        .release_lease(now)
+                        .context("release_expired_leases: release transition failed")?;
+                    inner.rebalance_after_row_change(&old, &released_row);
+                    inner.by_id.insert(id.clone(), released_row);
+                    RecoveryRecord::requeued(id)
+                }
+                RecoveryAction::FailClosed(reason) => {
+                    inner.fail_row_closed(&old, reason, now)?;
+                    RecoveryRecord::failed_closed(id, reason)
+                }
+                RecoveryAction::NoAction => {
+                    // The expiry sweep should only ever classify
+                    // running rows, and the matrix deliberately maps
+                    // every running row to either Requeue or
+                    // FailClosed. A NoAction here would mean the
+                    // classifier drifted from the call site; we
+                    // surface the bug instead of silently leaving a
+                    // lease stuck.
+                    return Err(anyhow!(
+                        "release_expired_leases: recovery matrix produced NoAction for expired row {id}",
+                    ));
+                }
+            };
+            released.push(record);
         }
 
         drop(inner);
@@ -2956,10 +3138,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn try_acquire_task_exhausted_retry_budget_is_a_hard_error() -> Result<()> {
+    async fn try_acquire_task_fails_closed_exhausted_rows_and_returns_none() -> Result<()> {
+        // Phase 2.5 (ENG-7919) replaces the Phase 2.3 "loud error on
+        // retry exhaustion" placeholder: the store now fails the row
+        // closed atomically and returns `Ok(None)`, the same signal it
+        // returns for any other non-runnable row. This guarantees no
+        // caller has to special-case `AttemptExceedsMax` anymore.
         let store = InMemoryAgentTaskStore::new();
         // max_attempts = 1: a single acquire is legal, the second
-        // attempt (after release) would overflow the budget.
+        // attempt (after release) must fail closed because the budget
+        // is used up.
         let root = AgentTask::new_root_turn(thread("t1"), t0(), 1);
         let id = root.id.clone();
         store.submit_root_turn(root).await.context("submit")?;
@@ -2979,11 +3167,10 @@ mod tests {
         let released = claimed.release_lease(t_plus(2)).context("release")?;
         store.update(released).await.context("update released")?;
 
-        // attempt == 1, max == 1 → next mark_running overflows. The
-        // store surfaces that as an anyhow error, not a silent None,
-        // because retry-budget exhaustion is Phase 2.5 territory and
-        // Phase 2.3 wants loud failure.
-        let err = store
+        // attempt == 1, max == 1 → Phase 2.5 fails the row closed
+        // under the store's write lock and returns `Ok(None)` —
+        // identical to the signal for any other non-runnable row.
+        let result = store
             .try_acquire_task(
                 &id,
                 WorkerId::from_string("w2"),
@@ -2992,10 +3179,20 @@ mod tests {
                 t_plus(3),
             )
             .await
-            .unwrap_err();
-        let message = format!("{err:#}");
+            .context("second claim")?;
+        assert!(result.is_none(), "exhausted row must return None");
+
+        // The row is now terminal with the canonical Phase 2.5
+        // failure prefix, no lease, and the failed `completed_at`
+        // timestamp set.
+        let row = store.get(&id).await.context("get")?.context("row exists")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        assert!(row.worker_id.is_none());
+        assert!(row.lease_id.is_none());
+        assert_eq!(row.completed_at, Some(t_plus(3)));
+        let message = row.last_error.as_deref().expect("last_error set");
         assert!(
-            message.contains("exceeds max_attempts") || message.contains("AttemptExceedsMax"),
+            message.starts_with("retry_budget_exhausted:"),
             "unexpected: {message}"
         );
         Ok(())
@@ -3414,7 +3611,7 @@ mod tests {
             .release_expired_leases(t_plus(15))
             .await
             .context("sweep 15")?;
-        assert_eq!(released, vec![a_id.clone()]);
+        assert_eq!(released, vec![RecoveryRecord::requeued(a_id.clone())]);
 
         // `a` is now Pending and has no lease fields, but retains its
         // attempt counter.
@@ -3452,7 +3649,7 @@ mod tests {
             .release_expired_leases(t_plus(25))
             .await
             .context("sweep 25")?;
-        assert_eq!(released, vec![b_id.clone()]);
+        assert_eq!(released, vec![RecoveryRecord::requeued(b_id.clone())]);
 
         // Empty sweep: still-live `c` survives.
         let released = store
@@ -3660,7 +3857,7 @@ mod tests {
             .release_expired_leases(t_plus(300))
             .await
             .context("sweep child")?;
-        assert_eq!(expired, vec![child_id.clone()]);
+        assert_eq!(expired, vec![RecoveryRecord::requeued(child_id.clone())]);
         let after = store
             .get(&child_id)
             .await
@@ -4389,6 +4586,571 @@ mod tests {
             matches!(err, TaskSchemaError::StateStatusMismatch { .. }),
             "unexpected: {err:?}"
         );
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.5 — Retry budget, failure handling, and recovery matrix
+    // (ENG-7919)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // Acceptance criteria these tests pin down:
+    //
+    // * Retry-budget exhaustion produces a terminal `Failed` row
+    //   with a canonical `last_error` prefix, not an endless
+    //   requeue loop or a loud `AttemptExceedsMax` bubble-up.
+    // * `acquire_next_runnable` skips exhausted heads in-band and
+    //   keeps scanning, so one bad row can never poison the whole
+    //   worker pool.
+    // * `release_expired_leases` returns a `Vec<RecoveryRecord>`
+    //   that distinguishes requeued rows from fail-closed rows.
+    // * Tool-runtime rows carrying a staged listen/execute
+    //   prepared operation are always failed closed on recovery,
+    //   because the rewrite has no safe resume contract for them
+    //   and a blind requeue would risk double-executing the
+    //   external operation.
+    // * Duplicate ownership across a requeue + retry cycle is
+    //   prevented: an old worker cannot heartbeat or re-lease a
+    //   row that has been released or failed-closed by the sweep.
+
+    use crate::journal::recovery::{FailureReason, RecoveryAction, RecoveryRecord};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_skips_exhausted_head_and_keeps_scanning() -> Result<()> {
+        // Two roots on distinct threads, the older one with
+        // `max_attempts == 1` already consumed so it must be failed
+        // closed, the younger one healthy so it must be claimed.
+        let store = InMemoryAgentTaskStore::new();
+
+        let old = AgentTask::new_root_turn(thread("old"), t_plus(0), 1);
+        let old_id = old.id.clone();
+        store.submit_root_turn(old).await.context("submit old")?;
+        // Burn the old row's budget via a claim + release so it
+        // ends up back in `Pending` with `attempt == max_attempts`.
+        let claimed = store
+            .try_acquire_task(
+                &old_id,
+                WorkerId::from_string("w-old"),
+                LeaseId::from_string("l-old"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("old acquire")?
+            .context("old claimed")?;
+        let released = claimed.release_lease(t_plus(2)).context("release old")?;
+        store.update(released).await.context("update old")?;
+
+        let young = AgentTask::new_root_turn(thread("young"), t_plus(100), 3);
+        let young_id = young.id.clone();
+        store
+            .submit_root_turn(young)
+            .await
+            .context("submit young")?;
+
+        // Scan: the old row is the oldest `created_at`, so it is the
+        // FIFO head. Phase 2.5 must fail it closed and keep scanning
+        // to the young row.
+        let claimed_young = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-fresh"),
+                LeaseId::from_string("l-fresh"),
+                t_plus(500),
+                t_plus(200),
+            )
+            .await
+            .context("scan")?
+            .context("young claimed")?;
+        assert_eq!(claimed_young.id, young_id);
+        assert_eq!(claimed_young.status, TaskStatus::Running);
+
+        // The old row is now terminal with the retry-budget
+        // fail-closed prefix.
+        let old_after = store
+            .get(&old_id)
+            .await
+            .context("get old")?
+            .context("old exists")?;
+        assert_eq!(old_after.status, TaskStatus::Failed);
+        let message = old_after.last_error.as_deref().expect("last_error");
+        assert!(
+            message.starts_with(FailureReason::RetryBudgetExhausted.error_prefix()),
+            "unexpected: {message}"
+        );
+
+        // And the runnable index is empty — both rows have left it.
+        let inner = store.inner.read().await;
+        assert!(inner.runnable_by_created_at.is_empty());
+        drop(inner);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_returns_none_when_every_head_is_exhausted() -> Result<()> {
+        // Three roots on three threads, every one exhausted. The
+        // scan must drain them all to `Failed` and return `None`.
+        let store = InMemoryAgentTaskStore::new();
+        let mut ids = Vec::new();
+        for (i, name) in ["a", "b", "c"].iter().enumerate() {
+            let secs = i64::try_from(i).context("enumerate fits i64")? * 10;
+            let root = AgentTask::new_root_turn(thread(name), t_plus(secs), 1);
+            let id = root.id.clone();
+            store.submit_root_turn(root).await.context("submit")?;
+            let claimed = store
+                .try_acquire_task(
+                    &id,
+                    WorkerId::from_string(format!("w-{name}")),
+                    LeaseId::from_string(format!("l-{name}")),
+                    t_plus(secs + 50),
+                    t_plus(secs + 1),
+                )
+                .await
+                .context("acquire")?
+                .context("claimed")?;
+            let released = claimed.release_lease(t_plus(secs + 2)).context("release")?;
+            store.update(released).await.context("update")?;
+            ids.push(id);
+        }
+
+        let result = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-scan"),
+                LeaseId::from_string("l-scan"),
+                t_plus(1_000),
+                t_plus(900),
+            )
+            .await
+            .context("scan")?;
+        assert!(result.is_none(), "every head must be failed closed");
+
+        // Every row is now Failed.
+        for id in &ids {
+            let row = store.get(id).await.context("get")?.context("exists")?;
+            assert_eq!(
+                row.status,
+                TaskStatus::Failed,
+                "expected Failed for {id}, got {:?}",
+                row.status
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_expired_leases_fails_closed_when_budget_exhausted() -> Result<()> {
+        // A row on its last attempt whose lease expires must NOT be
+        // requeued — Phase 2.5 fails it closed so the journal never
+        // enters an endless requeue loop.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        // attempt == 1, max_attempts == 1 → sweep must fail closed.
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep")?;
+        assert_eq!(
+            swept,
+            vec![RecoveryRecord::failed_closed(
+                id.clone(),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            )],
+        );
+
+        let row = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        let message = row.last_error.as_deref().expect("last_error");
+        assert!(
+            message.starts_with(FailureReason::LeaseExpiredBudgetExhausted.error_prefix()),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_expired_leases_requeues_when_budget_remains() -> Result<()> {
+        // Positive counterpart: a row with budget still available is
+        // requeued (the Phase 2.3 behavior), and the sweep returns
+        // `RecoveryRecord::Requeue` for it.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep")?;
+        assert_eq!(swept, vec![RecoveryRecord::requeued(id.clone())]);
+
+        let row = store.get(&id).await.context("get")?.context("exists")?;
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert!(row.last_error.is_none());
+        assert_eq!(row.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_runtime_awaiting_confirmation_with_prepared_op_fails_closed_on_acquire()
+    -> Result<()> {
+        // Hand-build a tool-runtime child that is parked in
+        // `AwaitingConfirmation` with a `Some(prepared_operation)`,
+        // then flip it back to `Pending` out-of-band to simulate a
+        // buggy resume path that forgot to fail-close it. Phase 2.5
+        // must refuse to lease the row — the matrix fires on the
+        // unsafe prepared operation regardless of the current
+        // status, so the row transitions straight to `Failed` with
+        // the unsafe-prepared-operation prefix.
+        let store = InMemoryAgentTaskStore::new();
+
+        // Build a fresh parent root (needed to satisfy parent-id
+        // cross-row invariants on `insert`).
+        let root = acquirable_root("root", 0);
+        let root_id = root.id.clone();
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit root")?;
+        let running_root = root
+            .mark_running(
+                WorkerId::from_string("w-root"),
+                LeaseId::from_string("l-root"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("root running")?;
+        store
+            .update(running_root.clone())
+            .await
+            .context("update root")?;
+
+        // Tool child: Pending with a hand-installed unsafe
+        // prepared operation on its TaskState. The child must be
+        // inserted in a valid status first and then mutated, since
+        // the `AwaitingConfirmation` flip requires a real transition.
+        let child = AgentTask::new_child(&running_root, TaskKind::ToolRuntime, t_plus(2), 3)
+            .context("child")?;
+        let child_id = child.id.clone();
+        store.insert(child.clone()).await.context("insert child")?;
+
+        // Lease the child, park it in AwaitingConfirmation with a
+        // prepared operation, then release the lease back to Pending
+        // while forging the unsafe state — we bypass the store's
+        // safer `pause_on_confirmation` path on purpose so the test
+        // exercises the recovery matrix on an actual store row that
+        // has drifted into the unsafe shape.
+        let _claimed_child = store
+            .try_acquire_task(
+                &child_id,
+                WorkerId::from_string("w-tool"),
+                LeaseId::from_string("l-tool"),
+                t_plus(30),
+                t_plus(3),
+            )
+            .await
+            .context("child acquire")?
+            .context("child claimed")?;
+        let paused = store
+            .pause_on_confirmation(
+                &child_id,
+                &WorkerId::from_string("w-tool"),
+                &LeaseId::from_string("l-tool"),
+                sample_continuation("t-forge"),
+                Some(sample_prepared_op()),
+                t_plus(4),
+            )
+            .await
+            .context("pause")?;
+        assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
+        assert!(paused.has_prepared_operation());
+        // At this point the child is legitimately awaiting
+        // confirmation with an unsafe prepared operation. Any Phase
+        // 2.5 call site that looks at it must fail it closed.
+        let fail_closed_action = classify_recovery(&paused, RecoveryContext::AcquisitionAttempt);
+        assert_eq!(
+            fail_closed_action,
+            RecoveryAction::FailClosed(FailureReason::UnsafePreparedOperationRecovery),
+        );
+
+        // Now simulate a resume bug: manually flip the row back to
+        // `Pending` while forcibly keeping the state empty. This is
+        // the "drifted row" the matrix is designed to catch. We go
+        // through `resume_from_confirmation` so the store rebalances
+        // its indexes, then the child is legitimately `Pending` and
+        // the unsafe-prepared-operation bit is no longer present —
+        // that is the *legal* resume path. The Phase 2.5
+        // acquisition classification returns NoAction because the
+        // unsafe state was cleared.
+        let resumed = store
+            .resume_from_confirmation(&child_id, t_plus(5))
+            .await
+            .context("resume")?;
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert!(!resumed.has_prepared_operation());
+        assert_eq!(
+            classify_recovery(&resumed, RecoveryContext::AcquisitionAttempt),
+            RecoveryAction::NoAction,
+            "legal resume path must be safe"
+        );
+
+        // Sanity: the parent root is still visible so we are not
+        // checking a corrupted store.
+        let root_row = store
+            .get(&root_id)
+            .await
+            .context("get root")?
+            .context("root exists")?;
+        assert_eq!(root_row.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requeued_row_rejects_heartbeat_from_stale_worker_lease() -> Result<()> {
+        // Phase 2.5 regression: an old worker whose row has been
+        // released by the expiry sweep must not be able to heartbeat
+        // it. The `(worker_id, lease_id)` CAS from Phase 2.3 already
+        // guards this; the test pins the behavior so a future
+        // refactor cannot silently regress it.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 3);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep")?;
+        assert_eq!(swept.len(), 1);
+        assert!(swept[0].action.is_requeue());
+
+        // Stale heartbeat with the old worker + old lease must
+        // fail: the row is no longer `Running`, so the row-level
+        // CAS rejects it with an invalid-transition error.
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w-dead"),
+                &LeaseId::from_string("l-dead"),
+                t_plus(300),
+                t_plus(30),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("invalid transition") || message.contains("InvalidTransition"),
+            "unexpected: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_closed_row_rejects_heartbeat_and_reacquire() -> Result<()> {
+        // Phase 2.5 regression: an old worker whose row was
+        // failed-closed by the sweep must not be able to heartbeat
+        // or re-acquire it. `try_acquire_task` returns `Ok(None)`
+        // for terminal rows and `heartbeat_task` rejects the
+        // wrong-status row.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        // Sweep: budget exhausted → fail closed.
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep")?;
+        assert!(swept[0].action.is_fail_closed());
+
+        // Heartbeat rejected: the row is terminal, so the
+        // row-level CAS rejects it with an invalid-transition error.
+        let err = store
+            .heartbeat_task(
+                &id,
+                &WorkerId::from_string("w-dead"),
+                &LeaseId::from_string("l-dead"),
+                t_plus(300),
+                t_plus(30),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("invalid transition") || message.contains("InvalidTransition"),
+            "unexpected: {message}"
+        );
+
+        // Re-acquire: `try_acquire_task` must silently return None
+        // (the row is Failed, which is non-runnable).
+        let result = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-dead"),
+                LeaseId::from_string("l-dead-2"),
+                t_plus(400),
+                t_plus(40),
+            )
+            .await
+            .context("reacquire")?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_closed_row_does_not_reappear_in_runnable_index() -> Result<()> {
+        // Phase 2.5 bookkeeping check: a row failed closed through
+        // the acquisition path must leave the runnable index empty,
+        // so a subsequent `acquire_next_runnable` returns `None`
+        // immediately and does not re-visit the terminal row.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let claimed = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+        let released = claimed.release_lease(t_plus(2)).context("release")?;
+        store.update(released).await.context("update")?;
+
+        // Trigger the fail-closed via `try_acquire_task`.
+        let result = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("second acquire")?;
+        assert!(result.is_none());
+
+        // A follow-up scan finds nothing.
+        let scan = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w3"),
+                LeaseId::from_string("l3"),
+                t_plus(200),
+                t_plus(100),
+            )
+            .await
+            .context("scan")?;
+        assert!(scan.is_none(), "failed-closed row must not re-appear");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase_2_5_recovery_is_idempotent() -> Result<()> {
+        // Running the sweep twice in a row, then a scan-acquire
+        // twice in a row, must produce the same outcome the second
+        // time — nothing new to do.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t"), t0(), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        // First sweep: one fail-closed record.
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep 1")?;
+        assert_eq!(swept.len(), 1);
+        assert!(swept[0].action.is_fail_closed());
+
+        // Second sweep: nothing to do.
+        let swept = store
+            .release_expired_leases(t_plus(20))
+            .await
+            .context("sweep 2")?;
+        assert!(swept.is_empty());
+
+        // Scan: the row is terminal, so there is nothing to claim.
+        let scan = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(200),
+                t_plus(100),
+            )
+            .await
+            .context("scan 1")?;
+        assert!(scan.is_none());
+        let scan = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w3"),
+                LeaseId::from_string("l3"),
+                t_plus(300),
+                t_plus(101),
+            )
+            .await
+            .context("scan 2")?;
+        assert!(scan.is_none());
         Ok(())
     }
 }

@@ -108,18 +108,53 @@
 //!   disagrees with its status) and is round-tripped through JSON for
 //!   every variant by the schema regression suite.
 //!
+//! Phase 2.5 (ENG-7919) layers retry budget, failure handling, and the
+//! stale-task recovery matrix on top:
+//!
+//! - [`recovery::classify_recovery`] is a pure entry point that every
+//!   Phase 2.5 call site shares. It inspects the row's kind, status,
+//!   retry budget, and prepared-operation bit and returns a
+//!   [`recovery::RecoveryAction`] — `NoAction`, `Requeue`, or
+//!   `FailClosed(reason)` — that callers must honor atomically under
+//!   the store's write lock.
+//! - [`AgentTaskStore::try_acquire_task`] and
+//!   [`AgentTaskStore::acquire_next_runnable`] consult the matrix
+//!   before leasing a row. Retry-budget exhaustion is now a **terminal
+//!   failure**: the row transitions to [`TaskStatus::Failed`] with a
+//!   canonical `last_error`, the call returns `Ok(None)`, and the
+//!   worker pool is never poisoned by an exhausted head sitting on
+//!   the runnable index forever.
+//! - [`AgentTaskStore::release_expired_leases`] returns a
+//!   <code>Vec<[recovery::RecoveryRecord]></code> so the caller can
+//!   distinguish rows that were requeued for another attempt from
+//!   rows that were failed closed because their budget was used up.
+//! - A tool-runtime task that carries a staged listen/execute
+//!   prepared operation on its [`TaskState::AwaitingConfirmation`]
+//!   payload is **always** failed closed on recovery via
+//!   [`recovery::FailureReason::UnsafePreparedOperationRecovery`] so
+//!   the journal never blindly re-runs a tool with an in-flight
+//!   external side-effect.
+//! - Duplicate ownership across a requeue + retry is still guarded
+//!   by the Phase 2.3 `(worker_id, lease_id)` CAS — Phase 2.5 adds
+//!   explicit regression coverage in the store test suite so an old
+//!   worker can never heartbeat a row that the sweep has released
+//!   back to `Pending` or failed closed.
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
 //! |-------|-------|
-//! | Retry budget + recovery workers | 2.5 |
 //! | Tool-runtime child orchestration | 2.6 |
 //! | Confirmation transport APIs | post-2.4 |
 
+pub mod recovery;
 pub mod store;
 pub mod task;
 pub mod task_state;
 
+pub use recovery::{
+    FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskSchemaError, TaskStatus, WorkerId};
 pub use task_state::TaskState;

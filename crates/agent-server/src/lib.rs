@@ -105,7 +105,7 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, and Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resolve_child` / `resume_from_confirmation` entry points |
+//! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resolve_child` / `resume_from_confirmation`, and Phase 2.5's retry budget / fail-closed recovery matrix shared across acquisition and expiry paths |
 //!
 //! ## Planned modules (not yet implemented)
 //!
@@ -120,8 +120,9 @@
 pub mod journal;
 
 pub use journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, InMemoryAgentTaskStore, LeaseId, TaskKind,
-    TaskSchemaError, TaskState, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, AgentTaskStore, FailureReason, InMemoryAgentTaskStore, LeaseId,
+    RecoveryAction, RecoveryContext, RecoveryRecord, TaskKind, TaskSchemaError, TaskState,
+    TaskStatus, WorkerId, classify_recovery,
 };
 
 // ── Re-exports that validate the dependency edges ────────────────────
