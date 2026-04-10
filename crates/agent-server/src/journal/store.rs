@@ -96,8 +96,8 @@
 //! The Phase 2.4 [`AgentTaskStore`] previously exposed a
 //! `resolve_child(parent_id)` helper that decremented the
 //! outstanding-child counter by one. Phase 2.6 replaced it with
-//! the journal-driven [`AgentTaskStore::complete_child`] /
-//! [`AgentTaskStore::fail_child`] pair — see the Phase 2.6
+//! the journal-driven [`AgentTaskStore::complete_task`] /
+//! [`AgentTaskStore::fail_task`] pair — see the Phase 2.6
 //! section below for why the decrement had to move.
 //!
 //! # Retry budget, failure handling, and the recovery matrix (Phase 2.5)
@@ -159,8 +159,8 @@
 //!   observable because the transition, the inserts, and the
 //!   index updates all run inside a single
 //!   `inner.write().await` scope.
-//! - [`AgentTaskStore::complete_child`] and
-//!   [`AgentTaskStore::fail_child`] drive a running child to its
+//! - [`AgentTaskStore::complete_task`] and
+//!   [`AgentTaskStore::fail_task`] drive a running child to its
 //!   terminal state (`Completed` / `Failed`) and, under the same
 //!   write lock, recompute the parent's `pending_child_count`
 //!   from the `by_parent` live-children index via
@@ -173,8 +173,8 @@
 //!   non-terminal descendant (and the root itself) via
 //!   [`AgentTask::cancel`]. Leases on `Running` rows are dropped
 //!   as part of the transition, so a stale worker's next
-//!   heartbeat / [`AgentTaskStore::complete_child`] /
-//!   [`AgentTaskStore::fail_child`] call fails the
+//!   heartbeat / [`AgentTaskStore::complete_task`] /
+//!   [`AgentTaskStore::fail_task`] call fails the
 //!   Phase 2.3 `(worker_id, lease_id)` CAS on the way out.
 //!   Already-terminal rows are skipped so repeat sweeps are
 //!   idempotent.
@@ -182,7 +182,7 @@
 //!   **removed**. It was a placeholder that subtracted one from
 //!   a parent's counter on every call, incompatible with Phase
 //!   2.6's journal-driven recompute. Its role is now served by
-//!   `complete_child` / `fail_child`, which both take a child id
+//!   `complete_task` / `fail_task`, which both take a child id
 //!   and a worker / lease CAS.
 //!
 //! The result is that a completed child batch makes the parent
@@ -217,24 +217,50 @@ use super::task::{
 /// the [`super`] module. The reference in-memory implementation below is
 /// used in tests and also acts as the semantic spec for any future SQL- or
 /// Redis-backed store.
+///
+/// # CAS discipline (Phase 2.7)
+///
+/// Every **state transition** a worker drives goes through a CAS-guarded
+/// method on this trait. The `(worker_id, lease_id)` tuple on every
+/// `Running` row is the ownership token — no mutation reaches the row
+/// unless the caller proves it holds the current lease.
+///
+/// **Structural primitives** (`insert`, `update`, `clear`) exist for
+/// store rehydration, test scaffolding, and internal batch plumbing.
+/// Worker code must never use them to drive lifecycle transitions —
+/// use the CAS helpers below instead.
+///
+/// ## Worker-visible CAS entry points
+///
+/// | Method | Transition | Guards |
+/// |--------|------------|--------|
+/// | [`submit_root_turn`](Self::submit_root_turn) | → `Pending` / `Queued` | kind, status, root invariants |
+/// | [`promote_next_queued_root`](Self::promote_next_queued_root) | `Queued` → `Pending` | active-root slot free |
+/// | [`try_acquire_task`](Self::try_acquire_task) / [`acquire_next_runnable`](Self::acquire_next_runnable) | `Pending` → `Running` | status CAS, retry budget |
+/// | [`heartbeat_task`](Self::heartbeat_task) | `Running` → `Running` | `(worker, lease)` CAS |
+/// | [`pause_on_children`](Self::pause_on_children) | `Running` → `WaitingOnChildren` | `(worker, lease)` CAS |
+/// | [`pause_on_confirmation`](Self::pause_on_confirmation) | `Running` → `AwaitingConfirmation` | `(worker, lease)` CAS |
+/// | [`spawn_tool_children`](Self::spawn_tool_children) | parent `Running` → `WaitingOnChildren` + children `Pending` | `(worker, lease)` CAS, non-leaf |
+/// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
+/// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
+/// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
+/// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
+/// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
 #[async_trait]
 pub trait AgentTaskStore: Send + Sync {
-    /// Insert a new task row.
+    /// Insert a new task row. **Not a mutation API** — see the
+    /// [CAS discipline](Self#cas-discipline-phase-27) table for the
+    /// correct entry point for each state transition.
     ///
-    /// The row must pass [`AgentTask::validate`] and, if it is a
-    /// [`TaskKind::RootTurn`] in a status that satisfies
-    /// [`TaskStatus::blocks_root_admission`], must not collide with an
-    /// existing blocking root on the same thread.
+    /// This is a structural insertion primitive for store rehydration
+    /// and internal batch plumbing. Worker code should use
+    /// [`submit_root_turn`](Self::submit_root_turn) for root turns
+    /// and the CAS helpers for every other transition.
     ///
     /// # Errors
     /// Returns an error if the row fails validation, if a row with the
     /// same `id` already exists, or if the blocking-root invariant would
     /// be violated.
-    ///
-    /// Prefer [`AgentTaskStore::submit_root_turn`] when inserting
-    /// externally-submitted root turns: it applies the FIFO queue rule
-    /// automatically instead of rejecting the submission when the slot
-    /// is busy.
     async fn insert(&self, task: AgentTask) -> Result<()>;
 
     /// Durably admit a new root turn on a thread, respecting the
@@ -269,10 +295,14 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if the underlying store cannot be queried.
     async fn get(&self, id: &AgentTaskId) -> Result<Option<AgentTask>>;
 
-    /// Replace a task row with an updated version.
+    /// Replace a task row with an updated version. **Not a mutation
+    /// API** — see the [CAS discipline](Self#cas-discipline-phase-27)
+    /// table for the correct entry point for each state transition.
     ///
-    /// The incoming row must pass [`AgentTask::validate`] and must refer
-    /// to an `id` that already exists in the store.
+    /// This is a structural replacement primitive for store
+    /// rehydration and test scaffolding. If you are reaching for
+    /// `update()` in worker code, you almost certainly want one of
+    /// the CAS-guarded helpers on this trait instead.
     ///
     /// # Errors
     /// Returns an error if the row fails validation, does not exist, or
@@ -696,21 +726,21 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns `(child, parent)` where `parent` is `None` if the
     /// child is a root (Phase 2.6 tool-runtime children always have
     /// a parent, but the signature is kept symmetric with
-    /// [`AgentTaskStore::fail_child`] so a future phase can reuse
+    /// [`AgentTaskStore::fail_task`] so a future phase can reuse
     /// the entry point for any kind of leaf).
     ///
     /// # Errors
-    /// - `complete_child rejected: task ... does not exist` — no
+    /// - `complete_task rejected: task ... does not exist` — no
     ///   row with the supplied id.
-    /// - `complete_child rejected: task ... is not running` — row
+    /// - `complete_task rejected: task ... is not running` — row
     ///   is in any non-`Running` status.
-    /// - `complete_child rejected: worker mismatch` — `worker`
+    /// - `complete_task rejected: worker mismatch` — `worker`
     ///   does not match the row's current `worker_id`.
-    /// - `complete_child rejected: lease mismatch` — `lease` does
+    /// - `complete_task rejected: lease mismatch` — `lease` does
     ///   not match the row's current `lease_id`.
     /// - Schema errors from [`AgentTask::complete`] or
     ///   [`AgentTask::recompute_pending_children`].
-    async fn complete_child(
+    async fn complete_task(
         &self,
         child_id: &AgentTaskId,
         worker: &WorkerId,
@@ -720,7 +750,7 @@ pub trait AgentTaskStore: Send + Sync {
 
     /// Transition a running child to [`TaskStatus::Failed`] with
     /// `error` and recompute the parent's `pending_child_count` the
-    /// same way [`AgentTaskStore::complete_child`] does.
+    /// same way [`AgentTaskStore::complete_task`] does.
     ///
     /// Phase 2.6 treats child failures exactly like child completions
     /// at the **journal** layer: a failed child still counts as a
@@ -733,9 +763,9 @@ pub trait AgentTaskStore: Send + Sync {
     ///
     /// # Errors
     /// Same error envelope as
-    /// [`AgentTaskStore::complete_child`] but routed through
+    /// [`AgentTaskStore::complete_task`] but routed through
     /// [`AgentTask::fail`] instead of [`AgentTask::complete`].
-    async fn fail_child(
+    async fn fail_task(
         &self,
         child_id: &AgentTaskId,
         worker: &WorkerId,
@@ -811,7 +841,9 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
-    /// Remove every stored task. Used by tests.
+    /// Remove every stored task. **Test-only housekeeping** — worker
+    /// code must use the CAS-guarded helpers to drive individual
+    /// tasks through their lifecycle.
     ///
     /// # Errors
     /// Returns an error if the store cannot be cleared.
@@ -1064,8 +1096,8 @@ impl Inner {
     }
 
     /// Count the direct children of `parent_id` whose status is
-    /// non-terminal, used by Phase 2.6's `complete_child` /
-    /// `fail_child` to recompute the parent's outstanding-child
+    /// non-terminal, used by Phase 2.6's `complete_task` /
+    /// `fail_task` to recompute the parent's outstanding-child
     /// counter from the journal's `by_parent` index instead of a
     /// caller-maintained running total.
     ///
@@ -1157,7 +1189,7 @@ impl Inner {
     /// terminal row, so the caller can choose between
     /// [`AgentTask::complete`] and [`AgentTask::fail`] without
     /// duplicating the CAS / rebalance / recompute plumbing.
-    fn apply_child_terminal_transition(
+    fn apply_task_terminal_transition(
         &mut self,
         child_id: &AgentTaskId,
         worker: &WorkerId,
@@ -1997,7 +2029,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok((new_parent, children))
     }
 
-    async fn complete_child(
+    async fn complete_task(
         &self,
         child_id: &AgentTaskId,
         worker: &WorkerId,
@@ -2005,19 +2037,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
-        let result = inner.apply_child_terminal_transition(
+        let result = inner.apply_task_terminal_transition(
             child_id,
             worker,
             lease,
             now,
-            "complete_child",
+            "complete_task",
             |child| child.complete(now),
         )?;
         drop(inner);
         Ok(result)
     }
 
-    async fn fail_child(
+    async fn fail_task(
         &self,
         child_id: &AgentTaskId,
         worker: &WorkerId,
@@ -2026,12 +2058,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
-        let result = inner.apply_child_terminal_transition(
+        let result = inner.apply_task_terminal_transition(
             child_id,
             worker,
             lease,
             now,
-            "fail_child",
+            "fail_task",
             move |child| child.fail(error, now),
         )?;
         drop(inner);
@@ -5632,7 +5664,7 @@ mod tests {
     //   `parent_id` / `root_id` / `thread_id` / `depth` — they share
     //   the Phase 2.3 acquisition path and never accidentally
     //   duplicate or re-acquire.
-    // * `complete_child` / `fail_child` recompute the parent's
+    // * `complete_task` / `fail_task` recompute the parent's
     //   `pending_child_count` from the live `by_parent` index so a
     //   double-complete is a no-op and a mixed success/failure batch
     //   still resumes the parent deterministically.
@@ -5956,7 +5988,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn complete_child_resumes_parent_on_final_decrement() -> Result<()> {
+    async fn complete_task_resumes_parent_on_final_decrement() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-complete").await?;
         let parent_id = parent.id.clone();
@@ -5988,7 +6020,7 @@ mod tests {
                 .context("acquire child")?
                 .context("child claimed")?;
             let (done, observed_parent) = store
-                .complete_child(
+                .complete_task(
                     &claimed.id,
                     &WorkerId::from_string(format!("w-c-{i}")),
                     &LeaseId::from_string(format!("l-c-{i}")),
@@ -6028,7 +6060,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn complete_child_stays_waiting_until_last() -> Result<()> {
+    async fn complete_task_stays_waiting_until_last() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-partial").await?;
         let parent_id = parent.id.clone();
@@ -6063,7 +6095,7 @@ mod tests {
             .context("acquire c0")?
             .context("c0 claimed")?;
         let (_, observed) = store
-            .complete_child(
+            .complete_task(
                 &first.id,
                 &WorkerId::from_string("w-c0"),
                 &LeaseId::from_string("l-c0"),
@@ -6079,12 +6111,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn complete_child_recomputes_from_index_not_caller_counter() -> Result<()> {
+    async fn complete_task_recomputes_from_index_not_caller_counter() -> Result<()> {
         // Phase 2.6 derives the parent's counter from the live
         // `by_parent` index, not a caller-maintained running total.
         // Drive a child to Completed out-of-band through `update()`
         // (simulating an older buggy path), then call
-        // `complete_child` on a sibling. The recompute must see the
+        // `complete_task` on a sibling. The recompute must see the
         // pre-completed child as terminal and report the parent's
         // new live count as 1, not 2.
         let store = InMemoryAgentTaskStore::new();
@@ -6139,7 +6171,7 @@ mod tests {
             .context("acquire c1")?
             .context("c1 claimed")?;
         let (_, observed) = store
-            .complete_child(
+            .complete_task(
                 &c1.id,
                 &WorkerId::from_string("w-c1"),
                 &LeaseId::from_string("l-c1"),
@@ -6157,7 +6189,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn complete_child_rejects_wrong_worker_or_lease() -> Result<()> {
+    async fn complete_task_rejects_wrong_worker_or_lease() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-cc-cas").await?;
         let (_, children) = store
@@ -6185,7 +6217,7 @@ mod tests {
             .context("claimed")?;
 
         let err = store
-            .complete_child(
+            .complete_task(
                 &child.id,
                 &WorkerId::from_string("w-imposter"),
                 &LeaseId::from_string("l-c"),
@@ -6199,7 +6231,7 @@ mod tests {
         );
 
         let err = store
-            .complete_child(
+            .complete_task(
                 &child.id,
                 &WorkerId::from_string("w-c"),
                 &LeaseId::from_string("l-stale"),
@@ -6231,7 +6263,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn fail_child_mirrors_complete_child_but_stamps_last_error() -> Result<()> {
+    async fn fail_task_mirrors_complete_task_but_stamps_last_error() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-fail").await?;
         let (_, children) = store
@@ -6260,7 +6292,7 @@ mod tests {
             .context("acquire a")?
             .context("a claimed")?;
         store
-            .complete_child(
+            .complete_task(
                 &first.id,
                 &WorkerId::from_string("w-a"),
                 &LeaseId::from_string("l-a"),
@@ -6282,7 +6314,7 @@ mod tests {
             .context("acquire b")?
             .context("b claimed")?;
         let (failed, observed_parent) = store
-            .fail_child(
+            .fail_task(
                 &second.id,
                 &WorkerId::from_string("w-b"),
                 &LeaseId::from_string("l-b"),
@@ -6349,7 +6381,7 @@ mod tests {
                 .context("claimed")?;
             let (_, observed) = if i == 1 {
                 store
-                    .fail_child(
+                    .fail_task(
                         &child.id,
                         &worker_id,
                         &lease_id,
@@ -6360,7 +6392,7 @@ mod tests {
                     .context("fail")?
             } else {
                 store
-                    .complete_child(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
+                    .complete_task(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
                     .await
                     .context("complete")?
             };
@@ -6390,9 +6422,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn complete_child_on_already_cancelled_parent_is_silent() -> Result<()> {
+    async fn complete_task_on_already_cancelled_parent_is_silent() -> Result<()> {
         // Edge case: a tree cancel lands between the worker's
-        // mark_running and its complete_child call. The child's
+        // mark_running and its complete_task call. The child's
         // terminal transition still runs (so the stale worker can
         // report its outcome), but the parent is already Cancelled
         // and must be left alone.
@@ -6431,10 +6463,10 @@ mod tests {
         assert!(cancelled_ids.contains(&parent.id));
         assert!(cancelled_ids.contains(&child.id));
 
-        // The late complete_child call now fails because the child
+        // The late complete_task call now fails because the child
         // is no longer Running (tree cancel already transitioned it).
         let err = store
-            .complete_child(
+            .complete_task(
                 &child.id,
                 &WorkerId::from_string("w-late"),
                 &LeaseId::from_string("l-late"),
@@ -6604,10 +6636,10 @@ mod tests {
             "unexpected: {err:#}"
         );
 
-        // complete_child from the stale worker also fails — the row
+        // complete_task from the stale worker also fails — the row
         // is no longer Running.
         let err = store
-            .complete_child(
+            .complete_task(
                 &leased_child.id,
                 &WorkerId::from_string("w-live"),
                 &LeaseId::from_string("l-live"),
@@ -6816,7 +6848,7 @@ mod tests {
                 .context("acquire")?
                 .context("claimed")?;
             store
-                .complete_child(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
+                .complete_task(&child.id, &worker_id, &lease_id, t_plus(20 + offset))
                 .await
                 .context("complete")?;
         }
@@ -6972,7 +7004,7 @@ mod tests {
             .context("persist recompute")?;
 
         // The store now reflects the resumed parent via the
-        // journal-derived counter alone — no complete_child call,
+        // journal-derived counter alone — no complete_task call,
         // no caller-maintained counter.
         let final_parent = store
             .get(&parent_id)
@@ -6982,6 +7014,752 @@ mod tests {
         assert_eq!(final_parent.status, TaskStatus::Pending);
         assert_eq!(final_parent.pending_child_count, 0);
         assert!(final_parent.state.is_none());
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase 2.7 — Concurrency regression suite (ENG-7921)
+    // ──────────────────────────────────────────────────────────────
+    //
+    // Every test below spawns real async tasks via `tokio::spawn` and
+    // joins them, so the store's internal `RwLock` serialises the
+    // mutations under genuine parallel scheduling.  The assertions
+    // are scheduler-agnostic: they check final state invariants, not
+    // interleaving order.
+
+    // ── Root queue under concurrency ──────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_submits_on_same_thread_serialize_with_exactly_one_pending() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let count = 10usize;
+        let mut handles = Vec::with_capacity(count);
+        for idx in 0..count {
+            let st = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let root = AgentTask::new_root_turn(
+                    thread("t-race"),
+                    t_plus(i64::try_from(idx).unwrap()),
+                    3,
+                );
+                st.submit_root_turn(root).await
+            }));
+        }
+        let mut results = Vec::with_capacity(count);
+        for handle in handles {
+            results.push(handle.await.context("join")?.context("submit")?);
+        }
+        let pending = results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Pending)
+            .count();
+        let queued = results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Queued)
+            .count();
+        assert_eq!(pending, 1, "exactly one root must be Pending");
+        assert_eq!(queued, count - 1, "the rest must be Queued");
+        let active = store
+            .active_root_for_thread(&thread("t-race"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.status, TaskStatus::Pending);
+        let queue = store
+            .list_queued_roots(&thread("t-race"))
+            .await
+            .context("queued")?;
+        assert_eq!(queue.len(), count - 1);
+        for pair in queue.windows(2) {
+            assert!(
+                pair[0].created_at <= pair[1].created_at,
+                "FIFO ordering broken"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_promotes_fire_exactly_once_after_slot_frees() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let first = AgentTask::new_root_turn(thread("t-promo"), t_plus(0), 3);
+        let second = AgentTask::new_root_turn(thread("t-promo"), t_plus(1), 3);
+        let second_id = second.id.clone();
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store.submit_root_turn(second).await.context("second")?;
+        let running = store
+            .try_acquire_task(
+                &first.id,
+                WorkerId::from_string("w-promo"),
+                LeaseId::from_string("l-promo"),
+                t_plus(60),
+                t_plus(2),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+        store
+            .update(running.complete(t_plus(3)).context("complete")?)
+            .await
+            .context("done")?;
+
+        let count = 8usize;
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let st = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                st.promote_next_queued_root(&thread("t-promo"), t_plus(4))
+                    .await
+            }));
+        }
+        let mut promoted = 0usize;
+        for handle in handles {
+            if handle.await.context("join")?.context("promote")?.is_some() {
+                promoted += 1;
+            }
+        }
+        assert_eq!(promoted, 1, "exactly one promotion must fire");
+        let active = store
+            .active_root_for_thread(&thread("t-promo"))
+            .await
+            .context("active")?
+            .context("slot held")?;
+        assert_eq!(active.id, second_id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_submits_across_threads_never_cross_boundaries() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let threads_count = 5usize;
+        let roots_per = 4usize;
+        let mut handles = Vec::new();
+        for ti in 0..threads_count {
+            for ri in 0..roots_per {
+                let st = Arc::clone(&store);
+                let name = format!("t-cross-{ti}");
+                let secs = i64::try_from(ti * roots_per + ri).unwrap();
+                handles.push(tokio::spawn(async move {
+                    let root =
+                        AgentTask::new_root_turn(ThreadId::from_string(&name), t_plus(secs), 3);
+                    st.submit_root_turn(root).await
+                }));
+            }
+        }
+        for handle in handles {
+            handle.await.context("join")?.context("submit")?;
+        }
+        for ti in 0..threads_count {
+            let tid = ThreadId::from_string(format!("t-cross-{ti}"));
+            let active = store
+                .active_root_for_thread(&tid)
+                .await
+                .context("active")?
+                .context("slot")?;
+            assert_eq!(active.status, TaskStatus::Pending);
+            let queue = store.list_queued_roots(&tid).await.context("queued")?;
+            assert_eq!(queue.len(), roots_per - 1);
+        }
+        Ok(())
+    }
+
+    // ── Runnable acquisition under concurrency ────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_try_acquire_same_id_yields_exactly_one_winner() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-acq1"), t_plus(0), 5);
+        let task_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let count = 10usize;
+        let mut handles = Vec::with_capacity(count);
+        for idx in 0..count {
+            let st = Arc::clone(&store);
+            let tid = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                st.try_acquire_task(
+                    &tid,
+                    WorkerId::from_string(format!("w-{idx}")),
+                    LeaseId::from_string(format!("l-{idx}")),
+                    t_plus(60),
+                    t_plus(1),
+                )
+                .await
+            }));
+        }
+        let mut winners = 0usize;
+        for handle in handles {
+            if handle.await.context("join")?.context("acquire")?.is_some() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "exactly one worker must win the claim");
+        let row = store
+            .get(&task_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(row.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scan_acquires_never_double_lease() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let task_count = 5usize;
+        for idx in 0..task_count {
+            let root = AgentTask::new_root_turn(
+                thread(&format!("t-scan-{idx}")),
+                t_plus(i64::try_from(idx).unwrap()),
+                5,
+            );
+            store.submit_root_turn(root).await.context("submit")?;
+        }
+        let worker_count = 12usize;
+        let mut handles = Vec::with_capacity(worker_count);
+        for idx in 0..worker_count {
+            let st = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                st.acquire_next_runnable(
+                    WorkerId::from_string(format!("w-scan-{idx}")),
+                    LeaseId::from_string(format!("l-scan-{idx}")),
+                    t_plus(60),
+                    t_plus(1),
+                )
+                .await
+            }));
+        }
+        let mut claimed_ids = std::collections::HashSet::new();
+        for handle in handles {
+            if let Some(task) = handle.await.context("join")?.context("scan")? {
+                assert_eq!(task.status, TaskStatus::Running);
+                assert!(
+                    claimed_ids.insert(task.id.clone()),
+                    "double-lease on task {}",
+                    task.id
+                );
+            }
+        }
+        assert_eq!(
+            claimed_ids.len(),
+            task_count,
+            "exactly K rows should be claimed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_acquire_skips_exhausted_head_fails_closed_once() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let exhausted = AgentTask::new_root_turn(thread("t-exhaust-conc"), t_plus(0), 1);
+        let exhausted_id = exhausted.id.clone();
+        store
+            .submit_root_turn(exhausted)
+            .await
+            .context("submit exhausted")?;
+        let running = store
+            .try_acquire_task(
+                &exhausted_id,
+                WorkerId::from_string("w-ex"),
+                LeaseId::from_string("l-ex"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+        store
+            .update(running.release_lease(t_plus(2)).context("release")?)
+            .await
+            .context("update")?;
+
+        let healthy = AgentTask::new_root_turn(thread("t-healthy-conc"), t_plus(3), 5);
+        let healthy_id = healthy.id.clone();
+        store
+            .submit_root_turn(healthy)
+            .await
+            .context("submit healthy")?;
+
+        let count = 8usize;
+        let mut handles = Vec::with_capacity(count);
+        for idx in 0..count {
+            let st = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                st.acquire_next_runnable(
+                    WorkerId::from_string(format!("w-fc-{idx}")),
+                    LeaseId::from_string(format!("l-fc-{idx}")),
+                    t_plus(60),
+                    t_plus(4),
+                )
+                .await
+            }));
+        }
+        let mut claimed_healthy = 0usize;
+        for handle in handles {
+            if let Some(task) = handle.await.context("join")?.context("scan")? {
+                assert_eq!(
+                    task.id, healthy_id,
+                    "only the healthy root should be claimed"
+                );
+                claimed_healthy += 1;
+            }
+        }
+        assert_eq!(claimed_healthy, 1, "healthy root claimed exactly once");
+        let ex_row = store
+            .get(&exhausted_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(ex_row.status, TaskStatus::Failed);
+        Ok(())
+    }
+
+    // ── Child-task waiting states under concurrency ───────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_complete_task_on_batch_drives_parent_to_pending() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-conc-batch").await?;
+        let parent_id = parent.id.clone();
+        let child_count = 6usize;
+        let specs: Vec<ChildSpawnSpec> = (0..child_count).map(|_| ChildSpawnSpec::new(2)).collect();
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                specs,
+                sample_continuation("t-conc-batch"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        let mut child_owners = Vec::with_capacity(child_count);
+        for (idx, child) in children.iter().enumerate() {
+            let wid = WorkerId::from_string(format!("w-cb-{idx}"));
+            let lid = LeaseId::from_string(format!("l-cb-{idx}"));
+            let offset = i64::try_from(idx).context("fits")?;
+            store
+                .try_acquire_task(
+                    &child.id,
+                    wid.clone(),
+                    lid.clone(),
+                    t_plus(60),
+                    t_plus(10 + offset),
+                )
+                .await
+                .context("acquire")?
+                .context("claimed")?;
+            child_owners.push((child.id.clone(), wid, lid));
+        }
+
+        let mut handles = Vec::with_capacity(child_count);
+        for (idx, (cid, wid, lid)) in child_owners.into_iter().enumerate() {
+            let st = Arc::clone(&store);
+            let offset = i64::try_from(idx).context("fits")?;
+            handles.push(tokio::spawn(async move {
+                st.complete_task(&cid, &wid, &lid, t_plus(20 + offset))
+                    .await
+            }));
+        }
+        for handle in handles {
+            handle.await.context("join")?.context("complete")?;
+        }
+
+        let final_parent = store
+            .get(&parent_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(final_parent.status, TaskStatus::Pending);
+        assert_eq!(final_parent.pending_child_count, 0);
+        assert!(final_parent.state.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mixed_complete_fail_task_batch_resumes_parent() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-conc-mix").await?;
+        let parent_id = parent.id.clone();
+        let child_count = 5usize;
+        let specs: Vec<ChildSpawnSpec> = (0..child_count).map(|_| ChildSpawnSpec::new(2)).collect();
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                specs,
+                sample_continuation("t-conc-mix"),
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+
+        let mut child_owners = Vec::with_capacity(child_count);
+        for (idx, child) in children.iter().enumerate() {
+            let wid = WorkerId::from_string(format!("w-mx-{idx}"));
+            let lid = LeaseId::from_string(format!("l-mx-{idx}"));
+            let offset = i64::try_from(idx).context("fits")?;
+            store
+                .try_acquire_task(
+                    &child.id,
+                    wid.clone(),
+                    lid.clone(),
+                    t_plus(60),
+                    t_plus(10 + offset),
+                )
+                .await
+                .context("acquire")?
+                .context("claimed")?;
+            child_owners.push((child.id.clone(), wid, lid));
+        }
+
+        let mut handles = Vec::with_capacity(child_count);
+        for (idx, (cid, wid, lid)) in child_owners.into_iter().enumerate() {
+            let st = Arc::clone(&store);
+            let offset = i64::try_from(idx).context("fits")?;
+            handles.push(tokio::spawn(async move {
+                if idx % 2 == 0 {
+                    st.complete_task(&cid, &wid, &lid, t_plus(20 + offset))
+                        .await
+                } else {
+                    st.fail_task(
+                        &cid,
+                        &wid,
+                        &lid,
+                        format!("child {idx} oops"),
+                        t_plus(20 + offset),
+                    )
+                    .await
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.context("join")?.context("terminal")?;
+        }
+
+        let final_parent = store
+            .get(&parent_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(final_parent.status, TaskStatus::Pending);
+        assert_eq!(final_parent.pending_child_count, 0);
+        let listed = store.list_children(&parent_id).await.context("list")?;
+        assert_eq!(listed.len(), child_count);
+        let completed = listed
+            .iter()
+            .filter(|c| c.status == TaskStatus::Completed)
+            .count();
+        let failed = listed
+            .iter()
+            .filter(|c| c.status == TaskStatus::Failed)
+            .count();
+        assert_eq!(completed, 3); // indices 0, 2, 4
+        assert_eq!(failed, 2); // indices 1, 3
+        Ok(())
+    }
+
+    // ── Recovery edges under concurrency ──────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_heartbeat_after_sweep_fails() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-stale-hb"), t_plus(0), 3);
+        let task_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let old_w = WorkerId::from_string("w-old");
+        let old_l = LeaseId::from_string("l-old");
+        store
+            .try_acquire_task(&task_id, old_w.clone(), old_l.clone(), t_plus(5), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+        store
+            .release_expired_leases(t_plus(10))
+            .await
+            .context("sweep")?;
+        let err = store
+            .heartbeat_task(&task_id, &old_w, &old_l, t_plus(60), t_plus(11))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not running") || msg.contains("invalid transition"),
+            "stale heartbeat should be rejected: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_complete_task_after_reacquire_fails_cas() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-stale-ct"), t_plus(0), 5);
+        let task_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let old_w = WorkerId::from_string("w-stale-old");
+        let old_l = LeaseId::from_string("l-stale-old");
+        store
+            .try_acquire_task(&task_id, old_w.clone(), old_l.clone(), t_plus(5), t_plus(1))
+            .await
+            .context("acquire old")?
+            .context("claimed old")?;
+        store
+            .release_expired_leases(t_plus(10))
+            .await
+            .context("sweep")?;
+        store
+            .try_acquire_task(
+                &task_id,
+                WorkerId::from_string("w-stale-new"),
+                LeaseId::from_string("l-stale-new"),
+                t_plus(60),
+                t_plus(11),
+            )
+            .await
+            .context("acquire new")?
+            .context("claimed new")?;
+        let err = store
+            .complete_task(&task_id, &old_w, &old_l, t_plus(12))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("worker mismatch") || msg.contains("lease mismatch"),
+            "stale complete should fail CAS: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_heartbeat_and_sweep_before_expiry_preserves_lease() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-hb-vs-sweep"), t_plus(0), 3);
+        let task_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let wid = WorkerId::from_string("w-hbsweep");
+        let lid = LeaseId::from_string("l-hbsweep");
+        store
+            .try_acquire_task(&task_id, wid.clone(), lid.clone(), t_plus(15), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let st1 = Arc::clone(&store);
+        let st2 = Arc::clone(&store);
+        let id1 = task_id.clone();
+        let hb_w = wid.clone();
+        let hb_l = lid.clone();
+        let hb_handle = tokio::spawn(async move {
+            st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), t_plus(10))
+                .await
+        });
+        let sweep_handle =
+            tokio::spawn(async move { st2.release_expired_leases(t_plus(10)).await });
+        let _ = hb_handle.await.context("hb join")?;
+        let _ = sweep_handle.await.context("sweep join")?;
+
+        let row = store
+            .get(&task_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(row.status, TaskStatus::Running);
+        assert_eq!(
+            row.worker_id.as_ref().map(WorkerId::as_str),
+            Some(wid.as_str())
+        );
+        assert_eq!(
+            row.lease_id.as_ref().map(LeaseId::as_str),
+            Some(lid.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sweep_on_budget_exhausted_fails_closed_once() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-conc-exhaust"), t_plus(0), 1);
+        let task_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        store
+            .try_acquire_task(
+                &task_id,
+                WorkerId::from_string("w-ce"),
+                LeaseId::from_string("l-ce"),
+                t_plus(5),
+                t_plus(1),
+            )
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let count = 6usize;
+        let mut handles: Vec<tokio::task::JoinHandle<Result<Vec<RecoveryRecord>>>> =
+            Vec::with_capacity(count);
+        for _ in 0..count {
+            let st = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                st.release_expired_leases(t_plus(10)).await
+            }));
+        }
+        let mut total_records = 0usize;
+        for handle in handles {
+            let records = handle.await.context("join")?.context("sweep")?;
+            total_records += records.len();
+        }
+        assert_eq!(total_records, 1, "exactly one sweep should touch the row");
+        let row = store
+            .get(&task_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert_eq!(row.status, TaskStatus::Failed);
+        let err = store
+            .heartbeat_task(
+                &task_id,
+                &WorkerId::from_string("w-ce"),
+                &LeaseId::from_string("l-ce"),
+                t_plus(60),
+                t_plus(11),
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not running") || msg.contains("invalid transition"),
+            "stale heartbeat after fail-closed should fail: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn complete_task_vs_cancel_tree_converges_to_single_terminal() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root = AgentTask::new_root_turn(thread("t-ct-vs-cancel"), t_plus(0), 3);
+        let root_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let wid = WorkerId::from_string("w-ctc");
+        let lid = LeaseId::from_string("l-ctc");
+        store
+            .try_acquire_task(&root_id, wid.clone(), lid.clone(), t_plus(60), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+
+        let st1 = Arc::clone(&store);
+        let st2 = Arc::clone(&store);
+        let rid1 = root_id.clone();
+        let rid2 = root_id.clone();
+        let cw = wid.clone();
+        let cl = lid.clone();
+        let complete_handle =
+            tokio::spawn(async move { st1.complete_task(&rid1, &cw, &cl, t_plus(2)).await });
+        let cancel_handle = tokio::spawn(async move { st2.cancel_tree(&rid2, t_plus(2)).await });
+        let complete_res = complete_handle.await.context("complete join")?;
+        let cancel_res = cancel_handle.await.context("cancel join")?;
+
+        let row = store
+            .get(&root_id)
+            .await
+            .context("get")?
+            .context("exists")?;
+        assert!(
+            row.status.is_terminal(),
+            "row must be terminal: {:?}",
+            row.status
+        );
+        match (complete_res.is_ok(), cancel_res.is_ok()) {
+            (true, true) => {
+                assert!(row.status == TaskStatus::Completed || row.status == TaskStatus::Cancelled);
+            }
+            (true, false) => assert_eq!(row.status, TaskStatus::Completed),
+            (false, true) => assert_eq!(row.status, TaskStatus::Cancelled),
+            (false, false) => panic!("both complete and cancel failed"),
+        }
+        Ok(())
+    }
+
+    // ── Scale / soak ─────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_workers_many_roots_drain_runnable_pool_without_duplication() -> Result<()> {
+        let store = Arc::new(InMemoryAgentTaskStore::new());
+        let root_count = 20usize;
+        let worker_count = 10usize;
+
+        for idx in 0..root_count {
+            let root = AgentTask::new_root_turn(
+                thread(&format!("t-soak-{idx}")),
+                t_plus(i64::try_from(idx).unwrap()),
+                5,
+            );
+            store.submit_root_turn(root).await.context("submit")?;
+        }
+
+        let claimed: Arc<tokio::sync::Mutex<Vec<(AgentTaskId, WorkerId, LeaseId)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::with_capacity(worker_count);
+        for idx in 0..worker_count {
+            let st = Arc::clone(&store);
+            let cl = Arc::clone(&claimed);
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let wid = WorkerId::from_string(format!("w-soak-{idx}"));
+                    let lid = LeaseId::new();
+                    match st
+                        .acquire_next_runnable(wid.clone(), lid.clone(), t_plus(120), t_plus(50))
+                        .await
+                    {
+                        Ok(Some(task)) => {
+                            cl.lock().await.push((task.id.clone(), wid, lid));
+                        }
+                        Ok(None) => break,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.await.context("join")?.context("acquire loop")?;
+        }
+
+        let claimed_vec = claimed.lock().await.clone();
+        assert_eq!(claimed_vec.len(), root_count, "all roots claimed");
+        let unique: std::collections::HashSet<_> =
+            claimed_vec.iter().map(|(id, _, _)| id.clone()).collect();
+        assert_eq!(unique.len(), root_count, "no duplicates");
+
+        let mut handles = Vec::with_capacity(root_count);
+        for (tid, wid, lid) in &claimed_vec {
+            let st = Arc::clone(&store);
+            let tid = tid.clone();
+            let wid = wid.clone();
+            let lid = lid.clone();
+            handles.push(tokio::spawn(async move {
+                st.complete_task(&tid, &wid, &lid, t_plus(100)).await
+            }));
+        }
+        for handle in handles {
+            handle.await.context("join")?.context("complete")?;
+        }
+
+        for idx in 0..root_count {
+            let all = store
+                .list_by_thread(&thread(&format!("t-soak-{idx}")))
+                .await
+                .context("list")?;
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].status, TaskStatus::Completed);
+            assert_eq!(all[0].attempt, 1, "each root touched exactly once");
+        }
         Ok(())
     }
 }

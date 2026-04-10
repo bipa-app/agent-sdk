@@ -49,7 +49,7 @@
 //!   authoritatively replaces the parent's `pending_child_count`
 //!   from a live-children count and, when the count hits zero, flips
 //!   the row back to [`TaskStatus::Pending`] with [`TaskState::None`].
-//!   The store calls this from `complete_child` / `fail_child` so the
+//!   The store calls this from `complete_task` / `fail_task` so the
 //!   parent's counter is derived from the journal (`by_parent` +
 //!   status) every time instead of drifting through saturating
 //!   arithmetic.

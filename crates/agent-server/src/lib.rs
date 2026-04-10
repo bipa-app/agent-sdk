@@ -105,7 +105,7 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resume_from_confirmation`, Phase 2.5's retry budget / fail-closed recovery matrix shared across acquisition and expiry paths, and Phase 2.6's tool-runtime child-task orchestration (`spawn_tool_children` / `complete_child` / `fail_child`) plus deterministic cancellation cascade (`cancel_tree`) with journal-driven parent resume triggers |
+//! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resume_from_confirmation`, Phase 2.5's retry budget / fail-closed recovery matrix shared across acquisition and expiry paths, and Phase 2.6's tool-runtime child-task orchestration (`spawn_tool_children` / `complete_task` / `fail_task`) plus deterministic cancellation cascade (`cancel_tree`) with journal-driven parent resume triggers |
 //!
 //! ## Planned modules (not yet implemented)
 //!
