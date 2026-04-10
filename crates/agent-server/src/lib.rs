@@ -121,11 +121,12 @@ pub mod journal;
 pub mod worker;
 
 pub use journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, ChildSpawnSpec, FailureReason, InMemoryAgentTaskStore,
-    InMemoryMessageProjectionStore, InMemoryThreadStore, LeaseId, MessageProjection,
-    MessageProjectionError, MessageProjectionStore, RecoveryAction, RecoveryContext,
-    RecoveryRecord, TaskKind, TaskSchemaError, TaskState, TaskStatus, Thread, ThreadSchemaError,
-    ThreadStatus, ThreadStore, WorkerId, classify_recovery,
+    AgentDefinition, AgentTask, AgentTaskId, AgentTaskStore, ChildSpawnSpec, ExecutionOptions,
+    FailureReason, InMemoryAgentTaskStore, InMemoryMessageProjectionStore, InMemoryThreadStore,
+    LeaseId, MessageProjection, MessageProjectionError, MessageProjectionStore, RecoveryAction,
+    RecoveryContext, RecoveryRecord, RootWorkerInputs, StagedMessageStore, StagedStateStore,
+    StagedStores, TaskKind, TaskSchemaError, TaskState, TaskStatus, Thread, ThreadSchemaError,
+    ThreadStatus, ThreadStore, WorkerId, build_root_worker_inputs, classify_recovery,
 };
 
 // ── Re-exports that validate the dependency edges ────────────────────

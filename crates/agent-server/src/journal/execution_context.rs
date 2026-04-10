@@ -1,0 +1,581 @@
+//! `ExecutionContextFactory` inputs and checkpoint-seeded context builder.
+//!
+//! The root worker needs a deterministic execution context built from
+//! durable task, thread, and checkpoint state plus host-provided runtime
+//! dependencies. This module captures those inputs and provides the
+//! builder function that wires them together.
+//!
+//! # Design properties
+//!
+//! 1. **Deterministic reconstruction** — given the same durable inputs
+//!    the builder always produces the same staged context, so crash
+//!    recovery picks up exactly where the last committed checkpoint
+//!    left off.
+//! 2. **No durable mid-turn writes** — the builder returns staged
+//!    adapters ([`super::staged::StagedStores`]) that buffer all
+//!    mutations in memory until the commit path runs.
+//! 3. **Separation of durable vs runtime inputs** — durable state
+//!    (`AgentTask`, `ThreadRecoveryView`, `AgentDefinition`) is
+//!    recoverable from storage; runtime dependencies (`HostDependencies`)
+//!    are created fresh by the orchestration layer each time.
+//!
+//! # What this module does **not** own
+//!
+//! - Text-only turn execution (Phase 4.3).
+//! - Tool-batch suspension and child-task creation (Phase 4.4+).
+//! - Commit orchestration (Phase 3.4).
+//! - Turn-attempt audit lifecycle (Phase 3.3).
+
+use agent_sdk_core::{AgentConfig, ThreadId};
+use anyhow::{Context, Result};
+use time::OffsetDateTime;
+
+use super::checkpoint_store::CheckpointStore;
+use super::staged::StagedStores;
+use super::task::AgentTask;
+use super::thread_recover::{ThreadRecoveryView, recover_thread};
+use super::thread_store::ThreadStore;
+
+// ─────────────────────────────────────────────────────────────────────
+// AgentDefinition
+// ─────────────────────────────────────────────────────────────────────
+
+/// Resolved agent configuration the root worker needs for execution.
+///
+/// Wraps [`AgentConfig`] alongside execution-time overrides that the
+/// server resolves before handing a task to a worker. Future phases
+/// will expand this with tool registry references, hook configuration,
+/// and provider routing tables.
+#[derive(Clone, Debug)]
+pub struct AgentDefinition {
+    /// Core agent configuration (model, system prompt, limits).
+    pub config: AgentConfig,
+
+    /// Server-side execution options.
+    pub execution: ExecutionOptions,
+}
+
+/// Server-side execution options resolved alongside the agent definition.
+///
+/// These are not part of `AgentConfig` because they are
+/// server-infrastructure concerns that a local SDK caller never sets.
+#[derive(Clone, Debug)]
+pub struct ExecutionOptions {
+    /// Maximum number of retry attempts for the LLM call within a
+    /// single turn attempt (distinct from the task-level retry budget
+    /// managed by the journal).
+    pub max_llm_retries: u32,
+
+    /// Whether to enable strict durability checkpoints at every
+    /// critical boundary.
+    pub strict_durability: bool,
+}
+
+impl Default for ExecutionOptions {
+    fn default() -> Self {
+        Self {
+            max_llm_retries: 3,
+            strict_durability: true,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// RootWorkerInputs
+// ─────────────────────────────────────────────────────────────────────
+
+/// Everything the root worker needs to begin (or resume) a turn.
+///
+/// This is the "factory input" struct the orchestration layer constructs
+/// from durable storage before handing control to the worker. All
+/// fields are deterministic — given the same task and thread state the
+/// same inputs are produced.
+///
+/// # Fields
+///
+/// | Group | Fields |
+/// |-------|--------|
+/// | Task identity | `task` |
+/// | Thread state | `recovery_view` |
+/// | Agent definition | `definition` |
+/// | Staged adapters | `staged_stores` |
+///
+/// The worker uses `staged_stores` for all message/state reads and
+/// writes during the turn. At commit time the staged data is drained
+/// and fed into [`super::commit::commit_completed_turn`].
+pub struct RootWorkerInputs {
+    /// The runnable task the worker is executing.
+    pub task: AgentTask,
+
+    /// Thread recovery view with committed messages, agent-state
+    /// snapshot, and next turn number.
+    pub recovery_view: ThreadRecoveryView,
+
+    /// Resolved agent definition (config + execution options).
+    pub definition: AgentDefinition,
+
+    /// Staged message and state stores seeded from the recovery view.
+    ///
+    /// The worker reads from and writes to these during the turn; the
+    /// commit path drains them.
+    pub staged_stores: StagedStores,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Builder
+// ─────────────────────────────────────────────────────────────────────
+
+/// Reconstruct trusted execution context for a root worker from durable
+/// task and thread state.
+///
+/// This is the primary entry point for Phase 4.2 context reconstruction.
+/// It:
+///
+/// 1. Recovers the thread state via Phase 3.5's [`recover_thread`].
+/// 2. Validates the task is bound to the same thread.
+/// 3. Seeds staged stores from the recovery view.
+/// 4. Returns [`RootWorkerInputs`] ready for turn execution.
+///
+/// # Errors
+///
+/// - Thread recovery fails (completed thread, missing checkpoint,
+///   consistency mismatch).
+/// - Task `thread_id` does not match the recovery view.
+/// - Agent-state snapshot deserialization fails.
+pub async fn build_root_worker_inputs(
+    task: AgentTask,
+    definition: AgentDefinition,
+    thread_store: &dyn ThreadStore,
+    checkpoint_store: &dyn CheckpointStore,
+    now: OffsetDateTime,
+) -> Result<RootWorkerInputs> {
+    // 1. Recover thread state from the latest checkpoint.
+    let recovery_view = recover_thread(&task.thread_id, thread_store, checkpoint_store, now)
+        .await
+        .context("build_root_worker_inputs: recover thread")?;
+
+    // 2. Validate thread binding.
+    ensure_thread_match(&task.thread_id, &recovery_view.thread.thread_id)?;
+
+    // 3. Seed staged stores from the recovery view.
+    let staged_stores = StagedStores::from_recovery_view(&recovery_view)
+        .context("build_root_worker_inputs: seed staged stores")?;
+
+    Ok(RootWorkerInputs {
+        task,
+        recovery_view,
+        definition,
+        staged_stores,
+    })
+}
+
+fn ensure_thread_match(task_thread: &ThreadId, recovered_thread: &ThreadId) -> Result<()> {
+    anyhow::ensure!(
+        task_thread == recovered_thread,
+        "task thread_id ({task_thread}) does not match recovered thread ({recovered_thread})",
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::super::checkpoint_store::InMemoryCheckpointStore;
+    use super::super::commit::{CompletedTurnCommit, commit_completed_turn};
+    use super::super::message_store::InMemoryMessageProjectionStore;
+    use super::super::message_store::MessageProjectionStore;
+    use super::super::task::{AgentTask, AgentTaskId};
+    use super::super::thread_store::InMemoryThreadStore;
+    use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
+    use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
+    use super::*;
+    use agent_sdk_core::audit::AuditProvenance;
+    use agent_sdk_core::{TokenUsage, llm};
+    use agent_sdk_tools::stores::{MessageStore, StateStore};
+    use time::Duration;
+
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
+    }
+
+    fn t_plus(secs: i64) -> OffsetDateTime {
+        t0() + Duration::seconds(secs)
+    }
+
+    fn thread_a() -> ThreadId {
+        ThreadId::from_string("t-exec-ctx-a")
+    }
+
+    fn usage(input: u32, output: u32) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+        }
+    }
+
+    fn sample_definition() -> AgentDefinition {
+        AgentDefinition {
+            config: AgentConfig {
+                system_prompt: "You are a helpful assistant.".into(),
+                model: "claude-sonnet-4-5-20250929".into(),
+                ..AgentConfig::default()
+            },
+            execution: ExecutionOptions::default(),
+        }
+    }
+
+    fn sample_close_params() -> super::super::turn_attempt::CloseAttemptParams {
+        super::super::turn_attempt::CloseAttemptParams {
+            response_blob: serde_json::json!({"id": "msg_01"}),
+            response_id: Some("msg_01".into()),
+            response_model: Some("claude-sonnet-4-5-20250929".into()),
+            stop_reason: Some(llm::StopReason::EndTurn),
+            outcome: TurnAttemptOutcome::Success,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 10,
+        }
+    }
+
+    /// Build a minimal root task for the given thread.
+    ///
+    /// The task is `Pending` — the builder does not check task status
+    /// (that is the orchestrator's responsibility).
+    fn root_task(thread_id: &ThreadId) -> AgentTask {
+        AgentTask::new_root_turn(thread_id.clone(), t0(), 3)
+    }
+
+    struct Stores {
+        threads: InMemoryThreadStore,
+        messages: InMemoryMessageProjectionStore,
+        attempts: InMemoryTurnAttemptStore,
+        checkpoints: InMemoryCheckpointStore,
+    }
+
+    impl Stores {
+        fn new() -> Self {
+            Self {
+                threads: InMemoryThreadStore::new(),
+                messages: InMemoryMessageProjectionStore::new(),
+                attempts: InMemoryTurnAttemptStore::new(),
+                checkpoints: InMemoryCheckpointStore::new(),
+            }
+        }
+
+        async fn commit_turn(
+            &self,
+            thread_id: &ThreadId,
+            task_id: &AgentTaskId,
+            messages: Vec<llm::Message>,
+            state_snapshot: serde_json::Value,
+            at: OffsetDateTime,
+        ) -> Result<super::super::commit::CommitOutcome> {
+            let attempt = self
+                .attempts
+                .open_attempt(OpenAttemptParams {
+                    task_id: task_id.clone(),
+                    attempt_number: 1,
+                    provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                    request_blob: serde_json::json!({"messages": []}),
+                    now: t0(),
+                })
+                .await
+                .context("open attempt")?;
+            commit_completed_turn(
+                CompletedTurnCommit {
+                    thread_id: thread_id.clone(),
+                    task_id: task_id.clone(),
+                    turn_attempt_id: attempt.id,
+                    close_attempt_params: sample_close_params(),
+                    messages,
+                    turn_usage: usage(100, 50),
+                    agent_state_snapshot: state_snapshot,
+                    now: at,
+                },
+                &self.threads,
+                &self.messages,
+                &self.attempts,
+                &self.checkpoints,
+            )
+            .await
+        }
+    }
+
+    // ── Fresh thread ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_inputs_for_fresh_thread() -> Result<()> {
+        let s = Stores::new();
+        let task = root_task(&thread_a());
+
+        let inputs =
+            build_root_worker_inputs(task, sample_definition(), &s.threads, &s.checkpoints, t0())
+                .await
+                .context("build")?;
+
+        // Recovery view is for a fresh thread.
+        assert_eq!(inputs.recovery_view.next_turn_number, 1);
+        assert!(inputs.recovery_view.messages.is_empty());
+
+        // Staged messages start empty.
+        let msgs = inputs
+            .staged_stores
+            .messages
+            .get_history(&thread_a())
+            .await?;
+        assert!(msgs.is_empty());
+
+        // Staged state is a fresh AgentState.
+        let state = inputs
+            .staged_stores
+            .state
+            .load(&thread_a())
+            .await?
+            .context("state")?;
+        assert_eq!(state.thread_id, thread_a());
+        assert_eq!(state.turn_count, 0);
+
+        // Definition forwarded.
+        assert_eq!(inputs.definition.config.model, "claude-sonnet-4-5-20250929");
+
+        Ok(())
+    }
+
+    // ── Existing thread with checkpoint ──────────────────────────
+
+    #[tokio::test]
+    async fn build_inputs_seeded_from_checkpoint() -> Result<()> {
+        let s = Stores::new();
+        let prior_task = AgentTaskId::from_string("task_prior");
+
+        // Commit two turns so the thread has a checkpoint.
+        let state_snapshot = serde_json::to_value(&agent_sdk_core::AgentState {
+            thread_id: thread_a(),
+            turn_count: 2,
+            total_usage: usage(200, 100),
+            metadata: std::collections::HashMap::default(),
+            created_at: t0(),
+        })?;
+
+        s.commit_turn(
+            &thread_a(),
+            &prior_task,
+            vec![llm::Message::user("turn 1")],
+            serde_json::json!({"turn": 1}),
+            t_plus(1),
+        )
+        .await
+        .context("turn 1")?;
+
+        s.commit_turn(
+            &thread_a(),
+            &prior_task,
+            vec![llm::Message::assistant("turn 2")],
+            state_snapshot,
+            t_plus(2),
+        )
+        .await
+        .context("turn 2")?;
+
+        // Build inputs for a new task on the same thread.
+        let task = root_task(&thread_a());
+        let inputs = build_root_worker_inputs(
+            task,
+            sample_definition(),
+            &s.threads,
+            &s.checkpoints,
+            t_plus(3),
+        )
+        .await
+        .context("build")?;
+
+        // Recovery view has the committed state.
+        assert_eq!(inputs.recovery_view.next_turn_number, 3);
+        assert_eq!(inputs.recovery_view.messages.len(), 2);
+
+        // Staged messages seeded from checkpoint.
+        let msgs = inputs
+            .staged_stores
+            .messages
+            .get_history(&thread_a())
+            .await?;
+        assert_eq!(msgs.len(), 2);
+
+        // Staged state deserialized from snapshot.
+        let state = inputs
+            .staged_stores
+            .state
+            .load(&thread_a())
+            .await?
+            .context("state")?;
+        assert_eq!(state.turn_count, 2);
+        assert_eq!(state.total_usage.input_tokens, 200);
+
+        Ok(())
+    }
+
+    // ── Staged mutations stay buffered ───────────────────────────
+
+    #[tokio::test]
+    async fn staged_mutations_do_not_affect_durable_stores() -> Result<()> {
+        let s = Stores::new();
+        let prior_task = AgentTaskId::from_string("task_prior");
+
+        let snapshot = serde_json::to_value(&agent_sdk_core::AgentState {
+            thread_id: thread_a(),
+            turn_count: 1,
+            total_usage: usage(100, 50),
+            metadata: std::collections::HashMap::default(),
+            created_at: t0(),
+        })?;
+
+        s.commit_turn(
+            &thread_a(),
+            &prior_task,
+            vec![llm::Message::user("committed")],
+            snapshot,
+            t_plus(1),
+        )
+        .await
+        .context("commit")?;
+
+        let task = root_task(&thread_a());
+        let inputs = build_root_worker_inputs(
+            task,
+            sample_definition(),
+            &s.threads,
+            &s.checkpoints,
+            t_plus(2),
+        )
+        .await
+        .context("build")?;
+
+        // Mutate staged stores.
+        inputs
+            .staged_stores
+            .messages
+            .append(&thread_a(), llm::Message::assistant("buffered"))
+            .await?;
+        let mut new_state = agent_sdk_core::AgentState::new(thread_a());
+        new_state.turn_count = 99;
+        inputs.staged_stores.state.save(&new_state).await?;
+
+        // Staged stores reflect mutations.
+        let staged_msgs = inputs
+            .staged_stores
+            .messages
+            .get_history(&thread_a())
+            .await?;
+        assert_eq!(staged_msgs.len(), 2); // 1 committed + 1 buffered
+
+        // Durable message projection unchanged — still only the
+        // committed message.
+        let durable_msgs = s.messages.get_history(&thread_a()).await?;
+        assert_eq!(durable_msgs.len(), 1);
+
+        // Durable thread aggregate unchanged.
+        let thread = s.threads.get(&thread_a()).await?.context("thread")?;
+        assert_eq!(thread.committed_turns, 1);
+
+        Ok(())
+    }
+
+    // ── Drain semantics ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_yields_staged_data_for_commit() -> Result<()> {
+        let s = Stores::new();
+        let task = root_task(&thread_a());
+        let inputs =
+            build_root_worker_inputs(task, sample_definition(), &s.threads, &s.checkpoints, t0())
+                .await
+                .context("build")?;
+
+        // Simulate turn work.
+        inputs
+            .staged_stores
+            .messages
+            .append(&thread_a(), llm::Message::user("hello"))
+            .await?;
+        inputs
+            .staged_stores
+            .messages
+            .append(&thread_a(), llm::Message::assistant("hi"))
+            .await?;
+
+        let mut state = agent_sdk_core::AgentState::new(thread_a());
+        state.turn_count = 1;
+        inputs.staged_stores.state.save(&state).await?;
+
+        // Drain for commit.
+        let msgs = inputs.staged_stores.messages.drain_messages()?;
+        assert_eq!(msgs.len(), 2);
+
+        let drained_state = inputs.staged_stores.state.drain_state()?.context("state")?;
+        assert_eq!(drained_state.turn_count, 1);
+
+        // After drain, stores are empty.
+        let remaining = inputs
+            .staged_stores
+            .messages
+            .get_history(&thread_a())
+            .await?;
+        assert!(remaining.is_empty());
+        let remaining_state = inputs.staged_stores.state.load(&thread_a()).await?;
+        assert!(remaining_state.is_none());
+
+        Ok(())
+    }
+
+    // ── Thread mismatch guard ────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_rejects_thread_mismatch() {
+        // This test verifies the guard works at the function level.
+        // In practice, task.thread_id always matches because the task
+        // is created for the thread, but the guard catches bugs.
+        let wrong_thread = ThreadId::from_string("t-wrong");
+        let right_thread = ThreadId::from_string("t-right");
+
+        let err = ensure_thread_match(&wrong_thread, &right_thread).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "expected mismatch error, got: {err}",
+        );
+    }
+
+    // ── Definition is preserved ──────────────────────────────────
+
+    #[tokio::test]
+    async fn definition_fields_are_accessible() -> Result<()> {
+        let s = Stores::new();
+        let task = root_task(&thread_a());
+
+        let def = AgentDefinition {
+            config: AgentConfig {
+                max_turns: Some(10),
+                system_prompt: "test prompt".into(),
+                model: "claude-opus-4-6-20250925".into(),
+                ..AgentConfig::default()
+            },
+            execution: ExecutionOptions {
+                max_llm_retries: 5,
+                strict_durability: false,
+            },
+        };
+
+        let inputs = build_root_worker_inputs(task, def, &s.threads, &s.checkpoints, t0())
+            .await
+            .context("build")?;
+
+        assert_eq!(inputs.definition.config.max_turns, Some(10));
+        assert_eq!(inputs.definition.config.system_prompt, "test prompt");
+        assert_eq!(inputs.definition.execution.max_llm_retries, 5);
+        assert!(!inputs.definition.execution.strict_durability);
+
+        Ok(())
+    }
+}
