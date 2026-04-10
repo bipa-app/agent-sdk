@@ -265,6 +265,28 @@
 //!   CAS mismatch → clean rejection
 //! ```
 //!
+//! # Phase 3.1 — Threads projection and aggregate ownership (ENG-7922)
+//!
+//! Phase 3.1 adds the **threads projection** — a durable materialized
+//! aggregate view of committed conversation-level counters and status.
+//! The key design property is **single ownership**: thread aggregates
+//! (`committed_turns`, `total_usage`) are updated exclusively through
+//! the [`thread_store::ThreadStore::commit_turn`] entry point, which
+//! delegates to [`thread::Thread::apply_committed_turn`] under the
+//! store's write lock. There is no raw `update()` that touches
+//! counters, so no worker can mutate thread-level aggregates outside
+//! the completed-turn commit path.
+//!
+//! - [`thread::Thread`] is the durable row: identity, status
+//!   (`Active` / `Completed`), committed turn count, cumulative
+//!   token usage, and timestamps.
+//! - [`thread_store::ThreadStore`] is the narrow trait surface:
+//!   `get_or_create`, `get`, `commit_turn`, `mark_completed`,
+//!   `list`.
+//! - [`thread_store::InMemoryThreadStore`] is the reference in-memory
+//!   implementation, following the same `Arc<RwLock<Inner>>` pattern
+//!   as [`store::InMemoryAgentTaskStore`].
+//!
 //! # What is **not** here yet
 //!
 //! | Scope | Phase |
@@ -277,6 +299,8 @@ pub mod recovery;
 pub mod store;
 pub mod task;
 pub mod task_state;
+pub mod thread;
+pub mod thread_store;
 
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
@@ -287,3 +311,5 @@ pub use task::{
     WorkerId,
 };
 pub use task_state::TaskState;
+pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+pub use thread_store::{InMemoryThreadStore, ThreadStore};
