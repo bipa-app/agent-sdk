@@ -1,13 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=migrations");
-    println!("cargo:rerun-if-changed=notes");
-    println!("cargo:rerun-if-changed=proto");
+    let proto_root = std::path::Path::new("../agent-service-host/proto");
+    println!("cargo:rerun-if-changed={}", proto_root.display());
 
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     let mut config = tonic_build::Config::new();
     config.protoc_executable(protoc);
 
-    let proto_root = std::path::Path::new("proto");
     let proto_files = [
         proto_root.join("agent/service/v1/control.proto"),
         proto_root.join("agent/service/v1/events.proto"),

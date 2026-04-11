@@ -119,6 +119,9 @@ impl StaticProviderResolver {
         Self::default()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the resolver registry lock is poisoned.
     pub fn register(
         &self,
         provider: impl Into<String>,
@@ -133,6 +136,9 @@ impl StaticProviderResolver {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the fallback-provider lock is poisoned.
     pub fn set_fallback(&self, runtime: Arc<dyn LlmProvider>) -> Result<()> {
         *self.fallback.write().ok().context("lock poisoned")? = Some(runtime);
         Ok(())

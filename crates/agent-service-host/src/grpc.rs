@@ -50,6 +50,31 @@ use crate::proto::agent::service::v1::agent_event_service_server::{
 use crate::runtime::ExecutionRuntime;
 use crate::stores::StoreRegistry;
 
+type RpcResult<T> = std::result::Result<T, RpcError>;
+
+#[derive(Debug)]
+struct RpcError(Box<Status>);
+
+impl From<Status> for RpcError {
+    fn from(status: Status) -> Self {
+        Self(Box::new(status))
+    }
+}
+
+impl From<RpcError> for Status {
+    fn from(error: RpcError) -> Self {
+        *error.0
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0.code(), self.0.message())
+    }
+}
+
+impl std::error::Error for RpcError {}
+
 #[derive(Default)]
 struct IdempotencyState {
     create_thread: HashMap<String, String>,
@@ -262,22 +287,18 @@ impl GrpcShared {
     }
 
     async fn resolve_tool_description(&self, task: &AgentTask, tool_name: &str) -> String {
-        let root = match self.stores.task_store.get(&task.root_id).await {
-            Ok(Some(root)) => root,
-            Ok(None) | Err(_) => return tool_name.to_owned(),
+        let Ok(Some(root)) = self.stores.task_store.get(&task.root_id).await else {
+            return tool_name.to_owned();
         };
-
-        let definition = match self.stores.definition_registry.resolve(&root).await {
-            Ok(definition) => definition,
-            Err(_) => return tool_name.to_owned(),
+        let Ok(definition) = self.stores.definition_registry.resolve(&root).await else {
+            return tool_name.to_owned();
         };
 
         definition
             .tools
             .iter()
             .find(|tool| tool.name == tool_name)
-            .map(|tool| tool.description.clone())
-            .unwrap_or_else(|| tool_name.to_owned())
+            .map_or_else(|| tool_name.to_owned(), |tool| tool.description.clone())
     }
 
     async fn execute_approved_confirmation(&self, task_id: &AgentTaskId) -> Result<()> {
@@ -334,8 +355,10 @@ impl GrpcShared {
         )
         .await
         {
-            Ok(ConfirmationResumeOutcome::Executed(_))
-            | Ok(ConfirmationResumeOutcome::PolicyDenied { .. }) => {}
+            Ok(
+                ConfirmationResumeOutcome::Executed(_)
+                | ConfirmationResumeOutcome::PolicyDenied { .. },
+            ) => {}
             Err(error) => {
                 warn!(?error, task_id = %task_id, "approved confirmation resume failed");
                 let _ = self
@@ -388,6 +411,142 @@ struct GrpcControlService {
 #[derive(Clone)]
 struct GrpcEventService {
     shared: Arc<GrpcShared>,
+}
+
+impl GrpcControlService {
+    async fn confirmation_response(
+        &self,
+        task: &AgentTask,
+        parent_task: Option<&AgentTask>,
+    ) -> RpcResult<pb::DecideConfirmationResponse> {
+        Ok(pb::DecideConfirmationResponse {
+            task: Some(self.shared.task_snapshot(task).await?),
+            parent_task: match parent_task {
+                Some(parent_task) => Some(self.shared.task_snapshot(parent_task).await?),
+                None => None,
+            },
+        })
+    }
+
+    async fn replay_decide_confirmation(
+        &self,
+        request: &pb::DecideConfirmationRequest,
+        fingerprint: &[u8],
+    ) -> RpcResult<Option<pb::DecideConfirmationResponse>> {
+        let record = {
+            let idempotency = self.shared.idempotency.lock().await;
+            idempotency
+                .decide_confirmation
+                .get(&request.request_id)
+                .cloned()
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if record.fingerprint != fingerprint {
+            return Err(
+                idempotency_conflict_status("DecideConfirmation", &request.request_id).into(),
+            );
+        }
+
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&AgentTaskId::from_string(record.task_id))
+            .await
+            .map_err(internal_status("loading idempotent confirmation task"))?
+            .ok_or_else(|| not_found_status("task", "idempotent confirmation result"))?;
+        let parent_task = match record.parent_task_id {
+            Some(parent_task_id) => self
+                .shared
+                .stores
+                .task_store
+                .get(&AgentTaskId::from_string(parent_task_id))
+                .await
+                .map_err(internal_status("loading idempotent confirmation parent"))?,
+            None => None,
+        };
+
+        Ok(Some(
+            self.confirmation_response(&task, parent_task.as_ref())
+                .await?,
+        ))
+    }
+
+    async fn load_task_and_parent(
+        &self,
+        task_id: &AgentTaskId,
+    ) -> RpcResult<(AgentTask, Option<AgentTask>)> {
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(task_id)
+            .await
+            .map_err(internal_status("reloading confirmation task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+        let parent_task = match task.parent_id.as_ref() {
+            Some(parent_id) => self
+                .shared
+                .stores
+                .task_store
+                .get(parent_id)
+                .await
+                .map_err(internal_status("reloading confirmation parent"))?,
+            None => None,
+        };
+        Ok((task, parent_task))
+    }
+
+    async fn run_confirmation_decision(
+        &self,
+        request: &pb::DecideConfirmationRequest,
+        thread_id: &ThreadId,
+        task_id: &AgentTaskId,
+    ) -> RpcResult<(AgentTask, Option<AgentTask>)> {
+        let current_task = self
+            .shared
+            .stores
+            .task_store
+            .get(task_id)
+            .await
+            .map_err(internal_status("loading confirmation task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+        if current_task.thread_id != *thread_id {
+            return Err(Status::failed_precondition(format!(
+                "task {task_id} does not belong to thread {thread_id}",
+            ))
+            .into());
+        }
+
+        let decision = map_confirmation_decision(
+            request
+                .decision
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("confirmation decision is required"))?,
+        )?;
+        match decision {
+            ConfirmationDecision::Approved => {
+                Box::pin(self.shared.execute_approved_confirmation(task_id))
+                    .await
+                    .map_err(internal_status("executing approved confirmation"))?;
+            }
+            other => {
+                let now = OffsetDateTime::now_utc();
+                let _ = apply_confirmation_decision(
+                    task_id,
+                    other,
+                    self.shared.stores.task_store.as_ref(),
+                    now,
+                )
+                .await
+                .map_err(internal_status("applying confirmation decision"))?;
+            }
+        }
+
+        self.load_task_and_parent(task_id).await
+    }
 }
 
 #[tonic::async_trait]
@@ -619,108 +778,16 @@ impl AgentControlService for GrpcControlService {
         let task_id = parse_task_id(&request.task_id)?;
         let fingerprint = decide_confirmation_fingerprint(&request);
 
-        if let Some(record) = {
-            let idempotency = self.shared.idempotency.lock().await;
-            idempotency
-                .decide_confirmation
-                .get(&request.request_id)
-                .cloned()
-        } {
-            if record.fingerprint != fingerprint {
-                return Err(idempotency_conflict_status(
-                    "DecideConfirmation",
-                    &request.request_id,
-                ));
-            }
-
-            let task = self
-                .shared
-                .stores
-                .task_store
-                .get(&AgentTaskId::from_string(record.task_id))
-                .await
-                .map_err(internal_status("loading idempotent confirmation task"))?
-                .ok_or_else(|| not_found_status("task", "idempotent confirmation result"))?;
-            let parent_task = match record.parent_task_id {
-                Some(parent_task_id) => self
-                    .shared
-                    .stores
-                    .task_store
-                    .get(&AgentTaskId::from_string(parent_task_id))
-                    .await
-                    .map_err(internal_status("loading idempotent confirmation parent"))?,
-                None => None,
-            };
-
-            return Ok(Response::new(pb::DecideConfirmationResponse {
-                task: Some(self.shared.task_snapshot(&task).await?),
-                parent_task: match parent_task {
-                    Some(parent_task) => Some(self.shared.task_snapshot(&parent_task).await?),
-                    None => None,
-                },
-            }));
+        if let Some(response) = self
+            .replay_decide_confirmation(&request, &fingerprint)
+            .await?
+        {
+            return Ok(Response::new(response));
         }
 
-        let current_task = self
-            .shared
-            .stores
-            .task_store
-            .get(&task_id)
-            .await
-            .map_err(internal_status("loading confirmation task"))?
-            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
-        if current_task.thread_id != thread_id {
-            return Err(Status::failed_precondition(format!(
-                "task {} does not belong to thread {}",
-                task_id, thread_id
-            )));
-        }
-
-        let decision = map_confirmation_decision(
-            request
-                .decision
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("confirmation decision is required"))?,
-        )?;
-        match decision {
-            ConfirmationDecision::Approved => {
-                self.shared
-                    .execute_approved_confirmation(&task_id)
-                    .await
-                    .map_err(internal_status("executing approved confirmation"))?;
-            }
-            other => {
-                let now = OffsetDateTime::now_utc();
-                let _ = apply_confirmation_decision(
-                    &task_id,
-                    other,
-                    self.shared.stores.task_store.as_ref(),
-                    now,
-                )
-                .await
-                .map_err(internal_status("applying confirmation decision"))?;
-            }
-        }
-
-        let task = self
-            .shared
-            .stores
-            .task_store
-            .get(&task_id)
-            .await
-            .map_err(internal_status("reloading confirmation task"))?
-            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
-
-        let parent_task = match task.parent_id.as_ref() {
-            Some(parent_id) => self
-                .shared
-                .stores
-                .task_store
-                .get(parent_id)
-                .await
-                .map_err(internal_status("reloading confirmation parent"))?,
-            None => None,
-        };
+        let (task, parent_task) = self
+            .run_confirmation_decision(&request, &thread_id, &task_id)
+            .await?;
 
         {
             let mut idempotency = self.shared.idempotency.lock().await;
@@ -734,18 +801,130 @@ impl AgentControlService for GrpcControlService {
             );
         }
 
-        Ok(Response::new(pb::DecideConfirmationResponse {
-            task: Some(self.shared.task_snapshot(&task).await?),
-            parent_task: match parent_task {
-                Some(parent_task) => Some(self.shared.task_snapshot(&parent_task).await?),
-                None => None,
-            },
-        }))
+        Ok(Response::new(
+            self.confirmation_response(&task, parent_task.as_ref())
+                .await?,
+        ))
     }
 }
 
 type EventStream =
     Pin<Box<dyn Stream<Item = Result<pb::StreamThreadEventsResponse, Status>> + Send>>;
+
+struct ReplayState {
+    all_events: Vec<agent_server::CommittedEvent>,
+    earliest_available: Option<u64>,
+    latest_available: Option<u64>,
+    next_sequence: u64,
+}
+
+impl GrpcEventService {
+    fn build_event_stream(
+        &self,
+        thread_id: ThreadId,
+        after_sequence: Option<u64>,
+        follow_mode: pb::FollowMode,
+    ) -> EventStream {
+        let shared = Arc::clone(&self.shared);
+        let stream = try_stream! {
+            let mut live_rx = shared.stores.event_notifier.subscribe(&thread_id);
+            let replay = load_replay_state(shared.as_ref(), &thread_id).await?;
+            if has_retention_gap(after_sequence, replay.earliest_available) {
+                yield retention_gap_response(
+                    &thread_id,
+                    after_sequence,
+                    replay.earliest_available,
+                    replay.latest_available,
+                );
+                return;
+            }
+
+            yield replay_opened_response(
+                &thread_id,
+                after_sequence,
+                replay.earliest_available,
+                replay.next_sequence.checked_sub(1),
+                follow_mode,
+            );
+
+            let replay_events = select_replay_events(replay.all_events, after_sequence);
+            let mut last_delivered_sequence = after_sequence;
+            for event in &replay_events {
+                last_delivered_sequence = Some(event.sequence);
+                yield event_stream_response(event)?;
+            }
+
+            yield replay_catchup_complete_response(
+                &thread_id,
+                replay_events.last().map(|event| event.sequence).or(after_sequence),
+                follow_mode,
+            );
+
+            let last_replayed_done = replay_events.last().is_some_and(is_done_event);
+            if follow_mode == pb::FollowMode::ReplayOnly {
+                yield closed_stream_response(
+                    &thread_id,
+                    pb::StreamCloseReason::ReplayExhausted,
+                    last_delivered_sequence,
+                );
+                return;
+            }
+            if last_replayed_done {
+                yield closed_stream_response(
+                    &thread_id,
+                    pb::StreamCloseReason::ThreadCompleted,
+                    last_delivered_sequence,
+                );
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    () = shared.shutdown.cancelled() => {
+                        yield closed_stream_response(
+                            &thread_id,
+                            pb::StreamCloseReason::ServerShutdown,
+                            last_delivered_sequence,
+                        );
+                        return;
+                    }
+                    received = live_rx.recv() => match received {
+                        Ok(event) => {
+                            if last_delivered_sequence.is_some_and(|sequence| event.sequence <= sequence) {
+                                continue;
+                            }
+                            last_delivered_sequence = Some(event.sequence);
+                            let is_done = is_done_event(&event);
+                            yield event_stream_response(&event)?;
+                            if is_done {
+                                yield closed_stream_response(
+                                    &thread_id,
+                                    pb::StreamCloseReason::ThreadCompleted,
+                                    last_delivered_sequence,
+                                );
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield replay_required_response(&thread_id, last_delivered_sequence);
+                            return;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            yield closed_stream_response(
+                                &thread_id,
+                                pb::StreamCloseReason::ServerShutdown,
+                                last_delivered_sequence,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        Box::pin(stream)
+    }
+}
 
 #[tonic::async_trait]
 impl AgentEventService for GrpcEventService {
@@ -759,188 +938,151 @@ impl AgentEventService for GrpcEventService {
         let thread_id = parse_thread_id(&request.thread_id)?;
         self.shared.require_thread(&thread_id).await?;
         let follow_mode = map_follow_mode(request.follow_mode)?;
-        let shared = Arc::clone(&self.shared);
-
-        let stream = try_stream! {
-            let mut live_rx = shared.stores.event_notifier.subscribe(&thread_id);
-            let next_sequence = shared
-                .stores
-                .event_repo
-                .next_sequence(&thread_id)
-                .await
-                .map_err(as_stream_status("capturing event watermark"))?;
-
-            let all_events = shared
-                .stores
-                .event_repo
-                .get_events(&thread_id)
-                .await
-                .map_err(as_stream_status("loading replay events"))?;
-            let earliest_available = all_events.first().map(|event| event.sequence);
-            let latest_available = all_events.last().map(|event| event.sequence);
-
-            if let (Some(requested_after), Some(earliest)) =
-                (request.after_sequence, earliest_available)
-            {
-                if requested_after < earliest.saturating_sub(1) {
-                    yield pb::StreamThreadEventsResponse {
-                        item: Some(pb::stream_thread_events_response::Item::RetentionGap(
-                            pb::RetentionGap {
-                                thread_id: thread_id.0.clone(),
-                                requested_after_sequence: request.after_sequence,
-                                earliest_available_sequence: earliest_available,
-                                latest_available_sequence: latest_available,
-                            },
-                        )),
-                    };
-                    return;
-                }
-            }
-
-            let replay_through_sequence = next_sequence.checked_sub(1);
-            yield pb::StreamThreadEventsResponse {
-                item: Some(pb::stream_thread_events_response::Item::ReplayOpened(
-                    pb::ReplayOpened {
-                        thread_id: thread_id.0.clone(),
-                        requested_after_sequence: request.after_sequence,
-                        earliest_available_sequence: earliest_available,
-                        replay_through_sequence,
-                        follow_mode: follow_mode as i32,
-                    },
-                )),
-            };
-
-            let replay_events: Vec<_> = match request.after_sequence {
-                Some(after_sequence) => all_events
-                    .into_iter()
-                    .filter(|event| event.sequence > after_sequence)
-                    .collect(),
-                None => all_events,
-            };
-
-            let mut last_delivered_sequence = request.after_sequence;
-            for event in &replay_events {
-                last_delivered_sequence = Some(event.sequence);
-                yield pb::StreamThreadEventsResponse {
-                    item: Some(pb::stream_thread_events_response::Item::Event(
-                        map_committed_event(event)?,
-                    )),
-                };
-            }
-
-            yield pb::StreamThreadEventsResponse {
-                item: Some(pb::stream_thread_events_response::Item::ReplayCatchupComplete(
-                    pb::ReplayCatchupComplete {
-                        thread_id: thread_id.0.clone(),
-                        replayed_through_sequence: replay_events
-                            .last()
-                            .map(|event| event.sequence)
-                            .or(request.after_sequence),
-                        following_live: matches!(
-                            follow_mode,
-                            pb::FollowMode::ReplayAndFollow
-                        ),
-                    },
-                )),
-            };
-
-            let last_replayed_done = replay_events.last().is_some_and(is_done_event);
-            if matches!(follow_mode, pb::FollowMode::ReplayOnly) {
-                yield pb::StreamThreadEventsResponse {
-                    item: Some(pb::stream_thread_events_response::Item::Closed(
-                        pb::EventStreamClosed {
-                            thread_id: thread_id.0.clone(),
-                            reason: pb::StreamCloseReason::ReplayExhausted as i32,
-                            last_sequence: last_delivered_sequence,
-                        },
-                    )),
-                };
-                return;
-            }
-
-            if last_replayed_done {
-                yield pb::StreamThreadEventsResponse {
-                    item: Some(pb::stream_thread_events_response::Item::Closed(
-                        pb::EventStreamClosed {
-                            thread_id: thread_id.0.clone(),
-                            reason: pb::StreamCloseReason::ThreadCompleted as i32,
-                            last_sequence: last_delivered_sequence,
-                        },
-                    )),
-                };
-                return;
-            }
-
-            loop {
-                tokio::select! {
-                    _ = shared.shutdown.cancelled() => {
-                        yield pb::StreamThreadEventsResponse {
-                            item: Some(pb::stream_thread_events_response::Item::Closed(
-                                pb::EventStreamClosed {
-                                    thread_id: thread_id.0.clone(),
-                                    reason: pb::StreamCloseReason::ServerShutdown as i32,
-                                    last_sequence: last_delivered_sequence,
-                                },
-                            )),
-                        };
-                        return;
-                    }
-                    received = live_rx.recv() => match received {
-                        Ok(event) => {
-                            if last_delivered_sequence.is_some_and(|sequence| event.sequence <= sequence) {
-                                continue;
-                            }
-                            last_delivered_sequence = Some(event.sequence);
-                            let is_done = is_done_event(&event);
-                            yield pb::StreamThreadEventsResponse {
-                                item: Some(pb::stream_thread_events_response::Item::Event(
-                                    map_committed_event(&event)?,
-                                )),
-                            };
-                            if is_done {
-                                yield pb::StreamThreadEventsResponse {
-                                    item: Some(pb::stream_thread_events_response::Item::Closed(
-                                        pb::EventStreamClosed {
-                                            thread_id: thread_id.0.clone(),
-                                            reason: pb::StreamCloseReason::ThreadCompleted as i32,
-                                            last_sequence: last_delivered_sequence,
-                                        },
-                                    )),
-                                };
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            yield pb::StreamThreadEventsResponse {
-                                item: Some(pb::stream_thread_events_response::Item::ReplayRequired(
-                                    pb::ReplayRequired {
-                                        thread_id: thread_id.0.clone(),
-                                        last_delivered_sequence,
-                                        reason: pb::ReplayRequiredReason::SubscriberLagged as i32,
-                                    },
-                                )),
-                            };
-                            return;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            yield pb::StreamThreadEventsResponse {
-                                item: Some(pb::stream_thread_events_response::Item::Closed(
-                                    pb::EventStreamClosed {
-                                        thread_id: thread_id.0.clone(),
-                                        reason: pb::StreamCloseReason::ServerShutdown as i32,
-                                        last_sequence: last_delivered_sequence,
-                                    },
-                                )),
-                            };
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(self.build_event_stream(
+            thread_id,
+            request.after_sequence,
+            follow_mode,
+        )))
     }
+}
+
+async fn load_replay_state(shared: &GrpcShared, thread_id: &ThreadId) -> RpcResult<ReplayState> {
+    let next_sequence = shared
+        .stores
+        .event_repo
+        .next_sequence(thread_id)
+        .await
+        .map_err(as_stream_status("capturing event watermark"))?;
+    let all_events = shared
+        .stores
+        .event_repo
+        .get_events(thread_id)
+        .await
+        .map_err(as_stream_status("loading replay events"))?;
+
+    Ok(ReplayState {
+        earliest_available: all_events.first().map(|event| event.sequence),
+        latest_available: all_events.last().map(|event| event.sequence),
+        all_events,
+        next_sequence,
+    })
+}
+
+const fn has_retention_gap(after_sequence: Option<u64>, earliest_available: Option<u64>) -> bool {
+    matches!(
+        (after_sequence, earliest_available),
+        (Some(requested_after), Some(earliest)) if requested_after < earliest.saturating_sub(1)
+    )
+}
+
+fn select_replay_events(
+    all_events: Vec<agent_server::CommittedEvent>,
+    after_sequence: Option<u64>,
+) -> Vec<agent_server::CommittedEvent> {
+    match after_sequence {
+        Some(after_sequence) => all_events
+            .into_iter()
+            .filter(|event| event.sequence > after_sequence)
+            .collect(),
+        None => all_events,
+    }
+}
+
+fn retention_gap_response(
+    thread_id: &ThreadId,
+    requested_after_sequence: Option<u64>,
+    earliest_available_sequence: Option<u64>,
+    latest_available_sequence: Option<u64>,
+) -> pb::StreamThreadEventsResponse {
+    pb::StreamThreadEventsResponse {
+        item: Some(pb::stream_thread_events_response::Item::RetentionGap(
+            pb::RetentionGap {
+                thread_id: thread_id.0.clone(),
+                requested_after_sequence,
+                earliest_available_sequence,
+                latest_available_sequence,
+            },
+        )),
+    }
+}
+
+fn replay_opened_response(
+    thread_id: &ThreadId,
+    requested_after_sequence: Option<u64>,
+    earliest_available_sequence: Option<u64>,
+    replay_through_sequence: Option<u64>,
+    follow_mode: pb::FollowMode,
+) -> pb::StreamThreadEventsResponse {
+    pb::StreamThreadEventsResponse {
+        item: Some(pb::stream_thread_events_response::Item::ReplayOpened(
+            pb::ReplayOpened {
+                thread_id: thread_id.0.clone(),
+                requested_after_sequence,
+                earliest_available_sequence,
+                replay_through_sequence,
+                follow_mode: follow_mode as i32,
+            },
+        )),
+    }
+}
+
+fn replay_catchup_complete_response(
+    thread_id: &ThreadId,
+    replayed_through_sequence: Option<u64>,
+    follow_mode: pb::FollowMode,
+) -> pb::StreamThreadEventsResponse {
+    pb::StreamThreadEventsResponse {
+        item: Some(
+            pb::stream_thread_events_response::Item::ReplayCatchupComplete(
+                pb::ReplayCatchupComplete {
+                    thread_id: thread_id.0.clone(),
+                    replayed_through_sequence,
+                    following_live: follow_mode == pb::FollowMode::ReplayAndFollow,
+                },
+            ),
+        ),
+    }
+}
+
+fn closed_stream_response(
+    thread_id: &ThreadId,
+    reason: pb::StreamCloseReason,
+    last_sequence: Option<u64>,
+) -> pb::StreamThreadEventsResponse {
+    pb::StreamThreadEventsResponse {
+        item: Some(pb::stream_thread_events_response::Item::Closed(
+            pb::EventStreamClosed {
+                thread_id: thread_id.0.clone(),
+                reason: reason as i32,
+                last_sequence,
+            },
+        )),
+    }
+}
+
+fn replay_required_response(
+    thread_id: &ThreadId,
+    last_delivered_sequence: Option<u64>,
+) -> pb::StreamThreadEventsResponse {
+    pb::StreamThreadEventsResponse {
+        item: Some(pb::stream_thread_events_response::Item::ReplayRequired(
+            pb::ReplayRequired {
+                thread_id: thread_id.0.clone(),
+                last_delivered_sequence,
+                reason: pb::ReplayRequiredReason::SubscriberLagged as i32,
+            },
+        )),
+    }
+}
+
+fn event_stream_response(
+    event: &agent_server::CommittedEvent,
+) -> RpcResult<pb::StreamThreadEventsResponse> {
+    Ok(pb::StreamThreadEventsResponse {
+        item: Some(pb::stream_thread_events_response::Item::Event(
+            map_committed_event(event)?,
+        )),
+    })
 }
 
 /// gRPC transport server bound to a durable host runtime.
@@ -969,6 +1111,10 @@ impl GrpcTransport {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if binding the TCP listener fails or if the gRPC server
+    /// exits with a transport error.
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr)
             .await
@@ -976,6 +1122,10 @@ impl GrpcTransport {
         self.serve_listener(listener).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the health loop or gRPC transport cannot be served on
+    /// the provided listener.
     pub async fn serve_listener(self, listener: TcpListener) -> Result<()> {
         let (mut reporter, health_service) = tonic_health::server::health_reporter();
         let control_service = GrpcControlService {
@@ -1008,7 +1158,7 @@ impl GrpcTransport {
                 }
 
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    () = shutdown.cancelled() => break,
                     _ = interval.tick() => {}
                 }
             }
@@ -1040,6 +1190,10 @@ pub struct LocalDaemon {
 }
 
 impl LocalDaemon {
+    /// # Errors
+    ///
+    /// Returns an error if the durable stores, host runtime, or local gRPC
+    /// listener cannot be initialized.
     pub async fn start(
         config: ServiceConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
@@ -1093,6 +1247,10 @@ impl LocalDaemon {
         self.shutdown.clone()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if either the host task or gRPC task fails while the
+    /// daemon is shutting down.
     pub async fn stop(self) -> Result<()> {
         self.shutdown.cancel();
         self.grpc_task.await.context("joining gRPC task")??;
@@ -1101,23 +1259,23 @@ impl LocalDaemon {
     }
 }
 
-fn require_request_id(request_id: &str) -> Result<(), Status> {
+fn require_request_id(request_id: &str) -> RpcResult<()> {
     if request_id.trim().is_empty() {
-        return Err(Status::invalid_argument("request_id is required"));
+        return Err(Status::invalid_argument("request_id is required").into());
     }
     Ok(())
 }
 
-fn parse_thread_id(thread_id: &str) -> Result<ThreadId, Status> {
+fn parse_thread_id(thread_id: &str) -> RpcResult<ThreadId> {
     if thread_id.trim().is_empty() {
-        return Err(Status::invalid_argument("thread_id is required"));
+        return Err(Status::invalid_argument("thread_id is required").into());
     }
     Ok(ThreadId::from_string(thread_id))
 }
 
-fn parse_task_id(task_id: &str) -> Result<AgentTaskId, Status> {
+fn parse_task_id(task_id: &str) -> RpcResult<AgentTaskId> {
     if task_id.trim().is_empty() {
-        return Err(Status::invalid_argument("task_id is required"));
+        return Err(Status::invalid_argument("task_id is required").into());
     }
     Ok(AgentTaskId::from_string(task_id))
 }
@@ -1156,14 +1314,14 @@ fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> V
     request.encode_to_vec()
 }
 
-fn map_thread_status(status: agent_server::ThreadStatus) -> i32 {
+const fn map_thread_status(status: agent_server::ThreadStatus) -> i32 {
     match status {
         agent_server::ThreadStatus::Active => pb::ThreadStatus::Active as i32,
         agent_server::ThreadStatus::Completed => pb::ThreadStatus::Completed as i32,
     }
 }
 
-fn map_task_kind(kind: JournalTaskKind) -> i32 {
+const fn map_task_kind(kind: JournalTaskKind) -> i32 {
     match kind {
         JournalTaskKind::RootTurn => pb::TaskKind::RootTurn as i32,
         JournalTaskKind::ToolRuntime => pb::TaskKind::ToolRuntime as i32,
@@ -1171,7 +1329,7 @@ fn map_task_kind(kind: JournalTaskKind) -> i32 {
     }
 }
 
-fn map_task_status(status: JournalTaskStatus) -> i32 {
+const fn map_task_status(status: JournalTaskStatus) -> i32 {
     match status {
         JournalTaskStatus::Queued => pb::TaskStatus::Queued as i32,
         JournalTaskStatus::Pending => pb::TaskStatus::Pending as i32,
@@ -1184,14 +1342,14 @@ fn map_task_status(status: JournalTaskStatus) -> i32 {
     }
 }
 
-fn map_tool_tier(tier: ToolTier) -> i32 {
+const fn map_tool_tier(tier: ToolTier) -> i32 {
     match tier {
         ToolTier::Observe => pb::ToolTier::Observe as i32,
         ToolTier::Confirm => pb::ToolTier::Confirm as i32,
     }
 }
 
-fn map_message_role(role: llm::Role) -> i32 {
+const fn map_message_role(role: llm::Role) -> i32 {
     match role {
         llm::Role::User => pb::MessageRole::User as i32,
         llm::Role::Assistant => pb::MessageRole::Assistant as i32,
@@ -1200,12 +1358,12 @@ fn map_message_role(role: llm::Role) -> i32 {
 
 fn map_token_usage(usage: &TokenUsage) -> pb::TokenUsage {
     pb::TokenUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
+        input_tokens: u64::from(usage.input_tokens),
+        output_tokens: u64::from(usage.output_tokens),
     }
 }
 
-fn map_timestamp(timestamp: OffsetDateTime) -> Result<ProtoTimestamp, Status> {
+fn map_timestamp(timestamp: OffsetDateTime) -> RpcResult<ProtoTimestamp> {
     Ok(ProtoTimestamp {
         seconds: timestamp.unix_timestamp(),
         nanos: i32::try_from(timestamp.nanosecond())
@@ -1213,13 +1371,11 @@ fn map_timestamp(timestamp: OffsetDateTime) -> Result<ProtoTimestamp, Status> {
     })
 }
 
-fn map_optional_timestamp(
-    timestamp: Option<OffsetDateTime>,
-) -> Result<Option<ProtoTimestamp>, Status> {
+fn map_optional_timestamp(timestamp: Option<OffsetDateTime>) -> RpcResult<Option<ProtoTimestamp>> {
     timestamp.map(map_timestamp).transpose()
 }
 
-fn map_duration(duration: std::time::Duration) -> Result<ProtoDuration, Status> {
+fn map_duration(duration: std::time::Duration) -> RpcResult<ProtoDuration> {
     Ok(ProtoDuration {
         seconds: i64::try_from(duration.as_secs())
             .map_err(|_| Status::internal("duration seconds out of range"))?,
@@ -1228,7 +1384,7 @@ fn map_duration(duration: std::time::Duration) -> Result<ProtoDuration, Status> 
     })
 }
 
-fn map_json_value(value: &serde_json::Value) -> Result<ProtoValue, Status> {
+fn map_json_value(value: &serde_json::Value) -> RpcResult<ProtoValue> {
     let kind = match value {
         serde_json::Value::Null => ProtoValueKind::NullValue(0),
         serde_json::Value::Bool(value) => ProtoValueKind::BoolValue(*value),
@@ -1242,19 +1398,19 @@ fn map_json_value(value: &serde_json::Value) -> Result<ProtoValue, Status> {
             values: values
                 .iter()
                 .map(map_json_value)
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<RpcResult<Vec<_>>>()?,
         }),
         serde_json::Value::Object(values) => ProtoValueKind::StructValue(ProtoStruct {
             fields: values
                 .iter()
                 .map(|(key, value)| Ok((key.clone(), map_json_value(value)?)))
-                .collect::<Result<BTreeMap<_, _>, Status>>()?,
+                .collect::<RpcResult<BTreeMap<_, _>>>()?,
         }),
     };
     Ok(ProtoValue { kind: Some(kind) })
 }
 
-fn map_binary_attachment(source: &ContentSource) -> Result<pb::BinaryAttachment, Status> {
+fn map_binary_attachment(source: &ContentSource) -> RpcResult<pb::BinaryAttachment> {
     Ok(pb::BinaryAttachment {
         media_type: source.media_type.clone(),
         data: base64::engine::general_purpose::STANDARD
@@ -1265,7 +1421,7 @@ fn map_binary_attachment(source: &ContentSource) -> Result<pb::BinaryAttachment,
     })
 }
 
-fn map_tool_result(result: &ToolResult) -> Result<pb::ToolResult, Status> {
+fn map_tool_result(result: &ToolResult) -> RpcResult<pb::ToolResult> {
     Ok(pb::ToolResult {
         success: result.success,
         output: result.output.clone(),
@@ -1274,14 +1430,14 @@ fn map_tool_result(result: &ToolResult) -> Result<pb::ToolResult, Status> {
             .documents
             .iter()
             .map(map_binary_attachment)
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<RpcResult<Vec<_>>>()?,
         duration_ms: result.duration_ms,
     })
 }
 
 fn map_prepared_operation(
     operation: &agent_sdk_core::ListenExecutionContext,
-) -> Result<pb::PreparedOperation, Status> {
+) -> RpcResult<pb::PreparedOperation> {
     Ok(pb::PreparedOperation {
         operation_id: operation.operation_id.clone(),
         revision: operation.revision,
@@ -1290,7 +1446,7 @@ fn map_prepared_operation(
     })
 }
 
-fn map_message(message: &llm::Message) -> Result<pb::ConversationMessage, Status> {
+fn map_message(message: &llm::Message) -> RpcResult<pb::ConversationMessage> {
     let content = match &message.content {
         llm::Content::Text(text) => Some(pb::conversation_message::Content::Text(text.clone())),
         llm::Content::Blocks(blocks) => Some(pb::conversation_message::Content::Blocks(
@@ -1298,7 +1454,7 @@ fn map_message(message: &llm::Message) -> Result<pb::ConversationMessage, Status
                 items: blocks
                     .iter()
                     .map(map_content_block)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .collect::<RpcResult<Vec<_>>>()?,
             },
         )),
     };
@@ -1309,7 +1465,7 @@ fn map_message(message: &llm::Message) -> Result<pb::ConversationMessage, Status
     })
 }
 
-fn map_content_block(block: &ContentBlock) -> Result<pb::ConversationContentBlock, Status> {
+fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentBlock> {
     let block = match block {
         ContentBlock::Text { text } => {
             pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
@@ -1357,7 +1513,7 @@ fn map_content_block(block: &ContentBlock) -> Result<pb::ConversationContentBloc
     Ok(pb::ConversationContentBlock { block: Some(block) })
 }
 
-fn map_submitted_input_item(item: &pb::UserInputItem) -> Result<SubmittedInputItem, Status> {
+fn map_submitted_input_item(item: &pb::UserInputItem) -> RpcResult<SubmittedInputItem> {
     match item.item.as_ref() {
         Some(pb::user_input_item::Item::Text(text)) => {
             Ok(SubmittedInputItem::Text { text: text.clone() })
@@ -1370,97 +1526,135 @@ fn map_submitted_input_item(item: &pb::UserInputItem) -> Result<SubmittedInputIt
             media_type: document.media_type.clone(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(&document.data),
         }),
-        None => Err(Status::invalid_argument("user input item is required")),
+        None => Err(Status::invalid_argument("user input item is required").into()),
     }
 }
 
 fn map_confirmation_decision(
     decision: &pb::ConfirmationDecision,
-) -> Result<ConfirmationDecision, Status> {
+) -> RpcResult<ConfirmationDecision> {
     match decision.decision.as_ref() {
         Some(pb::confirmation_decision::Decision::Approved(_)) => {
             Ok(ConfirmationDecision::Approved)
         }
         Some(pb::confirmation_decision::Decision::Rejected(rejected)) => {
             if rejected.reason.trim().is_empty() {
-                return Err(Status::invalid_argument(
-                    "rejected confirmations require a reason",
-                ));
+                return Err(
+                    Status::invalid_argument("rejected confirmations require a reason").into(),
+                );
             }
             Ok(ConfirmationDecision::Rejected {
                 reason: rejected.reason.clone(),
             })
         }
         Some(pb::confirmation_decision::Decision::TimedOut(_)) => Ok(ConfirmationDecision::Timeout),
-        None => Err(Status::invalid_argument(
-            "confirmation decision is required",
-        )),
+        None => Err(Status::invalid_argument("confirmation decision is required").into()),
     }
 }
 
-fn map_follow_mode(follow_mode: i32) -> Result<pb::FollowMode, Status> {
-    match pb::FollowMode::try_from(follow_mode).unwrap_or(pb::FollowMode::Unspecified) {
-        pb::FollowMode::ReplayOnly => Ok(pb::FollowMode::ReplayOnly),
-        pb::FollowMode::ReplayAndFollow => Ok(pb::FollowMode::ReplayAndFollow),
-        pb::FollowMode::Unspecified => Err(Status::invalid_argument(
-            "follow_mode must be replay_only or replay_and_follow",
-        )),
+fn map_follow_mode(follow_mode: i32) -> RpcResult<pb::FollowMode> {
+    match pb::FollowMode::try_from(follow_mode) {
+        Ok(pb::FollowMode::ReplayOnly) => Ok(pb::FollowMode::ReplayOnly),
+        Ok(pb::FollowMode::ReplayAndFollow) => Ok(pb::FollowMode::ReplayAndFollow),
+        _ => Err(
+            Status::invalid_argument("follow_mode must be replay_only or replay_and_follow").into(),
+        ),
     }
 }
 
-fn map_committed_event(event: &agent_server::CommittedEvent) -> Result<pb::EventEnvelope, Status> {
-    let payload = match &event.event {
-        AgentEvent::Start { thread_id, turn } => pb::event_envelope::Event::Start(pb::StartEvent {
-            thread_id: thread_id.0.clone(),
-            turn: u64::try_from(*turn)
-                .map_err(|_| Status::internal("turn out of range for protobuf"))?,
-        }),
-        AgentEvent::Thinking { message_id, text } => {
-            pb::event_envelope::Event::Thinking(pb::ThinkingEvent {
+fn map_committed_event(event: &agent_server::CommittedEvent) -> RpcResult<pb::EventEnvelope> {
+    let payload = map_event_payload(&event.event)?;
+    Ok(pb::EventEnvelope {
+        event_id: event.event_id.to_string(),
+        thread_id: event.thread_id.0.clone(),
+        sequence: event.sequence,
+        commit_time: Some(map_timestamp(event.timestamp)?),
+        event: Some(payload),
+    })
+}
+
+fn map_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    if let Some(payload) = map_message_event_payload(event)? {
+        return Ok(payload);
+    }
+    if let Some(payload) = map_tool_event_payload(event)? {
+        return Ok(payload);
+    }
+    map_lifecycle_event_payload(event)
+}
+
+fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
+    match event {
+        AgentEvent::Start { thread_id, turn } => {
+            Ok(Some(pb::event_envelope::Event::Start(pb::StartEvent {
+                thread_id: thread_id.0.clone(),
+                turn: map_u64(*turn, "turn")?,
+            })))
+        }
+        AgentEvent::Thinking { message_id, text } => Ok(Some(pb::event_envelope::Event::Thinking(
+            pb::ThinkingEvent {
                 message_id: message_id.clone(),
                 text: text.clone(),
-            })
-        }
-        AgentEvent::ThinkingDelta { message_id, delta } => {
+            },
+        ))),
+        AgentEvent::ThinkingDelta { message_id, delta } => Ok(Some(
             pb::event_envelope::Event::ThinkingDelta(pb::ThinkingDeltaEvent {
                 message_id: message_id.clone(),
                 delta: delta.clone(),
-            })
-        }
-        AgentEvent::TextDelta { message_id, delta } => {
+            }),
+        )),
+        AgentEvent::TextDelta { message_id, delta } => Ok(Some(
             pb::event_envelope::Event::TextDelta(pb::TextDeltaEvent {
                 message_id: message_id.clone(),
                 delta: delta.clone(),
-            })
+            }),
+        )),
+        AgentEvent::Text { message_id, text } => {
+            Ok(Some(pb::event_envelope::Event::Text(pb::TextEvent {
+                message_id: message_id.clone(),
+                text: text.clone(),
+            })))
         }
-        AgentEvent::Text { message_id, text } => pb::event_envelope::Event::Text(pb::TextEvent {
-            message_id: message_id.clone(),
-            text: text.clone(),
-        }),
+        AgentEvent::Refusal { message_id, text } => {
+            Ok(Some(pb::event_envelope::Event::Refusal(pb::RefusalEvent {
+                message_id: message_id.clone(),
+                text: text.clone(),
+            })))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
+    match event {
         AgentEvent::ToolCallStart {
             id,
             name,
             display_name,
             input,
             tier,
-        } => pb::event_envelope::Event::ToolCallStart(pb::ToolCallStartEvent {
-            tool_call_id: id.clone(),
-            name: name.clone(),
-            display_name: display_name.clone(),
-            input: Some(map_json_value(input)?),
-            tier: map_tool_tier(*tier),
-        }),
+        } => Ok(Some(pb::event_envelope::Event::ToolCallStart(
+            pb::ToolCallStartEvent {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: display_name.clone(),
+                input: Some(map_json_value(input)?),
+                tier: map_tool_tier(*tier),
+            },
+        ))),
         AgentEvent::ToolCallEnd {
             id,
             name,
             display_name,
             result,
-        } => pb::event_envelope::Event::ToolCallEnd(pb::ToolCallEndEvent {
-            tool_call_id: id.clone(),
-            name: name.clone(),
-            display_name: display_name.clone(),
-            result: Some(map_tool_result(result)?),
-        }),
+        } => Ok(Some(pb::event_envelope::Event::ToolCallEnd(
+            pb::ToolCallEndEvent {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: display_name.clone(),
+                result: Some(map_tool_result(result)?),
+            },
+        ))),
         AgentEvent::ToolProgress {
             id,
             name,
@@ -1468,75 +1662,73 @@ fn map_committed_event(event: &agent_server::CommittedEvent) -> Result<pb::Event
             stage,
             message,
             data,
-        } => pb::event_envelope::Event::ToolProgress(pb::ToolProgressEvent {
-            tool_call_id: id.clone(),
-            name: name.clone(),
-            display_name: display_name.clone(),
-            stage: stage.clone(),
-            message: message.clone(),
-            data: data.as_ref().map(map_json_value).transpose()?,
-        }),
+        } => Ok(Some(pb::event_envelope::Event::ToolProgress(
+            pb::ToolProgressEvent {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: display_name.clone(),
+                stage: stage.clone(),
+                message: message.clone(),
+                data: data.as_ref().map(map_json_value).transpose()?,
+            },
+        ))),
         AgentEvent::ToolRequiresConfirmation {
             id,
             name,
             input,
             description,
-        } => {
-            pb::event_envelope::Event::ToolRequiresConfirmation(pb::ToolRequiresConfirmationEvent {
+        } => Ok(Some(pb::event_envelope::Event::ToolRequiresConfirmation(
+            pb::ToolRequiresConfirmationEvent {
                 tool_call_id: id.clone(),
                 name: name.clone(),
                 display_name: name.clone(),
                 input: Some(map_json_value(input)?),
                 description: description.clone(),
-            })
-        }
-        AgentEvent::TurnComplete { turn, usage } => {
-            pb::event_envelope::Event::TurnComplete(pb::TurnCompleteEvent {
-                turn: u64::try_from(*turn)
-                    .map_err(|_| Status::internal("turn out of range for protobuf"))?,
+            },
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    match event {
+        AgentEvent::TurnComplete { turn, usage } => Ok(pb::event_envelope::Event::TurnComplete(
+            pb::TurnCompleteEvent {
+                turn: map_u64(*turn, "turn")?,
                 usage: Some(map_token_usage(usage)),
-            })
-        }
+            },
+        )),
         AgentEvent::Done {
             thread_id,
             total_turns,
             total_usage,
             duration,
-        } => pb::event_envelope::Event::Done(pb::DoneEvent {
+        } => Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
             thread_id: thread_id.0.clone(),
-            total_turns: u64::try_from(*total_turns)
-                .map_err(|_| Status::internal("total_turns out of range for protobuf"))?,
+            total_turns: map_u64(*total_turns, "total_turns")?,
             total_usage: Some(map_token_usage(total_usage)),
             duration: Some(map_duration(*duration)?),
-        }),
+        })),
         AgentEvent::Error {
             message,
             recoverable,
-        } => pb::event_envelope::Event::Error(pb::ErrorEvent {
+        } => Ok(pb::event_envelope::Event::Error(pb::ErrorEvent {
             message: message.clone(),
             recoverable: *recoverable,
-        }),
-        AgentEvent::Refusal { message_id, text } => {
-            pb::event_envelope::Event::Refusal(pb::RefusalEvent {
-                message_id: message_id.clone(),
-                text: text.clone(),
-            })
-        }
+        })),
         AgentEvent::ContextCompacted {
             original_count,
             new_count,
             original_tokens,
             new_tokens,
-        } => pb::event_envelope::Event::ContextCompacted(pb::ContextCompactedEvent {
-            original_count: u64::try_from(*original_count)
-                .map_err(|_| Status::internal("original_count out of range for protobuf"))?,
-            new_count: u64::try_from(*new_count)
-                .map_err(|_| Status::internal("new_count out of range for protobuf"))?,
-            original_tokens: u64::try_from(*original_tokens)
-                .map_err(|_| Status::internal("original_tokens out of range for protobuf"))?,
-            new_tokens: u64::try_from(*new_tokens)
-                .map_err(|_| Status::internal("new_tokens out of range for protobuf"))?,
-        }),
+        } => Ok(pb::event_envelope::Event::ContextCompacted(
+            pb::ContextCompactedEvent {
+                original_count: map_u64(*original_count, "original_count")?,
+                new_count: map_u64(*new_count, "new_count")?,
+                original_tokens: map_u64(*original_tokens, "original_tokens")?,
+                new_tokens: map_u64(*new_tokens, "new_tokens")?,
+            },
+        )),
         AgentEvent::SubagentProgress {
             subagent_id,
             subagent_name,
@@ -1550,32 +1742,36 @@ fn map_committed_event(event: &agent_server::CommittedEvent) -> Result<pb::Event
             success,
             tool_count,
             total_tokens,
-        } => pb::event_envelope::Event::SubagentProgress(pb::SubagentProgressEvent {
-            subagent_id: subagent_id.clone(),
-            subagent_name: subagent_name.clone(),
-            nickname: nickname.clone(),
-            max_turns: *max_turns,
-            current_turn: *current_turn,
-            model: model.clone(),
-            tool_name: tool_name.clone(),
-            tool_context: tool_context.clone(),
-            completed: *completed,
-            success: *success,
-            tool_count: *tool_count,
-            total_tokens: *total_tokens,
-        }),
-    };
-
-    Ok(pb::EventEnvelope {
-        event_id: event.event_id.to_string(),
-        thread_id: event.thread_id.0.clone(),
-        sequence: event.sequence,
-        commit_time: Some(map_timestamp(event.timestamp)?),
-        event: Some(payload),
-    })
+        } => Ok(pb::event_envelope::Event::SubagentProgress(
+            pb::SubagentProgressEvent {
+                subagent_id: subagent_id.clone(),
+                subagent_name: subagent_name.clone(),
+                nickname: nickname.clone(),
+                max_turns: *max_turns,
+                current_turn: *current_turn,
+                model: model.clone(),
+                tool_name: tool_name.clone(),
+                tool_context: tool_context.clone(),
+                completed: *completed,
+                success: *success,
+                tool_count: *tool_count,
+                total_tokens: *total_tokens,
+            },
+        )),
+        _ => Err(Status::internal("unsupported event variant").into()),
+    }
 }
 
-fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
+fn map_u64<T>(value: T, field: &'static str) -> RpcResult<u64>
+where
+    T: TryInto<u64>,
+{
+    value
+        .try_into()
+        .map_err(|_| Status::internal(format!("{field} out of range for protobuf")).into())
+}
+
+const fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
     matches!(event.event, AgentEvent::Done { .. })
 }
 
@@ -1620,13 +1816,15 @@ mod tests {
     #[async_trait]
     impl LlmProvider for ScriptedProvider {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-            let mut responses = self
-                .responses
-                .lock()
-                .map_err(|_| anyhow!("lock poisoned"))?;
-            let response = responses
-                .pop_front()
-                .context("no scripted response remaining")?;
+            let response = {
+                let mut responses = self
+                    .responses
+                    .lock()
+                    .map_err(|_| anyhow!("lock poisoned"))?;
+                responses
+                    .pop_front()
+                    .context("no scripted response remaining")?
+            };
             Ok(ChatOutcome::Success(response))
         }
 
@@ -1818,9 +2016,11 @@ mod tests {
             let item = next_stream_item(stream).await?;
             let terminal = matches!(
                 item.item.as_ref(),
-                Some(StreamItem::Closed(_))
-                    | Some(StreamItem::RetentionGap(_))
-                    | Some(StreamItem::ReplayRequired(_))
+                Some(
+                    StreamItem::Closed(_)
+                        | StreamItem::RetentionGap(_)
+                        | StreamItem::ReplayRequired(_)
+                )
             );
             items.push(item);
             if terminal {
@@ -1860,6 +2060,132 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    async fn list_thread_tasks(
+        control: &mut ControlClient,
+        thread_id: &str,
+        context_label: &'static str,
+    ) -> Result<Vec<pb::TaskSnapshot>> {
+        Ok(control
+            .list_thread_tasks(pb::ListThreadTasksRequest {
+                thread_id: thread_id.into(),
+            })
+            .await
+            .with_context(|| format!("{context_label} list_thread_tasks"))?
+            .into_inner()
+            .tasks)
+    }
+
+    async fn wait_for_awaiting_confirmation(
+        control: &ControlClient,
+        thread_id: &str,
+    ) -> Result<pb::TaskSnapshot> {
+        let thread_id = thread_id.to_owned();
+        wait_for(|| {
+            let mut control = control.clone();
+            let thread_id = thread_id.clone();
+            async move {
+                let tasks = list_thread_tasks(&mut control, &thread_id, "poll").await?;
+                Ok(tasks
+                    .into_iter()
+                    .find(|task| task.status == pb::TaskStatus::AwaitingConfirmation as i32))
+            }
+        })
+        .await
+    }
+
+    async fn wait_for_completed_tasks(control: &ControlClient, thread_id: &str) -> Result<()> {
+        let thread_id = thread_id.to_owned();
+        wait_for(|| {
+            let mut control = control.clone();
+            let thread_id = thread_id.clone();
+            async move {
+                let tasks = list_thread_tasks(&mut control, &thread_id, "poll final").await?;
+                let all_completed = tasks.len() == 2
+                    && tasks
+                        .iter()
+                        .all(|task| task.status == pb::TaskStatus::Completed as i32);
+                Ok(all_completed.then_some(()))
+            }
+        })
+        .await
+    }
+
+    async fn collect_until_confirmation(
+        stream: &mut tonic::Streaming<pb::StreamThreadEventsResponse>,
+    ) -> Result<(Vec<pb::StreamThreadEventsResponse>, u64)> {
+        let mut items = Vec::new();
+        let mut last_seen_sequence = None;
+        loop {
+            let item = next_stream_item(stream).await?;
+            let saw_confirmation = matches!(
+                item.item.as_ref(),
+                Some(StreamItem::Event(event))
+                    if matches!(
+                        event.event.as_ref(),
+                        Some(EventPayload::ToolRequiresConfirmation(_))
+                    )
+            );
+            if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                last_seen_sequence = Some(event.sequence);
+            }
+            items.push(item);
+            if saw_confirmation {
+                return Ok((
+                    items,
+                    last_seen_sequence.context("missing last seen sequence")?,
+                ));
+            }
+        }
+    }
+
+    struct ConfirmationEventOrder {
+        tool_start: usize,
+        requires_confirmation: usize,
+        tool_progress: usize,
+        tool_end: usize,
+        text: usize,
+        done: usize,
+    }
+
+    fn confirmation_event_order(
+        items: &[pb::StreamThreadEventsResponse],
+    ) -> Result<ConfirmationEventOrder> {
+        let mut saw_tool_start = None;
+        let mut saw_tool_requires_confirmation = None;
+        let mut saw_tool_progress = None;
+        let mut saw_tool_end = None;
+        let mut saw_text = None;
+        let mut saw_done = None;
+
+        for (index, item) in items.iter().enumerate() {
+            if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                match event.event.as_ref().context("event payload missing")? {
+                    EventPayload::ToolCallStart(_) => saw_tool_start = Some(index),
+                    EventPayload::ToolRequiresConfirmation(_) => {
+                        saw_tool_requires_confirmation = Some(index);
+                    }
+                    EventPayload::ToolProgress(_) => saw_tool_progress = Some(index),
+                    EventPayload::ToolCallEnd(_) => saw_tool_end = Some(index),
+                    EventPayload::Text(text) if text.text == "transfer complete" => {
+                        saw_text = Some(index);
+                    }
+                    EventPayload::Done(_) => saw_done = Some(index),
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(ConfirmationEventOrder {
+            tool_start: saw_tool_start.context("tool_call_start missing")?,
+            requires_confirmation: saw_tool_requires_confirmation
+                .context("tool_requires_confirmation missing")?,
+            tool_progress: saw_tool_progress.context("tool_progress missing")?,
+            tool_end: saw_tool_end.context("tool_call_end missing")?,
+            text: saw_text.context("final assistant text missing")?,
+            done: saw_done.context("done event missing")?,
+        })
     }
 
     #[tokio::test]
@@ -1994,7 +2320,7 @@ mod tests {
             };
             drop(live_stream);
 
-            let _ = wait_for(|| {
+            wait_for(|| {
                 let mut control = control.clone();
                 let thread_id = thread_id.clone();
                 async move {
@@ -2089,44 +2415,10 @@ mod tests {
                 pb::FollowMode::ReplayAndFollow,
             )
             .await?;
+            let (mut items, replay_after) = collect_until_confirmation(&mut stream).await?;
 
-            let mut items = Vec::new();
-            let mut last_seen_sequence = None;
-            loop {
-                let item = next_stream_item(&mut stream).await?;
-                let saw_confirmation = matches!(
-                    item.item.as_ref(),
-                    Some(StreamItem::Event(event))
-                        if matches!(
-                            event.event.as_ref(),
-                            Some(EventPayload::ToolRequiresConfirmation(_))
-                        )
-                );
-                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
-                    last_seen_sequence = Some(event.sequence);
-                }
-                items.push(item);
-                if saw_confirmation {
-                    break;
-                }
-            }
-
-            let awaiting_confirmation = wait_for(|| {
-                let mut control = control.clone();
-                let thread_id = thread_id.clone();
-                async move {
-                    let tasks = control
-                        .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
-                        .await
-                        .context("poll list_thread_tasks")?
-                        .into_inner()
-                        .tasks;
-                    Ok(tasks
-                        .into_iter()
-                        .find(|task| task.status == pb::TaskStatus::AwaitingConfirmation as i32))
-                }
-            })
-            .await?;
+            let awaiting_confirmation =
+                wait_for_awaiting_confirmation(&control, &thread_id).await?;
 
             let decision = control
                 .decide_confirmation(pb::DecideConfirmationRequest {
@@ -2145,37 +2437,12 @@ mod tests {
             assert!(decision.task.is_some(), "decision response missing task");
             drop(stream);
 
-            let completion_wait = wait_for(|| {
-                let mut control = control.clone();
-                let thread_id = thread_id.clone();
-                async move {
-                    let tasks = control
-                        .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
-                        .await
-                        .context("poll final list_thread_tasks")?
-                        .into_inner()
-                        .tasks;
-                    let all_completed = tasks.len() == 2
-                        && tasks
-                            .iter()
-                            .all(|task| task.status == pb::TaskStatus::Completed as i32);
-                    Ok(all_completed.then_some(()))
-                }
-            })
-            .await;
-            if let Err(error) = completion_wait {
-                let tasks = control
-                    .list_thread_tasks(pb::ListThreadTasksRequest {
-                        thread_id: thread_id.clone(),
-                    })
-                    .await
-                    .context("list_thread_tasks after completion timeout")?
-                    .into_inner()
-                    .tasks;
+            if let Err(error) = wait_for_completed_tasks(&control, &thread_id).await {
+                let tasks =
+                    list_thread_tasks(&mut control, &thread_id, "after completion timeout").await?;
                 bail!("confirmation flow did not complete: {error:#}; tasks: {tasks:?}");
             }
 
-            let replay_after = last_seen_sequence.context("missing last seen sequence")?;
             let mut replay_stream = open_stream(
                 &mut events,
                 &thread_id,
@@ -2188,53 +2455,14 @@ mod tests {
             let sequences = event_sequences(&items);
             assert_contiguous_sequences(&sequences);
 
-            let mut saw_tool_start = None;
-            let mut saw_tool_requires_confirmation = None;
-            let mut saw_tool_progress = None;
-            let mut saw_tool_end = None;
-            let mut saw_text = None;
-            let mut saw_done = None;
+            let order = confirmation_event_order(&items)?;
+            assert!(order.tool_start < order.requires_confirmation);
+            assert!(order.requires_confirmation < order.tool_progress);
+            assert!(order.tool_progress < order.tool_end);
+            assert!(order.tool_end < order.text);
+            assert!(order.text < order.done);
 
-            for (index, item) in items.iter().enumerate() {
-                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
-                    match event.event.as_ref().context("event payload missing")? {
-                        EventPayload::ToolCallStart(_) => saw_tool_start = Some(index),
-                        EventPayload::ToolRequiresConfirmation(_) => {
-                            saw_tool_requires_confirmation = Some(index)
-                        }
-                        EventPayload::ToolProgress(_) => saw_tool_progress = Some(index),
-                        EventPayload::ToolCallEnd(_) => saw_tool_end = Some(index),
-                        EventPayload::Text(text) if text.text == "transfer complete" => {
-                            saw_text = Some(index)
-                        }
-                        EventPayload::Done(_) => saw_done = Some(index),
-                        _ => {}
-                    }
-                }
-            }
-
-            assert!(saw_tool_start.is_some(), "tool_call_start missing");
-            assert!(
-                saw_tool_requires_confirmation.is_some(),
-                "tool_requires_confirmation missing"
-            );
-            assert!(saw_tool_progress.is_some(), "tool_progress missing");
-            assert!(saw_tool_end.is_some(), "tool_call_end missing");
-            assert!(saw_text.is_some(), "final assistant text missing");
-            assert!(saw_done.is_some(), "done event missing");
-
-            assert!(saw_tool_start < saw_tool_requires_confirmation);
-            assert!(saw_tool_requires_confirmation < saw_tool_progress);
-            assert!(saw_tool_progress < saw_tool_end);
-            assert!(saw_tool_end < saw_text);
-            assert!(saw_text < saw_done);
-
-            let tasks = control
-                .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
-                .await
-                .context("list_thread_tasks rpc")?
-                .into_inner()
-                .tasks;
+            let tasks = list_thread_tasks(&mut control, &thread_id, "rpc").await?;
             assert_eq!(tasks.len(), 2);
             assert!(
                 tasks

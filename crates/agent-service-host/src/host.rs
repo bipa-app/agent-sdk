@@ -446,7 +446,7 @@ async fn execute_acquired_task(
     match task.kind {
         TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
-        other => bail!("unsupported task kind in service host worker: {other:?}"),
+        TaskKind::Subagent => bail!("unsupported task kind in service host worker: Subagent"),
     }
 }
 
@@ -596,12 +596,14 @@ async fn execute_tool_task(
     .await;
 
     match outcome {
-        Ok(ToolTaskOutcome::Completed {
-            committed_events, ..
-        })
-        | Ok(ToolTaskOutcome::Failed {
-            committed_events, ..
-        }) => {
+        Ok(
+            ToolTaskOutcome::Completed {
+                committed_events, ..
+            }
+            | ToolTaskOutcome::Failed {
+                committed_events, ..
+            },
+        ) => {
             publish_events(stores, &committed_events);
             Ok(())
         }

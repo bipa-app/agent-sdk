@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-build = "build.rs"
 
 [[bin]]
 name = "agent-service-host"
@@ -16,6 +15,7 @@ agent-sdk-core.workspace = true
 agent-sdk-tools.workspace = true
 agent-sdk-providers.workspace = true
 agent-server.workspace = true
+agent-service-proto = { path = "../agent-service-proto" }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
@@ -35,10 +35,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time.workspace = true
 sqlx.workspace = true
-
-[build-dependencies]
-tonic-build.workspace = true
-protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
