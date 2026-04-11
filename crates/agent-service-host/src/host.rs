@@ -87,6 +87,10 @@ impl ServiceHost {
     /// Build a host with a pre-built store registry.
     ///
     /// Useful in tests where stores are pre-populated.
+    ///
+    /// # Errors
+    /// Returns an error if the configuration contains invalid values
+    /// (e.g. zero sweep interval).
     pub fn with_stores(config: ServiceConfig, stores: StoreRegistry) -> Result<Self> {
         anyhow::ensure!(
             config.worker.sweep_interval_secs > 0,
