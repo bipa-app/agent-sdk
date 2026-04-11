@@ -136,6 +136,9 @@ pub use journal::{
     redact_string, redact_value,
 };
 
+// Phase 6.1: durable event committer and thread-scoped sequencing.
+pub use journal::{CommittedEvent, EventRepository, InMemoryEventRepository};
+
 // ── Re-exports that validate the dependency edges ────────────────────
 //
 // Each `use` below proves that the corresponding narrow crate is

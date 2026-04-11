@@ -455,10 +455,45 @@
 //!   intent record and returns a [`execution_intent::RetryDecision`]
 //!   so retry logic can distinguish replay-safe operations from
 //!   unsafe duplicate mutation.
+//!
+//! # Phase 6.1 — Durable event committer and thread-scoped sequencing (ENG-7946)
+//!
+//! Phase 6.1 adds the **event repository** — the authoritative commit
+//! surface for durable events.  Every event committed through this
+//! layer receives server-owned metadata (UUID v7 `event_id`, monotonic
+//! per-thread `sequence`, commit-time `timestamp`), replacing
+//! SDK-local [`SequenceCounter`](agent_sdk_core::events::SequenceCounter)
+//! semantics for the authoritative server path.
+//!
+//! Key design properties:
+//!
+//! 1. **Single allocation authority** — the event repository is the
+//!    only place that assigns `event_id`, `sequence`, and `timestamp`
+//!    for committed events.  Workers submit raw [`AgentEvent`](agent_sdk_core::events::AgentEvent)s;
+//!    the repository wraps them atomically.
+//! 2. **Thread-scoped sequencing** — each thread gets an independent
+//!    monotonic counter starting at 0.  Sequences are contiguous
+//!    within batches and across single/batch operations on the same
+//!    thread.
+//! 3. **Append-only with `(thread_id, sequence)` uniqueness** —
+//!    enforced by allocating and persisting under the same write lock
+//!    (or transaction in a database backend).
+//! 4. **Batched append** — workers can commit an entire turn's event
+//!    stream atomically, reserving a contiguous sequence range.
+//!
+//! - [`committed_event::CommittedEvent`] is the server-owned event
+//!   record with envelope conversion methods.
+//! - [`event_repository::EventRepository`] is the commit surface
+//!   trait: `commit_event`, `commit_event_batch`, `next_sequence`,
+//!   `get_events`.
+//! - [`event_repository::InMemoryEventRepository`] is the reference
+//!   in-memory implementation.
 
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
+pub mod committed_event;
+pub mod event_repository;
 pub mod execution_context;
 pub mod execution_intent;
 pub mod message;
@@ -481,6 +516,8 @@ pub mod turn_attempt_store;
 pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
+pub use committed_event::CommittedEvent;
+pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use execution_intent::{
     ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
