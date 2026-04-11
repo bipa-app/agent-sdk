@@ -19,9 +19,9 @@
 //! ```text
 //!   Pending ──▶ Claimed ──▶ Delivered
 //!                  │
-//!                  └──▶ Failed ──▶ Pending  (retry, if budget allows)
-//!                          │
-//!                          └──▶ Expired     (max attempts exhausted)
+//!                  ├──▶ Pending  (retry, if budget allows)
+//!                  │
+//!                  └──▶ Expired  (max attempts exhausted)
 //! ```
 //!
 //! Terminal durable state **never depends** on successful outbox relay.
@@ -96,8 +96,6 @@ pub enum OutboxStatus {
     Claimed,
     /// Successfully delivered to the downstream consumer.
     Delivered,
-    /// Relay attempt failed; row may be retried if budget allows.
-    Failed,
     /// Max relay attempts exhausted; row is terminal.
     Expired,
 }
@@ -116,7 +114,6 @@ impl OutboxStatus {
             Self::Pending => "pending",
             Self::Claimed => "claimed",
             Self::Delivered => "delivered",
-            Self::Failed => "failed",
             Self::Expired => "expired",
         }
     }

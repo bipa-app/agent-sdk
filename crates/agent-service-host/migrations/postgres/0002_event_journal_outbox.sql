@@ -104,7 +104,7 @@ CREATE TABLE agent_sdk_outbox (
 
     -- Only known outbox statuses.
     CONSTRAINT agent_sdk_outbox_status_check
-        CHECK (status IN ('pending', 'claimed', 'delivered', 'failed', 'expired')),
+        CHECK (status IN ('pending', 'claimed', 'delivered', 'expired')),
 
     -- Sequence copied from committed_events; must be non-negative.
     CONSTRAINT agent_sdk_outbox_sequence_check
@@ -139,11 +139,11 @@ CREATE TABLE agent_sdk_outbox (
             OR (status <> 'delivered' AND delivered_at IS NULL)
         ),
 
-    -- Failed/expired rows must carry an error message.
+    -- Expired rows must carry an error message.
     CONSTRAINT agent_sdk_outbox_error_check
         CHECK (
-            (status IN ('failed', 'expired') AND last_error IS NOT NULL)
-            OR (status NOT IN ('failed', 'expired') AND last_error IS NULL)
+            (status = 'expired' AND last_error IS NOT NULL)
+            OR (status <> 'expired' AND last_error IS NULL)
         )
 );
 

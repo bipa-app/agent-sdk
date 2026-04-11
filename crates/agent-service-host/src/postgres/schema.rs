@@ -882,7 +882,7 @@ const AGENT_SDK_OUTBOX_COLUMNS: &[ColumnContract] = &[
         name: "status",
         sql_type: "TEXT",
         nullable: false,
-        notes: "Relay lifecycle status (`pending`, `claimed`, `delivered`, `failed`, `expired`).",
+        notes: "Relay lifecycle status (`pending`, `claimed`, `delivered`, `expired`).",
     },
     ColumnContract {
         name: "payload_json",
@@ -975,7 +975,7 @@ const AGENT_SDK_OUTBOX_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_outbox_error_check",
-        invariant: "Failed/expired rows require `last_error`; other rows must not carry one.",
+        invariant: "Expired rows require `last_error`; other rows must not carry one.",
     },
 ];
 

@@ -3076,7 +3076,7 @@ RETURNING id, thread_id, event_id, sequence, status, payload_json,
     }
 
     async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
-        sqlx::query!(
+        let result = sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET status = 'delivered', delivered_at = $2
@@ -3089,6 +3089,10 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
         .await
         .with_context(|| format!("mark outbox row {id} delivered"))?;
 
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}",
+        );
         Ok(())
     }
 
@@ -3101,7 +3105,7 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
     ) -> Result<()> {
         // last_error must be NULL for pending rows per the
         // agent_sdk_outbox_error_check constraint.
-        sqlx::query!(
+        let result = sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET
@@ -3136,6 +3140,10 @@ WHERE id = $1 AND status NOT IN ('delivered', 'expired')
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
 
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}",
+        );
         Ok(())
     }
 
