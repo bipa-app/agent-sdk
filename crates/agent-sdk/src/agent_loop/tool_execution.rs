@@ -601,6 +601,7 @@ where
         AgentEvent::ToolRequiresConfirmation {
             id: pending.id.clone(),
             name: pending.name.clone(),
+            display_name: pending.display_name.clone(),
             input: input.clone(),
             description: description.clone(),
         },
@@ -756,6 +757,7 @@ where
         AgentEvent::ToolRequiresConfirmation {
             id: pending.id.clone(),
             name: pending.name.clone(),
+            display_name: pending.display_name.clone(),
             input: pending.input.clone(),
             description: description.clone(),
         },

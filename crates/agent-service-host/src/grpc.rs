@@ -1675,13 +1675,14 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
         AgentEvent::ToolRequiresConfirmation {
             id,
             name,
+            display_name,
             input,
             description,
         } => Ok(Some(pb::event_envelope::Event::ToolRequiresConfirmation(
             pb::ToolRequiresConfirmationEvent {
                 tool_call_id: id.clone(),
                 name: name.clone(),
-                display_name: name.clone(),
+                display_name: display_name.clone(),
                 input: Some(map_json_value(input)?),
                 description: description.clone(),
             },
@@ -2143,6 +2144,7 @@ mod tests {
     struct ConfirmationEventOrder {
         tool_start: usize,
         requires_confirmation: usize,
+        requires_confirmation_display_name: String,
         tool_progress: usize,
         tool_end: usize,
         text: usize,
@@ -2154,6 +2156,7 @@ mod tests {
     ) -> Result<ConfirmationEventOrder> {
         let mut saw_tool_start = None;
         let mut saw_tool_requires_confirmation = None;
+        let mut saw_tool_requires_confirmation_display_name = None;
         let mut saw_tool_progress = None;
         let mut saw_tool_end = None;
         let mut saw_text = None;
@@ -2163,8 +2166,10 @@ mod tests {
             if let Some(StreamItem::Event(event)) = item.item.as_ref() {
                 match event.event.as_ref().context("event payload missing")? {
                     EventPayload::ToolCallStart(_) => saw_tool_start = Some(index),
-                    EventPayload::ToolRequiresConfirmation(_) => {
+                    EventPayload::ToolRequiresConfirmation(payload) => {
                         saw_tool_requires_confirmation = Some(index);
+                        saw_tool_requires_confirmation_display_name =
+                            Some(payload.display_name.clone());
                     }
                     EventPayload::ToolProgress(_) => saw_tool_progress = Some(index),
                     EventPayload::ToolCallEnd(_) => saw_tool_end = Some(index),
@@ -2181,11 +2186,27 @@ mod tests {
             tool_start: saw_tool_start.context("tool_call_start missing")?,
             requires_confirmation: saw_tool_requires_confirmation
                 .context("tool_requires_confirmation missing")?,
+            requires_confirmation_display_name: saw_tool_requires_confirmation_display_name
+                .context("tool_requires_confirmation display name missing")?,
             tool_progress: saw_tool_progress.context("tool_progress missing")?,
             tool_end: saw_tool_end.context("tool_call_end missing")?,
             text: saw_text.context("final assistant text missing")?,
             done: saw_done.context("done event missing")?,
         })
+    }
+
+    fn assert_confirmation_event_order(items: &[pb::StreamThreadEventsResponse]) -> Result<()> {
+        let sequences = event_sequences(items);
+        assert_contiguous_sequences(&sequences);
+
+        let order = confirmation_event_order(items)?;
+        assert!(order.tool_start < order.requires_confirmation);
+        assert!(order.requires_confirmation < order.tool_progress);
+        assert!(order.tool_progress < order.tool_end);
+        assert!(order.tool_end < order.text);
+        assert!(order.text < order.done);
+        assert_eq!(order.requires_confirmation_display_name, "Transfer");
+        Ok(())
     }
 
     #[tokio::test]
@@ -2451,16 +2472,7 @@ mod tests {
             )
             .await?;
             items.extend(collect_until_closed(&mut replay_stream).await?);
-
-            let sequences = event_sequences(&items);
-            assert_contiguous_sequences(&sequences);
-
-            let order = confirmation_event_order(&items)?;
-            assert!(order.tool_start < order.requires_confirmation);
-            assert!(order.requires_confirmation < order.tool_progress);
-            assert!(order.tool_progress < order.tool_end);
-            assert!(order.tool_end < order.text);
-            assert!(order.text < order.done);
+            assert_confirmation_event_order(&items)?;
 
             let tasks = list_thread_tasks(&mut control, &thread_id, "rpc").await?;
             assert_eq!(tasks.len(), 2);

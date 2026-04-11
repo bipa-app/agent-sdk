@@ -273,6 +273,7 @@ pub async fn pause_tool_for_confirmation(
     let confirm_event = AgentEvent::tool_requires_confirmation(
         &bootstrap.tool_call.id,
         &bootstrap.tool_call.name,
+        &bootstrap.tool_call.display_name,
         bootstrap.tool_call.input.clone(),
         format!(
             "Tool {} requires confirmation",
