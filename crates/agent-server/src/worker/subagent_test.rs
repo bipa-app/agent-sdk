@@ -236,6 +236,131 @@ fn inherited_constraints_validate_their_own_ceiling() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn task_is_trimmed_in_resolved_spec() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+    let request =
+        SubagentSpawnRequest::new("  run suite  ", SubagentCapabilityRequest::new("research"));
+
+    let spec = resolve_subagent_spec(&request, &constraints, &policy)?;
+    assert_eq!(spec.task, "run suite");
+
+    Ok(())
+}
+
+#[test]
+fn blank_model_is_rejected() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+    let request = SubagentSpawnRequest::new(
+        "Search for regressions",
+        SubagentCapabilityRequest::new("research"),
+    )
+    .with_model("");
+
+    let err = resolve_subagent_spec(&request, &constraints, &policy)
+        .err()
+        .ok_or_else(|| anyhow!("expected blank model to fail"))?;
+    let message = error_text(&err);
+    assert!(
+        message.contains("model cannot be blank"),
+        "unexpected error: {message}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn whitespace_only_model_is_rejected() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+    let request = SubagentSpawnRequest::new(
+        "Search for regressions",
+        SubagentCapabilityRequest::new("research"),
+    )
+    .with_model("   ");
+
+    let err = resolve_subagent_spec(&request, &constraints, &policy)
+        .err()
+        .ok_or_else(|| anyhow!("expected blank model to fail"))?;
+    let message = error_text(&err);
+    assert!(
+        message.contains("model cannot be blank"),
+        "unexpected error: {message}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn profile_name_is_trimmed_before_lookup() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+    let request = SubagentSpawnRequest::new(
+        "Search for regressions",
+        SubagentCapabilityRequest::new(" research "),
+    );
+
+    let spec = resolve_subagent_spec(&request, &constraints, &policy)?;
+    assert_eq!(spec.capabilities.profile, "research");
+
+    Ok(())
+}
+
+#[test]
+fn blank_capability_identifier_in_profile_is_rejected() -> Result<()> {
+    let mut constraints = sample_constraints();
+    constraints.capability_profiles.insert(
+        "bad".into(),
+        SubagentCapabilityProfile {
+            capabilities: set(&["", "read_file"]),
+        },
+    );
+    constraints.allowed_capabilities = set(&["", "read_file", "rg"]);
+
+    let policy = ServerSubagentSpawnPolicy;
+    let request = SubagentSpawnRequest::new(
+        "Search for regressions",
+        SubagentCapabilityRequest::new("research"),
+    );
+
+    let err = resolve_subagent_spec(&request, &constraints, &policy)
+        .err()
+        .ok_or_else(|| anyhow!("expected blank capability identifier to fail"))?;
+    let message = error_text(&err);
+    assert!(
+        message.contains("capability identifier in profile")
+            || message.contains("blank identifier"),
+        "unexpected error: {message}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn blank_allowed_capability_is_rejected() -> Result<()> {
+    let mut constraints = sample_constraints();
+    constraints.allowed_capabilities.insert(String::new());
+
+    let policy = ServerSubagentSpawnPolicy;
+    let request = SubagentSpawnRequest::new(
+        "Search for regressions",
+        SubagentCapabilityRequest::new("research"),
+    );
+
+    let err = resolve_subagent_spec(&request, &constraints, &policy)
+        .err()
+        .ok_or_else(|| anyhow!("expected blank allowed capability to fail"))?;
+    let message = error_text(&err);
+    assert!(
+        message.contains("blank identifier"),
+        "unexpected error: {message}"
+    );
+
+    Ok(())
+}
+
 struct FixedPolicy;
 
 impl SubagentSpawnPolicy for FixedPolicy {
