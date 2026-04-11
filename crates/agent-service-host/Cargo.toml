@@ -1,0 +1,33 @@
+[package]
+name = "agent-service-host"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "agent-service-host"
+path = "src/main.rs"
+
+[dependencies]
+agent-sdk-core.workspace = true
+agent-sdk-tools.workspace = true
+agent-sdk-providers.workspace = true
+agent-server.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tokio-util.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
