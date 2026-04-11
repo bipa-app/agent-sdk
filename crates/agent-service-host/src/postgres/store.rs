@@ -3078,7 +3078,41 @@ mod tests {
         }
     }
 
-    async fn test_store() -> Result<Option<PostgresDurableStore>> {
+    /// RAII guard that wraps a [`PostgresDurableStore`] and drops the
+    /// test schema on destruction so schemas don't accumulate across
+    /// local `cargo test` runs.
+    struct TestStore {
+        store: PostgresDurableStore,
+        schema: String,
+        database_url: String,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = PostgresDurableStore;
+        fn deref(&self) -> &Self::Target {
+            &self.store
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let schema = self.schema.clone();
+            let url = self.database_url.clone();
+            // All Postgres tests run on the multi_thread runtime, so
+            // block_in_place is safe here.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    if let Ok(mut conn) = PgConnection::connect(&url).await {
+                        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                            .execute(&mut conn)
+                            .await;
+                    }
+                });
+            });
+        }
+    }
+
+    async fn test_store() -> Result<Option<TestStore>> {
         let Ok(database_url) = env::var("TEST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         else {
             return Ok(None);
@@ -3112,7 +3146,11 @@ mod tests {
             .migrate()
             .await
             .context("migrate postgres test store")?;
-        Ok(Some(store))
+        Ok(Some(TestStore {
+            store,
+            schema,
+            database_url,
+        }))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3124,14 +3162,14 @@ mod tests {
         let count = 10usize;
         let mut handles = Vec::with_capacity(count);
         for idx in 0..count {
-            let store = store.clone();
+            let cloned = store.store.clone();
             handles.push(tokio::spawn(async move {
                 let root = AgentTask::new_root_turn(
                     thread_id("t-pg-race"),
                     t_plus(i64::try_from(idx).context("idx to i64")?),
                     3,
                 );
-                store.submit_root_turn(root).await
+                cloned.submit_root_turn(root).await
             }));
         }
 
@@ -3193,9 +3231,9 @@ mod tests {
         let count = 8usize;
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
-            let store = store.clone();
+            let cloned = store.store.clone();
             handles.push(tokio::spawn(async move {
-                store
+                cloned
                     .promote_next_queued_root(&thread_id("t-pg-promo"), t_plus(4))
                     .await
             }));
@@ -3319,7 +3357,7 @@ mod tests {
         assert!(result.is_none(), "every head must be failed closed");
 
         for id in &ids {
-            let row = AgentTaskStore::get(&store, id)
+            let row = AgentTaskStore::get(&*store, id)
                 .await
                 .context("get exhausted row")?
                 .context("row exists")?;
@@ -3385,7 +3423,7 @@ mod tests {
             .context("fault injection should fail")?;
         assert!(format!("{err:#}").contains("injected postgres completed-turn failure"));
 
-        let attempt_after = TurnAttemptStore::get(&store, &attempt.id)
+        let attempt_after = TurnAttemptStore::get(&*store, &attempt.id)
             .await?
             .context("attempt after")?;
         assert!(
@@ -3393,16 +3431,16 @@ mod tests {
             "attempt close should have rolled back"
         );
 
-        let thread = ThreadStore::get(&store, &running.thread_id)
+        let thread = ThreadStore::get(&*store, &running.thread_id)
             .await?
             .context("thread row should exist from task bootstrap")?;
         assert_eq!(thread.committed_turns, 0);
         assert_eq!(thread.total_usage, TokenUsage::default());
 
-        let projection = MessageProjectionStore::get(&store, &running.thread_id).await?;
+        let projection = MessageProjectionStore::get(&*store, &running.thread_id).await?;
         assert!(projection.is_none(), "message head must roll back");
 
-        let checkpoints = CheckpointStore::list_by_thread(&store, &running.thread_id).await?;
+        let checkpoints = CheckpointStore::list_by_thread(&*store, &running.thread_id).await?;
         assert!(checkpoints.is_empty(), "checkpoint insert must roll back");
 
         Ok(())
@@ -3447,10 +3485,10 @@ mod tests {
                 }],
                 now: t_plus(2),
             },
-            &store,
-            &store,
-            &store,
-            &store,
+            &*store,
+            &*store,
+            &*store,
+            &*store,
             &event_repo,
         )
         .await?;
@@ -3459,7 +3497,7 @@ mod tests {
         assert_eq!(outcome.checkpoint.turn_number, 1);
         assert!(outcome.closed_attempt.is_closed());
 
-        let history = MessageProjectionStore::get_history(&store, &running.thread_id).await?;
+        let history = MessageProjectionStore::get_history(&*store, &running.thread_id).await?;
         assert_eq!(history.len(), 2);
 
         Ok(())
