@@ -784,6 +784,7 @@ async fn suspend_and_complete_children(
         TaskState::WaitingOnChildren {
             continuation,
             suspended_messages,
+            ..
         } => (continuation.payload.clone(), suspended_messages.clone()),
         other => panic!("Expected WaitingOnChildren state, got: {other:?}"),
     };
@@ -2712,6 +2713,134 @@ async fn cancelled_child_produces_deterministic_error_result() -> Result<()> {
         .context("child")?;
     assert_eq!(child.status, TaskStatus::Cancelled);
     assert!(child.result_payload.is_none());
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Multi-round tool-call regression test
+// ─────────────────────────────────────────────────────────────────────
+
+/// Re-acquire a parent task, build worker inputs, and call
+/// `resume_from_children` with the given provider.
+async fn reacquire_and_resume(
+    stores: &TestStores,
+    parent: &AgentTask,
+    provider: &dyn LlmProvider,
+    t_acquire: time::OffsetDateTime,
+    t_resume: time::OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_acquire + Duration::seconds(300),
+            t_acquire,
+        )
+        .await?
+        .context("re-acquire parent")?;
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_acquire)
+            .await?;
+    resume_from_children(inputs, parent, provider, &stores.deps(), t_resume).await
+}
+
+fn ok_result(output: &str) -> agent_sdk_core::ToolResult {
+    agent_sdk_core::ToolResult {
+        success: true,
+        output: output.to_owned(),
+        data: None,
+        documents: Vec::new(),
+        duration_ms: Some(10),
+    }
+}
+
+#[tokio::test]
+async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
+    // Regression: multi-round spawn_index collision bug.
+    // Round 1: 2 tool calls -> 2 children. Round 2: resume returns 1
+    // more tool call -> 1 new child (spawn_index 0 again). Round 3:
+    // text-only -> Completed. Without the fix, round 3 aggregation
+    // sees all 3 children and collides on spawn_index 0.
+    let stores = TestStores::new();
+
+    // ── Round 1: suspend with 2 tool calls, complete durably ────
+    let r1_results = vec![
+        ("call_a".into(), ok_result("a")),
+        ("call_b".into(), ok_result("b")),
+    ];
+    let parent = suspend_and_complete_children_durably(
+        &stores,
+        vec![
+            (
+                "call_a".into(),
+                "bash".into(),
+                serde_json::json!({"c": "pwd"}),
+            ),
+            (
+                "call_b".into(),
+                "bash".into(),
+                serde_json::json!({"c": "ls"}),
+            ),
+        ],
+        &r1_results,
+    )
+    .await?;
+    assert_eq!(stores.tasks.list_children(&parent.id).await?.len(), 2);
+    assert_eq!(parent.state.child_ids().len(), 2);
+
+    // ── Round 2: resume -> re-suspend with 1 new tool call ──────
+    let r2_provider =
+        MockToolCallProvider::single("call_c", "bash", serde_json::json!({"c": "cat"}));
+    let outcome =
+        reacquire_and_resume(&stores, &parent, &r2_provider, t_plus(20), t_plus(25)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task: r2_parent,
+        child_tasks: r2_children,
+    } = outcome
+    else {
+        panic!("Expected Suspended after round 2");
+    };
+    assert_eq!(r2_children.len(), 1);
+    assert_eq!(r2_children[0].spawn_index, Some(0));
+    assert_eq!(stores.tasks.list_children(&parent.id).await?.len(), 3);
+    assert_eq!(r2_parent.state.child_ids().len(), 1);
+    assert_eq!(r2_parent.state.child_ids()[0], r2_children[0].id);
+
+    // Complete round 2 child, re-read parent.
+    acquire_and_complete_child(&stores, &r2_children[0], &ok_result("file")).await?;
+    let parent_r3 = stores.tasks.get(&parent.id).await?.context("parent r3")?;
+    assert!(matches!(parent_r3.state, TaskState::ReadyToResume { .. }));
+    assert_eq!(parent_r3.state.child_ids().len(), 1);
+
+    // ── Round 3: resume -> text-only -> Completed ───────────────
+    let final_provider = MockTextProvider::new("All done");
+    let outcome_r3 =
+        reacquire_and_resume(&stores, &parent_r3, &final_provider, t_plus(30), t_plus(35))
+            .await
+            .context("round 3")?;
+    let RootTurnOutcome::Completed {
+        completed_task,
+        response_text,
+        ..
+    } = outcome_r3
+    else {
+        panic!("Expected Completed after round 3");
+    };
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+    assert_eq!(response_text, "All done");
+    assert_eq!(
+        stores
+            .threads
+            .get(&thread_a())
+            .await?
+            .context("thread")?
+            .committed_turns,
+        1
+    );
 
     Ok(())
 }

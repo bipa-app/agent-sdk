@@ -410,6 +410,7 @@ mod tests {
                         continuation: sample_continuation(),
                         suspended_messages: Vec::new(),
                     },
+                    Vec::new(),
                     t_plus(160),
                 )
             }

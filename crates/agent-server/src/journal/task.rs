@@ -1047,6 +1047,7 @@ impl AgentTask {
         mut self,
         child_count: u32,
         payload: SuspensionPayload,
+        child_ids: Vec<AgentTaskId>,
         now: OffsetDateTime,
     ) -> Result<Self, TaskSchemaError> {
         if self.status != TaskStatus::Running {
@@ -1067,6 +1068,7 @@ impl AgentTask {
         self.state = TaskState::WaitingOnChildren {
             continuation: Box::new(payload.continuation),
             suspended_messages: payload.suspended_messages,
+            child_ids,
         };
         self.updated_at = now;
         self.validate()?;
@@ -1114,9 +1116,11 @@ impl AgentTask {
                 TaskState::WaitingOnChildren {
                     continuation,
                     suspended_messages,
+                    child_ids,
                 } => TaskState::ReadyToResume {
                     continuation,
                     suspended_messages,
+                    child_ids,
                 },
                 // Defensive: if state is somehow not WaitingOnChildren,
                 // clear it. This shouldn't happen because the status
@@ -1172,9 +1176,11 @@ impl AgentTask {
                 TaskState::WaitingOnChildren {
                     continuation,
                     suspended_messages,
+                    child_ids,
                 } => TaskState::ReadyToResume {
                     continuation,
                     suspended_messages,
+                    child_ids,
                 },
                 other => other,
             };
@@ -1872,6 +1878,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -1910,6 +1917,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -1942,6 +1950,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -1979,6 +1988,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -2014,6 +2024,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -2051,6 +2062,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -2157,6 +2169,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;
@@ -2234,6 +2247,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?
@@ -2418,6 +2432,7 @@ mod tests {
                     continuation: sample_continuation(),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait")?;

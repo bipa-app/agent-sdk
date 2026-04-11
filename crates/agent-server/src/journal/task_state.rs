@@ -109,6 +109,12 @@ pub enum TaskState {
         /// side-channel state.
         #[serde(default)]
         suspended_messages: Vec<llm::Message>,
+        /// IDs of the child tasks spawned in this suspension batch.
+        /// Used by the aggregation path to read only the children that
+        /// belong to the current round, avoiding collisions with
+        /// children from prior suspension rounds.
+        #[serde(default)]
+        child_ids: Vec<super::task::AgentTaskId>,
     },
 
     /// Durable state for a task that has paused on
@@ -159,6 +165,12 @@ pub enum TaskState {
         /// messages and rebuilds the full conversation from these.
         #[serde(default)]
         suspended_messages: Vec<llm::Message>,
+        /// IDs of the child tasks that belong to this suspension
+        /// batch, carried forward from the preceding
+        /// [`TaskState::WaitingOnChildren`] payload so the
+        /// aggregation path reads only the current round's children.
+        #[serde(default)]
+        child_ids: Vec<super::task::AgentTaskId>,
     },
 }
 
@@ -208,6 +220,19 @@ impl TaskState {
             | Self::ReadyToResume {
                 suspended_messages, ..
             } => suspended_messages,
+            _ => &[],
+        }
+    }
+
+    /// Borrow the child IDs embedded in a
+    /// [`TaskState::WaitingOnChildren`] or [`TaskState::ReadyToResume`]
+    /// payload. Returns an empty slice for all other variants.
+    #[must_use]
+    pub fn child_ids(&self) -> &[super::task::AgentTaskId] {
+        match self {
+            Self::WaitingOnChildren { child_ids, .. } | Self::ReadyToResume { child_ids, .. } => {
+                child_ids
+            }
             _ => &[],
         }
     }
@@ -279,6 +304,7 @@ mod tests {
         let state = TaskState::WaitingOnChildren {
             continuation: Box::new(envelope.clone()),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         };
         assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
         let inner = state.continuation().expect("continuation present");
@@ -329,6 +355,7 @@ mod tests {
         let waiting = TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         };
         let json = serde_json::to_string(&waiting)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -383,6 +410,7 @@ mod tests {
         let ready = TaskState::ReadyToResume {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         };
         let json = serde_json::to_string(&ready)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -407,6 +435,7 @@ mod tests {
         let waiting_value = serde_json::to_value(TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         })?;
         assert_eq!(
             waiting_value["kind"],
@@ -426,6 +455,7 @@ mod tests {
         let ready_value = serde_json::to_value(TaskState::ReadyToResume {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         })?;
         assert_eq!(ready_value["kind"], serde_json::json!("ready_to_resume"));
         assert!(ready_value.get("continuation").is_some());

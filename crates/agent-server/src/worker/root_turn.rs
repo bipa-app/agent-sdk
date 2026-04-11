@@ -1351,22 +1351,24 @@ pub async fn aggregate_child_outcomes(
     continuation: &AgentContinuation,
     task_store: &dyn AgentTaskStore,
 ) -> Result<Vec<(String, ToolResult)>> {
-    let children = task_store
-        .list_children(&parent.id)
-        .await
-        .context("list children for aggregation")?;
+    let child_ids = parent.state.child_ids();
 
     ensure!(
-        !children.is_empty(),
-        "parent {} has no children to aggregate",
+        !child_ids.is_empty(),
+        "parent {} has no child_ids to aggregate",
         parent.id
     );
 
     let pending = &continuation.pending_tool_calls;
     let mut results: Vec<Option<(String, ToolResult)>> = vec![None; pending.len()];
 
-    for child in &children {
-        // Every child must be terminal.
+    for child_id in child_ids {
+        let child = task_store
+            .get(child_id)
+            .await
+            .with_context(|| format!("read child {child_id}"))?
+            .with_context(|| format!("child {child_id} does not exist"))?;
+
         ensure!(
             child.status.is_terminal(),
             "child {} is not terminal (status {:?}); \
@@ -1386,12 +1388,11 @@ pub async fn aggregate_child_outcomes(
         );
 
         let tool_call_id = pending[idx].id.clone();
-        let tool_result = extract_child_tool_result(child)?;
+        let tool_result = extract_child_tool_result(&child)?;
 
         results[idx] = Some((tool_call_id, tool_result));
     }
 
-    // Verify every slot was filled.
     results
         .into_iter()
         .enumerate()
@@ -1480,6 +1481,7 @@ pub async fn resume_from_children(
         TaskState::ReadyToResume {
             continuation,
             suspended_messages,
+            ..
         } => (continuation.payload.clone(), suspended_messages.clone()),
         other => bail!(
             "resume_from_children requires ReadyToResume state, got {:?}",
