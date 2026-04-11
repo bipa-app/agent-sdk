@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package agent.service.v1;
+
+import "agent/service/v1/common.proto";
+
+// Unary control and inspection surface for threads, tasks, committed
+// transcript snapshots, and durable confirmations.
+//
+// Design rule: these RPCs return current committed snapshots. The only
+// replayable stream in the contract is `AgentEventService.StreamThreadEvents`.
+
+message CreateThreadRequest {
+  // Caller-supplied idempotency key for the logical create operation.
+  // Retries must reuse the same value.
+  string request_id = 1;
+}
+
+message CreateThreadResponse {
+  ThreadView thread = 1;
+}
+
+message GetThreadRequest {
+  string thread_id = 1;
+}
+
+message GetThreadResponse {
+  ThreadView thread = 1;
+}
+
+message GetThreadMessagesRequest {
+  string thread_id = 1;
+}
+
+message GetThreadMessagesResponse {
+  MessageProjectionSnapshot projection = 1;
+}
+
+message ListThreadTasksRequest {
+  string thread_id = 1;
+}
+
+message ListThreadTasksResponse {
+  repeated TaskSnapshot tasks = 1;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  TaskSnapshot task = 1;
+}
+
+message SubmitThreadWorkRequest {
+  // Caller-supplied idempotency key for the logical submission.
+  string request_id = 1;
+
+  // Existing thread to append work to. Thread creation is explicit via
+  // `CreateThread` so the replay and inspection surfaces never depend on
+  // implicit server-side thread bootstrapping.
+  string thread_id = 2;
+
+  // Client input for the next root-turn submission. At least one item must be
+  // supplied.
+  repeated UserInputItem input = 3;
+}
+
+message SubmitThreadWorkResponse {
+  // Thread snapshot after admission.
+  ThreadView thread = 1;
+
+  // The admitted root-turn task. The task is `pending` when the thread had no
+  // blocking root, or `queued` when it was accepted behind existing work.
+  TaskSnapshot task = 2;
+}
+
+message DecideConfirmationRequest {
+  // Caller-supplied idempotency key for the logical confirmation decision.
+  string request_id = 1;
+
+  // Thread guard. The server must reject mismatched `(thread_id, task_id)`
+  // pairs rather than silently applying the decision to some other thread's
+  // paused task.
+  string thread_id = 2;
+  string task_id = 3;
+  ConfirmationDecision decision = 4;
+}
+
+message DecideConfirmationResponse {
+  // Updated child task after the decision was durably applied.
+  TaskSnapshot task = 1;
+
+  // Parent task snapshot when the decision path also changed the parent's
+  // durable state (for example, a rejected confirmation failing the child and
+  // rebalancing the waiting parent).
+  TaskSnapshot parent_task = 2;
+}
+
+service AgentControlService {
+  // Allocate a new active thread and return its committed snapshot.
+  rpc CreateThread(CreateThreadRequest) returns (CreateThreadResponse);
+
+  // Inspect the current committed thread projection plus any active or queued
+  // root tasks for that thread.
+  rpc GetThread(GetThreadRequest) returns (GetThreadResponse);
+
+  // Return the current committed message projection for the thread.
+  //
+  // This is the recovery path after an event-stream retention gap: clients use
+  // the transcript snapshot to rebuild UI state, then reopen the event stream
+  // from a fresh cursor derived from `GetThread`.
+  rpc GetThreadMessages(GetThreadMessagesRequest) returns (GetThreadMessagesResponse);
+
+  // List every durable task row bound to the thread.
+  rpc ListThreadTasks(ListThreadTasksRequest) returns (ListThreadTasksResponse);
+
+  // Inspect one durable task row by id.
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+
+  // Submit the next unit of client work to an existing thread.
+  rpc SubmitThreadWork(SubmitThreadWorkRequest) returns (SubmitThreadWorkResponse);
+
+  // Apply a durable confirmation decision to an awaiting task.
+  rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);
+}

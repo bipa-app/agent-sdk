@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package agent.service.v1;
+
+import "agent/service/v1/common.proto";
+
+// Rich error-detail payloads for gRPC status responses.
+//
+// These messages are transport contract types only. The server attaches them
+// to gRPC status details when returning unary errors. Streaming replay and lag
+// conditions use explicit control frames in `events.proto` rather than relying
+// on transport-level failures.
+
+message ResourceNotFoundDetail {
+  string resource_kind = 1;
+  string resource_id = 2;
+}
+
+message IdempotencyConflictDetail {
+  string request_id = 1;
+  string method = 2;
+  string message = 3;
+}
+
+message ThreadStateConflictDetail {
+  string thread_id = 1;
+  ThreadStatus actual_status = 2;
+  string message = 3;
+}
+
+message TaskStateConflictDetail {
+  string task_id = 1;
+  TaskStatus actual_status = 2;
+  string message = 3;
+}
+
+message RetentionGapDetail {
+  string thread_id = 1;
+  optional uint64 requested_after_sequence = 2;
+  optional uint64 earliest_available_sequence = 3;
+  optional uint64 latest_available_sequence = 4;
+}
