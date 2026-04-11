@@ -264,20 +264,11 @@ pub async fn execute_root_turn(
 ) -> Result<RootTurnOutcome> {
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
-    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
 
     // 1. Open turn attempt.
     let attempt = open_attempt(&inputs, definition, user_prompt, deps.attempt_store, now)
         .await
         .context("open turn attempt")?;
-
-    // 1b. Commit Start event so replay observers see the turn begin.
-    let start_event = AgentEvent::start(thread_id.clone(), turn_number);
-    let start_committed = deps
-        .event_repo
-        .commit_event(thread_id, start_event, now)
-        .await
-        .context("commit Start event")?;
 
     // 2. Build, send LLM request, and resolve the outcome — closing
     //    the attempt on any non-success path.
@@ -297,30 +288,17 @@ pub async fn execute_root_turn(
     let commit_now = OffsetDateTime::now_utc();
 
     // 3. Branch: tool calls → suspend; text-only → commit.
+    //
+    // The Start event is committed inside each branch, AFTER its
+    // idempotency guard fires, so a stale-lease worker that
+    // re-acquired the task cannot produce a duplicate Start.
     if response.has_tool_use() {
-        return suspend_at_tool_boundary(
-            inputs,
-            user_prompt,
-            response,
-            attempt,
-            start_committed,
-            deps,
-            commit_now,
-        )
-        .await;
+        return suspend_at_tool_boundary(inputs, user_prompt, response, attempt, deps, commit_now)
+            .await;
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
-    commit_text_only_turn(
-        inputs,
-        user_prompt,
-        response,
-        attempt,
-        start_committed,
-        deps,
-        commit_now,
-    )
-    .await
+    commit_text_only_turn(inputs, user_prompt, response, attempt, deps, commit_now).await
 }
 
 /// Complete and commit a text-only turn (no tool calls).
@@ -329,7 +307,6 @@ async fn commit_text_only_turn(
     user_prompt: &str,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
-    start_committed: CommittedEvent,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
@@ -365,7 +342,10 @@ async fn commit_text_only_turn(
         );
     }
 
+    // Commit Start after the idempotency guard (see `commit_start_event` doc).
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
+    let start_committed = commit_start_event(thread_id, turn_number, deps.event_repo, now).await?;
+
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -442,6 +422,27 @@ async fn commit_text_only_turn(
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/// Commit a `Start` event for a root turn.
+///
+/// Called by both the text-only and suspension paths **after** their
+/// idempotency guards fire, ensuring a stale-lease worker that
+/// re-acquired the task cannot produce a duplicate `Start`.
+async fn commit_start_event(
+    thread_id: &agent_sdk_core::ThreadId,
+    turn_number: usize,
+    event_repo: &dyn EventRepository,
+    now: OffsetDateTime,
+) -> Result<CommittedEvent> {
+    event_repo
+        .commit_event(
+            thread_id,
+            AgentEvent::start(thread_id.clone(), turn_number),
+            now,
+        )
+        .await
+        .context("commit Start event")
+}
 
 async fn open_attempt(
     inputs: &RootWorkerInputs,
@@ -765,11 +766,11 @@ async fn suspend_at_tool_boundary(
     user_prompt: &str,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
-    start_committed: CommittedEvent,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
+    let thread_id = &inputs.bootstrap.thread_id;
 
     // Idempotency guard: re-read the task from the durable store to
     // detect if a prior worker already completed this suspension (e.g.
@@ -797,6 +798,10 @@ async fn suspend_at_tool_boundary(
              skipping duplicate suspension",
         );
     }
+
+    // Commit Start after the idempotency guard (see `commit_start_event` doc).
+    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
+    let start_committed = commit_start_event(thread_id, turn_number, deps.event_repo, now).await?;
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
     let close_params = build_close_params(&response, &attempt);

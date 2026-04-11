@@ -363,6 +363,16 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
         "event[2] should be Refusal, got {:?}",
         committed_events[2].event,
     );
+    assert!(
+        matches!(&committed_events[3].event, AgentEvent::TurnComplete { .. }),
+        "event[3] should be TurnComplete, got {:?}",
+        committed_events[3].event,
+    );
+    assert!(
+        matches!(&committed_events[4].event, AgentEvent::Done { .. }),
+        "event[4] should be Done, got {:?}",
+        committed_events[4].event,
+    );
 
     Ok(())
 }
