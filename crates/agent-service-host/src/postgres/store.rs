@@ -1121,7 +1121,7 @@ WHERE parent_id = $1
     ) -> Result<()> {
         Self::bootstrap_thread_row_tx(tx, child_thread_id, now).await?;
         let _ = Self::lock_thread_tx(tx, child_thread_id).await?;
-        let existing_child_thread_task = sqlx::query_scalar::<_, String>(
+        let existing_child_thread_task: Option<String> = sqlx::query_scalar!(
             r"
 SELECT id
 FROM agent_sdk_tasks
@@ -1129,8 +1129,8 @@ WHERE thread_id = $1
 LIMIT 1
 FOR UPDATE
 ",
+            thread_key(child_thread_id),
         )
-        .bind(thread_key(child_thread_id))
         .fetch_optional(&mut **tx)
         .await
         .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
