@@ -565,6 +565,7 @@ pub mod commit;
 pub mod committed_event;
 pub mod completed_turn_transaction;
 pub mod event_notifier;
+pub mod event_outbox_transaction;
 pub mod event_repository;
 pub mod event_stream;
 pub mod execution_context;
@@ -599,6 +600,9 @@ pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
 pub use completed_turn_transaction::AtomicCompletedTurnCommitter;
 pub use event_notifier::{EventNotifier, EventReceiver};
+pub use event_outbox_transaction::{
+    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
+};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};

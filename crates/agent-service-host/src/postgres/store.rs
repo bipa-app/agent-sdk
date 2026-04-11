@@ -29,6 +29,9 @@ use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{CommitOutcome, CompletedTurnCommit};
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
+use agent_server::journal::event_outbox_transaction::{
+    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
+};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
@@ -2723,42 +2726,18 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
 
 #[async_trait]
 impl EventRepository for PostgresDurableStore {
+    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
+        Some(self)
+    }
+
     async fn commit_event(
         &self,
         thread_id: &ThreadId,
         event: AgentEvent,
         now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
-        let mut tx = self.begin().await?;
-
-        let next_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
-        let event_id = uuid::Uuid::now_v7();
-        let event_json = json_to_value(&event, "committed event payload")?;
-
-        sqlx::query(
-            r"
-INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
-VALUES ($1, $2, $3, $4, $5)
-",
-        )
-        .bind(event_id.to_string())
-        .bind(thread_key(thread_id))
-        .bind(i64_from_u64(next_seq, "event sequence")?)
-        .bind(&event_json)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("insert committed event seq {next_seq} for {thread_id}"))?;
-
-        tx.commit().await.context("commit single event insert")?;
-
-        Ok(CommittedEvent {
-            event_id,
-            thread_id: thread_id.clone(),
-            sequence: next_seq,
-            timestamp: now,
-            event,
-        })
+        let mut committed = self.commit_event_batch(thread_id, vec![event], now).await?;
+        Ok(committed.remove(0))
     }
 
     async fn commit_event_batch(
@@ -2771,39 +2750,8 @@ VALUES ($1, $2, $3, $4, $5)
 
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
-
-        let mut committed = Vec::with_capacity(events.len());
-        for (idx, event) in events.into_iter().enumerate() {
-            let seq = start_seq + idx as u64;
-            let event_id = uuid::Uuid::now_v7();
-            let event_json = json_to_value(&event, "committed event batch payload")?;
-
-            sqlx::query(
-                r"
-INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
-VALUES ($1, $2, $3, $4, $5)
-",
-            )
-            .bind(event_id.to_string())
-            .bind(thread_key(thread_id))
-            .bind(i64_from_u64(seq, "event batch sequence")?)
-            .bind(&event_json)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("insert committed event seq {seq} for {thread_id}"))?;
-
-            committed.push(CommittedEvent {
-                event_id,
-                thread_id: thread_id.clone(),
-                sequence: seq,
-                timestamp: now,
-                event,
-            });
-        }
-
+        let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
         tx.commit().await.context("commit event batch insert")?;
-
         Ok(committed)
     }
 
@@ -2866,12 +2814,28 @@ ORDER BY sequence
 }
 
 impl PostgresDurableStore {
+    /// Allocate the next event sequence for a thread inside an existing
+    /// transaction.
+    ///
+    /// Postgres forbids `FOR UPDATE` on aggregate queries, so we lock
+    /// the owning `agent_sdk_threads` row instead to serialise concurrent
+    /// writers on the same thread, then read the max sequence without a
+    /// locking clause.
     async fn next_event_sequence_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
     ) -> Result<u64> {
+        // Lock the thread row to serialise concurrent event writers.
+        sqlx::query(r"SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+            .bind(thread_key(thread_id))
+            .fetch_optional(&mut **tx)
+            .await
+            .with_context(|| {
+                format!("lock thread row for event sequence allocation on {thread_id}")
+            })?;
+
         let row: (i64,) = sqlx::query_as(
-            r"SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_sdk_committed_events WHERE thread_id = $1 FOR UPDATE",
+            r"SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_sdk_committed_events WHERE thread_id = $1",
         )
         .bind(thread_key(thread_id))
         .fetch_one(&mut **tx)
@@ -2879,6 +2843,142 @@ impl PostgresDurableStore {
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
 
         u64::try_from(row.0).context("event next_sequence (tx) out of range")
+    }
+
+    /// Insert committed events into an existing transaction.
+    async fn insert_events_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        start_seq: u64,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        let mut committed = Vec::with_capacity(events.len());
+        for (idx, event) in events.into_iter().enumerate() {
+            let seq = start_seq + idx as u64;
+            let event_id = uuid::Uuid::now_v7();
+            let event_json = json_to_value(&event, "committed event batch payload")?;
+
+            sqlx::query(
+                r"
+INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
+VALUES ($1, $2, $3, $4, $5)
+",
+            )
+            .bind(event_id.to_string())
+            .bind(thread_key(thread_id))
+            .bind(i64_from_u64(seq, "event batch sequence")?)
+            .bind(&event_json)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("insert committed event seq {seq} for {thread_id}"))?;
+
+            committed.push(CommittedEvent {
+                event_id,
+                thread_id: thread_id.clone(),
+                sequence: seq,
+                timestamp: now,
+                event,
+            });
+        }
+        Ok(committed)
+    }
+
+    /// Insert outbox rows into an existing transaction.
+    async fn insert_outbox_rows_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        committed: &[CommittedEvent],
+        max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<OutboxRow>> {
+        let mut rows = Vec::with_capacity(committed.len());
+        for event in committed {
+            let id = OutboxRowId::new();
+            let payload_json = json_to_value(&event.to_envelope(), "outbox relay payload")?;
+
+            sqlx::query(
+                r"
+INSERT INTO agent_sdk_outbox
+    (id, thread_id, event_id, sequence, status, payload_json, created_at,
+     next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
+",
+            )
+            .bind(id.as_str())
+            .bind(thread_key(&event.thread_id))
+            .bind(event.event_id.to_string())
+            .bind(i64_from_u64(event.sequence, "outbox sequence")?)
+            .bind(&payload_json)
+            .bind(now)
+            .bind(i64::from(max_attempts))
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("insert outbox row for event seq {}", event.sequence))?;
+
+            rows.push(OutboxRow {
+                id,
+                thread_id: event.thread_id.clone(),
+                event_id: event.event_id,
+                sequence: event.sequence,
+                status: OutboxStatus::Pending,
+                payload_json,
+                created_at: now,
+                next_attempt_at: now,
+                attempt_count: 0,
+                max_attempts,
+                last_error: None,
+                claimed_by: None,
+                claimed_at: None,
+                delivered_at: None,
+            });
+        }
+        Ok(rows)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// AtomicEventOutboxCommitter
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl AtomicEventOutboxCommitter for PostgresDurableStore {
+    async fn commit_events_with_outbox(
+        &self,
+        params: EventOutboxCommit,
+    ) -> Result<EventOutboxCommitOutcome> {
+        ensure!(
+            !params.events.is_empty(),
+            "cannot commit an empty event batch"
+        );
+
+        let mut tx = self.begin().await?;
+
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
+        let committed = Self::insert_events_tx(
+            &mut tx,
+            &params.thread_id,
+            params.events,
+            start_seq,
+            params.now,
+        )
+        .await?;
+        let outbox_rows = Self::insert_outbox_rows_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .context("commit atomic events + outbox transaction")?;
+
+        Ok(EventOutboxCommitOutcome {
+            committed_events: committed,
+            outbox_rows,
+        })
     }
 }
 
@@ -2994,15 +3094,20 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
         next_attempt_at: OffsetDateTime,
         _now: OffsetDateTime,
     ) -> Result<()> {
+        // last_error must be NULL for pending rows per the
+        // agent_sdk_outbox_error_check constraint.
         sqlx::query(
             r"
 UPDATE agent_sdk_outbox
 SET
     attempt_count = attempt_count + 1,
-    last_error = $2,
     status = CASE
         WHEN attempt_count + 1 >= max_attempts THEN 'expired'
         ELSE 'pending'
+    END,
+    last_error = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN $2
+        ELSE NULL
     END,
     next_attempt_at = CASE
         WHEN attempt_count + 1 >= max_attempts THEN next_attempt_at
@@ -3108,19 +3213,37 @@ WHERE thread_id = $1
         now: OffsetDateTime,
     ) -> Result<RetentionCursor> {
         let mut tx = self.begin().await?;
+        let new_floor_i64 = i64_from_u64(new_floor, "retention floor")?;
+
+        // Read the current floor under a row lock so we can reject
+        // backward moves with a clear error, matching the in-memory
+        // implementation's contract.
+        let current: Option<(i64,)> = sqlx::query_as(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1 FOR UPDATE",
+        )
+        .bind(thread_key(thread_id))
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
+
+        if let Some((current_floor,)) = current {
+            ensure!(
+                new_floor_i64 >= current_floor,
+                "retention floor can only advance: current {current_floor}, requested {new_floor}",
+            );
+        }
 
         sqlx::query(
             r"
 INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at)
 VALUES ($1, $2, $3)
 ON CONFLICT (thread_id) DO UPDATE
-SET retention_floor = GREATEST(agent_sdk_retention_cursors.retention_floor, EXCLUDED.retention_floor),
+SET retention_floor = EXCLUDED.retention_floor,
     updated_at = EXCLUDED.updated_at
-WHERE EXCLUDED.retention_floor >= agent_sdk_retention_cursors.retention_floor
 ",
         )
         .bind(thread_key(thread_id))
-        .bind(i64_from_u64(new_floor, "retention floor")?)
+        .bind(new_floor_i64)
         .bind(now)
         .execute(&mut *tx)
         .await

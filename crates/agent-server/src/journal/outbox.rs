@@ -363,12 +363,13 @@ impl OutboxStore for InMemoryOutboxStore {
         }
 
         row.attempt_count += 1;
-        row.last_error = Some(error.to_string());
 
         if row.attempt_count >= row.max_attempts {
             row.status = OutboxStatus::Expired;
+            row.last_error = Some(error.to_string());
         } else {
             row.status = OutboxStatus::Pending;
+            row.last_error = None;
             row.next_attempt_at = next_attempt_at;
             row.claimed_by = None;
             row.claimed_at = None;
@@ -542,7 +543,8 @@ mod tests {
         let row = store.get(id).await?.expect("row should exist");
         assert_eq!(row.status, OutboxStatus::Pending);
         assert_eq!(row.attempt_count, 1);
-        assert_eq!(row.last_error.as_deref(), Some("connection refused"));
+        // Pending rows must have NULL last_error per the outbox_error_check constraint.
+        assert!(row.last_error.is_none());
         Ok(())
     }
 
