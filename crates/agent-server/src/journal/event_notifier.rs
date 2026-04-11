@@ -96,6 +96,7 @@ impl EventNotifier {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.channels.retain(|_, tx| tx.receiver_count() > 0);
         let tx = guard
             .channels
             .entry(thread_id.0.clone())
@@ -114,14 +115,12 @@ impl EventNotifier {
         if events.is_empty() {
             return;
         }
-        let thread_key = &events[0].thread_id.0;
-
         let guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(tx) = guard.channels.get(thread_key) {
-            for event in events {
+        for event in events {
+            if let Some(tx) = guard.channels.get(&event.thread_id.0) {
                 // If send fails (no receivers), that's fine — events
                 // are already durable.
                 let _ = tx.send(event.clone());
@@ -140,6 +139,17 @@ impl Default for EventNotifier {
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+impl EventNotifier {
+    fn channel_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .channels
+            .len()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -248,6 +258,51 @@ mod tests {
             matches!(result, Err(broadcast::error::RecvError::Lagged(_))),
             "expected Lagged, got {result:?}",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dead_channels_are_pruned_on_subscribe() {
+        let notifier = EventNotifier::new();
+        let thread_c = ThreadId::from_string("t-notifier-c");
+
+        // Subscribe to thread_a and drop the receiver.
+        drop(notifier.subscribe(&thread_a()));
+        assert_eq!(notifier.channel_count(), 1);
+
+        // Subscribing to thread_b prunes thread_a's dead channel.
+        drop(notifier.subscribe(&thread_b()));
+        assert_eq!(notifier.channel_count(), 1);
+
+        // Subscribing to thread_c prunes thread_b's dead channel.
+        let _rx = notifier.subscribe(&thread_c);
+        assert_eq!(notifier.channel_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_batch_routes_per_thread() -> anyhow::Result<()> {
+        let notifier = EventNotifier::new();
+        let mut rx_a = notifier.subscribe(&thread_a());
+        let mut rx_b = notifier.subscribe(&thread_b());
+
+        let events = vec![
+            sample_committed(&thread_a(), 0),
+            sample_committed(&thread_b(), 0),
+            sample_committed(&thread_a(), 1),
+        ];
+        notifier.notify(&events);
+
+        let a0 = rx_a.recv().await?;
+        let a1 = rx_a.recv().await?;
+        assert_eq!(a0.sequence, 0);
+        assert_eq!(a0.thread_id, thread_a());
+        assert_eq!(a1.sequence, 1);
+        assert_eq!(a1.thread_id, thread_a());
+
+        let b0 = rx_b.recv().await?;
+        assert_eq!(b0.sequence, 0);
+        assert_eq!(b0.thread_id, thread_b());
+
         Ok(())
     }
 
