@@ -404,14 +404,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_batch_is_rejected() {
+    async fn empty_batch_is_rejected() -> anyhow::Result<()> {
         let repo = InMemoryEventRepository::new();
-        let err = repo
-            .commit_event_batch(&thread_a(), vec![], t0())
-            .await
-            .expect_err("empty batch should fail");
+        let result = repo.commit_event_batch(&thread_a(), vec![], t0()).await;
 
+        assert!(result.is_err(), "expected empty batch to be rejected");
+        let err = result.unwrap_err();
         assert!(err.to_string().contains("empty event batch"));
+        Ok(())
     }
 
     // ── thread isolation ────────────────────────────────────────────
