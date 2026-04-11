@@ -51,7 +51,9 @@ use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_complete
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, ChildSpawnSpec, SuspensionPayload, TaskStatus};
+use crate::journal::task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
+};
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
@@ -115,6 +117,98 @@ pub enum RootTurnOutcome {
         /// The child tasks created, one per tool call.
         child_tasks: Vec<AgentTask>,
     },
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Failure & cancellation
+// ─────────────────────────────────────────────────────────────────────
+
+/// Fail a root turn after `execute_root_turn` or `resume_root_turn`
+/// returns `Err`.
+///
+/// Transitions the task to [`TaskStatus::Failed`] via
+/// [`AgentTaskStore::fail_task`] and best-effort closes any open turn
+/// attempts for the task so the audit trail is clean.
+///
+/// Because staged projections are in-memory only, they are naturally
+/// discarded when the `RootWorkerInputs` is dropped on the error path.
+/// This function handles the durable side: marking the task terminal
+/// and closing open attempts.
+///
+/// # Returns
+///
+/// The failed task row, or an error if the store rejects the
+/// transition (e.g. task is already terminal from a concurrent
+/// cancel).
+pub async fn fail_root_turn(
+    task_id: &AgentTaskId,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    // Best-effort close any open turn attempts for this task.
+    best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+
+    let error_msg = format!("{error:#}");
+    let (failed_task, _parent) = deps
+        .task_store
+        .fail_task(task_id, worker_id, lease_id, error_msg, now)
+        .await
+        .context("fail root task")?;
+
+    Ok(failed_task)
+}
+
+/// Cancel a root turn and its entire subtree.
+///
+/// Calls [`AgentTaskStore::cancel_tree`] to atomically cancel the root
+/// task and any live descendant tasks (e.g. `tool_runtime` children
+/// spawned during suspension). Best-effort closes any open turn
+/// attempts for the root task.
+///
+/// Because staged projections are in-memory only and no durable writes
+/// occur on the suspension path, cancellation at any lifecycle point
+/// leaves the journal in a coherent state: the task is terminal, its
+/// `TaskState` is cleared to `None`, and no stale projections exist.
+///
+/// # Returns
+///
+/// The task IDs that were actually transitioned (excludes rows that
+/// were already terminal).
+pub async fn cancel_root_turn(
+    task_id: &AgentTaskId,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<Vec<AgentTaskId>> {
+    best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
+
+    deps.task_store
+        .cancel_tree(task_id, now)
+        .await
+        .context("cancel root turn tree")
+}
+
+/// Best-effort close any open (non-closed) turn attempts for a task.
+///
+/// Iterates all attempts and closes any that are still open with the
+/// `Cancelled` outcome. Errors are swallowed — the caller's primary
+/// operation (fail or cancel) takes precedence.
+async fn best_effort_close_open_attempts(
+    task_id: &AgentTaskId,
+    attempt_store: &dyn TurnAttemptStore,
+    now: OffsetDateTime,
+) {
+    let attempts = match attempt_store.list_by_task(task_id).await {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    for attempt in &attempts {
+        if !attempt.is_closed() {
+            close_attempt_with(attempt, TurnAttemptOutcome::Cancelled, attempt_store, now).await;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1122,10 +1216,13 @@ async fn suspend_resumed_turn(
     // New assistant response (with new tool-use blocks).
     new_suspended.push(build_full_assistant_message(&response));
 
-    // One child task per new tool call.
+    // One child task per new tool call, inheriting the configured retry budget
+    // (same as suspend_at_tool_boundary — ChildSpawnSpec::default() would use
+    // DEFAULT_MAX_ATTEMPTS=1, not the policy's budget).
     let tool_call_count = response.tool_uses().count();
+    let child_max_attempts = inputs.bootstrap.definition.policy.max_attempts;
     let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
-        .map(|_| ChildSpawnSpec::default())
+        .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
 
     let (parent_task, child_tasks) = deps
