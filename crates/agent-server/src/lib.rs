@@ -106,7 +106,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`journal`] | Durable `agent_tasks` schema, root submission queue, FIFO promotion, lease acquisition, heartbeats, expiry sweeps, Phase 2.4's typed pause-state with journal-guarded `pause_on_children` / `pause_on_confirmation` / `resume_from_confirmation`, Phase 2.5's retry budget / fail-closed recovery matrix shared across acquisition and expiry paths, Phase 2.6's tool-runtime child-task orchestration (`spawn_tool_children` / `complete_task` / `fail_task`) plus deterministic cancellation tree, and Phase 3.1's **threads projection** — durable thread-level aggregates (`committed_turns`, `total_usage`) owned exclusively by the completed-turn commit path |on cascade (`cancel_tree`) with journal-driven parent resume triggers |
-//! | [`worker`] | Phase 4 worker bootstrapping: server-owned [`AgentDefinition`] resolution, [`AgentDefinitionRegistry`] lookup surface, and [`WorkerBootstrapContext`] construction for root-turn tasks. Phase 5.1 adds [`ToolTaskBootstrap`] and [`execute_tool_task`] for tool-runtime child-task execution. Phase 5.3 adds [`pause_tool_for_confirmation`], [`apply_confirmation_decision`], and [`resume_confirmed_tool`] for durable confirmation handling with authoritative policy rechecks. |
+//! | [`worker`] | Phase 4 worker bootstrapping: server-owned [`AgentDefinition`] resolution, [`AgentDefinitionRegistry`] lookup surface, and [`WorkerBootstrapContext`] construction for root-turn tasks. Phase 5.1 adds [`ToolTaskBootstrap`] and [`execute_tool_task`] for tool-runtime child-task execution. Phase 5.3 adds [`pause_tool_for_confirmation`], [`apply_confirmation_decision`], and [`resume_confirmed_tool`] for durable confirmation handling with authoritative policy rechecks. Phase 7.1 adds durable subagent spawn contracts via [`SubagentSpawnRequest`], [`InheritedSubagentConstraints`], and [`resolve_subagent_spec`]. |
 //!
 //! ## Planned modules (not yet implemented)
 //!
@@ -184,10 +184,13 @@ pub use worker::{
     AgentDefinition, AgentDefinitionRegistry, CONFIRMATION_POLICY_DENIED_PREFIX,
     CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX, ConfirmationDecision,
     ConfirmationDecisionOutcome, ConfirmationPolicy, ConfirmationResumeOutcome,
-    InMemoryAgentDefinitionRegistry, PolicyVerdict, RootTurnDeps, RootTurnOutcome, RuntimePolicy,
-    ThinkingPolicy, ToolTaskBootstrap, ToolTaskOutcome, WorkerBootstrapContext,
-    apply_confirmation_decision, execute_root_turn, execute_tool_task, pause_tool_for_confirmation,
-    resolve_bootstrap_context, resolve_tool_bootstrap, resume_confirmed_tool,
+    EffectiveSubagentCapabilities, EffectiveSubagentSpec, InMemoryAgentDefinitionRegistry,
+    InheritedSubagentConstraints, PolicyVerdict, RootTurnDeps, RootTurnOutcome, RuntimePolicy,
+    ServerSubagentSpawnPolicy, SubagentCapabilityProfile, SubagentCapabilityRequest,
+    SubagentSpawnPolicy, SubagentSpawnRequest, ThinkingPolicy, ToolTaskBootstrap, ToolTaskOutcome,
+    WorkerBootstrapContext, apply_confirmation_decision, execute_root_turn, execute_tool_task,
+    pause_tool_for_confirmation, resolve_bootstrap_context, resolve_subagent_spec,
+    resolve_tool_bootstrap, resume_confirmed_tool,
 };
 
 #[cfg(test)]
