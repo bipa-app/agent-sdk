@@ -58,7 +58,7 @@ const DEFAULT_BUFFER_CAPACITY: usize = 256;
 const DEFAULT_LAG_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Configuration for the live tail hub.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct LiveTailConfig {
     /// Maximum events buffered per subscriber before lag detection.
     pub buffer_capacity: usize,
@@ -216,8 +216,15 @@ impl LiveTailHub {
     }
 
     /// Create a new hub with custom configuration.
+    ///
+    /// `buffer_capacity` is clamped to a minimum of 1 because Tokio's
+    /// `mpsc::channel` requires a non-zero buffer size.
     #[must_use]
     pub fn with_config(config: LiveTailConfig) -> Self {
+        let config = LiveTailConfig {
+            buffer_capacity: config.buffer_capacity.max(1),
+            ..config
+        };
         Self {
             inner: Arc::new(Mutex::new(LiveTailHubInner {
                 threads: HashMap::new(),
@@ -791,6 +798,25 @@ mod tests {
         // IDs across threads may overlap (scoped to ThreadFanout),
         // which is fine — they're only meaningful within a thread.
         let _ = rx3;
+    }
+
+    // ── Zero buffer capacity is clamped ─────────────────────────────
+
+    #[tokio::test]
+    async fn zero_buffer_capacity_is_clamped_to_one() -> anyhow::Result<()> {
+        let hub = LiveTailHub::with_config(LiveTailConfig {
+            buffer_capacity: 0,
+            lag_grace_period: Duration::ZERO,
+        });
+        let mut rx = hub.subscribe(&thread_a());
+
+        hub.publish(&[sample_committed(&thread_a(), 0)]);
+
+        match rx.recv().await {
+            Some(LiveTailEvent::Event(e)) => assert_eq!(e.sequence, 0),
+            other => panic!("expected Event(0), got {other:?}"),
+        }
+        Ok(())
     }
 
     // ── Replay-required returned exactly once ──────────────────────
