@@ -102,14 +102,23 @@ async fn slow_consumer_recovers_via_durable_replay() -> Result<()> {
     // ── Reconnect via durable replay ───────────────────────────────
     // The subscriber uses `last_delivered_sequence` to fetch exactly
     // the missed events from the event repository.
-    let missed = repo
-        .get_events_in_range(
-            &thread_a(),
-            last_delivered.unwrap_or(0),
-            // Fetch up to the current watermark.
-            repo.next_sequence(&thread_a()).await? - 1,
-        )
-        .await?;
+    //
+    // `get_events_in_range` uses a strictly-greater-than lower bound,
+    // so `None` (no events delivered) must use `get_events` instead
+    // to avoid skipping sequence 0.
+    let watermark = repo.next_sequence(&thread_a()).await? - 1;
+    let missed = match last_delivered {
+        None => {
+            let all = repo.get_events(&thread_a()).await?;
+            all.into_iter()
+                .filter(|e| e.sequence <= watermark)
+                .collect()
+        }
+        Some(seq) => {
+            repo.get_events_in_range(&thread_a(), seq, watermark)
+                .await?
+        }
+    };
 
     let missed_seqs: Vec<u64> = missed.iter().map(|e| e.sequence).collect();
     assert_eq!(missed_seqs, vec![3, 4, 5, 6]);
