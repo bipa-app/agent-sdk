@@ -424,11 +424,43 @@
 //! | Event replay | future |
 //! | Subagent runtime | future |
 //! | Confirmation transport APIs | post-2.4 |
+//!
+//! # Phase 5.2 — Durable execution intent and fail-closed mutation guard (ENG-7995)
+//!
+//! Phase 5.2 adds the **execution intent** layer — a durable
+//! pre-execution record that side-effecting and resumable tools must
+//! persist before their executor callback runs. This closes the gap
+//! between "child task exists" and "tool was actually invoked",
+//! giving the system a reliable signal for retry, replay, and
+//! manual intervention decisions.
+//!
+//! - [`execution_intent::OperationId`] is a stable identity that
+//!   combines the server-generated child task id with the LLM-assigned
+//!   tool call id, surviving retries and restarts.
+//! - [`execution_intent::ToolEffectClass`] classifies every tool call
+//!   as `ReplaySafe`, `SideEffecting`, or `Resumable` to drive
+//!   durability and retry rules.
+//! - [`execution_intent::ExecutionIntent`] is the durable record
+//!   persisted before execution, updated to `Completed`/`Failed`
+//!   after.
+//! - [`execution_intent::ExecutionIntentStore`] is the trait for
+//!   durable intent persistence, with
+//!   [`execution_intent::InMemoryExecutionIntentStore`] as the
+//!   reference in-memory implementation.
+//! - [`execution_intent::guarded_tool_execution`] wraps
+//!   [`super::worker::tool_task::execute_tool_task`] with the
+//!   fail-closed guard: if intent persistence fails for a
+//!   side-effecting tool, the executor callback is never invoked.
+//! - [`execution_intent::check_retry_safety`] inspects a prior
+//!   intent record and returns a [`execution_intent::RetryDecision`]
+//!   so retry logic can distinguish replay-safe operations from
+//!   unsafe duplicate mutation.
 
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
 pub mod execution_context;
+pub mod execution_intent;
 pub mod message;
 pub mod message_store;
 #[cfg(test)]
@@ -448,6 +480,11 @@ pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpo
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
+pub use execution_intent::{
+    ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
+    RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
+    guarded_tool_execution,
+};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
