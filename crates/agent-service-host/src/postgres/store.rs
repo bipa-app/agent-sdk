@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
@@ -70,18 +70,61 @@ impl PostgresDurableStore {
         Self { pool }
     }
 
+    /// Build a lazily connecting Postgres pool.
+    ///
+    /// The returned store does not perform network I/O until first
+    /// use. Call [`Self::migrate`] during startup to verify the
+    /// database is reachable and the durable-core schema is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database URL is invalid or the schema
+    /// name is malformed.
+    pub fn connect_lazy(
+        database_url: &str,
+        max_connections: u32,
+        schema: Option<&str>,
+    ) -> Result<Self> {
+        ensure!(max_connections > 0, "postgres max_connections must be > 0");
+
+        let connect_options: PgConnectOptions = database_url
+            .parse()
+            .context("parse postgres durable store connection string")?;
+
+        let mut pool_options = PgPoolOptions::new().max_connections(max_connections);
+
+        if let Some(schema_name) = schema {
+            validate_schema_name(schema_name)?;
+            let schema_name = schema_name.to_owned();
+            pool_options = pool_options.after_connect(move |conn, _meta| {
+                let schema_name = schema_name.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+                        .bind(&schema_name)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        Ok(Self::from_pool(
+            pool_options.connect_lazy_with(connect_options),
+        ))
+    }
+
     /// Connect to Postgres and apply the durable-core migrations.
     ///
     /// # Errors
     ///
     /// Returns an error if the pool cannot be created or migrations fail.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(database_url)
+        let store = Self::connect_lazy(database_url, 8, None)?;
+        store
+            .pool
+            .acquire()
             .await
             .context("connect postgres durable store")?;
-        let store = Self::from_pool(pool);
         store.migrate().await?;
         Ok(store)
     }
@@ -1084,74 +1127,6 @@ WHERE parent_id = $1
         u32_from_i64(live, "live child count")
     }
 
-    async fn load_spawn_parent_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-    ) -> Result<AgentTask> {
-        let parent = Self::load_task_tx(tx, parent_id, true)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if parent.status != TaskStatus::Running {
-            let status = parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if parent.kind.is_leaf() {
-            let parent_kind = parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
-        Ok(parent)
-    }
-
-    async fn ensure_empty_child_thread_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        child_thread_id: &ThreadId,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        Self::bootstrap_thread_row_tx(tx, child_thread_id, now).await?;
-        let _ = Self::lock_thread_tx(tx, child_thread_id).await?;
-        let existing_child_thread_task: Option<String> = sqlx::query_scalar!(
-            r"
-SELECT id
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-LIMIT 1
-FOR UPDATE
-",
-            thread_key(child_thread_id),
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
-        if existing_child_thread_task.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child thread id {child_thread_id} already has tasks"
-            ));
-        }
-        Ok(())
-    }
-
     async fn apply_task_terminal_transition_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_id: &AgentTaskId,
@@ -1342,6 +1317,24 @@ FOR UPDATE
             committed_events: Vec::new(),
         })
     }
+}
+
+fn validate_schema_name(schema: &str) -> Result<()> {
+    ensure!(!schema.is_empty(), "postgres schema cannot be empty");
+    ensure!(
+        schema
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "postgres schema must contain only ASCII letters, digits, or underscores",
+    );
+    ensure!(
+        schema
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_'),
+        "postgres schema must start with an ASCII letter or underscore",
+    );
+    Ok(())
 }
 
 #[async_trait]
@@ -2072,7 +2065,37 @@ FOR UPDATE SKIP LOCKED
         }
 
         let mut tx = self.begin().await?;
-        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
 
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -2126,18 +2149,70 @@ FOR UPDATE SKIP LOCKED
             spawn_index,
         } = spawn;
 
-        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
-        Self::ensure_empty_child_thread_tx(&mut tx, &child_thread_id, now).await?;
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
+
+        let child_thread = Self::lock_thread_tx(&mut tx, &child_thread_id).await?;
+        if child_thread.is_none() {
+            return Err(anyhow!(
+                "spawn rejected: child thread {child_thread_id} does not exist"
+            ));
+        }
+
+        let existing_child_thread_task = sqlx::query_scalar::<_, String>(
+            r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+LIMIT 1
+",
+        )
+        .bind(thread_key(&child_thread_id))
+        .fetch_optional(tx.as_mut())
+        .await
+        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
+        if existing_child_thread_task.is_some() {
+            return Err(anyhow!(
+                "spawn rejected: child thread id {child_thread_id} already has tasks"
+            ));
+        }
 
         let child_root = AgentTask::new_root_turn(
             child_thread_id.clone(),
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         );
-        if Self::load_task_tx(&mut tx, &child_root.id, false)
-            .await?
-            .is_some()
-        {
+        let existing_child_root = Self::load_task_tx(&mut tx, &child_root.id, false).await?;
+        if existing_child_root.is_some() {
             return Err(anyhow!(
                 "spawn rejected: child root task id {} already exists",
                 child_root.id
@@ -2156,10 +2231,8 @@ FOR UPDATE SKIP LOCKED
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
-        if Self::load_task_tx(&mut tx, &invocation.id, false)
-            .await?
-            .is_some()
-        {
+        let existing_invocation = Self::load_task_tx(&mut tx, &invocation.id, false).await?;
+        if existing_invocation.is_some() {
             return Err(anyhow!(
                 "spawn rejected: invocation task id {} already exists",
                 invocation.id
@@ -2172,7 +2245,6 @@ FOR UPDATE SKIP LOCKED
             .context("spawn rejected: wait_on_children transition failed")?;
         Self::update_task_tx(&mut tx, &new_parent).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
-        Self::enforce_insert_cross_row_invariants_tx(&mut tx, &child_root).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
         tx.commit()
             .await
@@ -3742,41 +3814,7 @@ mod tests {
         }
     }
 
-    /// RAII guard that wraps a [`PostgresDurableStore`] and drops the
-    /// test schema on destruction so schemas don't accumulate across
-    /// local `cargo test` runs.
-    struct TestStore {
-        store: PostgresDurableStore,
-        schema: String,
-        database_url: String,
-    }
-
-    impl std::ops::Deref for TestStore {
-        type Target = PostgresDurableStore;
-        fn deref(&self) -> &Self::Target {
-            &self.store
-        }
-    }
-
-    impl Drop for TestStore {
-        fn drop(&mut self) {
-            let schema = self.schema.clone();
-            let url = self.database_url.clone();
-            // All Postgres tests run on the multi_thread runtime, so
-            // block_in_place is safe here.
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    if let Ok(mut conn) = PgConnection::connect(&url).await {
-                        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                            .execute(&mut conn)
-                            .await;
-                    }
-                });
-            });
-        }
-    }
-
-    async fn test_store() -> Result<Option<TestStore>> {
+    async fn test_store() -> Result<Option<PostgresDurableStore>> {
         let Ok(database_url) = env::var("TEST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         else {
             return Ok(None);
@@ -3810,11 +3848,7 @@ mod tests {
             .migrate()
             .await
             .context("migrate postgres test store")?;
-        Ok(Some(TestStore {
-            store,
-            schema,
-            database_url,
-        }))
+        Ok(Some(store))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3826,14 +3860,14 @@ mod tests {
         let count = 10usize;
         let mut handles = Vec::with_capacity(count);
         for idx in 0..count {
-            let cloned = store.store.clone();
+            let store = store.clone();
             handles.push(tokio::spawn(async move {
                 let root = AgentTask::new_root_turn(
                     thread_id("t-pg-race"),
                     t_plus(i64::try_from(idx).context("idx to i64")?),
                     3,
                 );
-                cloned.submit_root_turn(root).await
+                store.submit_root_turn(root).await
             }));
         }
 
@@ -3895,9 +3929,9 @@ mod tests {
         let count = 8usize;
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
-            let cloned = store.store.clone();
+            let store = store.clone();
             handles.push(tokio::spawn(async move {
-                cloned
+                store
                     .promote_next_queued_root(&thread_id("t-pg-promo"), t_plus(4))
                     .await
             }));
@@ -4021,7 +4055,7 @@ mod tests {
         assert!(result.is_none(), "every head must be failed closed");
 
         for id in &ids {
-            let row = AgentTaskStore::get(&*store, id)
+            let row = AgentTaskStore::get(&store, id)
                 .await
                 .context("get exhausted row")?
                 .context("row exists")?;
@@ -4087,7 +4121,7 @@ mod tests {
             .context("fault injection should fail")?;
         assert!(format!("{err:#}").contains("injected postgres completed-turn failure"));
 
-        let attempt_after = TurnAttemptStore::get(&*store, &attempt.id)
+        let attempt_after = TurnAttemptStore::get(&store, &attempt.id)
             .await?
             .context("attempt after")?;
         assert!(
@@ -4095,16 +4129,16 @@ mod tests {
             "attempt close should have rolled back"
         );
 
-        let thread = ThreadStore::get(&*store, &running.thread_id)
+        let thread = ThreadStore::get(&store, &running.thread_id)
             .await?
             .context("thread row should exist from task bootstrap")?;
         assert_eq!(thread.committed_turns, 0);
         assert_eq!(thread.total_usage, TokenUsage::default());
 
-        let projection = MessageProjectionStore::get(&*store, &running.thread_id).await?;
+        let projection = MessageProjectionStore::get(&store, &running.thread_id).await?;
         assert!(projection.is_none(), "message head must roll back");
 
-        let checkpoints = CheckpointStore::list_by_thread(&*store, &running.thread_id).await?;
+        let checkpoints = CheckpointStore::list_by_thread(&store, &running.thread_id).await?;
         assert!(checkpoints.is_empty(), "checkpoint insert must roll back");
 
         Ok(())
@@ -4149,10 +4183,10 @@ mod tests {
                 }],
                 now: t_plus(2),
             },
-            &*store,
-            &*store,
-            &*store,
-            &*store,
+            &store,
+            &store,
+            &store,
+            &store,
             &event_repo,
         )
         .await?;
@@ -4161,7 +4195,7 @@ mod tests {
         assert_eq!(outcome.checkpoint.turn_number, 1);
         assert!(outcome.closed_attempt.is_closed());
 
-        let history = MessageProjectionStore::get_history(&*store, &running.thread_id).await?;
+        let history = MessageProjectionStore::get_history(&store, &running.thread_id).await?;
         assert_eq!(history.len(), 2);
 
         Ok(())

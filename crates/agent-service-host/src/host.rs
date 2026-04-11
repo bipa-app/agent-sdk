@@ -140,6 +140,15 @@ impl ServiceHost {
             config.worker.acquisition_interval_secs > 0,
             "worker.acquisition_interval_secs must be > 0"
         );
+        if matches!(
+            config.storage.backend,
+            super::config::StorageBackend::Postgres
+        ) {
+            anyhow::ensure!(
+                config.storage.postgres.max_connections > 0,
+                "storage.postgres.max_connections must be > 0"
+            );
+        }
         Ok(())
     }
 
@@ -167,6 +176,18 @@ impl ServiceHost {
         &self.runtime
     }
 
+    /// Initialize backend-specific dependencies such as migrations.
+    ///
+    /// # Errors
+    /// Returns an error if the configured storage backend cannot be
+    /// made ready for use.
+    pub async fn initialize(&self) -> Result<()> {
+        self.stores
+            .initialize()
+            .await
+            .context("initialising storage backend")
+    }
+
     /// Token that, when cancelled, triggers graceful shutdown.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -188,7 +209,10 @@ impl ServiceHost {
     /// Returns an error if a background task panics or if shutdown
     /// coordination fails.
     pub async fn run(self) -> Result<()> {
+        self.initialize().await?;
+
         info!(
+            storage_backend = self.stores.backend_name(),
             pool_size = self.config.worker.pool_size,
             lease_duration_secs = self.config.worker.lease_duration_secs,
             sweep_interval_secs = self.config.worker.sweep_interval_secs,
@@ -197,6 +221,22 @@ impl ServiceHost {
             http_enabled = self.config.transport.http_enabled,
             "service host starting",
         );
+
+        if self.stores.backend_name() == "postgres" {
+            for surface in self
+                .stores
+                .durability_report()
+                .iter()
+                .filter(|surface| !surface.persists_restart)
+            {
+                warn!(
+                    surface = surface.surface,
+                    backend = surface.backend,
+                    note = surface.note,
+                    "storage surface remains non-durable under the postgres backend",
+                );
+            }
+        }
 
         // Register signal handlers before spawning any tasks so that a
         // registration failure (e.g. EMFILE) never leaves an orphaned
@@ -871,6 +911,26 @@ mod tests {
             worker: crate::config::WorkerConfig {
                 acquisition_interval_secs: 0,
                 ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = ServiceHost::new(config, sample_registry(), sample_runtime()?);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_postgres_max_connections_is_rejected() -> Result<()> {
+        let config = ServiceConfig {
+            storage: crate::config::StorageConfig {
+                backend: crate::config::StorageBackend::Postgres,
+                postgres: crate::config::PostgresStorageConfig {
+                    database_url: Some(
+                        "postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk".into(),
+                    ),
+                    schema: None,
+                    max_connections: 0,
+                },
             },
             ..Default::default()
         };

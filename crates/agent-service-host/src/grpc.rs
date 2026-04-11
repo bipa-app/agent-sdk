@@ -225,15 +225,15 @@ impl GrpcShared {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
                 }),
             ),
-            TaskState::SubagentInvocation { invocation } => Some(
-                pb::task_snapshot::StateDetail::SubagentInvocation(pb::SubagentInvocationState {
-                    child_thread_id: invocation.child_thread_id.to_string(),
-                    child_root_task_id: invocation.child_root_task_id.to_string(),
-                }),
-            ),
             TaskState::ReadyToResume { child_ids, .. } => Some(
                 pb::task_snapshot::StateDetail::ReadyToResume(pb::ReadyToResumeState {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
+                }),
+            ),
+            TaskState::SubagentInvocation { invocation } => Some(
+                pb::task_snapshot::StateDetail::SubagentInvocation(pb::SubagentInvocationState {
+                    child_thread_id: invocation.child_thread_id.0.clone(),
+                    child_root_task_id: invocation.child_root_task_id.to_string(),
                 }),
             ),
             TaskState::AwaitingConfirmation {
@@ -1207,6 +1207,10 @@ impl LocalDaemon {
     ) -> Result<Self> {
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
             .context("creating daemon stores")?;
+        stores
+            .initialize()
+            .await
+            .context("initializing daemon stores")?;
         let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))
             .context("creating daemon host")?;
         let health = Arc::clone(host.health());
@@ -1794,14 +1798,18 @@ mod tests {
         AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
         ToolCallExecutor,
     };
+    use agent_sdk_core::ThreadId;
     use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
     use agent_sdk_providers::LlmProvider;
+    use agent_server::AgentTaskId;
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
     use anyhow::{Context, Result, anyhow, bail};
     use async_trait::async_trait;
     use serde_json::json;
+    use sqlx::{Connection, PgConnection};
     use tonic::transport::Channel;
+    use uuid::Uuid;
 
     type ControlClient = pb::agent_control_service_client::AgentControlServiceClient<Channel>;
     type EventClient = pb::agent_event_service_client::AgentEventServiceClient<Channel>;
@@ -1951,6 +1959,55 @@ mod tests {
         pb::UserInputItem {
             item: Some(pb::user_input_item::Item::Text(text.into())),
         }
+    }
+
+    fn message_text(message: &pb::ConversationMessage) -> Option<&str> {
+        match message.content.as_ref() {
+            Some(pb::conversation_message::Content::Text(text)) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    async fn postgres_test_config() -> Result<Option<ServiceConfig>> {
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(None);
+        };
+
+        let schema = format!("eng_7999_{}", Uuid::new_v4().simple());
+        let mut admin = PgConnection::connect(&database_url)
+            .await
+            .context("connect postgres admin for grpc tests")?;
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&mut admin)
+            .await
+            .with_context(|| format!("create grpc test schema {schema}"))?;
+
+        Ok(Some(ServiceConfig {
+            storage: crate::config::StorageConfig {
+                backend: crate::config::StorageBackend::Postgres,
+                postgres: crate::config::PostgresStorageConfig {
+                    database_url: Some(database_url),
+                    schema: Some(schema),
+                    max_connections: 8,
+                },
+            },
+            ..ServiceConfig::default()
+        }))
+    }
+
+    async fn inspection_stores(config: &ServiceConfig) -> Result<StoreRegistry> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::from_config(&config.storage, registry)
+            .context("build inspection stores")?;
+        stores
+            .initialize()
+            .await
+            .context("initialize inspection stores")?;
+        Ok(stores)
     }
 
     async fn create_thread(control: &mut ControlClient, request_id: &str) -> Result<String> {
@@ -2390,6 +2447,298 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    #[tokio::test]
+    async fn local_daemon_postgres_restart_preserves_durable_core_and_exposes_event_gap()
+    -> Result<()> {
+        let Some(config) = postgres_test_config().await? else {
+            return Ok(());
+        };
+
+        let runtime1 = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_pg_restart_1",
+                "hello from postgres turn 1",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let registry1 = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let daemon1 = LocalDaemon::start(config.clone(), registry1, runtime1).await?;
+
+        let first_run = async {
+            let (mut control, mut events) = connect_clients(&daemon1.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-postgres-thread").await?;
+            let _task = submit_text_work(
+                &mut control,
+                "submit-postgres-turn-1",
+                &thread_id,
+                "turn one",
+            )
+            .await?;
+
+            let mut live_stream = open_stream(
+                &mut events,
+                &thread_id,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+
+            let last_seen = loop {
+                let item = next_stream_item(&mut live_stream).await?;
+                if let Some(StreamItem::Event(event)) = item.item {
+                    break event.sequence;
+                }
+            };
+            drop(live_stream);
+
+            wait_for(|| {
+                let mut control = control.clone();
+                let thread_id = thread_id.clone();
+                async move {
+                    let response = control
+                        .get_thread(pb::GetThreadRequest { thread_id })
+                        .await
+                        .context("poll get_thread during postgres replay")?
+                        .into_inner();
+                    let committed_turns = response
+                        .thread
+                        .and_then(|view| view.thread)
+                        .map(|thread| thread.committed_turns)
+                        .unwrap_or_default();
+                    Ok((committed_turns == 1).then_some(()))
+                }
+            })
+            .await?;
+
+            let mut replay_stream = open_stream(
+                &mut events,
+                &thread_id,
+                Some(last_seen),
+                pb::FollowMode::ReplayOnly,
+            )
+            .await?;
+            let replay_items = collect_until_closed(&mut replay_stream).await?;
+            let replayed = event_sequences(&replay_items);
+            assert!(
+                replayed.iter().all(|sequence| *sequence > last_seen),
+                "postgres replay returned an event at or before the last seen sequence",
+            );
+
+            let messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread_messages after first postgres turn")?
+                .into_inner()
+                .projection
+                .context("missing postgres message projection after first turn")?;
+            assert_eq!(messages.messages.len(), 2);
+            let tasks = list_thread_tasks(&mut control, &thread_id, "postgres first run").await?;
+            assert_eq!(tasks.len(), 1);
+
+            Ok::<_, anyhow::Error>((thread_id, tasks[0].task_id.clone()))
+        }
+        .await;
+
+        daemon1.stop().await?;
+        let (thread_id, first_task_id) = first_run?;
+
+        let inspection = inspection_stores(&config).await?;
+        let thread_key = ThreadId::from_string(thread_id.clone());
+        let first_task_key = AgentTaskId::from_string(first_task_id.clone());
+
+        let persisted_thread = inspection
+            .thread_store
+            .get(&thread_key)
+            .await?
+            .context("persisted postgres thread missing after restart")?;
+        assert_eq!(persisted_thread.committed_turns, 1);
+
+        let persisted_messages = inspection.message_store.get_history(&thread_key).await?;
+        assert_eq!(persisted_messages.len(), 2);
+
+        let checkpoints = inspection
+            .checkpoint_store
+            .list_by_thread(&thread_key)
+            .await?;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].turn_number, 1);
+
+        let persisted_task = inspection
+            .task_store
+            .get(&first_task_key)
+            .await?
+            .context("persisted postgres task missing after restart")?;
+        assert_eq!(
+            persisted_task.status,
+            agent_server::journal::task::TaskStatus::Completed,
+        );
+        let attempts = inspection
+            .attempt_store
+            .list_by_task(&first_task_key)
+            .await?;
+        assert_eq!(attempts.len(), 1);
+
+        let fresh_process_events = inspection.event_repo.get_events(&thread_key).await?;
+        assert!(
+            fresh_process_events.is_empty(),
+            "fresh inspection stores should start with an empty process-local event repository",
+        );
+
+        let runtime2 = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_pg_restart_2",
+                "hello from postgres turn 2",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let registry2 = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let daemon2 = LocalDaemon::start(config.clone(), registry2, runtime2).await?;
+
+        let second_run = async {
+            let (mut control, mut events) = connect_clients(&daemon2.endpoint()).await?;
+
+            let thread_snapshot = control
+                .get_thread(pb::GetThreadRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread after postgres restart")?
+                .into_inner()
+                .thread
+                .context("missing thread view after postgres restart")?
+                .thread
+                .context("missing thread snapshot after postgres restart")?;
+            assert_eq!(thread_snapshot.committed_turns, 1);
+
+            let messages_before = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread_messages after postgres restart")?
+                .into_inner()
+                .projection
+                .context("missing message projection after postgres restart")?;
+            assert_eq!(messages_before.messages.len(), 2);
+            assert_eq!(
+                message_text(&messages_before.messages[1]),
+                Some("hello from postgres turn 1"),
+            );
+
+            let tasks_before =
+                list_thread_tasks(&mut control, &thread_id, "postgres restart").await?;
+            assert_eq!(tasks_before.len(), 1);
+            assert_eq!(tasks_before[0].task_id, first_task_id);
+
+            let mut replay_stream =
+                open_stream(&mut events, &thread_id, None, pb::FollowMode::ReplayOnly).await?;
+            let replay_after_restart = collect_until_closed(&mut replay_stream).await?;
+            assert!(event_sequences(&replay_after_restart).is_empty());
+            assert!(matches!(
+                replay_after_restart.last().and_then(|item| item.item.as_ref()),
+                Some(StreamItem::Closed(closed))
+                    if closed.reason == pb::StreamCloseReason::ReplayExhausted as i32
+            ));
+
+            let mut live_stream = open_stream(
+                &mut events,
+                &thread_id,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+            let second_task = submit_text_work(
+                &mut control,
+                "submit-postgres-turn-2",
+                &thread_id,
+                "turn two",
+            )
+            .await?;
+            let second_items = collect_until_closed(&mut live_stream).await?;
+            let second_sequences = event_sequences(&second_items);
+            assert_contiguous_sequences(&second_sequences);
+
+            let messages_after = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread_messages after second postgres turn")?
+                .into_inner()
+                .projection
+                .context("missing message projection after second postgres turn")?;
+            assert_eq!(messages_after.messages.len(), 4);
+            assert_eq!(
+                message_text(&messages_after.messages[1]),
+                Some("hello from postgres turn 1"),
+            );
+            assert_eq!(
+                message_text(&messages_after.messages[3]),
+                Some("hello from postgres turn 2"),
+            );
+
+            let thread_after = control
+                .get_thread(pb::GetThreadRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread after second postgres turn")?
+                .into_inner()
+                .thread
+                .context("missing thread view after second postgres turn")?
+                .thread
+                .context("missing thread snapshot after second postgres turn")?;
+            assert_eq!(thread_after.committed_turns, 2);
+
+            let tasks_after =
+                list_thread_tasks(&mut control, &thread_id, "postgres second run").await?;
+            assert_eq!(tasks_after.len(), 2);
+
+            Ok::<_, anyhow::Error>(second_task.task_id)
+        }
+        .await;
+
+        daemon2.stop().await?;
+        let second_task_id = second_run?;
+        let second_task_key = AgentTaskId::from_string(second_task_id);
+
+        let checkpoints_after = inspection
+            .checkpoint_store
+            .list_by_thread(&thread_key)
+            .await?;
+        assert_eq!(checkpoints_after.len(), 2);
+        assert_eq!(
+            checkpoints_after
+                .last()
+                .context("missing latest checkpoint after second turn")?
+                .turn_number,
+            2,
+        );
+
+        let second_task = inspection
+            .task_store
+            .get(&second_task_key)
+            .await?
+            .context("second postgres task missing from durable store")?;
+        assert_eq!(
+            second_task.status,
+            agent_server::journal::task::TaskStatus::Completed,
+        );
+        let second_attempts = inspection
+            .attempt_store
+            .list_by_task(&second_task_key)
+            .await?;
+        assert_eq!(second_attempts.len(), 1);
+
+        Ok(())
     }
 
     #[tokio::test]
