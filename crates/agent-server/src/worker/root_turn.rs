@@ -169,12 +169,14 @@ pub async fn fail_root_turn(
         .await
         .context("fail root task")?;
 
-    // Commit Error event after state transition (fail-closed).
+    // Best-effort: the task is durably Failed; event commit failure
+    // must not override that outcome. Consistent with
+    // best_effort_close_open_attempts.
     let error_event = AgentEvent::error(error_msg, false);
-    deps.event_repo
+    let _ = deps
+        .event_repo
         .commit_event(thread_id, error_event, now)
-        .await
-        .context("commit Error event on root turn failure")?;
+        .await;
 
     Ok(failed_task)
 }
@@ -357,8 +359,15 @@ async fn commit_text_only_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize agent state")?;
 
-    let lifecycle_events =
-        build_turn_complete_events(&response, thread_id, turn_number, &turn_usage);
+    let duration = (now - attempt.opened_at).unsigned_abs();
+    let lifecycle_events = build_turn_complete_events(
+        &response,
+        thread_id,
+        turn_number,
+        &turn_usage,
+        &drained_state.total_usage,
+        duration,
+    );
 
     let commit = commit_completed_turn(
         CompletedTurnCommit {
@@ -657,6 +666,8 @@ fn build_turn_complete_events(
     thread_id: &agent_sdk_core::ThreadId,
     turn_number: usize,
     turn_usage: &TokenUsage,
+    total_usage: &TokenUsage,
+    duration: std::time::Duration,
 ) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     if response.stop_reason == Some(llm::StopReason::Refusal) {
@@ -672,8 +683,8 @@ fn build_turn_complete_events(
     events.push(AgentEvent::done(
         thread_id.clone(),
         turn_number,
-        turn_usage.clone(),
-        std::time::Duration::ZERO,
+        total_usage.clone(),
+        duration,
     ));
     events
 }
@@ -1152,8 +1163,15 @@ async fn commit_resumed_turn(
         serde_json::to_value(&drained_state).context("serialize resumed agent state")?;
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
-    let lifecycle_events =
-        build_turn_complete_events(response, thread_id, turn_number, &turn_usage);
+    let duration = (now - attempt.opened_at).unsigned_abs();
+    let lifecycle_events = build_turn_complete_events(
+        response,
+        thread_id,
+        turn_number,
+        &turn_usage,
+        &drained_state.total_usage,
+        duration,
+    );
 
     let commit = commit_completed_turn(
         CompletedTurnCommit {

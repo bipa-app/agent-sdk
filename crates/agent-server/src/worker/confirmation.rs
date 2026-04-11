@@ -425,11 +425,31 @@ where
                 &bootstrap.task_id,
                 &bootstrap.worker_id,
                 &bootstrap.lease_id,
-                error,
+                error.clone(),
                 now,
             )
             .await
             .with_context(|| format!("fail_task after policy denial for {}", bootstrap.task_id))?;
+
+        // Close the tool lifecycle with a ToolCallEnd event so observers
+        // see a complete ToolCallStart → ToolCallEnd pair.
+        let error_result = ToolResult {
+            success: false,
+            output: error,
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        };
+        let end_event = AgentEvent::tool_call_end(
+            &bootstrap.tool_call.id,
+            &bootstrap.tool_call.name,
+            &bootstrap.tool_call.display_name,
+            error_result,
+        );
+        deps.event_repo
+            .commit_event(&bootstrap.thread_id, end_event, now)
+            .await
+            .context("commit ToolCallEnd event after policy denial")?;
 
         return Ok(ConfirmationResumeOutcome::PolicyDenied {
             child,
