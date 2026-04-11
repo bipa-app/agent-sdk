@@ -18,20 +18,26 @@
 //! # Positional mapping
 //!
 //! Child tasks are spawned in the same order as the parent's
-//! [`AgentContinuation::pending_tool_calls`](agent_sdk_core::AgentContinuation::pending_tool_calls) array. The bootstrap
-//! step sorts siblings by `created_at` and matches each child to its
-//! tool call by position. This coupling is safe because both arrays
-//! are created atomically under the same store write lock in
-//! [`AgentTaskStore::spawn_tool_children`].
+//! [`AgentContinuation::pending_tool_calls`](agent_sdk_core::AgentContinuation::pending_tool_calls) array. Each child
+//! carries a `spawn_index` field set during
+//! [`AgentTaskStore::spawn_tool_children`] that records its position
+//! within the batch. The bootstrap step reads this index directly
+//! instead of relying on sibling sort order, making the mapping
+//! correct regardless of the store's `list_children` return order.
 //!
 //! # Cancellation and lease awareness
 //!
-//! The worker checks the supplied [`CancellationToken`] before and
-//! after tool execution. If cancelled, it returns early without
-//! driving the child to a terminal state — the
-//! [`AgentTaskStore::cancel_tree`] sweep handles cleanup. Lease
-//! expiry is caught by the store's CAS guards on `complete_task` /
-//! `fail_task`.
+//! The worker checks the supplied [`CancellationToken`] **before**
+//! tool execution. If cancelled at that point, it returns early
+//! without driving the child to a terminal state — the
+//! [`AgentTaskStore::cancel_tree`] sweep handles cleanup.
+//!
+//! After the executor returns, the result is **always** committed
+//! to the journal regardless of cancellation state, because the
+//! tool's side effects have already been applied and dropping the
+//! result would cause the recovery matrix to re-execute the tool.
+//! Lease expiry is caught by the store's CAS guards on
+//! `complete_task` / `fail_task`.
 //!
 //! [`TaskState`]: crate::journal::task_state::TaskState
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
@@ -96,10 +102,10 @@ pub struct ToolTaskBootstrap {
 ///
 /// # Positional index
 ///
-/// The child's position among its siblings determines which
-/// `PendingToolCallInfo` it owns. Siblings are sorted by
-/// `created_at` to match the spawn order from
-/// [`AgentTaskStore::spawn_tool_children`].
+/// The child's `spawn_index` field determines which
+/// `PendingToolCallInfo` it owns. This index is set during
+/// [`AgentTaskStore::spawn_tool_children`] and read directly,
+/// making the mapping independent of `list_children` ordering.
 /// # Errors
 ///
 /// Returns an error if any precondition fails, the parent task
@@ -154,26 +160,16 @@ pub async fn resolve_tool_bootstrap(
         }
     };
 
-    // ── Resolve positional index ─────────────────────────────────
-    let mut siblings = task_store
-        .list_children(parent_id)
-        .await
-        .context("failed to list sibling tasks")?;
-    siblings.sort_by_key(|t| t.created_at);
+    // ── Resolve positional index via spawn_index ─────────────────
+    let spawn_index = child
+        .spawn_index
+        .context("ToolRuntime child missing spawn_index")?;
 
-    let child_index = siblings
-        .iter()
-        .position(|t| t.id == child.id)
-        .with_context(|| {
-            format!(
-                "child task {} not found among siblings of parent {parent_id}",
-                child.id
-            )
-        })?;
+    let child_index = usize::try_from(spawn_index).context("spawn_index exceeds usize")?;
 
     ensure!(
         child_index < continuation.pending_tool_calls.len(),
-        "child index {child_index} out of bounds for {} pending tool calls on parent {parent_id}",
+        "child spawn_index {child_index} out of bounds for {} pending tool calls on parent {parent_id}",
         continuation.pending_tool_calls.len(),
     );
 
@@ -213,8 +209,8 @@ pub enum ToolTaskOutcome {
         parent: Option<AgentTask>,
         error: String,
     },
-    /// The worker was cancelled before completing. The child task
-    /// was **not** driven to a terminal state.
+    /// The worker was cancelled before the executor ran. The child
+    /// task was **not** driven to a terminal state.
     Cancelled,
 }
 
@@ -227,11 +223,10 @@ pub enum ToolTaskOutcome {
 /// The `executor` callback receives the resolved [`PendingToolCallInfo`]
 /// and produces the [`ToolResult`]. The worker owns the lifecycle:
 ///
-/// 1. Check cancellation.
+/// 1. Check cancellation (bail early if already cancelled).
 /// 2. Run `executor(tool_call)`.
 /// 3. On success → [`AgentTaskStore::complete_task`].
 /// 4. On failure → [`AgentTaskStore::fail_task`].
-/// 5. Check cancellation again (post-execution).
 ///
 /// The callback signature is intentionally minimal — the caller
 /// (which has access to the tool registry, hooks, audit sink, etc.)
@@ -267,10 +262,12 @@ where
     // ── Execute the tool ─────────────────────────────────────────
     let tool_result = executor(bootstrap.tool_call.clone()).await;
 
-    // ── Post-execution cancellation check ────────────────────────
-    if cancel.is_cancelled() {
-        return Ok(ToolTaskOutcome::Cancelled);
-    }
+    // NOTE: No post-execution cancellation check here. Once the
+    // executor has returned, side effects have already been applied
+    // and the result must be committed to the journal. Dropping it
+    // would leave the child in Running state, causing the recovery
+    // matrix to re-execute the tool on restart (double execution of
+    // non-idempotent operations).
 
     // ── Drive to terminal state ──────────────────────────────────
     match tool_result {

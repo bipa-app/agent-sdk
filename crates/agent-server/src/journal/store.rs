@@ -1994,10 +1994,12 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // hand-crafted test that uses fixed ids could otherwise slip
         // a duplicate into the batch.
         let mut children: Vec<AgentTask> = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let child =
+        for (idx, spec) in specs.into_iter().enumerate() {
+            let mut child =
                 AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts)
                     .context("spawn rejected: new_child failed")?;
+            child.spawn_index =
+                Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
             if inner.by_id.contains_key(&child.id)
                 || children.iter().any(|existing| existing.id == child.id)
             {
