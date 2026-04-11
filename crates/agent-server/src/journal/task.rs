@@ -755,6 +755,7 @@ impl AgentTask {
             root_id: parent.root_id.clone(),
             depth: parent.depth.saturating_add(1),
             thread_id: parent.thread_id.clone(),
+            submitted_input: Vec::new(),
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,
