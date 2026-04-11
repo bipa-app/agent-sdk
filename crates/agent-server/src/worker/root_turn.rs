@@ -35,6 +35,7 @@
 //! [`TaskState::WaitingOnChildren`]: crate::journal::task_state::TaskState::WaitingOnChildren
 
 use agent_sdk_core::audit::AuditProvenance;
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::llm::{self, ChatOutcome, ChatRequest};
 use agent_sdk_core::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage,
@@ -48,6 +49,8 @@ use time::OffsetDateTime;
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
+use crate::journal::committed_event::CommittedEvent;
+use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::AgentTaskStore;
@@ -76,6 +79,7 @@ pub struct RootTurnDeps<'a> {
     pub message_store: &'a dyn MessageProjectionStore,
     pub attempt_store: &'a dyn TurnAttemptStore,
     pub checkpoint_store: &'a dyn CheckpointStore,
+    pub event_repo: &'a dyn EventRepository,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -102,6 +106,8 @@ pub enum RootTurnOutcome {
         completed_task: AgentTask,
         /// The assistant's text response.
         response_text: String,
+        /// Lifecycle events committed with this turn.
+        committed_events: Vec<CommittedEvent>,
     },
 
     /// Turn suspended at the tool boundary.
@@ -117,6 +123,8 @@ pub enum RootTurnOutcome {
         parent_task: AgentTask,
         /// The child tasks created, one per tool call.
         child_tasks: Vec<AgentTask>,
+        /// `ToolCallStart` events committed for each spawned child.
+        committed_events: Vec<CommittedEvent>,
     },
 }
 
@@ -146,6 +154,7 @@ pub async fn fail_root_turn(
     task_id: &AgentTaskId,
     worker_id: &WorkerId,
     lease_id: &LeaseId,
+    thread_id: &agent_sdk_core::ThreadId,
     error: &anyhow::Error,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
@@ -156,9 +165,16 @@ pub async fn fail_root_turn(
     let error_msg = format!("{error:#}");
     let (failed_task, _parent) = deps
         .task_store
-        .fail_task(task_id, worker_id, lease_id, error_msg, now)
+        .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
         .await
         .context("fail root task")?;
+
+    // Commit Error event after state transition (fail-closed).
+    let error_event = AgentEvent::error(error_msg, false);
+    deps.event_repo
+        .commit_event(thread_id, error_event, now)
+        .await
+        .context("commit Error event on root turn failure")?;
 
     Ok(failed_task)
 }
@@ -246,7 +262,6 @@ pub async fn execute_root_turn(
 ) -> Result<RootTurnOutcome> {
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
-    let task_id = &inputs.bootstrap.task_id;
 
     // 1. Open turn attempt.
     let attempt = open_attempt(&inputs, definition, user_prompt, deps.attempt_store, now)
@@ -277,10 +292,22 @@ pub async fn execute_root_turn(
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
+    commit_text_only_turn(inputs, user_prompt, response, attempt, deps, commit_now).await
+}
 
+/// Complete and commit a text-only turn (no tool calls).
+async fn commit_text_only_turn(
+    inputs: RootWorkerInputs,
+    user_prompt: &str,
+    response: llm::ChatResponse,
+    attempt: TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let thread_id = &inputs.bootstrap.thread_id;
+    let task_id = &inputs.bootstrap.task_id;
     let response_text = response.first_text().unwrap_or("").to_owned();
 
-    // 4. Buffer in staged stores.
     buffer_turn_messages(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
@@ -291,10 +318,7 @@ pub async fn execute_root_turn(
     .await
     .context("buffer staged messages")?;
 
-    // 5. Idempotency guard: re-read the thread from the durable store
-    //    to detect if a prior worker already committed the turn we're
-    //    targeting (e.g. our lease expired between commit and
-    //    complete_task, and another worker re-acquired the task).
+    // Idempotency guard.
     let expected_turn = inputs.recovery_view.next_turn_number;
     let current_thread = deps
         .thread_store
@@ -312,7 +336,7 @@ pub async fn execute_root_turn(
         );
     }
 
-    // 6. Drain staged stores and commit.
+    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -333,6 +357,9 @@ pub async fn execute_root_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize agent state")?;
 
+    let lifecycle_events =
+        build_turn_complete_events(&response, thread_id, turn_number, &turn_usage);
+
     let commit = commit_completed_turn(
         CompletedTurnCommit {
             thread_id: thread_id.clone(),
@@ -342,24 +369,27 @@ pub async fn execute_root_turn(
             messages: drained_messages,
             turn_usage,
             agent_state_snapshot,
-            now: commit_now,
+            events: lifecycle_events,
+            now,
         },
         deps.thread_store,
         deps.message_store,
         deps.attempt_store,
         deps.checkpoint_store,
+        deps.event_repo,
     )
     .await
     .context("commit completed turn")?;
 
-    // 7. Advance the root task to Completed.
+    let committed_events = commit.committed_events.clone();
+
     let (completed_task, _parent) = deps
         .task_store
         .complete_task(
             task_id,
             &inputs.bootstrap.worker_id,
             &inputs.bootstrap.lease_id,
-            commit_now,
+            now,
         )
         .await
         .context("complete root task")?;
@@ -368,6 +398,7 @@ pub async fn execute_root_turn(
         commit: Box::new(commit),
         completed_task,
         response_text,
+        committed_events,
     })
 }
 
@@ -619,6 +650,34 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
     }
 }
 
+/// Build lifecycle events for a completed turn: optional `Refusal`,
+/// `TurnComplete`, and `Done`.
+fn build_turn_complete_events(
+    response: &llm::ChatResponse,
+    thread_id: &agent_sdk_core::ThreadId,
+    turn_number: usize,
+    turn_usage: &TokenUsage,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    if response.stop_reason == Some(llm::StopReason::Refusal) {
+        events.push(AgentEvent::refusal(
+            response.id.clone(),
+            response.first_text().map(str::to_owned),
+        ));
+    }
+    events.push(AgentEvent::TurnComplete {
+        turn: turn_number,
+        usage: turn_usage.clone(),
+    });
+    events.push(AgentEvent::done(
+        thread_id.clone(),
+        turn_number,
+        turn_usage.clone(),
+        std::time::Duration::ZERO,
+    ));
+    events
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tool-boundary suspension (Phase 4.4)
 // ─────────────────────────────────────────────────────────────────────
@@ -702,6 +761,22 @@ async fn suspend_at_tool_boundary(
         .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
 
+    // Build ToolCallStart events before continuation is moved.
+    let tool_call_events: Vec<AgentEvent> = continuation
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|tc| {
+            AgentEvent::tool_call_start(
+                &tc.id,
+                &tc.name,
+                &tc.display_name,
+                tc.input.clone(),
+                tc.tier,
+            )
+        })
+        .collect();
+
     // 5. Atomically spawn children and park the parent.
     let (parent_task, child_tasks) = deps
         .task_store
@@ -719,10 +794,37 @@ async fn suspend_at_tool_boundary(
         .await
         .context("spawn tool children")?;
 
+    // Commit ToolCallStart events after state transition.
+    let committed_events = commit_tool_call_start_events(
+        deps.event_repo,
+        &inputs.bootstrap.thread_id,
+        tool_call_events,
+        now,
+    )
+    .await?;
+
     Ok(RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        committed_events,
     })
+}
+
+/// Commit a batch of `ToolCallStart` events, returning an empty vec
+/// when the input is empty.
+async fn commit_tool_call_start_events(
+    event_repo: &dyn EventRepository,
+    thread_id: &agent_sdk_core::ThreadId,
+    events: Vec<AgentEvent>,
+    now: OffsetDateTime,
+) -> Result<Vec<CommittedEvent>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    event_repo
+        .commit_event_batch(thread_id, events, now)
+        .await
+        .context("commit ToolCallStart events")
 }
 
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
@@ -1049,6 +1151,10 @@ async fn commit_resumed_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize resumed agent state")?;
 
+    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
+    let lifecycle_events =
+        build_turn_complete_events(response, thread_id, turn_number, &turn_usage);
+
     let commit = commit_completed_turn(
         CompletedTurnCommit {
             thread_id: thread_id.clone(),
@@ -1058,15 +1164,19 @@ async fn commit_resumed_turn(
             messages: drained_messages,
             turn_usage,
             agent_state_snapshot,
+            events: lifecycle_events,
             now,
         },
         deps.thread_store,
         deps.message_store,
         deps.attempt_store,
         deps.checkpoint_store,
+        deps.event_repo,
     )
     .await
     .context("commit resumed turn")?;
+
+    let committed_events = commit.committed_events.clone();
 
     // Advance the root task to Completed.
     let (completed_task, _parent) = deps
@@ -1084,6 +1194,7 @@ async fn commit_resumed_turn(
         commit: Box::new(commit),
         completed_task,
         response_text,
+        committed_events,
     })
 }
 
@@ -1229,6 +1340,22 @@ async fn suspend_resumed_turn(
         .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
 
+    // Build ToolCallStart events before continuation is moved.
+    let tool_call_events: Vec<AgentEvent> = new_continuation
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|tc| {
+            AgentEvent::tool_call_start(
+                &tc.id,
+                &tc.name,
+                &tc.display_name,
+                tc.input.clone(),
+                tc.tier,
+            )
+        })
+        .collect();
+
     let (parent_task, child_tasks) = deps
         .task_store
         .spawn_tool_children(
@@ -1245,9 +1372,19 @@ async fn suspend_resumed_turn(
         .await
         .context("re-spawn tool children on resume")?;
 
+    // Commit ToolCallStart events after state transition.
+    let committed_events = commit_tool_call_start_events(
+        deps.event_repo,
+        &inputs.bootstrap.thread_id,
+        tool_call_events,
+        now,
+    )
+    .await?;
+
     Ok(RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        committed_events,
     })
 }
 

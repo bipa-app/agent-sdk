@@ -21,8 +21,9 @@ use super::confirmation::{
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
-use crate::journal::execution_intent::InMemoryExecutionIntentStore;
+use crate::journal::execution_intent::{GuardedExecutionDeps, InMemoryExecutionIntentStore};
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
@@ -218,6 +219,7 @@ struct TestStores {
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
 }
 
 impl TestStores {
@@ -228,6 +230,7 @@ impl TestStores {
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
         }
     }
 
@@ -238,6 +241,7 @@ impl TestStores {
             message_store: &self.messages,
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
         }
     }
 }
@@ -269,6 +273,7 @@ async fn suspend_root_with_tools(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended outcome");
@@ -339,7 +344,8 @@ async fn pause_transitions_child_to_awaiting_confirmation() -> Result<()> {
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
 
     // Pause for confirmation.
-    let paused = pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    let (paused, _committed_events) =
+        pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
     assert!(paused.worker_id.is_none(), "lease should be dropped");
@@ -382,7 +388,8 @@ async fn pause_persists_prepared_operation_from_listen_context() -> Result<()> {
 
     // The test mock doesn't set listen_context so prepared_operation
     // will be None. Verify the state handles this correctly.
-    let paused = pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    let (paused, _committed_events) =
+        pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     assert!(
         paused.state.prepared_operation().is_none(),
@@ -415,7 +422,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Apply approval decision.
     let outcome = apply_confirmation_decision(
@@ -446,8 +453,11 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
     // Resume with AllowAll policy → should execute.
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &AllowAllPolicy,
         &cancel,
         |_info| async { Ok(ToolResult::success("transfer completed")) },
@@ -462,6 +472,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
         child,
         parent,
         result,
+        ..
     } = tool_outcome
     else {
         panic!("expected Completed, got: {tool_outcome:?}");
@@ -501,7 +512,7 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
     // Acquire, bootstrap, pause, approve.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     apply_confirmation_decision(
         &children[0].id,
         ConfirmationDecision::Approved,
@@ -525,8 +536,11 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
     let policy = DenyAllPolicy::new("tool disabled by administrator");
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &policy,
         &cancel,
         |_info| async {
@@ -589,7 +603,7 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Reject.
     let outcome = apply_confirmation_decision(
@@ -652,7 +666,7 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Timeout.
     let outcome = apply_confirmation_decision(
@@ -770,7 +784,8 @@ async fn awaiting_confirmation_state_survives_store_reread() -> Result<()> {
     // Acquire, bootstrap, pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    let paused = pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    let (paused, _committed_events) =
+        pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
 
     // Simulate restart: re-read the task from the store.
@@ -837,7 +852,7 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
     // Acquire child 0 (transfer, Confirm tier) → pause.
     let child_0 = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap_0 = resolve_tool_bootstrap(child_0, &stores.tasks).await?;
-    pause_tool_for_confirmation(&bootstrap_0, &stores.tasks, t_plus(15)).await?;
+    pause_tool_for_confirmation(&bootstrap_0, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     // Acquire child 1 (bash, Observe tier) → execute directly.
     let child_1 = acquire_child_with(
@@ -852,6 +867,7 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
     let outcome_1 = super::tool_task::execute_tool_task(
         bootstrap_1,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("echo output")) },
         t_plus(20),
@@ -947,7 +963,8 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
     // Step 2: Worker acquires child → bootstrap → pause.
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
-    let paused = pause_tool_for_confirmation(&bootstrap, &stores.tasks, t_plus(15)).await?;
+    let (paused, _committed_events) =
+        pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
 
     // Step 3: External transport approves.
@@ -976,8 +993,11 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &AllowAllPolicy,
         &cancel,
         |_info| async { Ok(ToolResult::success("transfer of 42 completed")) },
@@ -990,6 +1010,7 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
         child,
         parent,
         result,
+        ..
     }) = resume_outcome
     else {
         panic!("expected Executed(Completed), got: {resume_outcome:?}");

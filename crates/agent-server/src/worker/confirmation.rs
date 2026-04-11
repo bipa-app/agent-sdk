@@ -80,6 +80,7 @@
 //! [`TaskState::AwaitingConfirmation`]: crate::journal::task_state::TaskState::AwaitingConfirmation
 //! [`PendingToolCallInfo::listen_context`]: agent_sdk_core::PendingToolCallInfo
 
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{ListenExecutionContext, PendingToolCallInfo, ToolResult};
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
@@ -88,8 +89,10 @@ use std::future::Future;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
+use crate::journal::committed_event::CommittedEvent;
+use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_intent::{
-    ExecutionIntentStore, classify_tool_effect, guarded_tool_execution,
+    GuardedExecutionDeps, classify_tool_effect, guarded_tool_execution,
 };
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, TaskKind};
@@ -231,8 +234,9 @@ pub enum ConfirmationResumeOutcome {
 pub async fn pause_tool_for_confirmation(
     bootstrap: &ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
+    event_repo: &dyn EventRepository,
     now: OffsetDateTime,
-) -> anyhow::Result<AgentTask> {
+) -> anyhow::Result<(AgentTask, Vec<CommittedEvent>)> {
     ensure!(
         bootstrap.child_task.kind == TaskKind::ToolRuntime,
         "confirmation pause requires a ToolRuntime task, got {:?}",
@@ -248,7 +252,7 @@ pub async fn pause_tool_for_confirmation(
 
     let prepared_operation = bootstrap.tool_call.listen_context.clone();
 
-    task_store
+    let paused_task = task_store
         .pause_on_confirmation(
             &bootstrap.task_id,
             &bootstrap.worker_id,
@@ -263,7 +267,24 @@ pub async fn pause_tool_for_confirmation(
                 "failed to pause child {} for confirmation",
                 bootstrap.task_id
             )
-        })
+        })?;
+
+    // Commit ToolRequiresConfirmation event after state transition.
+    let confirm_event = AgentEvent::tool_requires_confirmation(
+        &bootstrap.tool_call.id,
+        &bootstrap.tool_call.name,
+        bootstrap.tool_call.input.clone(),
+        format!(
+            "Tool {} requires confirmation",
+            bootstrap.tool_call.display_name
+        ),
+    );
+    let committed = event_repo
+        .commit_event(&bootstrap.thread_id, confirm_event, now)
+        .await
+        .context("commit ToolRequiresConfirmation event")?;
+
+    Ok((paused_task, vec![committed]))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -380,8 +401,7 @@ pub async fn apply_confirmation_decision(
 /// or store CAS operations fail.
 pub async fn resume_confirmed_tool<F, Fut>(
     bootstrap: ToolTaskBootstrap,
-    task_store: &dyn AgentTaskStore,
-    intent_store: &dyn ExecutionIntentStore,
+    deps: &GuardedExecutionDeps<'_>,
     policy: &dyn ConfirmationPolicy,
     cancel: &CancellationToken,
     executor: F,
@@ -399,7 +419,8 @@ where
 
     if let PolicyVerdict::Denied { reason } = verdict {
         let error = format!("{CONFIRMATION_POLICY_DENIED_PREFIX} {reason}");
-        let (child, parent) = task_store
+        let (child, parent) = deps
+            .task_store
             .fail_task(
                 &bootstrap.task_id,
                 &bootstrap.worker_id,
@@ -419,16 +440,8 @@ where
 
     // ── Execute through the guarded path ────────────────────────
     let effect_class = classify_tool_effect(&bootstrap.tool_call);
-    let outcome = guarded_tool_execution(
-        bootstrap,
-        task_store,
-        intent_store,
-        cancel,
-        effect_class,
-        executor,
-        now,
-    )
-    .await?;
+    let outcome =
+        guarded_tool_execution(bootstrap, deps, cancel, effect_class, executor, now).await?;
 
     Ok(ConfirmationResumeOutcome::Executed(outcome))
 }

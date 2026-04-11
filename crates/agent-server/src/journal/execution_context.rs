@@ -153,6 +153,7 @@ fn ensure_thread_match(task_thread: &ThreadId, recovered_thread: &ThreadId) -> R
 mod tests {
     use super::super::checkpoint_store::InMemoryCheckpointStore;
     use super::super::commit::{CompletedTurnCommit, commit_completed_turn};
+    use super::super::event_repository::InMemoryEventRepository;
     use super::super::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
     use super::super::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
     use super::super::thread_store::InMemoryThreadStore;
@@ -236,6 +237,7 @@ mod tests {
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
         checkpoints: InMemoryCheckpointStore,
+        events: InMemoryEventRepository,
     }
 
     impl Stores {
@@ -245,6 +247,7 @@ mod tests {
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
                 checkpoints: InMemoryCheckpointStore::new(),
+                events: InMemoryEventRepository::new(),
             }
         }
 
@@ -276,12 +279,14 @@ mod tests {
                     messages,
                     turn_usage: usage(100, 50),
                     agent_state_snapshot: state_snapshot,
+                    events: Vec::new(),
                     now: at,
                 },
                 &self.threads,
                 &self.messages,
                 &self.attempts,
                 &self.checkpoints,
+                &self.events,
             )
             .await
         }

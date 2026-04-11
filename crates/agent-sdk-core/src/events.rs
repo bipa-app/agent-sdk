@@ -232,6 +232,21 @@ impl AgentEvent {
     }
 
     #[must_use]
+    pub fn tool_requires_confirmation(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+        description: impl Into<String>,
+    ) -> Self {
+        Self::ToolRequiresConfirmation {
+            id: id.into(),
+            name: name.into(),
+            input,
+            description: description.into(),
+        }
+    }
+
+    #[must_use]
     pub const fn done(
         thread_id: ThreadId,
         total_turns: usize,

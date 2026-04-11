@@ -48,11 +48,14 @@
 
 use std::future::Future;
 
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{PendingToolCallInfo, ThreadId, ToolResult};
 use anyhow::{Context, bail, ensure};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
+use crate::journal::committed_event::CommittedEvent;
+use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 use crate::journal::task_state::TaskState;
@@ -201,6 +204,8 @@ pub enum ToolTaskOutcome {
         child: AgentTask,
         parent: Option<AgentTask>,
         result: ToolResult,
+        /// `ToolCallEnd` event committed after the state transition.
+        committed_events: Vec<CommittedEvent>,
     },
     /// Tool execution failed. The child task is now `Failed` and the
     /// parent's `pending_child_count` has been recomputed.
@@ -208,6 +213,8 @@ pub enum ToolTaskOutcome {
         child: AgentTask,
         parent: Option<AgentTask>,
         error: String,
+        /// `ToolCallEnd` event committed after the state transition.
+        committed_events: Vec<CommittedEvent>,
     },
     /// The worker was cancelled before the executor ran. The child
     /// task was **not** driven to a terminal state.
@@ -242,6 +249,7 @@ pub enum ToolTaskOutcome {
 pub async fn execute_tool_task<F, Fut>(
     bootstrap: ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
+    event_repo: &dyn EventRepository,
     cancel: &CancellationToken,
     executor: F,
     now: OffsetDateTime,
@@ -283,10 +291,23 @@ where
                 .await
                 .with_context(|| format!("complete_task_with_result failed for child {task_id}"))?;
 
+            // Commit ToolCallEnd event after state transition.
+            let end_event = AgentEvent::tool_call_end(
+                &bootstrap.tool_call.id,
+                &bootstrap.tool_call.name,
+                &bootstrap.tool_call.display_name,
+                result.clone(),
+            );
+            let committed = event_repo
+                .commit_event(&bootstrap.thread_id, end_event, now)
+                .await
+                .context("commit ToolCallEnd event")?;
+
             Ok(ToolTaskOutcome::Completed {
                 child,
                 parent,
                 result,
+                committed_events: vec![committed],
             })
         }
         Err(err) => {
@@ -296,10 +317,30 @@ where
                 .await
                 .with_context(|| format!("fail_task failed for child {task_id}"))?;
 
+            // Commit ToolCallEnd event with error result.
+            let error_result = ToolResult {
+                success: false,
+                output: error_msg.clone(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            };
+            let end_event = AgentEvent::tool_call_end(
+                &bootstrap.tool_call.id,
+                &bootstrap.tool_call.name,
+                &bootstrap.tool_call.display_name,
+                error_result,
+            );
+            let committed = event_repo
+                .commit_event(&bootstrap.thread_id, end_event, now)
+                .await
+                .context("commit ToolCallEnd event on failure")?;
+
             Ok(ToolTaskOutcome::Failed {
                 child,
                 parent,
                 error: error_msg,
+                committed_events: vec![committed],
             })
         }
     }
