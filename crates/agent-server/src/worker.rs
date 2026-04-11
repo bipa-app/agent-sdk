@@ -47,6 +47,15 @@
 //! entry point for journal-driven parent resume after all child
 //! tool tasks reach terminal states.
 //!
+//! # Durable subagent spawn contract (Phase 7.1)
+//!
+//! [`resolve_subagent_spec`] is the server-authoritative entry point
+//! for durable subagent spawn resolution. It takes a typed
+//! [`SubagentSpawnRequest`], narrows it through inherited parent
+//! constraints plus a [`SubagentSpawnPolicy`], and returns exactly one
+//! [`EffectiveSubagentSpec`] that later phases can use when creating
+//! child threads and invocation tasks.
+//!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
 //! ```ignore
@@ -78,6 +87,7 @@ pub mod confirmation;
 pub mod definition;
 pub mod registry;
 pub mod root_turn;
+pub mod subagent;
 pub mod tool_task;
 
 #[cfg(test)]
@@ -97,6 +107,8 @@ mod replay_coverage_test;
 #[cfg(test)]
 mod root_turn_test;
 #[cfg(test)]
+mod subagent_test;
+#[cfg(test)]
 mod tool_task_test;
 
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
@@ -105,6 +117,11 @@ pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
     RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn, execute_root_turn,
     fail_root_turn, resume_from_children, resume_root_turn,
+};
+pub use subagent::{
+    EffectiveSubagentCapabilities, EffectiveSubagentSpec, InheritedSubagentConstraints,
+    ServerSubagentSpawnPolicy, SubagentCapabilityProfile, SubagentCapabilityRequest,
+    SubagentSpawnPolicy, SubagentSpawnRequest, resolve_subagent_spec,
 };
 pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,
