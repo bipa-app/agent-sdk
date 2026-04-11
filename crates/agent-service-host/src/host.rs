@@ -143,6 +143,15 @@ impl ServiceHost {
             "service host starting",
         );
 
+        // Register signal handlers before spawning any tasks so that a
+        // registration failure (e.g. EMFILE) never leaves an orphaned
+        // sweep task running indefinitely.
+        #[cfg(unix)]
+        let mut sigterm = {
+            use tokio::signal::unix::{SignalKind, signal};
+            signal(SignalKind::terminate()).context("registering SIGTERM handler")?
+        };
+
         let sweep_handle = tokio::spawn(lease_sweep_loop(
             self.stores.clone(),
             self.config.worker.sweep_interval(),
@@ -152,10 +161,6 @@ impl ServiceHost {
         // Wait for shutdown signal or token cancellation.
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm =
-                signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
-
             tokio::select! {
                 () = self.shutdown.cancelled() => {
                     info!("shutdown token cancelled");

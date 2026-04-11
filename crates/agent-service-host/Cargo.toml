@@ -18,7 +18,6 @@ agent-server.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 tokio-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true
 tracing = "0.1"
@@ -26,7 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
