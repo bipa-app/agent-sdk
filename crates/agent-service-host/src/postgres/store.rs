@@ -2756,27 +2756,29 @@ impl EventRepository for PostgresDurableStore {
     }
 
     async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
-        let row: (i64,) = sqlx::query_as(
-            r"SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_sdk_committed_events WHERE thread_id = $1",
+        let record = sqlx::query!(
+            r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = $1",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_one(&self.pool)
         .await
         .with_context(|| format!("next event sequence for {thread_id}"))?;
 
-        u64::try_from(row.0).context("event next_sequence out of range")
+        let next = record.next_seq.unwrap_or(0);
+        u64::try_from(next).context("event next_sequence out of range")
     }
 
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
-        let records: Vec<CommittedEventRecord> = sqlx::query_as(
+        let records = sqlx::query_as!(
+            CommittedEventRecord,
             r"
 SELECT event_id, thread_id, sequence, event_json, committed_at
 FROM agent_sdk_committed_events
 WHERE thread_id = $1
 ORDER BY sequence
 ",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("get events for {thread_id}"))?;
@@ -2790,7 +2792,8 @@ ORDER BY sequence
         after_sequence: u64,
         up_to_sequence: u64,
     ) -> Result<Vec<CommittedEvent>> {
-        let records: Vec<CommittedEventRecord> = sqlx::query_as(
+        let records = sqlx::query_as!(
+            CommittedEventRecord,
             r"
 SELECT event_id, thread_id, sequence, event_json, committed_at
 FROM agent_sdk_committed_events
@@ -2799,10 +2802,10 @@ WHERE thread_id = $1
   AND sequence <= $3
 ORDER BY sequence
 ",
+            thread_key(thread_id),
+            i64_from_u64(after_sequence, "after_sequence")?,
+            i64_from_u64(up_to_sequence, "up_to_sequence")?,
         )
-        .bind(thread_key(thread_id))
-        .bind(i64_from_u64(after_sequence, "after_sequence")?)
-        .bind(i64_from_u64(up_to_sequence, "up_to_sequence")?)
         .fetch_all(&self.pool)
         .await
         .with_context(|| {
@@ -2826,23 +2829,24 @@ impl PostgresDurableStore {
         thread_id: &ThreadId,
     ) -> Result<u64> {
         // Lock the thread row to serialise concurrent event writers.
-        sqlx::query(r"SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
-            .bind(thread_key(thread_id))
-            .fetch_optional(&mut **tx)
-            .await
-            .with_context(|| {
-                format!("lock thread row for event sequence allocation on {thread_id}")
-            })?;
-
-        let row: (i64,) = sqlx::query_as(
-            r"SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_sdk_committed_events WHERE thread_id = $1",
+        sqlx::query!(
+            r"SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("lock thread row for event sequence allocation on {thread_id}"))?;
+
+        let record = sqlx::query!(
+            r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
 
-        u64::try_from(row.0).context("event next_sequence (tx) out of range")
+        let next = record.next_seq.unwrap_or(0);
+        u64::try_from(next).context("event next_sequence (tx) out of range")
     }
 
     /// Insert committed events into an existing transaction.
@@ -2859,17 +2863,17 @@ impl PostgresDurableStore {
             let event_id = uuid::Uuid::now_v7();
             let event_json = json_to_value(&event, "committed event batch payload")?;
 
-            sqlx::query(
+            sqlx::query!(
                 r"
 INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
 VALUES ($1, $2, $3, $4, $5)
 ",
+                event_id.to_string(),
+                thread_key(thread_id),
+                i64_from_u64(seq, "event batch sequence")?,
+                event_json,
+                now,
             )
-            .bind(event_id.to_string())
-            .bind(thread_key(thread_id))
-            .bind(i64_from_u64(seq, "event batch sequence")?)
-            .bind(&event_json)
-            .bind(now)
             .execute(&mut **tx)
             .await
             .with_context(|| format!("insert committed event seq {seq} for {thread_id}"))?;
@@ -2897,21 +2901,21 @@ VALUES ($1, $2, $3, $4, $5)
             let id = OutboxRowId::new();
             let payload_json = json_to_value(&event.to_envelope(), "outbox relay payload")?;
 
-            sqlx::query(
+            sqlx::query!(
                 r"
 INSERT INTO agent_sdk_outbox
     (id, thread_id, event_id, sequence, status, payload_json, created_at,
      next_attempt_at, attempt_count, max_attempts)
 VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 ",
+                id.as_str(),
+                thread_key(&event.thread_id),
+                event.event_id.to_string(),
+                i64_from_u64(event.sequence, "outbox sequence")?,
+                payload_json,
+                now,
+                i64::from(max_attempts),
             )
-            .bind(id.as_str())
-            .bind(thread_key(&event.thread_id))
-            .bind(event.event_id.to_string())
-            .bind(i64_from_u64(event.sequence, "outbox sequence")?)
-            .bind(&payload_json)
-            .bind(now)
-            .bind(i64::from(max_attempts))
             .execute(&mut **tx)
             .await
             .with_context(|| format!("insert outbox row for event seq {}", event.sequence))?;
@@ -2996,21 +3000,21 @@ impl OutboxStore for PostgresDurableStore {
 
         for params in rows {
             let id = OutboxRowId::new();
-            sqlx::query(
+            sqlx::query!(
                 r"
 INSERT INTO agent_sdk_outbox
     (id, thread_id, event_id, sequence, status, payload_json, created_at,
      next_attempt_at, attempt_count, max_attempts)
 VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 ",
+                id.as_str(),
+                thread_key(&params.thread_id),
+                params.event_id.to_string(),
+                i64_from_u64(params.sequence, "outbox sequence")?,
+                params.payload_json,
+                params.now,
+                i64::from(params.max_attempts),
             )
-            .bind(id.as_str())
-            .bind(thread_key(&params.thread_id))
-            .bind(params.event_id.to_string())
-            .bind(i64_from_u64(params.sequence, "outbox sequence")?)
-            .bind(&params.payload_json)
-            .bind(params.now)
-            .bind(i64::from(params.max_attempts))
             .execute(&mut *tx)
             .await
             .with_context(|| format!("insert outbox row {id}"))?;
@@ -3044,7 +3048,8 @@ VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
         limit: u32,
         now: OffsetDateTime,
     ) -> Result<Vec<OutboxRow>> {
-        let records: Vec<OutboxRecord> = sqlx::query_as(
+        let records = sqlx::query_as!(
+            OutboxRecord,
             r"
 UPDATE agent_sdk_outbox
 SET status = 'claimed', claimed_by = $1, claimed_at = $2
@@ -3059,10 +3064,10 @@ RETURNING id, thread_id, event_id, sequence, status, payload_json,
           created_at, next_attempt_at, attempt_count, max_attempts,
           last_error, claimed_by, claimed_at, delivered_at
 ",
+            worker_id,
+            now,
+            i64::from(limit),
         )
-        .bind(worker_id)
-        .bind(now)
-        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .context("claim pending outbox rows")?;
@@ -3071,15 +3076,15 @@ RETURNING id, thread_id, event_id, sequence, status, payload_json,
     }
 
     async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET status = 'delivered', delivered_at = $2
 WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
 ",
+            id.as_str(),
+            now,
         )
-        .bind(id.as_str())
-        .bind(now)
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} delivered"))?;
@@ -3096,7 +3101,7 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
     ) -> Result<()> {
         // last_error must be NULL for pending rows per the
         // agent_sdk_outbox_error_check constraint.
-        sqlx::query(
+        sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET
@@ -3123,10 +3128,10 @@ SET
     END
 WHERE id = $1 AND status NOT IN ('delivered', 'expired')
 ",
+            id.as_str(),
+            error,
+            next_attempt_at,
         )
-        .bind(id.as_str())
-        .bind(error)
-        .bind(next_attempt_at)
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
@@ -3135,7 +3140,8 @@ WHERE id = $1 AND status NOT IN ('delivered', 'expired')
     }
 
     async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>> {
-        let record: Option<OutboxRecord> = sqlx::query_as(
+        let record = sqlx::query_as!(
+            OutboxRecord,
             r"
 SELECT id, thread_id, event_id, sequence, status, payload_json,
        created_at, next_attempt_at, attempt_count, max_attempts,
@@ -3143,8 +3149,8 @@ SELECT id, thread_id, event_id, sequence, status, payload_json,
 FROM agent_sdk_outbox
 WHERE id = $1
 ",
+            id.as_str(),
         )
-        .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await
         .with_context(|| format!("get outbox row {id}"))?;
@@ -3153,7 +3159,8 @@ WHERE id = $1
     }
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<OutboxRow>> {
-        let records: Vec<OutboxRecord> = sqlx::query_as(
+        let records = sqlx::query_as!(
+            OutboxRecord,
             r"
 SELECT id, thread_id, event_id, sequence, status, payload_json,
        created_at, next_attempt_at, attempt_count, max_attempts,
@@ -3162,8 +3169,8 @@ FROM agent_sdk_outbox
 WHERE thread_id = $1
 ORDER BY sequence
 ",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("list outbox rows for {thread_id}"))?;
@@ -3172,15 +3179,16 @@ ORDER BY sequence
     }
 
     async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
-        let row: (i64,) = sqlx::query_as(
-            r"SELECT COUNT(*) FROM agent_sdk_outbox WHERE thread_id = $1 AND status IN ('pending', 'claimed')",
+        let record = sqlx::query!(
+            r"SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = $1 AND status IN ('pending', 'claimed')",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_one(&self.pool)
         .await
         .with_context(|| format!("count pending outbox rows for {thread_id}"))?;
 
-        u64::try_from(row.0).context("outbox pending count out of range")
+        let count = record.cnt.unwrap_or(0);
+        u64::try_from(count).context("outbox pending count out of range")
     }
 }
 
@@ -3191,14 +3199,15 @@ ORDER BY sequence
 #[async_trait]
 impl RetentionStore for PostgresDurableStore {
     async fn get_cursor(&self, thread_id: &ThreadId) -> Result<Option<RetentionCursor>> {
-        let record: Option<RetentionCursorRecord> = sqlx::query_as(
+        let record = sqlx::query_as!(
+            RetentionCursorRecord,
             r"
 SELECT thread_id, retention_floor, updated_at
 FROM agent_sdk_retention_cursors
 WHERE thread_id = $1
 ",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_optional(&self.pool)
         .await
         .with_context(|| format!("get retention cursor for {thread_id}"))?;
@@ -3218,22 +3227,23 @@ WHERE thread_id = $1
         // Read the current floor under a row lock so we can reject
         // backward moves with a clear error, matching the in-memory
         // implementation's contract.
-        let current: Option<(i64,)> = sqlx::query_as(
+        let current = sqlx::query!(
             r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1 FOR UPDATE",
+            thread_key(thread_id),
         )
-        .bind(thread_key(thread_id))
         .fetch_optional(&mut *tx)
         .await
         .with_context(|| format!("read retention floor for {thread_id}"))?;
 
-        if let Some((current_floor,)) = current {
+        if let Some(row) = current {
             ensure!(
-                new_floor_i64 >= current_floor,
-                "retention floor can only advance: current {current_floor}, requested {new_floor}",
+                new_floor_i64 >= row.retention_floor,
+                "retention floor can only advance: current {}, requested {new_floor}",
+                row.retention_floor,
             );
         }
 
-        sqlx::query(
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at)
 VALUES ($1, $2, $3)
@@ -3241,19 +3251,19 @@ ON CONFLICT (thread_id) DO UPDATE
 SET retention_floor = EXCLUDED.retention_floor,
     updated_at = EXCLUDED.updated_at
 ",
+            thread_key(thread_id),
+            new_floor_i64,
+            now,
         )
-        .bind(thread_key(thread_id))
-        .bind(new_floor_i64)
-        .bind(now)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("advance retention floor for {thread_id}"))?;
 
-        sqlx::query(
+        sqlx::query!(
             r"DELETE FROM agent_sdk_committed_events WHERE thread_id = $1 AND sequence < $2",
+            thread_key(thread_id),
+            new_floor_i64,
         )
-        .bind(thread_key(thread_id))
-        .bind(i64_from_u64(new_floor, "retention floor delete")?)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("purge events below floor {new_floor} for {thread_id}"))?;

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retention_floor",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c0d400d877fb00d2c5d19fcb2ff1a7438146a12ee577680ef8475002d3d7a0c3"
+}

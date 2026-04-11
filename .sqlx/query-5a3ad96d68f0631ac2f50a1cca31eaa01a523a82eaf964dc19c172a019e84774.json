@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at)\nVALUES ($1, $2, $3)\nON CONFLICT (thread_id) DO UPDATE\nSET retention_floor = EXCLUDED.retention_floor,\n    updated_at = EXCLUDED.updated_at\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5a3ad96d68f0631ac2f50a1cca31eaa01a523a82eaf964dc19c172a019e84774"
+}

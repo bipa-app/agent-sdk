@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM agent_sdk_committed_events WHERE thread_id = $1 AND sequence < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e784cdbcdb9b05fd22cf2247a4a109838af03ce81dd7d9ae1222cabc28f9b2f7"
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_outbox\n    (id, thread_id, event_id, sequence, status, payload_json, created_at,\n     next_attempt_at, attempt_count, max_attempts)\nVALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c12c7f07de6127e59af23686e4e59da5a3a69e68632a27f16287e818a269980c"
+}
