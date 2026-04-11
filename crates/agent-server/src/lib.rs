@@ -142,6 +142,10 @@ pub use journal::{CommittedEvent, EventRepository, InMemoryEventRepository};
 // Phase 6.3: replay API and race-free replay-to-live handoff.
 pub use journal::{EventNotifier, EventReceiver, EventStream, StreamEvent, stream_events};
 
+// Phase 6.4: live tail hub with per-subscriber bounded buffers,
+// lag detection, and replay-required disconnect.
+pub use journal::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
+
 // ── Re-exports that validate the dependency edges ────────────────────
 //
 // Each `use` below proves that the corresponding narrow crate is
