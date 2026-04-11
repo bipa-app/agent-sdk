@@ -13,6 +13,7 @@
 //! - Parent recompute: rejected confirmation decrements parent count.
 
 use super::confirmation::{
+    CONFIRMATION_POLICY_DENIED_PREFIX, CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX,
     ConfirmationDecision, ConfirmationDecisionOutcome, ConfirmationPolicy,
     ConfirmationResumeOutcome, PolicyVerdict, apply_confirmation_decision,
     pause_tool_for_confirmation, resume_confirmed_tool,
@@ -546,6 +547,15 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
 
     assert_eq!(child.status, TaskStatus::Failed);
     assert!(
+        child
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with(CONFIRMATION_POLICY_DENIED_PREFIX),
+        "error should have policy-denied prefix: {:?}",
+        child.last_error
+    );
+    assert!(
         reason.contains("tool disabled"),
         "reason should mention policy: {reason}"
     );
@@ -607,7 +617,7 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
             .last_error
             .as_deref()
             .unwrap_or("")
-            .starts_with("confirmation_rejected:"),
+            .starts_with(CONFIRMATION_REJECTED_PREFIX),
         "error should have rejection prefix: {:?}",
         child.last_error
     );
@@ -663,7 +673,7 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
             .last_error
             .as_deref()
             .unwrap_or("")
-            .starts_with("confirmation_timeout:"),
+            .starts_with(CONFIRMATION_TIMEOUT_PREFIX),
         "error should have timeout prefix: {:?}",
         child.last_error
     );

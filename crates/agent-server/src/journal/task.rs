@@ -1224,18 +1224,19 @@ impl AgentTask {
     pub fn resume_from_confirmation(
         mut self,
         now: OffsetDateTime,
-    ) -> Result<Self, TaskSchemaError> {
+    ) -> Result<(Self, Option<ListenExecutionContext>), TaskSchemaError> {
         if self.status != TaskStatus::AwaitingConfirmation {
             return Err(TaskSchemaError::InvalidTransition {
                 from: self.status,
                 to: TaskStatus::Pending,
             });
         }
+        let prepared_operation = self.state.prepared_operation().cloned();
         self.status = TaskStatus::Pending;
         self.state = TaskState::None;
         self.updated_at = now;
         self.validate()?;
-        Ok(self)
+        Ok((self, prepared_operation))
     }
 
     /// Mark the task [`TaskStatus::Completed`].
@@ -2089,7 +2090,7 @@ mod tests {
         let awaiting = running
             .await_confirmation(sample_continuation(), None, t_plus(2))
             .context("await")?;
-        let resumed = awaiting
+        let (resumed, _prepared) = awaiting
             .resume_from_confirmation(t_plus(3))
             .context("resume")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
