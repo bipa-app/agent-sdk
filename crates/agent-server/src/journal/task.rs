@@ -1084,19 +1084,23 @@ impl AgentTask {
                 to: TaskStatus::Running,
             });
         }
-        let next_attempt = self.attempt.saturating_add(1);
-        if next_attempt > self.max_attempts {
-            return Err(TaskSchemaError::AttemptExceedsMax {
-                attempt: next_attempt,
-                max: self.max_attempts,
-            });
+        // ReadyToResume is a continuation after child completion, not a
+        // new attempt — don't consume the retry budget on resume.
+        if !matches!(self.state, TaskState::ReadyToResume { .. }) {
+            let next_attempt = self.attempt.saturating_add(1);
+            if next_attempt > self.max_attempts {
+                return Err(TaskSchemaError::AttemptExceedsMax {
+                    attempt: next_attempt,
+                    max: self.max_attempts,
+                });
+            }
+            self.attempt = next_attempt;
         }
         self.status = TaskStatus::Running;
         self.worker_id = Some(worker);
         self.lease_id = Some(lease);
         self.lease_expires_at = Some(expires_at);
         self.last_heartbeat_at = Some(now);
-        self.attempt = next_attempt;
         self.updated_at = now;
         self.validate()?;
         Ok(self)
@@ -2725,6 +2729,82 @@ mod tests {
                 to: TaskStatus::Failed,
             }
         );
+        Ok(())
+    }
+
+    // ── Regression: ReadyToResume must not burn retry budget ─────────
+
+    #[test]
+    fn mark_running_does_not_increment_attempt_for_ready_to_resume() -> Result<()> {
+        // With DEFAULT_MAX_ATTEMPTS=1, the full child-spawn → resume
+        // lifecycle must work without exhausting the retry budget.
+        // Before the fix, mark_running would increment attempt to 2,
+        // exceeding max_attempts=1 and producing AttemptExceedsMax.
+        let root = AgentTask::new_root_turn(thread(), t0(), 1);
+        assert_eq!(root.attempt, 0);
+        assert_eq!(root.max_attempts, 1);
+
+        let running = root.mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+        assert_eq!(running.attempt, 1, "initial acquire must increment");
+
+        let waiting = running.wait_on_children(
+            1,
+            SuspensionPayload {
+                continuation: sample_continuation(),
+                suspended_messages: Vec::new(),
+            },
+            Vec::new(),
+            t_plus(2),
+        )?;
+        assert_eq!(waiting.attempt, 1);
+
+        let resumable = waiting.recompute_pending_children(0, t_plus(3))?;
+        assert_eq!(resumable.status, TaskStatus::Pending);
+        assert!(matches!(resumable.state, TaskState::ReadyToResume { .. }));
+        assert_eq!(resumable.attempt, 1);
+
+        // This is the critical assertion: re-acquire must succeed
+        // with max_attempts=1 because ReadyToResume is a continuation.
+        let reacquired = resumable.mark_running(
+            WorkerId::from_string("w2"),
+            LeaseId::from_string("l2"),
+            t_plus(90),
+            t_plus(4),
+        )?;
+        assert_eq!(reacquired.status, TaskStatus::Running);
+        assert!(matches!(reacquired.state, TaskState::ReadyToResume { .. }));
+        assert_eq!(reacquired.attempt, 1, "resume must not increment attempt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_running_still_increments_attempt_for_non_resume_tasks() -> Result<()> {
+        // Normal retry path: mark_running → release_lease → mark_running
+        // must still increment the attempt counter.
+        let root = AgentTask::new_root_turn(thread(), t0(), 3);
+        let running = root.mark_running(
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+        assert_eq!(running.attempt, 1);
+
+        let released = running.release_lease(t_plus(2))?;
+        let retried = released.mark_running(
+            WorkerId::from_string("w2"),
+            LeaseId::from_string("l2"),
+            t_plus(120),
+            t_plus(3),
+        )?;
+        assert_eq!(retried.attempt, 2, "normal retry must increment attempt");
+
         Ok(())
     }
 }

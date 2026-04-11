@@ -43,8 +43,10 @@
 //!
 //! | Context          | Status / kind                                     | Budget    | Prepared op | Action                                                   |
 //! |------------------|---------------------------------------------------|-----------|-------------|----------------------------------------------------------|
+//! | Acquisition      | `Pending`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget ok                              | ok        | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `RetryBudgetExhausted`    |
+//! | `ExpiredLease`   | `Running`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::Requeue`]                              |
 //! | `ExpiredLease`   | `Running`, budget ok                              | ok        | n/a         | [`RecoveryAction::Requeue`]                              |
 //! | `ExpiredLease`   | `Running`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `LeaseExpiredBudgetExhausted` |
 //! | Any              | `tool_runtime` `AwaitingConfirmation` w/ prep op  | any       | Some        | [`RecoveryAction::FailClosed`] `UnsafePreparedOperationRecovery` |
@@ -90,6 +92,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
+use super::task_state::TaskState;
 
 /// Canonical fail-closed reasons written on Phase 2.5 recovery
 /// transitions.
@@ -287,8 +290,14 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // waiting, running, terminal) silently classifies as
         // NoAction — the acquisition path will see `None` via the
         // existing CAS check regardless.
+        //
+        // `ReadyToResume` is a continuation after child completion,
+        // not a retry — the task's attempt counter was not incremented
+        // for the resume, so budget-exhaustion does not apply.
         (RecoveryContext::AcquisitionAttempt, TaskStatus::Pending) => {
-            if task.is_budget_exhausted() {
+            if matches!(task.state, TaskState::ReadyToResume { .. }) {
+                RecoveryAction::NoAction
+            } else if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::RetryBudgetExhausted)
             } else {
                 RecoveryAction::NoAction
@@ -300,8 +309,14 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // [`crate::journal::store::Inner::register_runnable_lease_indexes`]
         // from `Running` transitions. Anything else is a bookkeeping bug
         // and the store surfaces it as an error, not a recovery decision.
+        //
+        // A `ReadyToResume` task whose worker crashed is still a valid
+        // continuation — requeue it so another worker can resume the
+        // turn regardless of the attempt counter.
         (RecoveryContext::ExpiredLease, TaskStatus::Running) => {
-            if task.is_budget_exhausted() {
+            if matches!(task.state, TaskState::ReadyToResume { .. }) {
+                RecoveryAction::Requeue
+            } else if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted)
             } else {
                 RecoveryAction::Requeue
@@ -701,6 +716,89 @@ mod tests {
         assert_eq!(
             classify_recovery(&awaiting, RecoveryContext::AcquisitionAttempt),
             RecoveryAction::NoAction,
+        );
+        Ok(())
+    }
+
+    // ── Regression: ReadyToResume bypasses budget exhaustion ──────
+
+    /// Drive a fresh root through child-spawn → resume with the given
+    /// budget so the row reaches `Pending + ReadyToResume + attempt=1`.
+    fn ready_to_resume_root(budget: u32) -> Result<AgentTask> {
+        let root = fresh_root(budget);
+        let running = root.mark_running(
+            WorkerId::from_string("w-resume"),
+            LeaseId::from_string("l-resume"),
+            t_plus(60),
+            t_plus(1),
+        )?;
+        let waiting = running.wait_on_children(
+            1,
+            SuspensionPayload {
+                continuation: sample_continuation(),
+                suspended_messages: Vec::new(),
+            },
+            Vec::new(),
+            t_plus(2),
+        )?;
+        waiting
+            .recompute_pending_children(0, t_plus(3))
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn ready_to_resume_with_exhausted_budget_classifies_as_no_action() -> Result<()> {
+        // A ReadyToResume task with max_attempts=1 has attempt==1 after
+        // its initial run. The recovery matrix must treat it as a
+        // continuation (NoAction), not a retry with exhausted budget.
+        let task = ready_to_resume_root(1)?;
+        assert_eq!(task.attempt, 1);
+        assert_eq!(task.max_attempts, 1);
+        assert!(task.is_budget_exhausted());
+        assert!(matches!(task.state, TaskState::ReadyToResume { .. }));
+
+        assert_eq!(
+            classify_recovery(&task, RecoveryContext::AcquisitionAttempt),
+            RecoveryAction::NoAction,
+            "ReadyToResume must bypass budget exhaustion at acquisition"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_to_resume_running_with_exhausted_budget_requeues_on_expired_lease() -> Result<()> {
+        // A ReadyToResume task that has been re-acquired and then its
+        // worker crashes must be requeued, not failed closed.
+        let pending = ready_to_resume_root(1)?;
+        let running = pending.mark_running(
+            WorkerId::from_string("w-crash"),
+            LeaseId::from_string("l-crash"),
+            t_plus(120),
+            t_plus(4),
+        )?;
+        assert_eq!(running.attempt, 1);
+        assert!(running.is_budget_exhausted());
+        assert!(matches!(running.state, TaskState::ReadyToResume { .. }));
+
+        assert_eq!(
+            classify_recovery(&running, RecoveryContext::ExpiredLease),
+            RecoveryAction::Requeue,
+            "ReadyToResume must requeue even when budget is exhausted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_resume_pending_with_exhausted_budget_still_fails_closed() -> Result<()> {
+        // Sanity: a normal Pending task (not ReadyToResume) with an
+        // exhausted budget must still fail closed.
+        let exhausted = root_in_status(TaskStatus::Pending, 2, 2)?;
+        assert!(exhausted.is_budget_exhausted());
+        assert!(matches!(exhausted.state, TaskState::None));
+
+        assert_eq!(
+            classify_recovery(&exhausted, RecoveryContext::AcquisitionAttempt),
+            RecoveryAction::FailClosed(FailureReason::RetryBudgetExhausted),
         );
         Ok(())
     }

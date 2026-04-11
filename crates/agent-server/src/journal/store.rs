@@ -6797,9 +6797,10 @@ mod tests {
             .context("resumed parent found")?;
         assert_eq!(resumed.id, parent_id);
         assert_eq!(resumed.status, TaskStatus::Running);
-        // The resumed parent is on its second attempt — the first
-        // claim consumed attempt 1 and this scan consumed attempt 2.
-        assert_eq!(resumed.attempt, 2);
+        // The resumed parent is still on attempt 1 — the ReadyToResume
+        // re-acquisition is a continuation, not a retry, so the attempt
+        // counter is not incremented.
+        assert_eq!(resumed.attempt, 1);
         Ok(())
     }
 
