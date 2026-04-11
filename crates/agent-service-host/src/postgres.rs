@@ -84,6 +84,24 @@ mod tests {
     }
 
     #[test]
+    fn executable_migration_bundle_avoids_duplicate_unique_backing_indexes() -> Result<()> {
+        let sql_bundle = durable_core_migrations()
+            .iter()
+            .map(|migration| migration.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ensure!(
+            !sql_bundle.contains("agent_sdk_message_commits_by_thread_turn_idx"),
+            "message commits should rely on the primary-key backing index",
+        );
+        ensure!(
+            !sql_bundle.contains("agent_sdk_turn_attempts_by_task_attempt_idx"),
+            "turn attempts should rely on the unique-constraint backing index",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repository_contracts_cover_the_current_durable_core_traits() -> Result<()> {
         let actual = repository_boundaries()
             .iter()

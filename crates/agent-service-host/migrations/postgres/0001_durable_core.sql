@@ -58,6 +58,8 @@ CREATE TABLE agent_sdk_tasks (
                 AND root_id <> id
             )
         ),
+    CONSTRAINT agent_sdk_tasks_depth_kind_check
+        CHECK (depth > 0 OR kind = 'root_turn'),
     CONSTRAINT agent_sdk_tasks_depth_non_negative_check
         CHECK (depth >= 0),
     CONSTRAINT agent_sdk_tasks_attempt_bounds_check
@@ -220,6 +222,12 @@ CREATE INDEX agent_sdk_threads_active_idx
     ON agent_sdk_threads (thread_id)
     WHERE status = 'active';
 
+ALTER TABLE agent_sdk_tasks
+    ADD CONSTRAINT agent_sdk_tasks_thread_fk
+    FOREIGN KEY (thread_id) REFERENCES agent_sdk_threads(thread_id)
+    ON DELETE RESTRICT
+    DEFERRABLE INITIALLY IMMEDIATE;
+
 -- Mutable per-thread message projection.
 -- `commit_completed_turn` / `commit_messages` creates or advances this
 -- row when a turn commits successfully, and SDK compaction later
@@ -348,9 +356,6 @@ CREATE TABLE agent_sdk_turn_attempts (
             )
         )
 );
-
-CREATE INDEX agent_sdk_turn_attempts_by_task_attempt_idx
-    ON agent_sdk_turn_attempts (task_id, attempt_number);
 
 CREATE TABLE agent_sdk_turn_checkpoints (
     id TEXT PRIMARY KEY,

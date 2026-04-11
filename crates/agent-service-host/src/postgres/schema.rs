@@ -82,7 +82,7 @@ const AGENT_SDK_TASK_COLUMNS: &[ColumnContract] = &[
         name: "thread_id",
         sql_type: "TEXT",
         nullable: false,
-        notes: "Every task is thread-bound so queueing and recovery stay local.",
+        notes: "Every task is thread-bound so queueing and recovery stay local, and the row must reference an existing thread.",
     },
     ColumnContract {
         name: "worker_id",
@@ -192,8 +192,16 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
         invariant: "Depth / parent_id / root_id agree with root-vs-child identity.",
     },
     ConstraintContract {
+        name: "agent_sdk_tasks_depth_kind_check",
+        invariant: "Depth-0 rows must be `root_turn` tasks.",
+    },
+    ConstraintContract {
         name: "agent_sdk_tasks_depth_non_negative_check",
         invariant: "Depth cannot go negative.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tasks_thread_fk",
+        invariant: "Every task belongs to an existing thread row.",
     },
     ConstraintContract {
         name: "agent_sdk_tasks_attempt_bounds_check",
@@ -616,12 +624,7 @@ const AGENT_SDK_TURN_ATTEMPT_CONSTRAINTS: &[ConstraintContract] = &[
     },
 ];
 
-const AGENT_SDK_TURN_ATTEMPT_INDEXES: &[IndexContract] = &[IndexContract {
-    name: "agent_sdk_turn_attempts_by_task_attempt_idx",
-    key_columns: "(task_id, attempt_number)",
-    predicate: None,
-    purpose: "Powers `list_by_task` in durable attempt order.",
-}];
+const AGENT_SDK_TURN_ATTEMPT_INDEXES: &[IndexContract] = &[];
 
 const AGENT_SDK_TURN_CHECKPOINT_COLUMNS: &[ColumnContract] = &[
     ColumnContract {
