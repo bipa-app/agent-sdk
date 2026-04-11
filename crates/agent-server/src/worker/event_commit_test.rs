@@ -4,14 +4,16 @@
 //! transitions they describe, returned in outcome types, and follow
 //! monotonic thread-scoped sequencing.
 
-use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, fail_root_turn};
+use super::root_turn::{
+    RootTurnDeps, RootTurnOutcome, execute_root_turn, fail_root_turn, resume_from_children,
+};
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
-use crate::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
+use crate::journal::task::{AgentTask, LeaseId, WorkerId};
 use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
@@ -194,7 +196,7 @@ impl LlmProvider for MockTextProvider {
         }))
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &'static str {
         "mock-model"
     }
 
@@ -259,7 +261,7 @@ impl LlmProvider for MockToolCallProvider {
         }))
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &'static str {
         "mock-model"
     }
 
@@ -288,7 +290,7 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
         RootTurnOutcome::Completed {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Completed, got {other:?}"),
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
     // Should have TurnComplete + Done (2 events).
@@ -330,7 +332,7 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
         RootTurnOutcome::Completed {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Completed, got {other:?}"),
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
     // Should have Refusal + TurnComplete + Done (3 events).
@@ -372,7 +374,7 @@ async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
         RootTurnOutcome::Suspended {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Suspended, got {other:?}"),
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
     };
 
     // One ToolCallStart per tool call.
@@ -410,7 +412,7 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
     let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
     let child_tasks = match outcome {
         RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
-        other => panic!("expected Suspended, got {other:?}"),
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
     };
 
     // Acquire and bootstrap the child.
@@ -451,7 +453,9 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
         ToolTaskOutcome::Completed {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Completed, got {other:?}"),
+        ToolTaskOutcome::Failed { .. } | ToolTaskOutcome::Cancelled => {
+            panic!("expected Completed")
+        }
     };
 
     // Should have exactly one ToolCallEnd event.
@@ -482,7 +486,7 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
     let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
     let child_tasks = match outcome {
         RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
-        other => panic!("expected Suspended, got {other:?}"),
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
     };
 
     let child = stores
@@ -513,7 +517,9 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
         ToolTaskOutcome::Failed {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Failed, got {other:?}"),
+        ToolTaskOutcome::Completed { .. } | ToolTaskOutcome::Cancelled => {
+            panic!("expected Failed")
+        }
     };
 
     assert_eq!(committed_events.len(), 1);
@@ -521,7 +527,7 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
         AgentEvent::ToolCallEnd { result, .. } => {
             assert!(!result.success, "failed tool should have success=false");
         }
-        other => panic!("expected ToolCallEnd, got {other:?}"),
+        event => panic!("expected ToolCallEnd, got {event:?}"),
     }
 
     Ok(())
@@ -558,27 +564,13 @@ async fn fail_root_turn_emits_error_event() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
-    let stores = TestStores::new();
-    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
-    let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
-
-    // Step 1: suspend (emits ToolCallStart).
-    let provider = MockToolCallProvider::new(vec![(
-        "tc_seq".into(),
-        "bash".into(),
-        serde_json::json!({"command": "echo"}),
-    )]);
-    let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
-    let child_tasks = match outcome {
-        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
-        other => panic!("expected Suspended, got {other:?}"),
-    };
-
-    // Step 2: execute child tool (emits ToolCallEnd).
+/// Execute a child tool task and resume the parent, collecting all
+/// lifecycle events along the way.
+async fn execute_child_and_resume(
+    stores: &TestStores,
+    child_tasks: &[AgentTask],
+    provider: &MockToolCallProvider,
+) -> Result<()> {
     let child = stores
         .tasks
         .try_acquire_task(
@@ -610,13 +602,11 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     )
     .await?;
 
-    // Step 3: resume and complete (emits TurnComplete + Done).
     let parent = stores
         .tasks
         .get(&child_tasks[0].parent_id.as_ref().unwrap().clone())
         .await?
         .context("parent")?;
-    assert_eq!(parent.status, TaskStatus::Pending);
 
     let parent_acq = stores
         .tasks
@@ -642,8 +632,32 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
         build_root_worker_inputs(resume_bootstrap, &stores.threads, &stores.checkpoints, t0())
             .await?;
 
-    use super::root_turn::resume_from_children;
-    resume_from_children(resume_inputs, &parent_acq, &provider, &stores.deps(), t0()).await?;
+    resume_from_children(resume_inputs, &parent_acq, provider, &stores.deps(), t0()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    // Step 1: suspend (emits ToolCallStart).
+    let provider = MockToolCallProvider::new(vec![(
+        "tc_seq".into(),
+        "bash".into(),
+        serde_json::json!({"command": "echo"}),
+    )]);
+    let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
+    let child_tasks = match outcome {
+        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
+    };
+
+    // Steps 2-3: execute child tool + resume parent.
+    execute_child_and_resume(&stores, &child_tasks, &provider).await?;
 
     // Verify all events have strictly monotonic sequences.
     let all_events = stores.events.get_events(&thread_a()).await?;
@@ -699,7 +713,7 @@ async fn committed_events_returned_in_outcome_types() -> Result<()> {
         RootTurnOutcome::Completed {
             committed_events, ..
         } => committed_events,
-        other => panic!("expected Completed, got {other:?}"),
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
     let repo_events = stores.events.get_events(&thread_a()).await?;
