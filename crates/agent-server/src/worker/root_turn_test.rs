@@ -4,7 +4,10 @@
 //! tool-boundary suspension path, and the Phase 4.5 resume from
 //! completed child tool results.
 
-use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_root_turn};
+use super::root_turn::{
+    RootTurnDeps, RootTurnOutcome, cancel_root_turn, execute_root_turn, fail_root_turn,
+    resume_root_turn,
+};
 use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
@@ -1374,6 +1377,607 @@ async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
     assert!(continuation.is_some(), "continuation must be present");
     let messages = acquired.state.suspended_messages();
     assert!(!messages.is_empty(), "suspended messages must be present");
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 4.6 — failure, cancellation, and regression coverage
+// ─────────────────────────────────────────────────────────────────────
+
+/// Mock provider that always returns a server error.
+struct ErrorProvider;
+
+#[async_trait]
+impl LlmProvider for ErrorProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        Ok(ChatOutcome::ServerError("internal error".into()))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+// ── Failure path ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn failed_root_turn_does_not_advance_projections() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let worker_id = WorkerId::from_string("worker_test");
+    let lease_id = LeaseId::from_string("lease_test");
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    // execute_root_turn fails (LLM server error).
+    let err = execute_root_turn(inputs, "test", &ErrorProvider, &stores.deps(), t_plus(1))
+        .await
+        .unwrap_err();
+
+    // Explicitly fail the task.
+    let failed = fail_root_turn(
+        &task_id,
+        &worker_id,
+        &lease_id,
+        &err,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+
+    // Task is Failed.
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert!(failed.last_error.is_some());
+    assert!(failed.completed_at.is_some());
+    assert!(failed.state.is_none());
+
+    // No durable projection writes.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 0);
+    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_root_turn_closes_open_attempt() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let worker_id = WorkerId::from_string("worker_test");
+    let lease_id = LeaseId::from_string("lease_test");
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let err = execute_root_turn(inputs, "test", &ErrorProvider, &stores.deps(), t_plus(1))
+        .await
+        .unwrap_err();
+
+    fail_root_turn(
+        &task_id,
+        &worker_id,
+        &lease_id,
+        &err,
+        &stores.deps(),
+        t_plus(2),
+    )
+    .await?;
+
+    // The attempt opened by execute_root_turn should be closed.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0].is_closed(),
+        "attempt should be closed after fail_root_turn"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
+    let stores = TestStores::new();
+
+    // Phase 4.4: suspend with a single tool call.
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "ok".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire for resume.
+    let parent_id = parent.id.clone();
+    let worker_id = WorkerId::from_string("worker_test");
+    let lease_id = LeaseId::from_string("lease_test");
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            worker_id.clone(),
+            lease_id.clone(),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    // Resume fails (LLM error).
+    let err = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &ErrorProvider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await
+    .unwrap_err();
+
+    // Explicitly fail the task.
+    let failed = fail_root_turn(
+        &parent_id,
+        &worker_id,
+        &lease_id,
+        &err,
+        &stores.deps(),
+        t_plus(26),
+    )
+    .await?;
+
+    // Task is Failed with state cleared.
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert!(failed.state.is_none(), "TaskState must be cleared on fail");
+    assert!(failed.last_error.is_some());
+
+    // No checkpoint created (no durable projection writes).
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        stores
+            .threads
+            .get(&thread_a())
+            .await?
+            .context("thread")?
+            .committed_turns,
+        0
+    );
+
+    Ok(())
+}
+
+// ── Cancellation path ───────────────────────────────────────────
+
+#[tokio::test]
+async fn cancelled_root_turn_does_not_advance_projections() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    // Just build inputs to trigger thread get_or_create, then cancel.
+    let _inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    // Cancel the running root task.
+    let cancelled_ids = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
+
+    assert_eq!(cancelled_ids.len(), 1);
+    assert_eq!(cancelled_ids[0], task_id);
+
+    // Task is Cancelled.
+    let task = stores.tasks.get(&task_id).await?.context("task")?;
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert!(task.completed_at.is_some());
+    assert!(task.state.is_none());
+
+    // No durable projection writes.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 0);
+    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_suspended_turn_cancels_children() -> Result<()> {
+    let stores = TestStores::new();
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "call_a".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        ),
+        (
+            "call_b".into(),
+            "bash".into(),
+            serde_json::json!({"command": "pwd"}),
+        ),
+    ]);
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
+
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+    } = outcome
+    else {
+        panic!("Expected Suspended");
+    };
+
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(child_tasks.len(), 2);
+
+    // Cancel the entire subtree.
+    let cancelled_ids = cancel_root_turn(&task_id, &stores.deps(), t_plus(10)).await?;
+
+    // All 3 tasks (parent + 2 children) should be cancelled.
+    assert_eq!(cancelled_ids.len(), 3);
+
+    // Parent is cancelled.
+    let parent = stores.tasks.get(&task_id).await?.context("parent")?;
+    assert_eq!(parent.status, TaskStatus::Cancelled);
+    assert!(parent.state.is_none(), "state must be cleared on cancel");
+
+    // Both children are cancelled.
+    for child in &child_tasks {
+        let c = stores.tasks.get(&child.id).await?.context("child")?;
+        assert_eq!(c.status, TaskStatus::Cancelled);
+    }
+
+    // No durable projection writes leaked.
+    assert_eq!(
+        stores
+            .threads
+            .get(&thread_a())
+            .await?
+            .context("thread")?
+            .committed_turns,
+        0
+    );
+    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+// ── Regression coverage (full lifecycle) ────────────────────────
+
+#[tokio::test]
+async fn regression_text_only_completion() -> Result<()> {
+    // End-to-end regression guard for Phase 4.3: create → acquire →
+    // execute (text-only) → task Completed, thread advanced, checkpoint
+    // created.
+    let stores = TestStores::new();
+    let provider = MockTextProvider::new("regression response");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t_plus(1)).await?;
+
+    let RootTurnOutcome::Completed {
+        completed_task,
+        response_text,
+        commit,
+    } = outcome
+    else {
+        panic!("Expected Completed");
+    };
+
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+    assert_eq!(response_text, "regression response");
+    assert_eq!(commit.thread.committed_turns, 1);
+    assert_eq!(commit.checkpoint.turn_number, 1);
+
+    // Durable stores consistent.
+    let task = stores.tasks.get(&task_id).await?.context("task")?;
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(stores.messages.get_history(&thread_a()).await?.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
+    // Full lifecycle regression guard for Phase 4.4 + 4.5:
+    // suspend → complete children → resume (text-only) → Completed.
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "hello world".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: Some(25),
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "echo hello world"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Verify intermediate state.
+    assert_eq!(parent.status, TaskStatus::Pending);
+    assert!(matches!(parent.state, TaskState::ReadyToResume { .. }));
+
+    // Re-acquire and resume.
+    let parent_id = parent.id.clone();
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    let resume_provider = MockTextProvider::new("Output: hello world");
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    let RootTurnOutcome::Completed {
+        completed_task,
+        response_text,
+        commit,
+    } = outcome
+    else {
+        panic!("Expected Completed");
+    };
+
+    // Final state assertions.
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+    assert_eq!(response_text, "Output: hello world");
+    assert_eq!(commit.thread.committed_turns, 1);
+    assert!(commit.checkpoint.messages.len() >= 4);
+
+    // Task in store is Completed.
+    let task = stores.tasks.get(&parent_id).await?.context("task")?;
+    assert_eq!(task.status, TaskStatus::Completed);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_re_suspension_child_retry_budget() -> Result<()> {
+    // Verify that re-suspended children inherit the policy's max_attempts
+    // (not ChildSpawnSpec::default()). This is the fix verification for
+    // the Phase 4.6 bug fix.
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "result".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire for resume.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    // Resume with more tool calls → re-suspend.
+    let resume_provider =
+        MockToolCallProvider::single("call_2", "bash", serde_json::json!({"command": "cat file"}));
+    let outcome = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &resume_provider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await?;
+
+    let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
+        panic!("Expected Suspended after resume with tool calls");
+    };
+
+    // The re-suspended child must inherit policy.max_attempts (3 from
+    // server_default), not DEFAULT_MAX_ATTEMPTS (1).
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(
+        child_tasks[0].max_attempts, 3,
+        "re-suspended children must inherit policy max_attempts, got {}",
+        child_tasks[0].max_attempts
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
+    // When the resume path's LLM call fails, no durable projection
+    // writes should exist (staged stores are discarded with the inputs).
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "ok".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Re-acquire.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
+            .await?;
+
+    // Resume with error provider.
+    let err = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &ErrorProvider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await;
+    assert!(err.is_err(), "resume should fail on LLM error");
+
+    // No durable projection writes leaked.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(
+        thread.committed_turns, 0,
+        "no commits should occur on failed resume"
+    );
+    assert!(
+        stores.messages.get_history(&thread_a()).await?.is_empty(),
+        "no durable messages should exist after failed resume"
+    );
+    assert!(
+        stores
+            .checkpoints
+            .list_by_thread(&thread_a())
+            .await?
+            .is_empty(),
+        "no checkpoints should exist after failed resume"
+    );
 
     Ok(())
 }
