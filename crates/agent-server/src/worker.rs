@@ -87,6 +87,8 @@ mod confirmation_test;
 #[cfg(test)]
 mod guarded_execution_test;
 #[cfg(test)]
+mod mutation_safety_test;
+#[cfg(test)]
 mod root_turn_test;
 #[cfg(test)]
 mod tool_task_test;

@@ -129,6 +129,13 @@ pub use journal::{
     WorkerId, build_root_worker_inputs, classify_recovery,
 };
 
+// Phase 5.5: tool audit and redaction re-exports.
+pub use journal::{
+    InMemoryToolAuditEventStore, REDACTED_MARKER, RedactionLevel, RedactionPolicy, ToolAuditEvent,
+    ToolAuditEventId, ToolAuditEventKind, ToolAuditEventParams, ToolAuditEventStore, redact_error,
+    redact_string, redact_value,
+};
+
 // ── Re-exports that validate the dependency edges ────────────────────
 //
 // Each `use` below proves that the corresponding narrow crate is
