@@ -750,6 +750,30 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)>;
 
+    /// Transition a running child to [`TaskStatus::Completed`] with a
+    /// durable result payload, then recompute the parent's
+    /// `pending_child_count` exactly as [`AgentTaskStore::complete_task`]
+    /// does.
+    ///
+    /// This is the Phase 5.4 entry point for tool-runtime children
+    /// that carry a serialized [`agent_sdk_core::ToolResult`] back to
+    /// the parent. The `result_payload` is persisted on the child row's
+    /// [`AgentTask::result_payload`] field so the parent's resume path
+    /// can read it from the journal via
+    /// [`AgentTaskStore::list_children`] without relying on in-memory
+    /// state.
+    ///
+    /// # Errors
+    /// Same error envelope as [`AgentTaskStore::complete_task`].
+    async fn complete_task_with_result(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
+
     /// Transition a running child to [`TaskStatus::Failed`] with
     /// `error` and recompute the parent's `pending_child_count` the
     /// same way [`AgentTaskStore::complete_task`] does.
@@ -1918,7 +1942,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         let paused = old
             .clone()
-            .wait_on_children(child_count, payload, now)
+            .wait_on_children(child_count, payload, Vec::new(), now)
             .context("pause rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.by_id.insert(paused.id.clone(), paused.clone());
@@ -2048,9 +2072,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // computed batch size, not a caller-supplied number.
         let child_count = u32::try_from(children.len())
             .context("spawn rejected: child count exceeds u32::MAX")?;
+        let child_ids: Vec<AgentTaskId> = children.iter().map(|c| c.id.clone()).collect();
         let new_parent = old_parent
             .clone()
-            .wait_on_children(child_count, payload, now)
+            .wait_on_children(child_count, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old_parent, &new_parent);
         inner
@@ -2085,6 +2110,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             now,
             "complete_task",
             |child| child.complete(now),
+        )?;
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn complete_task_with_result(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut inner = self.inner.write().await;
+        let result = inner.apply_task_terminal_transition(
+            child_id,
+            worker,
+            lease,
+            now,
+            "complete_task_with_result",
+            |child| child.complete_with_result(result_payload, now),
         )?;
         drop(inner);
         Ok(result)
@@ -2875,6 +2921,7 @@ mod tests {
                                 continuation: sample_continuation("t1"),
                                 suspended_messages: Vec::new(),
                             },
+                            Vec::new(),
                             t_plus(2),
                         )
                         .context("wait_on_children")?;
@@ -3579,6 +3626,7 @@ mod tests {
                     continuation: sample_continuation("t1"),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(7),
             )
             .context("wait")?;
@@ -3756,6 +3804,7 @@ mod tests {
                     continuation: sample_continuation("t-wait"),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(2),
             )
             .context("wait_on_children")?;
@@ -4074,6 +4123,7 @@ mod tests {
                     continuation: sample_continuation("b"),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(3),
             )
             .context("wait_on_children")?;
@@ -4578,6 +4628,7 @@ mod tests {
                     continuation: sample_continuation("t1"),
                     suspended_messages: Vec::new(),
                 },
+                Vec::new(),
                 t_plus(3),
             )
             .context("root waiting")?;
@@ -5299,6 +5350,7 @@ mod tests {
         bad.state = TaskState::WaitingOnChildren {
             continuation: Box::new(sample_continuation("t-bad-2")),
             suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
         };
         let err = bad.validate().unwrap_err();
         assert!(
