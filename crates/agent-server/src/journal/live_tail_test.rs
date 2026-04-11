@@ -124,7 +124,7 @@ async fn slow_consumer_recovers_via_durable_replay() -> Result<()> {
 /// After a lag disconnect, a subscriber can reconnect using
 /// [`stream_events`] with `after_sequence` set to the last-delivered
 /// sequence, seamlessly resuming from durable replay into the live
-/// tail (via EventNotifier).
+/// tail (via `EventNotifier`).
 #[tokio::test]
 async fn reconnect_via_stream_events_recovers_cleanly() -> Result<()> {
     let repo = InMemoryEventRepository::new();
@@ -151,7 +151,7 @@ async fn reconnect_via_stream_events_recovers_cleanly() -> Result<()> {
     // Drain receiver to get ReplayRequired.
     let last_delivered = loop {
         match rx.recv().await {
-            Some(LiveTailEvent::Event(_)) => continue,
+            Some(LiveTailEvent::Event(_)) => {}
             Some(LiveTailEvent::ReplayRequired {
                 last_delivered_sequence,
             }) => break last_delivered_sequence,
@@ -208,10 +208,11 @@ async fn fast_subscriber_unaffected_by_slow_disconnect() -> Result<()> {
     assert_eq!(hub.subscriber_count(&thread_a()), 2);
 
     // Commit 5 events.  Fast subscriber drains between each publish.
-    for i in 0..5 {
+    for i in 0i64..5 {
         commit_and_publish(&repo, &hub, &thread_a(), i).await?;
+        let expected_seq = u64::try_from(i).unwrap();
         match fast_rx.recv().await {
-            Some(LiveTailEvent::Event(e)) => assert_eq!(e.sequence, i as u64),
+            Some(LiveTailEvent::Event(e)) => assert_eq!(e.sequence, expected_seq),
             other => panic!("fast subscriber: expected Event({i}), got {other:?}"),
         }
     }
