@@ -183,15 +183,16 @@ mod tests {
     fn root_turn_deps_borrows_compile() {
         let stores = StoreRegistry::in_memory(sample_registry());
         let deps = stores.root_turn_deps();
-        // Prove the deps struct is usable.
-        let _task = deps.task_store;
-        let _thread = deps.thread_store;
+        // Prove the deps struct fields are accessible.
+        let _ = deps.task_store;
+        let _ = deps.thread_store;
     }
 
     #[test]
     fn registry_is_clone() {
         let stores = StoreRegistry::in_memory(sample_registry());
+        #[allow(clippy::redundant_clone)]
         let cloned = stores.clone();
-        let _task = &cloned.task_store;
+        drop(cloned);
     }
 }
