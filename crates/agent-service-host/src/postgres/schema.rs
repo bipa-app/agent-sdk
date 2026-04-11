@@ -781,3 +781,285 @@ const DURABLE_CORE_TABLES: &[TableContract] = &[
 pub const fn durable_core_tables() -> &'static [TableContract] {
     DURABLE_CORE_TABLES
 }
+
+// =====================================================================
+// Event journal, outbox, and retention tables (migration 0002)
+// =====================================================================
+
+const AGENT_SDK_COMMITTED_EVENT_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "event_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Primary event identity (UUID v7 string, time-ordered).",
+    },
+    ColumnContract {
+        name: "thread_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Owning thread identity.",
+    },
+    ColumnContract {
+        name: "sequence",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Monotonically increasing sequence within the thread. 0-indexed.",
+    },
+    ColumnContract {
+        name: "event_json",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Serialised `AgentEvent` payload.",
+    },
+    ColumnContract {
+        name: "committed_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "Server commit timestamp (UTC).",
+    },
+];
+
+const AGENT_SDK_COMMITTED_EVENT_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_committed_events_thread_fk",
+        invariant: "Every committed event belongs to an existing thread row.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_committed_events_thread_sequence_key",
+        invariant: "`(thread_id, sequence)` is the durable unique key for replay and ordering.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_committed_events_sequence_check",
+        invariant: "Event sequence is non-negative.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_committed_events_event_json_check",
+        invariant: "Event payload is stored as a JSON object.",
+    },
+];
+
+const AGENT_SDK_COMMITTED_EVENT_INDEXES: &[IndexContract] = &[
+    IndexContract {
+        name: "agent_sdk_committed_events_replay_idx",
+        key_columns: "(thread_id, sequence)",
+        predicate: None,
+        purpose: "Primary replay query path for reconnecting clients.",
+    },
+    IndexContract {
+        name: "agent_sdk_committed_events_by_time_idx",
+        key_columns: "(thread_id, committed_at)",
+        predicate: None,
+        purpose: "Time-range queries for operational inspection and retention scans.",
+    },
+];
+
+const AGENT_SDK_OUTBOX_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Primary outbox row identity (`outbox_<uuid>` wire form).",
+    },
+    ColumnContract {
+        name: "thread_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Thread the event belongs to.",
+    },
+    ColumnContract {
+        name: "event_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "References `agent_sdk_committed_events.event_id`.",
+    },
+    ColumnContract {
+        name: "sequence",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Copy of the event's thread-scoped sequence for ordering.",
+    },
+    ColumnContract {
+        name: "status",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Relay lifecycle status (`pending`, `claimed`, `delivered`, `failed`, `expired`).",
+    },
+    ColumnContract {
+        name: "payload_json",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Self-contained relay payload (serialised event envelope).",
+    },
+    ColumnContract {
+        name: "created_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the outbox row was created (same transaction as event commit).",
+    },
+    ColumnContract {
+        name: "next_attempt_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the relay should next attempt delivery.",
+    },
+    ColumnContract {
+        name: "attempt_count",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Number of relay attempts so far.",
+    },
+    ColumnContract {
+        name: "max_attempts",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Maximum relay attempts before the row expires.",
+    },
+    ColumnContract {
+        name: "last_error",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Most recent relay failure message.",
+    },
+    ColumnContract {
+        name: "claimed_by",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Relay worker identity that claimed this row.",
+    },
+    ColumnContract {
+        name: "claimed_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: true,
+        notes: "When the relay worker claimed this row.",
+    },
+    ColumnContract {
+        name: "delivered_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: true,
+        notes: "When the relay successfully delivered this row.",
+    },
+];
+
+const AGENT_SDK_OUTBOX_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_outbox_thread_fk",
+        invariant: "Every outbox row belongs to an existing thread.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_event_fk",
+        invariant: "Every outbox row references a committed event.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_status_check",
+        invariant: "Only known outbox statuses can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_sequence_check",
+        invariant: "Outbox sequence (copied from event) is non-negative.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_attempt_bounds_check",
+        invariant: "Retry counters stay within the configured relay budget.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_payload_json_check",
+        invariant: "Relay payload is stored as a JSON object.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_claim_atomicity_check",
+        invariant: "Claim fields are either all absent or all present together.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_delivered_check",
+        invariant: "Delivered rows require `delivered_at`; non-delivered rows must not set it.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_error_check",
+        invariant: "Failed/expired rows require `last_error`; other rows must not carry one.",
+    },
+];
+
+const AGENT_SDK_OUTBOX_INDEXES: &[IndexContract] = &[
+    IndexContract {
+        name: "agent_sdk_outbox_relay_scan_idx",
+        key_columns: "(next_attempt_at, id)",
+        predicate: Some("status = 'pending'"),
+        purpose: "Relay worker scan for pending delivery work, ordered by next_attempt_at.",
+    },
+    IndexContract {
+        name: "agent_sdk_outbox_by_thread_idx",
+        key_columns: "(thread_id, sequence)",
+        predicate: None,
+        purpose: "Thread-scoped inspection of outbox rows in sequence order.",
+    },
+    IndexContract {
+        name: "agent_sdk_outbox_claimed_sweep_idx",
+        key_columns: "(claimed_at, id)",
+        predicate: Some("status = 'claimed'"),
+        purpose: "Stale-claim sweep for relay workers that failed without releasing.",
+    },
+];
+
+const AGENT_SDK_RETENTION_CURSOR_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "thread_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Primary key and owning thread identity.",
+    },
+    ColumnContract {
+        name: "retention_floor",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Lowest committed-event sequence guaranteed to still exist. Events below this value may have been garbage-collected.",
+    },
+    ColumnContract {
+        name: "updated_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the retention floor was last advanced.",
+    },
+];
+
+const AGENT_SDK_RETENTION_CURSOR_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_retention_cursors_thread_fk",
+        invariant: "Every retention cursor belongs to an existing thread row.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_retention_cursors_floor_check",
+        invariant: "Retention floor is non-negative.",
+    },
+];
+
+const AGENT_SDK_RETENTION_CURSOR_INDEXES: &[IndexContract] = &[];
+
+const EVENT_JOURNAL_OUTBOX_TABLES: &[TableContract] = &[
+    TableContract {
+        name: "agent_sdk_committed_events",
+        purpose: "Append-only event journal with thread-scoped sequence ordering. Authoritative source of truth for event replay.",
+        columns: AGENT_SDK_COMMITTED_EVENT_COLUMNS,
+        constraints: AGENT_SDK_COMMITTED_EVENT_CONSTRAINTS,
+        indexes: AGENT_SDK_COMMITTED_EVENT_INDEXES,
+    },
+    TableContract {
+        name: "agent_sdk_outbox",
+        purpose: "Transactional relay buffer for AMQP/pub-sub delivery. Inserted atomically with committed events. Not the authority for ordering.",
+        columns: AGENT_SDK_OUTBOX_COLUMNS,
+        constraints: AGENT_SDK_OUTBOX_CONSTRAINTS,
+        indexes: AGENT_SDK_OUTBOX_INDEXES,
+    },
+    TableContract {
+        name: "agent_sdk_retention_cursors",
+        purpose: "Per-thread retention watermarks for event garbage collection and replay gap detection.",
+        columns: AGENT_SDK_RETENTION_CURSOR_COLUMNS,
+        constraints: AGENT_SDK_RETENTION_CURSOR_CONSTRAINTS,
+        indexes: AGENT_SDK_RETENTION_CURSOR_INDEXES,
+    },
+];
+
+/// Tables introduced by the event journal and outbox migration (0002).
+#[must_use]
+pub const fn event_journal_outbox_tables() -> &'static [TableContract] {
+    EVENT_JOURNAL_OUTBOX_TABLES
+}

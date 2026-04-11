@@ -25,10 +25,13 @@ mod tests {
     use anyhow::{Context, Result, ensure};
 
     use super::migrations::{
-        DURABLE_CORE_MIGRATOR, durable_core_migrations, future_event_outbox_notes,
+        DURABLE_CORE_MIGRATOR, durable_core_migrations, event_journal_outbox_migration,
     };
-    use super::repository::{completed_turn_units_of_work, repository_boundaries};
-    use super::schema::durable_core_tables;
+    use super::repository::{
+        completed_turn_units_of_work, event_journal_repository_boundaries,
+        event_journal_units_of_work, repository_boundaries,
+    };
+    use super::schema::{durable_core_tables, event_journal_outbox_tables};
 
     #[test]
     fn durable_core_migrations_cover_every_declared_table_constraint_and_index() -> Result<()> {
@@ -68,11 +71,11 @@ mod tests {
     }
 
     #[test]
-    fn executable_migration_bundle_excludes_future_notes() -> Result<()> {
+    fn executable_migration_bundle_contains_both_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 1,
-            "expected only executable durable-core migrations, got {:?}",
+            migrations.len() == 2,
+            "expected 2 executable migrations (durable core + event journal), got {:?}",
             migrations
                 .iter()
                 .map(|migration| migration.version)
@@ -80,8 +83,13 @@ mod tests {
         );
         ensure!(
             migrations[0].version == 1,
-            "expected durable core executable migration version 1, got {}",
+            "expected durable core migration version 1, got {}",
             migrations[0].version,
+        );
+        ensure!(
+            migrations[1].version == 2,
+            "expected event journal migration version 2, got {}",
+            migrations[1].version,
         );
         Ok(())
     }
@@ -216,16 +224,105 @@ mod tests {
     }
 
     #[test]
-    fn future_notes_call_out_event_repository_and_outbox_follow_up() -> Result<()> {
-        let notes = future_event_outbox_notes();
+    fn event_journal_migration_covers_every_declared_table_constraint_and_index() -> Result<()> {
+        let sql = event_journal_outbox_migration();
+
+        for table in event_journal_outbox_tables() {
+            ensure!(
+                sql.contains(&format!("CREATE TABLE {}", table.name)),
+                "missing CREATE TABLE for {}",
+                table.name,
+            );
+
+            for constraint in table.constraints {
+                ensure!(
+                    sql.contains(constraint.name),
+                    "missing constraint {} for {}",
+                    constraint.name,
+                    table.name,
+                );
+            }
+
+            for index in table.indexes {
+                ensure!(
+                    sql.contains(index.name),
+                    "missing index {} for {}",
+                    index.name,
+                    table.name,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn event_journal_repository_contracts_cover_new_traits() -> Result<()> {
+        let boundaries = event_journal_repository_boundaries();
+        let actual: BTreeSet<_> = boundaries.iter().map(|b| b.store_trait).collect();
+        let expected = BTreeSet::from([
+            "agent_server::journal::event_repository::EventRepository",
+            "agent_server::journal::outbox::OutboxStore",
+            "agent_server::journal::retention::RetentionStore",
+        ]);
         ensure!(
-            notes.contains("committed_events"),
-            "future notes must mention committed_events",
+            actual == expected,
+            "event journal repository traits mismatch: expected {expected:?}, got {actual:?}",
         );
-        ensure!(notes.contains("outbox"), "future notes must mention outbox",);
+        Ok(())
+    }
+
+    #[test]
+    fn event_journal_units_of_work_cover_cross_table_transactions() -> Result<()> {
+        let units = event_journal_units_of_work();
+
+        let commit_with_outbox = units
+            .iter()
+            .find(|u| u.name == "commit_events_with_outbox")
+            .context("missing commit_events_with_outbox unit of work")?;
         ensure!(
-            notes.contains("thread-scoped sequence"),
-            "future notes must preserve event ordering semantics",
+            commit_with_outbox.tables == ["agent_sdk_committed_events", "agent_sdk_outbox"],
+            "commit_events_with_outbox tables drifted: {:?}",
+            commit_with_outbox.tables,
+        );
+
+        let retention = units
+            .iter()
+            .find(|u| u.name == "advance_retention_floor")
+            .context("missing advance_retention_floor unit of work")?;
+        ensure!(
+            retention.tables == ["agent_sdk_retention_cursors", "agent_sdk_committed_events"],
+            "advance_retention_floor tables drifted: {:?}",
+            retention.tables,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn committed_events_table_enforces_thread_sequence_uniqueness() -> Result<()> {
+        let sql = event_journal_outbox_migration();
+        ensure!(
+            sql.contains("agent_sdk_committed_events_thread_sequence_key"),
+            "committed_events must enforce (thread_id, sequence) uniqueness",
+        );
+        ensure!(
+            sql.contains("UNIQUE (thread_id, sequence)"),
+            "committed_events UNIQUE constraint must cover (thread_id, sequence)",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_is_transactionally_tied_to_committed_events() -> Result<()> {
+        let sql = event_journal_outbox_migration();
+        ensure!(
+            sql.contains("agent_sdk_outbox_event_fk"),
+            "outbox must have a FK to committed_events",
+        );
+        ensure!(
+            sql.contains("REFERENCES agent_sdk_committed_events(event_id)"),
+            "outbox FK must reference committed_events.event_id",
         );
         Ok(())
     }

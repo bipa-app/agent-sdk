@@ -574,12 +574,14 @@ pub mod live_tail;
 mod live_tail_test;
 pub mod message;
 pub mod message_store;
+pub mod outbox;
 #[cfg(test)]
 mod persistence_regression;
 pub mod recovery;
 pub mod redaction;
 #[cfg(test)]
 mod replay_test;
+pub mod retention;
 pub mod staged;
 pub mod store;
 pub mod task;
@@ -608,12 +610,16 @@ pub use execution_intent::{
 pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
+pub use outbox::{
+    InMemoryOutboxStore, NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
+};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 pub use redaction::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
 };
+pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
 pub use task::{
