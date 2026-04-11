@@ -38,7 +38,7 @@
 //! compose on top by accepting a [`StoreRegistry`] reference:
 //!
 //! ```ignore
-//! let host = ServiceHost::new(config)?;
+//! let host = ServiceHost::new(config, registry)?;
 //! let grpc = GrpcTransport::new(host.stores());
 //! tokio::select! {
 //!     res = host.run() => res?,

@@ -7,9 +7,10 @@
 //!
 //! The config path is resolved in order:
 //!
-//! 1. `AGENT_SERVICE_CONFIG` environment variable.
-//! 2. `./config.yaml` in the working directory.
-//! 3. If neither exists, the built-in defaults are used.
+//! 1. `AGENT_SERVICE_CONFIG` environment variable — **must** point to
+//!    an existing file or the process exits with an error.
+//! 2. `./config.yaml` in the working directory (if it exists).
+//! 3. If neither is present, the built-in defaults are used.
 //!
 //! [`ServiceHost`]: agent_service_host::host::ServiceHost
 
@@ -54,33 +55,34 @@ fn main() -> Result<()> {
 
 /// Resolve and load configuration.
 fn load_config() -> Result<ServiceConfig> {
-    let path = config_path();
-    match path {
-        Some(p) if p.exists() => {
-            info!(path = %p.display(), "loading config from file");
-            ServiceConfig::from_yaml_file(&p)
-        }
-        Some(p) => {
-            info!(path = %p.display(), "config file not found, using defaults");
-            Ok(ServiceConfig::default())
-        }
-        None => {
+    config_path()?.map_or_else(
+        || {
             info!("no config path specified, using defaults");
             Ok(ServiceConfig::default())
-        }
-    }
+        },
+        |p| {
+            info!(path = %p.display(), "loading config from file");
+            ServiceConfig::from_yaml_file(&p)
+        },
+    )
 }
 
 /// Determine the config file path.
-fn config_path() -> Option<PathBuf> {
+///
+/// Returns `Err` if `AGENT_SERVICE_CONFIG` is set but the file does
+/// not exist — this is an explicit operator intent that must not be
+/// silently ignored.
+fn config_path() -> Result<Option<PathBuf>> {
     if let Ok(env_path) = std::env::var("AGENT_SERVICE_CONFIG") {
-        return Some(PathBuf::from(env_path));
+        let p = PathBuf::from(&env_path);
+        anyhow::ensure!(p.exists(), "AGENT_SERVICE_CONFIG={env_path} does not exist");
+        return Ok(Some(p));
     }
     let default = PathBuf::from("config.yaml");
     if default.exists() {
-        return Some(default);
+        return Ok(Some(default));
     }
-    None
+    Ok(None)
 }
 
 /// Initialise the `tracing` subscriber.

@@ -5,7 +5,7 @@
 //! target creates:
 //!
 //! ```ignore
-//! let host = ServiceHost::new(config)?;
+//! let host = ServiceHost::new(config, registry)?;
 //! host.run().await?;   // blocks until shutdown signal
 //! ```
 //!
@@ -13,7 +13,7 @@
 //! compose on top via [`ServiceHost::stores`]:
 //!
 //! ```ignore
-//! let host = ServiceHost::new(config)?;
+//! let host = ServiceHost::new(config, registry)?;
 //! let grpc = GrpcTransport::new(host.stores());
 //! tokio::select! {
 //!     res = host.run() => res?,

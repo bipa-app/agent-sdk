@@ -192,8 +192,8 @@ mod tests {
     #[test]
     fn registry_is_clone() {
         let stores = StoreRegistry::in_memory(sample_registry());
-        #[allow(clippy::redundant_clone)]
         let cloned = stores.clone();
-        drop(cloned);
+        // Clone shares the same underlying Arc instances.
+        assert!(Arc::ptr_eq(&stores.task_store, &cloned.task_store));
     }
 }
