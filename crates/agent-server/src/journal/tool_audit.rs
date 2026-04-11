@@ -349,12 +349,28 @@ pub trait ToolAuditEventStore: Send + Sync {
 ///
 /// Suitable for testing and single-process deployments. Indexes by
 /// `operation_id`, `task_id`, and `thread_id` for efficient queries.
-#[derive(Default)]
+///
+/// All data is held behind a single [`RwLock`] so that writes to
+/// `events` and the three index maps are atomic with respect to
+/// concurrent readers.
 pub struct InMemoryToolAuditEventStore {
-    events: RwLock<Vec<ToolAuditEvent>>,
-    by_operation: RwLock<HashMap<String, Vec<usize>>>,
-    by_task: RwLock<HashMap<String, Vec<usize>>>,
-    by_thread: RwLock<HashMap<String, Vec<usize>>>,
+    inner: RwLock<InMemoryToolAuditInner>,
+}
+
+#[derive(Default)]
+struct InMemoryToolAuditInner {
+    events: Vec<ToolAuditEvent>,
+    by_operation: HashMap<String, Vec<usize>>,
+    by_task: HashMap<String, Vec<usize>>,
+    by_thread: HashMap<String, Vec<usize>>,
+}
+
+impl Default for InMemoryToolAuditEventStore {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(InMemoryToolAuditInner::default()),
+        }
+    }
 }
 
 impl InMemoryToolAuditEventStore {
@@ -370,7 +386,13 @@ impl InMemoryToolAuditEventStore {
     /// Returns an error if the lock is poisoned.
     pub fn all_events(&self) -> anyhow::Result<Vec<ToolAuditEvent>> {
         use anyhow::Context;
-        Ok(self.events.read().ok().context("lock poisoned")?.clone())
+        Ok(self
+            .inner
+            .read()
+            .ok()
+            .context("lock poisoned")?
+            .events
+            .clone())
     }
 }
 
@@ -379,55 +401,45 @@ impl ToolAuditEventStore for InMemoryToolAuditEventStore {
     async fn record_event(&self, event: &ToolAuditEvent) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let idx = {
-            let mut events = self.events.write().ok().context("lock poisoned")?;
-            let idx = events.len();
-            events.push(event.clone());
-            idx
-        };
+        let mut inner = self.inner.write().ok().context("lock poisoned")?;
 
-        self.by_operation
-            .write()
-            .ok()
-            .context("lock poisoned")?
+        let idx = inner.events.len();
+        inner.events.push(event.clone());
+
+        inner
+            .by_operation
             .entry(event.operation_id.clone())
             .or_default()
             .push(idx);
 
-        self.by_task
-            .write()
-            .ok()
-            .context("lock poisoned")?
+        inner
+            .by_task
             .entry(event.task_id.0.clone())
             .or_default()
             .push(idx);
 
-        self.by_thread
-            .write()
-            .ok()
-            .context("lock poisoned")?
+        inner
+            .by_thread
             .entry(event.thread_id.0.clone())
             .or_default()
             .push(idx);
 
+        drop(inner);
         Ok(())
     }
 
     async fn list_by_operation(&self, operation_id: &str) -> anyhow::Result<Vec<ToolAuditEvent>> {
         use anyhow::Context;
 
-        let indices = {
-            let index = self.by_operation.read().ok().context("lock poisoned")?;
-            match index.get(operation_id) {
-                Some(v) => v.clone(),
-                None => return Ok(Vec::new()),
-            }
+        let inner = self.inner.read().ok().context("lock poisoned")?;
+        let Some(indices) = inner.by_operation.get(operation_id) else {
+            return Ok(Vec::new());
         };
-        let events = self.events.read().ok().context("lock poisoned")?;
         let mut result: Vec<ToolAuditEvent> = indices
             .iter()
-            .filter_map(|&i| events.get(i).cloned())
+            .filter_map(|&i| inner.events.get(i).cloned())
             .collect();
+        drop(inner);
         result.sort_by_key(|e| e.recorded_at);
         Ok(result)
     }
@@ -435,18 +447,15 @@ impl ToolAuditEventStore for InMemoryToolAuditEventStore {
     async fn list_by_task(&self, task_id: &AgentTaskId) -> anyhow::Result<Vec<ToolAuditEvent>> {
         use anyhow::Context;
 
-        let indices = {
-            let index = self.by_task.read().ok().context("lock poisoned")?;
-            match index.get(&task_id.0) {
-                Some(v) => v.clone(),
-                None => return Ok(Vec::new()),
-            }
+        let inner = self.inner.read().ok().context("lock poisoned")?;
+        let Some(indices) = inner.by_task.get(&task_id.0) else {
+            return Ok(Vec::new());
         };
-        let events = self.events.read().ok().context("lock poisoned")?;
         let mut result: Vec<ToolAuditEvent> = indices
             .iter()
-            .filter_map(|&i| events.get(i).cloned())
+            .filter_map(|&i| inner.events.get(i).cloned())
             .collect();
+        drop(inner);
         result.sort_by_key(|e| e.recorded_at);
         Ok(result)
     }
@@ -454,18 +463,15 @@ impl ToolAuditEventStore for InMemoryToolAuditEventStore {
     async fn list_by_thread(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<ToolAuditEvent>> {
         use anyhow::Context;
 
-        let indices = {
-            let index = self.by_thread.read().ok().context("lock poisoned")?;
-            match index.get(&thread_id.0) {
-                Some(v) => v.clone(),
-                None => return Ok(Vec::new()),
-            }
+        let inner = self.inner.read().ok().context("lock poisoned")?;
+        let Some(indices) = inner.by_thread.get(&thread_id.0) else {
+            return Ok(Vec::new());
         };
-        let events = self.events.read().ok().context("lock poisoned")?;
         let mut result: Vec<ToolAuditEvent> = indices
             .iter()
-            .filter_map(|&i| events.get(i).cloned())
+            .filter_map(|&i| inner.events.get(i).cloned())
             .collect();
+        drop(inner);
         result.sort_by_key(|e| e.recorded_at);
         Ok(result)
     }

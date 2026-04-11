@@ -104,7 +104,6 @@ impl RedactionPolicy {
                 "token".into(),
                 "api_key".into(),
                 "apikey".into(),
-                "auth".into(),
                 "authorization".into(),
                 "credential".into(),
                 "private_key".into(),
@@ -116,9 +115,9 @@ impl RedactionPolicy {
                 "ssn".into(),
                 "credit_card".into(),
                 "cpf".into(),
+                "cnh".into(),
                 "cnpj".into(),
                 "crm".into(),
-                "rg".into(),
                 "passport".into(),
                 "driver_license".into(),
                 "social_security".into(),
@@ -541,16 +540,20 @@ mod tests {
         assert!(policy.is_sensitive_key("api_key"));
         assert!(policy.is_sensitive_key("MY_API_KEY"));
         assert!(policy.is_sensitive_key("Authorization"));
-        assert!(policy.is_sensitive_key("auth_token"));
         assert!(policy.is_sensitive_key("session_id"));
         assert!(policy.is_sensitive_key("private_key"));
         assert!(policy.is_sensitive_key("access_key_id"));
 
-        // Should not match
+        // Should not match — guards against overly-short substring patterns
         assert!(!policy.is_sensitive_key("username"));
         assert!(!policy.is_sensitive_key("command"));
         assert!(!policy.is_sensitive_key("amount"));
         assert!(!policy.is_sensitive_key("path"));
+        assert!(!policy.is_sensitive_key("args"));
+        assert!(!policy.is_sensitive_key("target"));
+        assert!(!policy.is_sensitive_key("author"));
+        assert!(!policy.is_sensitive_key("org_id"));
+        assert!(!policy.is_sensitive_key("merge"));
     }
 
     // ── Sensitive value detection ───────────────────────────────
