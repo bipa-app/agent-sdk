@@ -568,6 +568,17 @@ pub struct AgentTask {
     /// before this task can leave [`TaskStatus::WaitingOnChildren`].
     pub pending_child_count: u32,
 
+    // ── spawn ordering (used by 5.1) ───────────────────────
+    /// Positional index within a batch spawned by
+    /// [`super::store::AgentTaskStore::spawn_tool_children`].
+    ///
+    /// `None` for root tasks and any child not created through a
+    /// batch spawn. The bootstrap step in the tool-runtime worker
+    /// sorts siblings by this field to map each child to the correct
+    /// `PendingToolCallInfo` in the parent's continuation.
+    #[serde(default)]
+    pub spawn_index: Option<u32>,
+
     // ── timestamps ──────────────────────────────────────────
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -606,6 +617,7 @@ impl AgentTask {
             max_attempts,
             last_error: None,
             pending_child_count: 0,
+            spawn_index: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -646,6 +658,7 @@ impl AgentTask {
             max_attempts,
             last_error: None,
             pending_child_count: 0,
+            spawn_index: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
