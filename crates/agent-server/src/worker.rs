@@ -30,6 +30,14 @@
 //! The [`classify_tool_effect`] helper determines a tool's
 //! [`ToolEffectClass`] from its [`PendingToolCallInfo`] metadata.
 //!
+//! # Confirmation pause/resume (Phase 5.3)
+//!
+//! [`pause_tool_for_confirmation`] pauses a running tool-runtime
+//! child task for user confirmation. [`apply_confirmation_decision`]
+//! handles approval, rejection, or timeout. On approval,
+//! [`resume_confirmed_tool`] re-checks authoritative policy via
+//! [`ConfirmationPolicy`] before executing through the guarded path.
+//!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
 //! ```ignore
@@ -57,6 +65,7 @@
 //!   bootstrapping a child task or a queued root.
 
 pub mod bootstrap;
+pub mod confirmation;
 pub mod definition;
 pub mod registry;
 pub mod root_turn;
@@ -64,6 +73,8 @@ pub mod tool_task;
 
 #[cfg(test)]
 mod bootstrap_test;
+#[cfg(test)]
+mod confirmation_test;
 #[cfg(test)]
 mod guarded_execution_test;
 #[cfg(test)]
@@ -87,4 +98,11 @@ pub use crate::journal::execution_intent::{
     ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
     RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
     guarded_tool_execution,
+};
+
+// Phase 5.3: re-export confirmation types and functions.
+pub use confirmation::{
+    ConfirmationDecision, ConfirmationDecisionOutcome, ConfirmationPolicy,
+    ConfirmationResumeOutcome, PolicyVerdict, apply_confirmation_decision,
+    pause_tool_for_confirmation, resume_confirmed_tool,
 };

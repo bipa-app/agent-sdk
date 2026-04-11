@@ -245,6 +245,7 @@ use super::task::{
 /// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
 /// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
 /// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
+/// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
 #[async_trait]
@@ -841,6 +842,39 @@ pub trait AgentTaskStore: Send + Sync {
         id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
+
+    /// Reject or time out a [`TaskStatus::AwaitingConfirmation`] task,
+    /// transitioning it directly to [`TaskStatus::Failed`] and
+    /// recomputing the parent's `pending_child_count` under the same
+    /// write lock.
+    ///
+    /// This is the Phase 5.3 entry point for confirmation decisions
+    /// that do **not** lead to execution (rejection, timeout, or
+    /// revocation). Unlike [`AgentTaskStore::fail_task`], this method
+    /// does not require a `(worker, lease)` CAS because the task has
+    /// no lease while in [`TaskStatus::AwaitingConfirmation`].
+    ///
+    /// The child's [`crate::journal::TaskState::AwaitingConfirmation`] payload
+    /// (continuation + prepared operation) is cleared atomically with
+    /// the terminal transition, same as every other terminal helper.
+    ///
+    /// Returns `(child, parent)` where `parent` is the recomputed
+    /// parent row (or `None` if the child is a root task). If the
+    /// parent was in [`TaskStatus::WaitingOnChildren`] and this was
+    /// its last live child, the parent flips to
+    /// [`TaskStatus::Pending`] with [`crate::journal::TaskState::ReadyToResume`].
+    ///
+    /// # Errors
+    /// - `reject_confirmation rejected: task ... does not exist`
+    /// - `reject_confirmation rejected: task ... is not awaiting
+    ///   confirmation`
+    /// - Schema errors from [`AgentTask::fail`] or parent recompute.
+    async fn reject_confirmation(
+        &self,
+        id: &AgentTaskId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
 
     /// Remove every stored task. **Test-only housekeeping** — worker
     /// code must use the CAS-guarded helpers to drive individual
@@ -2136,6 +2170,66 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.by_id.insert(resumed.id.clone(), resumed.clone());
         drop(inner);
         Ok(resumed)
+    }
+
+    async fn reject_confirmation(
+        &self,
+        id: &AgentTaskId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
+
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "reject_confirmation rejected: task {id} is not awaiting confirmation \
+                 (status {status:?})"
+            ));
+        }
+
+        let failed = old
+            .clone()
+            .fail(error, now)
+            .context("reject_confirmation: fail transition failed")?;
+        inner.rebalance_after_row_change(&old, &failed);
+        inner.by_id.insert(failed.id.clone(), failed.clone());
+
+        // Recompute the parent's pending_child_count the same way
+        // `apply_task_terminal_transition` does in complete_task /
+        // fail_task. If this was the last live child the parent
+        // becomes Pending with ReadyToResume.
+        let parent = if let Some(parent_id) = &failed.parent_id {
+            let Some(old_parent) = inner.by_id.get(parent_id).cloned() else {
+                return Err(anyhow!(
+                    "reject_confirmation: child {id} references missing parent {parent_id}"
+                ));
+            };
+            if old_parent.status == TaskStatus::WaitingOnChildren {
+                let live = inner.count_live_children(parent_id);
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .context("reject_confirmation: recompute_pending_children failed")?;
+                inner.rebalance_after_row_change(&old_parent, &new_parent);
+                inner
+                    .by_id
+                    .insert(new_parent.id.clone(), new_parent.clone());
+                Some(new_parent)
+            } else {
+                Some(old_parent)
+            }
+        } else {
+            None
+        };
+
+        drop(inner);
+        Ok((failed, parent))
     }
 
     async fn clear(&self) -> Result<()> {
