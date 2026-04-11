@@ -246,13 +246,13 @@ impl ExecutionIntent {
     }
 
     /// Transition to `Started`.
-    pub fn mark_started(&mut self, now: OffsetDateTime) {
+    pub const fn mark_started(&mut self, now: OffsetDateTime) {
         self.status = IntentStatus::Started;
         self.updated_at = now;
     }
 
     /// Transition to `Completed`.
-    pub fn mark_completed(&mut self, now: OffsetDateTime) {
+    pub const fn mark_completed(&mut self, now: OffsetDateTime) {
         self.status = IntentStatus::Completed;
         self.updated_at = now;
     }
@@ -305,14 +305,20 @@ pub trait ExecutionIntentStore: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
-    async fn get_intent(&self, operation_id: &OperationId) -> anyhow::Result<Option<ExecutionIntent>>;
+    async fn get_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> anyhow::Result<Option<ExecutionIntent>>;
 
     /// Look up an intent by the child task id.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
-    async fn get_intent_by_task(&self, child_task_id: &AgentTaskId) -> anyhow::Result<Option<ExecutionIntent>>;
+    async fn get_intent_by_task(
+        &self,
+        child_task_id: &AgentTaskId,
+    ) -> anyhow::Result<Option<ExecutionIntent>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -359,7 +365,10 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
         Ok(())
     }
 
-    async fn get_intent(&self, operation_id: &OperationId) -> anyhow::Result<Option<ExecutionIntent>> {
+    async fn get_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> anyhow::Result<Option<ExecutionIntent>> {
         Ok(self
             .intents
             .read()
@@ -368,7 +377,10 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
             .cloned())
     }
 
-    async fn get_intent_by_task(&self, child_task_id: &AgentTaskId) -> anyhow::Result<Option<ExecutionIntent>> {
+    async fn get_intent_by_task(
+        &self,
+        child_task_id: &AgentTaskId,
+    ) -> anyhow::Result<Option<ExecutionIntent>> {
         let op_id = self
             .task_index
             .read()
@@ -402,7 +414,7 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
 ///
 /// Future phases may introduce explicit per-tool annotations.
 #[must_use]
-pub fn classify_tool_effect(tool_call: &PendingToolCallInfo) -> ToolEffectClass {
+pub const fn classify_tool_effect(tool_call: &PendingToolCallInfo) -> ToolEffectClass {
     use agent_sdk_core::ToolTier;
 
     match tool_call.tier {
@@ -481,6 +493,12 @@ pub fn check_retry_safety(prior: Option<ExecutionIntent>) -> RetryDecision {
 /// 6. Update the intent to terminal status after execution.
 ///
 /// Replay-safe tools bypass the intent write entirely.
+///
+/// # Errors
+///
+/// Returns an error if the retry-safety check rejects the operation
+/// (e.g. duplicate execution or ambiguous in-flight state), or if the
+/// underlying [`execute_tool_task`] fails.
 pub async fn guarded_tool_execution<F, Fut>(
     bootstrap: ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
@@ -970,10 +988,12 @@ mod tests {
         let store = InMemoryExecutionIntentStore::new();
         let op = OperationId("nonexistent:call".into());
         assert!(store.get_intent(&op).await.unwrap().is_none());
-        assert!(store
-            .get_intent_by_task(&AgentTaskId("nope".into()))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_intent_by_task(&AgentTaskId("nope".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -672,7 +672,11 @@ async fn side_effecting_failure_records_intent_as_failed() -> Result<()> {
         .expect("intent should be persisted");
     assert_eq!(intent.status, IntentStatus::Failed);
     assert!(
-        intent.error.as_deref().unwrap().contains("insufficient funds"),
+        intent
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("insufficient funds"),
         "intent error should contain root cause: {:?}",
         intent.error
     );
