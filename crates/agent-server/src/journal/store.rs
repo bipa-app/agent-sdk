@@ -750,6 +750,30 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)>;
 
+    /// Transition a running child to [`TaskStatus::Completed`] with a
+    /// durable result payload, then recompute the parent's
+    /// `pending_child_count` exactly as [`AgentTaskStore::complete_task`]
+    /// does.
+    ///
+    /// This is the Phase 5.4 entry point for tool-runtime children
+    /// that carry a serialized [`agent_sdk_core::ToolResult`] back to
+    /// the parent. The `result_payload` is persisted on the child row's
+    /// [`AgentTask::result_payload`] field so the parent's resume path
+    /// can read it from the journal via
+    /// [`AgentTaskStore::list_children`] without relying on in-memory
+    /// state.
+    ///
+    /// # Errors
+    /// Same error envelope as [`AgentTaskStore::complete_task`].
+    async fn complete_task_with_result(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)>;
+
     /// Transition a running child to [`TaskStatus::Failed`] with
     /// `error` and recompute the parent's `pending_child_count` the
     /// same way [`AgentTaskStore::complete_task`] does.
@@ -2085,6 +2109,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             now,
             "complete_task",
             |child| child.complete(now),
+        )?;
+        drop(inner);
+        Ok(result)
+    }
+
+    async fn complete_task_with_result(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let mut inner = self.inner.write().await;
+        let result = inner.apply_task_terminal_transition(
+            child_id,
+            worker,
+            lease,
+            now,
+            "complete_task_with_result",
+            |child| child.complete_with_result(result_payload, now),
         )?;
         drop(inner);
         Ok(result)

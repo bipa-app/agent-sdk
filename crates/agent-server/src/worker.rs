@@ -38,6 +38,15 @@
 //! [`resume_confirmed_tool`] re-checks authoritative policy via
 //! [`ConfirmationPolicy`] before executing through the guarded path.
 //!
+//! # Parent resume from durable child outcomes (Phase 5.4)
+//!
+//! [`aggregate_child_outcomes`] reads child task rows from the
+//! journal and maps each terminal child to a deterministic
+//! `(tool_call_id, ToolResult)` pair. [`resume_from_children`]
+//! ties aggregation to [`resume_root_turn`], providing the single
+//! entry point for journal-driven parent resume after all child
+//! tool tasks reach terminal states.
+//!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
 //! ```ignore
@@ -86,8 +95,8 @@ pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
-    RootTurnDeps, RootTurnOutcome, cancel_root_turn, execute_root_turn, fail_root_turn,
-    resume_root_turn,
+    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn, execute_root_turn,
+    fail_root_turn, resume_from_children, resume_root_turn,
 };
 pub use tool_task::{
     ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap,

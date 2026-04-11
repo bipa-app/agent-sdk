@@ -272,10 +272,16 @@ where
     // ── Drive to terminal state ──────────────────────────────────
     match tool_result {
         Ok(result) => {
+            // Serialize the tool result so it is durably persisted on the
+            // child row. The parent's resume path reads it back via
+            // `aggregate_child_outcomes` without relying on in-memory state.
+            let result_payload = serde_json::to_value(&result)
+                .context("serialize tool result for durable storage")?;
+
             let (child, parent) = task_store
-                .complete_task(task_id, worker_id, lease_id, now)
+                .complete_task_with_result(task_id, worker_id, lease_id, result_payload, now)
                 .await
-                .with_context(|| format!("complete_task failed for child {task_id}"))?;
+                .with_context(|| format!("complete_task_with_result failed for child {task_id}"))?;
 
             Ok(ToolTaskOutcome::Completed {
                 child,

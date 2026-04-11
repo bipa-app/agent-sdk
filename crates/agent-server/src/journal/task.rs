@@ -579,6 +579,19 @@ pub struct AgentTask {
     #[serde(default)]
     pub spawn_index: Option<u32>,
 
+    // ── durable tool result (used by 5.4) ──────────────────
+    /// Serialized tool result persisted when a tool-runtime child
+    /// task reaches [`TaskStatus::Completed`].
+    ///
+    /// The parent's resume path deserializes this field via
+    /// [`aggregate_child_outcomes`](crate::worker::root_turn::aggregate_child_outcomes)
+    /// to reconstruct the `(tool_call_id, ToolResult)` pairs the
+    /// LLM needs. `None` for root tasks, failed children (whose
+    /// error result is derived from [`Self::last_error`]), and any
+    /// child that has not yet completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_payload: Option<serde_json::Value>,
+
     // ── timestamps ──────────────────────────────────────────
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -618,6 +631,7 @@ impl AgentTask {
             last_error: None,
             pending_child_count: 0,
             spawn_index: None,
+            result_payload: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -659,6 +673,7 @@ impl AgentTask {
             last_error: None,
             pending_child_count: 0,
             spawn_index: None,
+            result_payload: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -1272,6 +1287,26 @@ impl AgentTask {
         self.updated_at = now;
         self.validate()?;
         Ok(self)
+    }
+
+    /// Mark the task [`TaskStatus::Completed`] with a durable result
+    /// payload.
+    ///
+    /// Identical to [`Self::complete`] but additionally persists
+    /// `result_payload` on the row so the parent's resume path can
+    /// read tool results from the journal without relying on
+    /// in-memory state. Used by Phase 5.4's
+    /// [`complete_task_with_result`](super::store::AgentTaskStore::complete_task_with_result).
+    ///
+    /// # Errors
+    /// Same as [`Self::complete`].
+    pub fn complete_with_result(
+        mut self,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        self.result_payload = Some(result_payload);
+        self.complete(now)
     }
 
     /// Mark the task [`TaskStatus::Failed`] with the given error.

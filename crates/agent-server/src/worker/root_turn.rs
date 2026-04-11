@@ -42,7 +42,7 @@ use agent_sdk_core::{
 };
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::{MessageStore, StateStore};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use time::OffsetDateTime;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
@@ -54,6 +54,7 @@ use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
+use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
@@ -1308,4 +1309,198 @@ fn build_resume_continuation(
     };
 
     Ok(ContinuationEnvelope::wrap(continuation))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 5.4: child outcome aggregation and durable resume
+// ─────────────────────────────────────────────────────────────────────
+
+/// Aggregate child task outcomes into the `(tool_call_id, ToolResult)`
+/// pairs that [`resume_root_turn`] consumes.
+///
+/// This is the Phase 5.4 durable bridge: the parent's resume path
+/// reads child outcomes exclusively from the journal, never from
+/// in-memory channels or hidden state. Each child task row carries:
+///
+/// - **Completed**: a serialized [`ToolResult`] on
+///   [`AgentTask::result_payload`], persisted by
+///   [`execute_tool_task`](super::tool_task::execute_tool_task) via
+///   [`AgentTaskStore::complete_task_with_result`].
+/// - **Failed / Cancelled**: a deterministic error [`ToolResult`]
+///   derived from [`AgentTask::last_error`] and [`AgentTask::status`].
+///
+/// Children are mapped to their parent's
+/// [`AgentContinuation::pending_tool_calls`] via the positional
+/// [`AgentTask::spawn_index`] field set during
+/// [`AgentTaskStore::spawn_tool_children`]. The returned vector is
+/// ordered by `spawn_index` so tool-result messages appear in the
+/// same order the LLM emitted the tool-use blocks.
+///
+/// # Errors
+///
+/// - A child is not in a terminal state.
+/// - A completed child has no `result_payload`.
+/// - A child's `spawn_index` is out of bounds for the parent's
+///   `pending_tool_calls`.
+/// - The parent has no children.
+///
+/// [`AgentTaskStore::complete_task_with_result`]: crate::journal::store::AgentTaskStore::complete_task_with_result
+/// [`AgentTaskStore::spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
+pub async fn aggregate_child_outcomes(
+    parent: &AgentTask,
+    continuation: &AgentContinuation,
+    task_store: &dyn AgentTaskStore,
+) -> Result<Vec<(String, ToolResult)>> {
+    let children = task_store
+        .list_children(&parent.id)
+        .await
+        .context("list children for aggregation")?;
+
+    ensure!(
+        !children.is_empty(),
+        "parent {} has no children to aggregate",
+        parent.id
+    );
+
+    let pending = &continuation.pending_tool_calls;
+    let mut results: Vec<Option<(String, ToolResult)>> = vec![None; pending.len()];
+
+    for child in &children {
+        // Every child must be terminal.
+        ensure!(
+            child.status.is_terminal(),
+            "child {} is not terminal (status {:?}); \
+             cannot aggregate until all children finish",
+            child.id,
+            child.status,
+        );
+
+        let spawn_index = child.spawn_index.context("child missing spawn_index")?;
+        let idx = usize::try_from(spawn_index).context("spawn_index exceeds usize")?;
+
+        ensure!(
+            idx < pending.len(),
+            "child {} spawn_index {idx} out of bounds for {} pending tool calls",
+            child.id,
+            pending.len(),
+        );
+
+        let tool_call_id = pending[idx].id.clone();
+        let tool_result = extract_child_tool_result(child)?;
+
+        results[idx] = Some((tool_call_id, tool_result));
+    }
+
+    // Verify every slot was filled.
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.with_context(|| format!("no child resolved pending tool call at index {i}"))
+        })
+        .collect()
+}
+
+/// Extract a [`ToolResult`] from a terminal child task.
+///
+/// - **Completed**: deserializes [`AgentTask::result_payload`].
+/// - **Failed**: builds a deterministic error result from
+///   [`AgentTask::last_error`].
+/// - **Cancelled**: builds a deterministic cancellation result.
+fn extract_child_tool_result(child: &AgentTask) -> Result<ToolResult> {
+    match child.status {
+        TaskStatus::Completed => {
+            let payload = child
+                .result_payload
+                .as_ref()
+                .with_context(|| format!("completed child {} has no result_payload", child.id))?;
+            serde_json::from_value(payload.clone()).with_context(|| {
+                format!("failed to deserialize result_payload on child {}", child.id)
+            })
+        }
+        TaskStatus::Failed => {
+            let error = child.last_error.as_deref().unwrap_or("unknown error");
+            Ok(ToolResult {
+                success: false,
+                output: error.to_owned(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            })
+        }
+        TaskStatus::Cancelled => Ok(ToolResult {
+            success: false,
+            output: "tool execution was cancelled".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        }),
+        other => bail!(
+            "child {} has non-terminal status {:?}; cannot extract tool result",
+            child.id,
+            other,
+        ),
+    }
+}
+
+/// Resume a suspended root turn by aggregating child outcomes from
+/// the journal and calling [`resume_root_turn`].
+///
+/// This is the Phase 5.4 entry point that bridges child completion
+/// to root resume entirely through durable state. The caller
+/// provides:
+///
+/// - `inputs`: execution context recovered from the latest checkpoint
+///   (same as a fresh turn).
+/// - `parent`: the parent task row, which must be in
+///   [`TaskState::ReadyToResume`].
+///
+/// The function:
+///
+/// 1. Extracts the continuation and suspended messages from the
+///    parent's [`TaskState::ReadyToResume`] payload.
+/// 2. Aggregates child outcomes from the journal via
+///    [`aggregate_child_outcomes`].
+/// 3. Delegates to [`resume_root_turn`] with the aggregated results.
+///
+/// # Errors
+///
+/// - Parent is not in [`TaskState::ReadyToResume`].
+/// - Child aggregation fails (non-terminal children, missing results).
+/// - The underlying [`resume_root_turn`] fails.
+pub async fn resume_from_children(
+    inputs: RootWorkerInputs,
+    parent: &AgentTask,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    // 1. Extract continuation and suspended messages.
+    let (continuation, suspended_messages) = match &parent.state {
+        TaskState::ReadyToResume {
+            continuation,
+            suspended_messages,
+        } => (continuation.payload.clone(), suspended_messages.clone()),
+        other => bail!(
+            "resume_from_children requires ReadyToResume state, got {:?}",
+            std::mem::discriminant(other),
+        ),
+    };
+
+    // 2. Aggregate child outcomes from the journal.
+    let child_results = aggregate_child_outcomes(parent, &continuation, deps.task_store)
+        .await
+        .context("aggregate child outcomes for resume")?;
+
+    // 3. Delegate to the existing resume path.
+    resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        provider,
+        deps,
+        now,
+    )
+    .await
 }
