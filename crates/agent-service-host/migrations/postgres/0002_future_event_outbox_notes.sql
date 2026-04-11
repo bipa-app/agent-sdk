@@ -1,0 +1,33 @@
+-- ENG-7984 follow-up notes: these are durable-contract notes, not an
+-- executable migration yet.
+--
+-- Future table: agent_sdk_committed_events
+-- --------------------------------
+-- Purpose:
+--   Preserve the Phase 6 event repository's durable commit surface with
+--   a thread-scoped sequence number.
+--
+-- Required contract:
+--   * `(thread_id, sequence)` unique key
+--   * append-only writes
+--   * batch insert in the same SQL transaction as the state changes that
+--     produced the events
+--   * replay window query ordered by `(thread_id, sequence)`
+--
+-- Future table: agent_sdk_outbox
+-- --------------------
+-- Purpose:
+--   Hold relay work for AMQP / pub-sub delivery without weakening the
+--   journal's commit guarantees.
+--
+-- Required contract:
+--   * rows are inserted in the same SQL transaction as the durable
+--     journal mutation that triggered them
+--   * relay workers claim by status + next_attempt_at ordering
+--   * delivery is idempotent at the consumer boundary
+--   * terminal durable state never depends on successful outbox relay
+--
+-- Ordering note:
+--   committed_events must remain the source of truth for thread-scoped
+--   sequence order. The outbox is a delivery buffer, not the authority
+--   for replay or ordering semantics.
