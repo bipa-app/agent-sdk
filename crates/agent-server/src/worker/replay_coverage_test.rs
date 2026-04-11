@@ -479,7 +479,10 @@ async fn execute_child_and_resume(
         thread_id: thread_replay(),
         task_id: parent_acq.id.clone(),
         worker_id: WorkerId::from_string("w_resume"),
-        lease_id: parent_acq.lease_id.clone().unwrap(),
+        lease_id: parent_acq
+            .lease_id
+            .clone()
+            .context("parent has no lease_id")?,
     };
     let resume_inputs =
         build_root_worker_inputs(resume_ctx, &stores.threads, &stores.checkpoints, t0()).await?;

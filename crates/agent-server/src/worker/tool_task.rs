@@ -320,23 +320,15 @@ where
     // matrix to re-execute the tool on restart (double execution of
     // non-idempotent operations).
 
-    // ── Commit collected progress events ────────────────────────
+    // Drain collected progress events now, but defer committing until
+    // after the CAS-guarded store operation succeeds. This prevents
+    // orphaned progress events when a stale-lease worker's CAS fails
+    // and another worker re-executes the tool.
     let progress_events = collector.drain();
-    let mut committed_events = if progress_events.is_empty() {
-        Vec::new()
-    } else {
-        event_repo
-            .commit_event_batch(&bootstrap.thread_id, progress_events, now)
-            .await
-            .context("commit tool progress events")?
-    };
 
     // ── Drive to terminal state ──────────────────────────────────
     match tool_result {
         Ok(result) => {
-            // Serialize the tool result so it is durably persisted on the
-            // child row. The parent's resume path reads it back via
-            // `aggregate_child_outcomes` without relying on in-memory state.
             let result_payload = serde_json::to_value(&result)
                 .context("serialize tool result for durable storage")?;
 
@@ -345,18 +337,23 @@ where
                 .await
                 .with_context(|| format!("complete_task_with_result failed for child {task_id}"))?;
 
-            // Commit ToolCallEnd event after state transition.
+            // Commit progress events + ToolCallEnd in a single batch
+            // AFTER the CAS-guarded store operation succeeds, so only
+            // the winning worker writes events.
             let end_event = AgentEvent::tool_call_end(
                 &bootstrap.tool_call.id,
                 &bootstrap.tool_call.name,
                 &bootstrap.tool_call.display_name,
                 result.clone(),
             );
-            let end_committed = event_repo
-                .commit_event(&bootstrap.thread_id, end_event, now)
-                .await
-                .context("commit ToolCallEnd event")?;
-            committed_events.push(end_committed);
+            let committed_events = commit_tool_events(
+                event_repo,
+                &bootstrap.thread_id,
+                progress_events,
+                end_event,
+                now,
+            )
+            .await?;
 
             Ok(ToolTaskOutcome::Completed {
                 child,
@@ -372,7 +369,6 @@ where
                 .await
                 .with_context(|| format!("fail_task failed for child {task_id}"))?;
 
-            // Commit ToolCallEnd event with error result.
             let error_result = ToolResult {
                 success: false,
                 output: error_msg.clone(),
@@ -386,11 +382,14 @@ where
                 &bootstrap.tool_call.display_name,
                 error_result,
             );
-            let end_committed = event_repo
-                .commit_event(&bootstrap.thread_id, end_event, now)
-                .await
-                .context("commit ToolCallEnd event on failure")?;
-            committed_events.push(end_committed);
+            let committed_events = commit_tool_events(
+                event_repo,
+                &bootstrap.thread_id,
+                progress_events,
+                end_event,
+                now,
+            )
+            .await?;
 
             Ok(ToolTaskOutcome::Failed {
                 child,
@@ -400,4 +399,23 @@ where
             })
         }
     }
+}
+
+/// Commit progress events and a terminal event in a single batch.
+///
+/// Called after the CAS-guarded store operation succeeds so only the
+/// winning worker writes events to the journal.
+async fn commit_tool_events(
+    event_repo: &dyn EventRepository,
+    thread_id: &ThreadId,
+    progress_events: Vec<AgentEvent>,
+    end_event: AgentEvent,
+    now: OffsetDateTime,
+) -> anyhow::Result<Vec<CommittedEvent>> {
+    let mut batch = progress_events;
+    batch.push(end_event);
+    event_repo
+        .commit_event_batch(thread_id, batch, now)
+        .await
+        .context("commit tool events")
 }

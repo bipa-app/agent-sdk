@@ -342,10 +342,7 @@ async fn commit_text_only_turn(
         );
     }
 
-    // Commit Start after the idempotency guard (see `commit_start_event` doc).
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
-    let start_committed = commit_start_event(thread_id, turn_number, deps.event_repo, now).await?;
-
     let close_params = build_close_params(&response, &attempt);
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
@@ -366,15 +363,21 @@ async fn commit_text_only_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize agent state")?;
 
+    // Build lifecycle events with Start prepended. Start is included
+    // in the events vec passed to commit_completed_turn so it is
+    // committed atomically as step 5 — after all CAS-guarded state
+    // projections succeed. This prevents a stale-lease worker from
+    // producing orphaned Start events.
     let duration = (now - attempt.opened_at).unsigned_abs();
-    let lifecycle_events = build_turn_complete_events(
+    let mut lifecycle_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
+    lifecycle_events.extend(build_turn_complete_events(
         &response,
         thread_id,
         turn_number,
         &turn_usage,
         &drained_state.total_usage,
         duration,
-    );
+    ));
 
     let commit = commit_completed_turn(
         CompletedTurnCommit {
@@ -397,8 +400,7 @@ async fn commit_text_only_turn(
     .await
     .context("commit completed turn")?;
 
-    let mut committed_events = vec![start_committed];
-    committed_events.extend(commit.committed_events.clone());
+    let committed_events = commit.committed_events.clone();
 
     let (completed_task, _parent) = deps
         .task_store
@@ -422,27 +424,6 @@ async fn commit_text_only_turn(
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
-
-/// Commit a `Start` event for a root turn.
-///
-/// Called by both the text-only and suspension paths **after** their
-/// idempotency guards fire, ensuring a stale-lease worker that
-/// re-acquired the task cannot produce a duplicate `Start`.
-async fn commit_start_event(
-    thread_id: &agent_sdk_core::ThreadId,
-    turn_number: usize,
-    event_repo: &dyn EventRepository,
-    now: OffsetDateTime,
-) -> Result<CommittedEvent> {
-    event_repo
-        .commit_event(
-            thread_id,
-            AgentEvent::start(thread_id.clone(), turn_number),
-            now,
-        )
-        .await
-        .context("commit Start event")
-}
 
 async fn open_attempt(
     inputs: &RootWorkerInputs,
@@ -799,9 +780,7 @@ async fn suspend_at_tool_boundary(
         );
     }
 
-    // Commit Start after the idempotency guard (see `commit_start_event` doc).
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
-    let start_committed = commit_start_event(thread_id, turn_number, deps.event_repo, now).await?;
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
     let close_params = build_close_params(&response, &attempt);
@@ -868,18 +847,19 @@ async fn suspend_at_tool_boundary(
         .await
         .context("spawn tool children")?;
 
-    // Commit content events (Thinking) followed by ToolCallStart events.
-    let mut suspension_events = content_events;
+    // Commit Start + content events (Thinking) + ToolCallStart events
+    // in a single batch AFTER spawn_tool_children. Since
+    // spawn_tool_children is CAS-guarded (only the lease-holder can
+    // succeed), only the winning worker writes events — preventing
+    // orphaned Start events from stale-lease workers.
+    let mut suspension_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
+    suspension_events.extend(content_events);
     suspension_events.extend(tool_call_events);
-    let mut committed_events = vec![start_committed];
-    if !suspension_events.is_empty() {
-        let batch = deps
-            .event_repo
-            .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
-            .await
-            .context("commit suspension events")?;
-        committed_events.extend(batch);
-    }
+    let committed_events = deps
+        .event_repo
+        .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
+        .await
+        .context("commit suspension events")?;
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
