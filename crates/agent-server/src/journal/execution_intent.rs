@@ -348,11 +348,13 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
         let task_id = intent.child_task_id.0.clone();
         self.intents
             .write()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .insert(op_id.clone(), intent.clone());
         self.task_index
             .write()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .insert(task_id, op_id);
         Ok(())
     }
@@ -360,7 +362,8 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
     async fn update_intent(&self, intent: &ExecutionIntent) -> anyhow::Result<()> {
         self.intents
             .write()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .insert(intent.operation_id.as_str().to_owned(), intent.clone());
         Ok(())
     }
@@ -372,7 +375,8 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
         Ok(self
             .intents
             .read()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .get(operation_id.as_str())
             .cloned())
     }
@@ -384,7 +388,8 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
         let op_id = self
             .task_index
             .read()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .get(&child_task_id.0)
             .cloned();
         let Some(op_id) = op_id else {
@@ -393,7 +398,8 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
         Ok(self
             .intents
             .read()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .ok()
+            .context("lock poisoned")?
             .get(&op_id)
             .cloned())
     }
@@ -460,9 +466,17 @@ pub fn check_retry_safety(prior: Option<ExecutionIntent>) -> RetryDecision {
     match intent.status {
         IntentStatus::Completed => RetryDecision::AlreadyCompleted(intent),
         IntentStatus::Failed => {
-            // Failed before execution started (Pending → Failed means
-            // the guard blocked it). Safe to retry.
-            RetryDecision::FailedBeforeStart(intent)
+            // Failed in the store means the executor was invoked and
+            // returned an error (the post-execution handler wrote
+            // Failed). For side-effecting/resumable tools, the
+            // executor may have caused partial side effects, so
+            // automatic retry is unsafe. Only replay-safe tools can
+            // be safely re-executed.
+            if intent.effect_class.safe_to_retry() {
+                RetryDecision::FailedBeforeStart(intent)
+            } else {
+                RetryDecision::AmbiguousInFlight(intent)
+            }
         }
         IntentStatus::Pending | IntentStatus::Started => {
             if intent.effect_class.safe_to_retry() {
@@ -684,11 +698,12 @@ mod tests {
     }
 
     #[test]
-    fn operation_id_round_trips_through_json() {
+    fn operation_id_round_trips_through_json() -> anyhow::Result<()> {
         let op = OperationId::new(&AgentTaskId("task_1".into()), "call_2");
-        let json = serde_json::to_string(&op).unwrap();
-        let recovered: OperationId = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&op)?;
+        let recovered: OperationId = serde_json::from_str(&json)?;
         assert_eq!(op, recovered);
+        Ok(())
     }
 
     // ── ToolEffectClass ──────────────────────────────────────────
@@ -799,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_round_trips_through_json() {
+    fn intent_round_trips_through_json() -> anyhow::Result<()> {
         let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
         let tool = make_tool_call(ToolTier::Confirm, false);
         let now = OffsetDateTime::now_utc();
@@ -811,12 +826,13 @@ mod tests {
             AgentTaskId("t1".into()),
             now,
         );
-        let json = serde_json::to_string(&intent).unwrap();
-        let recovered: ExecutionIntent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&intent)?;
+        let recovered: ExecutionIntent = serde_json::from_str(&json)?;
         assert_eq!(recovered.operation_id, intent.operation_id);
         assert_eq!(recovered.effect_class, intent.effect_class);
         assert_eq!(recovered.status, intent.status);
         assert_eq!(recovered.tool_name, intent.tool_name);
+        Ok(())
     }
 
     // ── RetryDecision ────────────────────────────────────────────
@@ -849,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_intent_returns_failed_before_start() {
+    fn failed_side_effecting_intent_returns_ambiguous() {
         let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
         let tool = make_tool_call(ToolTier::Confirm, false);
         let now = OffsetDateTime::now_utc();
@@ -860,7 +876,26 @@ mod tests {
             AgentTaskId("t1".into()),
             now,
         );
-        intent.mark_failed("blocked", now);
+        intent.mark_failed("executor error", now);
+        assert!(matches!(
+            check_retry_safety(Some(intent)),
+            RetryDecision::AmbiguousInFlight(_)
+        ));
+    }
+
+    #[test]
+    fn failed_replay_safe_intent_returns_failed_before_start() {
+        let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
+        let tool = make_tool_call(ToolTier::Observe, false);
+        let now = OffsetDateTime::now_utc();
+        let mut intent = ExecutionIntent::new(
+            op,
+            ToolEffectClass::ReplaySafe,
+            &tool,
+            AgentTaskId("t1".into()),
+            now,
+        );
+        intent.mark_failed("transient error", now);
         assert!(matches!(
             check_retry_safety(Some(intent)),
             RetryDecision::FailedBeforeStart(_)
@@ -907,7 +942,7 @@ mod tests {
     // ── InMemoryExecutionIntentStore ─────────────────────────────
 
     #[tokio::test]
-    async fn in_memory_store_persist_and_get() {
+    async fn in_memory_store_persist_and_get() -> anyhow::Result<()> {
         let store = InMemoryExecutionIntentStore::new();
         let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
         let tool = make_tool_call(ToolTier::Confirm, false);
@@ -921,17 +956,19 @@ mod tests {
             now,
         );
 
-        store.persist_intent(&intent).await.unwrap();
+        store.persist_intent(&intent).await?;
 
-        let loaded = store.get_intent(&op).await.unwrap();
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
+        let loaded = store
+            .get_intent(&op)
+            .await?
+            .context("intent should be present")?;
         assert_eq!(loaded.operation_id, op);
         assert_eq!(loaded.status, IntentStatus::Pending);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn in_memory_store_get_by_task() {
+    async fn in_memory_store_get_by_task() -> anyhow::Result<()> {
         let store = InMemoryExecutionIntentStore::new();
         let task_id = AgentTaskId("task_42".into());
         let op = OperationId::new(&task_id, "c1");
@@ -946,15 +983,18 @@ mod tests {
             now,
         );
 
-        store.persist_intent(&intent).await.unwrap();
+        store.persist_intent(&intent).await?;
 
-        let loaded = store.get_intent_by_task(&task_id).await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().child_task_id, task_id);
+        let loaded = store
+            .get_intent_by_task(&task_id)
+            .await?
+            .context("intent should be present")?;
+        assert_eq!(loaded.child_task_id, task_id);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn in_memory_store_update_transitions_status() {
+    async fn in_memory_store_update_transitions_status() -> anyhow::Result<()> {
         let store = InMemoryExecutionIntentStore::new();
         let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
         let tool = make_tool_call(ToolTier::Confirm, false);
@@ -968,32 +1008,39 @@ mod tests {
             now,
         );
 
-        store.persist_intent(&intent).await.unwrap();
+        store.persist_intent(&intent).await?;
 
         intent.mark_started(now);
-        store.update_intent(&intent).await.unwrap();
+        store.update_intent(&intent).await?;
 
-        let loaded = store.get_intent(&op).await.unwrap().unwrap();
+        let loaded = store
+            .get_intent(&op)
+            .await?
+            .context("intent should be present after update")?;
         assert_eq!(loaded.status, IntentStatus::Started);
 
         intent.mark_completed(now);
-        store.update_intent(&intent).await.unwrap();
+        store.update_intent(&intent).await?;
 
-        let loaded = store.get_intent(&op).await.unwrap().unwrap();
+        let loaded = store
+            .get_intent(&op)
+            .await?
+            .context("intent should be present after completion")?;
         assert_eq!(loaded.status, IntentStatus::Completed);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn in_memory_store_get_nonexistent_returns_none() {
+    async fn in_memory_store_get_nonexistent_returns_none() -> anyhow::Result<()> {
         let store = InMemoryExecutionIntentStore::new();
         let op = OperationId("nonexistent:call".into());
-        assert!(store.get_intent(&op).await.unwrap().is_none());
+        assert!(store.get_intent(&op).await?.is_none());
         assert!(
             store
                 .get_intent_by_task(&AgentTaskId("nope".into()))
-                .await
-                .unwrap()
+                .await?
                 .is_none()
         );
+        Ok(())
     }
 }

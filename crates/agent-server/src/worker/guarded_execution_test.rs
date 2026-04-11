@@ -562,11 +562,11 @@ async fn retry_blocked_when_intent_ambiguous_in_flight() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 5.2 — retry: failed-before-start allows re-execution
+// Phase 5.2 — retry: failed side-effecting intent blocks re-execution
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn retry_allowed_when_prior_intent_failed_before_start() -> Result<()> {
+async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
     let stores = TestStores::new();
     let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
@@ -585,7 +585,8 @@ async fn retry_allowed_when_prior_intent_failed_before_start() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
     let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
-    // Pre-seed a Failed intent (e.g. previous attempt was fail-closed).
+    // Pre-seed a Failed intent — the executor ran and returned an error,
+    // so it may have caused partial side effects.
     let tool_call = ctx.tool_call.clone();
     let mut prior = ExecutionIntent::new(
         op_id.clone(),
@@ -594,17 +595,83 @@ async fn retry_allowed_when_prior_intent_failed_before_start() -> Result<()> {
         ctx.task_id.clone(),
         t_plus(10),
     );
-    prior.mark_failed("previous fail-closed", t_plus(11));
+    prior.mark_failed("network timeout after partial debit", t_plus(11));
     intent_store.persist_intent(&prior).await?;
     intent_store.update_intent(&prior).await?;
 
-    // Attempt guarded execution — should succeed.
-    let outcome = guarded_tool_execution(
+    // Attempt guarded execution — should fail with "ambiguous in-flight".
+    let result = guarded_tool_execution(
         ctx,
         &stores.tasks,
         &intent_store,
         &cancel,
         ToolEffectClass::SideEffecting,
+        |_info| async {
+            panic!("executor should not be called for failed side-effecting operation");
+        },
+        t_plus(20),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "expected error for failed side-effecting retry"
+    );
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(
+        err.contains("ambiguous in-flight"),
+        "error should mention ambiguous: {err}"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 5.2 — retry: failed replay-safe intent allows re-execution
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn retry_allowed_when_replay_safe_intent_failed() -> Result<()> {
+    let stores = TestStores::new();
+    let intent_store = InMemoryExecutionIntentStore::new();
+    let cancel = CancellationToken::new();
+
+    let (_parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "echo hello"}),
+        )],
+    )
+    .await?;
+
+    let child = acquire_child(&stores.tasks, &children[0].id).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
+
+    // Pre-seed a Failed intent for a replay-safe tool — safe to retry
+    // since replay-safe tools have no side effects.
+    let tool_call = ctx.tool_call.clone();
+    let mut prior = ExecutionIntent::new(
+        op_id.clone(),
+        ToolEffectClass::ReplaySafe,
+        &tool_call,
+        ctx.task_id.clone(),
+        t_plus(10),
+    );
+    prior.mark_failed("transient error", t_plus(11));
+    intent_store.persist_intent(&prior).await?;
+    intent_store.update_intent(&prior).await?;
+
+    // Attempt guarded execution — should succeed because ReplaySafe
+    // bypasses intent persistence entirely.
+    let outcome = guarded_tool_execution(
+        ctx,
+        &stores.tasks,
+        &intent_store,
+        &cancel,
+        ToolEffectClass::ReplaySafe,
         |_info| async { Ok(ToolResult::success("retry succeeded")) },
         t_plus(20),
     )
@@ -614,13 +681,6 @@ async fn retry_allowed_when_prior_intent_failed_before_start() -> Result<()> {
         matches!(outcome, ToolTaskOutcome::Completed { .. }),
         "expected Completed after retry, got: {outcome:?}"
     );
-
-    // The intent store should now have the new Completed intent.
-    let intent = intent_store
-        .get_intent(&op_id)
-        .await?
-        .expect("intent should exist");
-    assert_eq!(intent.status, IntentStatus::Completed);
 
     Ok(())
 }
@@ -722,23 +782,20 @@ async fn cancellation_records_intent_as_failed() -> Result<()> {
     )
     .await?;
 
-    // The inner execute_tool_task catches cancellation before calling
-    // the executor, so no intent is persisted (cancellation happens
-    // before the intent write in execute_tool_task's pre-check).
     assert!(
         matches!(outcome, ToolTaskOutcome::Cancelled),
         "expected Cancelled, got: {outcome:?}"
     );
 
-    // Intent should be Failed because guarded execution persisted it
-    // before delegating, and the cancellation updated it.
-    let intent = intent_store.get_intent(&op_id).await?;
-    // Note: if cancellation happens before execute_tool_task runs the
-    // executor, the intent is persisted as Pending then updated to
-    // Failed by the post-execution handler.
-    if let Some(intent) = intent {
-        assert_eq!(intent.status, IntentStatus::Failed);
-    }
+    // guarded_tool_execution persists intent *before* delegating to
+    // execute_tool_task, so the intent must exist even when the
+    // cancel token was pre-set. The post-execution handler updates
+    // it to Failed.
+    let intent = intent_store
+        .get_intent(&op_id)
+        .await?
+        .expect("intent must be persisted for SideEffecting tool");
+    assert_eq!(intent.status, IntentStatus::Failed);
 
     Ok(())
 }
