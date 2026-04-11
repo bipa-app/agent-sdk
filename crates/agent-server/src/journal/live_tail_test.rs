@@ -17,7 +17,7 @@ use super::event_stream::{StreamEvent, stream_events};
 use super::live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub};
 use agent_sdk_core::ThreadId;
 use agent_sdk_core::events::AgentEvent;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -210,7 +210,7 @@ async fn fast_subscriber_unaffected_by_slow_disconnect() -> Result<()> {
     // Commit 5 events.  Fast subscriber drains between each publish.
     for i in 0i64..5 {
         commit_and_publish(&repo, &hub, &thread_a(), i).await?;
-        let expected_seq = u64::try_from(i).unwrap();
+        let expected_seq = u64::try_from(i).context("loop index")?;
         match fast_rx.recv().await {
             Some(LiveTailEvent::Event(e)) => assert_eq!(e.sequence, expected_seq),
             other => panic!("fast subscriber: expected Event({i}), got {other:?}"),

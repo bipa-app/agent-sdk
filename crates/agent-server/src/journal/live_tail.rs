@@ -79,7 +79,7 @@ impl Default for LiveTailConfig {
 // Subscriber types
 // ─────────────────────────────────────────────────────────────────────
 
-/// Unique identifier for a subscriber within the hub.
+/// Unique identifier for a subscriber within a single thread's fanout.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SubscriberId(u64);
 
@@ -288,6 +288,11 @@ impl LiveTailHub {
             return;
         }
 
+        debug_assert!(
+            events.iter().all(|e| e.thread_id == events[0].thread_id),
+            "publish: all events must belong to the same thread"
+        );
+
         let thread_key = &events[0].thread_id.0;
         let now = Instant::now();
         let grace = self.config.lag_grace_period;
@@ -306,7 +311,10 @@ impl LiveTailHub {
         for (&sub_id, handle) in &mut fanout.subscribers {
             // ── Lagging subscribers: check grace period ─────────
             if let LagState::Lagging { since } = handle.lag_state {
-                if now.duration_since(since) >= grace {
+                if handle.tx.is_closed() {
+                    // Receiver was dropped — clean up immediately.
+                    to_remove.push(sub_id);
+                } else if now.duration_since(since) >= grace {
                     // Grace period expired — disconnect.
                     *handle
                         .shared
@@ -663,7 +671,7 @@ mod tests {
     // ── Receiver dropped cleans up ─────────────────────────────────
 
     #[tokio::test]
-    async fn receiver_dropped_cleans_up_subscriber() {
+    async fn receiver_dropped_cleans_up_healthy_subscriber() {
         let hub = LiveTailHub::new();
         let rx = hub.subscribe(&thread_a());
         assert_eq!(hub.subscriber_count(&thread_a()), 1);
@@ -672,6 +680,31 @@ mod tests {
 
         // Publish triggers cleanup of the closed channel.
         hub.publish(&[sample_committed(&thread_a(), 0)]);
+        assert_eq!(hub.subscriber_count(&thread_a()), 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_dropped_cleans_up_lagging_subscriber() {
+        let hub = LiveTailHub::with_config(LiveTailConfig {
+            buffer_capacity: 2,
+            lag_grace_period: Duration::from_secs(60),
+        });
+        let rx = hub.subscribe(&thread_a());
+
+        // Fill buffer and trigger lag.
+        hub.publish(&[
+            sample_committed(&thread_a(), 0),
+            sample_committed(&thread_a(), 1),
+        ]);
+        hub.publish(&[sample_committed(&thread_a(), 2)]);
+        assert_eq!(hub.subscriber_count(&thread_a()), 1);
+
+        // Drop the receiver while lagging.
+        drop(rx);
+
+        // Next publish detects the closed channel and cleans up
+        // immediately — does not wait for the 60s grace period.
+        hub.publish(&[sample_committed(&thread_a(), 3)]);
         assert_eq!(hub.subscriber_count(&thread_a()), 0);
     }
 
