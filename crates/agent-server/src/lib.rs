@@ -139,6 +139,9 @@ pub use journal::{
 // Phase 6.1: durable event committer and thread-scoped sequencing.
 pub use journal::{CommittedEvent, EventRepository, InMemoryEventRepository};
 
+// Phase 6.3: replay API and race-free replay-to-live handoff.
+pub use journal::{EventNotifier, EventReceiver, EventStream, StreamEvent, stream_events};
+
 // ── Re-exports that validate the dependency edges ────────────────────
 //
 // Each `use` below proves that the corresponding narrow crate is

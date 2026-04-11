@@ -488,12 +488,47 @@
 //!   `get_events`.
 //! - [`event_repository::InMemoryEventRepository`] is the reference
 //!   in-memory implementation.
+//!
+//! # Phase 6.3 — Replay API and race-free replay-to-live handoff (ENG-7948)
+//!
+//! Phase 6.3 adds the **replay surface** — the public API for
+//! reconnecting clients to resume from their last-seen sequence and
+//! seamlessly transition to live committed event delivery.
+//!
+//! Key design properties:
+//!
+//! 1. **Race-free handoff** — the subscribe-before-read protocol
+//!    ensures no event committed after the subscribe call is missed,
+//!    even under concurrent production.  Overlap between the durable
+//!    replay and live tail is deduplicated by tracking the last
+//!    yielded sequence.
+//! 2. **No gaps, no duplicates** — the `(subscribe → watermark →
+//!    replay → live)` ordering closes every race window at the
+//!    watermark boundary.
+//! 3. **Unpublished events never exposed** — clients only see events
+//!    that have been durably committed to the [`event_repository::EventRepository`].
+//!    The live tail is fed by [`event_notifier::EventNotifier::notify`],
+//!    which callers invoke only after durable commit.
+//! 4. **Thread-scoped, stateless** — each stream is bound to a single
+//!    thread. There is no hidden per-connection cursor state on the
+//!    server; the client's `after_sequence` is the only resume token.
+//!
+//! - [`event_notifier::EventNotifier`] is the same-process live tail
+//!   notification hub backed by per-thread broadcast channels.
+//! - [`event_stream::stream_events`] is the public entry point that
+//!   returns an [`event_stream::EventStream`] with the race-free
+//!   handoff baked in.
+//! - [`event_stream::StreamEvent`] is the stream item type:
+//!   `Event(CommittedEvent)` for normal delivery, `Lagged { skipped }`
+//!   when the subscriber falls behind the broadcast buffer.
 
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
 pub mod committed_event;
+pub mod event_notifier;
 pub mod event_repository;
+pub mod event_stream;
 pub mod execution_context;
 pub mod execution_intent;
 pub mod message;
@@ -502,6 +537,8 @@ pub mod message_store;
 mod persistence_regression;
 pub mod recovery;
 pub mod redaction;
+#[cfg(test)]
+mod replay_test;
 pub mod staged;
 pub mod store;
 pub mod task;
@@ -517,7 +554,9 @@ pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpo
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
+pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
+pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use execution_intent::{
     ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
