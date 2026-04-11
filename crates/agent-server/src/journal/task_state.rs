@@ -13,7 +13,8 @@
 //! |--------------|---------------------|---------------------------|
 //! | [`super::TaskStatus::WaitingOnChildren`] | [`TaskState::WaitingOnChildren`] | A root turn that has spawned tool-runtime children carries a versioned [`ContinuationEnvelope`] so the parent loop can resume from the same point once every child reaches a terminal state. |
 //! | [`super::TaskStatus::AwaitingConfirmation`] | [`TaskState::AwaitingConfirmation`] | A task paused on a user confirmation needs both the continuation **and** any prepared listen/execute operation that the SDK staged before the pause, so the resume path can either execute or cancel it. |
-//! | every other status | [`TaskState::None`] | Active rows (`Pending`, `Running`, `Queued`) and terminal rows (`Completed`, `Failed`, `Cancelled`) carry no durable per-pause state — the row's status itself is enough. |
+//! | `Pending` / `Running` after child aggregation | [`TaskState::ReadyToResume`] | A parent whose child batch has drained carries the saved continuation and suspended messages until a worker resumes the turn. |
+//! | every other status | [`TaskState::None`] | Fresh runnable rows (`Pending`, `Running`, `Queued`) and terminal rows (`Completed`, `Failed`, `Cancelled`) carry no durable resume payload — the row's status itself is enough. |
 //!
 //! Cross-row invariants (`state` ↔ `status`) are enforced by
 //! [`super::AgentTask::validate`] so the schema layer catches
@@ -154,6 +155,12 @@ pub enum TaskState {
     /// Unlike [`TaskState::None`], this variant is **not** a "blank
     /// slate" — the worker must inspect it and branch into the resume
     /// path rather than starting a fresh turn.
+    ///
+    /// The state is valid on both [`TaskStatus::Pending`] (waiting to
+    /// be re-acquired) and [`TaskStatus::Running`] (already acquired
+    /// and actively resuming). The canonical durable form is
+    /// [`TaskStatus::Pending`]; acquisition preserves the payload while
+    /// flipping the row to `Running`.
     ReadyToResume {
         /// Versioned continuation envelope from the original
         /// suspension. Contains pending tool calls, usage, and agent
@@ -175,17 +182,59 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    /// Returns the [`TaskStatus`] this state is paired with, or `None`
-    /// if the variant is compatible with any non-paused status.
+    /// Returns the canonical [`TaskStatus`] this state is paired with,
+    /// or `None` if the variant is compatible with any non-paused
+    /// status.
     ///
     /// Used by [`super::AgentTask::validate`] to enforce the
     /// state ↔ status invariant in a single place.
     #[must_use]
     pub const fn required_status(&self) -> Option<TaskStatus> {
         match self {
-            Self::None | Self::ReadyToResume { .. } => None,
+            Self::None => None,
             Self::WaitingOnChildren { .. } => Some(TaskStatus::WaitingOnChildren),
             Self::AwaitingConfirmation { .. } => Some(TaskStatus::AwaitingConfirmation),
+            Self::ReadyToResume { .. } => Some(TaskStatus::Pending),
+        }
+    }
+
+    /// Human-readable description of the statuses this state may
+    /// legally coexist with.
+    ///
+    /// Used by [`super::TaskSchemaError::StateStatusMismatch`] so
+    /// schema validation can explain multi-status states such as
+    /// [`TaskState::ReadyToResume`] without discarding the canonical
+    /// durable form returned by [`Self::required_status`].
+    #[must_use]
+    pub const fn compatible_statuses_label(&self) -> &'static str {
+        match self {
+            Self::None => "any non-paused status",
+            Self::WaitingOnChildren { .. } => "WaitingOnChildren",
+            Self::AwaitingConfirmation { .. } => "AwaitingConfirmation",
+            Self::ReadyToResume { .. } => "Pending or Running",
+        }
+    }
+
+    /// Returns `true` when the state may legally coexist with `status`.
+    ///
+    /// [`TaskState::ReadyToResume`] is the only non-terminal payload
+    /// that intentionally spans two statuses: `Pending` while the row
+    /// waits in the runnable queue and `Running` after acquisition
+    /// while the worker resumes the suspended turn.
+    #[must_use]
+    pub const fn is_compatible_with_status(&self, status: TaskStatus) -> bool {
+        match self {
+            Self::None => !matches!(
+                status,
+                TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
+            ),
+            Self::WaitingOnChildren { .. } => matches!(status, TaskStatus::WaitingOnChildren),
+            Self::AwaitingConfirmation { .. } => {
+                matches!(status, TaskStatus::AwaitingConfirmation)
+            }
+            Self::ReadyToResume { .. } => {
+                matches!(status, TaskStatus::Pending | TaskStatus::Running)
+            }
         }
     }
 
@@ -418,9 +467,23 @@ mod tests {
             serde_json::to_value(&recovered)?,
             serde_json::to_value(&ready)?
         );
-        assert_eq!(recovered.required_status(), None);
+        assert_eq!(recovered.required_status(), Some(TaskStatus::Pending));
         assert!(recovered.continuation().is_some());
         Ok(())
+    }
+
+    #[test]
+    fn ready_to_resume_state_accepts_pending_and_running() {
+        let state = TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
+        };
+
+        assert!(state.is_compatible_with_status(TaskStatus::Pending));
+        assert!(state.is_compatible_with_status(TaskStatus::Running));
+        assert!(!state.is_compatible_with_status(TaskStatus::Queued));
+        assert_eq!(state.compatible_statuses_label(), "Pending or Running");
     }
 
     #[test]

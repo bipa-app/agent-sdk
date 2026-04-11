@@ -6,6 +6,7 @@ CREATE TABLE agent_sdk_tasks (
     root_id TEXT NOT NULL,
     depth BIGINT NOT NULL,
     thread_id TEXT NOT NULL,
+    submitted_input_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     worker_id TEXT NULL,
     lease_id TEXT NULL,
     lease_expires_at TIMESTAMPTZ NULL,
@@ -147,19 +148,17 @@ CREATE TABLE agent_sdk_tasks (
                 )
                 OR (
                     state_json ->> 'kind' = 'none'
+                    AND status IN ('queued', 'pending', 'running')
+                    AND pending_child_count = 0
+                )
+                OR (
+                    state_json ->> 'kind' = 'none'
                     AND status IN ('completed', 'failed', 'cancelled')
                     AND pending_child_count = 0
                 )
                 OR (
-                    state_json ->> 'kind' IN ('none', 'ready_to_resume')
-                    AND status NOT IN (
-                        'queued',
-                        'waiting_on_children',
-                        'awaiting_confirmation',
-                        'completed',
-                        'failed',
-                        'cancelled'
-                    )
+                    state_json ->> 'kind' = 'ready_to_resume'
+                    AND status IN ('pending', 'running')
                     AND pending_child_count = 0
                 )
             )

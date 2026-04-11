@@ -12,8 +12,10 @@
 //!
 //! If any step fails the function returns `Err` and no subsequent
 //! steps execute. For the in-memory stores each individual call is
-//! internally atomic (single write-lock scope). A real database
-//! backend would wrap all four calls in a transaction.
+//! internally atomic (single write-lock scope). Durable backends can
+//! expose an atomic transaction hook through
+//! [`super::thread_store::ThreadStore::atomic_completed_turn_committer`]
+//! so this helper routes steps 1-4 through one database transaction.
 //!
 //! # Guarantees
 //!
@@ -128,16 +130,37 @@ pub struct CommitOutcome {
 ///
 /// Returns an error if any step fails. Callers should treat a
 /// partial failure as a bug — the in-memory stores guarantee
-/// per-call atomicity, and a database backend should use a
-/// transaction.
+/// per-call atomicity, and durable backends should surface an atomic
+/// transaction hook.
 pub async fn commit_completed_turn(
-    params: CompletedTurnCommit,
+    mut params: CompletedTurnCommit,
     thread_store: &dyn ThreadStore,
     message_store: &dyn MessageProjectionStore,
     turn_attempt_store: &dyn TurnAttemptStore,
     checkpoint_store: &dyn CheckpointStore,
     event_repo: &dyn EventRepository,
 ) -> Result<CommitOutcome> {
+    let events = std::mem::take(&mut params.events);
+    let thread_id_for_events = params.thread_id.clone();
+
+    if let Some(committer) = thread_store.atomic_completed_turn_committer() {
+        let mut outcome = committer
+            .commit_completed_turn_atomic(params)
+            .await
+            .context("commit: atomic completed-turn transaction")?;
+
+        outcome.committed_events = if events.is_empty() {
+            Vec::new()
+        } else {
+            event_repo
+                .commit_event_batch(&thread_id_for_events, events, outcome.checkpoint.created_at)
+                .await
+                .context("commit: persist lifecycle events")?
+        };
+
+        return Ok(outcome);
+    }
+
     // 1. Close the turn attempt.
     let closed_attempt = turn_attempt_store
         .close_attempt(
@@ -164,9 +187,6 @@ pub async fn commit_completed_turn(
     //    not the delta — recovery must be able to restore the thread
     //    to this turn without replaying prior turns.
     //
-    // Clone thread_id before checkpoint consumes it — step 5 needs
-    // a reference for the event batch commit.
-    let thread_id_for_events = params.thread_id.clone();
     let checkpoint = checkpoint_store
         .commit_checkpoint(NewCheckpointParams {
             thread_id: params.thread_id,
@@ -182,11 +202,11 @@ pub async fn commit_completed_turn(
 
     // 5. Commit lifecycle events. Skipped when no events are provided
     //    (e.g. callers that don't produce lifecycle events yet).
-    let committed_events = if params.events.is_empty() {
+    let committed_events = if events.is_empty() {
         Vec::new()
     } else {
         event_repo
-            .commit_event_batch(&thread_id_for_events, params.events, params.now)
+            .commit_event_batch(&thread_id_for_events, events, params.now)
             .await
             .context("commit: persist lifecycle events")?
     };

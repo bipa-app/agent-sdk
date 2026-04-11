@@ -563,6 +563,7 @@ pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
 pub mod committed_event;
+pub mod completed_turn_transaction;
 pub mod event_notifier;
 pub mod event_repository;
 pub mod event_stream;
@@ -594,6 +595,7 @@ pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpo
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
+pub use completed_turn_transaction::AtomicCompletedTurnCommitter;
 pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};

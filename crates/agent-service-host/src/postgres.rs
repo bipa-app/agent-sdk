@@ -16,6 +16,7 @@
 pub mod migrations;
 pub mod repository;
 pub mod schema;
+pub mod store;
 
 #[cfg(test)]
 mod tests {
@@ -104,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_state_check_rejects_json_null_kind_and_queued_ready_to_resume() -> Result<()> {
+    fn waiting_state_check_allows_queued_none_and_rejects_queued_ready_to_resume() -> Result<()> {
         let sql_bundle = durable_core_migrations()
             .iter()
             .map(|migration| migration.sql)
@@ -116,7 +117,13 @@ mod tests {
         );
         ensure!(
             sql_bundle.contains(
-                "state_json ->> 'kind' IN ('none', 'ready_to_resume')\n                    AND status NOT IN (\n                        'queued',"
+                "state_json ->> 'kind' = 'none'\n                    AND status IN ('queued', 'pending', 'running')"
+            ),
+            "waiting-state check must allow queued rows with the default none state",
+        );
+        ensure!(
+            sql_bundle.contains(
+                "state_json ->> 'kind' = 'ready_to_resume'\n                    AND status IN ('pending', 'running')"
             ),
             "waiting-state check must exclude queued rows from ready_to_resume",
         );

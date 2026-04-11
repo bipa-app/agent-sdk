@@ -38,6 +38,7 @@ sqlx.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

@@ -486,10 +486,10 @@ pub enum TaskSchemaError {
     HeartbeatWorkerMismatch,
     #[error("heartbeat lease_id does not match the task's current lease")]
     HeartbeatLeaseMismatch,
-    #[error("task state {state_kind} requires status {required_status:?}, found {actual_status:?}")]
+    #[error("task state {state_kind} requires status {expected_statuses}, found {actual_status:?}")]
     StateStatusMismatch {
         state_kind: &'static str,
-        required_status: TaskStatus,
+        expected_statuses: &'static str,
         actual_status: TaskStatus,
     },
     #[error(
@@ -901,36 +901,40 @@ impl AgentTask {
     ///   with [`TaskSchemaError::PausedStatusMissingPayload`] so a
     ///   worker can never look at the row, see the paused status,
     ///   and find no continuation to resume.
-    /// - A non-paused status that carries a paused payload is
+    /// - A status that is incompatible with the current payload is
     ///   rejected with [`TaskSchemaError::StateStatusMismatch`] so
-    ///   the row can never claim to be runnable while still holding
-    ///   stale resume state.
+    ///   the row can never claim an impossible lifecycle shape. The
+    ///   one intentional exception is
+    ///   [`TaskState::ReadyToResume`], which is valid both while the
+    ///   parent waits in `Pending` and after acquisition in
+    ///   `Running`.
     ///
     /// The mismatch returns the variant name as a `&'static str` for
     /// clean error messages without coupling the schema to the wire
     /// format.
-    fn validate_state_status_invariant(&self) -> Result<(), TaskSchemaError> {
+    const fn validate_state_status_invariant(&self) -> Result<(), TaskSchemaError> {
         let state_kind: &'static str = match &self.state {
             TaskState::None => "none",
             TaskState::WaitingOnChildren { .. } => "waiting_on_children",
             TaskState::AwaitingConfirmation { .. } => "awaiting_confirmation",
             TaskState::ReadyToResume { .. } => "ready_to_resume",
         };
-        match self.state.required_status() {
-            Some(required) if required != self.status => {
-                Err(TaskSchemaError::StateStatusMismatch {
-                    state_kind,
-                    required_status: required,
-                    actual_status: self.status,
-                })
-            }
-            None if matches!(
-                self.status,
-                TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
-            ) =>
+        match &self.state {
+            TaskState::None
+                if matches!(
+                    self.status,
+                    TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
+                ) =>
             {
                 Err(TaskSchemaError::PausedStatusMissingPayload {
                     status: self.status,
+                })
+            }
+            _ if !self.state.is_compatible_with_status(self.status) => {
+                Err(TaskSchemaError::StateStatusMismatch {
+                    state_kind,
+                    expected_statuses: self.state.compatible_statuses_label(),
+                    actual_status: self.status,
                 })
             }
             _ => Ok(()),
@@ -1780,6 +1784,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn validate_ready_to_resume_mismatch_reports_both_valid_statuses() {
+        let mut task = fresh_root();
+        task.status = TaskStatus::Queued;
+        task.state = TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
+        };
+
+        let err = task
+            .validate()
+            .expect_err("queued ready-to-resume must fail");
+        assert_eq!(
+            err,
+            TaskSchemaError::StateStatusMismatch {
+                state_kind: "ready_to_resume",
+                expected_statuses: "Pending or Running",
+                actual_status: TaskStatus::Queued,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "task state ready_to_resume requires status Pending or Running, found Queued"
+        );
+    }
+
     // ── blocks_root_admission classification ──────────────────────
     //
     // Phase 2.2's "one active root per thread" partial-unique invariant
@@ -2081,6 +2112,45 @@ mod tests {
             matches!(recomputed.state, TaskState::ReadyToResume { .. }),
             "Pending row must hold TaskState::ReadyToResume after recompute resume"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mark_running_preserves_ready_to_resume_payload() -> Result<()> {
+        let running = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w1"),
+                LeaseId::from_string("l1"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("running")?;
+        let waiting = running
+            .wait_on_children(
+                1,
+                SuspensionPayload {
+                    continuation: sample_continuation(),
+                    suspended_messages: Vec::new(),
+                },
+                Vec::new(),
+                t_plus(2),
+            )
+            .context("wait")?;
+        let resumable = waiting
+            .recompute_pending_children(0, t_plus(3))
+            .context("recompute")?;
+
+        let reacquired = resumable
+            .mark_running(
+                WorkerId::from_string("w2"),
+                LeaseId::from_string("l2"),
+                t_plus(90),
+                t_plus(4),
+            )
+            .context("reacquire")?;
+
+        assert_eq!(reacquired.status, TaskStatus::Running);
+        assert!(matches!(reacquired.state, TaskState::ReadyToResume { .. }));
         Ok(())
     }
 

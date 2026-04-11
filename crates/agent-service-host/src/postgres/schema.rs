@@ -85,6 +85,12 @@ const AGENT_SDK_TASK_COLUMNS: &[ColumnContract] = &[
         notes: "Every task is thread-bound so queueing and recovery stay local, and the row must reference an existing thread.",
     },
     ColumnContract {
+        name: "submitted_input_json",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Durable root-turn submission payload captured from the external transport.",
+    },
+    ColumnContract {
         name: "worker_id",
         sql_type: "TEXT",
         nullable: true,
@@ -237,7 +243,7 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_tasks_waiting_state_check",
-        invariant: "Paused-state JSON kind must be a non-null known value; waiting counters agree with task status; terminal rows reset state kind to `none`; `ready_to_resume` is not valid for queued rows.",
+        invariant: "Paused-state JSON kind must be a non-null known value; waiting counters agree with task status; terminal rows reset state kind to `none`; `ready_to_resume` is valid only for pending/running rows and never for queued rows.",
     },
 ];
 
