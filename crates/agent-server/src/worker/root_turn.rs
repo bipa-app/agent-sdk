@@ -288,6 +288,10 @@ pub async fn execute_root_turn(
     let commit_now = OffsetDateTime::now_utc();
 
     // 3. Branch: tool calls → suspend; text-only → commit.
+    //
+    // The Start event is committed inside each branch, AFTER its
+    // idempotency guard fires, so a stale-lease worker that
+    // re-acquired the task cannot produce a duplicate Start.
     if response.has_tool_use() {
         return suspend_at_tool_boundary(inputs, user_prompt, response, attempt, deps, commit_now)
             .await;
@@ -359,15 +363,21 @@ async fn commit_text_only_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize agent state")?;
 
+    // Build lifecycle events with Start prepended. Start is included
+    // in the events vec passed to commit_completed_turn so it is
+    // committed atomically as step 5 — after all CAS-guarded state
+    // projections succeed. This prevents a stale-lease worker from
+    // producing orphaned Start events.
     let duration = (now - attempt.opened_at).unsigned_abs();
-    let lifecycle_events = build_turn_complete_events(
+    let mut lifecycle_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
+    lifecycle_events.extend(build_turn_complete_events(
         &response,
         thread_id,
         turn_number,
         &turn_usage,
         &drained_state.total_usage,
         duration,
-    );
+    ));
 
     let commit = commit_completed_turn(
         CompletedTurnCommit {
@@ -659,8 +669,33 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
     }
 }
 
-/// Build lifecycle events for a completed turn: optional `Refusal`,
-/// `TurnComplete`, and `Done`.
+/// Extract `Thinking` and `Text` content events from the LLM response.
+///
+/// These events give replay observers the fine-grained content that
+/// the root turn produced — thinking blocks (model reasoning) and
+/// text blocks (final response). Tool-use blocks are excluded because
+/// they are covered by `ToolCallStart` events on the suspension path.
+fn build_content_events(response: &llm::ChatResponse) -> Vec<AgentEvent> {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                Some(AgentEvent::thinking(&response.id, thinking))
+            }
+            llm::ContentBlock::Text { text } if !text.is_empty() => {
+                Some(AgentEvent::text(&response.id, text))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build lifecycle events for a completed turn: content events,
+/// optional `Refusal`, `TurnComplete`, and `Done`.
+///
+/// Content events (`Thinking`, `Text`) are emitted first so replay
+/// observers see the model's output before the lifecycle edges.
 fn build_turn_complete_events(
     response: &llm::ChatResponse,
     thread_id: &agent_sdk_core::ThreadId,
@@ -669,7 +704,7 @@ fn build_turn_complete_events(
     total_usage: &TokenUsage,
     duration: std::time::Duration,
 ) -> Vec<AgentEvent> {
-    let mut events = Vec::new();
+    let mut events = build_content_events(response);
     if response.stop_reason == Some(llm::StopReason::Refusal) {
         events.push(AgentEvent::refusal(
             response.id.clone(),
@@ -716,6 +751,7 @@ async fn suspend_at_tool_boundary(
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
+    let thread_id = &inputs.bootstrap.thread_id;
 
     // Idempotency guard: re-read the task from the durable store to
     // detect if a prior worker already completed this suspension (e.g.
@@ -744,6 +780,8 @@ async fn suspend_at_tool_boundary(
         );
     }
 
+    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
+
     // 1. Close the turn attempt — the LLM call itself succeeded.
     let close_params = build_close_params(&response, &attempt);
     deps.attempt_store
@@ -771,6 +809,10 @@ async fn suspend_at_tool_boundary(
     let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
         .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
+
+    // Build content events (Thinking) from the tool-call response so
+    // replay observers see the model's reasoning before tool dispatch.
+    let content_events = build_content_events(&response);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events: Vec<AgentEvent> = continuation
@@ -805,37 +847,25 @@ async fn suspend_at_tool_boundary(
         .await
         .context("spawn tool children")?;
 
-    // Commit ToolCallStart events after state transition.
-    let committed_events = commit_tool_call_start_events(
-        deps.event_repo,
-        &inputs.bootstrap.thread_id,
-        tool_call_events,
-        now,
-    )
-    .await?;
+    // Commit Start + content events (Thinking) + ToolCallStart events
+    // in a single batch AFTER spawn_tool_children. Since
+    // spawn_tool_children is CAS-guarded (only the lease-holder can
+    // succeed), only the winning worker writes events — preventing
+    // orphaned Start events from stale-lease workers.
+    let mut suspension_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
+    suspension_events.extend(content_events);
+    suspension_events.extend(tool_call_events);
+    let committed_events = deps
+        .event_repo
+        .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
+        .await
+        .context("commit suspension events")?;
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
         committed_events,
     })
-}
-
-/// Commit a batch of `ToolCallStart` events, returning an empty vec
-/// when the input is empty.
-async fn commit_tool_call_start_events(
-    event_repo: &dyn EventRepository,
-    thread_id: &agent_sdk_core::ThreadId,
-    events: Vec<AgentEvent>,
-    now: OffsetDateTime,
-) -> Result<Vec<CommittedEvent>> {
-    if events.is_empty() {
-        return Ok(Vec::new());
-    }
-    event_repo
-        .commit_event_batch(thread_id, events, now)
-        .await
-        .context("commit ToolCallStart events")
 }
 
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
@@ -1358,6 +1388,9 @@ async fn suspend_resumed_turn(
         .map(|_| ChildSpawnSpec::new(child_max_attempts))
         .collect();
 
+    // Build content events (Thinking) from the resume response.
+    let content_events = build_content_events(&response);
+
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events: Vec<AgentEvent> = new_continuation
         .payload
@@ -1390,14 +1423,17 @@ async fn suspend_resumed_turn(
         .await
         .context("re-spawn tool children on resume")?;
 
-    // Commit ToolCallStart events after state transition.
-    let committed_events = commit_tool_call_start_events(
-        deps.event_repo,
-        &inputs.bootstrap.thread_id,
-        tool_call_events,
-        now,
-    )
-    .await?;
+    // Commit content events (Thinking) followed by ToolCallStart events.
+    let mut suspension_events = content_events;
+    suspension_events.extend(tool_call_events);
+    let committed_events = if suspension_events.is_empty() {
+        Vec::new()
+    } else {
+        deps.event_repo
+            .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
+            .await
+            .context("commit resume suspension events")?
+    };
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,

@@ -91,6 +91,8 @@ mod guarded_execution_test;
 #[cfg(test)]
 mod mutation_safety_test;
 #[cfg(test)]
+mod replay_coverage_test;
+#[cfg(test)]
 mod root_turn_test;
 #[cfg(test)]
 mod tool_task_test;
@@ -103,7 +105,8 @@ pub use root_turn::{
     fail_root_turn, resume_from_children, resume_root_turn,
 };
 pub use tool_task::{
-    ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap,
+    ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,
+    resolve_tool_bootstrap,
 };
 
 // Phase 5.2: re-export durable execution intent from journal.

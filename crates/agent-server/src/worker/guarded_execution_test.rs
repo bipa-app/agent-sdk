@@ -314,7 +314,7 @@ async fn replay_safe_tool_bypasses_intent_persistence() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::ReplaySafe,
-        |_info| async { Ok(ToolResult::success("hello")) },
+        |_info, _collector| async { Ok(ToolResult::success("hello")) },
         t_plus(20),
     )
     .await?;
@@ -365,7 +365,7 @@ async fn side_effecting_tool_persists_intent_and_completes() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async { Ok(ToolResult::success("transfer done")) },
+        |_info, _collector| async { Ok(ToolResult::success("transfer done")) },
         t_plus(20),
     )
     .await?;
@@ -420,7 +420,7 @@ async fn fail_closed_when_intent_persist_fails() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async {
+        |_info, _collector| async {
             panic!("executor should never be called when intent persist fails");
         },
         t_plus(20),
@@ -500,7 +500,7 @@ async fn retry_blocked_when_intent_already_completed() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async {
+        |_info, _collector| async {
             panic!("executor should not be called for already-completed operation");
         },
         t_plus(20),
@@ -564,7 +564,7 @@ async fn retry_blocked_when_intent_ambiguous_in_flight() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async {
+        |_info, _collector| async {
             panic!("executor should not be called for ambiguous in-flight");
         },
         t_plus(20),
@@ -629,7 +629,7 @@ async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async {
+        |_info, _collector| async {
             panic!("executor should not be called for failed side-effecting operation");
         },
         t_plus(20),
@@ -698,7 +698,7 @@ async fn retry_allowed_when_replay_safe_intent_failed() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::ReplaySafe,
-        |_info| async { Ok(ToolResult::success("retry succeeded")) },
+        |_info, _collector| async { Ok(ToolResult::success("retry succeeded")) },
         t_plus(20),
     )
     .await?;
@@ -744,7 +744,7 @@ async fn side_effecting_failure_records_intent_as_failed() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async { Err(anyhow::anyhow!("insufficient funds")) },
+        |_info, _collector| async { Err(anyhow::anyhow!("insufficient funds")) },
         t_plus(20),
     )
     .await?;
@@ -809,7 +809,7 @@ async fn cancellation_records_intent_as_failed() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_info| async { Ok(ToolResult::success("should not reach")) },
+        |_info, _collector| async { Ok(ToolResult::success("should not reach")) },
         t_plus(20),
     )
     .await?;

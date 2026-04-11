@@ -461,7 +461,7 @@ async fn execute_success_completes_child_and_decrements_parent() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("command output")) },
+        |_info, _collector| async { Ok(ToolResult::success("command output")) },
         t_plus(20),
     )
     .await?;
@@ -524,7 +524,7 @@ async fn execute_failure_fails_child_without_corrupting_parent() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Err(anyhow::anyhow!("command failed with exit code 1")) },
+        |_info, _collector| async { Err(anyhow::anyhow!("command failed with exit code 1")) },
         t_plus(20),
     )
     .await?;
@@ -583,7 +583,7 @@ async fn execute_cancelled_before_tool_returns_cancelled() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("should not reach")) },
+        |_info, _collector| async { Ok(ToolResult::success("should not reach")) },
         t_plus(20),
     )
     .await?;
@@ -641,7 +641,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("ls output")) },
+        |_info, _collector| async { Ok(ToolResult::success("ls output")) },
         t_plus(20),
     )
     .await?;
@@ -676,7 +676,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("file contents")) },
+        |_info, _collector| async { Ok(ToolResult::success("file contents")) },
         t_plus(30),
     )
     .await?;
@@ -731,7 +731,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("ok")) },
+        |_info, _collector| async { Ok(ToolResult::success("ok")) },
         t_plus(20),
     )
     .await?;
@@ -754,7 +754,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Err(anyhow::anyhow!("file not found")) },
+        |_info, _collector| async { Err(anyhow::anyhow!("file not found")) },
         t_plus(30),
     )
     .await?;
@@ -797,7 +797,7 @@ async fn execute_with_wrong_lease_fails_at_complete() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("ok")) },
+        |_info, _collector| async { Ok(ToolResult::success("ok")) },
         t_plus(20),
     )
     .await;

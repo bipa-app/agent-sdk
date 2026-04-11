@@ -530,7 +530,7 @@ pub async fn guarded_tool_execution<F, Fut>(
     now: OffsetDateTime,
 ) -> anyhow::Result<ToolTaskOutcome>
 where
-    F: FnOnce(PendingToolCallInfo) -> Fut,
+    F: FnOnce(PendingToolCallInfo, crate::worker::tool_task::ToolEventCollector) -> Fut,
     Fut: Future<Output = anyhow::Result<ToolResult>>,
 {
     let operation_id = OperationId::new(&bootstrap.task_id, &bootstrap.tool_call.id);
