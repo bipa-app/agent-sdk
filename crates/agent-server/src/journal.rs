@@ -466,6 +466,7 @@ pub mod message_store;
 #[cfg(test)]
 mod persistence_regression;
 pub mod recovery;
+pub mod redaction;
 pub mod staged;
 pub mod store;
 pub mod task;
@@ -473,6 +474,7 @@ pub mod task_state;
 pub mod thread;
 pub mod thread_recover;
 pub mod thread_store;
+pub mod tool_audit;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
 
@@ -490,6 +492,9 @@ pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
+pub use redaction::{
+    REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
+};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
 pub use task::{
@@ -500,6 +505,10 @@ pub use task_state::TaskState;
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
+pub use tool_audit::{
+    InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventId, ToolAuditEventKind,
+    ToolAuditEventParams, ToolAuditEventStore,
+};
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,
     TurnAttemptSchemaError,
