@@ -521,6 +521,43 @@
 //! - [`event_stream::StreamEvent`] is the stream item type:
 //!   `Event(CommittedEvent)` for normal delivery, `Lagged { skipped }`
 //!   when the subscriber falls behind the broadcast buffer.
+//!
+//! # Phase 6.4 — Live tail hub, lag detection, and bounded-wait disconnect (ENG-7949)
+//!
+//! Phase 6.4 adds the **live tail hub** — a same-process fanout surface
+//! with per-subscriber bounded buffers, lag detection, grace-period
+//! handling, and replay-required disconnect semantics.
+//!
+//! Key design properties:
+//!
+//! 1. **Per-subscriber isolation** — each subscriber gets an independent
+//!    bounded `mpsc` channel.  A slow subscriber never affects other
+//!    subscribers on the same thread.
+//! 2. **Workers never block** — [`live_tail::LiveTailHub::publish`]
+//!    uses `try_send` and never awaits.  Slow or dead subscribers are
+//!    skipped, not waited on.
+//! 3. **Lag detection with bounded-wait grace period** — when a
+//!    subscriber's buffer fills up, the hub enters a grace period.
+//!    During the grace period, the hub stops delivering events to the
+//!    subscriber (they are durable and recoverable via replay).  If
+//!    the subscriber remains behind after the grace period, the hub
+//!    disconnects with replay-required semantics.
+//! 4. **Replay-required disconnect contract** — the disconnect signal
+//!    includes the last successfully delivered durable sequence.  The
+//!    subscriber reconnects via [`event_stream::stream_events`] with
+//!    `after_sequence` set to this value.
+//! 5. **Only committed envelopes** — the hub delivers events only
+//!    after they have been durably committed to the
+//!    [`event_repository::EventRepository`].
+//!
+//! - [`live_tail::LiveTailHub`] is the fanout hub with per-subscriber
+//!   bounded buffers and lag management.
+//! - [`live_tail::LiveTailReceiver`] is the subscriber's receive handle.
+//! - [`live_tail::LiveTailEvent`] is the stream item type:
+//!   `Event(CommittedEvent)` for normal delivery,
+//!   `ReplayRequired { last_delivered_sequence }` on lag disconnect.
+//! - [`live_tail::LiveTailConfig`] controls buffer capacity and grace
+//!   period duration.
 
 pub mod checkpoint;
 pub mod checkpoint_store;
@@ -531,6 +568,9 @@ pub mod event_repository;
 pub mod event_stream;
 pub mod execution_context;
 pub mod execution_intent;
+pub mod live_tail;
+#[cfg(test)]
+mod live_tail_test;
 pub mod message;
 pub mod message_store;
 #[cfg(test)]
@@ -563,6 +603,7 @@ pub use execution_intent::{
     RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
     guarded_tool_execution,
 };
+pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use recovery::{
