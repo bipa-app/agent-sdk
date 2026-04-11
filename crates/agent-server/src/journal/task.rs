@@ -502,6 +502,23 @@ pub enum TaskSchemaError {
 // AgentTask
 // ─────────────────────────────────────────────────────────────────────
 
+/// Durably captured client input admitted to a root task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubmittedInputItem {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
+    Document {
+        media_type: String,
+        data_base64: String,
+    },
+}
+
 /// One row in the `agent_tasks` journal.
 ///
 /// An `AgentTask` carries everything a worker needs to reason about a unit
@@ -535,6 +552,17 @@ pub struct AgentTask {
     /// Present on root tasks and forwarded to children for locality.
     /// Required on every task kind so rows can be queried per thread.
     pub thread_id: ThreadId,
+
+    // ── submitted input ─────────────────────────────────────
+    /// Durably captured root-turn input admitted through an external
+    /// transport.
+    ///
+    /// This is empty for schema-only fixtures created with
+    /// [`Self::new_root_turn`]. Transport-owned submissions use
+    /// [`Self::new_root_turn_with_input`] so a background worker can
+    /// execute the task without relying on an in-memory side channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submitted_input: Vec<SubmittedInputItem>,
 
     // ── lease ───────────────────────────────────────────────
     pub worker_id: Option<WorkerId>,
@@ -621,6 +649,7 @@ impl AgentTask {
             parent_id: None,
             depth: 0,
             thread_id,
+            submitted_input: Vec::new(),
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,
@@ -636,6 +665,20 @@ impl AgentTask {
             updated_at: now,
             completed_at: None,
         }
+    }
+
+    /// Allocate a fresh [`TaskKind::RootTurn`] with durably captured
+    /// external input.
+    #[must_use]
+    pub fn new_root_turn_with_input(
+        thread_id: ThreadId,
+        input: Vec<SubmittedInputItem>,
+        now: OffsetDateTime,
+        max_attempts: u32,
+    ) -> Self {
+        let mut task = Self::new_root_turn(thread_id, now, max_attempts);
+        task.submitted_input = input;
+        task
     }
 
     /// Allocate a fresh child task under `parent`.
@@ -663,6 +706,7 @@ impl AgentTask {
             root_id: parent.root_id.clone(),
             depth: parent.depth.saturating_add(1),
             thread_id: parent.thread_id.clone(),
+            submitted_input: Vec::new(),
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,

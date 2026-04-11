@@ -20,7 +20,11 @@ use std::sync::Arc;
 use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
 use agent_service_host::config::ServiceConfig;
+use agent_service_host::grpc::GrpcTransport;
 use agent_service_host::host::ServiceHost;
+use agent_service_host::runtime::{
+    AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
+};
 use anyhow::{Context, Result};
 use tracing::info;
 
@@ -43,14 +47,34 @@ fn main() -> Result<()> {
         policy: RuntimePolicy::server_default(),
     };
     let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(default_definition));
+    let runtime = Arc::new(ExecutionRuntime::new(
+        Arc::new(StaticProviderResolver::new()),
+        Arc::new(NoopToolExecutor),
+        Arc::new(AllowAllConfirmationPolicy),
+    ));
 
-    let host = ServiceHost::new(config, registry).context("creating service host")?;
+    let grpc_enabled = config.transport.grpc_enabled;
+    let grpc_addr = config.transport.grpc_addr;
+    let lease_duration = config.worker.lease_duration();
+    let host = ServiceHost::new(config, registry, Arc::clone(&runtime))
+        .context("creating service host")?;
+    let stores = host.stores().clone();
+    let health = Arc::clone(host.health());
+    let shutdown = host.shutdown_token();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?
-        .block_on(host.run())
+        .block_on(async move {
+            if grpc_enabled {
+                let grpc = GrpcTransport::new(stores, runtime, health, shutdown, lease_duration);
+                tokio::try_join!(host.run(), grpc.serve(grpc_addr))?;
+                Ok(())
+            } else {
+                host.run().await
+            }
+        })
 }
 
 /// Resolve and load configuration.

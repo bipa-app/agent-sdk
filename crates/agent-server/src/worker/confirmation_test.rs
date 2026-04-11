@@ -35,9 +35,9 @@ use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_core::{PendingToolCallInfo, ThreadId, ToolResult, ToolTier};
+use agent_sdk_core::{AgentEvent, PendingToolCallInfo, ThreadId, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -344,7 +344,7 @@ async fn pause_transitions_child_to_awaiting_confirmation() -> Result<()> {
     let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
 
     // Pause for confirmation.
-    let (paused, _committed_events) =
+    let (paused, committed_events) =
         pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
 
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
@@ -364,6 +364,23 @@ async fn pause_transitions_child_to_awaiting_confirmation() -> Result<()> {
         .context("parent should exist")?;
     assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
     assert_eq!(parent.pending_child_count, 1);
+    assert_eq!(committed_events.len(), 1);
+    match &committed_events[0].event {
+        AgentEvent::ToolRequiresConfirmation {
+            id,
+            name,
+            display_name,
+            input,
+            description,
+        } => {
+            assert_eq!(id, "call_1");
+            assert_eq!(name, "transfer");
+            assert_eq!(display_name, "Transfer");
+            assert_eq!(input, &serde_json::json!({"amount": 100}));
+            assert_eq!(description, "Tool Transfer requires confirmation");
+        }
+        other => bail!("expected ToolRequiresConfirmation event, got {other:?}"),
+    }
 
     Ok(())
 }

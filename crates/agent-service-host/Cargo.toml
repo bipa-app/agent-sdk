@@ -15,11 +15,22 @@ agent-sdk-core.workspace = true
 agent-sdk-tools.workspace = true
 agent-sdk-providers.workspace = true
 agent-server.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+agent-service-proto = { path = "../agent-service-proto" }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net"] }
+tokio-stream = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time.workspace = true

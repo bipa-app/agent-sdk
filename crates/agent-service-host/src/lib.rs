@@ -64,7 +64,10 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod grpc;
 pub mod health;
 pub mod host;
 pub mod postgres;
+pub mod proto;
+pub mod runtime;
 pub mod stores;

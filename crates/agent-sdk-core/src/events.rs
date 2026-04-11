@@ -77,6 +77,7 @@ pub enum AgentEvent {
     ToolRequiresConfirmation {
         id: String,
         name: String,
+        display_name: String,
         input: serde_json::Value,
         description: String,
     },
@@ -235,12 +236,14 @@ impl AgentEvent {
     pub fn tool_requires_confirmation(
         id: impl Into<String>,
         name: impl Into<String>,
+        display_name: impl Into<String>,
         input: serde_json::Value,
         description: impl Into<String>,
     ) -> Self {
         Self::ToolRequiresConfirmation {
             id: id.into(),
             name: name.into(),
+            display_name: display_name.into(),
             input,
             description: description.into(),
         }

@@ -47,15 +47,25 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use agent_server::journal::task::{LeaseId, WorkerId};
-use agent_server::worker::registry::AgentDefinitionRegistry;
+use agent_sdk_core::ToolTier;
+use agent_server::journal::committed_event::CommittedEvent;
+use agent_server::journal::execution_context::build_root_worker_inputs;
+use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
+use agent_server::journal::task::{AgentTask, LeaseId, SubmittedInputItem, TaskKind, WorkerId};
+use agent_server::journal::task_state::TaskState;
+use agent_server::worker::{
+    AgentDefinitionRegistry, RootTurnOutcome, ToolTaskOutcome, fail_root_turn,
+    guarded_tool_execution, pause_tool_for_confirmation, resolve_bootstrap_context,
+    resolve_tool_bootstrap, resume_from_children,
+};
 
 use super::config::ServiceConfig;
 use super::health::HealthSurface;
+use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -67,6 +77,7 @@ use super::stores::StoreRegistry;
 pub struct ServiceHost {
     config: ServiceConfig,
     stores: StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
     health: Arc<HealthSurface>,
     shutdown: CancellationToken,
 }
@@ -84,6 +95,7 @@ impl ServiceHost {
     pub fn new(
         config: ServiceConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
         Self::validate_config(&config)?;
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
@@ -91,6 +103,7 @@ impl ServiceHost {
         Ok(Self {
             config,
             stores,
+            runtime,
             health: HealthSurface::shared(),
             shutdown: CancellationToken::new(),
         })
@@ -102,11 +115,16 @@ impl ServiceHost {
     ///
     /// # Errors
     /// Returns an error if the configuration contains invalid values.
-    pub fn with_stores(config: ServiceConfig, stores: StoreRegistry) -> Result<Self> {
+    pub fn with_stores(
+        config: ServiceConfig,
+        stores: StoreRegistry,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Result<Self> {
         Self::validate_config(&config)?;
         Ok(Self {
             config,
             stores,
+            runtime,
             health: HealthSurface::shared(),
             shutdown: CancellationToken::new(),
         })
@@ -141,6 +159,12 @@ impl ServiceHost {
     #[must_use]
     pub const fn health(&self) -> &Arc<HealthSurface> {
         &self.health
+    }
+
+    /// Access the host runtime wiring.
+    #[must_use]
+    pub const fn runtime(&self) -> &Arc<ExecutionRuntime> {
+        &self.runtime
     }
 
     /// Token that, when cancelled, triggers graceful shutdown.
@@ -198,6 +222,7 @@ impl ServiceHost {
             let handle = tokio::spawn(worker_loop(
                 idx,
                 self.stores.clone(),
+                Arc::clone(&self.runtime),
                 self.config.worker.lease_duration(),
                 self.config.worker.acquisition_interval(),
                 Arc::clone(&self.health),
@@ -352,6 +377,7 @@ async fn lease_sweep_loop(
 async fn worker_loop(
     index: usize,
     stores: StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
     lease_duration: time::Duration,
     poll_interval: std::time::Duration,
     _health: Arc<HealthSurface>,
@@ -393,10 +419,11 @@ async fn worker_loop(
                             kind = ?task.kind,
                             "acquired task",
                         );
-                        // Future phase: execute the task via
-                        // resolve_bootstrap_context + execute_root_turn.
-                        // For now, the acquisition proves the bootstrap
-                        // loop works end-to-end.
+                        if let Err(err) =
+                            execute_acquired_task(task, &stores, Arc::clone(&runtime), &cancel).await
+                        {
+                            warn!(%worker_id, error = %err, "task execution failed");
+                        }
                     }
                     Ok(None) => {
                         // No runnable tasks — idle wait.
@@ -410,6 +437,278 @@ async fn worker_loop(
     }
 }
 
+async fn execute_acquired_task(
+    task: AgentTask,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    match task.kind {
+        TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
+        TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
+        TaskKind::Subagent => bail!("unsupported task kind in service host worker: Subagent"),
+    }
+}
+
+async fn execute_root_task(
+    task: AgentTask,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+) -> Result<()> {
+    let now = time::OffsetDateTime::now_utc();
+    let error_watermark = stores
+        .event_repo
+        .next_sequence(&task.thread_id)
+        .await
+        .context("reading root-task event watermark")?;
+
+    let outcome = async {
+        let bootstrap =
+            resolve_bootstrap_context(task.clone(), stores.definition_registry.as_ref())
+                .await
+                .context("resolve root-task bootstrap")?;
+        let inputs = build_root_worker_inputs(
+            bootstrap,
+            stores.thread_store.as_ref(),
+            stores.checkpoint_store.as_ref(),
+            now,
+        )
+        .await
+        .context("build root-worker inputs")?;
+        let provider = runtime
+            .provider_resolver()
+            .resolve_provider(inputs.definition())
+            .await
+            .context("resolve runtime provider")?;
+
+        if matches!(task.state, TaskState::ReadyToResume { .. }) {
+            resume_from_children(
+                inputs,
+                &task,
+                provider.as_ref(),
+                &stores.root_turn_deps(),
+                now,
+            )
+            .await
+            .context("resume root task from durable child results")
+        } else {
+            let user_prompt = root_task_prompt(&task)?;
+            agent_server::worker::execute_root_turn(
+                inputs,
+                &user_prompt,
+                provider.as_ref(),
+                &stores.root_turn_deps(),
+                now,
+            )
+            .await
+            .context("execute fresh root task")
+        }
+    }
+    .await;
+
+    match outcome {
+        Ok(RootTurnOutcome::Completed {
+            committed_events, ..
+        }) => {
+            publish_events(stores, &committed_events);
+            promote_next_root(stores, &task, now).await?;
+            Ok(())
+        }
+        Ok(RootTurnOutcome::Suspended {
+            committed_events, ..
+        }) => {
+            publish_events(stores, &committed_events);
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                task_id = %task.id,
+                thread_id = %task.thread_id,
+                error = %err,
+                "root task execution failed; marking task failed",
+            );
+            fail_root_task(stores, &task, &err, error_watermark, now).await?;
+            promote_next_root(stores, &task, now).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn execute_tool_task(
+    task: AgentTask,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let now = time::OffsetDateTime::now_utc();
+    let (worker_id, lease_id) = running_lease(&task)?;
+
+    let bootstrap = match resolve_tool_bootstrap(task.clone(), stores.task_store.as_ref()).await {
+        Ok(bootstrap) => bootstrap,
+        Err(err) => {
+            stores
+                .task_store
+                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .await
+                .context("fail invalid tool task")?;
+            return Ok(());
+        }
+    };
+
+    if bootstrap.tool_call.tier == ToolTier::Confirm {
+        let (_paused, committed_events) = pause_tool_for_confirmation(
+            &bootstrap,
+            stores.task_store.as_ref(),
+            stores.event_repo.as_ref(),
+            now,
+        )
+        .await
+        .context("pause tool task for confirmation")?;
+        publish_events(stores, &committed_events);
+        return Ok(());
+    }
+
+    let guarded_deps = GuardedExecutionDeps {
+        task_store: stores.task_store.as_ref(),
+        intent_store: stores.execution_intent_store.as_ref(),
+        event_repo: stores.event_repo.as_ref(),
+    };
+    let effect_class = classify_tool_effect(&bootstrap.tool_call);
+    let exec_bootstrap = bootstrap.clone();
+    let tool_executor = Arc::clone(runtime.tool_executor());
+    let outcome = guarded_tool_execution(
+        bootstrap,
+        &guarded_deps,
+        cancel,
+        effect_class,
+        move |_tool_call, collector| {
+            let tool_executor = Arc::clone(&tool_executor);
+            let exec_bootstrap = exec_bootstrap.clone();
+            let cancel = cancel.clone();
+            async move {
+                tool_executor
+                    .execute_tool_call(&exec_bootstrap, collector, cancel)
+                    .await
+            }
+        },
+        now,
+    )
+    .await;
+
+    match outcome {
+        Ok(
+            ToolTaskOutcome::Completed {
+                committed_events, ..
+            }
+            | ToolTaskOutcome::Failed {
+                committed_events, ..
+            },
+        ) => {
+            publish_events(stores, &committed_events);
+            Ok(())
+        }
+        Ok(ToolTaskOutcome::Cancelled) => Ok(()),
+        Err(err) => {
+            stores
+                .task_store
+                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .await
+                .context("fail tool task after guarded execution error")?;
+            Ok(())
+        }
+    }
+}
+
+async fn fail_root_task(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    error: &anyhow::Error,
+    event_watermark: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    let (worker_id, lease_id) = running_lease(task)?;
+    fail_root_turn(
+        &task.id,
+        &worker_id,
+        &lease_id,
+        &task.thread_id,
+        error,
+        &stores.root_turn_deps(),
+        now,
+    )
+    .await
+    .context("mark root task failed")?;
+
+    let new_events = newly_committed_events(stores, &task.thread_id, event_watermark).await?;
+    publish_events(stores, &new_events);
+    Ok(())
+}
+
+fn publish_events(stores: &StoreRegistry, events: &[CommittedEvent]) {
+    if !events.is_empty() {
+        stores.event_notifier.notify(events);
+    }
+}
+
+async fn newly_committed_events(
+    stores: &StoreRegistry,
+    thread_id: &agent_sdk_core::ThreadId,
+    watermark: u64,
+) -> Result<Vec<CommittedEvent>> {
+    Ok(stores
+        .event_repo
+        .get_events(thread_id)
+        .await
+        .context("read committed events after failure")?
+        .into_iter()
+        .filter(|event| event.sequence >= watermark)
+        .collect())
+}
+
+async fn promote_next_root(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    if task.kind == TaskKind::RootTurn {
+        let _ = stores
+            .task_store
+            .promote_next_queued_root(&task.thread_id, now)
+            .await
+            .context("promote next queued root after terminal root")?;
+    }
+    Ok(())
+}
+
+fn running_lease(task: &AgentTask) -> Result<(WorkerId, LeaseId)> {
+    let worker_id = task
+        .worker_id
+        .clone()
+        .context("running task missing worker_id")?;
+    let lease_id = task
+        .lease_id
+        .clone()
+        .context("running task missing lease_id")?;
+    Ok((worker_id, lease_id))
+}
+
+fn root_task_prompt(task: &AgentTask) -> Result<String> {
+    if task.submitted_input.is_empty() {
+        bail!("root task missing submitted input");
+    }
+
+    task.submitted_input
+        .iter()
+        .map(|item| match item {
+            SubmittedInputItem::Text { text } => Ok(text.clone()),
+            other => Err(anyhow!(
+                "root task input item is not supported by the service host yet: {other:?}"
+            )),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("\n"))
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
@@ -418,13 +717,22 @@ async fn worker_loop(
 mod tests {
     use super::*;
     use crate::config::ServiceConfig;
+    use crate::runtime::{
+        AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
+    };
+    use agent_sdk_core::llm::{
+        ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
+    };
+    use agent_sdk_providers::LlmProvider;
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_definition() -> AgentDefinition {
         AgentDefinition {
-            provider: "anthropic".into(),
-            model: "claude-sonnet-4-5-20250929".into(),
+            provider: "mock".into(),
+            model: "mock-model".into(),
             system_prompt: "test".into(),
             max_tokens: 4096,
             tools: Vec::new(),
@@ -437,12 +745,64 @@ mod tests {
         Arc::new(InMemoryAgentDefinitionRegistry::new(sample_definition()))
     }
 
+    struct MockTextProvider {
+        response_text: String,
+        call_count: AtomicUsize,
+    }
+
+    impl MockTextProvider {
+        fn new(text: &str) -> Self {
+            Self {
+                response_text: text.to_owned(),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockTextProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: "msg_host_test_01".into(),
+                content: vec![ContentBlock::Text {
+                    text: self.response_text.clone(),
+                }],
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                },
+            }))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn sample_runtime() -> Result<Arc<ExecutionRuntime>> {
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(MockTextProvider::new("host reply")))?;
+        Ok(Arc::new(ExecutionRuntime::new(
+            resolver,
+            Arc::new(NoopToolExecutor),
+            Arc::new(AllowAllConfirmationPolicy),
+        )))
+    }
+
     // ── Construction ─────────────────────────────────────────────
 
     #[test]
     fn host_construction_succeeds() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         assert_eq!(host.config().worker.pool_size, 4);
         Ok(())
     }
@@ -450,7 +810,7 @@ mod tests {
     #[test]
     fn stores_accessible_from_host() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let _stores = host.stores();
         let _deps = host.stores().root_turn_deps();
         Ok(())
@@ -459,7 +819,7 @@ mod tests {
     #[test]
     fn shutdown_token_is_clonable() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let token = host.shutdown_token();
         assert!(!token.is_cancelled());
         Ok(())
@@ -468,7 +828,7 @@ mod tests {
     #[test]
     fn health_surface_accessible() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let snap = host.health().snapshot();
         // Before run(), health is not yet alive.
         assert!(!snap.is_ready());
@@ -478,7 +838,7 @@ mod tests {
     // ── Validation ───────────────────────────────────────────────
 
     #[test]
-    fn zero_sweep_interval_is_rejected() {
+    fn zero_sweep_interval_is_rejected() -> Result<()> {
         let config = ServiceConfig {
             worker: crate::config::WorkerConfig {
                 sweep_interval_secs: 0,
@@ -486,12 +846,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = ServiceHost::new(config, sample_registry());
+        let result = ServiceHost::new(config, sample_registry(), sample_runtime()?);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn zero_pool_size_is_rejected() {
+    fn zero_pool_size_is_rejected() -> Result<()> {
         let config = ServiceConfig {
             worker: crate::config::WorkerConfig {
                 pool_size: 0,
@@ -499,12 +860,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = ServiceHost::new(config, sample_registry());
+        let result = ServiceHost::new(config, sample_registry(), sample_runtime()?);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn zero_acquisition_interval_is_rejected() {
+    fn zero_acquisition_interval_is_rejected() -> Result<()> {
         let config = ServiceConfig {
             worker: crate::config::WorkerConfig {
                 acquisition_interval_secs: 0,
@@ -512,8 +874,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = ServiceHost::new(config, sample_registry());
+        let result = ServiceHost::new(config, sample_registry(), sample_runtime()?);
         assert!(result.is_err());
+        Ok(())
     }
 
     // ── Lifecycle ────────────────────────────────────────────────
@@ -521,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn host_shuts_down_on_token_cancel() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let token = host.shutdown_token();
 
         // Cancel immediately so `run()` returns promptly.
@@ -533,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn health_becomes_ready_during_run() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let health = Arc::clone(host.health());
         let token = host.shutdown_token();
 
@@ -554,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn health_becomes_unready_after_shutdown() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let health = Arc::clone(host.health());
         let token = host.shutdown_token();
 
@@ -581,7 +944,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let stores = host.stores().clone();
         let token = host.shutdown_token();
 
@@ -638,13 +1001,20 @@ mod tests {
             },
             ..Default::default()
         };
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let stores = host.stores().clone();
         let token = host.shutdown_token();
 
         // Submit a pending root turn.
         let thread = ThreadId::from_string("t-worker-test");
-        let task = AgentTask::new_root_turn(thread, time::OffsetDateTime::now_utc(), 3);
+        let task = AgentTask::new_root_turn_with_input(
+            thread,
+            vec![SubmittedInputItem::Text {
+                text: "hello from host worker".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
         let task_id = task.id.clone();
         stores.task_store.submit_root_turn(task).await?;
 
@@ -653,16 +1023,16 @@ mod tests {
         // Advance time so the worker polls and acquires.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        // The task should have been acquired (status = Running).
-        let acquired = stores
+        // The task should have been completed by the worker.
+        let completed = stores
             .task_store
             .get(&task_id)
             .await?
             .context("task should still exist")?;
         assert_eq!(
-            acquired.status,
-            agent_server::journal::task::TaskStatus::Running,
-            "worker should have acquired the pending task",
+            completed.status,
+            agent_server::journal::task::TaskStatus::Completed,
+            "worker should have completed the pending task",
         );
 
         token.cancel();
@@ -679,7 +1049,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let host = ServiceHost::new(config, sample_registry())?;
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
         let token = host.shutdown_token();
 
         // Cancel immediately — all 8 workers must drain cleanly.
