@@ -613,7 +613,10 @@ async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
     )
     .await;
 
-    assert!(result.is_err(), "expected error for failed side-effecting retry");
+    assert!(
+        result.is_err(),
+        "expected error for failed side-effecting retry"
+    );
     let err = format!("{:#}", result.unwrap_err());
     assert!(
         err.contains("ambiguous in-flight"),
