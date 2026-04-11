@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 
 use crate::journal::{
     AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
-    SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
+    SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -476,28 +476,33 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
         },
     };
 
+    let child_thread_id = agent_sdk_core::ThreadId::new();
     let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
         &parent.id,
         &worker,
         &lease,
-        spec.clone(),
-        SuspensionPayload {
-            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                agent_sdk_core::AgentContinuation {
-                    thread_id: parent.thread_id.clone(),
-                    turn: 1,
-                    total_usage: agent_sdk_core::TokenUsage::default(),
-                    turn_usage: agent_sdk_core::TokenUsage::default(),
-                    pending_tool_calls: Vec::new(),
-                    awaiting_index: 0,
-                    completed_results: Vec::new(),
-                    state: agent_sdk_core::AgentState::new(parent.thread_id.clone()),
-                    response_id: None,
-                    stop_reason: None,
-                    response_content: Vec::new(),
-                },
-            ),
-            suspended_messages: Vec::new(),
+        SubagentInvocationSpawn {
+            child_thread_id,
+            spawn_index: 0,
+            spec: spec.clone(),
+            payload: SuspensionPayload {
+                continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+                    agent_sdk_core::AgentContinuation {
+                        thread_id: parent.thread_id.clone(),
+                        turn: 1,
+                        total_usage: agent_sdk_core::TokenUsage::default(),
+                        turn_usage: agent_sdk_core::TokenUsage::default(),
+                        pending_tool_calls: Vec::new(),
+                        awaiting_index: 0,
+                        completed_results: Vec::new(),
+                        state: agent_sdk_core::AgentState::new(parent.thread_id.clone()),
+                        response_id: None,
+                        stop_reason: None,
+                        response_content: Vec::new(),
+                    },
+                ),
+                suspended_messages: Vec::new(),
+            },
         },
         &SubagentInvocationDeps {
             task_store: &task_store,

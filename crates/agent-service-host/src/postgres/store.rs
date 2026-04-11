@@ -2113,6 +2113,7 @@ FOR UPDATE SKIP LOCKED
             child_thread_id,
             spec,
             payload,
+            spawn_index,
         } = spawn;
 
         let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
@@ -2140,6 +2141,7 @@ FOR UPDATE SKIP LOCKED
                 child_thread_id,
                 child_root_task_id: child_root.id.clone(),
             },
+            spawn_index,
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         )

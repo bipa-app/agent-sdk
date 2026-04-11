@@ -30,14 +30,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SubagentInvocationSpawn, SuspensionPayload,
-    Thread, ThreadStore, WorkerId,
+    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SubagentInvocationSpawn, Thread, ThreadStore,
+    WorkerId,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -553,6 +552,10 @@ pub struct SpawnedSubagentInvocation {
 /// - durable linkage among those records is persisted on the
 ///   invocation task.
 ///
+/// `child_thread_id` must be pre-allocated by the caller and reused
+/// across retries so [`ThreadStore::get_or_create`] is idempotent and
+/// failed attempts do not orphan thread rows.
+///
 /// # Errors
 ///
 /// Returns an error if the parent task cannot be parked on child
@@ -563,31 +566,19 @@ pub async fn spawn_subagent_invocation(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
     lease: &LeaseId,
-    spec: EffectiveSubagentSpec,
-    payload: SuspensionPayload,
+    spawn: SubagentInvocationSpawn,
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentInvocation> {
-    let child_thread_id = ThreadId::new();
     let child_thread = deps
         .thread_store
-        .get_or_create(&child_thread_id, now)
+        .get_or_create(&spawn.child_thread_id, now)
         .await
         .context("materialize child thread projection")?;
 
     let (parent_task, invocation_task, child_root_task) = deps
         .task_store
-        .spawn_subagent_invocation(
-            parent_id,
-            worker,
-            lease,
-            SubagentInvocationSpawn {
-                child_thread_id,
-                spec,
-                payload,
-            },
-            now,
-        )
+        .spawn_subagent_invocation(parent_id, worker, lease, spawn, now)
         .await
         .context("persist subagent invocation tasks")?;
 
