@@ -331,7 +331,7 @@ pub struct AgentEventEnvelope {
     /// Unique identifier for this event emission.
     ///
     /// UUID v4 when created via [`AgentEventEnvelope::wrap`] (SDK-local path),
-    /// UUID v7 when created via server-committed [`CommittedEvent::into_envelope`].
+    /// UUID v7 when created via server-committed `CommittedEvent::into_envelope`.
     pub event_id: uuid::Uuid,
     /// Monotonically increasing sequence number within a single run.
     pub sequence: u64,
