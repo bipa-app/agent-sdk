@@ -164,12 +164,13 @@ pub use agent_sdk_tools::{
 /// execution. Phase 5.3 adds confirmation pause/resume and policy
 /// recheck.
 pub use worker::{
-    AgentDefinition, AgentDefinitionRegistry, ConfirmationDecision, ConfirmationDecisionOutcome,
-    ConfirmationPolicy, ConfirmationResumeOutcome, InMemoryAgentDefinitionRegistry, PolicyVerdict,
-    RootTurnDeps, RootTurnOutcome, RuntimePolicy, ThinkingPolicy, ToolTaskBootstrap,
-    ToolTaskOutcome, WorkerBootstrapContext, apply_confirmation_decision, execute_root_turn,
-    execute_tool_task, pause_tool_for_confirmation, resolve_bootstrap_context,
-    resolve_tool_bootstrap, resume_confirmed_tool,
+    AgentDefinition, AgentDefinitionRegistry, CONFIRMATION_POLICY_DENIED_PREFIX,
+    CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX, ConfirmationDecision,
+    ConfirmationDecisionOutcome, ConfirmationPolicy, ConfirmationResumeOutcome,
+    InMemoryAgentDefinitionRegistry, PolicyVerdict, RootTurnDeps, RootTurnOutcome, RuntimePolicy,
+    ThinkingPolicy, ToolTaskBootstrap, ToolTaskOutcome, WorkerBootstrapContext,
+    apply_confirmation_decision, execute_root_turn, execute_tool_task, pause_tool_for_confirmation,
+    resolve_bootstrap_context, resolve_tool_bootstrap, resume_confirmed_tool,
 };
 
 #[cfg(test)]

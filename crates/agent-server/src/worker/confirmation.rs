@@ -92,7 +92,7 @@ use crate::journal::execution_intent::{
     ExecutionIntentStore, classify_tool_effect, guarded_tool_execution,
 };
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
+use crate::journal::task::{AgentTask, AgentTaskId, TaskKind};
 use crate::worker::tool_task::{ToolTaskBootstrap, ToolTaskOutcome};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -303,23 +303,10 @@ pub async fn apply_confirmation_decision(
 ) -> anyhow::Result<ConfirmationDecisionOutcome> {
     match decision {
         ConfirmationDecision::Approved => {
-            // Read the current state before resume clears it.
-            let child = task_store
-                .get(child_id)
-                .await
-                .context("failed to read child task")?
-                .with_context(|| format!("child task {child_id} not found"))?;
-
-            ensure!(
-                child.status == TaskStatus::AwaitingConfirmation,
-                "expected AwaitingConfirmation for child {child_id}, got {:?}",
-                child.status,
-            );
-
-            let prepared_operation = child.state.prepared_operation().cloned();
-
-            // Resume: AwaitingConfirmation → Pending.
-            let resumed = task_store
+            // Atomically resume and extract the prepared operation
+            // under a single write lock, closing the TOCTOU window
+            // that a concurrent rejection could exploit.
+            let (resumed, prepared_operation) = task_store
                 .resume_from_confirmation(child_id, now)
                 .await
                 .with_context(|| format!("failed to resume child {child_id} from confirmation"))?;
@@ -330,7 +317,7 @@ pub async fn apply_confirmation_decision(
             })
         }
         ConfirmationDecision::Rejected { reason } => {
-            let error = format!("confirmation_rejected: {reason}");
+            let error = format!("{CONFIRMATION_REJECTED_PREFIX} {reason}");
             let (child, parent) = task_store
                 .reject_confirmation(child_id, error, now)
                 .await
@@ -343,8 +330,9 @@ pub async fn apply_confirmation_decision(
             })
         }
         ConfirmationDecision::Timeout => {
-            let error =
-                "confirmation_timeout: no decision received within the allowed window".to_owned();
+            let error = format!(
+                "{CONFIRMATION_TIMEOUT_PREFIX} no decision received within the allowed window"
+            );
             let (child, parent) = task_store
                 .reject_confirmation(child_id, error, now)
                 .await
@@ -410,7 +398,7 @@ where
         .context("authoritative policy recheck failed")?;
 
     if let PolicyVerdict::Denied { reason } = verdict {
-        let error = format!("confirmation_policy_denied: {reason}");
+        let error = format!("{CONFIRMATION_POLICY_DENIED_PREFIX} {reason}");
         let (child, parent) = task_store
             .fail_task(
                 &bootstrap.task_id,

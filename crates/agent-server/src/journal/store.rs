@@ -819,19 +819,17 @@ pub trait AgentTaskStore: Send + Sync {
     ) -> Result<Vec<AgentTaskId>>;
 
     /// Resume a [`TaskStatus::AwaitingConfirmation`] task back to
-    /// [`TaskStatus::Pending`], clearing the typed
-    /// [`crate::journal::TaskState::AwaitingConfirmation`] payload atomically with
+    /// [`TaskStatus::Pending`], atomically extracting the prepared
+    /// listen/execute operation and clearing the typed
+    /// [`crate::journal::TaskState::AwaitingConfirmation`] payload with
     /// the status flip.
     ///
-    /// This is the resume entry point a confirmation transport will
-    /// call once it receives the user's decision (Phase 2.4 leaves
-    /// the transport itself out of scope). The caller is responsible
-    /// for reading the embedded [`ContinuationEnvelope`] and any
-    /// prepared listen/execute operation **before** calling this
-    /// method, because the resume transition wipes the typed payload
-    /// to satisfy the state ↔ status invariant.
-    ///
-    /// Returns the persisted resumed row.
+    /// Returns `(resumed_task, prepared_operation)` where
+    /// `prepared_operation` is the [`ListenExecutionContext`] that was
+    /// embedded in the `AwaitingConfirmation` payload (or `None` for
+    /// non-listen tools). Both are extracted under a single write
+    /// lock so there is no window for a concurrent rejection to
+    /// invalidate the snapshot.
     ///
     /// # Errors
     /// - `task does not exist` — if no row with `id` is stored.
@@ -841,7 +839,7 @@ pub trait AgentTaskStore: Send + Sync {
         &self,
         id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<AgentTask>;
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)>;
 
     /// Reject or time out a [`TaskStatus::AwaitingConfirmation`] task,
     /// transitioning it directly to [`TaskStatus::Failed`] and
@@ -2147,7 +2145,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         &self,
         id: &AgentTaskId,
         now: OffsetDateTime,
-    ) -> Result<AgentTask> {
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
         let mut inner = self.inner.write().await;
         let old = inner
             .by_id
@@ -2162,14 +2160,14 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        let resumed = old
+        let (resumed, prepared_operation) = old
             .clone()
             .resume_from_confirmation(now)
             .context("resume rejected: resume_from_confirmation transition failed")?;
         inner.rebalance_after_row_change(&old, &resumed);
         inner.by_id.insert(resumed.id.clone(), resumed.clone());
         drop(inner);
-        Ok(resumed)
+        Ok((resumed, prepared_operation))
     }
 
     async fn reject_confirmation(
@@ -5096,7 +5094,7 @@ mod tests {
             .await
             .context("pause")?;
 
-        let resumed = store
+        let (resumed, _prepared) = store
             .resume_from_confirmation(&id, t_plus(3))
             .await
             .context("resume")?;
@@ -5626,7 +5624,7 @@ mod tests {
         // that is the *legal* resume path. The Phase 2.5
         // acquisition classification returns NoAction because the
         // unsafe state was cleared.
-        let resumed = store
+        let (resumed, _prepared) = store
             .resume_from_confirmation(&child_id, t_plus(5))
             .await
             .context("resume")?;

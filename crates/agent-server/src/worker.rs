@@ -102,6 +102,7 @@ pub use crate::journal::execution_intent::{
 
 // Phase 5.3: re-export confirmation types and functions.
 pub use confirmation::{
+    CONFIRMATION_POLICY_DENIED_PREFIX, CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX,
     ConfirmationDecision, ConfirmationDecisionOutcome, ConfirmationPolicy,
     ConfirmationResumeOutcome, PolicyVerdict, apply_confirmation_decision,
     pause_tool_for_confirmation, resume_confirmed_tool,
