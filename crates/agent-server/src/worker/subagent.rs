@@ -240,6 +240,19 @@ impl InheritedSubagentConstraints {
                 !definition.capabilities.is_empty(),
                 "capability profile `{profile}` cannot be empty",
             );
+            for cap in &definition.capabilities {
+                ensure!(
+                    !cap.trim().is_empty(),
+                    "capability identifier in profile `{profile}` cannot be blank",
+                );
+            }
+        }
+
+        for cap in &self.allowed_capabilities {
+            ensure!(
+                !cap.trim().is_empty(),
+                "allowed_capabilities contains a blank identifier",
+            );
         }
 
         let known_capabilities = self.known_capabilities();
@@ -411,10 +424,11 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         requested: &SubagentCapabilityRequest,
         constraints: &InheritedSubagentConstraints,
     ) -> Result<EffectiveSubagentCapabilities> {
+        let profile_name = requested.profile.trim();
         let profile = constraints
             .capability_profiles
-            .get(&requested.profile)
-            .with_context(|| format!("unknown capability profile `{}`", requested.profile))?;
+            .get(profile_name)
+            .with_context(|| format!("unknown capability profile `{profile_name}`"))?;
 
         let invalid_allowlist: Vec<_> = requested
             .allowlist
@@ -424,7 +438,7 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         ensure!(
             invalid_allowlist.is_empty(),
             "capability allowlist can only narrow profile `{}`; unsupported entries: {}",
-            requested.profile,
+            profile_name,
             invalid_allowlist.join(", "),
         );
 
@@ -441,12 +455,11 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
 
         ensure!(
             !allowed.is_empty(),
-            "capability selection for profile `{}` resolves to no allowed capabilities",
-            requested.profile,
+            "capability selection for profile `{profile_name}` resolves to no allowed capabilities",
         );
 
         Ok(EffectiveSubagentCapabilities {
-            profile: requested.profile.clone(),
+            profile: profile_name.to_owned(),
             allowed,
         })
     }
@@ -491,7 +504,7 @@ pub fn resolve_subagent_spec(
         .context("resolve subagent capabilities")?;
 
     Ok(EffectiveSubagentSpec {
-        task: request.task.clone(),
+        task: request.task.trim().to_owned(),
         prompt: normalize_optional_string(request.prompt.as_deref()).unwrap_or_default(),
         model,
         max_turns,
@@ -507,6 +520,9 @@ fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {
         !request.capabilities.profile.trim().is_empty(),
         "capability profile cannot be blank",
     );
+    if let Some(ref model) = request.model {
+        ensure!(!model.trim().is_empty(), "model cannot be blank");
+    }
     if let Some(max_turns) = request.max_turns {
         ensure!(max_turns > 0, "max_turns must be greater than zero");
     }
