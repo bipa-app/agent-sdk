@@ -86,6 +86,19 @@ pub trait EventRepository: Send + Sync {
 
     /// Retrieve all committed events for a thread in sequence order.
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>>;
+
+    /// Retrieve committed events for a thread with `sequence > after_sequence`
+    /// and `sequence <= up_to_sequence`, in sequence order.
+    ///
+    /// This is the replay query surface: a reconnecting client passes its
+    /// last-seen sequence as `after_sequence` and the captured watermark
+    /// as `up_to_sequence` to get exactly the committed events it missed.
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -197,6 +210,27 @@ impl EventRepository for InMemoryEventRepository {
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
         let inner = self.inner.read().await;
         Ok(inner.events.get(&thread_id.0).cloned().unwrap_or_default())
+    }
+
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>> {
+        let inner = self.inner.read().await;
+        let result = inner
+            .events
+            .get(&thread_id.0)
+            .map(|evts| {
+                evts.iter()
+                    .filter(|e| e.sequence > after_sequence && e.sequence <= up_to_sequence)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(inner);
+        Ok(result)
     }
 }
 
@@ -597,6 +631,80 @@ mod tests {
         for event in &batch {
             assert_eq!(event.event_id.get_version(), Some(uuid::Version::SortRand),);
         }
+        Ok(())
+    }
+
+    // ── get_events_in_range ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_events_in_range_returns_correct_window() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+
+        // Commit 5 events: sequences 0..4.
+        for i in 0..5 {
+            repo.commit_event(&thread_a(), sample_event(), t_plus(i))
+                .await?;
+        }
+
+        // Range (1, 3] → sequences 2, 3.
+        let events = repo.get_events_in_range(&thread_a(), 1, 3).await?;
+        let seqs: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![2, 3]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_events_in_range_empty_when_after_equals_up_to() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+
+        repo.commit_event(&thread_a(), sample_event(), t0()).await?;
+        repo.commit_event(&thread_a(), sample_event(), t_plus(1))
+            .await?;
+
+        let events = repo.get_events_in_range(&thread_a(), 1, 1).await?;
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_events_in_range_empty_for_unknown_thread() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+        let events = repo.get_events_in_range(&thread_a(), 0, 10).await?;
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_events_in_range_full_range() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+
+        for i in 0..3 {
+            repo.commit_event(&thread_a(), sample_event(), t_plus(i))
+                .await?;
+        }
+
+        // Range (0, 2] → sequences 1, 2. Excludes 0.
+        let events = repo.get_events_in_range(&thread_a(), 0, 2).await?;
+        let seqs: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_events_in_range_thread_isolated() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+
+        repo.commit_event(&thread_a(), sample_event(), t0()).await?;
+        repo.commit_event(&thread_a(), sample_event(), t_plus(1))
+            .await?;
+        repo.commit_event(&thread_b(), sample_event(), t0()).await?;
+
+        let a_events = repo.get_events_in_range(&thread_a(), 0, 1).await?;
+        assert_eq!(a_events.len(), 1);
+        assert_eq!(a_events[0].thread_id, thread_a());
+
+        let b_events = repo.get_events_in_range(&thread_b(), 0, 10).await?;
+        assert!(b_events.is_empty());
         Ok(())
     }
 }
