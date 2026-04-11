@@ -137,9 +137,9 @@ impl Default for WorkerConfig {
 impl WorkerConfig {
     /// Lease duration as a [`time::Duration`].
     #[must_use]
-    #[allow(clippy::cast_possible_wrap)]
-    pub const fn lease_duration(&self) -> time::Duration {
-        time::Duration::seconds(self.lease_duration_secs as i64)
+    pub fn lease_duration(&self) -> time::Duration {
+        let secs = i64::try_from(self.lease_duration_secs).unwrap_or(i64::MAX);
+        time::Duration::seconds(secs)
     }
 
     /// Heartbeat interval as a [`std::time::Duration`] (for tokio timers).

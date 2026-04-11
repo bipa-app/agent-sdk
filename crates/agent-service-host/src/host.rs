@@ -138,16 +138,43 @@ impl ServiceHost {
         ));
 
         // Wait for shutdown signal or token cancellation.
-        tokio::select! {
-            () = self.shutdown.cancelled() => {
-                info!("shutdown token cancelled");
-            }
-            result = tokio::signal::ctrl_c() => {
-                match result {
-                    Ok(()) => info!("received SIGINT, shutting down"),
-                    Err(e) => warn!(error = %e, "signal handler failed"),
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
+
+            tokio::select! {
+                () = self.shutdown.cancelled() => {
+                    info!("shutdown token cancelled");
                 }
-                self.shutdown.cancel();
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => info!("received SIGINT, shutting down"),
+                        Err(e) => warn!(error = %e, "signal handler failed"),
+                    }
+                    self.shutdown.cancel();
+                }
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down");
+                    self.shutdown.cancel();
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                () = self.shutdown.cancelled() => {
+                    info!("shutdown token cancelled");
+                }
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => info!("received SIGINT, shutting down"),
+                        Err(e) => warn!(error = %e, "signal handler failed"),
+                    }
+                    self.shutdown.cancel();
+                }
             }
         }
 
@@ -231,42 +258,45 @@ mod tests {
     }
 
     #[test]
-    fn host_construction_succeeds() {
+    fn host_construction_succeeds() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry()).unwrap();
+        let host = ServiceHost::new(config, sample_registry())?;
         assert_eq!(host.config().worker.pool_size, 4);
+        Ok(())
     }
 
     #[test]
-    fn stores_accessible_from_host() {
+    fn stores_accessible_from_host() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry()).unwrap();
+        let host = ServiceHost::new(config, sample_registry())?;
         let _stores = host.stores();
         let _deps = host.stores().root_turn_deps();
+        Ok(())
     }
 
     #[test]
-    fn shutdown_token_is_clonable() {
+    fn shutdown_token_is_clonable() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry()).unwrap();
+        let host = ServiceHost::new(config, sample_registry())?;
         let token = host.shutdown_token();
         assert!(!token.is_cancelled());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn host_shuts_down_on_token_cancel() {
+    async fn host_shuts_down_on_token_cancel() -> Result<()> {
         let config = ServiceConfig::default();
-        let host = ServiceHost::new(config, sample_registry()).unwrap();
+        let host = ServiceHost::new(config, sample_registry())?;
         let token = host.shutdown_token();
 
         // Cancel immediately so `run()` returns promptly.
         token.cancel();
-        let result = host.run().await;
-        assert!(result.is_ok());
+        host.run().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sweep_runs_at_least_once_before_shutdown() {
+    async fn sweep_runs_at_least_once_before_shutdown() -> Result<()> {
         use agent_sdk_core::ThreadId;
         use agent_server::journal::task::AgentTask;
 
@@ -277,7 +307,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let host = ServiceHost::new(config, sample_registry()).unwrap();
+        let host = ServiceHost::new(config, sample_registry())?;
         let stores = host.stores().clone();
         let token = host.shutdown_token();
 
@@ -286,7 +316,7 @@ mod tests {
         let thread = ThreadId::from_string("t-sweep-test");
         let task = AgentTask::new_root_turn(thread.clone(), time::OffsetDateTime::now_utc(), 3);
         let task_id = task.id.clone();
-        stores.task_store.submit_root_turn(task).await.unwrap();
+        stores.task_store.submit_root_turn(task).await?;
 
         let now = time::OffsetDateTime::now_utc();
         let worker = agent_server::journal::task::WorkerId::from_string("w1");
@@ -296,8 +326,7 @@ mod tests {
         stores
             .task_store
             .try_acquire_task(&task_id, worker, lease, expires, now)
-            .await
-            .unwrap();
+            .await?;
 
         // Run the host briefly.
         let host_handle = tokio::spawn(async move { host.run().await });
@@ -305,15 +334,20 @@ mod tests {
         // Give the sweep one cycle.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         token.cancel();
-        host_handle.await.unwrap().unwrap();
+        host_handle.await??;
 
         // The expired lease should have been released — task is back to
         // Pending.
-        let recovered = stores.task_store.get(&task_id).await.unwrap().unwrap();
+        let recovered = stores
+            .task_store
+            .get(&task_id)
+            .await?
+            .context("task should still exist")?;
         assert_eq!(
             recovered.status,
             agent_server::journal::task::TaskStatus::Pending,
             "sweep should have released the expired lease",
         );
+        Ok(())
     }
 }

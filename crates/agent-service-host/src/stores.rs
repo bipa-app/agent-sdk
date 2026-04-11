@@ -173,10 +173,11 @@ mod tests {
     }
 
     #[test]
-    fn from_config_in_memory_matches_convenience() {
+    fn from_config_in_memory_matches_convenience() -> anyhow::Result<()> {
         let config = StorageConfig::default();
-        let stores = StoreRegistry::from_config(&config, sample_registry()).unwrap();
+        let stores = StoreRegistry::from_config(&config, sample_registry())?;
         let _task = &stores.task_store;
+        Ok(())
     }
 
     #[test]
