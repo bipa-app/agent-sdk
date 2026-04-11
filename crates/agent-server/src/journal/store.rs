@@ -214,6 +214,18 @@ use super::task::{
 use super::task_state::SubagentInvocationState;
 use crate::worker::subagent::EffectiveSubagentSpec;
 
+/// Input struct for [`AgentTaskStore::spawn_subagent_invocation`].
+///
+/// The worker materializes `child_thread_id` through [`super::ThreadStore`]
+/// before calling into the task store so durable backends can satisfy the
+/// task → thread foreign key while inserting the child root task.
+#[derive(Clone, Debug)]
+pub struct SubagentInvocationSpawn {
+    pub child_thread_id: ThreadId,
+    pub spec: EffectiveSubagentSpec,
+    pub payload: SuspensionPayload,
+}
+
 /// Persistent store for [`AgentTask`] rows.
 ///
 /// Implementations are required to expose the index surface documented on
@@ -709,14 +721,18 @@ pub trait AgentTaskStore: Send + Sync {
     /// 1. CAS-checks the running parent against `(worker, lease)`.
     /// 2. Allocates one parent-visible `subagent` invocation task
     ///    under the parent.
-    /// 3. Allocates one fresh child-thread `root_turn` task on a new
-    ///    child thread.
+    /// 3. Allocates one fresh child-thread `root_turn` task on the
+    ///    provided child thread.
     /// 4. Persists durable linkage by storing the authoritative spawn
     ///    spec plus the child thread / child root ids on the
     ///    invocation task's [`crate::journal::task_state::SubagentInvocationState`]
     ///    payload.
     /// 5. Transitions the parent to [`TaskStatus::WaitingOnChildren`]
     ///    with the invocation task id as its child-wait target.
+    ///
+    /// Callers must materialize the child thread row before invoking
+    /// this method so durable backends can satisfy task → thread
+    /// foreign keys while inserting the child root task.
     ///
     /// Returns `(parent, invocation, child_root)` with the rows as
     /// persisted.
@@ -730,8 +746,7 @@ pub trait AgentTaskStore: Send + Sync {
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
-        spec: EffectiveSubagentSpec,
-        payload: SuspensionPayload,
+        spawn: SubagentInvocationSpawn,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)>;
 
@@ -2173,11 +2188,15 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         parent_id: &AgentTaskId,
         worker: &WorkerId,
         lease: &LeaseId,
-        spec: EffectiveSubagentSpec,
-        payload: SuspensionPayload,
+        spawn: SubagentInvocationSpawn,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         let mut inner = self.inner.write().await;
+        let SubagentInvocationSpawn {
+            child_thread_id,
+            spec,
+            payload,
+        } = spawn;
 
         let old_parent = inner
             .by_id
@@ -2213,12 +2232,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        let child_thread_id = ThreadId::new();
         if inner.by_thread.contains_key(&child_thread_id)
             || inner.active_root_by_thread.contains_key(&child_thread_id)
         {
             return Err(anyhow!(
-                "spawn rejected: generated child thread id {child_thread_id} already exists"
+                "spawn rejected: child thread id {child_thread_id} already has tasks"
             ));
         }
 
@@ -6383,16 +6401,20 @@ mod tests {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-subagent-spawn").await?;
         let parent_id = parent.id.clone();
+        let child_thread_id = thread("t-subagent-child");
 
         let (parked_parent, invocation, child_root) = store
             .spawn_subagent_invocation(
                 &parent_id,
                 &worker,
                 &lease,
-                sample_subagent_spec(),
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-spawn"),
-                    suspended_messages: Vec::new(),
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread_id.clone(),
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn"),
+                        suspended_messages: Vec::new(),
+                    },
                 },
                 t_plus(2),
             )
@@ -6417,6 +6439,7 @@ mod tests {
         assert_eq!(linkage.child_root_task_id, child_root.id);
         assert_eq!(linkage.child_thread_id, child_root.thread_id);
         assert_eq!(linkage.spec, sample_subagent_spec());
+        assert_eq!(child_root.thread_id, child_thread_id);
 
         assert_eq!(child_root.kind, TaskKind::RootTurn);
         assert_eq!(child_root.status, TaskStatus::Pending);
@@ -6454,16 +6477,20 @@ mod tests {
         let (parent, worker, lease) =
             running_root_for_spawn(&store, "t-subagent-spawn-cas").await?;
         let parent_id = parent.id.clone();
+        let child_thread_id = thread("t-subagent-cas-child");
 
         let err = store
             .spawn_subagent_invocation(
                 &parent_id,
                 &WorkerId::from_string("w-imposter"),
                 &lease,
-                sample_subagent_spec(),
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-spawn-cas"),
-                    suspended_messages: Vec::new(),
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread_id.clone(),
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn-cas"),
+                        suspended_messages: Vec::new(),
+                    },
                 },
                 t_plus(2),
             )
@@ -6480,10 +6507,13 @@ mod tests {
                 &parent_id,
                 &worker,
                 &LeaseId::from_string("l-stale"),
-                sample_subagent_spec(),
-                SuspensionPayload {
-                    continuation: sample_continuation("t-subagent-spawn-cas"),
-                    suspended_messages: Vec::new(),
+                SubagentInvocationSpawn {
+                    child_thread_id,
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn-cas"),
+                        suspended_messages: Vec::new(),
+                    },
                 },
                 t_plus(3),
             )

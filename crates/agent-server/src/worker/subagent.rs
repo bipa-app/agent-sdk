@@ -30,13 +30,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SuspensionPayload, Thread, ThreadStore,
-    WorkerId,
+    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SubagentInvocationSpawn, SuspensionPayload,
+    Thread, ThreadStore, WorkerId,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -545,7 +546,8 @@ pub struct SpawnedSubagentInvocation {
 ///
 /// - parent root task parks in `waiting_on_children`,
 /// - one parent-visible `subagent` invocation task is created,
-/// - one child thread is allocated and materialized,
+/// - one child thread is allocated and materialized before any child
+///   task row is persisted,
 /// - one initial child-thread `root_turn` task is admitted as
 ///   runnable,
 /// - durable linkage among those records is persisted on the
@@ -566,9 +568,26 @@ pub async fn spawn_subagent_invocation(
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentInvocation> {
+    let child_thread_id = ThreadId::new();
+    let child_thread = deps
+        .thread_store
+        .get_or_create(&child_thread_id, now)
+        .await
+        .context("materialize child thread projection")?;
+
     let (parent_task, invocation_task, child_root_task) = deps
         .task_store
-        .spawn_subagent_invocation(parent_id, worker, lease, spec, payload, now)
+        .spawn_subagent_invocation(
+            parent_id,
+            worker,
+            lease,
+            SubagentInvocationSpawn {
+                child_thread_id,
+                spec,
+                payload,
+            },
+            now,
+        )
         .await
         .context("persist subagent invocation tasks")?;
 
@@ -589,11 +608,12 @@ pub async fn spawn_subagent_invocation(
         child_root_task.thread_id,
     );
 
-    let child_thread = deps
-        .thread_store
-        .get_or_create(&child_root_task.thread_id, now)
-        .await
-        .context("materialize child thread projection")?;
+    ensure!(
+        child_thread.thread_id == child_root_task.thread_id,
+        "materialized child thread {} but child root uses {}",
+        child_thread.thread_id,
+        child_root_task.thread_id,
+    );
 
     Ok(SpawnedSubagentInvocation {
         parent_task,
