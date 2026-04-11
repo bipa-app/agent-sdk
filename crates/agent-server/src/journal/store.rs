@@ -245,6 +245,7 @@ use super::task::{
 /// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
 /// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
 /// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
+/// | [`approve_confirmation_and_acquire`](Self::approve_confirmation_and_acquire) | `AwaitingConfirmation` → `Running` | status CAS, retry budget |
 /// | [`reject_confirmation`](Self::reject_confirmation) | `AwaitingConfirmation` → `Failed` + parent recompute | status CAS |
 /// | [`cancel_tree`](Self::cancel_tree) | subtree → `Cancelled` | existence check |
 /// | [`release_expired_leases`](Self::release_expired_leases) | `Running` → `Pending` / `Failed` | lease-expiry CAS, recovery matrix |
@@ -862,6 +863,41 @@ pub trait AgentTaskStore: Send + Sync {
     async fn resume_from_confirmation(
         &self,
         id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)>;
+
+    /// Atomically approve an [`AwaitingConfirmation`](TaskStatus::AwaitingConfirmation)
+    /// task and claim it for immediate execution under `(worker, lease)`.
+    ///
+    /// This closes the race between a transport's "approved" decision
+    /// and the background worker pool's next scan. A successful call:
+    ///
+    /// 1. Verifies that the row exists and is currently
+    ///    [`TaskStatus::AwaitingConfirmation`].
+    /// 2. Extracts the prepared listen/execute operation from the
+    ///    typed confirmation payload.
+    /// 3. Flips the row back to [`TaskStatus::Pending`] and immediately
+    ///    claims it as [`TaskStatus::Running`] under the supplied
+    ///    `(worker, lease)` ownership token.
+    /// 4. Persists the claimed row under the same write lock so no
+    ///    concurrent scan can observe an intermediate `Pending` row.
+    ///
+    /// Returns `(claimed_task, prepared_operation)` where
+    /// `prepared_operation` is the listen-tier operation staged before
+    /// the confirmation pause, if any.
+    ///
+    /// # Errors
+    /// - `task does not exist` — if no row with `id` is stored.
+    /// - `approve rejected: not awaiting confirmation` — if the row is
+    ///   in any status other than [`TaskStatus::AwaitingConfirmation`].
+    /// - Schema errors from [`AgentTask::resume_from_confirmation`] or
+    ///   [`AgentTask::mark_running`].
+    async fn approve_confirmation_and_acquire(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<ListenExecutionContext>)>;
 
@@ -2214,6 +2250,41 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.by_id.insert(resumed.id.clone(), resumed.clone());
         drop(inner);
         Ok((resumed, prepared_operation))
+    }
+
+    async fn approve_confirmation_and_acquire(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("approve rejected: task {id} does not exist"))?;
+
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "approve rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
+        }
+
+        let (resumed, prepared_operation) = old
+            .clone()
+            .resume_from_confirmation(now)
+            .context("approve rejected: resume_from_confirmation transition failed")?;
+        let claimed = resumed
+            .mark_running(worker, lease, expires_at, now)
+            .context("approve rejected: mark_running transition failed")?;
+        inner.rebalance_after_row_change(&old, &claimed);
+        inner.by_id.insert(claimed.id.clone(), claimed.clone());
+        drop(inner);
+        Ok((claimed, prepared_operation))
     }
 
     async fn reject_confirmation(
@@ -5165,6 +5236,58 @@ mod tests {
             .context("scan returned row")?;
         assert_eq!(scanned.id, id);
         assert_eq!(scanned.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approve_confirmation_and_acquire_claims_without_pending_race() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (claimed, worker, lease) =
+            submitted_and_claimed_root(&store, "t-approve-conf", "w1", "l1").await?;
+        let id = claimed.id.clone();
+        store
+            .pause_on_confirmation(
+                &id,
+                &worker,
+                &lease,
+                sample_continuation("t-approve-conf"),
+                Some(sample_prepared_op()),
+                t_plus(2),
+            )
+            .await
+            .context("pause")?;
+
+        let (approved, prepared) = store
+            .approve_confirmation_and_acquire(
+                &id,
+                WorkerId::from_string("w-approved"),
+                LeaseId::from_string("l-approved"),
+                t_plus(120),
+                t_plus(3),
+            )
+            .await
+            .context("approve and acquire")?;
+        assert_eq!(approved.status, TaskStatus::Running);
+        assert_eq!(
+            approved.worker_id,
+            Some(WorkerId::from_string("w-approved"))
+        );
+        assert_eq!(approved.lease_id, Some(LeaseId::from_string("l-approved")));
+
+        let prepared = prepared.context("prepared operation missing")?;
+        assert_eq!(prepared.operation_id, "op-store");
+
+        let persisted = store
+            .get(&id)
+            .await
+            .context("get approved task")?
+            .context("approved task missing")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert_eq!(
+            persisted.worker_id,
+            Some(WorkerId::from_string("w-approved"))
+        );
+        assert_eq!(persisted.lease_id, Some(LeaseId::from_string("l-approved")));
         Ok(())
     }
 

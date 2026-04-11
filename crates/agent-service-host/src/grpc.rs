@@ -1,0 +1,2252 @@
+//! gRPC transport and local-daemon runtime for the durable service host.
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+
+use agent_sdk_core::events::AgentEvent;
+use agent_sdk_core::llm::{self, ContentBlock, ContentSource};
+use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use agent_server::journal::execution_intent::GuardedExecutionDeps;
+use agent_server::journal::task::{
+    AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
+    TaskStatus as JournalTaskStatus, WorkerId,
+};
+use agent_server::journal::task_state::TaskState;
+use agent_server::worker::{
+    AgentDefinitionRegistry, ConfirmationDecision, ConfirmationResumeOutcome,
+    apply_confirmation_decision, resolve_tool_bootstrap, resume_confirmed_tool,
+};
+use anyhow::{Context, Result};
+use async_stream::try_stream;
+use base64::Engine as _;
+use futures::Stream;
+use prost::Message as ProstMessage;
+use prost_types::{
+    Duration as ProtoDuration, ListValue as ProtoListValue, Struct as ProtoStruct,
+    Timestamp as ProtoTimestamp, Value as ProtoValue, value::Kind as ProtoValueKind,
+};
+use time::OffsetDateTime;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
+use tracing::{info, warn};
+
+use crate::config::ServiceConfig;
+use crate::health::HealthSurface;
+use crate::host::ServiceHost;
+use crate::proto::agent::service::v1 as pb;
+use crate::proto::agent::service::v1::agent_control_service_server::{
+    AgentControlService, AgentControlServiceServer,
+};
+use crate::proto::agent::service::v1::agent_event_service_server::{
+    AgentEventService, AgentEventServiceServer,
+};
+use crate::runtime::ExecutionRuntime;
+use crate::stores::StoreRegistry;
+
+#[derive(Default)]
+struct IdempotencyState {
+    create_thread: HashMap<String, String>,
+    submit_work: HashMap<String, SubmitWorkRecord>,
+    decide_confirmation: HashMap<String, DecideConfirmationRecord>,
+}
+
+#[derive(Clone)]
+struct SubmitWorkRecord {
+    fingerprint: Vec<u8>,
+    thread_id: String,
+    task_id: String,
+}
+
+#[derive(Clone)]
+struct DecideConfirmationRecord {
+    fingerprint: Vec<u8>,
+    task_id: String,
+    parent_task_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct GrpcShared {
+    stores: StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    health: Arc<HealthSurface>,
+    shutdown: CancellationToken,
+    lease_duration: time::Duration,
+    idempotency: Arc<Mutex<IdempotencyState>>,
+}
+
+impl GrpcShared {
+    fn new(
+        stores: StoreRegistry,
+        runtime: Arc<ExecutionRuntime>,
+        health: Arc<HealthSurface>,
+        shutdown: CancellationToken,
+        lease_duration: time::Duration,
+    ) -> Self {
+        Self {
+            stores,
+            runtime,
+            health,
+            shutdown,
+            lease_duration,
+            idempotency: Arc::new(Mutex::new(IdempotencyState::default())),
+        }
+    }
+
+    async fn require_thread(&self, thread_id: &ThreadId) -> Result<agent_server::Thread, Status> {
+        self.stores
+            .thread_store
+            .get(thread_id)
+            .await
+            .map_err(internal_status("loading thread"))?
+            .ok_or_else(|| not_found_status("thread", &thread_id.0))
+    }
+
+    async fn thread_view(&self, thread_id: &ThreadId) -> Result<pb::ThreadView, Status> {
+        let thread = self.require_thread(thread_id).await?;
+        let tasks = self
+            .stores
+            .task_store
+            .list_by_thread(thread_id)
+            .await
+            .map_err(internal_status("listing thread tasks"))?;
+
+        let active_root = tasks
+            .iter()
+            .filter(|task| task.is_root() && task.status.blocks_root_admission())
+            .min_by_key(|task| task.created_at);
+
+        let mut queued_roots: Vec<&AgentTask> = tasks
+            .iter()
+            .filter(|task| task.is_root() && task.status == JournalTaskStatus::Queued)
+            .collect();
+        queued_roots.sort_by_key(|task| task.created_at);
+
+        let mut queued_root_snapshots = Vec::with_capacity(queued_roots.len());
+        for task in queued_roots {
+            queued_root_snapshots.push(self.task_snapshot(task).await?);
+        }
+
+        Ok(pb::ThreadView {
+            thread: Some(self.thread_snapshot(&thread).await?),
+            active_root: match active_root {
+                Some(task) => Some(self.task_snapshot(task).await?),
+                None => None,
+            },
+            queued_roots: queued_root_snapshots,
+        })
+    }
+
+    async fn thread_snapshot(
+        &self,
+        thread: &agent_server::Thread,
+    ) -> Result<pb::ThreadSnapshot, Status> {
+        let events = self
+            .stores
+            .event_repo
+            .get_events(&thread.thread_id)
+            .await
+            .map_err(internal_status("loading thread events"))?;
+
+        Ok(pb::ThreadSnapshot {
+            thread_id: thread.thread_id.0.clone(),
+            status: map_thread_status(thread.status),
+            committed_turns: thread.committed_turns,
+            total_usage: Some(map_token_usage(&thread.total_usage)),
+            created_at: Some(map_timestamp(thread.created_at)?),
+            updated_at: Some(map_timestamp(thread.updated_at)?),
+            latest_event_sequence: events.last().map(|event| event.sequence),
+            earliest_available_event_sequence: events.first().map(|event| event.sequence),
+        })
+    }
+
+    async fn message_projection_snapshot(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<pb::MessageProjectionSnapshot, Status> {
+        self.require_thread(thread_id).await?;
+        let now = OffsetDateTime::now_utc();
+        let projection = self
+            .stores
+            .message_store
+            .get_or_create(thread_id, now)
+            .await
+            .map_err(internal_status("loading message projection"))?;
+
+        Ok(pb::MessageProjectionSnapshot {
+            thread_id: projection.thread_id.0,
+            messages: projection
+                .messages
+                .iter()
+                .map(map_message)
+                .collect::<Result<Vec<_>, _>>()?,
+            version: projection.version,
+            created_at: Some(map_timestamp(projection.created_at)?),
+            updated_at: Some(map_timestamp(projection.updated_at)?),
+        })
+    }
+
+    async fn task_snapshot(&self, task: &AgentTask) -> Result<pb::TaskSnapshot, Status> {
+        let state_detail = match &task.state {
+            TaskState::None => None,
+            TaskState::WaitingOnChildren { child_ids, .. } => Some(
+                pb::task_snapshot::StateDetail::WaitingOnChildren(pb::WaitingOnChildrenState {
+                    child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
+                }),
+            ),
+            TaskState::ReadyToResume { child_ids, .. } => Some(
+                pb::task_snapshot::StateDetail::ReadyToResume(pb::ReadyToResumeState {
+                    child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
+                }),
+            ),
+            TaskState::AwaitingConfirmation {
+                continuation,
+                prepared_operation,
+            } => {
+                let pending_tool = continuation
+                    .payload
+                    .pending_tool_calls
+                    .get(continuation.payload.awaiting_index)
+                    .ok_or_else(|| {
+                        Status::internal(format!(
+                            "task {} awaiting confirmation without pending tool at index {}",
+                            task.id, continuation.payload.awaiting_index
+                        ))
+                    })?;
+                let description = self
+                    .resolve_tool_description(task, &pending_tool.name)
+                    .await;
+                Some(pb::task_snapshot::StateDetail::AwaitingConfirmation(
+                    pb::AwaitingConfirmationState {
+                        confirmation: Some(pb::PendingConfirmation {
+                            task_id: task.id.to_string(),
+                            tool_call_id: pending_tool.id.clone(),
+                            tool_name: pending_tool.name.clone(),
+                            display_name: pending_tool.display_name.clone(),
+                            requested_input: Some(map_json_value(&pending_tool.input)?),
+                            description,
+                            prepared_operation: prepared_operation
+                                .as_ref()
+                                .map(map_prepared_operation)
+                                .transpose()?,
+                            paused_at: Some(map_timestamp(task.updated_at)?),
+                        }),
+                    },
+                ))
+            }
+        };
+
+        Ok(pb::TaskSnapshot {
+            task_id: task.id.to_string(),
+            thread_id: task.thread_id.0.clone(),
+            root_task_id: task.root_id.to_string(),
+            parent_task_id: task.parent_id.as_ref().map(ToString::to_string),
+            kind: map_task_kind(task.kind),
+            status: map_task_status(task.status),
+            depth: task.depth,
+            attempt: task.attempt,
+            max_attempts: task.max_attempts,
+            pending_child_count: task.pending_child_count,
+            last_error: task.last_error.clone(),
+            state_detail,
+            created_at: Some(map_timestamp(task.created_at)?),
+            updated_at: Some(map_timestamp(task.updated_at)?),
+            completed_at: map_optional_timestamp(task.completed_at)?,
+        })
+    }
+
+    async fn resolve_tool_description(&self, task: &AgentTask, tool_name: &str) -> String {
+        let root = match self.stores.task_store.get(&task.root_id).await {
+            Ok(Some(root)) => root,
+            Ok(None) | Err(_) => return tool_name.to_owned(),
+        };
+
+        let definition = match self.stores.definition_registry.resolve(&root).await {
+            Ok(definition) => definition,
+            Err(_) => return tool_name.to_owned(),
+        };
+
+        definition
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .map(|tool| tool.description.clone())
+            .unwrap_or_else(|| tool_name.to_owned())
+    }
+
+    async fn execute_approved_confirmation(&self, task_id: &AgentTaskId) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        let worker_id = WorkerId::new();
+        let lease_id = LeaseId::new();
+        let lease_expires_at = now + self.lease_duration;
+        let (acquired, _prepared_operation) = self
+            .stores
+            .task_store
+            .approve_confirmation_and_acquire(task_id, worker_id, lease_id, lease_expires_at, now)
+            .await
+            .context("approving and acquiring confirmation task")?;
+
+        let watermark = self
+            .stores
+            .event_repo
+            .next_sequence(&acquired.thread_id)
+            .await
+            .context("capturing approved confirmation watermark")?;
+
+        let bootstrap = resolve_tool_bootstrap(acquired, self.stores.task_store.as_ref())
+            .await
+            .context("bootstrapping approved confirmation task")?;
+        let executor_bootstrap = bootstrap.clone();
+        let publish_thread_id = bootstrap.thread_id.clone();
+        let running_task_id = bootstrap.task_id.clone();
+        let running_worker_id = bootstrap.worker_id.clone();
+        let running_lease_id = bootstrap.lease_id.clone();
+        let tool_executor = Arc::clone(self.runtime.tool_executor());
+        let cancel = self.shutdown.clone();
+        let deps = GuardedExecutionDeps {
+            task_store: self.stores.task_store.as_ref(),
+            intent_store: self.stores.execution_intent_store.as_ref(),
+            event_repo: self.stores.event_repo.as_ref(),
+        };
+
+        match resume_confirmed_tool(
+            bootstrap,
+            &deps,
+            self.runtime.confirmation_policy().as_ref(),
+            &self.shutdown,
+            move |_tool_call, collector| {
+                let tool_executor = Arc::clone(&tool_executor);
+                let executor_bootstrap = executor_bootstrap.clone();
+                let cancel = cancel.clone();
+                async move {
+                    tool_executor
+                        .execute_tool_call(&executor_bootstrap, collector, cancel)
+                        .await
+                }
+            },
+            now,
+        )
+        .await
+        {
+            Ok(ConfirmationResumeOutcome::Executed(_))
+            | Ok(ConfirmationResumeOutcome::PolicyDenied { .. }) => {}
+            Err(error) => {
+                warn!(?error, task_id = %task_id, "approved confirmation resume failed");
+                let _ = self
+                    .stores
+                    .task_store
+                    .fail_task(
+                        &running_task_id,
+                        &running_worker_id,
+                        &running_lease_id,
+                        format!("{error:#}"),
+                        now,
+                    )
+                    .await;
+            }
+        }
+
+        self.publish_committed_after(&publish_thread_id, watermark)
+            .await
+            .context("publishing approved confirmation events")?;
+        Ok(())
+    }
+
+    async fn publish_committed_after(
+        &self,
+        thread_id: &ThreadId,
+        start_sequence: u64,
+    ) -> Result<()> {
+        let events = self
+            .stores
+            .event_repo
+            .get_events(thread_id)
+            .await
+            .context("loading committed events for publish")?;
+        let to_publish: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.sequence >= start_sequence)
+            .collect();
+        if !to_publish.is_empty() {
+            self.stores.event_notifier.notify(&to_publish);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct GrpcControlService {
+    shared: Arc<GrpcShared>,
+}
+
+#[derive(Clone)]
+struct GrpcEventService {
+    shared: Arc<GrpcShared>,
+}
+
+#[tonic::async_trait]
+impl AgentControlService for GrpcControlService {
+    async fn create_thread(
+        &self,
+        request: Request<pb::CreateThreadRequest>,
+    ) -> Result<Response<pb::CreateThreadResponse>, Status> {
+        let request = request.into_inner();
+        require_request_id(&request.request_id)?;
+
+        let existing = {
+            let idempotency = self.shared.idempotency.lock().await;
+            idempotency.create_thread.get(&request.request_id).cloned()
+        };
+        if let Some(thread_id) = existing {
+            let response = pb::CreateThreadResponse {
+                thread: Some(
+                    self.shared
+                        .thread_view(&ThreadId::from_string(thread_id))
+                        .await?,
+                ),
+            };
+            return Ok(Response::new(response));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let thread_id = ThreadId::new();
+        self.shared
+            .stores
+            .thread_store
+            .get_or_create(&thread_id, now)
+            .await
+            .map_err(internal_status("creating thread"))?;
+        self.shared
+            .stores
+            .message_store
+            .get_or_create(&thread_id, now)
+            .await
+            .map_err(internal_status("creating message projection"))?;
+
+        {
+            let mut idempotency = self.shared.idempotency.lock().await;
+            idempotency
+                .create_thread
+                .insert(request.request_id, thread_id.0.clone());
+        }
+
+        Ok(Response::new(pb::CreateThreadResponse {
+            thread: Some(self.shared.thread_view(&thread_id).await?),
+        }))
+    }
+
+    async fn get_thread(
+        &self,
+        request: Request<pb::GetThreadRequest>,
+    ) -> Result<Response<pb::GetThreadResponse>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        Ok(Response::new(pb::GetThreadResponse {
+            thread: Some(self.shared.thread_view(&thread_id).await?),
+        }))
+    }
+
+    async fn get_thread_messages(
+        &self,
+        request: Request<pb::GetThreadMessagesRequest>,
+    ) -> Result<Response<pb::GetThreadMessagesResponse>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        Ok(Response::new(pb::GetThreadMessagesResponse {
+            projection: Some(self.shared.message_projection_snapshot(&thread_id).await?),
+        }))
+    }
+
+    async fn list_thread_tasks(
+        &self,
+        request: Request<pb::ListThreadTasksRequest>,
+    ) -> Result<Response<pb::ListThreadTasksResponse>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        self.shared.require_thread(&thread_id).await?;
+
+        let mut tasks = self
+            .shared
+            .stores
+            .task_store
+            .list_by_thread(&thread_id)
+            .await
+            .map_err(internal_status("listing thread tasks"))?;
+        tasks.sort_by_key(|task| (task.created_at, task.depth, task.spawn_index.unwrap_or(0)));
+
+        let mut snapshots = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            snapshots.push(self.shared.task_snapshot(task).await?);
+        }
+
+        Ok(Response::new(pb::ListThreadTasksResponse {
+            tasks: snapshots,
+        }))
+    }
+
+    async fn get_task(
+        &self,
+        request: Request<pb::GetTaskRequest>,
+    ) -> Result<Response<pb::GetTaskResponse>, Status> {
+        let request = request.into_inner();
+        let task_id = parse_task_id(&request.task_id)?;
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+
+        Ok(Response::new(pb::GetTaskResponse {
+            task: Some(self.shared.task_snapshot(&task).await?),
+        }))
+    }
+
+    async fn submit_thread_work(
+        &self,
+        request: Request<pb::SubmitThreadWorkRequest>,
+    ) -> Result<Response<pb::SubmitThreadWorkResponse>, Status> {
+        let request = request.into_inner();
+        require_request_id(&request.request_id)?;
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        let fingerprint = submit_work_fingerprint(&request);
+
+        if let Some(record) = {
+            let idempotency = self.shared.idempotency.lock().await;
+            idempotency.submit_work.get(&request.request_id).cloned()
+        } {
+            if record.fingerprint != fingerprint || record.thread_id != request.thread_id {
+                return Err(idempotency_conflict_status(
+                    "SubmitThreadWork",
+                    &request.request_id,
+                ));
+            }
+
+            let task = self
+                .shared
+                .stores
+                .task_store
+                .get(&AgentTaskId::from_string(record.task_id))
+                .await
+                .map_err(internal_status("loading idempotent submitted task"))?
+                .ok_or_else(|| not_found_status("task", "idempotent submit result"))?;
+
+            return Ok(Response::new(pb::SubmitThreadWorkResponse {
+                thread: Some(self.shared.thread_view(&thread_id).await?),
+                task: Some(self.shared.task_snapshot(&task).await?),
+            }));
+        }
+
+        let thread = self.shared.require_thread(&thread_id).await?;
+        if thread.status.is_completed() {
+            return Err(Status::failed_precondition(format!(
+                "thread {} is completed",
+                thread.thread_id
+            )));
+        }
+
+        if request.input.is_empty() {
+            return Err(Status::invalid_argument(
+                "submit_thread_work requires at least one input item",
+            ));
+        }
+
+        let submitted_input = request
+            .input
+            .iter()
+            .map(map_submitted_input_item)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let now = OffsetDateTime::now_utc();
+        let submission_template =
+            AgentTask::new_root_turn(thread_id.clone(), now, AgentTask::DEFAULT_MAX_ATTEMPTS);
+        let definition = self
+            .shared
+            .stores
+            .definition_registry
+            .resolve(&submission_template)
+            .await
+            .map_err(internal_status(
+                "resolving root-turn definition for submission",
+            ))?;
+        let task = AgentTask::new_root_turn_with_input(
+            thread_id.clone(),
+            submitted_input,
+            now,
+            definition.policy.max_attempts,
+        );
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .submit_root_turn(task)
+            .await
+            .map_err(internal_status("submitting root turn"))?;
+
+        {
+            let mut idempotency = self.shared.idempotency.lock().await;
+            idempotency.submit_work.insert(
+                request.request_id,
+                SubmitWorkRecord {
+                    fingerprint,
+                    thread_id: thread_id.0.clone(),
+                    task_id: task.id.to_string(),
+                },
+            );
+        }
+
+        Ok(Response::new(pb::SubmitThreadWorkResponse {
+            thread: Some(self.shared.thread_view(&thread_id).await?),
+            task: Some(self.shared.task_snapshot(&task).await?),
+        }))
+    }
+
+    async fn decide_confirmation(
+        &self,
+        request: Request<pb::DecideConfirmationRequest>,
+    ) -> Result<Response<pb::DecideConfirmationResponse>, Status> {
+        let request = request.into_inner();
+        require_request_id(&request.request_id)?;
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        let task_id = parse_task_id(&request.task_id)?;
+        let fingerprint = decide_confirmation_fingerprint(&request);
+
+        if let Some(record) = {
+            let idempotency = self.shared.idempotency.lock().await;
+            idempotency
+                .decide_confirmation
+                .get(&request.request_id)
+                .cloned()
+        } {
+            if record.fingerprint != fingerprint {
+                return Err(idempotency_conflict_status(
+                    "DecideConfirmation",
+                    &request.request_id,
+                ));
+            }
+
+            let task = self
+                .shared
+                .stores
+                .task_store
+                .get(&AgentTaskId::from_string(record.task_id))
+                .await
+                .map_err(internal_status("loading idempotent confirmation task"))?
+                .ok_or_else(|| not_found_status("task", "idempotent confirmation result"))?;
+            let parent_task = match record.parent_task_id {
+                Some(parent_task_id) => self
+                    .shared
+                    .stores
+                    .task_store
+                    .get(&AgentTaskId::from_string(parent_task_id))
+                    .await
+                    .map_err(internal_status("loading idempotent confirmation parent"))?,
+                None => None,
+            };
+
+            return Ok(Response::new(pb::DecideConfirmationResponse {
+                task: Some(self.shared.task_snapshot(&task).await?),
+                parent_task: match parent_task {
+                    Some(parent_task) => Some(self.shared.task_snapshot(&parent_task).await?),
+                    None => None,
+                },
+            }));
+        }
+
+        let current_task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading confirmation task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+        if current_task.thread_id != thread_id {
+            return Err(Status::failed_precondition(format!(
+                "task {} does not belong to thread {}",
+                task_id, thread_id
+            )));
+        }
+
+        let decision = map_confirmation_decision(
+            request
+                .decision
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("confirmation decision is required"))?,
+        )?;
+        match decision {
+            ConfirmationDecision::Approved => {
+                self.shared
+                    .execute_approved_confirmation(&task_id)
+                    .await
+                    .map_err(internal_status("executing approved confirmation"))?;
+            }
+            other => {
+                let now = OffsetDateTime::now_utc();
+                let _ = apply_confirmation_decision(
+                    &task_id,
+                    other,
+                    self.shared.stores.task_store.as_ref(),
+                    now,
+                )
+                .await
+                .map_err(internal_status("applying confirmation decision"))?;
+            }
+        }
+
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("reloading confirmation task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+
+        let parent_task = match task.parent_id.as_ref() {
+            Some(parent_id) => self
+                .shared
+                .stores
+                .task_store
+                .get(parent_id)
+                .await
+                .map_err(internal_status("reloading confirmation parent"))?,
+            None => None,
+        };
+
+        {
+            let mut idempotency = self.shared.idempotency.lock().await;
+            idempotency.decide_confirmation.insert(
+                request.request_id,
+                DecideConfirmationRecord {
+                    fingerprint,
+                    task_id: task.id.to_string(),
+                    parent_task_id: parent_task.as_ref().map(|parent| parent.id.to_string()),
+                },
+            );
+        }
+
+        Ok(Response::new(pb::DecideConfirmationResponse {
+            task: Some(self.shared.task_snapshot(&task).await?),
+            parent_task: match parent_task {
+                Some(parent_task) => Some(self.shared.task_snapshot(&parent_task).await?),
+                None => None,
+            },
+        }))
+    }
+}
+
+type EventStream =
+    Pin<Box<dyn Stream<Item = Result<pb::StreamThreadEventsResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl AgentEventService for GrpcEventService {
+    type StreamThreadEventsStream = EventStream;
+
+    async fn stream_thread_events(
+        &self,
+        request: Request<pb::StreamThreadEventsRequest>,
+    ) -> Result<Response<Self::StreamThreadEventsStream>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        self.shared.require_thread(&thread_id).await?;
+        let follow_mode = map_follow_mode(request.follow_mode)?;
+        let shared = Arc::clone(&self.shared);
+
+        let stream = try_stream! {
+            let mut live_rx = shared.stores.event_notifier.subscribe(&thread_id);
+            let next_sequence = shared
+                .stores
+                .event_repo
+                .next_sequence(&thread_id)
+                .await
+                .map_err(as_stream_status("capturing event watermark"))?;
+
+            let all_events = shared
+                .stores
+                .event_repo
+                .get_events(&thread_id)
+                .await
+                .map_err(as_stream_status("loading replay events"))?;
+            let earliest_available = all_events.first().map(|event| event.sequence);
+            let latest_available = all_events.last().map(|event| event.sequence);
+
+            if let (Some(requested_after), Some(earliest)) =
+                (request.after_sequence, earliest_available)
+            {
+                if requested_after < earliest.saturating_sub(1) {
+                    yield pb::StreamThreadEventsResponse {
+                        item: Some(pb::stream_thread_events_response::Item::RetentionGap(
+                            pb::RetentionGap {
+                                thread_id: thread_id.0.clone(),
+                                requested_after_sequence: request.after_sequence,
+                                earliest_available_sequence: earliest_available,
+                                latest_available_sequence: latest_available,
+                            },
+                        )),
+                    };
+                    return;
+                }
+            }
+
+            let replay_through_sequence = next_sequence.checked_sub(1);
+            yield pb::StreamThreadEventsResponse {
+                item: Some(pb::stream_thread_events_response::Item::ReplayOpened(
+                    pb::ReplayOpened {
+                        thread_id: thread_id.0.clone(),
+                        requested_after_sequence: request.after_sequence,
+                        earliest_available_sequence: earliest_available,
+                        replay_through_sequence,
+                        follow_mode: follow_mode as i32,
+                    },
+                )),
+            };
+
+            let replay_events: Vec<_> = match request.after_sequence {
+                Some(after_sequence) => all_events
+                    .into_iter()
+                    .filter(|event| event.sequence > after_sequence)
+                    .collect(),
+                None => all_events,
+            };
+
+            let mut last_delivered_sequence = request.after_sequence;
+            for event in &replay_events {
+                last_delivered_sequence = Some(event.sequence);
+                yield pb::StreamThreadEventsResponse {
+                    item: Some(pb::stream_thread_events_response::Item::Event(
+                        map_committed_event(event)?,
+                    )),
+                };
+            }
+
+            yield pb::StreamThreadEventsResponse {
+                item: Some(pb::stream_thread_events_response::Item::ReplayCatchupComplete(
+                    pb::ReplayCatchupComplete {
+                        thread_id: thread_id.0.clone(),
+                        replayed_through_sequence: replay_events
+                            .last()
+                            .map(|event| event.sequence)
+                            .or(request.after_sequence),
+                        following_live: matches!(
+                            follow_mode,
+                            pb::FollowMode::ReplayAndFollow
+                        ),
+                    },
+                )),
+            };
+
+            let last_replayed_done = replay_events.last().is_some_and(is_done_event);
+            if matches!(follow_mode, pb::FollowMode::ReplayOnly) {
+                yield pb::StreamThreadEventsResponse {
+                    item: Some(pb::stream_thread_events_response::Item::Closed(
+                        pb::EventStreamClosed {
+                            thread_id: thread_id.0.clone(),
+                            reason: pb::StreamCloseReason::ReplayExhausted as i32,
+                            last_sequence: last_delivered_sequence,
+                        },
+                    )),
+                };
+                return;
+            }
+
+            if last_replayed_done {
+                yield pb::StreamThreadEventsResponse {
+                    item: Some(pb::stream_thread_events_response::Item::Closed(
+                        pb::EventStreamClosed {
+                            thread_id: thread_id.0.clone(),
+                            reason: pb::StreamCloseReason::ThreadCompleted as i32,
+                            last_sequence: last_delivered_sequence,
+                        },
+                    )),
+                };
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    _ = shared.shutdown.cancelled() => {
+                        yield pb::StreamThreadEventsResponse {
+                            item: Some(pb::stream_thread_events_response::Item::Closed(
+                                pb::EventStreamClosed {
+                                    thread_id: thread_id.0.clone(),
+                                    reason: pb::StreamCloseReason::ServerShutdown as i32,
+                                    last_sequence: last_delivered_sequence,
+                                },
+                            )),
+                        };
+                        return;
+                    }
+                    received = live_rx.recv() => match received {
+                        Ok(event) => {
+                            if last_delivered_sequence.is_some_and(|sequence| event.sequence <= sequence) {
+                                continue;
+                            }
+                            last_delivered_sequence = Some(event.sequence);
+                            let is_done = is_done_event(&event);
+                            yield pb::StreamThreadEventsResponse {
+                                item: Some(pb::stream_thread_events_response::Item::Event(
+                                    map_committed_event(&event)?,
+                                )),
+                            };
+                            if is_done {
+                                yield pb::StreamThreadEventsResponse {
+                                    item: Some(pb::stream_thread_events_response::Item::Closed(
+                                        pb::EventStreamClosed {
+                                            thread_id: thread_id.0.clone(),
+                                            reason: pb::StreamCloseReason::ThreadCompleted as i32,
+                                            last_sequence: last_delivered_sequence,
+                                        },
+                                    )),
+                                };
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield pb::StreamThreadEventsResponse {
+                                item: Some(pb::stream_thread_events_response::Item::ReplayRequired(
+                                    pb::ReplayRequired {
+                                        thread_id: thread_id.0.clone(),
+                                        last_delivered_sequence,
+                                        reason: pb::ReplayRequiredReason::SubscriberLagged as i32,
+                                    },
+                                )),
+                            };
+                            return;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            yield pb::StreamThreadEventsResponse {
+                                item: Some(pb::stream_thread_events_response::Item::Closed(
+                                    pb::EventStreamClosed {
+                                        thread_id: thread_id.0.clone(),
+                                        reason: pb::StreamCloseReason::ServerShutdown as i32,
+                                        last_sequence: last_delivered_sequence,
+                                    },
+                                )),
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// gRPC transport server bound to a durable host runtime.
+#[derive(Clone)]
+pub struct GrpcTransport {
+    shared: Arc<GrpcShared>,
+}
+
+impl GrpcTransport {
+    #[must_use]
+    pub fn new(
+        stores: StoreRegistry,
+        runtime: Arc<ExecutionRuntime>,
+        health: Arc<HealthSurface>,
+        shutdown: CancellationToken,
+        lease_duration: time::Duration,
+    ) -> Self {
+        Self {
+            shared: Arc::new(GrpcShared::new(
+                stores,
+                runtime,
+                health,
+                shutdown,
+                lease_duration,
+            )),
+        }
+    }
+
+    pub async fn serve(self, addr: SocketAddr) -> Result<()> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding gRPC listener on {addr}"))?;
+        self.serve_listener(listener).await
+    }
+
+    pub async fn serve_listener(self, listener: TcpListener) -> Result<()> {
+        let (mut reporter, health_service) = tonic_health::server::health_reporter();
+        let control_service = GrpcControlService {
+            shared: Arc::clone(&self.shared),
+        };
+        let event_service = GrpcEventService {
+            shared: Arc::clone(&self.shared),
+        };
+
+        let shutdown = self.shared.shutdown.clone();
+        let health = Arc::clone(&self.shared.health);
+        let health_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            loop {
+                let ready = health.snapshot().is_ready();
+                if ready {
+                    reporter
+                        .set_serving::<AgentControlServiceServer<GrpcControlService>>()
+                        .await;
+                    reporter
+                        .set_serving::<AgentEventServiceServer<GrpcEventService>>()
+                        .await;
+                } else {
+                    reporter
+                        .set_not_serving::<AgentControlServiceServer<GrpcControlService>>()
+                        .await;
+                    reporter
+                        .set_not_serving::<AgentEventServiceServer<GrpcEventService>>()
+                        .await;
+                }
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+            }
+        });
+
+        Server::builder()
+            .add_service(health_service)
+            .add_service(AgentControlServiceServer::new(control_service))
+            .add_service(AgentEventServiceServer::new(event_service))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                self.shared.shutdown.cancelled(),
+            )
+            .await
+            .context("serving gRPC transport")?;
+
+        health_task.abort();
+        let _ = health_task.await;
+        Ok(())
+    }
+}
+
+/// Process-local daemon that runs the host workers and gRPC listener together.
+pub struct LocalDaemon {
+    addr: SocketAddr,
+    shutdown: CancellationToken,
+    host_task: JoinHandle<Result<()>>,
+    grpc_task: JoinHandle<Result<()>>,
+}
+
+impl LocalDaemon {
+    pub async fn start(
+        config: ServiceConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Result<Self> {
+        let stores = StoreRegistry::from_config(&config.storage, definition_registry)
+            .context("creating daemon stores")?;
+        let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))
+            .context("creating daemon host")?;
+        let health = Arc::clone(host.health());
+        let shutdown = host.shutdown_token();
+        let grpc = GrpcTransport::new(
+            stores,
+            runtime,
+            health,
+            shutdown.clone(),
+            config.worker.lease_duration(),
+        );
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("binding local daemon listener")?;
+        let addr = listener
+            .local_addr()
+            .context("reading local daemon listener address")?;
+
+        let host_task = tokio::spawn(async move { host.run().await });
+        let grpc_task = tokio::spawn(async move { grpc.serve_listener(listener).await });
+
+        info!(%addr, "local daemon started");
+        Ok(Self {
+            addr,
+            shutdown,
+            host_task,
+            grpc_task,
+        })
+    }
+
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        self.shutdown.cancel();
+        self.grpc_task.await.context("joining gRPC task")??;
+        self.host_task.await.context("joining host task")??;
+        Ok(())
+    }
+}
+
+fn require_request_id(request_id: &str) -> Result<(), Status> {
+    if request_id.trim().is_empty() {
+        return Err(Status::invalid_argument("request_id is required"));
+    }
+    Ok(())
+}
+
+fn parse_thread_id(thread_id: &str) -> Result<ThreadId, Status> {
+    if thread_id.trim().is_empty() {
+        return Err(Status::invalid_argument("thread_id is required"));
+    }
+    Ok(ThreadId::from_string(thread_id))
+}
+
+fn parse_task_id(task_id: &str) -> Result<AgentTaskId, Status> {
+    if task_id.trim().is_empty() {
+        return Err(Status::invalid_argument("task_id is required"));
+    }
+    Ok(AgentTaskId::from_string(task_id))
+}
+
+fn internal_status(
+    context: &'static str,
+) -> impl Fn(anyhow::Error) -> Status + Copy + Send + Sync + 'static {
+    move |error| Status::internal(format!("{context}: {error:#}"))
+}
+
+fn as_stream_status(
+    context: &'static str,
+) -> impl Fn(anyhow::Error) -> Status + Copy + Send + Sync + 'static {
+    internal_status(context)
+}
+
+fn not_found_status(resource_kind: &str, resource_id: &str) -> Status {
+    Status::not_found(format!("{resource_kind} '{resource_id}' was not found"))
+}
+
+fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
+    Status::already_exists(format!(
+        "request_id '{request_id}' was already used for a different {method} request"
+    ))
+}
+
+fn submit_work_fingerprint(request: &pb::SubmitThreadWorkRequest) -> Vec<u8> {
+    let mut request = request.clone();
+    request.request_id.clear();
+    request.encode_to_vec()
+}
+
+fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> Vec<u8> {
+    let mut request = request.clone();
+    request.request_id.clear();
+    request.encode_to_vec()
+}
+
+fn map_thread_status(status: agent_server::ThreadStatus) -> i32 {
+    match status {
+        agent_server::ThreadStatus::Active => pb::ThreadStatus::Active as i32,
+        agent_server::ThreadStatus::Completed => pb::ThreadStatus::Completed as i32,
+    }
+}
+
+fn map_task_kind(kind: JournalTaskKind) -> i32 {
+    match kind {
+        JournalTaskKind::RootTurn => pb::TaskKind::RootTurn as i32,
+        JournalTaskKind::ToolRuntime => pb::TaskKind::ToolRuntime as i32,
+        JournalTaskKind::Subagent => pb::TaskKind::Subagent as i32,
+    }
+}
+
+fn map_task_status(status: JournalTaskStatus) -> i32 {
+    match status {
+        JournalTaskStatus::Queued => pb::TaskStatus::Queued as i32,
+        JournalTaskStatus::Pending => pb::TaskStatus::Pending as i32,
+        JournalTaskStatus::Running => pb::TaskStatus::Running as i32,
+        JournalTaskStatus::WaitingOnChildren => pb::TaskStatus::WaitingOnChildren as i32,
+        JournalTaskStatus::AwaitingConfirmation => pb::TaskStatus::AwaitingConfirmation as i32,
+        JournalTaskStatus::Completed => pb::TaskStatus::Completed as i32,
+        JournalTaskStatus::Failed => pb::TaskStatus::Failed as i32,
+        JournalTaskStatus::Cancelled => pb::TaskStatus::Cancelled as i32,
+    }
+}
+
+fn map_tool_tier(tier: ToolTier) -> i32 {
+    match tier {
+        ToolTier::Observe => pb::ToolTier::Observe as i32,
+        ToolTier::Confirm => pb::ToolTier::Confirm as i32,
+    }
+}
+
+fn map_message_role(role: llm::Role) -> i32 {
+    match role {
+        llm::Role::User => pb::MessageRole::User as i32,
+        llm::Role::Assistant => pb::MessageRole::Assistant as i32,
+    }
+}
+
+fn map_token_usage(usage: &TokenUsage) -> pb::TokenUsage {
+    pb::TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    }
+}
+
+fn map_timestamp(timestamp: OffsetDateTime) -> Result<ProtoTimestamp, Status> {
+    Ok(ProtoTimestamp {
+        seconds: timestamp.unix_timestamp(),
+        nanos: i32::try_from(timestamp.nanosecond())
+            .map_err(|_| Status::internal("timestamp nanoseconds out of range"))?,
+    })
+}
+
+fn map_optional_timestamp(
+    timestamp: Option<OffsetDateTime>,
+) -> Result<Option<ProtoTimestamp>, Status> {
+    timestamp.map(map_timestamp).transpose()
+}
+
+fn map_duration(duration: std::time::Duration) -> Result<ProtoDuration, Status> {
+    Ok(ProtoDuration {
+        seconds: i64::try_from(duration.as_secs())
+            .map_err(|_| Status::internal("duration seconds out of range"))?,
+        nanos: i32::try_from(duration.subsec_nanos())
+            .map_err(|_| Status::internal("duration nanoseconds out of range"))?,
+    })
+}
+
+fn map_json_value(value: &serde_json::Value) -> Result<ProtoValue, Status> {
+    let kind = match value {
+        serde_json::Value::Null => ProtoValueKind::NullValue(0),
+        serde_json::Value::Bool(value) => ProtoValueKind::BoolValue(*value),
+        serde_json::Value::Number(number) => ProtoValueKind::NumberValue(
+            number
+                .as_f64()
+                .ok_or_else(|| Status::internal("json number could not be represented as f64"))?,
+        ),
+        serde_json::Value::String(value) => ProtoValueKind::StringValue(value.clone()),
+        serde_json::Value::Array(values) => ProtoValueKind::ListValue(ProtoListValue {
+            values: values
+                .iter()
+                .map(map_json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        serde_json::Value::Object(values) => ProtoValueKind::StructValue(ProtoStruct {
+            fields: values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), map_json_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Status>>()?,
+        }),
+    };
+    Ok(ProtoValue { kind: Some(kind) })
+}
+
+fn map_binary_attachment(source: &ContentSource) -> Result<pb::BinaryAttachment, Status> {
+    Ok(pb::BinaryAttachment {
+        media_type: source.media_type.clone(),
+        data: base64::engine::general_purpose::STANDARD
+            .decode(&source.data)
+            .map_err(|error| {
+                Status::internal(format!("invalid base64 attachment payload: {error}"))
+            })?,
+    })
+}
+
+fn map_tool_result(result: &ToolResult) -> Result<pb::ToolResult, Status> {
+    Ok(pb::ToolResult {
+        success: result.success,
+        output: result.output.clone(),
+        data: result.data.as_ref().map(map_json_value).transpose()?,
+        documents: result
+            .documents
+            .iter()
+            .map(map_binary_attachment)
+            .collect::<Result<Vec<_>, _>>()?,
+        duration_ms: result.duration_ms,
+    })
+}
+
+fn map_prepared_operation(
+    operation: &agent_sdk_core::ListenExecutionContext,
+) -> Result<pb::PreparedOperation, Status> {
+    Ok(pb::PreparedOperation {
+        operation_id: operation.operation_id.clone(),
+        revision: operation.revision,
+        snapshot: Some(map_json_value(&operation.snapshot)?),
+        expires_at: map_optional_timestamp(operation.expires_at)?,
+    })
+}
+
+fn map_message(message: &llm::Message) -> Result<pb::ConversationMessage, Status> {
+    let content = match &message.content {
+        llm::Content::Text(text) => Some(pb::conversation_message::Content::Text(text.clone())),
+        llm::Content::Blocks(blocks) => Some(pb::conversation_message::Content::Blocks(
+            pb::ConversationContentList {
+                items: blocks
+                    .iter()
+                    .map(map_content_block)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        )),
+    };
+
+    Ok(pb::ConversationMessage {
+        role: map_message_role(message.role),
+        content,
+    })
+}
+
+fn map_content_block(block: &ContentBlock) -> Result<pb::ConversationContentBlock, Status> {
+    let block = match block {
+        ContentBlock::Text { text } => {
+            pb::conversation_content_block::Block::Text(pb::TextBlock { text: text.clone() })
+        }
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => pb::conversation_content_block::Block::Thinking(pb::ThinkingBlock {
+            thinking: thinking.clone(),
+            signature: signature.clone(),
+        }),
+        ContentBlock::RedactedThinking { data } => {
+            pb::conversation_content_block::Block::RedactedThinking(pb::RedactedThinkingBlock {
+                data: data.clone(),
+            })
+        }
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            thought_signature,
+        } => pb::conversation_content_block::Block::ToolUse(pb::ToolUseBlock {
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            input: Some(map_json_value(input)?),
+            thought_signature: thought_signature.clone(),
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => pb::conversation_content_block::Block::ToolResult(pb::ToolResultBlock {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            is_error: *is_error,
+        }),
+        ContentBlock::Image { source } => {
+            pb::conversation_content_block::Block::Image(map_binary_attachment(source)?)
+        }
+        ContentBlock::Document { source } => {
+            pb::conversation_content_block::Block::Document(map_binary_attachment(source)?)
+        }
+    };
+
+    Ok(pb::ConversationContentBlock { block: Some(block) })
+}
+
+fn map_submitted_input_item(item: &pb::UserInputItem) -> Result<SubmittedInputItem, Status> {
+    match item.item.as_ref() {
+        Some(pb::user_input_item::Item::Text(text)) => {
+            Ok(SubmittedInputItem::Text { text: text.clone() })
+        }
+        Some(pb::user_input_item::Item::Image(image)) => Ok(SubmittedInputItem::Image {
+            media_type: image.media_type.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&image.data),
+        }),
+        Some(pb::user_input_item::Item::Document(document)) => Ok(SubmittedInputItem::Document {
+            media_type: document.media_type.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&document.data),
+        }),
+        None => Err(Status::invalid_argument("user input item is required")),
+    }
+}
+
+fn map_confirmation_decision(
+    decision: &pb::ConfirmationDecision,
+) -> Result<ConfirmationDecision, Status> {
+    match decision.decision.as_ref() {
+        Some(pb::confirmation_decision::Decision::Approved(_)) => {
+            Ok(ConfirmationDecision::Approved)
+        }
+        Some(pb::confirmation_decision::Decision::Rejected(rejected)) => {
+            if rejected.reason.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "rejected confirmations require a reason",
+                ));
+            }
+            Ok(ConfirmationDecision::Rejected {
+                reason: rejected.reason.clone(),
+            })
+        }
+        Some(pb::confirmation_decision::Decision::TimedOut(_)) => Ok(ConfirmationDecision::Timeout),
+        None => Err(Status::invalid_argument(
+            "confirmation decision is required",
+        )),
+    }
+}
+
+fn map_follow_mode(follow_mode: i32) -> Result<pb::FollowMode, Status> {
+    match pb::FollowMode::try_from(follow_mode).unwrap_or(pb::FollowMode::Unspecified) {
+        pb::FollowMode::ReplayOnly => Ok(pb::FollowMode::ReplayOnly),
+        pb::FollowMode::ReplayAndFollow => Ok(pb::FollowMode::ReplayAndFollow),
+        pb::FollowMode::Unspecified => Err(Status::invalid_argument(
+            "follow_mode must be replay_only or replay_and_follow",
+        )),
+    }
+}
+
+fn map_committed_event(event: &agent_server::CommittedEvent) -> Result<pb::EventEnvelope, Status> {
+    let payload = match &event.event {
+        AgentEvent::Start { thread_id, turn } => pb::event_envelope::Event::Start(pb::StartEvent {
+            thread_id: thread_id.0.clone(),
+            turn: u64::try_from(*turn)
+                .map_err(|_| Status::internal("turn out of range for protobuf"))?,
+        }),
+        AgentEvent::Thinking { message_id, text } => {
+            pb::event_envelope::Event::Thinking(pb::ThinkingEvent {
+                message_id: message_id.clone(),
+                text: text.clone(),
+            })
+        }
+        AgentEvent::ThinkingDelta { message_id, delta } => {
+            pb::event_envelope::Event::ThinkingDelta(pb::ThinkingDeltaEvent {
+                message_id: message_id.clone(),
+                delta: delta.clone(),
+            })
+        }
+        AgentEvent::TextDelta { message_id, delta } => {
+            pb::event_envelope::Event::TextDelta(pb::TextDeltaEvent {
+                message_id: message_id.clone(),
+                delta: delta.clone(),
+            })
+        }
+        AgentEvent::Text { message_id, text } => pb::event_envelope::Event::Text(pb::TextEvent {
+            message_id: message_id.clone(),
+            text: text.clone(),
+        }),
+        AgentEvent::ToolCallStart {
+            id,
+            name,
+            display_name,
+            input,
+            tier,
+        } => pb::event_envelope::Event::ToolCallStart(pb::ToolCallStartEvent {
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            display_name: display_name.clone(),
+            input: Some(map_json_value(input)?),
+            tier: map_tool_tier(*tier),
+        }),
+        AgentEvent::ToolCallEnd {
+            id,
+            name,
+            display_name,
+            result,
+        } => pb::event_envelope::Event::ToolCallEnd(pb::ToolCallEndEvent {
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            display_name: display_name.clone(),
+            result: Some(map_tool_result(result)?),
+        }),
+        AgentEvent::ToolProgress {
+            id,
+            name,
+            display_name,
+            stage,
+            message,
+            data,
+        } => pb::event_envelope::Event::ToolProgress(pb::ToolProgressEvent {
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            display_name: display_name.clone(),
+            stage: stage.clone(),
+            message: message.clone(),
+            data: data.as_ref().map(map_json_value).transpose()?,
+        }),
+        AgentEvent::ToolRequiresConfirmation {
+            id,
+            name,
+            input,
+            description,
+        } => {
+            pb::event_envelope::Event::ToolRequiresConfirmation(pb::ToolRequiresConfirmationEvent {
+                tool_call_id: id.clone(),
+                name: name.clone(),
+                display_name: name.clone(),
+                input: Some(map_json_value(input)?),
+                description: description.clone(),
+            })
+        }
+        AgentEvent::TurnComplete { turn, usage } => {
+            pb::event_envelope::Event::TurnComplete(pb::TurnCompleteEvent {
+                turn: u64::try_from(*turn)
+                    .map_err(|_| Status::internal("turn out of range for protobuf"))?,
+                usage: Some(map_token_usage(usage)),
+            })
+        }
+        AgentEvent::Done {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+        } => pb::event_envelope::Event::Done(pb::DoneEvent {
+            thread_id: thread_id.0.clone(),
+            total_turns: u64::try_from(*total_turns)
+                .map_err(|_| Status::internal("total_turns out of range for protobuf"))?,
+            total_usage: Some(map_token_usage(total_usage)),
+            duration: Some(map_duration(*duration)?),
+        }),
+        AgentEvent::Error {
+            message,
+            recoverable,
+        } => pb::event_envelope::Event::Error(pb::ErrorEvent {
+            message: message.clone(),
+            recoverable: *recoverable,
+        }),
+        AgentEvent::Refusal { message_id, text } => {
+            pb::event_envelope::Event::Refusal(pb::RefusalEvent {
+                message_id: message_id.clone(),
+                text: text.clone(),
+            })
+        }
+        AgentEvent::ContextCompacted {
+            original_count,
+            new_count,
+            original_tokens,
+            new_tokens,
+        } => pb::event_envelope::Event::ContextCompacted(pb::ContextCompactedEvent {
+            original_count: u64::try_from(*original_count)
+                .map_err(|_| Status::internal("original_count out of range for protobuf"))?,
+            new_count: u64::try_from(*new_count)
+                .map_err(|_| Status::internal("new_count out of range for protobuf"))?,
+            original_tokens: u64::try_from(*original_tokens)
+                .map_err(|_| Status::internal("original_tokens out of range for protobuf"))?,
+            new_tokens: u64::try_from(*new_tokens)
+                .map_err(|_| Status::internal("new_tokens out of range for protobuf"))?,
+        }),
+        AgentEvent::SubagentProgress {
+            subagent_id,
+            subagent_name,
+            nickname,
+            max_turns,
+            current_turn,
+            model,
+            tool_name,
+            tool_context,
+            completed,
+            success,
+            tool_count,
+            total_tokens,
+        } => pb::event_envelope::Event::SubagentProgress(pb::SubagentProgressEvent {
+            subagent_id: subagent_id.clone(),
+            subagent_name: subagent_name.clone(),
+            nickname: nickname.clone(),
+            max_turns: *max_turns,
+            current_turn: *current_turn,
+            model: model.clone(),
+            tool_name: tool_name.clone(),
+            tool_context: tool_context.clone(),
+            completed: *completed,
+            success: *success,
+            tool_count: *tool_count,
+            total_tokens: *total_tokens,
+        }),
+    };
+
+    Ok(pb::EventEnvelope {
+        event_id: event.event_id.to_string(),
+        thread_id: event.thread_id.0.clone(),
+        sequence: event.sequence,
+        commit_time: Some(map_timestamp(event.timestamp)?),
+        event: Some(payload),
+    })
+}
+
+fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
+    matches!(event.event, AgentEvent::Done { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::runtime::{
+        AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
+        ToolCallExecutor,
+    };
+    use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
+    use agent_sdk_providers::LlmProvider;
+    use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+    use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
+    use anyhow::{Context, Result, anyhow, bail};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tonic::transport::Channel;
+
+    type ControlClient = pb::agent_control_service_client::AgentControlServiceClient<Channel>;
+    type EventClient = pb::agent_event_service_client::AgentEventServiceClient<Channel>;
+    type StreamItem = pb::stream_thread_events_response::Item;
+    type EventPayload = pb::event_envelope::Event;
+
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<ChatResponse>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            let mut responses = self
+                .responses
+                .lock()
+                .map_err(|_| anyhow!("lock poisoned"))?;
+            let response = responses
+                .pop_front()
+                .context("no scripted response remaining")?;
+            Ok(ChatOutcome::Success(response))
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProgressToolExecutor {
+        result: ToolResult,
+        emit_progress: bool,
+    }
+
+    #[async_trait]
+    impl ToolCallExecutor for ProgressToolExecutor {
+        async fn execute_tool_call(
+            &self,
+            bootstrap: &agent_server::ToolTaskBootstrap,
+            collector: agent_server::worker::ToolEventCollector,
+            _cancel: CancellationToken,
+        ) -> Result<ToolResult> {
+            if self.emit_progress {
+                collector.emit(AgentEvent::tool_progress(
+                    &bootstrap.tool_call.id,
+                    &bootstrap.tool_call.name,
+                    &bootstrap.tool_call.display_name,
+                    "running",
+                    "in progress",
+                    Some(json!({"step": 1})),
+                ));
+            }
+            Ok(self.result.clone())
+        }
+    }
+
+    fn mock_definition(tools: Vec<Tool>) -> AgentDefinition {
+        AgentDefinition {
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            system_prompt: "test".into(),
+            max_tokens: 512,
+            tools,
+            thinking: ThinkingPolicy::default(),
+            policy: RuntimePolicy::server_default(),
+        }
+    }
+
+    fn text_response(id: &str, text: &str) -> ChatResponse {
+        ChatResponse {
+            id: id.into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+        }
+    }
+
+    fn tool_use_response(
+        id: &str,
+        tool_call_id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> ChatResponse {
+        ChatResponse {
+            id: id.into(),
+            content: vec![ContentBlock::ToolUse {
+                id: tool_call_id.into(),
+                name: name.into(),
+                input,
+                thought_signature: None,
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage {
+                input_tokens: 12,
+                output_tokens: 6,
+                cached_input_tokens: 0,
+            },
+        }
+    }
+
+    fn runtime_with(
+        provider: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolCallExecutor>,
+    ) -> Result<Arc<ExecutionRuntime>> {
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(provider)?;
+        Ok(Arc::new(ExecutionRuntime::new(
+            resolver,
+            tool_executor,
+            Arc::new(AllowAllConfirmationPolicy),
+        )))
+    }
+
+    async fn connect_clients(endpoint: &str) -> Result<(ControlClient, EventClient)> {
+        let channel = Channel::from_shared(endpoint.to_owned())
+            .context("building channel endpoint")?
+            .connect()
+            .await
+            .context("connecting channel")?;
+        Ok((
+            ControlClient::new(channel.clone()),
+            EventClient::new(channel),
+        ))
+    }
+
+    fn text_input(text: &str) -> pb::UserInputItem {
+        pb::UserInputItem {
+            item: Some(pb::user_input_item::Item::Text(text.into())),
+        }
+    }
+
+    async fn create_thread(control: &mut ControlClient, request_id: &str) -> Result<String> {
+        let response = control
+            .create_thread(pb::CreateThreadRequest {
+                request_id: request_id.into(),
+            })
+            .await
+            .context("create_thread rpc")?
+            .into_inner();
+        let thread = response
+            .thread
+            .context("create_thread response missing thread")?;
+        let snapshot = thread
+            .thread
+            .context("create_thread response missing snapshot")?;
+        Ok(snapshot.thread_id)
+    }
+
+    async fn submit_text_work(
+        control: &mut ControlClient,
+        request_id: &str,
+        thread_id: &str,
+        text: &str,
+    ) -> Result<pb::TaskSnapshot> {
+        let response = control
+            .submit_thread_work(pb::SubmitThreadWorkRequest {
+                request_id: request_id.into(),
+                thread_id: thread_id.into(),
+                input: vec![text_input(text)],
+            })
+            .await
+            .context("submit_thread_work rpc")?
+            .into_inner();
+        response.task.context("submit_thread_work missing task")
+    }
+
+    async fn open_stream(
+        events: &mut EventClient,
+        thread_id: &str,
+        after_sequence: Option<u64>,
+        follow_mode: pb::FollowMode,
+    ) -> Result<tonic::Streaming<pb::StreamThreadEventsResponse>> {
+        let response = events
+            .stream_thread_events(pb::StreamThreadEventsRequest {
+                thread_id: thread_id.into(),
+                after_sequence,
+                follow_mode: follow_mode as i32,
+            })
+            .await
+            .context("stream_thread_events rpc")?;
+        Ok(response.into_inner())
+    }
+
+    async fn next_stream_item(
+        stream: &mut tonic::Streaming<pb::StreamThreadEventsResponse>,
+    ) -> Result<pb::StreamThreadEventsResponse> {
+        tokio::time::timeout(Duration::from_secs(10), stream.message())
+            .await
+            .context("timed out waiting for event stream item")?
+            .context("stream message error")?
+            .context("event stream closed unexpectedly")
+    }
+
+    async fn collect_until_closed(
+        stream: &mut tonic::Streaming<pb::StreamThreadEventsResponse>,
+    ) -> Result<Vec<pb::StreamThreadEventsResponse>> {
+        let mut items = Vec::new();
+        loop {
+            let item = next_stream_item(stream).await?;
+            let terminal = matches!(
+                item.item.as_ref(),
+                Some(StreamItem::Closed(_))
+                    | Some(StreamItem::RetentionGap(_))
+                    | Some(StreamItem::ReplayRequired(_))
+            );
+            items.push(item);
+            if terminal {
+                return Ok(items);
+            }
+        }
+    }
+
+    fn event_sequences(items: &[pb::StreamThreadEventsResponse]) -> Vec<u64> {
+        items
+            .iter()
+            .filter_map(|item| match item.item.as_ref() {
+                Some(StreamItem::Event(event)) => Some(event.sequence),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_contiguous_sequences(sequences: &[u64]) {
+        for (index, sequence) in sequences.iter().enumerate() {
+            assert_eq!(*sequence, index as u64, "sequence gap at index {index}");
+        }
+    }
+
+    async fn wait_for<F, Fut, T>(mut check: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<T>>>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = check().await? {
+                return Ok(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("timed out waiting for condition");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_daemon_streams_committed_text_turn_end_to_end() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_text_1",
+                "hello from daemon",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-text-thread").await?;
+            let _submitted =
+                submit_text_work(&mut control, "submit-text-turn", &thread_id, "hi").await?;
+            let mut stream = open_stream(
+                &mut events,
+                &thread_id,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+            let items = collect_until_closed(&mut stream).await?;
+
+            assert!(matches!(
+                items.first().and_then(|item| item.item.as_ref()),
+                Some(StreamItem::ReplayOpened(_))
+            ));
+            let sequences = event_sequences(&items);
+            assert_contiguous_sequences(&sequences);
+
+            let mut saw_start = false;
+            let mut saw_text = false;
+            let mut saw_done = false;
+            for item in &items {
+                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                    match event.event.as_ref().context("event payload missing")? {
+                        EventPayload::Start(_) => saw_start = true,
+                        EventPayload::Text(text) => {
+                            saw_text = text.text == "hello from daemon";
+                        }
+                        EventPayload::Done(_) => saw_done = true,
+                        _ => {}
+                    }
+                }
+            }
+            assert!(saw_start, "start event missing");
+            assert!(saw_text, "text event missing");
+            assert!(saw_done, "done event missing");
+
+            let thread = control
+                .get_thread(pb::GetThreadRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread rpc")?
+                .into_inner()
+                .thread
+                .context("get_thread missing thread view")?;
+            let snapshot = thread.thread.context("get_thread missing snapshot")?;
+            assert_eq!(snapshot.committed_turns, 1);
+            assert_eq!(snapshot.latest_event_sequence, sequences.last().copied());
+
+            let messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: thread_id.clone(),
+                })
+                .await
+                .context("get_thread_messages rpc")?
+                .into_inner()
+                .projection
+                .context("missing message projection")?;
+            assert_eq!(messages.messages.len(), 2);
+            assert_eq!(messages.messages[0].role, pb::MessageRole::User as i32);
+            assert_eq!(messages.messages[1].role, pb::MessageRole::Assistant as i32);
+
+            let tasks = control
+                .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
+                .await
+                .context("list_thread_tasks rpc")?
+                .into_inner()
+                .tasks;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].status, pb::TaskStatus::Completed as i32);
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn local_daemon_replays_from_last_sequence_after_disconnect() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_replay_1",
+                "replay reply",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-replay-thread").await?;
+            let _task =
+                submit_text_work(&mut control, "submit-replay-turn", &thread_id, "replay").await?;
+
+            let mut live_stream = open_stream(
+                &mut events,
+                &thread_id,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+
+            let last_seen = loop {
+                let item = next_stream_item(&mut live_stream).await?;
+                if let Some(StreamItem::Event(event)) = item.item {
+                    break event.sequence;
+                }
+            };
+            drop(live_stream);
+
+            let _ = wait_for(|| {
+                let mut control = control.clone();
+                let thread_id = thread_id.clone();
+                async move {
+                    let response = control
+                        .get_thread(pb::GetThreadRequest { thread_id })
+                        .await
+                        .context("poll get_thread")?
+                        .into_inner();
+                    let committed_turns = response
+                        .thread
+                        .and_then(|view| view.thread)
+                        .map(|thread| thread.committed_turns)
+                        .unwrap_or_default();
+                    Ok((committed_turns == 1).then_some(()))
+                }
+            })
+            .await?;
+
+            let mut replay_stream = open_stream(
+                &mut events,
+                &thread_id,
+                Some(last_seen),
+                pb::FollowMode::ReplayOnly,
+            )
+            .await?;
+            let items = collect_until_closed(&mut replay_stream).await?;
+            let replayed = event_sequences(&items);
+            assert!(
+                replayed.iter().all(|sequence| *sequence > last_seen),
+                "replay returned an event at or before the last seen sequence",
+            );
+            assert!(matches!(
+                items.last().and_then(|item| item.item.as_ref()),
+                Some(StreamItem::Closed(closed))
+                    if closed.reason == pb::StreamCloseReason::ReplayExhausted as i32
+            ));
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn local_daemon_confirms_tool_and_resumes_root_turn() -> Result<()> {
+        let transfer_tool = Tool {
+            name: "transfer".into(),
+            description: "Transfer funds".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "amount": { "type": "number" } },
+                "required": ["amount"]
+            }),
+            display_name: "Transfer".into(),
+            tier: ToolTier::Confirm,
+        };
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            transfer_tool,
+        ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                tool_use_response(
+                    "resp_confirm_1",
+                    "tool_call_1",
+                    "transfer",
+                    json!({"amount": 42}),
+                ),
+                text_response("resp_confirm_2", "transfer complete"),
+            ])),
+            Arc::new(ProgressToolExecutor {
+                result: ToolResult::success("transfer ok"),
+                emit_progress: true,
+            }),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-confirm-thread").await?;
+            let _task = submit_text_work(
+                &mut control,
+                "submit-confirm-turn",
+                &thread_id,
+                "transfer 42",
+            )
+            .await?;
+            let mut stream = open_stream(
+                &mut events,
+                &thread_id,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+
+            let mut items = Vec::new();
+            let mut last_seen_sequence = None;
+            loop {
+                let item = next_stream_item(&mut stream).await?;
+                let saw_confirmation = matches!(
+                    item.item.as_ref(),
+                    Some(StreamItem::Event(event))
+                        if matches!(
+                            event.event.as_ref(),
+                            Some(EventPayload::ToolRequiresConfirmation(_))
+                        )
+                );
+                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                    last_seen_sequence = Some(event.sequence);
+                }
+                items.push(item);
+                if saw_confirmation {
+                    break;
+                }
+            }
+
+            let awaiting_confirmation = wait_for(|| {
+                let mut control = control.clone();
+                let thread_id = thread_id.clone();
+                async move {
+                    let tasks = control
+                        .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
+                        .await
+                        .context("poll list_thread_tasks")?
+                        .into_inner()
+                        .tasks;
+                    Ok(tasks
+                        .into_iter()
+                        .find(|task| task.status == pb::TaskStatus::AwaitingConfirmation as i32))
+                }
+            })
+            .await?;
+
+            let decision = control
+                .decide_confirmation(pb::DecideConfirmationRequest {
+                    request_id: "approve-confirmation".into(),
+                    thread_id: thread_id.clone(),
+                    task_id: awaiting_confirmation.task_id.clone(),
+                    decision: Some(pb::ConfirmationDecision {
+                        decision: Some(pb::confirmation_decision::Decision::Approved(
+                            pb::ApprovedConfirmation {},
+                        )),
+                    }),
+                })
+                .await
+                .context("decide_confirmation rpc")?
+                .into_inner();
+            assert!(decision.task.is_some(), "decision response missing task");
+            drop(stream);
+
+            let completion_wait = wait_for(|| {
+                let mut control = control.clone();
+                let thread_id = thread_id.clone();
+                async move {
+                    let tasks = control
+                        .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
+                        .await
+                        .context("poll final list_thread_tasks")?
+                        .into_inner()
+                        .tasks;
+                    let all_completed = tasks.len() == 2
+                        && tasks
+                            .iter()
+                            .all(|task| task.status == pb::TaskStatus::Completed as i32);
+                    Ok(all_completed.then_some(()))
+                }
+            })
+            .await;
+            if let Err(error) = completion_wait {
+                let tasks = control
+                    .list_thread_tasks(pb::ListThreadTasksRequest {
+                        thread_id: thread_id.clone(),
+                    })
+                    .await
+                    .context("list_thread_tasks after completion timeout")?
+                    .into_inner()
+                    .tasks;
+                bail!("confirmation flow did not complete: {error:#}; tasks: {tasks:?}");
+            }
+
+            let replay_after = last_seen_sequence.context("missing last seen sequence")?;
+            let mut replay_stream = open_stream(
+                &mut events,
+                &thread_id,
+                Some(replay_after),
+                pb::FollowMode::ReplayOnly,
+            )
+            .await?;
+            items.extend(collect_until_closed(&mut replay_stream).await?);
+
+            let sequences = event_sequences(&items);
+            assert_contiguous_sequences(&sequences);
+
+            let mut saw_tool_start = None;
+            let mut saw_tool_requires_confirmation = None;
+            let mut saw_tool_progress = None;
+            let mut saw_tool_end = None;
+            let mut saw_text = None;
+            let mut saw_done = None;
+
+            for (index, item) in items.iter().enumerate() {
+                if let Some(StreamItem::Event(event)) = item.item.as_ref() {
+                    match event.event.as_ref().context("event payload missing")? {
+                        EventPayload::ToolCallStart(_) => saw_tool_start = Some(index),
+                        EventPayload::ToolRequiresConfirmation(_) => {
+                            saw_tool_requires_confirmation = Some(index)
+                        }
+                        EventPayload::ToolProgress(_) => saw_tool_progress = Some(index),
+                        EventPayload::ToolCallEnd(_) => saw_tool_end = Some(index),
+                        EventPayload::Text(text) if text.text == "transfer complete" => {
+                            saw_text = Some(index)
+                        }
+                        EventPayload::Done(_) => saw_done = Some(index),
+                        _ => {}
+                    }
+                }
+            }
+
+            assert!(saw_tool_start.is_some(), "tool_call_start missing");
+            assert!(
+                saw_tool_requires_confirmation.is_some(),
+                "tool_requires_confirmation missing"
+            );
+            assert!(saw_tool_progress.is_some(), "tool_progress missing");
+            assert!(saw_tool_end.is_some(), "tool_call_end missing");
+            assert!(saw_text.is_some(), "final assistant text missing");
+            assert!(saw_done.is_some(), "done event missing");
+
+            assert!(saw_tool_start < saw_tool_requires_confirmation);
+            assert!(saw_tool_requires_confirmation < saw_tool_progress);
+            assert!(saw_tool_progress < saw_tool_end);
+            assert!(saw_tool_end < saw_text);
+            assert!(saw_text < saw_done);
+
+            let tasks = control
+                .list_thread_tasks(pb::ListThreadTasksRequest { thread_id })
+                .await
+                .context("list_thread_tasks rpc")?
+                .into_inner()
+                .tasks;
+            assert_eq!(tasks.len(), 2);
+            assert!(
+                tasks
+                    .iter()
+                    .all(|task| task.status == pb::TaskStatus::Completed as i32),
+                "not every task completed after confirmation flow",
+            );
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+}
