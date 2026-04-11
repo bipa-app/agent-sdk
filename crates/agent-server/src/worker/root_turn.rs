@@ -137,9 +137,10 @@ pub enum RootTurnOutcome {
 ///
 /// # Returns
 ///
-/// The failed task row, or an error if the store rejects the
-/// transition (e.g. task is already terminal from a concurrent
-/// cancel).
+/// # Errors
+///
+/// Returns an error if the store rejects the transition (e.g. task is
+/// already terminal from a concurrent cancel).
 pub async fn fail_root_turn(
     task_id: &AgentTaskId,
     worker_id: &WorkerId,
@@ -177,6 +178,9 @@ pub async fn fail_root_turn(
 ///
 /// The task IDs that were actually transitioned (excludes rows that
 /// were already terminal).
+/// # Errors
+///
+/// Returns an error if the store rejects the transition.
 pub async fn cancel_root_turn(
     task_id: &AgentTaskId,
     deps: &RootTurnDeps<'_>,
@@ -200,9 +204,8 @@ async fn best_effort_close_open_attempts(
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
 ) {
-    let attempts = match attempt_store.list_by_task(task_id).await {
-        Ok(a) => a,
-        Err(_) => return,
+    let Ok(attempts) = attempt_store.list_by_task(task_id).await else {
+        return;
     };
     for attempt in &attempts {
         if !attempt.is_closed() {

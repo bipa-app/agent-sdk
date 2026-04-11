@@ -1523,7 +1523,13 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
     let lease_id = LeaseId::from_string("lease_test");
     let acquired = stores
         .tasks
-        .try_acquire_task(&parent_id, worker_id.clone(), lease_id.clone(), t_plus(900), t_plus(20))
+        .try_acquire_task(
+            &parent_id,
+            worker_id.clone(),
+            lease_id.clone(),
+            t_plus(900),
+            t_plus(20),
+        )
         .await?
         .context("re-acquire")?;
 
@@ -1644,8 +1650,7 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
     let inputs =
         build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
 
-    let outcome =
-        execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
+    let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
 
     let RootTurnOutcome::Suspended {
         parent_task,
@@ -1868,11 +1873,8 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
             .await?;
 
     // Resume with more tool calls → re-suspend.
-    let resume_provider = MockToolCallProvider::single(
-        "call_2",
-        "bash",
-        serde_json::json!({"command": "cat file"}),
-    );
+    let resume_provider =
+        MockToolCallProvider::single("call_2", "bash", serde_json::json!({"command": "cat file"}));
     let outcome = resume_root_turn(
         inputs,
         continuation,
