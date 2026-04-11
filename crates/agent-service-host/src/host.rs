@@ -87,13 +87,16 @@ impl ServiceHost {
     /// Build a host with a pre-built store registry.
     ///
     /// Useful in tests where stores are pre-populated.
-    #[must_use]
-    pub fn with_stores(config: ServiceConfig, stores: StoreRegistry) -> Self {
-        Self {
+    pub fn with_stores(config: ServiceConfig, stores: StoreRegistry) -> Result<Self> {
+        anyhow::ensure!(
+            config.worker.sweep_interval_secs > 0,
+            "worker.sweep_interval_secs must be > 0"
+        );
+        Ok(Self {
             config,
             stores,
             shutdown: CancellationToken::new(),
-        }
+        })
     }
 
     /// Access the store registry (for transport layers and tests).
