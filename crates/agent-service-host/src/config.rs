@@ -15,6 +15,7 @@
 //!   lease_duration_secs: 30
 //!   heartbeat_interval_secs: 10
 //!   sweep_interval_secs: 5
+//!   acquisition_interval_secs: 1
 //! transport:
 //!   grpc_enabled: false
 //!   grpc_addr: "127.0.0.1:50051"
@@ -121,6 +122,13 @@ pub struct WorkerConfig {
     pub heartbeat_interval_secs: u64,
     /// Seconds between expired-lease sweep runs.
     pub sweep_interval_secs: u64,
+    /// Seconds between idle worker acquisition polls.
+    ///
+    /// When a worker has no active task it sleeps for this duration
+    /// before calling `acquire_next_runnable` again.  A shorter
+    /// interval reduces latency to first pick-up but increases
+    /// polling load on the store.
+    pub acquisition_interval_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -130,6 +138,7 @@ impl Default for WorkerConfig {
             lease_duration_secs: 30,
             heartbeat_interval_secs: 10,
             sweep_interval_secs: 5,
+            acquisition_interval_secs: 1,
         }
     }
 }
@@ -152,6 +161,12 @@ impl WorkerConfig {
     #[must_use]
     pub const fn sweep_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sweep_interval_secs)
+    }
+
+    /// Acquisition poll interval as a [`std::time::Duration`] (for tokio timers).
+    #[must_use]
+    pub const fn acquisition_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.acquisition_interval_secs)
     }
 }
 
@@ -265,6 +280,7 @@ transport:
         assert_eq!(wc.lease_duration(), time::Duration::seconds(30));
         assert_eq!(wc.heartbeat_interval(), std::time::Duration::from_secs(10));
         assert_eq!(wc.sweep_interval(), std::time::Duration::from_secs(5));
+        assert_eq!(wc.acquisition_interval(), std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -277,6 +293,7 @@ worker:
   lease_duration_secs: 60
   heartbeat_interval_secs: 20
   sweep_interval_secs: 10
+  acquisition_interval_secs: 2
 transport:
   grpc_enabled: true
   grpc_addr: "0.0.0.0:50051"
@@ -289,6 +306,7 @@ retention:
         let config = ServiceConfig::from_yaml_str(yaml)?;
         assert_eq!(config.worker.pool_size, 8);
         assert_eq!(config.worker.lease_duration_secs, 60);
+        assert_eq!(config.worker.acquisition_interval_secs, 2);
         assert!(config.transport.grpc_enabled);
         assert!(config.transport.http_enabled);
         assert_eq!(config.retention.event_ttl_secs, Some(86400));

@@ -12,8 +12,12 @@
 //! - **Store registry** ([`stores`]) — constructs and owns the full set
 //!   of durable store trait-objects that the journal and worker layers
 //!   consume.
+//! - **Health surface** ([`health`]) — lock-free health and readiness
+//!   reporting that separates core correctness from latency-layer
+//!   degradation.
 //! - **Service lifecycle** ([`host`]) — startup / background-task /
 //!   graceful-shutdown orchestration via a single [`ServiceHost`] struct.
+//!   Boots a worker pool, runs sweep loops, and reports health.
 //!
 //! ## Crate boundary
 //!
@@ -55,5 +59,6 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod health;
 pub mod host;
 pub mod stores;
