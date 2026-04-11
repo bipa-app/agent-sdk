@@ -550,6 +550,13 @@ pub struct SpawnedSubagentInvocation {
 ///   runnable,
 /// - durable linkage among those records is persisted on the
 ///   invocation task.
+///
+/// # Errors
+///
+/// Returns an error if the parent task cannot be parked on child
+/// execution, if the invocation and child root tasks cannot be
+/// persisted, if the durable linkage is inconsistent, or if the child
+/// thread projection cannot be materialized.
 pub async fn spawn_subagent_invocation(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
