@@ -60,7 +60,7 @@ The request carries both `thread_id` and `task_id` so the server can reject cros
 
 Recommended gRPC status mapping:
 
-- `INVALID_ARGUMENT`: malformed IDs, empty input, missing idempotency key
+- `INVALID_ARGUMENT`: malformed IDs, empty input, missing idempotency key, `FOLLOW_MODE_UNSPECIFIED` on `StreamThreadEvents`
 - `NOT_FOUND`: unknown thread or task
 - `FAILED_PRECONDITION`: thread is completed, task is not awaiting confirmation, or the requested state transition is not valid for the current committed row
 - `ALREADY_EXISTS`: reused idempotency key with a different logical request body

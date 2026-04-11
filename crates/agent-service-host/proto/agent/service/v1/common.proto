@@ -50,8 +50,8 @@ enum MessageRole {
 }
 
 message TokenUsage {
-  uint32 input_tokens = 1;
-  uint32 output_tokens = 2;
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
 }
 
 // Binary payload surfaced to clients.
