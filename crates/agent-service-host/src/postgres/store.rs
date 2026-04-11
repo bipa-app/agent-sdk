@@ -1698,8 +1698,8 @@ FOR UPDATE
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        let mut tx = self.begin().await?;
         loop {
+            let mut tx = self.begin().await?;
             let record = sqlx::query_as!(
                 TaskRecord,
                 r"
@@ -1744,6 +1744,9 @@ FOR UPDATE SKIP LOCKED
             let old = AgentTask::try_from(record)?;
             if !old.status.can_be_leased() {
                 let status = old.status;
+                tx.rollback()
+                    .await
+                    .context("rollback corrupt runnable head")?;
                 return Err(anyhow!(
                     "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
                     old.id
@@ -1768,8 +1771,14 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    tx.commit()
+                        .await
+                        .context("commit fail-closed runnable head")?;
                 }
                 RecoveryAction::Requeue => {
+                    tx.rollback()
+                        .await
+                        .context("rollback invalid acquire_next_runnable recovery")?;
                     return Err(anyhow!(
                         "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {}",
                         old.id
@@ -2861,6 +2870,7 @@ mod tests {
     use agent_server::journal::commit::commit_completed_turn;
     use agent_server::journal::event_repository::InMemoryEventRepository;
     use agent_server::journal::message_store::MessageProjectionStore;
+    use agent_server::journal::recovery::FailureReason;
     use agent_server::journal::store::AgentTaskStore;
     use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{CloseAttemptParams, OpenAttemptParams};
@@ -3092,6 +3102,82 @@ mod tests {
 
         let winner = r1.or(r2).context("winner")?;
         assert_eq!(winner.status, TaskStatus::Running);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_next_runnable_commits_fail_closed_heads_before_returning_none() -> Result<()> {
+        let Some(store) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut ids = Vec::new();
+        for (idx, name) in ["a", "b", "c"].iter().enumerate() {
+            let secs = i64::try_from(idx).context("enumerate fits i64")? * 10;
+            let root = AgentTask::new_root_turn(
+                thread_id(&format!("t-pg-exhaust-{name}")),
+                t_plus(secs),
+                1,
+            );
+            let id = root.id.clone();
+            store
+                .submit_root_turn(root)
+                .await
+                .context("submit exhausted root")?;
+            let claimed = store
+                .try_acquire_task(
+                    &id,
+                    WorkerId::from_string(format!("w-{name}")),
+                    LeaseId::from_string(format!("l-{name}")),
+                    t_plus(secs + 50),
+                    t_plus(secs + 1),
+                )
+                .await
+                .context("acquire exhausted root")?
+                .context("exhausted root claimed")?;
+            store
+                .update(
+                    claimed
+                        .release_lease(t_plus(secs + 2))
+                        .context("release exhausted root")?,
+                )
+                .await
+                .context("persist released exhausted root")?;
+            ids.push(id);
+        }
+
+        let result = store
+            .acquire_next_runnable(
+                WorkerId::from_string("w-scan"),
+                LeaseId::from_string("l-scan"),
+                t_plus(1_000),
+                t_plus(900),
+            )
+            .await
+            .context("scan exhausted queue")?;
+        assert!(result.is_none(), "every head must be failed closed");
+
+        for id in &ids {
+            let row = AgentTaskStore::get(&store, id)
+                .await
+                .context("get exhausted row")?
+                .context("row exists")?;
+            assert_eq!(
+                row.status,
+                TaskStatus::Failed,
+                "expected Failed for {id}, got {:?}",
+                row.status
+            );
+            let message = row
+                .last_error
+                .as_deref()
+                .context("failed rows carry last_error")?;
+            assert!(
+                message.starts_with(FailureReason::RetryBudgetExhausted.error_prefix()),
+                "unexpected fail-closed reason for {id}: {message}"
+            );
+        }
 
         Ok(())
     }

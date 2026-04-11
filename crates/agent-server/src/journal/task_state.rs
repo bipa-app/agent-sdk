@@ -198,6 +198,23 @@ impl TaskState {
         }
     }
 
+    /// Human-readable description of the statuses this state may
+    /// legally coexist with.
+    ///
+    /// Used by [`super::TaskSchemaError::StateStatusMismatch`] so
+    /// schema validation can explain multi-status states such as
+    /// [`TaskState::ReadyToResume`] without discarding the canonical
+    /// durable form returned by [`Self::required_status`].
+    #[must_use]
+    pub const fn compatible_statuses_label(&self) -> &'static str {
+        match self {
+            Self::None => "any non-paused status",
+            Self::WaitingOnChildren { .. } => "WaitingOnChildren",
+            Self::AwaitingConfirmation { .. } => "AwaitingConfirmation",
+            Self::ReadyToResume { .. } => "Pending or Running",
+        }
+    }
+
     /// Returns `true` when the state may legally coexist with `status`.
     ///
     /// [`TaskState::ReadyToResume`] is the only non-terminal payload
@@ -466,6 +483,7 @@ mod tests {
         assert!(state.is_compatible_with_status(TaskStatus::Pending));
         assert!(state.is_compatible_with_status(TaskStatus::Running));
         assert!(!state.is_compatible_with_status(TaskStatus::Queued));
+        assert_eq!(state.compatible_statuses_label(), "Pending or Running");
     }
 
     #[test]

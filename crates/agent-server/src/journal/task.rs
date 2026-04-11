@@ -486,10 +486,10 @@ pub enum TaskSchemaError {
     HeartbeatWorkerMismatch,
     #[error("heartbeat lease_id does not match the task's current lease")]
     HeartbeatLeaseMismatch,
-    #[error("task state {state_kind} requires status {required_status:?}, found {actual_status:?}")]
+    #[error("task state {state_kind} requires status {expected_statuses}, found {actual_status:?}")]
     StateStatusMismatch {
         state_kind: &'static str,
-        required_status: TaskStatus,
+        expected_statuses: &'static str,
         actual_status: TaskStatus,
     },
     #[error(
@@ -931,10 +931,9 @@ impl AgentTask {
                 })
             }
             _ if !self.state.is_compatible_with_status(self.status) => {
-                let required = self.state.required_status().unwrap_or(TaskStatus::Pending);
                 Err(TaskSchemaError::StateStatusMismatch {
                     state_kind,
-                    required_status: required,
+                    expected_statuses: self.state.compatible_statuses_label(),
                     actual_status: self.status,
                 })
             }
@@ -1783,6 +1782,33 @@ mod tests {
             Err(TaskSchemaError::QueuedOnlyForRootTurns)
         );
         Ok(())
+    }
+
+    #[test]
+    fn validate_ready_to_resume_mismatch_reports_both_valid_statuses() {
+        let mut task = fresh_root();
+        task.status = TaskStatus::Queued;
+        task.state = TaskState::ReadyToResume {
+            continuation: Box::new(sample_continuation()),
+            suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
+        };
+
+        let err = task
+            .validate()
+            .expect_err("queued ready-to-resume must fail");
+        assert_eq!(
+            err,
+            TaskSchemaError::StateStatusMismatch {
+                state_kind: "ready_to_resume",
+                expected_statuses: "Pending or Running",
+                actual_status: TaskStatus::Queued,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "task state ready_to_resume requires status Pending or Running, found Queued"
+        );
     }
 
     // ── blocks_root_admission classification ──────────────────────
