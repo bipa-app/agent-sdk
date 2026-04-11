@@ -135,6 +135,12 @@ mod tests {
         );
         ensure!(
             sql_bundle.contains(
+                "state_json ->> 'kind' = 'subagent_invocation'\n                    AND (\n                        (\n                            status = 'waiting_on_children'\n                            AND pending_child_count > 0\n                        )\n                        OR (\n                            status IN ('pending', 'running')\n                            AND pending_child_count = 0\n                        )\n                    )"
+            ),
+            "waiting-state check must allow subagent_invocation rows to become runnable after their child thread drains",
+        );
+        ensure!(
+            sql_bundle.contains(
                 "state_json ->> 'kind' = 'ready_to_resume'\n                    AND status IN ('pending', 'running')"
             ),
             "waiting-state check must allow queued rows with the default none state",

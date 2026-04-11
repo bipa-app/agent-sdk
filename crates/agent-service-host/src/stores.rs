@@ -135,6 +135,17 @@ impl StoreRegistry {
             event_repo: self.event_repo.as_ref(),
         }
     }
+
+    /// Build [`agent_server::SubagentResultDeps`] for invocation-task
+    /// materialization.
+    #[must_use]
+    pub fn subagent_result_deps(&self) -> agent_server::SubagentResultDeps<'_> {
+        agent_server::SubagentResultDeps {
+            task_store: self.task_store.as_ref(),
+            thread_store: self.thread_store.as_ref(),
+            message_store: self.message_store.as_ref(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

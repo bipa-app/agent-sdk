@@ -58,9 +58,10 @@ use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_too
 use agent_server::journal::task::{AgentTask, LeaseId, SubmittedInputItem, TaskKind, WorkerId};
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
-    AgentDefinitionRegistry, RootTurnOutcome, ToolTaskOutcome, fail_root_turn,
-    guarded_tool_execution, pause_tool_for_confirmation, resolve_bootstrap_context,
-    resolve_tool_bootstrap, resume_from_children,
+    AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
+    execute_subagent_task, fail_root_turn, guarded_tool_execution, pause_tool_for_confirmation,
+    resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
+    resume_from_children,
 };
 
 use super::config::ServiceConfig;
@@ -446,7 +447,7 @@ async fn execute_acquired_task(
     match task.kind {
         TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
-        TaskKind::Subagent => bail!("unsupported task kind in service host worker: Subagent"),
+        TaskKind::Subagent => execute_subagent_task_entry(task, stores).await,
     }
 }
 
@@ -614,6 +615,36 @@ async fn execute_tool_task(
                 .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
                 .await
                 .context("fail tool task after guarded execution error")?;
+            Ok(())
+        }
+    }
+}
+
+async fn execute_subagent_task_entry(task: AgentTask, stores: &StoreRegistry) -> Result<()> {
+    let now = time::OffsetDateTime::now_utc();
+    let (worker_id, lease_id) = running_lease(&task)?;
+
+    let bootstrap = match resolve_subagent_bootstrap(task.clone(), stores.task_store.as_ref()).await
+    {
+        Ok(bootstrap) => bootstrap,
+        Err(err) => {
+            stores
+                .task_store
+                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .await
+                .context("fail invalid subagent task")?;
+            return Ok(());
+        }
+    };
+
+    match execute_subagent_task(bootstrap, &stores.subagent_result_deps(), now).await {
+        Ok(SubagentTaskOutcome { .. }) => Ok(()),
+        Err(err) => {
+            stores
+                .task_store
+                .fail_task(&task.id, &worker_id, &lease_id, format!("{err:#}"), now)
+                .await
+                .context("fail subagent task after materialization error")?;
             Ok(())
         }
     }

@@ -188,10 +188,12 @@ pub use worker::{
     EffectiveSubagentCapabilities, EffectiveSubagentSpec, InMemoryAgentDefinitionRegistry,
     InheritedSubagentConstraints, PolicyVerdict, RootTurnDeps, RootTurnOutcome, RuntimePolicy,
     ServerSubagentSpawnPolicy, SpawnedSubagentInvocation, SubagentCapabilityProfile,
-    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentSpawnPolicy, SubagentSpawnRequest,
-    ThinkingPolicy, ToolTaskBootstrap, ToolTaskOutcome, WorkerBootstrapContext,
-    apply_confirmation_decision, execute_root_turn, execute_tool_task, pause_tool_for_confirmation,
-    resolve_bootstrap_context, resolve_subagent_spec, resolve_tool_bootstrap,
+    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentResult, SubagentResultDeps,
+    SubagentSpawnPolicy, SubagentSpawnRequest, SubagentSummary, SubagentTaskBootstrap,
+    SubagentTaskOutcome, ThinkingPolicy, ToolTaskBootstrap, ToolTaskOutcome,
+    WorkerBootstrapContext, apply_confirmation_decision, execute_root_turn, execute_subagent_task,
+    execute_tool_task, pause_tool_for_confirmation, resolve_bootstrap_context,
+    resolve_subagent_bootstrap, resolve_subagent_spec, resolve_tool_bootstrap,
     resume_confirmed_tool, spawn_subagent_invocation,
 };
 

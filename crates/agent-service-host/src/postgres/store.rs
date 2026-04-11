@@ -54,6 +54,7 @@ use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
 };
 use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+use agent_server::worker::definition::RuntimePolicy;
 
 use super::migrations::apply_durable_core_migrations;
 
@@ -1213,11 +1214,72 @@ FOR UPDATE
             } else {
                 Some(old_parent)
             }
+        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+            let Some(old_invocation) =
+                Self::load_linked_subagent_invocation_tx(tx, &new_child.id).await?
+            else {
+                return Ok((new_child, None));
+            };
+            let new_invocation = old_invocation
+                .clone()
+                .recompute_pending_children(0, now)
+                .with_context(|| {
+                    format!("{error_prefix}: subagent invocation resume transition failed")
+                })?;
+            Self::update_task_tx(tx, &new_invocation).await?;
+            Some(new_invocation)
         } else {
             None
         };
 
         Ok((new_child, parent))
+    }
+
+    async fn load_linked_subagent_invocation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r#"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
+FOR UPDATE
+            "#,
+            child_root_id.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| {
+            format!("load linked subagent invocation for child root {child_root_id}")
+        })?;
+
+        record.map(TryInto::try_into).transpose()
     }
 
     async fn load_subtree_tx(
@@ -2122,17 +2184,19 @@ FOR UPDATE SKIP LOCKED
         let SubagentInvocationSpawn {
             child_thread_id,
             spec,
-            payload,
+            child_root_input,
             spawn_index,
+            payload,
         } = spawn;
 
         let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
         Self::ensure_empty_child_thread_tx(&mut tx, &child_thread_id, now).await?;
 
-        let child_root = AgentTask::new_root_turn(
+        let child_root = AgentTask::new_root_turn_with_input(
             child_thread_id.clone(),
+            child_root_input,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            RuntimePolicy::server_default().max_attempts,
         );
         if Self::load_task_tx(&mut tx, &child_root.id, false)
             .await?

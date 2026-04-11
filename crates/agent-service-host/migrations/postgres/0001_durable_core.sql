@@ -138,9 +138,22 @@ CREATE TABLE agent_sdk_tasks (
             )
             AND (
                 (
-                    state_json ->> 'kind' IN ('waiting_on_children', 'subagent_invocation')
+                    state_json ->> 'kind' = 'waiting_on_children'
                     AND status = 'waiting_on_children'
                     AND pending_child_count > 0
+                )
+                OR (
+                    state_json ->> 'kind' = 'subagent_invocation'
+                    AND (
+                        (
+                            status = 'waiting_on_children'
+                            AND pending_child_count > 0
+                        )
+                        OR (
+                            status IN ('pending', 'running')
+                            AND pending_child_count = 0
+                        )
+                    )
                 )
                 OR (
                     state_json ->> 'kind' = 'awaiting_confirmation'

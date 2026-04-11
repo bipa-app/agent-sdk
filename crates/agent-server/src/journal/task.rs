@@ -1276,7 +1276,9 @@ impl AgentTask {
             self.status = TaskStatus::Pending;
             // Phase 4.5: preserve the continuation and suspended
             // messages so the resume path can rebuild the turn from
-            // durable state. See `child_resolved` for the same logic.
+            // durable state. Subagent invocations preserve their
+            // durable child-thread linkage for the final
+            // materialization worker.
             self.state = match self.state {
                 TaskState::WaitingOnChildren {
                     continuation,
@@ -1287,6 +1289,9 @@ impl AgentTask {
                     suspended_messages,
                     child_ids,
                 },
+                TaskState::SubagentInvocation { invocation } => {
+                    TaskState::SubagentInvocation { invocation }
+                }
                 other => other,
             };
         }
