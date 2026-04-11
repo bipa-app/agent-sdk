@@ -912,7 +912,7 @@ impl AgentTask {
     /// The mismatch returns the variant name as a `&'static str` for
     /// clean error messages without coupling the schema to the wire
     /// format.
-    fn validate_state_status_invariant(&self) -> Result<(), TaskSchemaError> {
+    const fn validate_state_status_invariant(&self) -> Result<(), TaskSchemaError> {
         let state_kind: &'static str = match &self.state {
             TaskState::None => "none",
             TaskState::WaitingOnChildren { .. } => "waiting_on_children",
