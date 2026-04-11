@@ -469,7 +469,7 @@
 //!
 //! 1. **Single allocation authority** — the event repository is the
 //!    only place that assigns `event_id`, `sequence`, and `timestamp`
-//!    for committed events.  Workers submit raw [`AgentEvent`]s;
+//!    for committed events.  Workers submit raw [`AgentEvent`](agent_sdk_core::events::AgentEvent)s;
 //!    the repository wraps them atomically.
 //! 2. **Thread-scoped sequencing** — each thread gets an independent
 //!    monotonic counter starting at 0.  Sequences are contiguous
