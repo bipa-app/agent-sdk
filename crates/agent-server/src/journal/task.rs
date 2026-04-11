@@ -741,6 +741,7 @@ impl AgentTask {
     pub fn new_subagent_invocation(
         parent: &Self,
         invocation: SubagentInvocationState,
+        spawn_index: u32,
         now: OffsetDateTime,
         max_attempts: u32,
     ) -> Result<Self, TaskSchemaError> {
@@ -767,7 +768,7 @@ impl AgentTask {
             max_attempts,
             last_error: None,
             pending_child_count: 1,
-            spawn_index: None,
+            spawn_index: Some(spawn_index),
             result_payload: None,
             created_at: now,
             updated_at: now,
@@ -1681,6 +1682,7 @@ mod tests {
                 child_thread_id: child_thread_id.clone(),
                 child_root_task_id: AgentTaskId::from_string("task_child_root"),
             },
+            0,
             t_plus(2),
             2,
         )
@@ -1690,6 +1692,7 @@ mod tests {
         assert_eq!(invocation.parent_id.as_ref(), Some(&root.id));
         assert_eq!(invocation.root_id, root.root_id);
         assert_eq!(invocation.thread_id, root.thread_id);
+        assert_eq!(invocation.spawn_index, Some(0));
         assert_eq!(invocation.depth, root.depth + 1);
         assert_eq!(invocation.pending_child_count, 1);
         let linked = invocation

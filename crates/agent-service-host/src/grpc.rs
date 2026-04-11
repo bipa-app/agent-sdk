@@ -226,8 +226,9 @@ impl GrpcShared {
                 }),
             ),
             TaskState::SubagentInvocation { invocation } => Some(
-                pb::task_snapshot::StateDetail::WaitingOnChildren(pb::WaitingOnChildrenState {
-                    child_task_ids: vec![invocation.child_root_task_id.to_string()],
+                pb::task_snapshot::StateDetail::SubagentInvocation(pb::SubagentInvocationState {
+                    child_thread_id: invocation.child_thread_id.to_string(),
+                    child_root_task_id: invocation.child_root_task_id.to_string(),
                 }),
             ),
             TaskState::ReadyToResume { child_ids, .. } => Some(

@@ -186,6 +186,17 @@ message ReadyToResumeState {
   repeated string child_task_ids = 1;
 }
 
+// Durable state for a subagent invocation task that owns the
+// cross-thread relationship to a spawned child thread.
+//
+// Separated from WaitingOnChildrenState because the child_root_task_id
+// lives on a different thread than the invocation task itself, so clients
+// cannot resolve it via list_thread_tasks on the parent thread.
+message SubagentInvocationState {
+  string child_thread_id = 1;
+  string child_root_task_id = 2;
+}
+
 // Snapshot view of the current durable task row.
 //
 // Worker ownership and lease fields are intentionally omitted. They are
@@ -208,6 +219,7 @@ message TaskSnapshot {
     WaitingOnChildrenState waiting_on_children = 13;
     AwaitingConfirmationState awaiting_confirmation = 14;
     ReadyToResumeState ready_to_resume = 15;
+    SubagentInvocationState subagent_invocation = 16;
   }
 
   google.protobuf.Timestamp created_at = 20;

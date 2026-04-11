@@ -224,6 +224,11 @@ pub struct SubagentInvocationSpawn {
     pub child_thread_id: ThreadId,
     pub spec: EffectiveSubagentSpec,
     pub payload: SuspensionPayload,
+    /// Index into the parent's `pending_tool_calls` that this
+    /// invocation maps to, so [`super::AgentTask::spawn_index`] is set
+    /// on the invocation task and the resume path can aggregate its
+    /// result alongside tool-runtime children.
+    pub spawn_index: u32,
 }
 
 /// Persistent store for [`AgentTask`] rows.
@@ -2196,6 +2201,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             child_thread_id,
             spec,
             payload,
+            spawn_index,
         } = spawn;
 
         let old_parent = inner
@@ -2259,6 +2265,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 child_thread_id,
                 child_root_task_id: child_root.id.clone(),
             },
+            spawn_index,
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         )
@@ -6415,6 +6422,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn"),
                         suspended_messages: Vec::new(),
                     },
+                    spawn_index: 0,
                 },
                 t_plus(2),
             )
@@ -6424,6 +6432,7 @@ mod tests {
         assert_eq!(parked_parent.status, TaskStatus::WaitingOnChildren);
         assert_eq!(parked_parent.pending_child_count, 1);
         assert!(parked_parent.worker_id.is_none());
+        assert_eq!(invocation.spawn_index, Some(0));
 
         assert_eq!(invocation.kind, TaskKind::Subagent);
         assert_eq!(invocation.status, TaskStatus::WaitingOnChildren);
@@ -6491,6 +6500,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
                     },
+                    spawn_index: 0,
                 },
                 t_plus(2),
             )
@@ -6514,6 +6524,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
                     },
+                    spawn_index: 0,
                 },
                 t_plus(3),
             )
