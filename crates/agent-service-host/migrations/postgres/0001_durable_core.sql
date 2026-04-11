@@ -1,5 +1,3 @@
-BEGIN;
-
 CREATE TABLE agent_sdk_tasks (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -129,6 +127,7 @@ CREATE TABLE agent_sdk_tasks (
         CHECK (
             jsonb_typeof(state_json) = 'object'
             AND state_json ? 'kind'
+            AND state_json ->> 'kind' IS NOT NULL
             AND state_json ->> 'kind' IN (
                 'none',
                 'waiting_on_children',
@@ -154,6 +153,7 @@ CREATE TABLE agent_sdk_tasks (
                 OR (
                     state_json ->> 'kind' IN ('none', 'ready_to_resume')
                     AND status NOT IN (
+                        'queued',
                         'waiting_on_children',
                         'awaiting_confirmation',
                         'completed',
@@ -391,5 +391,3 @@ CREATE INDEX agent_sdk_turn_checkpoints_latest_by_thread_idx
 
 CREATE INDEX agent_sdk_turn_checkpoints_by_task_idx
     ON agent_sdk_turn_checkpoints (task_id, turn_number);
-
-COMMIT;

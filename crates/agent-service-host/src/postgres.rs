@@ -23,7 +23,9 @@ mod tests {
 
     use anyhow::{Context, Result, ensure};
 
-    use super::migrations::{durable_core_migrations, future_event_outbox_notes};
+    use super::migrations::{
+        DURABLE_CORE_MIGRATOR, durable_core_migrations, future_event_outbox_notes,
+    };
     use super::repository::{completed_turn_units_of_work, repository_boundaries};
     use super::schema::durable_core_tables;
 
@@ -66,7 +68,7 @@ mod tests {
 
     #[test]
     fn executable_migration_bundle_excludes_future_notes() -> Result<()> {
-        let migrations = durable_core_migrations();
+        let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
             migrations.len() == 1,
             "expected only executable durable-core migrations, got {:?}",
@@ -76,8 +78,8 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         ensure!(
-            migrations[0].version == "0001",
-            "expected durable core executable migration version 0001, got {}",
+            migrations[0].version == 1,
+            "expected durable core executable migration version 1, got {}",
             migrations[0].version,
         );
         Ok(())
@@ -97,6 +99,26 @@ mod tests {
         ensure!(
             !sql_bundle.contains("agent_sdk_turn_attempts_by_task_attempt_idx"),
             "turn attempts should rely on the unique-constraint backing index",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_state_check_rejects_json_null_kind_and_queued_ready_to_resume() -> Result<()> {
+        let sql_bundle = durable_core_migrations()
+            .iter()
+            .map(|migration| migration.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ensure!(
+            sql_bundle.contains("AND state_json ->> 'kind' IS NOT NULL"),
+            "waiting-state check must reject JSON null kind values",
+        );
+        ensure!(
+            sql_bundle.contains(
+                "state_json ->> 'kind' IN ('none', 'ready_to_resume')\n                    AND status NOT IN (\n                        'queued',"
+            ),
+            "waiting-state check must exclude queued rows from ready_to_resume",
         );
         Ok(())
     }
