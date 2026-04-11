@@ -99,6 +99,7 @@ impl EventStream {
                 return Some(StreamEvent::Event(Box::new(event)));
             }
             self.replay_drained = true;
+            self.replay_buffer.clear();
         }
 
         // Phase 2: live tail.
@@ -513,6 +514,37 @@ mod tests {
             Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 3),
             other => panic!("expected Event(seq=3), got {other:?}"),
         }
+        Ok(())
+    }
+
+    // ── Replay buffer memory ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn replay_buffer_cleared_after_drain() -> Result<()> {
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+
+        repo.commit_event(&thread_a(), AgentEvent::text("m1", "a"), t0())
+            .await?;
+        repo.commit_event(&thread_a(), AgentEvent::text("m2", "b"), t_plus(1))
+            .await?;
+
+        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        assert_eq!(stream.replay_buffer.len(), 2);
+
+        // Drain replay.
+        stream.next().await;
+        stream.next().await;
+
+        // Commit and notify a live event so the transition call doesn't block.
+        let e = repo
+            .commit_event(&thread_a(), AgentEvent::text("m3", "c"), t_plus(2))
+            .await?;
+        notifier.notify(&[e]);
+
+        // This call transitions to live tail, clearing the replay buffer.
+        stream.next().await;
+        assert!(stream.replay_buffer.is_empty());
         Ok(())
     }
 
