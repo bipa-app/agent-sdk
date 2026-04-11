@@ -74,6 +74,7 @@ use std::sync::RwLock;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
+use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::AgentTaskId;
 use crate::worker::tool_task::{ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task};
@@ -493,6 +494,13 @@ pub fn check_retry_safety(prior: Option<ExecutionIntent>) -> RetryDecision {
 // Fail-closed guarded execution
 // ─────────────────────────────────────────────────────────────────────
 
+/// Store dependencies for [`guarded_tool_execution`].
+pub struct GuardedExecutionDeps<'a> {
+    pub task_store: &'a dyn AgentTaskStore,
+    pub intent_store: &'a dyn ExecutionIntentStore,
+    pub event_repo: &'a dyn EventRepository,
+}
+
 /// Execute a tool-runtime child task with durable intent persistence.
 ///
 /// This is the Phase 5.2 wrapper around [`execute_tool_task`] that
@@ -515,8 +523,7 @@ pub fn check_retry_safety(prior: Option<ExecutionIntent>) -> RetryDecision {
 /// underlying [`execute_tool_task`] fails.
 pub async fn guarded_tool_execution<F, Fut>(
     bootstrap: ToolTaskBootstrap,
-    task_store: &dyn AgentTaskStore,
-    intent_store: &dyn ExecutionIntentStore,
+    deps: &GuardedExecutionDeps<'_>,
     cancel: &CancellationToken,
     effect_class: ToolEffectClass,
     executor: F,
@@ -530,11 +537,20 @@ where
 
     // ── Replay-safe shortcut ─────────────────────────────────────
     if !effect_class.requires_intent() {
-        return execute_tool_task(bootstrap, task_store, cancel, executor, now).await;
+        return execute_tool_task(
+            bootstrap,
+            deps.task_store,
+            deps.event_repo,
+            cancel,
+            executor,
+            now,
+        )
+        .await;
     }
 
     // ── Retry-safety check ───────────────────────────────────────
-    let prior = intent_store
+    let prior = deps
+        .intent_store
         .get_intent(&operation_id)
         .await
         .context("failed to check prior intent")?;
@@ -575,7 +591,7 @@ where
         now,
     );
 
-    if let Err(persist_err) = intent_store.persist_intent(&intent).await {
+    if let Err(persist_err) = deps.intent_store.persist_intent(&intent).await {
         // FAIL-CLOSED: intent could not be durably written.
         // Fail the child task so the parent can handle it.
         let error_msg = format!(
@@ -587,7 +603,8 @@ where
         let worker_id = &bootstrap.worker_id;
         let lease_id = &bootstrap.lease_id;
 
-        let (child, parent) = task_store
+        let (child, parent) = deps
+            .task_store
             .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
             .await
             .with_context(|| format!("fail_task after intent-persist failure for {task_id}"))?;
@@ -596,6 +613,7 @@ where
             child,
             parent,
             error: error_msg,
+            committed_events: Vec::new(),
         });
     }
 
@@ -603,10 +621,18 @@ where
     intent.mark_started(now);
     // Best-effort: a failure here doesn't block execution since the
     // Pending intent already provides the safety guarantee.
-    let _ = intent_store.update_intent(&intent).await;
+    let _ = deps.intent_store.update_intent(&intent).await;
 
     // ── Execute ──────────────────────────────────────────────────
-    let outcome = execute_tool_task(bootstrap, task_store, cancel, executor, now).await;
+    let outcome = execute_tool_task(
+        bootstrap,
+        deps.task_store,
+        deps.event_repo,
+        cancel,
+        executor,
+        now,
+    )
+    .await;
 
     // ── Update intent to terminal status ─────────────────────────
     match &outcome {
@@ -625,7 +651,7 @@ where
     }
     // Best-effort: the terminal update is not required for safety —
     // the intent record already prevents unsafe retry.
-    let _ = intent_store.update_intent(&intent).await;
+    let _ = deps.intent_store.update_intent(&intent).await;
 
     outcome
 }

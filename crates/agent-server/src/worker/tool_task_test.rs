@@ -17,6 +17,7 @@
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -169,6 +170,7 @@ struct TestStores {
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
 }
 
 impl TestStores {
@@ -179,6 +181,7 @@ impl TestStores {
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
         }
     }
 
@@ -189,6 +192,7 @@ impl TestStores {
             message_store: &self.messages,
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
         }
     }
 }
@@ -227,6 +231,7 @@ async fn suspend_root_with_tools(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended outcome");
@@ -454,6 +459,7 @@ async fn execute_success_completes_child_and_decrements_parent() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("command output")) },
         t_plus(20),
@@ -465,6 +471,7 @@ async fn execute_success_completes_child_and_decrements_parent() -> Result<()> {
         child,
         parent,
         result,
+        ..
     } = outcome
     else {
         panic!("Expected Completed outcome, got: {outcome:?}");
@@ -515,6 +522,7 @@ async fn execute_failure_fails_child_without_corrupting_parent() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Err(anyhow::anyhow!("command failed with exit code 1")) },
         t_plus(20),
@@ -525,6 +533,7 @@ async fn execute_failure_fails_child_without_corrupting_parent() -> Result<()> {
         child,
         parent,
         error,
+        ..
     } = outcome
     else {
         panic!("Expected Failed outcome, got: {outcome:?}");
@@ -572,6 +581,7 @@ async fn execute_cancelled_before_tool_returns_cancelled() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("should not reach")) },
         t_plus(20),
@@ -629,6 +639,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
     let outcome_0 = execute_tool_task(
         ctx_0,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("ls output")) },
         t_plus(20),
@@ -663,6 +674,7 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
     let outcome_1 = execute_tool_task(
         ctx_1,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("file contents")) },
         t_plus(30),
@@ -717,6 +729,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
     execute_tool_task(
         ctx_0,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("ok")) },
         t_plus(20),
@@ -739,6 +752,7 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
     let outcome = execute_tool_task(
         ctx_1,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Err(anyhow::anyhow!("file not found")) },
         t_plus(30),
@@ -781,6 +795,7 @@ async fn execute_with_wrong_lease_fails_at_complete() -> Result<()> {
     let result = execute_tool_task(
         ctx,
         &stores.tasks,
+        &stores.events,
         &cancel,
         |_info| async { Ok(ToolResult::success("ok")) },
         t_plus(20),

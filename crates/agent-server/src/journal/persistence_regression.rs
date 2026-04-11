@@ -23,6 +23,7 @@
 mod tests {
     use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
     use crate::journal::commit::{CompletedTurnCommit, commit_completed_turn};
+    use crate::journal::event_repository::InMemoryEventRepository;
     use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
     use crate::journal::task::AgentTaskId;
     use crate::journal::thread_recover::{ThreadRecoveryView, recover_thread};
@@ -77,6 +78,7 @@ mod tests {
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
         checkpoints: InMemoryCheckpointStore,
+        events: InMemoryEventRepository,
     }
 
     impl Stores {
@@ -86,6 +88,7 @@ mod tests {
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
                 checkpoints: InMemoryCheckpointStore::new(),
+                events: InMemoryEventRepository::new(),
             }
         }
 
@@ -126,12 +129,14 @@ mod tests {
                     messages,
                     turn_usage: usage(100, 50),
                     agent_state_snapshot: state_snapshot,
+                    events: Vec::new(),
                     now: at,
                 },
                 &self.threads,
                 &self.messages,
                 &self.attempts,
                 &self.checkpoints,
+                &self.events,
             )
             .await
         }
@@ -347,12 +352,14 @@ mod tests {
                 messages: vec![llm::Message::user("should not appear")],
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(2),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .unwrap_err();
@@ -964,12 +971,14 @@ mod tests {
                 messages: vec![llm::Message::user("rejected")],
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(3),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .unwrap_err();

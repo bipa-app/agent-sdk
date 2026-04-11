@@ -10,6 +10,7 @@ use super::root_turn::{
     fail_root_turn, resume_from_children, resume_root_turn,
 };
 use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
+use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -212,6 +213,7 @@ struct TestStores {
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
 }
 
 impl TestStores {
@@ -222,6 +224,7 @@ impl TestStores {
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
         }
     }
 
@@ -232,6 +235,7 @@ impl TestStores {
             message_store: &self.messages,
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
         }
     }
 }
@@ -289,6 +293,7 @@ async fn text_only_turn_end_to_end() -> Result<()> {
         commit,
         completed_task,
         response_text,
+        ..
     } = outcome
     else {
         panic!("Expected Completed variant, got Suspended");
@@ -507,6 +512,7 @@ async fn tool_suspension_end_to_end() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended variant, got Completed");
@@ -597,6 +603,7 @@ async fn tool_suspension_multiple_tool_calls() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended");
@@ -773,6 +780,7 @@ async fn suspend_and_complete_children(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended variant");
@@ -898,6 +906,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
         commit,
         completed_task,
         response_text,
+        ..
     } = outcome
     else {
         panic!("Expected Completed variant, got Suspended");
@@ -1081,6 +1090,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended after resume with tool calls");
@@ -1429,6 +1439,7 @@ async fn failed_root_turn_does_not_advance_projections() -> Result<()> {
         &task_id,
         &worker_id,
         &lease_id,
+        &thread_a(),
         &err,
         &stores.deps(),
         t_plus(2),
@@ -1476,6 +1487,7 @@ async fn failed_root_turn_closes_open_attempt() -> Result<()> {
         &task_id,
         &worker_id,
         &lease_id,
+        &thread_a(),
         &err,
         &stores.deps(),
         t_plus(2),
@@ -1558,6 +1570,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
         &parent_id,
         &worker_id,
         &lease_id,
+        &thread_a(),
         &err,
         &stores.deps(),
         t_plus(26),
@@ -1657,6 +1670,7 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended");
@@ -1726,6 +1740,7 @@ async fn regression_text_only_completion() -> Result<()> {
         completed_task,
         response_text,
         commit,
+        ..
     } = outcome
     else {
         panic!("Expected Completed");
@@ -1810,6 +1825,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
         completed_task,
         response_text,
         commit,
+        ..
     } = outcome
     else {
         panic!("Expected Completed");
@@ -2011,6 +2027,7 @@ async fn suspend_and_complete_children_durably(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended variant");
@@ -2080,6 +2097,7 @@ async fn suspend_and_fail_children(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended variant");
@@ -2254,6 +2272,7 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended");
@@ -2495,6 +2514,7 @@ async fn resume_from_children_with_mixed_batch() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended");
@@ -2619,6 +2639,7 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended after resume with tool calls");
@@ -2691,6 +2712,7 @@ async fn cancelled_child_produces_deterministic_error_result() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended");
@@ -2800,6 +2822,7 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
     let RootTurnOutcome::Suspended {
         parent_task: r2_parent,
         child_tasks: r2_children,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended after round 2");

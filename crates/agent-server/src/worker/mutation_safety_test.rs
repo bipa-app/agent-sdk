@@ -32,10 +32,11 @@ use super::confirmation::{
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::execution_intent::{
-    ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
-    ToolEffectClass, classify_tool_effect, guarded_tool_execution,
+    ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, InMemoryExecutionIntentStore,
+    IntentStatus, OperationId, ToolEffectClass, classify_tool_effect, guarded_tool_execution,
 };
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::redaction::{RedactionPolicy, redact_value};
@@ -262,6 +263,7 @@ struct TestStores {
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
 }
 
 impl TestStores {
@@ -272,6 +274,7 @@ impl TestStores {
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
         }
     }
 
@@ -282,6 +285,7 @@ impl TestStores {
             message_store: &self.messages,
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
         }
     }
 }
@@ -313,6 +317,7 @@ async fn suspend_root_with_tools(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         anyhow::bail!("Expected Suspended outcome, got: {outcome:?}");
@@ -399,8 +404,11 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { Ok(ToolResult::success("transfer complete")) },
@@ -459,8 +467,11 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
 
     let result = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { panic!("executor must not be called for ambiguous retry") },
@@ -501,8 +512,11 @@ async fn replay_safe_tool_retries_freely_after_failure() -> Result<()> {
     // ReplaySafe bypasses intent entirely, so no intent to seed.
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::ReplaySafe,
         |_| async { Ok(ToolResult::success("hello")) },
@@ -544,7 +558,8 @@ async fn confirmation_state_survives_restart() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
     let child_id = ctx.task_id.clone();
 
-    let paused = pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
+    let (paused, _committed_events) =
+        pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
     assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
 
     // Simulate restart: re-read from store
@@ -606,7 +621,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
-    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
 
     // Approve
     apply_confirmation_decision(
@@ -639,8 +654,11 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         ctx2,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &deny_policy,
         &cancel,
         |_| async { panic!("executor must not be called when policy denies") },
@@ -700,7 +718,7 @@ async fn confirmation_rejected_produces_canonical_error() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
     let child_id = ctx.task_id.clone();
 
-    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
 
     let outcome = apply_confirmation_decision(
         &child_id,
@@ -762,7 +780,7 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
     let ctx = resolve_tool_bootstrap(child, &stores.tasks).await?;
     let child_id = ctx.task_id.clone();
 
-    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
 
     let outcome = apply_confirmation_decision(
         &child_id,
@@ -827,8 +845,11 @@ async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { panic!("executor should not run when cancelled") },
@@ -939,8 +960,11 @@ async fn fail_closed_on_intent_persist_failure() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &failing_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &failing_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { panic!("executor must not be called when intent persist fails") },
@@ -991,7 +1015,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
     let child_id = ctx.task_id.clone();
 
     // Pause for confirmation
-    pause_tool_for_confirmation(&ctx, &stores.tasks, t_plus(10)).await?;
+    pause_tool_for_confirmation(&ctx, &stores.tasks, &stores.events, t_plus(10)).await?;
 
     // Approve
     apply_confirmation_decision(
@@ -1019,8 +1043,11 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         ctx2,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &AllowAllPolicy,
         &cancel,
         |_| async { Ok(ToolResult::success("transfer done")) },
@@ -1095,8 +1122,11 @@ async fn audit_trail_covers_full_lifecycle() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { Ok(ToolResult::success("done")) },
@@ -1338,8 +1368,11 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 
     let bash_outcome = guarded_tool_execution(
         bash_ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::ReplaySafe,
         |_| async { Ok(ToolResult::success("a")) },
@@ -1367,8 +1400,11 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 
     let transfer_outcome = guarded_tool_execution(
         transfer_ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { Ok(ToolResult::success("50 transferred")) },
@@ -1425,8 +1461,11 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_| async { Err(anyhow::anyhow!("insufficient funds")) },
@@ -1491,8 +1530,11 @@ async fn no_intent_means_no_execution_invariant() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &failing_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &failing_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         move |_| {

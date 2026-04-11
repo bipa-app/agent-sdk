@@ -12,10 +12,11 @@
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::execution_intent::{
-    ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
-    ToolEffectClass, guarded_tool_execution,
+    ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, InMemoryExecutionIntentStore,
+    IntentStatus, OperationId, ToolEffectClass, guarded_tool_execution,
 };
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -199,6 +200,7 @@ struct TestStores {
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
 }
 
 impl TestStores {
@@ -209,6 +211,7 @@ impl TestStores {
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
         }
     }
 
@@ -219,6 +222,7 @@ impl TestStores {
             message_store: &self.messages,
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
         }
     }
 }
@@ -250,6 +254,7 @@ async fn suspend_root_with_tools(
     let RootTurnOutcome::Suspended {
         parent_task,
         child_tasks,
+        ..
     } = outcome
     else {
         panic!("Expected Suspended outcome");
@@ -302,8 +307,11 @@ async fn replay_safe_tool_bypasses_intent_persistence() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::ReplaySafe,
         |_info| async { Ok(ToolResult::success("hello")) },
@@ -350,8 +358,11 @@ async fn side_effecting_tool_persists_intent_and_completes() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async { Ok(ToolResult::success("transfer done")) },
@@ -402,8 +413,11 @@ async fn fail_closed_when_intent_persist_fails() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &failing_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &failing_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async {
@@ -479,8 +493,11 @@ async fn retry_blocked_when_intent_already_completed() -> Result<()> {
     // Attempt guarded execution — should fail with "already completed".
     let result = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async {
@@ -540,8 +557,11 @@ async fn retry_blocked_when_intent_ambiguous_in_flight() -> Result<()> {
     // Attempt guarded execution — should fail with "ambiguous in-flight".
     let result = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async {
@@ -602,8 +622,11 @@ async fn retry_blocked_when_side_effecting_intent_failed() -> Result<()> {
     // Attempt guarded execution — should fail with "ambiguous in-flight".
     let result = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async {
@@ -668,8 +691,11 @@ async fn retry_allowed_when_replay_safe_intent_failed() -> Result<()> {
     // bypasses intent persistence entirely.
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::ReplaySafe,
         |_info| async { Ok(ToolResult::success("retry succeeded")) },
@@ -711,8 +737,11 @@ async fn side_effecting_failure_records_intent_as_failed() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async { Err(anyhow::anyhow!("insufficient funds")) },
@@ -773,8 +802,11 @@ async fn cancellation_records_intent_as_failed() -> Result<()> {
 
     let outcome = guarded_tool_execution(
         ctx,
-        &stores.tasks,
-        &intent_store,
+        &GuardedExecutionDeps {
+            task_store: &stores.tasks,
+            intent_store: &intent_store,
+            event_repo: &stores.events,
+        },
         &cancel,
         ToolEffectClass::SideEffecting,
         |_info| async { Ok(ToolResult::success("should not reach")) },

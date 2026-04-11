@@ -29,8 +29,10 @@
 //! - Recovery loaders — see [`super::thread_recover`].
 //! - Task state transitions — the caller is responsible for calling
 //!   [`super::store::AgentTaskStore::complete_task`] separately.
-//! - Event persistence — out of scope (future phase).
+//! - Event persistence — lifecycle events are committed as step 5
+//!   after all state projections (Phase 6.2).
 
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -38,6 +40,8 @@ use time::OffsetDateTime;
 use super::checkpoint::Checkpoint;
 use super::checkpoint::NewCheckpointParams;
 use super::checkpoint_store::CheckpointStore;
+use super::committed_event::CommittedEvent;
+use super::event_repository::EventRepository;
 use super::message_store::MessageProjectionStore;
 use super::task::AgentTaskId;
 use super::thread::Thread;
@@ -69,6 +73,11 @@ pub struct CompletedTurnCommit {
     pub turn_usage: TokenUsage,
     /// Opaque agent-state snapshot for v1 recovery.
     pub agent_state_snapshot: serde_json::Value,
+    /// Lifecycle events to commit atomically with the turn.
+    ///
+    /// These are committed as step 5, after all state projections.
+    /// An empty vec skips the event-commit step.
+    pub events: Vec<AgentEvent>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
 }
@@ -90,6 +99,8 @@ pub struct CommitOutcome {
     pub checkpoint: Checkpoint,
     /// The closed turn attempt.
     pub closed_attempt: TurnAttempt,
+    /// Lifecycle events committed as part of this turn.
+    pub committed_events: Vec<CommittedEvent>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -125,6 +136,7 @@ pub async fn commit_completed_turn(
     message_store: &dyn MessageProjectionStore,
     turn_attempt_store: &dyn TurnAttemptStore,
     checkpoint_store: &dyn CheckpointStore,
+    event_repo: &dyn EventRepository,
 ) -> Result<CommitOutcome> {
     // 1. Close the turn attempt.
     let closed_attempt = turn_attempt_store
@@ -151,6 +163,10 @@ pub async fn commit_completed_turn(
     // 4. Create the checkpoint with the *full* accumulated history,
     //    not the delta — recovery must be able to restore the thread
     //    to this turn without replaying prior turns.
+    //
+    // Clone thread_id before checkpoint consumes it — step 5 needs
+    // a reference for the event batch commit.
+    let thread_id_for_events = params.thread_id.clone();
     let checkpoint = checkpoint_store
         .commit_checkpoint(NewCheckpointParams {
             thread_id: params.thread_id,
@@ -164,10 +180,22 @@ pub async fn commit_completed_turn(
         .await
         .context("commit: create checkpoint")?;
 
+    // 5. Commit lifecycle events. Skipped when no events are provided
+    //    (e.g. callers that don't produce lifecycle events yet).
+    let committed_events = if params.events.is_empty() {
+        Vec::new()
+    } else {
+        event_repo
+            .commit_event_batch(&thread_id_for_events, params.events, params.now)
+            .await
+            .context("commit: persist lifecycle events")?
+    };
+
     Ok(CommitOutcome {
         thread,
         checkpoint,
         closed_attempt,
+        committed_events,
     })
 }
 
@@ -178,6 +206,7 @@ pub async fn commit_completed_turn(
 #[cfg(test)]
 mod tests {
     use super::super::checkpoint_store::InMemoryCheckpointStore;
+    use super::super::event_repository::InMemoryEventRepository;
     use super::super::message_store::InMemoryMessageProjectionStore;
     use super::super::thread_store::InMemoryThreadStore;
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
@@ -238,6 +267,7 @@ mod tests {
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
         checkpoints: InMemoryCheckpointStore,
+        events: InMemoryEventRepository,
     }
 
     impl Stores {
@@ -247,6 +277,7 @@ mod tests {
                 messages: InMemoryMessageProjectionStore::new(),
                 attempts: InMemoryTurnAttemptStore::new(),
                 checkpoints: InMemoryCheckpointStore::new(),
+                events: InMemoryEventRepository::new(),
             }
         }
 
@@ -284,12 +315,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
                 now: t_plus(5),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("commit")?;
@@ -342,12 +375,14 @@ mod tests {
                 messages: vec![llm::Message::user("turn 1")],
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
                 now: t_plus(1),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("turn 1")?;
@@ -362,12 +397,14 @@ mod tests {
                 messages: vec![llm::Message::user("turn 2")],
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
+                events: Vec::new(),
                 now: t_plus(2),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("turn 2")?;
@@ -421,12 +458,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(1),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("thread a")?;
@@ -440,12 +479,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(2),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("thread b")?;
@@ -479,12 +520,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(1),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .unwrap_err();
@@ -529,12 +572,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(2),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .unwrap_err();
@@ -569,12 +614,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(1),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("first commit")?;
@@ -594,12 +641,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
                 now: t_plus(3),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .unwrap_err();
@@ -657,12 +706,14 @@ mod tests {
                 messages: sample_messages(),
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: snapshot.clone(),
+                events: Vec::new(),
                 now: t_plus(5),
             },
             &s.threads,
             &s.messages,
             &s.attempts,
             &s.checkpoints,
+            &s.events,
         )
         .await
         .context("commit")?;

@@ -85,6 +85,8 @@ mod bootstrap_test;
 #[cfg(test)]
 mod confirmation_test;
 #[cfg(test)]
+mod event_commit_test;
+#[cfg(test)]
 mod guarded_execution_test;
 #[cfg(test)]
 mod mutation_safety_test;
