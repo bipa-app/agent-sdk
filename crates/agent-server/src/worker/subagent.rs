@@ -492,7 +492,7 @@ pub fn resolve_subagent_spec(
 
     Ok(EffectiveSubagentSpec {
         task: request.task.clone(),
-        prompt: request.prompt.clone().unwrap_or_default(),
+        prompt: normalize_optional_string(request.prompt.as_deref()).unwrap_or_default(),
         model,
         max_turns,
         timeout_ms,

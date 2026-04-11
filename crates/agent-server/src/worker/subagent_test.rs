@@ -112,6 +112,36 @@ fn resolution_is_deterministic_for_same_inputs() -> Result<()> {
 }
 
 #[test]
+fn prompt_is_trimmed_and_blank_prompt_resolves_to_empty_string() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+
+    let trimmed = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Find the durable bootstrap path",
+            SubagentCapabilityRequest::new("research"),
+        )
+        .with_prompt("  Focus on authoritative contracts.  "),
+        &constraints,
+        &policy,
+    )?;
+    assert_eq!(trimmed.prompt, "Focus on authoritative contracts.");
+
+    let blank = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Find the durable bootstrap path",
+            SubagentCapabilityRequest::new("research"),
+        )
+        .with_prompt("   "),
+        &constraints,
+        &policy,
+    )?;
+    assert!(blank.prompt.is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn allowlist_narrows_profile_before_parent_ceiling() -> Result<()> {
     let constraints = sample_constraints();
     let request = SubagentSpawnRequest::new(
