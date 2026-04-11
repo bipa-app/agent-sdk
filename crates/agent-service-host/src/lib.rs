@@ -54,7 +54,9 @@
 //! ```
 //!
 //! This keeps the service-host crate focused on composition and
-//! lifecycle while transports remain pluggable.
+//! lifecycle while transports remain pluggable. The reviewable gRPC
+//! contract for the desktop/service path lives under
+//! `crates/agent-service-host/proto/agent/service/v1`.
 //!
 //! [`ServiceHost`]: host::ServiceHost
 //! [`StoreRegistry`]: stores::StoreRegistry
