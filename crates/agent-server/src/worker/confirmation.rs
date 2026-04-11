@@ -164,7 +164,7 @@ pub trait ConfirmationPolicy: Send + Sync {
 /// Outcome of [`apply_confirmation_decision`].
 #[derive(Debug)]
 pub enum ConfirmationDecisionOutcome {
-    /// User approved. Child is now [`TaskStatus::Pending`] and will
+    /// User approved. Child is now [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending) and will
     /// be re-acquired by a worker for policy recheck + execution.
     ///
     /// `prepared_operation` is the listen/execute context that was
@@ -175,13 +175,13 @@ pub enum ConfirmationDecisionOutcome {
         child: AgentTask,
         prepared_operation: Option<ListenExecutionContext>,
     },
-    /// User rejected. Child is now [`TaskStatus::Failed`].
+    /// User rejected. Child is now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
     Rejected {
         child: AgentTask,
         parent: Option<AgentTask>,
         reason: String,
     },
-    /// Confirmation timed out. Child is now [`TaskStatus::Failed`].
+    /// Confirmation timed out. Child is now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
     TimedOut {
         child: AgentTask,
         parent: Option<AgentTask>,
@@ -198,7 +198,7 @@ pub enum ConfirmationResumeOutcome {
     /// Tool executed after approval and policy recheck.
     Executed(ToolTaskOutcome),
     /// Policy denied execution despite user approval. Child is
-    /// now [`TaskStatus::Failed`].
+    /// now [`TaskStatus::Failed`](crate::journal::task::TaskStatus::Failed).
     PolicyDenied {
         child: AgentTask,
         parent: Option<AgentTask>,
@@ -218,10 +218,10 @@ pub enum ConfirmationResumeOutcome {
 ///
 /// # Preconditions
 ///
-/// - `bootstrap.child_task` must be in [`TaskStatus::Running`].
+/// - `bootstrap.child_task` must be in [`TaskStatus::Running`](crate::journal::task::TaskStatus::Running).
 /// - `bootstrap.child_task.kind` must be [`TaskKind::ToolRuntime`].
 /// - The parent task must carry a continuation (it should, since it
-///   is in [`TaskStatus::WaitingOnChildren`]).
+///   is in [`TaskStatus::WaitingOnChildren`](crate::journal::task::TaskStatus::WaitingOnChildren)).
 ///
 /// # Errors
 ///
@@ -271,7 +271,7 @@ pub async fn pause_tool_for_confirmation(
 // ─────────────────────────────────────────────────────────────────────
 
 /// Apply a confirmation decision to an
-/// [`AwaitingConfirmation`](TaskStatus::AwaitingConfirmation) child
+/// [`AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation) child
 /// task.
 ///
 /// This is the entry point the external transport calls after
@@ -279,7 +279,7 @@ pub async fn pause_tool_for_confirmation(
 /// then:
 ///
 /// - **Approved**: extracts the prepared operation, resumes the child
-///   to [`TaskStatus::Pending`] via
+///   to [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending) via
 ///   [`AgentTaskStore::resume_from_confirmation`], and returns the
 ///   extracted prepared operation so the caller can pass it to the
 ///   worker on re-acquisition.
@@ -293,7 +293,7 @@ pub async fn pause_tool_for_confirmation(
 /// # Errors
 ///
 /// Returns an error if the child does not exist, is not in
-/// [`TaskStatus::AwaitingConfirmation`], or if the store transition
+/// [`TaskStatus::AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation), or if the store transition
 /// fails.
 pub async fn apply_confirmation_decision(
     child_id: &AgentTaskId,
@@ -366,10 +366,10 @@ pub async fn apply_confirmation_decision(
 /// # Preconditions
 ///
 /// - `bootstrap` must be a valid [`ToolTaskBootstrap`] for a
-///   [`TaskStatus::Running`] child (i.e. the child was re-acquired
-///   after the approval resumed it to [`TaskStatus::Pending`]).
+///   [`TaskStatus::Running`](crate::journal::task::TaskStatus::Running) child (i.e. the child was re-acquired
+///   after the approval resumed it to [`TaskStatus::Pending`](crate::journal::task::TaskStatus::Pending)).
 /// - The caller must have verified that the child was previously in
-///   [`TaskStatus::AwaitingConfirmation`] and was approved. This
+///   [`TaskStatus::AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation) and was approved. This
 ///   function does not re-read the confirmation decision.
 ///
 /// # Errors
