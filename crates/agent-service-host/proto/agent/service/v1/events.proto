@@ -166,6 +166,7 @@ message StreamThreadEventsRequest {
   optional uint64 after_sequence = 2;
 
   // Replay only, or replay and then continue with committed live events.
+  // FOLLOW_MODE_UNSPECIFIED is treated as INVALID_ARGUMENT.
   FollowMode follow_mode = 3;
 }
 
