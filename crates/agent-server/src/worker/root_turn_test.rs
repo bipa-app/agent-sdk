@@ -1988,7 +1988,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Phase 5.4 helper: suspend at tool boundary, complete children with
-/// durable result payloads, return the parent in ReadyToResume state.
+/// durable result payloads, return the parent in `ReadyToResume` state.
 ///
 /// Unlike `suspend_and_complete_children`, this helper persists the
 /// tool results on the child rows via `complete_task_with_result` so
@@ -2061,7 +2061,7 @@ async fn suspend_and_complete_children_durably(
 }
 
 /// Phase 5.4 helper: suspend, fail children (no result payload), and
-/// return the parent in ReadyToResume state.
+/// return the parent in `ReadyToResume` state.
 async fn suspend_and_fail_children(
     stores: &TestStores,
     tool_calls: Vec<(String, String, serde_json::Value)>,
@@ -2258,19 +2258,7 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
         panic!("Expected Suspended");
     };
 
-    // Complete child 0 with success result.
-    let child_0 = &child_tasks[0];
-    stores
-        .tasks
-        .try_acquire_task(
-            &child_0.id,
-            WorkerId::from_string("cw"),
-            LeaseId::from_string("cl"),
-            t_plus(600),
-            t_plus(10),
-        )
-        .await?
-        .context("acquire child 0")?;
+    // Complete child 0 with success result, fail child 1.
     let success_result = agent_sdk_core::ToolResult {
         success: true,
         output: "/home/user".to_owned(),
@@ -2278,40 +2266,8 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
         documents: Vec::new(),
         duration_ms: Some(5),
     };
-    stores
-        .tasks
-        .complete_task_with_result(
-            &child_0.id,
-            &WorkerId::from_string("cw"),
-            &LeaseId::from_string("cl"),
-            serde_json::to_value(&success_result)?,
-            t_plus(15),
-        )
-        .await?;
-
-    // Fail child 1.
-    let child_1 = &child_tasks[1];
-    stores
-        .tasks
-        .try_acquire_task(
-            &child_1.id,
-            WorkerId::from_string("cw"),
-            LeaseId::from_string("cl"),
-            t_plus(600),
-            t_plus(10),
-        )
-        .await?
-        .context("acquire child 1")?;
-    stores
-        .tasks
-        .fail_task(
-            &child_1.id,
-            &WorkerId::from_string("cw"),
-            &LeaseId::from_string("cl"),
-            "permission denied".to_owned(),
-            t_plus(15),
-        )
-        .await?;
+    acquire_and_complete_child(&stores, &child_tasks[0], &success_result).await?;
+    acquire_and_fail_child(&stores, &child_tasks[1], "permission denied").await?;
 
     // Reload parent.
     let parent = stores.tasks.get(&parent_task.id).await?.context("parent")?;
@@ -2452,6 +2408,64 @@ async fn resume_from_children_end_to_end() -> Result<()> {
     Ok(())
 }
 
+/// Acquire a child task, complete it with a durable result payload.
+async fn acquire_and_complete_child(
+    stores: &TestStores,
+    child: &AgentTask,
+    result: &agent_sdk_core::ToolResult,
+) -> Result<()> {
+    stores
+        .tasks
+        .try_acquire_task(
+            &child.id,
+            WorkerId::from_string("cw"),
+            LeaseId::from_string("cl"),
+            t_plus(600),
+            t_plus(10),
+        )
+        .await?
+        .context("acquire child")?;
+    stores
+        .tasks
+        .complete_task_with_result(
+            &child.id,
+            &WorkerId::from_string("cw"),
+            &LeaseId::from_string("cl"),
+            serde_json::to_value(result).context("serialize")?,
+            t_plus(15),
+        )
+        .await
+        .context("complete child with result")?;
+    Ok(())
+}
+
+/// Acquire a child task, fail it with the given error.
+async fn acquire_and_fail_child(stores: &TestStores, child: &AgentTask, error: &str) -> Result<()> {
+    stores
+        .tasks
+        .try_acquire_task(
+            &child.id,
+            WorkerId::from_string("cw"),
+            LeaseId::from_string("cl"),
+            t_plus(600),
+            t_plus(10),
+        )
+        .await?
+        .context("acquire child")?;
+    stores
+        .tasks
+        .fail_task(
+            &child.id,
+            &WorkerId::from_string("cw"),
+            &LeaseId::from_string("cl"),
+            error.to_owned(),
+            t_plus(15),
+        )
+        .await
+        .context("fail child")?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn resume_from_children_with_mixed_batch() -> Result<()> {
     let stores = TestStores::new();
@@ -2485,58 +2499,16 @@ async fn resume_from_children_with_mixed_batch() -> Result<()> {
         panic!("Expected Suspended");
     };
 
-    // Complete child 0 with result.
-    let child_0 = &child_tasks[0];
-    stores
-        .tasks
-        .try_acquire_task(
-            &child_0.id,
-            WorkerId::from_string("cw"),
-            LeaseId::from_string("cl"),
-            t_plus(600),
-            t_plus(10),
-        )
-        .await?
-        .context("acquire child 0")?;
-    stores
-        .tasks
-        .complete_task_with_result(
-            &child_0.id,
-            &WorkerId::from_string("cw"),
-            &LeaseId::from_string("cl"),
-            serde_json::to_value(&agent_sdk_core::ToolResult::success("/home"))?,
-            t_plus(15),
-        )
-        .await?;
+    acquire_and_complete_child(
+        &stores,
+        &child_tasks[0],
+        &agent_sdk_core::ToolResult::success("/home"),
+    )
+    .await?;
+    acquire_and_fail_child(&stores, &child_tasks[1], "oops").await?;
 
-    // Fail child 1.
-    let child_1 = &child_tasks[1];
-    stores
-        .tasks
-        .try_acquire_task(
-            &child_1.id,
-            WorkerId::from_string("cw"),
-            LeaseId::from_string("cl"),
-            t_plus(600),
-            t_plus(10),
-        )
-        .await?
-        .context("acquire child 1")?;
-    stores
-        .tasks
-        .fail_task(
-            &child_1.id,
-            &WorkerId::from_string("cw"),
-            &LeaseId::from_string("cl"),
-            "oops".to_owned(),
-            t_plus(15),
-        )
-        .await?;
-
-    // Reload parent.
+    // Reload parent and re-acquire.
     let parent = stores.tasks.get(&parent_task.id).await?.context("parent")?;
-
-    // Re-acquire.
     let acquired = stores
         .tasks
         .try_acquire_task(
