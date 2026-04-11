@@ -168,7 +168,7 @@ pub enum ConfirmationDecisionOutcome {
     /// be re-acquired by a worker for policy recheck + execution.
     ///
     /// `prepared_operation` is the listen/execute context that was
-    /// persisted on the [`TaskState::AwaitingConfirmation`] payload,
+    /// persisted on the `TaskState::AwaitingConfirmation` payload,
     /// extracted before the resume cleared the typed state. `None`
     /// for non-listen tools.
     Approved {
@@ -371,7 +371,7 @@ pub async fn apply_confirmation_decision(
 ///    failed with a `confirmation_policy_denied:` error prefix
 ///    and no executor callback runs.
 /// 2. **Executes** the tool through
-///    [`guarded_tool_execution`](crate::journal::execution_intent::guarded_tool_execution),
+///    [`guarded_tool_execution`],
 ///    which applies the Phase 5.2 durable intent guard on top of the
 ///    Phase 5.1 executor lifecycle.
 ///
@@ -388,7 +388,7 @@ pub async fn apply_confirmation_decision(
 ///
 /// Returns an error if the policy check fails (infrastructure
 /// error), or if the underlying
-/// [`guarded_tool_execution`](crate::journal::execution_intent::guarded_tool_execution)
+/// [`guarded_tool_execution`]
 /// or store CAS operations fail.
 pub async fn resume_confirmed_tool<F, Fut>(
     bootstrap: ToolTaskBootstrap,
