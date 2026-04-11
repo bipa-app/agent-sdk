@@ -379,14 +379,14 @@ transport:
 
     #[test]
     fn postgres_backend_yaml_parses() -> Result<()> {
-        let yaml = r#"
+        let yaml = r"
 storage:
   backend: postgres
   postgres:
     database_url: postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
     schema: host_tests
     max_connections: 16
-"#;
+";
 
         let config = ServiceConfig::from_yaml_str(yaml)?;
         assert!(matches!(config.storage.backend, StorageBackend::Postgres));

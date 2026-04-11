@@ -11,8 +11,8 @@
 //!   `storage.backend=postgres`.
 //!
 //! The remaining host surfaces without a Postgres implementation
-//! (committed events, execution intents, tool audit) stay explicit in
-//! the store registry as in-memory fallbacks until follow-up work lands.
+//! (execution intents and tool audit) stay explicit in the store
+//! registry as in-memory fallbacks until follow-up work lands.
 
 pub mod migrations;
 pub mod repository;

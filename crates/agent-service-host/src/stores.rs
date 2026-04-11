@@ -58,7 +58,7 @@ pub struct StorageSurfaceStatus {
     pub note: &'static str,
 }
 
-const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 8] = [
+const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "in_memory",
@@ -107,9 +107,21 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 8] = [
         persists_restart: false,
         note: "all state is process-local",
     },
+    StorageSurfaceStatus {
+        surface: "outbox_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "all state is process-local",
+    },
+    StorageSurfaceStatus {
+        surface: "retention_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "all state is process-local",
+    },
 ];
 
-const POSTGRES_SURFACES: [StorageSurfaceStatus; 8] = [
+const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "postgres",
@@ -142,9 +154,9 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 8] = [
     },
     StorageSurfaceStatus {
         surface: "event_repo",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "committed events remain process-local until the Postgres event repository lands",
+        backend: "postgres",
+        persists_restart: true,
+        note: "",
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
@@ -157,6 +169,18 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 8] = [
         backend: "in_memory",
         persists_restart: false,
         note: "tool audit events remain process-local until a durable backend is implemented",
+    },
+    StorageSurfaceStatus {
+        surface: "outbox_store",
+        backend: "postgres",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "retention_store",
+        backend: "postgres",
+        persists_restart: true,
+        note: "",
     },
 ];
 
@@ -317,9 +341,11 @@ impl StoreRegistry {
             message_store: durable_store.clone(),
             attempt_store: durable_store.clone(),
             checkpoint_store: durable_store.clone(),
-            event_repo: Arc::new(InMemoryEventRepository::new()),
+            event_repo: durable_store.clone(),
             execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
+            outbox_store: durable_store.clone(),
+            retention_store: durable_store.clone(),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             backend: RegistryBackend::Postgres(PostgresBackend {
@@ -421,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn from_config_postgres_uses_hybrid_durability_report() -> anyhow::Result<()> {
+    fn from_config_postgres_reports_remaining_non_durable_surfaces() -> anyhow::Result<()> {
         let config = StorageConfig {
             backend: StorageBackend::Postgres,
             postgres: PostgresStorageConfig {
@@ -449,9 +475,28 @@ mod tests {
             .iter()
             .find(|surface| surface.surface == "event_repo")
             .context("missing event_repo surface")?;
-        assert!(!event_surface.persists_restart);
-        assert_eq!(event_surface.backend, "in_memory");
-        assert!(!event_surface.note.is_empty());
+        assert!(event_surface.persists_restart);
+        assert_eq!(event_surface.backend, "postgres");
+        assert!(event_surface.note.is_empty());
+
+        let outbox_surface = stores
+            .durability_report()
+            .iter()
+            .find(|surface| surface.surface == "outbox_store")
+            .context("missing outbox_store surface")?;
+        assert!(outbox_surface.persists_restart);
+        assert_eq!(outbox_surface.backend, "postgres");
+
+        let nondurable_surfaces = stores
+            .durability_report()
+            .iter()
+            .filter(|surface| !surface.persists_restart)
+            .map(|surface| surface.surface)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nondurable_surfaces,
+            vec!["execution_intent_store", "tool_audit_store"]
+        );
         Ok(())
     }
 

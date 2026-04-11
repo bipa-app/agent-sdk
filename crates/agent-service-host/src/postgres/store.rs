@@ -1337,6 +1337,89 @@ fn validate_schema_name(schema: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_subagent_spawn_parent(
+    parent: &AgentTask,
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+) -> Result<()> {
+    if parent.status != TaskStatus::Running {
+        let status = parent.status;
+        return Err(anyhow!(
+            "spawn rejected: task {parent_id} is not running (status {status:?})"
+        ));
+    }
+    match &parent.worker_id {
+        Some(current) if current == worker => {}
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: worker mismatch on task {parent_id}"
+            ));
+        }
+    }
+    match &parent.lease_id {
+        Some(current) if current == lease => {}
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: lease mismatch on task {parent_id}"
+            ));
+        }
+    }
+    if parent.kind.is_leaf() {
+        let parent_kind = parent.kind;
+        return Err(anyhow!(
+            "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_child_thread_available_for_spawn_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    child_thread_id: &ThreadId,
+) -> Result<()> {
+    let child_thread = PostgresDurableStore::lock_thread_tx(tx, child_thread_id).await?;
+    if child_thread.is_none() {
+        return Err(anyhow!(
+            "spawn rejected: child thread {child_thread_id} does not exist"
+        ));
+    }
+
+    let existing_child_thread_task = sqlx::query_scalar::<_, String>(
+        r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+LIMIT 1
+",
+    )
+    .bind(thread_key(child_thread_id))
+    .fetch_optional(tx.as_mut())
+    .await
+    .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
+    if existing_child_thread_task.is_some() {
+        return Err(anyhow!(
+            "spawn rejected: child thread id {child_thread_id} already has tasks"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn ensure_spawn_task_id_available_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &AgentTaskId,
+    label: &str,
+) -> Result<()> {
+    let existing_task = PostgresDurableStore::load_task_tx(tx, task_id, false).await?;
+    if existing_task.is_some() {
+        return Err(anyhow!(
+            "spawn rejected: {label} task id {task_id} already exists"
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -2152,72 +2235,15 @@ FOR UPDATE SKIP LOCKED
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
-
-        let child_thread = Self::lock_thread_tx(&mut tx, &child_thread_id).await?;
-        if child_thread.is_none() {
-            return Err(anyhow!(
-                "spawn rejected: child thread {child_thread_id} does not exist"
-            ));
-        }
-
-        let existing_child_thread_task = sqlx::query_scalar::<_, String>(
-            r"
-SELECT id
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-LIMIT 1
-",
-        )
-        .bind(thread_key(&child_thread_id))
-        .fetch_optional(tx.as_mut())
-        .await
-        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
-        if existing_child_thread_task.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child thread id {child_thread_id} already has tasks"
-            ));
-        }
+        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+        ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
 
         let child_root = AgentTask::new_root_turn(
             child_thread_id.clone(),
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         );
-        let existing_child_root = Self::load_task_tx(&mut tx, &child_root.id, false).await?;
-        if existing_child_root.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child root task id {} already exists",
-                child_root.id
-            ));
-        }
+        ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
 
         let invocation = AgentTask::new_subagent_invocation(
             &old_parent,
@@ -2231,13 +2257,7 @@ LIMIT 1
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
-        let existing_invocation = Self::load_task_tx(&mut tx, &invocation.id, false).await?;
-        if existing_invocation.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: invocation task id {} already exists",
-                invocation.id
-            ));
-        }
+        ensure_spawn_task_id_available_tx(&mut tx, &invocation.id, "invocation").await?;
 
         let new_parent = old_parent
             .clone()

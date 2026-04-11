@@ -10,6 +10,9 @@ durable-core tables:
 - message projections
 - turn attempts
 - checkpoints
+- committed event repository
+- transactional outbox rows
+- retention cursors
 
 Example config:
 
@@ -50,13 +53,13 @@ isolated durable-core tables inside one physical database.
 
 Startup applies the embedded durable-core migrations before the host
 starts serving work. The Postgres pool is shared across the task,
-thread, message, turn-attempt, and checkpoint stores.
+thread, message, turn-attempt, checkpoint, event-journal, outbox, and
+retention stores.
 
 The current Postgres backend is intentionally partial. These host
 surfaces still remain process-local in-memory state and do not survive
 restart:
 
-- committed event repository
 - execution intent store
 - tool audit store
 
