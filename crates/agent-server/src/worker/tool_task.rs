@@ -225,7 +225,7 @@ pub enum ToolTaskOutcome {
 ///
 /// 1. Check cancellation (bail early if already cancelled).
 /// 2. Run `executor(tool_call)`.
-/// 3. On success → [`AgentTaskStore::complete_task`].
+/// 3. On success → [`AgentTaskStore::complete_task_with_result`].
 /// 4. On failure → [`AgentTaskStore::fail_task`].
 ///
 /// The callback signature is intentionally minimal — the caller
@@ -233,12 +233,12 @@ pub enum ToolTaskOutcome {
 /// provides whatever execution logic it needs. This keeps
 /// `agent-server` independent of `agent-sdk`'s runtime.
 ///
-/// [`AgentTaskStore::complete_task`]: crate::journal::store::AgentTaskStore::complete_task
+/// [`AgentTaskStore::complete_task_with_result`]: crate::journal::store::AgentTaskStore::complete_task_with_result
 /// [`AgentTaskStore::fail_task`]: crate::journal::store::AgentTaskStore::fail_task
 /// # Errors
 ///
-/// Returns an error if the store's `complete_task` or `fail_task`
-/// CAS check fails (e.g. lease expired or wrong worker).
+/// Returns an error if the store's `complete_task_with_result` or
+/// `fail_task` CAS check fails (e.g. lease expired or wrong worker).
 pub async fn execute_tool_task<F, Fut>(
     bootstrap: ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
