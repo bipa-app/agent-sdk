@@ -18,7 +18,7 @@
 //! # Positional mapping
 //!
 //! Child tasks are spawned in the same order as the parent's
-//! [`AgentContinuation::pending_tool_calls`] array. The bootstrap
+//! [`AgentContinuation::pending_tool_calls`](agent_sdk_core::AgentContinuation::pending_tool_calls) array. The bootstrap
 //! step sorts siblings by `created_at` and matches each child to its
 //! tool call by position. This coupling is safe because both arrays
 //! are created atomically under the same store write lock in
