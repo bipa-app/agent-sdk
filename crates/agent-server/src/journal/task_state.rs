@@ -240,7 +240,7 @@ impl TaskState {
     pub const fn compatible_statuses_label(&self) -> &'static str {
         match self {
             Self::None => "any non-paused status",
-            Self::WaitingOnChildren { .. } => "WaitingOnChildren",
+            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => "WaitingOnChildren",
             Self::AwaitingConfirmation { .. } => "AwaitingConfirmation",
             Self::ReadyToResume { .. } => "Pending or Running",
         }
