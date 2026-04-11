@@ -21,6 +21,15 @@
 //! [`execute_tool_task`] drives the child to completion or failure
 //! through the journal.
 //!
+//! # Guarded execution (Phase 5.2)
+//!
+//! [`guarded_tool_execution`] wraps [`execute_tool_task`] with the
+//! durable execution-intent guard. Side-effecting and resumable tools
+//! must persist an [`ExecutionIntent`] before the executor callback
+//! runs. If persistence fails, execution is blocked (fail-closed).
+//! The [`classify_tool_effect`] helper determines a tool's
+//! [`ToolEffectClass`] from its [`PendingToolCallInfo`] metadata.
+//!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
 //! ```ignore
@@ -56,6 +65,8 @@ pub mod tool_task;
 #[cfg(test)]
 mod bootstrap_test;
 #[cfg(test)]
+mod guarded_execution_test;
+#[cfg(test)]
 mod root_turn_test;
 #[cfg(test)]
 mod tool_task_test;
@@ -69,4 +80,11 @@ pub use root_turn::{
 };
 pub use tool_task::{
     ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap,
+};
+
+// Phase 5.2: re-export durable execution intent from journal.
+pub use crate::journal::execution_intent::{
+    ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
+    RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
+    guarded_tool_execution,
 };
