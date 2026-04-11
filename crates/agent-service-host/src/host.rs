@@ -65,11 +65,16 @@ impl ServiceHost {
     /// storage backend.
     ///
     /// # Errors
-    /// Returns an error if store initialisation fails.
+    /// Returns an error if store initialisation fails or if the
+    /// configuration contains invalid values (e.g. zero sweep interval).
     pub fn new(
         config: ServiceConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            config.worker.sweep_interval_secs > 0,
+            "worker.sweep_interval_secs must be > 0"
+        );
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
             .context("initialising store registry")?;
         Ok(Self {
@@ -180,10 +185,10 @@ impl ServiceHost {
 
         info!("draining background tasks");
 
-        // Give the sweep task a moment to finish its current iteration.
-        if let Err(e) = sweep_handle.await {
-            warn!(error = %e, "lease sweep task panicked during shutdown");
-        }
+        // Wait for the sweep task; propagate panics as errors.
+        sweep_handle
+            .await
+            .context("lease sweep task panicked during shutdown")?;
 
         info!("service host stopped");
         Ok(())
@@ -283,6 +288,19 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn zero_sweep_interval_is_rejected() {
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                sweep_interval_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = ServiceHost::new(config, sample_registry());
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn host_shuts_down_on_token_cancel() -> Result<()> {
         let config = ServiceConfig::default();
@@ -295,7 +313,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sweep_runs_at_least_once_before_shutdown() -> Result<()> {
         use agent_sdk_core::ThreadId;
         use agent_server::journal::task::AgentTask;
@@ -328,11 +346,14 @@ mod tests {
             .try_acquire_task(&task_id, worker, lease, expires, now)
             .await?;
 
-        // Run the host briefly.
+        // Run the host in the background.
         let host_handle = tokio::spawn(async move { host.run().await });
 
-        // Give the sweep one cycle.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // With start_paused, sleep auto-advances the synthetic clock
+        // and yields to scheduled tasks — deterministic, no wall-clock
+        // dependency.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
         token.cancel();
         host_handle.await??;
 
