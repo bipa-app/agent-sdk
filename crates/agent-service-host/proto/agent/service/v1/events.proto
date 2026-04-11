@@ -83,8 +83,9 @@ message ToolProgressEvent {
 message ToolRequiresConfirmationEvent {
   string tool_call_id = 1;
   string name = 2;
-  google.protobuf.Value input = 3;
-  string description = 4;
+  string display_name = 3;
+  google.protobuf.Value input = 4;
+  string description = 5;
 }
 
 message TurnCompleteEvent {
