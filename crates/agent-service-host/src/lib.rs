@@ -9,6 +9,9 @@
 //! - **Configuration model** ([`config`]) — typed, serde-stable settings
 //!   for storage backend, worker pool sizing, retention policy, and
 //!   transport enablement.
+//! - **Postgres durable contract** ([`postgres`]) — reviewable schema,
+//!   migration, and repository-boundary definitions for the current
+//!   durable core, ready for a future SQL implementation.
 //! - **Store registry** ([`stores`]) — constructs and owns the full set
 //!   of durable store trait-objects that the journal and worker layers
 //!   consume.
@@ -61,4 +64,5 @@
 pub mod config;
 pub mod health;
 pub mod host;
+pub mod postgres;
 pub mod stores;
