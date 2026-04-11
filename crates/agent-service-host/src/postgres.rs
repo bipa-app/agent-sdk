@@ -116,6 +116,10 @@ mod tests {
             "waiting-state check must reject JSON null kind values",
         );
         ensure!(
+            sql_bundle.contains("'subagent_invocation'"),
+            "waiting-state check must accept the subagent_invocation state kind",
+        );
+        ensure!(
             sql_bundle.contains(
                 "state_json ->> 'kind' = 'none'\n                    AND status IN ('queued', 'pending', 'running')"
             ),
@@ -125,7 +129,13 @@ mod tests {
             sql_bundle.contains(
                 "state_json ->> 'kind' = 'ready_to_resume'\n                    AND status IN ('pending', 'running')"
             ),
-            "waiting-state check must exclude queued rows from ready_to_resume",
+            "waiting-state check must allow queued rows with the default none state",
+        );
+        ensure!(
+            sql_bundle.contains(
+                "state_json ->> 'kind' = 'ready_to_resume'\n                    AND status IN ('pending', 'running')"
+            ),
+            "waiting-state check must allow ready_to_resume only on pending/running rows",
         );
         Ok(())
     }

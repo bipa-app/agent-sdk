@@ -6,13 +6,14 @@
 //! Phase 2.4 (ENG-7918) replaces it with [`TaskState`], a strongly typed
 //! enum keyed on the row's pause status.
 //!
-//! The variants line up 1:1 with the two **paused** [`super::TaskStatus`]
-//! values that exist in the rewrite today:
+//! The variants cover every paused-status payload the rewrite needs
+//! today:
 //!
 //! | `TaskStatus` | `TaskState` variant | Why we need durable state |
 //! |--------------|---------------------|---------------------------|
 //! | [`super::TaskStatus::WaitingOnChildren`] | [`TaskState::WaitingOnChildren`] | A root turn that has spawned tool-runtime children carries a versioned [`ContinuationEnvelope`] so the parent loop can resume from the same point once every child reaches a terminal state. |
 //! | [`super::TaskStatus::AwaitingConfirmation`] | [`TaskState::AwaitingConfirmation`] | A task paused on a user confirmation needs both the continuation **and** any prepared listen/execute operation that the SDK staged before the pause, so the resume path can either execute or cancel it. |
+//! | [`super::TaskStatus::WaitingOnChildren`] | [`TaskState::SubagentInvocation`] | A parent-visible `subagent` invocation task is itself parked on a spawned child thread and owns the durable linkage to that child thread and its initial `root_turn` task. |
 //! | `Pending` / `Running` after child aggregation | [`TaskState::ReadyToResume`] | A parent whose child batch has drained carries the saved continuation and suspended messages until a worker resumes the turn. |
 //! | every other status | [`TaskState::None`] | Fresh runnable rows (`Pending`, `Running`, `Queued`) and terminal rows (`Completed`, `Failed`, `Cancelled`) carry no durable resume payload — the row's status itself is enough. |
 //!
@@ -52,6 +53,7 @@
 //! { "kind": "none" }
 //! { "kind": "waiting_on_children", "continuation": { "version": 1, "payload": { ... } } }
 //! { "kind": "awaiting_confirmation", "continuation": { "version": 1, "payload": { ... } }, "prepared_operation": null }
+//! { "kind": "subagent_invocation", "invocation": { "spec": { ... }, "child_thread_id": "...", "child_root_task_id": "task_..." } }
 //! ```
 //!
 //! The variant names are stable across releases so durable rows persisted
@@ -60,10 +62,26 @@
 //! introduce, the same forward-compatibility rule
 //! [`agent_sdk_core::ContinuationEnvelope`] follows.
 
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, llm};
+use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId, llm};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
+use crate::worker::subagent::EffectiveSubagentSpec;
+
+/// Durable linkage owned by a `subagent` invocation task.
+///
+/// The invocation task is the parent-visible supervisor and
+/// aggregation unit for a spawned child thread. It is not the child
+/// thread itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentInvocationState {
+    /// Server-authoritative resolved spawn spec.
+    pub spec: EffectiveSubagentSpec,
+    /// Durable identity of the spawned child thread.
+    pub child_thread_id: ThreadId,
+    /// Initial `root_turn` task allocated on the child thread.
+    pub child_root_task_id: super::task::AgentTaskId,
+}
 
 /// Typed durable per-task state owned by the task kind.
 ///
@@ -142,6 +160,17 @@ pub enum TaskState {
         prepared_operation: Option<ListenExecutionContext>,
     },
 
+    /// Durable state for a `subagent` invocation task that is parked
+    /// on the spawned child thread.
+    ///
+    /// The invocation task owns the authoritative spawn spec plus the
+    /// durable child-thread / child-root linkage needed for replay,
+    /// inspection, and recovery.
+    SubagentInvocation {
+        /// Authoritative spawn spec plus durable child linkage.
+        invocation: Box<SubagentInvocationState>,
+    },
+
     /// Durable state for a task whose tool-runtime children have all
     /// reached terminal states and is ready for the resume path.
     ///
@@ -192,7 +221,9 @@ impl TaskState {
     pub const fn required_status(&self) -> Option<TaskStatus> {
         match self {
             Self::None => None,
-            Self::WaitingOnChildren { .. } => Some(TaskStatus::WaitingOnChildren),
+            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => {
+                Some(TaskStatus::WaitingOnChildren)
+            }
             Self::AwaitingConfirmation { .. } => Some(TaskStatus::AwaitingConfirmation),
             Self::ReadyToResume { .. } => Some(TaskStatus::Pending),
         }
@@ -228,7 +259,9 @@ impl TaskState {
                 status,
                 TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
             ),
-            Self::WaitingOnChildren { .. } => matches!(status, TaskStatus::WaitingOnChildren),
+            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => {
+                matches!(status, TaskStatus::WaitingOnChildren)
+            }
             Self::AwaitingConfirmation { .. } => {
                 matches!(status, TaskStatus::AwaitingConfirmation)
             }
@@ -245,11 +278,12 @@ impl TaskState {
     }
 
     /// Borrow the [`ContinuationEnvelope`] embedded in a paused state,
-    /// if any. Returns `None` for [`TaskState::None`].
+    /// if any. Returns `None` for [`TaskState::None`] and
+    /// [`TaskState::SubagentInvocation`].
     #[must_use]
     pub fn continuation(&self) -> Option<&ContinuationEnvelope> {
         match self {
-            Self::None => None,
+            Self::None | Self::SubagentInvocation { .. } => None,
             Self::WaitingOnChildren { continuation, .. }
             | Self::AwaitingConfirmation { continuation, .. }
             | Self::ReadyToResume { continuation, .. } => Some(continuation),
@@ -291,7 +325,8 @@ impl TaskState {
     ///
     /// Returns `None` for [`TaskState::None`],
     /// [`TaskState::WaitingOnChildren`], [`TaskState::ReadyToResume`],
-    /// and confirmations that did not stage a listen-tier operation.
+    /// [`TaskState::SubagentInvocation`], and confirmations that did
+    /// not stage a listen-tier operation.
     #[must_use]
     pub const fn prepared_operation(&self) -> Option<&ListenExecutionContext> {
         match self {
@@ -299,6 +334,16 @@ impl TaskState {
                 prepared_operation: Some(op),
                 ..
             } => Some(op),
+            _ => None,
+        }
+    }
+
+    /// Borrow the subagent invocation linkage embedded in a
+    /// [`TaskState::SubagentInvocation`] payload, if any.
+    #[must_use]
+    pub fn subagent_invocation(&self) -> Option<&SubagentInvocationState> {
+        match self {
+            Self::SubagentInvocation { invocation } => Some(invocation),
             _ => None,
         }
     }
@@ -311,6 +356,12 @@ mod tests {
         AgentContinuation, AgentState, CONTINUATION_VERSION, ContinuationEnvelope, ThreadId,
         TokenUsage,
     };
+    use anyhow::{Context, Result};
+    use std::collections::BTreeSet;
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
 
     fn sample_continuation() -> ContinuationEnvelope {
         let thread = ThreadId::from_string("t-state");
@@ -335,6 +386,29 @@ mod tests {
             revision: 7,
             snapshot: serde_json::json!({"name": "preview"}),
             expires_at: None,
+        }
+    }
+
+    fn sample_spec() -> crate::worker::subagent::EffectiveSubagentSpec {
+        crate::worker::subagent::EffectiveSubagentSpec {
+            task: "Investigate durable linkage".into(),
+            prompt: "Focus on task/thread boundaries.".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_turns: 4,
+            timeout_ms: 20_000,
+            nickname: Some("Scout".into()),
+            capabilities: crate::worker::subagent::EffectiveSubagentCapabilities {
+                profile: "research".into(),
+                allowed: set(&["read_file", "rg"]),
+            },
+        }
+    }
+
+    fn sample_subagent_invocation() -> SubagentInvocationState {
+        SubagentInvocationState {
+            spec: sample_spec(),
+            child_thread_id: ThreadId::from_string("t-child-state"),
+            child_root_task_id: crate::journal::task::AgentTaskId::from_string("task_child_state"),
         }
     }
 
@@ -392,7 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn task_state_round_trips_through_json_for_every_variant() -> anyhow::Result<()> {
+    fn subagent_invocation_state_pins_waiting_status_and_exposes_linkage() -> Result<()> {
+        let invocation = sample_subagent_invocation();
+        let state = TaskState::SubagentInvocation {
+            invocation: Box::new(invocation.clone()),
+        };
+        assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
+        let linked = state
+            .subagent_invocation()
+            .context("subagent invocation linkage should be present")?;
+        assert_eq!(linked.child_thread_id, invocation.child_thread_id);
+        assert_eq!(linked.child_root_task_id, invocation.child_root_task_id);
+        assert!(state.continuation().is_none());
+        assert!(state.prepared_operation().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_state_round_trips_through_json_for_every_variant() -> Result<()> {
         // None — the default for every active and terminal row.
         let none = TaskState::None;
         let json = serde_json::to_string(&none)?;
@@ -454,6 +545,22 @@ mod tests {
         );
         assert!(recovered.prepared_operation().is_none());
 
+        // SubagentInvocation.
+        let subagent = TaskState::SubagentInvocation {
+            invocation: Box::new(sample_subagent_invocation()),
+        };
+        let json = serde_json::to_string(&subagent)?;
+        let recovered: TaskState = serde_json::from_str(&json)?;
+        assert_eq!(
+            serde_json::to_value(&recovered)?,
+            serde_json::to_value(&subagent)?
+        );
+        assert_eq!(
+            recovered.required_status(),
+            Some(TaskStatus::WaitingOnChildren)
+        );
+        assert!(recovered.subagent_invocation().is_some());
+
         // ReadyToResume — durably persisted on Pending parents after
         // all children reach terminal states (Phase 4.5).
         let ready = TaskState::ReadyToResume {
@@ -514,6 +621,15 @@ mod tests {
             awaiting_value["kind"],
             serde_json::json!("awaiting_confirmation")
         );
+
+        let subagent_value = serde_json::to_value(TaskState::SubagentInvocation {
+            invocation: Box::new(sample_subagent_invocation()),
+        })?;
+        assert_eq!(
+            subagent_value["kind"],
+            serde_json::json!("subagent_invocation")
+        );
+        assert!(subagent_value.get("invocation").is_some());
 
         let ready_value = serde_json::to_value(TaskState::ReadyToResume {
             continuation: Box::new(sample_continuation()),

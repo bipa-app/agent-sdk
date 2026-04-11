@@ -4,10 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow};
 
+use crate::journal::{
+    AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
+    SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
+};
+use time::{Duration, OffsetDateTime};
+
 use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentSpec, InheritedSubagentConstraints,
-    ServerSubagentSpawnPolicy, SubagentCapabilityProfile, SubagentCapabilityRequest,
-    SubagentSpawnPolicy, SubagentSpawnRequest, resolve_subagent_spec,
+    ServerSubagentSpawnPolicy, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentSpawnPolicy, SubagentSpawnRequest,
+    resolve_subagent_spec, spawn_subagent_invocation,
 };
 
 fn set(values: &[&str]) -> BTreeSet<String> {
@@ -42,6 +49,14 @@ fn sample_constraints() -> InheritedSubagentConstraints {
         ]),
         allowed_capabilities: set(&["read_file", "rg"]),
     }
+}
+
+fn t0() -> OffsetDateTime {
+    OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
+}
+
+fn t_plus(secs: i64) -> OffsetDateTime {
+    t0() + Duration::seconds(secs)
 }
 
 #[test]
@@ -414,6 +429,127 @@ fn custom_policy_hooks_drive_effective_resolution() -> Result<()> {
     assert_eq!(spec.max_turns, 3);
     assert_eq!(spec.timeout_ms, 5_000);
     assert_eq!(spec.capabilities.allowed, set(&["rg"]));
+
+    Ok(())
+}
+
+async fn running_parent_root(
+    task_store: &InMemoryAgentTaskStore,
+) -> Result<(AgentTask, WorkerId, LeaseId)> {
+    let root = AgentTask::new_root_turn(
+        agent_sdk_core::ThreadId::from_string("t-parent-subagent"),
+        t0(),
+        3,
+    );
+    let parent_id = root.id.clone();
+    task_store.submit_root_turn(root).await?;
+    let worker = WorkerId::from_string("w-parent");
+    let lease = LeaseId::from_string("l-parent");
+    let claimed = task_store
+        .try_acquire_task(
+            &parent_id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(60),
+            t_plus(1),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("expected parent root to be acquired"))?;
+    Ok((claimed, worker, lease))
+}
+
+#[tokio::test]
+async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let spec = EffectiveSubagentSpec {
+        task: "Inspect durable linkage".into(),
+        prompt: "Stay in read-only mode.".into(),
+        model: "claude-sonnet-4-5-20250929".into(),
+        max_turns: 5,
+        timeout_ms: 15_000,
+        nickname: Some("Scout".into()),
+        capabilities: EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["read_file", "rg"]),
+        },
+    };
+
+    let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        spec.clone(),
+        SuspensionPayload {
+            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+                agent_sdk_core::AgentContinuation {
+                    thread_id: parent.thread_id.clone(),
+                    turn: 1,
+                    total_usage: agent_sdk_core::TokenUsage::default(),
+                    turn_usage: agent_sdk_core::TokenUsage::default(),
+                    pending_tool_calls: Vec::new(),
+                    awaiting_index: 0,
+                    completed_results: Vec::new(),
+                    state: agent_sdk_core::AgentState::new(parent.thread_id.clone()),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: Vec::new(),
+                },
+            ),
+            suspended_messages: Vec::new(),
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    assert_eq!(created.parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(created.parent_task.pending_child_count, 1);
+    assert_eq!(created.invocation_task.kind, TaskKind::Subagent);
+    assert_eq!(
+        created.invocation_task.status,
+        TaskStatus::WaitingOnChildren
+    );
+    assert_eq!(created.invocation_task.parent_id.as_ref(), Some(&parent.id));
+    assert_eq!(created.invocation_task.thread_id, parent.thread_id);
+    assert_eq!(created.child_root_task.kind, TaskKind::RootTurn);
+    assert_eq!(created.child_root_task.status, TaskStatus::Pending);
+    assert!(created.child_root_task.parent_id.is_none());
+    assert_eq!(
+        created.child_thread.thread_id,
+        created.child_root_task.thread_id
+    );
+    let linkage = created
+        .invocation_task
+        .state
+        .subagent_invocation()
+        .ok_or_else(|| anyhow!("invocation linkage missing"))?;
+    assert_eq!(linkage.spec, spec);
+    assert_eq!(linkage.child_thread_id, created.child_thread.thread_id);
+    assert_eq!(linkage.child_root_task_id, created.child_root_task.id);
+
+    let parent_children = task_store.list_children(&parent.id).await?;
+    assert_eq!(parent_children.len(), 1);
+    assert_eq!(parent_children[0].id, created.invocation_task.id);
+
+    let child_thread_tasks = task_store
+        .list_by_thread(&created.child_thread.thread_id)
+        .await?;
+    assert_eq!(child_thread_tasks.len(), 1);
+    assert_eq!(child_thread_tasks[0].id, created.child_root_task.id);
+
+    let persisted_child_thread = thread_store
+        .get(&created.child_thread.thread_id)
+        .await?
+        .ok_or_else(|| anyhow!("child thread projection missing"))?;
+    assert_eq!(
+        persisted_child_thread.thread_id,
+        created.child_thread.thread_id
+    );
 
     Ok(())
 }

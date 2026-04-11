@@ -78,7 +78,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::recovery::FailureReason;
-use super::task_state::TaskState;
+use super::task_state::{SubagentInvocationState, TaskState};
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity newtypes
@@ -726,6 +726,56 @@ impl AgentTask {
         Ok(task)
     }
 
+    /// Allocate a fresh parent-visible `subagent` invocation task.
+    ///
+    /// The invocation task is the durable supervisor for a spawned
+    /// child thread. It lives under the parent's task tree on the
+    /// parent thread, starts immediately in
+    /// [`TaskStatus::WaitingOnChildren`], and carries the durable
+    /// child-thread linkage on [`TaskState::SubagentInvocation`].
+    ///
+    /// # Errors
+    /// Returns [`TaskSchemaError::ToolRuntimeCannotSpawnChildren`] if the
+    /// parent is a [`TaskKind::ToolRuntime`] (tool-runtime tasks are
+    /// leaves).
+    pub fn new_subagent_invocation(
+        parent: &Self,
+        invocation: SubagentInvocationState,
+        now: OffsetDateTime,
+        max_attempts: u32,
+    ) -> Result<Self, TaskSchemaError> {
+        if parent.kind.is_leaf() {
+            return Err(TaskSchemaError::ToolRuntimeCannotSpawnChildren);
+        }
+        let task = Self {
+            id: AgentTaskId::new(),
+            kind: TaskKind::Subagent,
+            status: TaskStatus::WaitingOnChildren,
+            parent_id: Some(parent.id.clone()),
+            root_id: parent.root_id.clone(),
+            depth: parent.depth.saturating_add(1),
+            thread_id: parent.thread_id.clone(),
+            worker_id: None,
+            lease_id: None,
+            lease_expires_at: None,
+            last_heartbeat_at: None,
+            state: TaskState::SubagentInvocation {
+                invocation: Box::new(invocation),
+            },
+            attempt: 0,
+            max_attempts,
+            last_error: None,
+            pending_child_count: 1,
+            spawn_index: None,
+            result_payload: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        task.validate()?;
+        Ok(task)
+    }
+
     /// `true` if this task is the root of its tree.
     #[must_use]
     pub const fn is_root(&self) -> bool {
@@ -917,6 +967,7 @@ impl AgentTask {
             TaskState::None => "none",
             TaskState::WaitingOnChildren { .. } => "waiting_on_children",
             TaskState::AwaitingConfirmation { .. } => "awaiting_confirmation",
+            TaskState::SubagentInvocation { .. } => "subagent_invocation",
             TaskState::ReadyToResume { .. } => "ready_to_resume",
         };
         match &self.state {
@@ -1508,6 +1559,7 @@ mod tests {
     use super::*;
     use agent_sdk_core::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use anyhow::{Context, Result};
+    use std::collections::BTreeSet;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -1524,6 +1576,10 @@ mod tests {
 
     fn fresh_root() -> AgentTask {
         AgentTask::new_root_turn(thread(), t0(), 3)
+    }
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
     /// Build a sample [`ContinuationEnvelope`] for the Phase 2.4 typed
@@ -1588,6 +1644,56 @@ mod tests {
         assert_eq!(child.depth, root.depth + 1);
         assert!(!child.is_root());
         child.validate().context("child validates")?;
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_invocation_inherits_parent_lineage_and_parks_waiting() -> Result<()> {
+        let root = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w-subagent"),
+                LeaseId::from_string("l-subagent"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("mark root running")?;
+        let child_thread_id = ThreadId::from_string("t-subagent-child");
+        let invocation = AgentTask::new_subagent_invocation(
+            &root,
+            SubagentInvocationState {
+                spec: crate::worker::subagent::EffectiveSubagentSpec {
+                    task: "Summarize durable recovery".into(),
+                    prompt: String::new(),
+                    model: "claude-sonnet-4-5-20250929".into(),
+                    max_turns: 4,
+                    timeout_ms: 30_000,
+                    nickname: Some("Scout".into()),
+                    capabilities: crate::worker::subagent::EffectiveSubagentCapabilities {
+                        profile: "research".into(),
+                        allowed: set(&["read_file", "rg"]),
+                    },
+                },
+                child_thread_id: child_thread_id.clone(),
+                child_root_task_id: AgentTaskId::from_string("task_child_root"),
+            },
+            t_plus(2),
+            2,
+        )
+        .context("new_subagent_invocation")?;
+        assert_eq!(invocation.kind, TaskKind::Subagent);
+        assert_eq!(invocation.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(invocation.parent_id.as_ref(), Some(&root.id));
+        assert_eq!(invocation.root_id, root.root_id);
+        assert_eq!(invocation.thread_id, root.thread_id);
+        assert_eq!(invocation.depth, root.depth + 1);
+        assert_eq!(invocation.pending_child_count, 1);
+        let linked = invocation
+            .state
+            .subagent_invocation()
+            .context("linkage missing")?;
+        assert_eq!(linked.child_thread_id, child_thread_id);
+        assert_eq!(linked.child_root_task_id.as_str(), "task_child_root");
+        invocation.validate().context("invocation validates")?;
         Ok(())
     }
 

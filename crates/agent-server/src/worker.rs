@@ -56,6 +56,9 @@
 //! [`EffectiveSubagentSpec`] that later phases can use when creating
 //! child threads and invocation tasks.
 //!
+//! Phase 7.2 adds [`spawn_subagent_invocation`], which turns that
+//! authoritative spec into durable task/thread records.
+//!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
 //! ```ignore
@@ -120,8 +123,9 @@ pub use root_turn::{
 };
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentSpec, InheritedSubagentConstraints,
-    ServerSubagentSpawnPolicy, SubagentCapabilityProfile, SubagentCapabilityRequest,
-    SubagentSpawnPolicy, SubagentSpawnRequest, resolve_subagent_spec,
+    ServerSubagentSpawnPolicy, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentSpawnPolicy, SubagentSpawnRequest,
+    resolve_subagent_spec, spawn_subagent_invocation,
 };
 pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,

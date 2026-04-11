@@ -18,6 +18,10 @@
 //!   [`EffectiveSubagentSpec`] that later phases can persist on
 //!   invocation tasks or child threads.
 //!
+//! Phase 7.2 adds [`spawn_subagent_invocation`], the durable creation
+//! path for one parent-visible invocation task plus one child thread
+//! and its initial child-thread `root_turn` task.
+//!
 //! Capability selection is deliberately expressed as a server-defined
 //! profile plus an optional allowlist that can only narrow that
 //! profile. The resolution path may narrow further through inherited
@@ -28,6 +32,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::journal::{
+    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SuspensionPayload, Thread, ThreadStore,
+    WorkerId,
+};
 
 /// Typed durable request to spawn a subagent.
 ///
@@ -511,6 +521,78 @@ pub fn resolve_subagent_spec(
         timeout_ms,
         nickname: normalize_optional_string(request.nickname.as_deref()),
         capabilities,
+    })
+}
+
+/// Durable stores needed to persist a subagent invocation and
+/// materialize its child thread projection.
+pub struct SubagentInvocationDeps<'a> {
+    pub task_store: &'a dyn AgentTaskStore,
+    pub thread_store: &'a dyn ThreadStore,
+}
+
+/// Durable records created for one subagent spawn.
+pub struct SpawnedSubagentInvocation {
+    pub parent_task: AgentTask,
+    pub invocation_task: AgentTask,
+    pub child_thread: Thread,
+    pub child_root_task: AgentTask,
+}
+
+/// Persist one durable subagent invocation under a running parent.
+///
+/// This is the Phase 7.2 creation path:
+///
+/// - parent root task parks in `waiting_on_children`,
+/// - one parent-visible `subagent` invocation task is created,
+/// - one child thread is allocated and materialized,
+/// - one initial child-thread `root_turn` task is admitted as
+///   runnable,
+/// - durable linkage among those records is persisted on the
+///   invocation task.
+pub async fn spawn_subagent_invocation(
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    spec: EffectiveSubagentSpec,
+    payload: SuspensionPayload,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedSubagentInvocation> {
+    let (parent_task, invocation_task, child_root_task) = deps
+        .task_store
+        .spawn_subagent_invocation(parent_id, worker, lease, spec, payload, now)
+        .await
+        .context("persist subagent invocation tasks")?;
+
+    let linkage = invocation_task
+        .state
+        .subagent_invocation()
+        .context("subagent invocation task missing durable linkage")?;
+    ensure!(
+        linkage.child_root_task_id == child_root_task.id,
+        "subagent invocation linkage points at child root {} but store returned {}",
+        linkage.child_root_task_id,
+        child_root_task.id,
+    );
+    ensure!(
+        linkage.child_thread_id == child_root_task.thread_id,
+        "subagent invocation linkage points at child thread {} but child root uses {}",
+        linkage.child_thread_id,
+        child_root_task.thread_id,
+    );
+
+    let child_thread = deps
+        .thread_store
+        .get_or_create(&child_root_task.thread_id, now)
+        .await
+        .context("materialize child thread projection")?;
+
+    Ok(SpawnedSubagentInvocation {
+        parent_task,
+        invocation_task,
+        child_thread,
+        child_root_task,
     })
 }
 

@@ -620,7 +620,7 @@ pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
     TaskStatus, WorkerId,
 };
-pub use task_state::TaskState;
+pub use task_state::{SubagentInvocationState, TaskState};
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
