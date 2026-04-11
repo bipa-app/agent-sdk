@@ -57,7 +57,7 @@ CREATE TABLE agent_sdk_tasks (
             )
         ),
     CONSTRAINT agent_sdk_tasks_depth_kind_check
-        CHECK (depth > 0 OR kind = 'root_turn'),
+        CHECK ((depth = 0) = (kind = 'root_turn')),
     CONSTRAINT agent_sdk_tasks_depth_non_negative_check
         CHECK (depth >= 0),
     CONSTRAINT agent_sdk_tasks_attempt_bounds_check

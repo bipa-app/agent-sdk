@@ -124,6 +124,20 @@ mod tests {
     }
 
     #[test]
+    fn depth_kind_check_is_biconditional() -> Result<()> {
+        let sql_bundle = durable_core_migrations()
+            .iter()
+            .map(|migration| migration.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ensure!(
+            sql_bundle.contains("CHECK ((depth = 0) = (kind = 'root_turn'))"),
+            "depth/kind check must enforce the full depth-zero iff root_turn invariant",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repository_contracts_cover_the_current_durable_core_traits() -> Result<()> {
         let actual = repository_boundaries()
             .iter()

@@ -193,7 +193,7 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_tasks_depth_kind_check",
-        invariant: "Depth-0 rows must be `root_turn` tasks.",
+        invariant: "Depth is zero if and only if the task kind is `root_turn`.",
     },
     ConstraintContract {
         name: "agent_sdk_tasks_depth_non_negative_check",
