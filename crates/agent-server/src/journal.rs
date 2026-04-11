@@ -615,12 +615,12 @@ pub use redaction::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
 };
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
-pub use store::{AgentTaskStore, InMemoryAgentTaskStore};
+pub use store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
     TaskStatus, WorkerId,
 };
-pub use task_state::TaskState;
+pub use task_state::{SubagentInvocationState, TaskState};
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};

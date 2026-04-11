@@ -32,11 +32,12 @@ use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::recovery::{
     RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
-use agent_server::journal::store::AgentTaskStore;
+use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
 };
+use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
 use agent_server::journal::thread_store::ThreadStore;
 use agent_server::journal::turn_attempt::{
@@ -1073,6 +1074,74 @@ WHERE parent_id = $1
         u32_from_i64(live, "live child count")
     }
 
+    async fn load_spawn_parent_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+    ) -> Result<AgentTask> {
+        let parent = Self::load_task_tx(tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if parent.status != TaskStatus::Running {
+            let status = parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if parent.kind.is_leaf() {
+            let parent_kind = parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
+        Ok(parent)
+    }
+
+    async fn ensure_empty_child_thread_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        child_thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        Self::bootstrap_thread_row_tx(tx, child_thread_id, now).await?;
+        let _ = Self::lock_thread_tx(tx, child_thread_id).await?;
+        let existing_child_thread_task: Option<String> = sqlx::query_scalar!(
+            r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+LIMIT 1
+FOR UPDATE
+",
+            thread_key(child_thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
+        if existing_child_thread_task.is_some() {
+            return Err(anyhow!(
+                "spawn rejected: child thread id {child_thread_id} already has tasks"
+            ));
+        }
+        Ok(())
+    }
+
     async fn apply_task_terminal_transition_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_id: &AgentTaskId,
@@ -1993,37 +2062,7 @@ FOR UPDATE SKIP LOCKED
         }
 
         let mut tx = self.begin().await?;
-        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
+        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
 
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -2059,6 +2098,74 @@ FOR UPDATE SKIP LOCKED
         }
         tx.commit().await.context("commit spawn_tool_children")?;
         Ok((new_parent, children))
+    }
+
+    async fn spawn_subagent_invocation(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: SubagentInvocationSpawn,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let mut tx = self.begin().await?;
+        let SubagentInvocationSpawn {
+            child_thread_id,
+            spec,
+            payload,
+        } = spawn;
+
+        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
+        Self::ensure_empty_child_thread_tx(&mut tx, &child_thread_id, now).await?;
+
+        let child_root = AgentTask::new_root_turn(
+            child_thread_id.clone(),
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
+        if Self::load_task_tx(&mut tx, &child_root.id, false)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow!(
+                "spawn rejected: child root task id {} already exists",
+                child_root.id
+            ));
+        }
+
+        let invocation = AgentTask::new_subagent_invocation(
+            &old_parent,
+            SubagentInvocationState {
+                spec,
+                child_thread_id,
+                child_root_task_id: child_root.id.clone(),
+            },
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
+        if Self::load_task_tx(&mut tx, &invocation.id, false)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow!(
+                "spawn rejected: invocation task id {} already exists",
+                invocation.id
+            ));
+        }
+
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(1, payload, vec![invocation.id.clone()], now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(&mut tx, &new_parent).await?;
+        Self::insert_task_tx(&mut tx, &invocation).await?;
+        Self::enforce_insert_cross_row_invariants_tx(&mut tx, &child_root).await?;
+        Self::insert_task_tx(&mut tx, &child_root).await?;
+        tx.commit()
+            .await
+            .context("commit spawn_subagent_invocation")?;
+        Ok((new_parent, invocation, child_root))
     }
 
     async fn complete_task(

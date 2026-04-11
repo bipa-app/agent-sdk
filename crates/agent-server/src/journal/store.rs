@@ -211,6 +211,20 @@ use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
     WorkerId,
 };
+use super::task_state::SubagentInvocationState;
+use crate::worker::subagent::EffectiveSubagentSpec;
+
+/// Input struct for [`AgentTaskStore::spawn_subagent_invocation`].
+///
+/// The worker materializes `child_thread_id` through [`super::ThreadStore`]
+/// before calling into the task store so durable backends can satisfy the
+/// task → thread foreign key while inserting the child root task.
+#[derive(Clone, Debug)]
+pub struct SubagentInvocationSpawn {
+    pub child_thread_id: ThreadId,
+    pub spec: EffectiveSubagentSpec,
+    pub payload: SuspensionPayload,
+}
 
 /// Persistent store for [`AgentTask`] rows.
 ///
@@ -242,6 +256,7 @@ use super::task::{
 /// | [`pause_on_children`](Self::pause_on_children) | `Running` → `WaitingOnChildren` | `(worker, lease)` CAS |
 /// | [`pause_on_confirmation`](Self::pause_on_confirmation) | `Running` → `AwaitingConfirmation` | `(worker, lease)` CAS |
 /// | [`spawn_tool_children`](Self::spawn_tool_children) | parent `Running` → `WaitingOnChildren` + children `Pending` | `(worker, lease)` CAS, non-leaf |
+/// | [`spawn_subagent_invocation`](Self::spawn_subagent_invocation) | parent `Running` → `WaitingOnChildren` + invocation `WaitingOnChildren` + child root `Pending` | `(worker, lease)` CAS, non-leaf |
 /// | [`complete_task`](Self::complete_task) | `Running` → `Completed` + parent recompute | `(worker, lease)` CAS |
 /// | [`fail_task`](Self::fail_task) | `Running` → `Failed` + parent recompute | `(worker, lease)` CAS |
 /// | [`resume_from_confirmation`](Self::resume_from_confirmation) | `AwaitingConfirmation` → `Pending` | status CAS |
@@ -697,6 +712,43 @@ pub trait AgentTaskStore: Send + Sync {
         payload: SuspensionPayload,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)>;
+
+    /// Atomically persist the durable task records for one subagent
+    /// spawn.
+    ///
+    /// A successful call:
+    ///
+    /// 1. CAS-checks the running parent against `(worker, lease)`.
+    /// 2. Allocates one parent-visible `subagent` invocation task
+    ///    under the parent.
+    /// 3. Allocates one fresh child-thread `root_turn` task on the
+    ///    provided child thread.
+    /// 4. Persists durable linkage by storing the authoritative spawn
+    ///    spec plus the child thread / child root ids on the
+    ///    invocation task's [`crate::journal::task_state::SubagentInvocationState`]
+    ///    payload.
+    /// 5. Transitions the parent to [`TaskStatus::WaitingOnChildren`]
+    ///    with the invocation task id as its child-wait target.
+    ///
+    /// Callers must materialize the child thread row before invoking
+    /// this method so durable backends can satisfy task → thread
+    /// foreign keys while inserting the child root task.
+    ///
+    /// Returns `(parent, invocation, child_root)` with the rows as
+    /// persisted.
+    ///
+    /// # Errors
+    /// Same CAS and non-leaf envelope as
+    /// [`AgentTaskStore::spawn_tool_children`], plus schema errors from
+    /// [`AgentTask::new_subagent_invocation`].
+    async fn spawn_subagent_invocation(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: SubagentInvocationSpawn,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)>;
 
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
@@ -2129,6 +2181,116 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, children))
+    }
+
+    async fn spawn_subagent_invocation(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: SubagentInvocationSpawn,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let mut inner = self.inner.write().await;
+        let SubagentInvocationSpawn {
+            child_thread_id,
+            spec,
+            payload,
+        } = spawn;
+
+        let old_parent = inner
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
+
+        if inner.by_thread.contains_key(&child_thread_id)
+            || inner.active_root_by_thread.contains_key(&child_thread_id)
+        {
+            return Err(anyhow!(
+                "spawn rejected: child thread id {child_thread_id} already has tasks"
+            ));
+        }
+
+        let child_root = AgentTask::new_root_turn(
+            child_thread_id.clone(),
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
+        if inner.by_id.contains_key(&child_root.id) {
+            let id = &child_root.id;
+            return Err(anyhow!(
+                "spawn rejected: child root task id {id} already exists"
+            ));
+        }
+
+        let invocation = AgentTask::new_subagent_invocation(
+            &old_parent,
+            SubagentInvocationState {
+                spec,
+                child_thread_id,
+                child_root_task_id: child_root.id.clone(),
+            },
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
+        if inner.by_id.contains_key(&invocation.id) {
+            let id = &invocation.id;
+            return Err(anyhow!(
+                "spawn rejected: invocation task id {id} already exists"
+            ));
+        }
+
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(1, payload, vec![invocation.id.clone()], now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        inner.rebalance_after_row_change(&old_parent, &new_parent);
+        inner
+            .by_id
+            .insert(new_parent.id.clone(), new_parent.clone());
+
+        inner.add_to_indexes(&invocation);
+        inner
+            .by_id
+            .insert(invocation.id.clone(), invocation.clone());
+
+        inner.add_to_indexes(&child_root);
+        inner
+            .by_id
+            .insert(child_root.id.clone(), child_root.clone());
+
+        drop(inner);
+        Ok((new_parent, invocation, child_root))
     }
 
     async fn complete_task(
@@ -6077,6 +6239,7 @@ mod tests {
     //   round-trip through the serialized wire form.
 
     use crate::journal::task::ChildSpawnSpec;
+    use crate::worker::subagent::{EffectiveSubagentCapabilities, EffectiveSubagentSpec};
 
     /// Spawn a parent root, lease it, and return
     /// `(parent, worker, lease)` so Phase 2.6 tests can exercise
@@ -6086,6 +6249,21 @@ mod tests {
         thread_name: &str,
     ) -> Result<(AgentTask, WorkerId, LeaseId)> {
         submitted_and_claimed_root(store, thread_name, "w-parent", "l-parent").await
+    }
+
+    fn sample_subagent_spec() -> EffectiveSubagentSpec {
+        EffectiveSubagentSpec {
+            task: "Inspect durable linkage".into(),
+            prompt: "Stay in read-only mode.".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_turns: 5,
+            timeout_ms: 15_000,
+            nickname: Some("Scout".into()),
+            capabilities: EffectiveSubagentCapabilities {
+                profile: "research".into(),
+                allowed: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
+            },
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6215,6 +6393,146 @@ mod tests {
         // No children were created.
         let children = store.list_children(&parent_id).await.context("list")?;
         assert!(children.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_invocation_creates_durable_linkage() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-subagent-spawn").await?;
+        let parent_id = parent.id.clone();
+        let child_thread_id = thread("t-subagent-child");
+
+        let (parked_parent, invocation, child_root) = store
+            .spawn_subagent_invocation(
+                &parent_id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread_id.clone(),
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn"),
+                        suspended_messages: Vec::new(),
+                    },
+                },
+                t_plus(2),
+            )
+            .await
+            .context("spawn_subagent_invocation")?;
+
+        assert_eq!(parked_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked_parent.pending_child_count, 1);
+        assert!(parked_parent.worker_id.is_none());
+
+        assert_eq!(invocation.kind, TaskKind::Subagent);
+        assert_eq!(invocation.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(invocation.parent_id.as_ref(), Some(&parent_id));
+        assert_eq!(invocation.root_id, parent.root_id);
+        assert_eq!(invocation.thread_id, parent.thread_id);
+        assert_eq!(invocation.depth, parent.depth + 1);
+        assert_eq!(invocation.pending_child_count, 1);
+        let linkage = invocation
+            .state
+            .subagent_invocation()
+            .context("subagent linkage missing")?;
+        assert_eq!(linkage.child_root_task_id, child_root.id);
+        assert_eq!(linkage.child_thread_id, child_root.thread_id);
+        assert_eq!(linkage.spec, sample_subagent_spec());
+        assert_eq!(child_root.thread_id, child_thread_id);
+
+        assert_eq!(child_root.kind, TaskKind::RootTurn);
+        assert_eq!(child_root.status, TaskStatus::Pending);
+        assert!(child_root.parent_id.is_none());
+        assert_eq!(child_root.depth, 0);
+        assert_eq!(child_root.root_id, child_root.id);
+
+        let parent_children = store
+            .list_children(&parent_id)
+            .await
+            .context("list parent children")?;
+        assert_eq!(parent_children.len(), 1);
+        assert_eq!(parent_children[0].id, invocation.id);
+
+        let child_thread_tasks = store
+            .list_by_thread(&child_root.thread_id)
+            .await
+            .context("list child thread")?;
+        assert_eq!(child_thread_tasks.len(), 1);
+        assert_eq!(child_thread_tasks[0].id, child_root.id);
+
+        let active_child_root = store
+            .active_root_for_thread(&child_root.thread_id)
+            .await
+            .context("active child root")?
+            .context("child root should block admission on child thread")?;
+        assert_eq!(active_child_root.id, child_root.id);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_invocation_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) =
+            running_root_for_spawn(&store, "t-subagent-spawn-cas").await?;
+        let parent_id = parent.id.clone();
+        let child_thread_id = thread("t-subagent-cas-child");
+
+        let err = store
+            .spawn_subagent_invocation(
+                &parent_id,
+                &WorkerId::from_string("w-imposter"),
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread_id.clone(),
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn-cas"),
+                        suspended_messages: Vec::new(),
+                    },
+                },
+                t_plus(2),
+            )
+            .await
+            .err()
+            .context("wrong worker should fail")?;
+        assert!(
+            format!("{err:#}").contains("worker mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        let err = store
+            .spawn_subagent_invocation(
+                &parent_id,
+                &worker,
+                &LeaseId::from_string("l-stale"),
+                SubagentInvocationSpawn {
+                    child_thread_id,
+                    spec: sample_subagent_spec(),
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-subagent-spawn-cas"),
+                        suspended_messages: Vec::new(),
+                    },
+                },
+                t_plus(3),
+            )
+            .await
+            .err()
+            .context("wrong lease should fail")?;
+        assert!(
+            format!("{err:#}").contains("lease mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
         Ok(())
     }
 

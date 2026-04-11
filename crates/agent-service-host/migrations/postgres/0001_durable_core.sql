@@ -133,11 +133,12 @@ CREATE TABLE agent_sdk_tasks (
                 'none',
                 'waiting_on_children',
                 'awaiting_confirmation',
+                'subagent_invocation',
                 'ready_to_resume'
             )
             AND (
                 (
-                    state_json ->> 'kind' = 'waiting_on_children'
+                    state_json ->> 'kind' IN ('waiting_on_children', 'subagent_invocation')
                     AND status = 'waiting_on_children'
                     AND pending_child_count > 0
                 )

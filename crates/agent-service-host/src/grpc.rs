@@ -225,6 +225,11 @@ impl GrpcShared {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
                 }),
             ),
+            TaskState::SubagentInvocation { invocation } => Some(
+                pb::task_snapshot::StateDetail::WaitingOnChildren(pb::WaitingOnChildrenState {
+                    child_task_ids: vec![invocation.child_root_task_id.to_string()],
+                }),
+            ),
             TaskState::ReadyToResume { child_ids, .. } => Some(
                 pb::task_snapshot::StateDetail::ReadyToResume(pb::ReadyToResumeState {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
