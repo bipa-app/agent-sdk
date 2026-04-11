@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = $1 AND status IN ('pending', 'claimed')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cnt",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "edde3ce423b801ace86dd8c638ea283011970bc721215deea8c1d86c5d0c2ea1"
+}

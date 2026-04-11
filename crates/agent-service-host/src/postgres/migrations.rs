@@ -39,19 +39,26 @@ const DURABLE_CORE_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0001_durable_core.sql"
 ));
-const FUTURE_EVENT_OUTBOX_NOTES_SQL: &str = include_str!(concat!(
+const EVENT_JOURNAL_OUTBOX_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/notes/future_event_outbox_notes.sql"
+    "/migrations/postgres/0002_event_journal_outbox.sql"
 ));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 1] = [PostgresMigration {
-    version: "0001",
-    summary: "current durable core tables, constraints, and indexes",
-    sql: DURABLE_CORE_SQL,
-}];
+const MIGRATIONS: [PostgresMigration; 2] = [
+    PostgresMigration {
+        version: "0001",
+        summary: "current durable core tables, constraints, and indexes",
+        sql: DURABLE_CORE_SQL,
+    },
+    PostgresMigration {
+        version: "0002",
+        summary: "event journal, transactional outbox, and retention cursors",
+        sql: EVENT_JOURNAL_OUTBOX_SQL,
+    },
+];
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]
@@ -75,8 +82,8 @@ pub async fn apply_durable_core_migrations(pool: &PgPool) -> Result<()> {
         .context("apply sqlx postgres durable-core migrations")
 }
 
-/// Non-executable follow-up notes for the later event/outbox phase.
+/// The reviewable event journal and outbox migration SQL.
 #[must_use]
-pub const fn future_event_outbox_notes() -> &'static str {
-    FUTURE_EVENT_OUTBOX_NOTES_SQL
+pub const fn event_journal_outbox_migration() -> &'static str {
+    EVENT_JOURNAL_OUTBOX_SQL
 }

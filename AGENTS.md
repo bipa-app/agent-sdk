@@ -192,3 +192,70 @@ let value = some_option.context("value was None")?;
 ```
 
 This rule applies to both production code AND tests. In tests, return `Result<()>` and use `?`.
+
+## sqlx and Postgres Development (CRITICAL)
+
+### Always use typed sqlx macros
+
+**Use `sqlx::query!` and `sqlx::query_as!` macros** for all Postgres queries in
+`agent-service-host`. These macros provide compile-time SQL validation and type
+checking. Never use the untyped `sqlx::query(...)` string form.
+
+```rust
+// BAD: untyped query — no compile-time checking
+let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_sdk_tasks WHERE thread_id = $1")
+    .bind(thread_key(thread_id))
+    .fetch_one(&self.pool)
+    .await?;
+
+// GOOD: typed macro — validated at compile time
+let record = sqlx::query!(
+    r"SELECT COUNT(*) AS cnt FROM agent_sdk_tasks WHERE thread_id = $1",
+    thread_key(thread_id),
+)
+.fetch_one(&self.pool)
+.await?;
+let count = record.cnt.unwrap_or(0);
+```
+
+### Local Postgres via Docker Compose
+
+A Postgres 18 instance is available via `compose.yml`:
+
+```bash
+# Start Postgres
+scripts/postgres18-dev.sh up
+
+# Wait until healthy
+scripts/postgres18-dev.sh wait
+
+# Connection URL
+scripts/postgres18-dev.sh url
+# → postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
+```
+
+### sqlx Offline Cache
+
+Normal builds use `SQLX_OFFLINE=true` (set in `.cargo/config.toml`). The
+`.sqlx/` directory holds cached query metadata so builds work without a live
+database.
+
+**After adding or changing any `sqlx::query!` / `sqlx::query_as!` call, you must
+refresh the offline cache:**
+
+```bash
+# Apply migrations + regenerate .sqlx/ cache
+scripts/postgres18-dev.sh prepare
+
+# Or manually:
+scripts/postgres18-dev.sh wait
+SQLX_OFFLINE=false DATABASE_URL="postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk" \
+  cargo sqlx prepare --workspace -- -p agent-service-host --all-targets
+```
+
+### Running Postgres Integration Tests
+
+```bash
+# Full cycle: migrate + run store tests against real Postgres
+scripts/postgres18-dev.sh test-migrations
+```

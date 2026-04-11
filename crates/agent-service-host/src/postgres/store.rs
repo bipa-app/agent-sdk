@@ -14,6 +14,7 @@
 //! aggregate advance, message head/raw-batch write, and checkpoint
 //! insert into one SQL transaction.
 
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -26,12 +27,21 @@ use time::OffsetDateTime;
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 use agent_server::journal::checkpoint_store::CheckpointStore;
 use agent_server::journal::commit::{CommitOutcome, CompletedTurnCommit};
+use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
+use agent_server::journal::event_outbox_transaction::{
+    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
+};
+use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
+use agent_server::journal::outbox::{
+    NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
+};
 use agent_server::journal::recovery::{
     RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
+use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -2710,6 +2720,574 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// EventRepository
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl EventRepository for PostgresDurableStore {
+    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
+        Some(self)
+    }
+
+    async fn commit_event(
+        &self,
+        thread_id: &ThreadId,
+        event: AgentEvent,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        let mut committed = self.commit_event_batch(thread_id, vec![event], now).await?;
+        Ok(committed.remove(0))
+    }
+
+    async fn commit_event_batch(
+        &self,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        ensure!(!events.is_empty(), "cannot commit an empty event batch");
+
+        let mut tx = self.begin().await?;
+        let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
+        let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
+        tx.commit().await.context("commit event batch insert")?;
+        Ok(committed)
+    }
+
+    async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+        let record = sqlx::query!(
+            r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("next event sequence for {thread_id}"))?;
+
+        let next = record.next_seq.unwrap_or(0);
+        u64::try_from(next).context("event next_sequence out of range")
+    }
+
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
+        let records = sqlx::query_as!(
+            CommittedEventRecord,
+            r"
+SELECT event_id, thread_id, sequence, event_json, committed_at
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+ORDER BY sequence
+",
+            thread_key(thread_id),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("get events for {thread_id}"))?;
+
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>> {
+        let records = sqlx::query_as!(
+            CommittedEventRecord,
+            r"
+SELECT event_id, thread_id, sequence, event_json, committed_at
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+  AND sequence > $2
+  AND sequence <= $3
+ORDER BY sequence
+",
+            thread_key(thread_id),
+            i64_from_u64(after_sequence, "after_sequence")?,
+            i64_from_u64(up_to_sequence, "up_to_sequence")?,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| {
+            format!("get events in range ({after_sequence}, {up_to_sequence}] for {thread_id}")
+        })?;
+
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+}
+
+impl PostgresDurableStore {
+    /// Allocate the next event sequence for a thread inside an existing
+    /// transaction.
+    ///
+    /// Postgres forbids `FOR UPDATE` on aggregate queries, so we lock
+    /// the owning `agent_sdk_threads` row instead to serialise concurrent
+    /// writers on the same thread, then read the max sequence without a
+    /// locking clause.
+    async fn next_event_sequence_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+    ) -> Result<u64> {
+        // Lock the thread row to serialise concurrent event writers.
+        sqlx::query!(
+            r"SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("lock thread row for event sequence allocation on {thread_id}"))?;
+
+        let record = sqlx::query!(
+            r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
+
+        let next = record.next_seq.unwrap_or(0);
+        u64::try_from(next).context("event next_sequence (tx) out of range")
+    }
+
+    /// Insert committed events into an existing transaction.
+    async fn insert_events_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        start_seq: u64,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        let mut committed = Vec::with_capacity(events.len());
+        for (idx, event) in events.into_iter().enumerate() {
+            let seq = start_seq + idx as u64;
+            let event_id = uuid::Uuid::now_v7();
+            let event_json = json_to_value(&event, "committed event batch payload")?;
+
+            sqlx::query!(
+                r"
+INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
+VALUES ($1, $2, $3, $4, $5)
+",
+                event_id.to_string(),
+                thread_key(thread_id),
+                i64_from_u64(seq, "event batch sequence")?,
+                event_json,
+                now,
+            )
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("insert committed event seq {seq} for {thread_id}"))?;
+
+            committed.push(CommittedEvent {
+                event_id,
+                thread_id: thread_id.clone(),
+                sequence: seq,
+                timestamp: now,
+                event,
+            });
+        }
+        Ok(committed)
+    }
+
+    /// Insert outbox rows into an existing transaction.
+    async fn insert_outbox_rows_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        committed: &[CommittedEvent],
+        max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<OutboxRow>> {
+        let mut rows = Vec::with_capacity(committed.len());
+        for event in committed {
+            let id = OutboxRowId::new();
+            let payload_json = json_to_value(&event.to_envelope(), "outbox relay payload")?;
+
+            sqlx::query!(
+                r"
+INSERT INTO agent_sdk_outbox
+    (id, thread_id, event_id, sequence, status, payload_json, created_at,
+     next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
+",
+                id.as_str(),
+                thread_key(&event.thread_id),
+                event.event_id.to_string(),
+                i64_from_u64(event.sequence, "outbox sequence")?,
+                payload_json,
+                now,
+                i64::from(max_attempts),
+            )
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("insert outbox row for event seq {}", event.sequence))?;
+
+            rows.push(OutboxRow {
+                id,
+                thread_id: event.thread_id.clone(),
+                event_id: event.event_id,
+                sequence: event.sequence,
+                status: OutboxStatus::Pending,
+                payload_json,
+                created_at: now,
+                next_attempt_at: now,
+                attempt_count: 0,
+                max_attempts,
+                last_error: None,
+                claimed_by: None,
+                claimed_at: None,
+                delivered_at: None,
+            });
+        }
+        Ok(rows)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// AtomicEventOutboxCommitter
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl AtomicEventOutboxCommitter for PostgresDurableStore {
+    async fn commit_events_with_outbox(
+        &self,
+        params: EventOutboxCommit,
+    ) -> Result<EventOutboxCommitOutcome> {
+        ensure!(
+            !params.events.is_empty(),
+            "cannot commit an empty event batch"
+        );
+
+        let mut tx = self.begin().await?;
+
+        let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
+        let committed = Self::insert_events_tx(
+            &mut tx,
+            &params.thread_id,
+            params.events,
+            start_seq,
+            params.now,
+        )
+        .await?;
+        let outbox_rows = Self::insert_outbox_rows_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .context("commit atomic events + outbox transaction")?;
+
+        Ok(EventOutboxCommitOutcome {
+            committed_events: committed,
+            outbox_rows,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OutboxStore
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl OutboxStore for PostgresDurableStore {
+    async fn insert_batch(&self, rows: Vec<NewOutboxRow>) -> Result<Vec<OutboxRow>> {
+        ensure!(!rows.is_empty(), "cannot insert an empty outbox batch");
+
+        let mut tx = self.begin().await?;
+        let mut result = Vec::with_capacity(rows.len());
+
+        for params in rows {
+            let id = OutboxRowId::new();
+            sqlx::query!(
+                r"
+INSERT INTO agent_sdk_outbox
+    (id, thread_id, event_id, sequence, status, payload_json, created_at,
+     next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
+",
+                id.as_str(),
+                thread_key(&params.thread_id),
+                params.event_id.to_string(),
+                i64_from_u64(params.sequence, "outbox sequence")?,
+                params.payload_json,
+                params.now,
+                i64::from(params.max_attempts),
+            )
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("insert outbox row {id}"))?;
+
+            result.push(OutboxRow {
+                id,
+                thread_id: params.thread_id,
+                event_id: params.event_id,
+                sequence: params.sequence,
+                status: OutboxStatus::Pending,
+                payload_json: params.payload_json,
+                created_at: params.now,
+                next_attempt_at: params.now,
+                attempt_count: 0,
+                max_attempts: params.max_attempts,
+                last_error: None,
+                claimed_by: None,
+                claimed_at: None,
+                delivered_at: None,
+            });
+        }
+
+        tx.commit().await.context("commit outbox batch insert")?;
+
+        Ok(result)
+    }
+
+    async fn claim_pending(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<OutboxRow>> {
+        let records = sqlx::query_as!(
+            OutboxRecord,
+            r"
+UPDATE agent_sdk_outbox
+SET status = 'claimed', claimed_by = $1, claimed_at = $2
+WHERE id IN (
+    SELECT id FROM agent_sdk_outbox
+    WHERE status = 'pending' AND next_attempt_at <= $2
+    ORDER BY next_attempt_at, id
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, thread_id, event_id, sequence, status, payload_json,
+          created_at, next_attempt_at, attempt_count, max_attempts,
+          last_error, claimed_by, claimed_at, delivered_at
+",
+            worker_id,
+            now,
+            i64::from(limit),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("claim pending outbox rows")?;
+
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
+        let result = sqlx::query!(
+            r"
+UPDATE agent_sdk_outbox
+SET status = 'delivered', delivered_at = $2
+WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
+",
+            id.as_str(),
+            now,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("mark outbox row {id} delivered"))?;
+
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}",
+        );
+        Ok(())
+    }
+
+    async fn mark_failed(
+        &self,
+        id: &OutboxRowId,
+        error: &str,
+        next_attempt_at: OffsetDateTime,
+        _now: OffsetDateTime,
+    ) -> Result<()> {
+        // last_error must be NULL for pending rows per the
+        // agent_sdk_outbox_error_check constraint.
+        let result = sqlx::query!(
+            r"
+UPDATE agent_sdk_outbox
+SET
+    attempt_count = attempt_count + 1,
+    status = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN 'expired'
+        ELSE 'pending'
+    END,
+    last_error = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN $2
+        ELSE NULL
+    END,
+    next_attempt_at = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN next_attempt_at
+        ELSE $3
+    END,
+    claimed_by = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN claimed_by
+        ELSE NULL
+    END,
+    claimed_at = CASE
+        WHEN attempt_count + 1 >= max_attempts THEN claimed_at
+        ELSE NULL
+    END
+WHERE id = $1 AND status NOT IN ('delivered', 'expired')
+",
+            id.as_str(),
+            error,
+            next_attempt_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("mark outbox row {id} failed"))?;
+
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}",
+        );
+        Ok(())
+    }
+
+    async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>> {
+        let record = sqlx::query_as!(
+            OutboxRecord,
+            r"
+SELECT id, thread_id, event_id, sequence, status, payload_json,
+       created_at, next_attempt_at, attempt_count, max_attempts,
+       last_error, claimed_by, claimed_at, delivered_at
+FROM agent_sdk_outbox
+WHERE id = $1
+",
+            id.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get outbox row {id}"))?;
+
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<OutboxRow>> {
+        let records = sqlx::query_as!(
+            OutboxRecord,
+            r"
+SELECT id, thread_id, event_id, sequence, status, payload_json,
+       created_at, next_attempt_at, attempt_count, max_attempts,
+       last_error, claimed_by, claimed_at, delivered_at
+FROM agent_sdk_outbox
+WHERE thread_id = $1
+ORDER BY sequence
+",
+            thread_key(thread_id),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list outbox rows for {thread_id}"))?;
+
+        records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
+        let record = sqlx::query!(
+            r"SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = $1 AND status IN ('pending', 'claimed')",
+            thread_key(thread_id),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("count pending outbox rows for {thread_id}"))?;
+
+        let count = record.cnt.unwrap_or(0);
+        u64::try_from(count).context("outbox pending count out of range")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// RetentionStore
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl RetentionStore for PostgresDurableStore {
+    async fn get_cursor(&self, thread_id: &ThreadId) -> Result<Option<RetentionCursor>> {
+        let record = sqlx::query_as!(
+            RetentionCursorRecord,
+            r"
+SELECT thread_id, retention_floor, updated_at
+FROM agent_sdk_retention_cursors
+WHERE thread_id = $1
+",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get retention cursor for {thread_id}"))?;
+
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn advance_floor(
+        &self,
+        thread_id: &ThreadId,
+        new_floor: u64,
+        now: OffsetDateTime,
+    ) -> Result<RetentionCursor> {
+        let mut tx = self.begin().await?;
+        let new_floor_i64 = i64_from_u64(new_floor, "retention floor")?;
+
+        // Read the current floor under a row lock so we can reject
+        // backward moves with a clear error, matching the in-memory
+        // implementation's contract.
+        let current = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1 FOR UPDATE",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
+
+        if let Some(row) = current {
+            ensure!(
+                new_floor_i64 >= row.retention_floor,
+                "retention floor can only advance: current {}, requested {new_floor}",
+                row.retention_floor,
+            );
+        }
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (thread_id) DO UPDATE
+SET retention_floor = EXCLUDED.retention_floor,
+    updated_at = EXCLUDED.updated_at
+",
+            thread_key(thread_id),
+            new_floor_i64,
+            now,
+        )
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("advance retention floor for {thread_id}"))?;
+
+        sqlx::query!(
+            r"DELETE FROM agent_sdk_committed_events WHERE thread_id = $1 AND sequence < $2",
+            thread_key(thread_id),
+            new_floor_i64,
+        )
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge events below floor {new_floor} for {thread_id}"))?;
+
+        tx.commit()
+            .await
+            .context("commit retention floor advance")?;
+
+        Ok(RetentionCursor {
+            thread_id: thread_id.clone(),
+            retention_floor: new_floor,
+            updated_at: now,
+        })
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct TaskRecord {
     id: String,
@@ -2944,6 +3522,90 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
             .validate()
             .context("rehydrate checkpoint from postgres row validation")?;
         Ok(checkpoint)
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct CommittedEventRecord {
+    event_id: String,
+    thread_id: String,
+    sequence: i64,
+    event_json: serde_json::Value,
+    committed_at: OffsetDateTime,
+}
+
+impl TryFrom<CommittedEventRecord> for CommittedEvent {
+    type Error = anyhow::Error;
+
+    fn try_from(record: CommittedEventRecord) -> Result<Self> {
+        Ok(Self {
+            event_id: uuid::Uuid::parse_str(&record.event_id)
+                .context("parse committed event UUID")?,
+            thread_id: ThreadId::from_string(record.thread_id),
+            sequence: u64_from_i64(record.sequence, "committed event sequence")?,
+            timestamp: record.committed_at,
+            event: json_from_value(record.event_json, "committed event payload")?,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct OutboxRecord {
+    id: String,
+    thread_id: String,
+    event_id: String,
+    sequence: i64,
+    status: String,
+    payload_json: serde_json::Value,
+    created_at: OffsetDateTime,
+    next_attempt_at: OffsetDateTime,
+    attempt_count: i64,
+    max_attempts: i64,
+    last_error: Option<String>,
+    claimed_by: Option<String>,
+    claimed_at: Option<OffsetDateTime>,
+    delivered_at: Option<OffsetDateTime>,
+}
+
+impl TryFrom<OutboxRecord> for OutboxRow {
+    type Error = anyhow::Error;
+
+    fn try_from(record: OutboxRecord) -> Result<Self> {
+        Ok(Self {
+            id: OutboxRowId::from_string(record.id),
+            thread_id: ThreadId::from_string(record.thread_id),
+            event_id: uuid::Uuid::parse_str(&record.event_id).context("parse outbox event UUID")?,
+            sequence: u64_from_i64(record.sequence, "outbox sequence")?,
+            status: enum_from_wire(&record.status, "outbox status")?,
+            payload_json: record.payload_json,
+            created_at: record.created_at,
+            next_attempt_at: record.next_attempt_at,
+            attempt_count: u32_from_i64(record.attempt_count, "outbox attempt_count")?,
+            max_attempts: u32_from_i64(record.max_attempts, "outbox max_attempts")?,
+            last_error: record.last_error,
+            claimed_by: record.claimed_by,
+            claimed_at: record.claimed_at,
+            delivered_at: record.delivered_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct RetentionCursorRecord {
+    thread_id: String,
+    retention_floor: i64,
+    updated_at: OffsetDateTime,
+}
+
+impl TryFrom<RetentionCursorRecord> for RetentionCursor {
+    type Error = anyhow::Error;
+
+    fn try_from(record: RetentionCursorRecord) -> Result<Self> {
+        Ok(Self {
+            thread_id: ThreadId::from_string(record.thread_id),
+            retention_floor: u64_from_i64(record.retention_floor, "retention floor")?,
+            updated_at: record.updated_at,
+        })
     }
 }
 

@@ -565,6 +565,7 @@ pub mod commit;
 pub mod committed_event;
 pub mod completed_turn_transaction;
 pub mod event_notifier;
+pub mod event_outbox_transaction;
 pub mod event_repository;
 pub mod event_stream;
 pub mod execution_context;
@@ -574,12 +575,14 @@ pub mod live_tail;
 mod live_tail_test;
 pub mod message;
 pub mod message_store;
+pub mod outbox;
 #[cfg(test)]
 mod persistence_regression;
 pub mod recovery;
 pub mod redaction;
 #[cfg(test)]
 mod replay_test;
+pub mod retention;
 pub mod staged;
 pub mod store;
 pub mod task;
@@ -597,6 +600,9 @@ pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
 pub use completed_turn_transaction::AtomicCompletedTurnCommitter;
 pub use event_notifier::{EventNotifier, EventReceiver};
+pub use event_outbox_transaction::{
+    AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
+};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
@@ -608,12 +614,16 @@ pub use execution_intent::{
 pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
 pub use message::{MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
+pub use outbox::{
+    InMemoryOutboxStore, NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
+};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 pub use redaction::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
 };
+pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
 pub use task::{

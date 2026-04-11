@@ -30,6 +30,8 @@ use agent_server::journal::execution_intent::{ExecutionIntentStore, InMemoryExec
 use agent_server::journal::message_store::{
     InMemoryMessageProjectionStore, MessageProjectionStore,
 };
+use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
+use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
 use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEventStore};
@@ -66,6 +68,10 @@ pub struct StoreRegistry {
     pub execution_intent_store: Arc<dyn ExecutionIntentStore>,
     /// Tool audit events.
     pub tool_audit_store: Arc<dyn ToolAuditEventStore>,
+    /// Transactional outbox for durable event relay.
+    pub outbox_store: Arc<dyn OutboxStore>,
+    /// Retention-floor tracking for committed events.
+    pub retention_store: Arc<dyn RetentionStore>,
     /// Agent definition lookup surface.
     pub definition_registry: Arc<dyn AgentDefinitionRegistry>,
     /// Same-process event notification hub for replay-to-live handoff.
@@ -106,6 +112,8 @@ impl StoreRegistry {
             event_repo: Arc::new(InMemoryEventRepository::new()),
             execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
+            outbox_store: Arc::new(InMemoryOutboxStore::new()),
+            retention_store: Arc::new(InMemoryRetentionStore::new()),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
         }
@@ -168,6 +176,8 @@ mod tests {
         let _event = &stores.event_repo;
         let _intent = &stores.execution_intent_store;
         let _audit = &stores.tool_audit_store;
+        let _outbox = &stores.outbox_store;
+        let _retention = &stores.retention_store;
         let _def = &stores.definition_registry;
         let _notifier = &stores.event_notifier;
     }

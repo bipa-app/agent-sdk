@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT thread_id, retention_floor, updated_at\nFROM agent_sdk_retention_cursors\nWHERE thread_id = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "thread_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "retention_floor",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1c191f214166b8e0bba20b8b5a49a9a617a1964e8db5ddc5d24e662fc249323d"
+}

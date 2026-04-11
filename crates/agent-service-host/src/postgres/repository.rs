@@ -170,3 +170,95 @@ pub const fn repository_boundaries() -> &'static [RepositoryBoundary] {
 pub const fn completed_turn_units_of_work() -> &'static [UnitOfWorkContract] {
     UNITS_OF_WORK
 }
+
+// =====================================================================
+// Event journal, outbox, and retention repository boundaries
+// =====================================================================
+
+const EVENT_READS: &[&str] = &["get_events", "get_events_in_range", "next_sequence"];
+const EVENT_WRITES: &[&str] = &["commit_event", "commit_event_batch"];
+
+const OUTBOX_READS: &[&str] = &["get", "list_by_thread", "count_pending"];
+const OUTBOX_WRITES: &[&str] = &[
+    "insert_batch",
+    "claim_pending",
+    "mark_delivered",
+    "mark_failed",
+];
+
+const RETENTION_READS: &[&str] = &["get_cursor", "effective_floor"];
+const RETENTION_WRITES: &[&str] = &["advance_floor"];
+
+const EVENT_JOURNAL_REPOSITORIES: &[RepositoryBoundary] = &[
+    RepositoryBoundary {
+        name: "event_repository",
+        store_trait: "agent_server::journal::event_repository::EventRepository",
+        tables: &["agent_sdk_committed_events"],
+        reads: EVENT_READS,
+        writes: EVENT_WRITES,
+        invariants: &[
+            "`(thread_id, sequence)` is unique and enforced by the database",
+            "sequences are monotonically allocated per thread under write serialisation",
+            "batch inserts assign contiguous sequence ranges atomically",
+            "the table is append-only: no UPDATE or DELETE by application code",
+            "all committed event_ids are UUID v7 (time-ordered)",
+        ],
+        transaction_notes: "Single-event commits are single-row inserts. Batch commits run in one SQL transaction to guarantee contiguous sequences. When used with the outbox, both committed-events and outbox rows share the same transaction boundary.",
+    },
+    RepositoryBoundary {
+        name: "outbox_repository",
+        store_trait: "agent_server::journal::outbox::OutboxStore",
+        tables: &["agent_sdk_outbox"],
+        reads: OUTBOX_READS,
+        writes: OUTBOX_WRITES,
+        invariants: &[
+            "outbox rows are created only inside an event-commit transaction",
+            "the outbox is a delivery buffer, not the authority for ordering",
+            "relay workers claim by `next_attempt_at` ordering for fair scheduling",
+            "terminal durable state never depends on successful relay",
+            "delivery is idempotent at the consumer boundary",
+            "claim fields (claimed_by, claimed_at) are all-or-nothing",
+            "failed/expired rows always carry a last_error message",
+        ],
+        transaction_notes: "`insert_batch` participates in the same SQL transaction as `commit_event_batch`. Claim, deliver, and fail operations are independent single-row mutations. Stale-claim sweeps may reclaim rows whose relay worker has died.",
+    },
+    RepositoryBoundary {
+        name: "retention_repository",
+        store_trait: "agent_server::journal::retention::RetentionStore",
+        tables: &["agent_sdk_retention_cursors"],
+        reads: RETENTION_READS,
+        writes: RETENTION_WRITES,
+        invariants: &[
+            "the retention floor is monotonically increasing per thread",
+            "a thread with no cursor has an implicit floor of 0",
+            "advancing the floor and purging events below it must happen atomically",
+            "replay queries consult the floor to detect retention gaps",
+        ],
+        transaction_notes: "`advance_floor` and the corresponding DELETE of committed_events below the new floor share one SQL transaction. `get_cursor` and `effective_floor` are read-only and may use the pool directly.",
+    },
+];
+
+const EVENT_JOURNAL_UNITS_OF_WORK: &[UnitOfWorkContract] = &[
+    UnitOfWorkContract {
+        name: "commit_events_with_outbox",
+        tables: &["agent_sdk_committed_events", "agent_sdk_outbox"],
+        requirement: "Insert committed events and their corresponding outbox rows in one SQL transaction. Either all rows commit or none do. This is the only path that creates outbox rows.",
+    },
+    UnitOfWorkContract {
+        name: "advance_retention_floor",
+        tables: &["agent_sdk_retention_cursors", "agent_sdk_committed_events"],
+        requirement: "Advance the per-thread retention floor and delete committed events below the new floor in one SQL transaction. The floor only moves forward. Replay clients observing a sequence below the new floor receive a RetentionGap control frame.",
+    },
+];
+
+/// Repository boundaries for the event journal, outbox, and retention surfaces.
+#[must_use]
+pub const fn event_journal_repository_boundaries() -> &'static [RepositoryBoundary] {
+    EVENT_JOURNAL_REPOSITORIES
+}
+
+/// Cross-repository units of work for event journal and retention operations.
+#[must_use]
+pub const fn event_journal_units_of_work() -> &'static [UnitOfWorkContract] {
+    EVENT_JOURNAL_UNITS_OF_WORK
+}

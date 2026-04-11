@@ -26,6 +26,7 @@
 //! interleaved sequences from concurrent turns on the same thread.
 
 use super::committed_event::CommittedEvent;
+use super::event_outbox_transaction::AtomicEventOutboxCommitter;
 use agent_sdk_core::ThreadId;
 use agent_sdk_core::events::AgentEvent;
 use anyhow::{Result, ensure};
@@ -52,6 +53,18 @@ use tokio::sync::RwLock;
 /// storage-specific errors with context.
 #[async_trait]
 pub trait EventRepository: Send + Sync {
+    /// Optional backend-specific hook for atomically committing events
+    /// and outbox rows in one transaction.
+    ///
+    /// In-memory stores leave this as `None`; durable backends such as
+    /// Postgres override it to surface the
+    /// [`commit_events_with_outbox`](super::event_outbox_transaction::AtomicEventOutboxCommitter::commit_events_with_outbox)
+    /// unit of work.
+    #[must_use]
+    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
+        None
+    }
+
     /// Commit a single event to the given thread.
     ///
     /// Allocates a UUID v7 `event_id`, the next monotonic `sequence`,
