@@ -147,19 +147,17 @@ CREATE TABLE agent_sdk_tasks (
                 )
                 OR (
                     state_json ->> 'kind' = 'none'
+                    AND status IN ('queued', 'pending', 'running')
+                    AND pending_child_count = 0
+                )
+                OR (
+                    state_json ->> 'kind' = 'none'
                     AND status IN ('completed', 'failed', 'cancelled')
                     AND pending_child_count = 0
                 )
                 OR (
-                    state_json ->> 'kind' IN ('none', 'ready_to_resume')
-                    AND status NOT IN (
-                        'queued',
-                        'waiting_on_children',
-                        'awaiting_confirmation',
-                        'completed',
-                        'failed',
-                        'cancelled'
-                    )
+                    state_json ->> 'kind' = 'ready_to_resume'
+                    AND status IN ('pending', 'running')
                     AND pending_child_count = 0
                 )
             )

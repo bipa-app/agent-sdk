@@ -237,7 +237,7 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_tasks_waiting_state_check",
-        invariant: "Paused-state JSON kind must be a non-null known value; waiting counters agree with task status; terminal rows reset state kind to `none`; `ready_to_resume` is not valid for queued rows.",
+        invariant: "Paused-state JSON kind must be a non-null known value; waiting counters agree with task status; terminal rows reset state kind to `none`; `ready_to_resume` is valid only for pending/running rows and never for queued rows.",
     },
 ];
 

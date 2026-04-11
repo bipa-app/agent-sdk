@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT id\nFROM agent_sdk_tasks\nWHERE thread_id = $1\n  AND kind = 'root_turn'\n  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')\nLIMIT 1\nFOR UPDATE\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1c2620fcd2477309d88902a569f372d31e10e027e6131eaa3e9bc2bafa87c4c1"
+}

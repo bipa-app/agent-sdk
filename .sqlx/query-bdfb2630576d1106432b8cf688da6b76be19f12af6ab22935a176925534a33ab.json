@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_tasks (\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\n) VALUES (\n    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,\n    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bdfb2630576d1106432b8cf688da6b76be19f12af6ab22935a176925534a33ab"
+}

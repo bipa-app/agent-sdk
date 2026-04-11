@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
+use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use super::thread::Thread;
 
 /// Storage trait for [`Thread`] projection rows.
@@ -47,6 +48,17 @@ use super::thread::Thread;
 /// and that `get_or_create` is idempotent.
 #[async_trait]
 pub trait ThreadStore: Send + Sync {
+    /// Optional backend-specific hook that can commit the completed
+    /// turn projections inside one durable transaction.
+    ///
+    /// In-memory stores leave this as `None`; durable backends such as
+    /// Postgres override it to surface an atomic commit boundary to
+    /// [`super::commit::commit_completed_turn`].
+    #[must_use]
+    fn atomic_completed_turn_committer(&self) -> Option<&dyn AtomicCompletedTurnCommitter> {
+        None
+    }
+
     /// Return the thread row, creating it if it does not exist.
     ///
     /// Idempotent: if the row already exists, returns it unchanged.

@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    id,\n    thread_id,\n    turn_number,\n    task_id,\n    messages_json,\n    agent_state_snapshot,\n    turn_input_tokens,\n    turn_output_tokens,\n    created_at\nFROM agent_sdk_turn_checkpoints\nWHERE id = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "thread_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "turn_number",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "task_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "messages_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "agent_state_snapshot",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "turn_input_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "turn_output_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "bbc83151c0de2ea387862a23a917a9dc715714e3b361537fd6ba9ffa2664a88c"
+}

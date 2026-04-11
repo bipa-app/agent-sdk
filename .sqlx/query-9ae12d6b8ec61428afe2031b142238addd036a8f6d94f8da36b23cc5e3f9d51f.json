@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    opened_at,\n    closed_at,\n    duration_ms\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_number",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "requested_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "request_blob",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "response_blob",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "response_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "response_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "stop_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "outcome",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "input_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "output_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "cached_input_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "opened_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "closed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "duration_ms",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9ae12d6b8ec61428afe2031b142238addd036a8f6d94f8da36b23cc5e3f9d51f"
+}
