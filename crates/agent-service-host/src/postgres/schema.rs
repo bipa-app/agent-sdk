@@ -85,6 +85,12 @@ const AGENT_SDK_TASK_COLUMNS: &[ColumnContract] = &[
         notes: "Every task is thread-bound so queueing and recovery stay local, and the row must reference an existing thread.",
     },
     ColumnContract {
+        name: "submitted_input_json",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Durable root-turn submission payload captured from the external transport.",
+    },
+    ColumnContract {
         name: "worker_id",
         sql_type: "TEXT",
         nullable: true,

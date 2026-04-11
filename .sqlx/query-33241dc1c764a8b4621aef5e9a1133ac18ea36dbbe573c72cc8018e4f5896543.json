@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE id = $1\nFOR UPDATE\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "parent_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "root_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "depth",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "thread_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "submitted_input_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "worker_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "lease_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_heartbeat_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "state_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 13,
+        "name": "attempt",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "max_attempts",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "last_error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "pending_child_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 17,
+        "name": "spawn_index",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "result_payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "33241dc1c764a8b4621aef5e9a1133ac18ea36dbbe573c72cc8018e4f5896543"
+}

@@ -34,8 +34,8 @@ use agent_server::journal::recovery::{
 };
 use agent_server::journal::store::AgentTaskStore;
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
-    WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
+    TaskKind, TaskStatus, WorkerId,
 };
 use agent_server::journal::thread::Thread;
 use agent_server::journal::thread_store::ThreadStore;
@@ -645,6 +645,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -679,6 +680,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -717,6 +719,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -753,6 +756,7 @@ INSERT INTO agent_sdk_tasks (
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -769,7 +773,7 @@ INSERT INTO agent_sdk_tasks (
     completed_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
 )
 ",
             task.id.as_str(),
@@ -779,6 +783,7 @@ INSERT INTO agent_sdk_tasks (
             task.root_id.as_str(),
             i64::from(task.depth),
             thread_key(&task.thread_id),
+            json_to_value(&task.submitted_input, "task submitted input")?,
             task.worker_id.as_ref().map(WorkerId::as_str),
             task.lease_id.as_ref().map(LeaseId::as_str),
             task.lease_expires_at,
@@ -811,20 +816,21 @@ SET
     root_id = $5,
     depth = $6,
     thread_id = $7,
-    worker_id = $8,
-    lease_id = $9,
-    lease_expires_at = $10,
-    last_heartbeat_at = $11,
-    state_json = $12,
-    attempt = $13,
-    max_attempts = $14,
-    last_error = $15,
-    pending_child_count = $16,
-    spawn_index = $17,
-    result_payload = $18,
-    created_at = $19,
-    updated_at = $20,
-    completed_at = $21
+    submitted_input_json = $8,
+    worker_id = $9,
+    lease_id = $10,
+    lease_expires_at = $11,
+    last_heartbeat_at = $12,
+    state_json = $13,
+    attempt = $14,
+    max_attempts = $15,
+    last_error = $16,
+    pending_child_count = $17,
+    spawn_index = $18,
+    result_payload = $19,
+    created_at = $20,
+    updated_at = $21,
+    completed_at = $22
 WHERE id = $1
 ",
             task.id.as_str(),
@@ -834,6 +840,7 @@ WHERE id = $1
             task.root_id.as_str(),
             i64::from(task.depth),
             thread_key(&task.thread_id),
+            json_to_value(&task.submitted_input, "task submitted input")?,
             task.worker_id.as_ref().map(WorkerId::as_str),
             task.lease_id.as_ref().map(LeaseId::as_str),
             task.lease_expires_at,
@@ -1149,6 +1156,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1379,6 +1387,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1417,6 +1426,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1456,6 +1466,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1494,6 +1505,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1535,6 +1547,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1603,6 +1616,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1711,6 +1725,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -1822,6 +1837,7 @@ SELECT
     root_id,
     depth,
     thread_id,
+    submitted_input_json,
     worker_id,
     lease_id,
     lease_expires_at,
@@ -2167,6 +2183,38 @@ FOR UPDATE SKIP LOCKED
             .await
             .context("commit resume_from_confirmation")?;
         Ok((resumed, prepared_operation))
+    }
+
+    async fn approve_confirmation_and_acquire(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, id, true)
+            .await?
+            .ok_or_else(|| anyhow!("approve rejected: task {id} does not exist"))?;
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "approve rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
+        }
+        let (resumed, prepared_operation) = old
+            .clone()
+            .resume_from_confirmation(now)
+            .context("approve rejected: resume_from_confirmation transition failed")?;
+        let claimed = resumed
+            .mark_running(worker, lease, expires_at, now)
+            .context("approve rejected: mark_running transition failed")?;
+        Self::update_task_tx(&mut tx, &claimed).await?;
+        tx.commit()
+            .await
+            .context("commit approve_confirmation_and_acquire")?;
+        Ok((claimed, prepared_operation))
     }
 
     async fn reject_confirmation(
@@ -2562,6 +2610,7 @@ struct TaskRecord {
     root_id: String,
     depth: i64,
     thread_id: String,
+    submitted_input_json: serde_json::Value,
     worker_id: Option<String>,
     lease_id: Option<String>,
     lease_expires_at: Option<OffsetDateTime>,
@@ -2590,6 +2639,10 @@ impl TryFrom<TaskRecord> for AgentTask {
             root_id: AgentTaskId::from_string(record.root_id),
             depth: u32_from_i64(record.depth, "task depth")?,
             thread_id: ThreadId::from_string(record.thread_id),
+            submitted_input: json_from_value::<Vec<SubmittedInputItem>>(
+                record.submitted_input_json,
+                "task submitted_input",
+            )?,
             worker_id: record.worker_id.map(WorkerId::from_string),
             lease_id: record.lease_id.map(LeaseId::from_string),
             lease_expires_at: record.lease_expires_at,

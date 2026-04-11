@@ -6,6 +6,7 @@ CREATE TABLE agent_sdk_tasks (
     root_id TEXT NOT NULL,
     depth BIGINT NOT NULL,
     thread_id TEXT NOT NULL,
+    submitted_input_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     worker_id TEXT NULL,
     lease_id TEXT NULL,
     lease_expires_at TIMESTAMPTZ NULL,
