@@ -47,6 +47,7 @@
 //! [`CancellationToken`]: tokio_util::sync::CancellationToken
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{PendingToolCallInfo, ThreadId, ToolResult};
@@ -58,6 +59,47 @@ use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
+
+// ─────────────────────────────────────────────────────────────────────
+// Tool event collector
+// ─────────────────────────────────────────────────────────────────────
+
+/// Collects [`AgentEvent`]s emitted by a tool executor during execution.
+///
+/// The executor receives a `ToolEventCollector` and calls [`emit`](Self::emit)
+/// to record progress events (e.g. [`AgentEvent::ToolProgress`]).  After the
+/// executor returns, [`execute_tool_task`] drains the collected events and
+/// commits them to the event repository before the `ToolCallEnd` event.
+///
+/// The collector is `Clone + Send + Sync` so it can be shared across
+/// spawned tasks within the executor.
+#[derive(Clone, Default)]
+pub struct ToolEventCollector {
+    events: Arc<Mutex<Vec<AgentEvent>>>,
+}
+
+impl ToolEventCollector {
+    /// Create a new empty collector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a progress event. This is a non-blocking operation.
+    pub fn emit(&self, event: AgentEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+
+    /// Drain all collected events (internal use by the worker).
+    fn drain(&self) -> Vec<AgentEvent> {
+        self.events
+            .lock()
+            .map(|mut e| std::mem::take(&mut *e))
+            .unwrap_or_default()
+    }
+}
 use crate::journal::task_state::TaskState;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -255,7 +297,7 @@ pub async fn execute_tool_task<F, Fut>(
     now: OffsetDateTime,
 ) -> anyhow::Result<ToolTaskOutcome>
 where
-    F: FnOnce(PendingToolCallInfo) -> Fut,
+    F: FnOnce(PendingToolCallInfo, ToolEventCollector) -> Fut,
     Fut: Future<Output = anyhow::Result<ToolResult>>,
 {
     // ── Pre-execution cancellation check ─────────────────────────
@@ -268,7 +310,8 @@ where
     let lease_id = &bootstrap.lease_id;
 
     // ── Execute the tool ─────────────────────────────────────────
-    let tool_result = executor(bootstrap.tool_call.clone()).await;
+    let collector = ToolEventCollector::new();
+    let tool_result = executor(bootstrap.tool_call.clone(), collector.clone()).await;
 
     // NOTE: No post-execution cancellation check here. Once the
     // executor has returned, side effects have already been applied
@@ -276,6 +319,17 @@ where
     // would leave the child in Running state, causing the recovery
     // matrix to re-execute the tool on restart (double execution of
     // non-idempotent operations).
+
+    // ── Commit collected progress events ────────────────────────
+    let progress_events = collector.drain();
+    let mut committed_events = if progress_events.is_empty() {
+        Vec::new()
+    } else {
+        event_repo
+            .commit_event_batch(&bootstrap.thread_id, progress_events, now)
+            .await
+            .context("commit tool progress events")?
+    };
 
     // ── Drive to terminal state ──────────────────────────────────
     match tool_result {
@@ -298,16 +352,17 @@ where
                 &bootstrap.tool_call.display_name,
                 result.clone(),
             );
-            let committed = event_repo
+            let end_committed = event_repo
                 .commit_event(&bootstrap.thread_id, end_event, now)
                 .await
                 .context("commit ToolCallEnd event")?;
+            committed_events.push(end_committed);
 
             Ok(ToolTaskOutcome::Completed {
                 child,
                 parent,
                 result,
-                committed_events: vec![committed],
+                committed_events,
             })
         }
         Err(err) => {
@@ -331,16 +386,17 @@ where
                 &bootstrap.tool_call.display_name,
                 error_result,
             );
-            let committed = event_repo
+            let end_committed = event_repo
                 .commit_event(&bootstrap.thread_id, end_event, now)
                 .await
                 .context("commit ToolCallEnd event on failure")?;
+            committed_events.push(end_committed);
 
             Ok(ToolTaskOutcome::Failed {
                 child,
                 parent,
                 error: error_msg,
-                committed_events: vec![committed],
+                committed_events,
             })
         }
     }

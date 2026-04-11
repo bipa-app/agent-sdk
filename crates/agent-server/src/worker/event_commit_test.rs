@@ -293,24 +293,35 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
-    // Should have TurnComplete + Done (2 events).
-    assert_eq!(committed_events.len(), 2, "expected 2 lifecycle events");
+    // Should have Start + Text + TurnComplete + Done (4 events).
+    assert_eq!(committed_events.len(), 4, "expected 4 events");
     assert!(
-        matches!(&committed_events[0].event, AgentEvent::TurnComplete { .. }),
-        "first event should be TurnComplete, got {:?}",
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
         committed_events[0].event,
     );
     assert!(
-        matches!(&committed_events[1].event, AgentEvent::Done { .. }),
-        "second event should be Done, got {:?}",
+        matches!(&committed_events[1].event, AgentEvent::Text { .. }),
+        "event[1] should be Text, got {:?}",
         committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::TurnComplete { .. }),
+        "event[2] should be TurnComplete, got {:?}",
+        committed_events[2].event,
+    );
+    assert!(
+        matches!(&committed_events[3].event, AgentEvent::Done { .. }),
+        "event[3] should be Done, got {:?}",
+        committed_events[3].event,
     );
 
     // Events should also be in the repository.
     let repo_events = stores.events.get_events(&thread_a()).await?;
-    assert_eq!(repo_events.len(), 2);
-    assert_eq!(repo_events[0].sequence, 0);
-    assert_eq!(repo_events[1].sequence, 1);
+    assert_eq!(repo_events.len(), 4);
+    for (i, evt) in repo_events.iter().enumerate() {
+        assert_eq!(evt.sequence, i as u64);
+    }
 
     Ok(())
 }
@@ -335,12 +346,22 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
-    // Should have Refusal + TurnComplete + Done (3 events).
-    assert_eq!(committed_events.len(), 3, "expected 3 lifecycle events");
+    // Should have Start + Text + Refusal + TurnComplete + Done (5 events).
+    assert_eq!(committed_events.len(), 5, "expected 5 events");
     assert!(
-        matches!(&committed_events[0].event, AgentEvent::Refusal { .. }),
-        "first event should be Refusal, got {:?}",
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
         committed_events[0].event,
+    );
+    assert!(
+        matches!(&committed_events[1].event, AgentEvent::Text { .. }),
+        "event[1] should be Text, got {:?}",
+        committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::Refusal { .. }),
+        "event[2] should be Refusal, got {:?}",
+        committed_events[2].event,
     );
 
     Ok(())
@@ -377,19 +398,28 @@ async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
         RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
     };
 
-    // One ToolCallStart per tool call.
-    assert_eq!(committed_events.len(), 2, "expected 2 ToolCallStart events");
-    for event in &committed_events {
-        assert!(
-            matches!(&event.event, AgentEvent::ToolCallStart { .. }),
-            "expected ToolCallStart, got {:?}",
-            event.event,
-        );
-    }
+    // Start + one ToolCallStart per tool call (3 events).
+    assert_eq!(committed_events.len(), 3, "expected 3 suspension events");
+    assert!(
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
+        committed_events[0].event,
+    );
+    assert!(
+        matches!(&committed_events[1].event, AgentEvent::ToolCallStart { .. }),
+        "event[1] should be ToolCallStart, got {:?}",
+        committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::ToolCallStart { .. }),
+        "event[2] should be ToolCallStart, got {:?}",
+        committed_events[2].event,
+    );
 
     // Sequences should be contiguous.
-    assert_eq!(committed_events[0].sequence, 0);
-    assert_eq!(committed_events[1].sequence, 1);
+    for (i, evt) in committed_events.iter().enumerate() {
+        assert_eq!(evt.sequence, i as u64);
+    }
 
     Ok(())
 }
@@ -436,7 +466,7 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_tc| async {
+        |_tc, _collector| async {
             Ok(ToolResult {
                 success: true,
                 output: "hi".into(),
@@ -508,7 +538,7 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_tc| async { anyhow::bail!("tool execution failed") },
+        |_tc, _collector| async { anyhow::bail!("tool execution failed") },
         t0(),
     )
     .await?;
@@ -589,7 +619,7 @@ async fn execute_child_and_resume(
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_tc| async {
+        |_tc, _collector| async {
             Ok(ToolResult {
                 success: true,
                 output: "ok".into(),
@@ -660,10 +690,11 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     execute_child_and_resume(&stores, &child_tasks, &provider).await?;
 
     // Verify all events have strictly monotonic sequences.
+    // Expected: Start → ToolCallStart → ToolCallEnd → Text → TurnComplete → Done
     let all_events = stores.events.get_events(&thread_a()).await?;
     assert!(
-        all_events.len() >= 4,
-        "expected at least 4 events (ToolCallStart + ToolCallEnd + TurnComplete + Done), got {}",
+        all_events.len() >= 6,
+        "expected at least 6 events (Start + ToolCallStart + ToolCallEnd + Text + TurnComplete + Done), got {}",
         all_events.len(),
     );
 
@@ -679,20 +710,22 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
         );
     }
 
-    // Verify event type ordering.
+    // Verify event type ordering across root + tool task boundaries.
+    assert!(matches!(&all_events[0].event, AgentEvent::Start { .. }));
     assert!(matches!(
-        &all_events[0].event,
+        &all_events[1].event,
         AgentEvent::ToolCallStart { .. }
     ));
     assert!(matches!(
-        &all_events[1].event,
+        &all_events[2].event,
         AgentEvent::ToolCallEnd { .. }
     ));
+    assert!(matches!(&all_events[3].event, AgentEvent::Text { .. }));
     assert!(matches!(
-        &all_events[2].event,
+        &all_events[4].event,
         AgentEvent::TurnComplete { .. }
     ));
-    assert!(matches!(&all_events[3].event, AgentEvent::Done { .. }));
+    assert!(matches!(&all_events[5].event, AgentEvent::Done { .. }));
 
     Ok(())
 }

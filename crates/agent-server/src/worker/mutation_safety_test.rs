@@ -411,7 +411,7 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { Ok(ToolResult::success("transfer complete")) },
+        |_, _collector| async { Ok(ToolResult::success("transfer complete")) },
         t_plus(20),
     )
     .await?;
@@ -474,7 +474,7 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { panic!("executor must not be called for ambiguous retry") },
+        |_, _collector| async { panic!("executor must not be called for ambiguous retry") },
         t_plus(20),
     )
     .await;
@@ -519,7 +519,7 @@ async fn replay_safe_tool_retries_freely_after_failure() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::ReplaySafe,
-        |_| async { Ok(ToolResult::success("hello")) },
+        |_, _collector| async { Ok(ToolResult::success("hello")) },
         t_plus(20),
     )
     .await?;
@@ -661,7 +661,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
         },
         &deny_policy,
         &cancel,
-        |_| async { panic!("executor must not be called when policy denies") },
+        |_, _collector| async { panic!("executor must not be called when policy denies") },
         t_plus(30),
     )
     .await?;
@@ -852,7 +852,7 @@ async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { panic!("executor should not run when cancelled") },
+        |_, _collector| async { panic!("executor should not run when cancelled") },
         t_plus(20),
     )
     .await?;
@@ -967,7 +967,7 @@ async fn fail_closed_on_intent_persist_failure() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { panic!("executor must not be called when intent persist fails") },
+        |_, _collector| async { panic!("executor must not be called when intent persist fails") },
         t_plus(20),
     )
     .await?;
@@ -1050,7 +1050,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
         },
         &AllowAllPolicy,
         &cancel,
-        |_| async { Ok(ToolResult::success("transfer done")) },
+        |_, _collector| async { Ok(ToolResult::success("transfer done")) },
         t_plus(30),
     )
     .await?;
@@ -1129,7 +1129,7 @@ async fn audit_trail_covers_full_lifecycle() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { Ok(ToolResult::success("done")) },
+        |_, _collector| async { Ok(ToolResult::success("done")) },
         t_plus(20),
     )
     .await?;
@@ -1375,7 +1375,7 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::ReplaySafe,
-        |_| async { Ok(ToolResult::success("a")) },
+        |_, _collector| async { Ok(ToolResult::success("a")) },
         t_plus(20),
     )
     .await?;
@@ -1407,7 +1407,7 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { Ok(ToolResult::success("50 transferred")) },
+        |_, _collector| async { Ok(ToolResult::success("50 transferred")) },
         t_plus(30),
     )
     .await?;
@@ -1468,7 +1468,7 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        |_| async { Err(anyhow::anyhow!("insufficient funds")) },
+        |_, _collector| async { Err(anyhow::anyhow!("insufficient funds")) },
         t_plus(20),
     )
     .await?;
@@ -1537,7 +1537,7 @@ async fn no_intent_means_no_execution_invariant() -> Result<()> {
         },
         &cancel,
         ToolEffectClass::SideEffecting,
-        move |_| {
+        move |_, _collector| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             async { Ok(ToolResult::success("should not reach")) }
         },

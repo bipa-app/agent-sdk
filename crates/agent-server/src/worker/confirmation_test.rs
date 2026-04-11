@@ -460,7 +460,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
         },
         &AllowAllPolicy,
         &cancel,
-        |_info| async { Ok(ToolResult::success("transfer completed")) },
+        |_info, _collector| async { Ok(ToolResult::success("transfer completed")) },
         t_plus(30),
     )
     .await?;
@@ -543,7 +543,7 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
         },
         &policy,
         &cancel,
-        |_info| async {
+        |_info, _collector| async {
             panic!("executor should not be called when policy denies");
         },
         t_plus(30),
@@ -869,7 +869,7 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
         &stores.tasks,
         &stores.events,
         &cancel,
-        |_info| async { Ok(ToolResult::success("echo output")) },
+        |_info, _collector| async { Ok(ToolResult::success("echo output")) },
         t_plus(20),
     )
     .await?;
@@ -1000,7 +1000,7 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
         },
         &AllowAllPolicy,
         &cancel,
-        |_info| async { Ok(ToolResult::success("transfer of 42 completed")) },
+        |_info, _collector| async { Ok(ToolResult::success("transfer of 42 completed")) },
         t_plus(30),
     )
     .await?;

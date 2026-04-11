@@ -408,7 +408,7 @@ pub async fn resume_confirmed_tool<F, Fut>(
     now: OffsetDateTime,
 ) -> anyhow::Result<ConfirmationResumeOutcome>
 where
-    F: FnOnce(PendingToolCallInfo) -> Fut,
+    F: FnOnce(PendingToolCallInfo, crate::worker::tool_task::ToolEventCollector) -> Fut,
     Fut: Future<Output = anyhow::Result<ToolResult>>,
 {
     // ── Authoritative policy recheck ────────────────────────────
