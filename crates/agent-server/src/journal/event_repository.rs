@@ -169,12 +169,11 @@ impl EventRepository for InMemoryEventRepository {
 
         let committed: Vec<CommittedEvent> = events
             .into_iter()
-            .enumerate()
-            .map(|(i, event)| CommittedEvent {
+            .zip(start_seq..)
+            .map(|(event, seq)| CommittedEvent {
                 event_id: uuid::Uuid::now_v7(),
                 thread_id: thread_id.clone(),
-                #[allow(clippy::cast_possible_truncation)]
-                sequence: start_seq + i as u64,
+                sequence: seq,
                 timestamp: now,
                 event,
             })

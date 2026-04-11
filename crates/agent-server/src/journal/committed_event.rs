@@ -130,14 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn into_envelope_serializes_flat() {
+    fn into_envelope_serializes_flat() -> anyhow::Result<()> {
         let committed = sample_committed(0);
         let envelope = committed.into_envelope();
-        let json: serde_json::Value = serde_json::to_value(&envelope).expect("serialize");
+        let json: serde_json::Value = serde_json::to_value(&envelope)?;
 
         // Flattened: type at top level, no nested "event" key
         assert!(json.get("type").is_some());
         assert!(json.get("event").is_none());
+        Ok(())
     }
 
     // ── serialization ───────────────────────────────────────────────
@@ -171,15 +172,17 @@ mod tests {
 
     #[test]
     fn committed_event_nests_event_payload() -> anyhow::Result<()> {
+        use anyhow::Context;
+
         let committed = sample_committed(0);
         let value = serde_json::to_value(&committed)?;
 
         // The event is nested (not flattened) in the storage format.
         let event_obj = value
             .get("event")
-            .expect("event key must exist")
+            .context("event key must exist")?
             .as_object()
-            .expect("event must be an object");
+            .context("event must be an object")?;
         assert_eq!(event_obj.get("type").and_then(|v| v.as_str()), Some("text"),);
         Ok(())
     }
