@@ -12,8 +12,9 @@
 //! - `agent_sdk_turn_checkpoints`
 //!
 //! Event persistence and outbox relay tables are called out separately
-//! in the follow-up notes because ENG-7984 is not implementing that
-//! behavior yet.
+//! in follow-up notes under `notes/` because ENG-7984 is not
+//! implementing that behavior yet, and those notes must not be picked
+//! up by `sqlx::migrate!`.
 //!
 //! The bundle is embedded through [`sqlx::migrate!`] so the future
 //! backend can use `sqlx`'s built-in migration table and startup
@@ -40,26 +41,19 @@ const DURABLE_CORE_SQL: &str = include_str!(concat!(
 ));
 const FUTURE_EVENT_OUTBOX_NOTES_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/migrations/postgres/0002_future_event_outbox_notes.sql"
+    "/notes/future_event_outbox_notes.sql"
 ));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 2] = [
-    PostgresMigration {
-        version: "0001",
-        summary: "current durable core tables, constraints, and indexes",
-        sql: DURABLE_CORE_SQL,
-    },
-    PostgresMigration {
-        version: "0002",
-        summary: "future event and outbox follow-up notes",
-        sql: FUTURE_EVENT_OUTBOX_NOTES_SQL,
-    },
-];
+const MIGRATIONS: [PostgresMigration; 1] = [PostgresMigration {
+    version: "0001",
+    summary: "current durable core tables, constraints, and indexes",
+    sql: DURABLE_CORE_SQL,
+}];
 
-/// The reviewable migration bundle for the current durable core.
+/// The reviewable executable migration bundle for the current durable core.
 #[must_use]
 pub const fn durable_core_migrations() -> &'static [PostgresMigration] {
     &MIGRATIONS

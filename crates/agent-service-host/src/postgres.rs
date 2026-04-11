@@ -65,6 +65,25 @@ mod tests {
     }
 
     #[test]
+    fn executable_migration_bundle_excludes_future_notes() -> Result<()> {
+        let migrations = durable_core_migrations();
+        ensure!(
+            migrations.len() == 1,
+            "expected only executable durable-core migrations, got {:?}",
+            migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+        );
+        ensure!(
+            migrations[0].version == "0001",
+            "expected durable core executable migration version 0001, got {}",
+            migrations[0].version,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repository_contracts_cover_the_current_durable_core_traits() -> Result<()> {
         let actual = repository_boundaries()
             .iter()
@@ -110,6 +129,16 @@ mod tests {
             message_boundary.tables == ["agent_sdk_message_heads", "agent_sdk_message_commits"],
             "message repository tables drifted: {:?}",
             message_boundary.tables,
+        );
+        ensure!(
+            message_boundary.reads == ["get", "get_history"],
+            "message repository reads drifted: {:?}",
+            message_boundary.reads,
+        );
+        ensure!(
+            message_boundary.writes == ["get_or_create", "commit_messages", "replace_history"],
+            "message repository writes drifted: {:?}",
+            message_boundary.writes,
         );
 
         Ok(())

@@ -60,8 +60,8 @@ const AGENT_TASK_WRITES: &[&str] = &[
 
 const THREAD_READS: &[&str] = &["get", "list"];
 const THREAD_WRITES: &[&str] = &["get_or_create", "commit_turn", "mark_completed"];
-const MESSAGE_READS: &[&str] = &["get_or_create", "get", "get_history"];
-const MESSAGE_WRITES: &[&str] = &["commit_messages", "replace_history"];
+const MESSAGE_READS: &[&str] = &["get", "get_history"];
+const MESSAGE_WRITES: &[&str] = &["get_or_create", "commit_messages", "replace_history"];
 const TURN_ATTEMPT_READS: &[&str] = &["get", "list_by_task"];
 const TURN_ATTEMPT_WRITES: &[&str] = &["open_attempt", "close_attempt"];
 const TURN_CHECKPOINT_READS: &[&str] = &[

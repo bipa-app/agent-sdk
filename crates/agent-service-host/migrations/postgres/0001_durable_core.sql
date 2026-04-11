@@ -145,8 +145,19 @@ CREATE TABLE agent_sdk_tasks (
                     AND pending_child_count = 0
                 )
                 OR (
+                    state_json ->> 'kind' = 'none'
+                    AND status IN ('completed', 'failed', 'cancelled')
+                    AND pending_child_count = 0
+                )
+                OR (
                     state_json ->> 'kind' IN ('none', 'ready_to_resume')
-                    AND status NOT IN ('waiting_on_children', 'awaiting_confirmation')
+                    AND status NOT IN (
+                        'waiting_on_children',
+                        'awaiting_confirmation',
+                        'completed',
+                        'failed',
+                        'cancelled'
+                    )
                     AND pending_child_count = 0
                 )
             )
@@ -238,14 +249,14 @@ CREATE TABLE agent_sdk_message_commits (
     head_version_after BIGINT NOT NULL,
     batch_json JSONB NOT NULL,
     committed_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT agent_sdk_message_commits_thread_turn_key
+        PRIMARY KEY (thread_id, turn_number),
     CONSTRAINT agent_sdk_message_commits_thread_fk
         FOREIGN KEY (thread_id) REFERENCES agent_sdk_threads(thread_id)
         ON DELETE CASCADE,
     CONSTRAINT agent_sdk_message_commits_task_fk
         FOREIGN KEY (task_id) REFERENCES agent_sdk_tasks(id)
         ON DELETE RESTRICT,
-    CONSTRAINT agent_sdk_message_commits_thread_turn_key
-        UNIQUE (thread_id, turn_number),
     CONSTRAINT agent_sdk_message_commits_turn_number_check
         CHECK (turn_number >= 1),
     CONSTRAINT agent_sdk_message_commits_head_version_check
@@ -253,9 +264,6 @@ CREATE TABLE agent_sdk_message_commits (
     CONSTRAINT agent_sdk_message_commits_batch_json_check
         CHECK (jsonb_typeof(batch_json) = 'array')
 );
-
-CREATE INDEX agent_sdk_message_commits_by_thread_turn_idx
-    ON agent_sdk_message_commits (thread_id, turn_number);
 
 CREATE INDEX agent_sdk_message_commits_by_task_idx
     ON agent_sdk_message_commits (task_id, turn_number);

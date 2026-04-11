@@ -229,7 +229,7 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_tasks_waiting_state_check",
-        invariant: "Paused-state JSON kind and waiting counters agree with task status.",
+        invariant: "Paused-state JSON kind and waiting counters agree with task status, and terminal rows reset state kind to `none`.",
     },
 ];
 
@@ -473,20 +473,12 @@ const AGENT_SDK_MESSAGE_COMMIT_CONSTRAINTS: &[ConstraintContract] = &[
     },
 ];
 
-const AGENT_SDK_MESSAGE_COMMIT_INDEXES: &[IndexContract] = &[
-    IndexContract {
-        name: "agent_sdk_message_commits_by_thread_turn_idx",
-        key_columns: "(thread_id, turn_number)",
-        predicate: None,
-        purpose: "Powers raw committed-message replay per thread without touching compacted heads.",
-    },
-    IndexContract {
-        name: "agent_sdk_message_commits_by_task_idx",
-        key_columns: "(task_id, turn_number)",
-        predicate: None,
-        purpose: "Supports task-oriented audit inspection of committed message batches.",
-    },
-];
+const AGENT_SDK_MESSAGE_COMMIT_INDEXES: &[IndexContract] = &[IndexContract {
+    name: "agent_sdk_message_commits_by_task_idx",
+    key_columns: "(task_id, turn_number)",
+    predicate: None,
+    purpose: "Supports task-oriented audit inspection of committed message batches.",
+}];
 
 const AGENT_SDK_TURN_ATTEMPT_COLUMNS: &[ColumnContract] = &[
     ColumnContract {
