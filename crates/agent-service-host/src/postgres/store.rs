@@ -3176,7 +3176,10 @@ RETURNING id, thread_id, event_id, sequence, status, payload_json,
         .await
         .context("claim pending outbox rows")?;
 
-        let mut rows: Vec<OutboxRow> = records.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
+        let mut rows: Vec<OutboxRow> = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_>>()?;
         rows.sort_by_key(|r| (r.next_attempt_at, r.id.clone()));
         Ok(rows)
     }
