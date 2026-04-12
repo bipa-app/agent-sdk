@@ -2,10 +2,10 @@
 
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_from_children};
 use super::subagent::{
-    EffectiveSubagentCapabilities, EffectiveSubagentSpec, SpawnedSubagentInvocation,
-    SubagentInvocationDeps, SubagentResult, SubagentResultDeps, SubagentSummary,
-    SubagentTaskOutcome, execute_subagent_task, resolve_subagent_bootstrap,
-    spawn_subagent_invocation,
+    EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+    InheritedSubagentPolicy, SpawnedSubagentInvocation, SubagentInvocationDeps, SubagentResult,
+    SubagentResultDeps, SubagentSandboxPolicy, SubagentSummary, SubagentTaskOutcome,
+    execute_subagent_task, resolve_subagent_bootstrap, spawn_subagent_invocation,
 };
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
@@ -18,6 +18,7 @@ use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
@@ -311,7 +312,36 @@ fn subagent_spec() -> EffectiveSubagentSpec {
         model: "mock-model".into(),
         max_turns: 4,
         timeout_ms: 30_000,
+        depth: 1,
+        max_parallel_subagents: 1,
         nickname: Some("Scout".into()),
+        sandbox: SubagentSandboxPolicy::read_only(),
+        mcp: EffectiveSubagentMcpPolicy {
+            allowed_servers: set(&["docs"]),
+        },
+        audit_provenance: Some(AuditProvenance::new("mock", "mock-model")),
+        inherited_policy: InheritedSubagentPolicy {
+            default_model: "mock-model".into(),
+            allowed_models: BTreeSet::from(["mock-model".to_owned()]),
+            default_max_turns: 4,
+            max_turns: 4,
+            default_timeout_ms: 30_000,
+            max_timeout_ms: 30_000,
+            capability_profiles: std::collections::BTreeMap::from([(
+                "research".into(),
+                super::subagent::SubagentCapabilityProfile {
+                    capabilities: set(&["read_file", "rg"]),
+                    sandbox: SubagentSandboxPolicy::read_only(),
+                    allowed_mcp_servers: set(&["docs"]),
+                },
+            )]),
+            allowed_capabilities: set(&["read_file", "rg"]),
+            max_depth: 3,
+            max_parallel_subagents: 1,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            allowed_mcp_servers: set(&["docs"]),
+            audit_provider: "mock".into(),
+        },
         capabilities: EffectiveSubagentCapabilities {
             profile: "research".into(),
             allowed: set(&["read_file", "rg"]),

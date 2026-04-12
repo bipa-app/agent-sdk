@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
@@ -10,14 +10,17 @@ use crate::journal::{
     AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
     SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
 };
+use agent_sdk_core::ToolTier;
+use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::events::AgentEvent;
 use time::{Duration, OffsetDateTime};
 
 use super::subagent::{
-    EffectiveSubagentCapabilities, EffectiveSubagentSpec, InheritedSubagentConstraints,
-    ServerSubagentSpawnPolicy, SpawnedSubagentInvocation, SubagentCapabilityProfile,
-    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentSpawnPolicy, SubagentSpawnRequest,
-    resolve_subagent_spec, spawn_subagent_invocation,
+    EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+    InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
+    SpawnedSubagentInvocation, SubagentCapabilityProfile, SubagentCapabilityRequest,
+    SubagentInvocationDeps, SubagentMcpRequest, SubagentSandboxPolicy, SubagentSpawnPolicy,
+    SubagentSpawnRequest, resolve_subagent_spec, spawn_subagent_invocation,
 };
 
 fn set(values: &[&str]) -> BTreeSet<String> {
@@ -71,8 +74,8 @@ impl EventRepository for FailingEventRepository {
     }
 }
 
-fn sample_constraints() -> InheritedSubagentConstraints {
-    InheritedSubagentConstraints {
+fn sample_policy() -> InheritedSubagentPolicy {
+    InheritedSubagentPolicy {
         default_model: "claude-sonnet-4-5-20250929".into(),
         allowed_models: set(&["claude-sonnet-4-5-20250929", "claude-opus-4-5-20250929"]),
         default_max_turns: 8,
@@ -84,16 +87,73 @@ fn sample_constraints() -> InheritedSubagentConstraints {
                 "research".into(),
                 SubagentCapabilityProfile {
                     capabilities: set(&["read_file", "rg", "web_search"]),
+                    sandbox: SubagentSandboxPolicy::read_only().with_network_access(true),
+                    allowed_mcp_servers: set(&["docs", "search"]),
                 },
             ),
             (
                 "edit".into(),
                 SubagentCapabilityProfile {
                     capabilities: set(&["read_file", "rg", "apply_patch"]),
+                    sandbox: SubagentSandboxPolicy::workspace_write(),
+                    allowed_mcp_servers: set(&["docs"]),
                 },
             ),
         ]),
         allowed_capabilities: set(&["read_file", "rg"]),
+        max_depth: 3,
+        max_parallel_subagents: 2,
+        sandbox: SubagentSandboxPolicy::workspace_write(),
+        allowed_mcp_servers: set(&["docs"]),
+        audit_provider: "anthropic".into(),
+    }
+}
+
+fn sample_constraints() -> InheritedSubagentConstraints {
+    InheritedSubagentConstraints {
+        policy: sample_policy(),
+        current_depth: 0,
+        active_parallel_subagents: 0,
+    }
+}
+
+fn sample_spec(task: &str) -> EffectiveSubagentSpec {
+    EffectiveSubagentSpec {
+        task: task.into(),
+        prompt: "Stay in read-only mode.".into(),
+        model: "claude-sonnet-4-5-20250929".into(),
+        max_turns: 5,
+        timeout_ms: 15_000,
+        depth: 1,
+        max_parallel_subagents: 1,
+        nickname: Some("Scout".into()),
+        sandbox: SubagentSandboxPolicy::read_only(),
+        mcp: EffectiveSubagentMcpPolicy {
+            allowed_servers: set(&["docs"]),
+        },
+        audit_provenance: Some(AuditProvenance::new(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+        )),
+        inherited_policy: InheritedSubagentPolicy {
+            default_model: "claude-sonnet-4-5-20250929".into(),
+            allowed_models: set(&["claude-sonnet-4-5-20250929"]),
+            default_max_turns: 5,
+            max_turns: 5,
+            default_timeout_ms: 15_000,
+            max_timeout_ms: 15_000,
+            capability_profiles: sample_policy().capability_profiles,
+            allowed_capabilities: set(&["read_file", "rg"]),
+            max_depth: 3,
+            max_parallel_subagents: 1,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            allowed_mcp_servers: set(&["docs"]),
+            audit_provider: "anthropic".into(),
+        },
+        capabilities: EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["read_file", "rg"]),
+        },
     }
 }
 
@@ -115,6 +175,9 @@ fn spawn_request_round_trips_through_json() -> Result<()> {
     .with_model("claude-opus-4-5-20250929")
     .with_max_turns(10)
     .with_timeout_ms(45_000)
+    .with_max_parallel_subagents(1)
+    .with_sandbox(SubagentSandboxPolicy::read_only())
+    .with_mcp_allowlist(["docs"])
     .with_nickname("Scout");
 
     let json = serde_json::to_string(&request)?;
@@ -126,22 +189,61 @@ fn spawn_request_round_trips_through_json() -> Result<()> {
 
 #[test]
 fn effective_spec_round_trips_through_json() -> Result<()> {
-    let spec = EffectiveSubagentSpec {
-        task: "Summarize the storage contract".into(),
-        prompt: "Stay within the server boundary.".into(),
-        model: "claude-sonnet-4-5-20250929".into(),
-        max_turns: 6,
-        timeout_ms: 20_000,
-        nickname: Some("Scout".into()),
-        capabilities: EffectiveSubagentCapabilities {
-            profile: "research".into(),
-            allowed: set(&["read_file", "rg"]),
-        },
-    };
+    let spec = sample_spec("Summarize the storage contract");
 
     let json = serde_json::to_string(&spec)?;
     let round_trip: EffectiveSubagentSpec = serde_json::from_str(&json)?;
     assert_eq!(round_trip, spec);
+
+    Ok(())
+}
+
+#[test]
+fn legacy_effective_spec_without_inherited_policy_deserializes_fail_closed() -> Result<()> {
+    let spec = sample_spec("Summarize the storage contract");
+    let mut json = serde_json::to_value(&spec)?;
+    let object = json
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected effective spec JSON object"))?;
+    object.remove("inherited_policy");
+    object.remove("max_parallel_subagents");
+
+    let legacy: EffectiveSubagentSpec = serde_json::from_value(json)?;
+    let profile = legacy
+        .inherited_policy
+        .capability_profiles
+        .get("research")
+        .ok_or_else(|| anyhow!("expected derived legacy profile"))?;
+
+    assert_eq!(
+        legacy.inherited_policy.allowed_models,
+        set(&[legacy.model.as_str()])
+    );
+    assert_eq!(
+        legacy.inherited_policy.allowed_capabilities,
+        legacy.capabilities.allowed
+    );
+    assert_eq!(legacy.inherited_policy.max_depth, legacy.depth);
+    assert_eq!(legacy.max_parallel_subagents, 0);
+    assert_eq!(legacy.inherited_policy.max_parallel_subagents, 1);
+    assert_eq!(profile.capabilities, legacy.capabilities.allowed);
+    assert_eq!(profile.sandbox, legacy.sandbox);
+    assert_eq!(profile.allowed_mcp_servers, legacy.mcp.allowed_servers);
+
+    let err = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Inspect durable bootstrap",
+            SubagentCapabilityRequest::new("research"),
+        ),
+        &legacy.inherited_constraints(0),
+        &ServerSubagentSpawnPolicy,
+    )
+    .err()
+    .ok_or_else(|| anyhow!("expected legacy fallback constraints to fail closed"))?;
+    assert!(
+        error_text(&err).contains("depth limit exceeded"),
+        "unexpected error: {err:#}"
+    );
 
     Ok(())
 }
@@ -166,8 +268,19 @@ fn resolution_is_deterministic_for_same_inputs() -> Result<()> {
     assert_eq!(first.model, "claude-sonnet-4-5-20250929");
     assert_eq!(first.max_turns, 12);
     assert_eq!(first.timeout_ms, 60_000);
+    assert_eq!(first.depth, 1);
+    assert_eq!(first.max_parallel_subagents, 2);
     assert_eq!(first.nickname.as_deref(), Some("Scout"));
     assert_eq!(first.capabilities.allowed, set(&["read_file", "rg"]));
+    assert_eq!(first.sandbox, SubagentSandboxPolicy::read_only());
+    assert_eq!(first.mcp.allowed_servers, set(&["docs"]));
+    assert_eq!(
+        first.audit_provenance,
+        Some(AuditProvenance::new(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+        )),
+    );
 
     Ok(())
 }
@@ -278,7 +391,7 @@ fn empty_task_is_rejected_before_policy_runs() -> Result<()> {
 #[test]
 fn inherited_constraints_validate_their_own_ceiling() -> Result<()> {
     let mut constraints = sample_constraints();
-    constraints.allowed_capabilities = set(&["read_file", "does_not_exist"]);
+    constraints.policy.allowed_capabilities = set(&["read_file", "does_not_exist"]);
     let request = SubagentSpawnRequest::new(
         "Search for schema regressions",
         SubagentCapabilityRequest::new("research"),
@@ -372,13 +485,15 @@ fn profile_name_is_trimmed_before_lookup() -> Result<()> {
 #[test]
 fn blank_capability_identifier_in_profile_is_rejected() -> Result<()> {
     let mut constraints = sample_constraints();
-    constraints.capability_profiles.insert(
+    constraints.policy.capability_profiles.insert(
         "bad".into(),
         SubagentCapabilityProfile {
             capabilities: set(&["", "read_file"]),
+            sandbox: SubagentSandboxPolicy::read_only(),
+            allowed_mcp_servers: BTreeSet::new(),
         },
     );
-    constraints.allowed_capabilities = set(&["", "read_file", "rg"]);
+    constraints.policy.allowed_capabilities = set(&["", "read_file", "rg"]);
 
     let policy = ServerSubagentSpawnPolicy;
     let request = SubagentSpawnRequest::new(
@@ -402,7 +517,10 @@ fn blank_capability_identifier_in_profile_is_rejected() -> Result<()> {
 #[test]
 fn blank_allowed_capability_is_rejected() -> Result<()> {
     let mut constraints = sample_constraints();
-    constraints.allowed_capabilities.insert(String::new());
+    constraints
+        .policy
+        .allowed_capabilities
+        .insert(String::new());
 
     let policy = ServerSubagentSpawnPolicy;
     let request = SubagentSpawnRequest::new(
@@ -423,6 +541,8 @@ fn blank_allowed_capability_is_rejected() -> Result<()> {
 }
 
 struct FixedPolicy;
+
+struct AliasingPolicy;
 
 impl SubagentSpawnPolicy for FixedPolicy {
     fn resolve_model(
@@ -459,6 +579,136 @@ impl SubagentSpawnPolicy for FixedPolicy {
             allowed: set(&["rg"]),
         })
     }
+
+    fn resolve_max_parallel_subagents(
+        &self,
+        _requested: Option<u32>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        Ok(1)
+    }
+
+    fn resolve_depth(&self, _constraints: &InheritedSubagentConstraints) -> Result<u32> {
+        Ok(2)
+    }
+
+    fn resolve_sandbox(
+        &self,
+        _profile: &str,
+        _requested: Option<&SubagentSandboxPolicy>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<SubagentSandboxPolicy> {
+        Ok(SubagentSandboxPolicy::read_only())
+    }
+
+    fn resolve_mcp(
+        &self,
+        _profile: &str,
+        _requested: Option<&SubagentMcpRequest>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentMcpPolicy> {
+        Ok(EffectiveSubagentMcpPolicy {
+            allowed_servers: set(&["docs"]),
+        })
+    }
+
+    fn resolve_audit_provenance(
+        &self,
+        model: &str,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<AuditProvenance> {
+        Ok(AuditProvenance::new("anthropic", model))
+    }
+}
+
+impl SubagentSpawnPolicy for AliasingPolicy {
+    fn resolve_model(
+        &self,
+        _requested: Option<&str>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<String> {
+        Ok("gpt-5".into())
+    }
+
+    fn resolve_max_turns(
+        &self,
+        _requested: Option<u32>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        Ok(3)
+    }
+
+    fn resolve_timeout_ms(
+        &self,
+        _requested: Option<u64>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u64> {
+        Ok(5_000)
+    }
+
+    fn resolve_capabilities(
+        &self,
+        requested: &SubagentCapabilityRequest,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentCapabilities> {
+        ensure!(
+            requested.profile == "research-lite",
+            "expected alias input, got `{}`",
+            requested.profile
+        );
+        Ok(EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["rg"]),
+        })
+    }
+
+    fn resolve_max_parallel_subagents(
+        &self,
+        _requested: Option<u32>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        Ok(1)
+    }
+
+    fn resolve_depth(&self, _constraints: &InheritedSubagentConstraints) -> Result<u32> {
+        Ok(2)
+    }
+
+    fn resolve_sandbox(
+        &self,
+        profile: &str,
+        _requested: Option<&SubagentSandboxPolicy>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<SubagentSandboxPolicy> {
+        ensure!(
+            profile == "research",
+            "sandbox received unresolved profile `{profile}`"
+        );
+        Ok(SubagentSandboxPolicy::read_only())
+    }
+
+    fn resolve_mcp(
+        &self,
+        profile: &str,
+        _requested: Option<&SubagentMcpRequest>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentMcpPolicy> {
+        ensure!(
+            profile == "research",
+            "mcp received unresolved profile `{profile}`"
+        );
+        Ok(EffectiveSubagentMcpPolicy {
+            allowed_servers: set(&["docs"]),
+        })
+    }
+
+    fn resolve_audit_provenance(
+        &self,
+        model: &str,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<AuditProvenance> {
+        Ok(AuditProvenance::new("anthropic", model))
+    }
 }
 
 #[test]
@@ -474,7 +724,26 @@ fn custom_policy_hooks_drive_effective_resolution() -> Result<()> {
     assert_eq!(spec.model, "gpt-5");
     assert_eq!(spec.max_turns, 3);
     assert_eq!(spec.timeout_ms, 5_000);
+    assert_eq!(spec.depth, 2);
+    assert_eq!(spec.max_parallel_subagents, 1);
     assert_eq!(spec.capabilities.allowed, set(&["rg"]));
+    assert_eq!(spec.mcp.allowed_servers, set(&["docs"]));
+
+    Ok(())
+}
+
+#[test]
+fn resolved_capability_profile_name_drives_sandbox_and_mcp_resolution() -> Result<()> {
+    let constraints = sample_constraints();
+    let request = SubagentSpawnRequest::new(
+        "Search for schema regressions",
+        SubagentCapabilityRequest::new("research-lite"),
+    );
+
+    let spec = resolve_subagent_spec(&request, &constraints, &AliasingPolicy)?;
+    assert_eq!(spec.capabilities.profile, "research");
+    assert_eq!(spec.sandbox, SubagentSandboxPolicy::read_only());
+    assert_eq!(spec.mcp.allowed_servers, set(&["docs"]));
 
     Ok(())
 }
@@ -514,11 +783,19 @@ fn parent_suspension_payload(
     parent_thread_id: &agent_sdk_core::ThreadId,
     task: &str,
 ) -> SuspensionPayload {
+    parent_suspension_payload_with_tier(parent_thread_id, task, ToolTier::Confirm)
+}
+
+fn parent_suspension_payload_with_tier(
+    parent_thread_id: &agent_sdk_core::ThreadId,
+    task: &str,
+    tier: ToolTier,
+) -> SuspensionPayload {
     let tool_call = agent_sdk_core::PendingToolCallInfo {
         id: "call_subagent".into(),
         name: "subagent_researcher".into(),
         display_name: "Subagent: Researcher".into(),
-        tier: agent_sdk_core::ToolTier::Confirm,
+        tier,
         input: serde_json::json!({ "task": task }),
         effective_input: serde_json::json!({ "task": task }),
         listen_context: None,
@@ -619,18 +896,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
     let event_repo = InMemoryEventRepository::new();
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
-    let spec = EffectiveSubagentSpec {
-        task: task.into(),
-        prompt: "Stay in read-only mode.".into(),
-        model: "claude-sonnet-4-5-20250929".into(),
-        max_turns: 5,
-        timeout_ms: 15_000,
-        nickname: Some("Scout".into()),
-        capabilities: EffectiveSubagentCapabilities {
-            profile: "research".into(),
-            allowed: set(&["read_file", "rg"]),
-        },
-    };
+    let spec = sample_spec(task);
 
     let child_thread_id = agent_sdk_core::ThreadId::new();
     let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
@@ -715,18 +981,7 @@ async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
     let event_repo = FailingEventRepository;
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
-    let spec = EffectiveSubagentSpec {
-        task: task.into(),
-        prompt: "Stay in read-only mode.".into(),
-        model: "claude-sonnet-4-5-20250929".into(),
-        max_turns: 5,
-        timeout_ms: 15_000,
-        nickname: Some("Scout".into()),
-        capabilities: EffectiveSubagentCapabilities {
-            profile: "research".into(),
-            allowed: set(&["read_file", "rg"]),
-        },
-    };
+    let spec = sample_spec(task);
 
     let child_thread_id = agent_sdk_core::ThreadId::new();
     let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
@@ -760,5 +1015,162 @@ async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
     .await?;
     assert!(created.committed_events.is_empty());
 
+    Ok(())
+}
+
+#[test]
+fn depth_limit_is_enforced() -> Result<()> {
+    let mut constraints = sample_constraints();
+    constraints.current_depth = constraints.policy.max_depth;
+
+    let err = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Search for schema regressions",
+            SubagentCapabilityRequest::new("research"),
+        ),
+        &constraints,
+        &ServerSubagentSpawnPolicy,
+    )
+    .err()
+    .ok_or_else(|| anyhow!("expected depth exhaustion to fail"))?;
+    assert!(
+        error_text(&err).contains("depth limit exceeded"),
+        "unexpected error: {err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn parallel_budget_is_enforced() -> Result<()> {
+    let mut constraints = sample_constraints();
+    constraints.active_parallel_subagents = constraints.policy.max_parallel_subagents;
+
+    let err = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Search for schema regressions",
+            SubagentCapabilityRequest::new("research"),
+        ),
+        &constraints,
+        &ServerSubagentSpawnPolicy,
+    )
+    .err()
+    .ok_or_else(|| anyhow!("expected parallel budget exhaustion to fail"))?;
+    assert!(
+        error_text(&err).contains("parallel subagent budget exhausted"),
+        "unexpected error: {err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn sandbox_request_cannot_widen_profile_or_parent() -> Result<()> {
+    let constraints = sample_constraints();
+    let request = SubagentSpawnRequest::new(
+        "Search for schema regressions",
+        SubagentCapabilityRequest::new("research"),
+    )
+    .with_sandbox(SubagentSandboxPolicy::full_access());
+
+    let spec = resolve_subagent_spec(&request, &constraints, &ServerSubagentSpawnPolicy)?;
+    assert_eq!(spec.sandbox, SubagentSandboxPolicy::read_only());
+    Ok(())
+}
+
+#[test]
+fn mcp_allowlist_narrows_profile_before_parent_ceiling() -> Result<()> {
+    let constraints = sample_constraints();
+    let request = SubagentSpawnRequest::new(
+        "Search for schema regressions",
+        SubagentCapabilityRequest::new("research"),
+    )
+    .with_mcp_allowlist(["search", "docs"]);
+
+    let spec = resolve_subagent_spec(&request, &constraints, &ServerSubagentSpawnPolicy)?;
+    assert_eq!(spec.mcp.allowed_servers, set(&["docs"]));
+    Ok(())
+}
+
+#[test]
+fn mcp_allowlist_cannot_widen_profile() -> Result<()> {
+    let constraints = sample_constraints();
+    let request = SubagentSpawnRequest::new(
+        "Search for schema regressions",
+        SubagentCapabilityRequest::new("edit"),
+    )
+    .with_mcp_allowlist(["search"]);
+
+    let err = resolve_subagent_spec(&request, &constraints, &ServerSubagentSpawnPolicy)
+        .err()
+        .ok_or_else(|| anyhow!("expected MCP widening allowlist to fail"))?;
+    assert!(
+        error_text(&err).contains("MCP allowlist can only narrow profile servers"),
+        "unexpected error: {err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn resolved_spec_carries_forward_nested_constraints() -> Result<()> {
+    let constraints = sample_constraints();
+    let spec = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Search for schema regressions",
+            SubagentCapabilityRequest::new("research").with_allowlist(["rg"]),
+        )
+        .with_max_parallel_subagents(1)
+        .with_mcp_allowlist(["docs"])
+        .with_sandbox(SubagentSandboxPolicy::read_only()),
+        &constraints,
+        &ServerSubagentSpawnPolicy,
+    )?;
+
+    let nested = spec.inherited_constraints(0);
+    assert_eq!(nested.current_depth, spec.depth);
+    assert_eq!(nested.policy.allowed_models, set(&[spec.model.as_str()]));
+    assert_eq!(nested.policy.max_turns, spec.max_turns);
+    assert_eq!(nested.policy.max_timeout_ms, spec.timeout_ms);
+    assert_eq!(nested.policy.allowed_capabilities, set(&["rg"]));
+    assert_eq!(nested.policy.allowed_mcp_servers, set(&["docs"]));
+    assert_eq!(nested.policy.max_parallel_subagents, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_flow_rejects_non_confirm_tier_subagent_tools() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let task = "Inspect durable linkage";
+
+    let err = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        SubagentInvocationSpawn {
+            child_thread_id: agent_sdk_core::ThreadId::new(),
+            spec: sample_spec(task),
+            child_root_input: child_root_input(task),
+            spawn_index: 0,
+            payload: parent_suspension_payload_with_tier(
+                &parent.thread_id,
+                task,
+                ToolTier::Observe,
+            ),
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow!("expected observe-tier subagent spawn to fail"))?;
+    assert!(
+        error_text(&err).contains("must remain confirm-tier"),
+        "unexpected error: {err:#}"
+    );
     Ok(())
 }

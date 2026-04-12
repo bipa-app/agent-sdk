@@ -1678,7 +1678,40 @@ mod tests {
                     model: "claude-sonnet-4-5-20250929".into(),
                     max_turns: 4,
                     timeout_ms: 30_000,
+                    depth: 1,
+                    max_parallel_subagents: 1,
                     nickname: Some("Scout".into()),
+                    sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(),
+                    mcp: crate::worker::subagent::EffectiveSubagentMcpPolicy {
+                        allowed_servers: set(&["docs"]),
+                    },
+                    audit_provenance: Some(agent_sdk_core::audit::AuditProvenance::new(
+                        "anthropic",
+                        "claude-sonnet-4-5-20250929",
+                    )),
+                    inherited_policy: crate::worker::subagent::InheritedSubagentPolicy {
+                        default_model: "claude-sonnet-4-5-20250929".into(),
+                        allowed_models: set(&["claude-sonnet-4-5-20250929"]),
+                        default_max_turns: 4,
+                        max_turns: 4,
+                        default_timeout_ms: 30_000,
+                        max_timeout_ms: 30_000,
+                        capability_profiles: std::collections::BTreeMap::from([(
+                            "research".into(),
+                            crate::worker::subagent::SubagentCapabilityProfile {
+                                capabilities: set(&["read_file", "rg"]),
+                                sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(
+                                ),
+                                allowed_mcp_servers: set(&["docs"]),
+                            },
+                        )]),
+                        allowed_capabilities: set(&["read_file", "rg"]),
+                        max_depth: 3,
+                        max_parallel_subagents: 1,
+                        sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(),
+                        allowed_mcp_servers: set(&["docs"]),
+                        audit_provider: "anthropic".into(),
+                    },
                     capabilities: crate::worker::subagent::EffectiveSubagentCapabilities {
                         profile: "research".into(),
                         allowed: set(&["read_file", "rg"]),

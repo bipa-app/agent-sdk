@@ -30,8 +30,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, llm};
+use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier, llm};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -67,9 +68,19 @@ pub struct SubagentSpawnRequest {
     /// milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Optional nested-subagent sibling budget requested by the
+    /// caller. Zero forbids nested subagent spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_subagents: Option<u32>,
     /// Optional human-friendly nickname shown in progress events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nickname: Option<String>,
+    /// Optional sandbox narrowing for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SubagentSandboxPolicy>,
+    /// Optional MCP-server narrowing for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<SubagentMcpRequest>,
     /// Requested capability profile plus optional narrowing allowlist.
     pub capabilities: SubagentCapabilityRequest,
 }
@@ -83,7 +94,10 @@ impl SubagentSpawnRequest {
             model: None,
             max_turns: None,
             timeout_ms: None,
+            max_parallel_subagents: None,
             nickname: None,
+            sandbox: None,
+            mcp: None,
             capabilities,
         }
     }
@@ -113,8 +127,30 @@ impl SubagentSpawnRequest {
     }
 
     #[must_use]
+    pub const fn with_max_parallel_subagents(mut self, max_parallel_subagents: u32) -> Self {
+        self.max_parallel_subagents = Some(max_parallel_subagents);
+        self
+    }
+
+    #[must_use]
     pub fn with_nickname(mut self, nickname: impl Into<String>) -> Self {
         self.nickname = Some(nickname.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_sandbox(mut self, sandbox: SubagentSandboxPolicy) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_allowlist<I, S>(mut self, allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.mcp = Some(SubagentMcpRequest::with_allowlist(allowlist));
         self
     }
 }
@@ -154,10 +190,96 @@ impl SubagentCapabilityRequest {
     }
 }
 
+/// Ordered sandbox modes for durable subagent policy narrowing.
+///
+/// The declaration order is from the narrowest to the widest mode so
+/// `Ord` comparisons line up with authority widening.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSandboxMode {
+    #[default]
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+/// Sandbox policy carried through durable subagent specs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSandboxPolicy {
+    /// Filesystem / process authority level.
+    #[serde(default)]
+    pub mode: SubagentSandboxMode,
+    /// Whether outbound network access is allowed.
+    #[serde(default)]
+    pub network_access: bool,
+}
+
+impl SubagentSandboxPolicy {
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            mode: SubagentSandboxMode::ReadOnly,
+            network_access: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn workspace_write() -> Self {
+        Self {
+            mode: SubagentSandboxMode::WorkspaceWrite,
+            network_access: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn full_access() -> Self {
+        Self {
+            mode: SubagentSandboxMode::FullAccess,
+            network_access: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_network_access(mut self, network_access: bool) -> Self {
+        self.network_access = network_access;
+        self
+    }
+
+    #[must_use]
+    pub fn narrow_to(&self, other: &Self) -> Self {
+        Self {
+            mode: self.mode.min(other.mode),
+            network_access: self.network_access && other.network_access,
+        }
+    }
+}
+
+/// Optional MCP-server allowlist narrowing requested by the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentMcpRequest {
+    /// Optional allowlist. `None` means "inherit the profile default";
+    /// `Some(empty)` means "disable MCP access".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<BTreeSet<String>>,
+}
+
+impl SubagentMcpRequest {
+    #[must_use]
+    pub fn with_allowlist<I, S>(allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowlist: Some(allowlist.into_iter().map(Into::into).collect()),
+        }
+    }
+}
+
 /// Server-defined capability profile.
 ///
 /// The profile ID is the key in
-/// [`InheritedSubagentConstraints::capability_profiles`]. Storing only
+/// [`InheritedSubagentPolicy::capability_profiles`]. Storing only
 /// the capability set here keeps the durable wire format compact while
 /// preserving deterministic ordering via [`BTreeSet`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,15 +287,22 @@ pub struct SubagentCapabilityProfile {
     /// Capability identifiers exposed by the profile.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub capabilities: BTreeSet<String>,
+    /// Sandbox ceiling associated with this profile.
+    #[serde(default)]
+    pub sandbox: SubagentSandboxPolicy,
+    /// MCP servers visible through this profile.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_mcp_servers: BTreeSet<String>,
 }
 
-/// Parent-bounded constraints inherited by a durable subagent spawn.
+/// Durable inherited policy ceiling carried forward for nested subagents.
 ///
-/// These values are authoritative: a child request cannot exceed them.
-/// The capability ceiling represents the parent's already-resolved
-/// effective access. Later nested spawns can only narrow from there.
+/// This is the reusable policy object that later nested subagent
+/// spawns inherit. Runtime counters such as the current depth and
+/// current active-sibling count live outside this struct so they can be
+/// recomputed from durable task state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InheritedSubagentConstraints {
+pub struct InheritedSubagentPolicy {
     /// Default model to use when the request omits one or asks for a
     /// disallowed model.
     pub default_model: String,
@@ -194,9 +323,21 @@ pub struct InheritedSubagentConstraints {
     /// Effective capability ceiling inherited from the parent.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub allowed_capabilities: BTreeSet<String>,
+    /// Maximum nested subagent depth this lineage may reach.
+    pub max_depth: u32,
+    /// Maximum number of live subagent siblings this lineage may have.
+    pub max_parallel_subagents: u32,
+    /// Inherited sandbox ceiling.
+    #[serde(default)]
+    pub sandbox: SubagentSandboxPolicy,
+    /// Inherited MCP-server ceiling.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_mcp_servers: BTreeSet<String>,
+    /// Inherited provider / audit context.
+    pub audit_provider: String,
 }
 
-impl InheritedSubagentConstraints {
+impl InheritedSubagentPolicy {
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.default_model.trim().is_empty(),
@@ -244,6 +385,10 @@ impl InheritedSubagentConstraints {
             !self.allowed_capabilities.is_empty(),
             "allowed_capabilities cannot be empty",
         );
+        ensure!(
+            !self.audit_provider.trim().is_empty(),
+            "audit_provider cannot be blank",
+        );
 
         for (profile, definition) in &self.capability_profiles {
             ensure!(
@@ -260,12 +405,25 @@ impl InheritedSubagentConstraints {
                     "capability identifier in profile `{profile}` cannot be blank",
                 );
             }
+            for server in &definition.allowed_mcp_servers {
+                ensure!(
+                    !server.trim().is_empty(),
+                    "MCP server identifier in profile `{profile}` cannot be blank",
+                );
+            }
         }
 
         for cap in &self.allowed_capabilities {
             ensure!(
                 !cap.trim().is_empty(),
                 "allowed_capabilities contains a blank identifier",
+            );
+        }
+
+        for server in &self.allowed_mcp_servers {
+            ensure!(
+                !server.trim().is_empty(),
+                "allowed_mcp_servers contains a blank identifier",
             );
         }
 
@@ -292,6 +450,43 @@ impl InheritedSubagentConstraints {
     }
 }
 
+/// Parent-bounded constraints inherited by a durable subagent spawn.
+///
+/// These values are authoritative: a child request cannot exceed them.
+/// The capability ceiling represents the parent's already-resolved
+/// effective access. Later nested spawns can only narrow from there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InheritedSubagentConstraints {
+    /// Reusable inherited policy ceiling.
+    pub policy: InheritedSubagentPolicy,
+    /// Current durable depth of the would-be parent.
+    pub current_depth: u32,
+    /// Current number of live subagent siblings under the same parent.
+    pub active_parallel_subagents: u32,
+}
+
+impl InheritedSubagentConstraints {
+    fn validate(&self) -> Result<()> {
+        self.policy
+            .validate()
+            .context("invalid inherited subagent policy")?;
+        ensure!(
+            self.current_depth <= self.policy.max_depth,
+            "current_depth ({}) cannot exceed max_depth ({})",
+            self.current_depth,
+            self.policy.max_depth,
+        );
+        ensure!(
+            self.active_parallel_subagents <= self.policy.max_parallel_subagents,
+            "active_parallel_subagents ({}) cannot exceed max_parallel_subagents ({})",
+            self.active_parallel_subagents,
+            self.policy.max_parallel_subagents,
+        );
+
+        Ok(())
+    }
+}
+
 /// Effective capability selection after server policy resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveSubagentCapabilities {
@@ -303,12 +498,21 @@ pub struct EffectiveSubagentCapabilities {
     pub allowed: BTreeSet<String>,
 }
 
+/// Effective MCP-server policy after server resolution.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveSubagentMcpPolicy {
+    /// Effective MCP servers visible to the subagent.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_servers: BTreeSet<String>,
+}
+
 /// Server-authoritative durable subagent spec.
 ///
 /// This is the resolved contract later phases should persist on
 /// invocation tasks or child threads. It is the only spec the server
 /// should treat as authoritative when creating durable subagent work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "EffectiveSubagentSpecWire")]
 pub struct EffectiveSubagentSpec {
     /// Task the subagent should perform.
     pub task: String,
@@ -320,11 +524,152 @@ pub struct EffectiveSubagentSpec {
     pub max_turns: u32,
     /// Server-authoritative timeout, in milliseconds.
     pub timeout_ms: u64,
+    /// Durable depth of this child within the subagent lineage.
+    #[serde(default = "default_subagent_depth")]
+    pub depth: u32,
+    /// Maximum live nested-subagent siblings this child may create.
+    #[serde(default)]
+    pub max_parallel_subagents: u32,
     /// Optional human-friendly nickname for progress reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nickname: Option<String>,
+    /// Effective sandbox policy for this subagent.
+    #[serde(default)]
+    pub sandbox: SubagentSandboxPolicy,
+    /// Effective MCP policy for this subagent.
+    #[serde(default)]
+    pub mcp: EffectiveSubagentMcpPolicy,
+    /// Audit provenance enforced by the server for this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_provenance: Option<AuditProvenance>,
+    /// Durable inherited policy ceiling for later nested spawns.
+    pub inherited_policy: InheritedSubagentPolicy,
     /// Effective capability selection.
     pub capabilities: EffectiveSubagentCapabilities,
+}
+
+#[derive(Deserialize)]
+struct EffectiveSubagentSpecWire {
+    task: String,
+    prompt: String,
+    model: String,
+    max_turns: u32,
+    timeout_ms: u64,
+    #[serde(default = "default_subagent_depth")]
+    depth: u32,
+    #[serde(default)]
+    max_parallel_subagents: u32,
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    sandbox: SubagentSandboxPolicy,
+    #[serde(default)]
+    mcp: EffectiveSubagentMcpPolicy,
+    #[serde(default)]
+    audit_provenance: Option<AuditProvenance>,
+    #[serde(default)]
+    inherited_policy: Option<InheritedSubagentPolicy>,
+    capabilities: EffectiveSubagentCapabilities,
+}
+
+impl From<EffectiveSubagentSpecWire> for EffectiveSubagentSpec {
+    fn from(wire: EffectiveSubagentSpecWire) -> Self {
+        let inherited_policy = wire
+            .inherited_policy
+            .clone()
+            .unwrap_or_else(|| wire.legacy_inherited_policy());
+        let EffectiveSubagentSpecWire {
+            task,
+            prompt,
+            model,
+            max_turns,
+            timeout_ms,
+            depth,
+            max_parallel_subagents,
+            nickname,
+            sandbox,
+            mcp,
+            audit_provenance,
+            inherited_policy: _,
+            capabilities,
+        } = wire;
+
+        Self {
+            task,
+            prompt,
+            model,
+            max_turns,
+            timeout_ms,
+            depth,
+            max_parallel_subagents,
+            nickname,
+            sandbox,
+            mcp,
+            audit_provenance,
+            inherited_policy,
+            capabilities,
+        }
+    }
+}
+
+impl EffectiveSubagentSpecWire {
+    fn legacy_inherited_policy(&self) -> InheritedSubagentPolicy {
+        let default_model =
+            normalize_optional_string(Some(&self.model)).unwrap_or_else(|| "unknown".into());
+        let allowed_capabilities = if self.capabilities.allowed.is_empty() {
+            BTreeSet::from([legacy_unavailable_capability().to_owned()])
+        } else {
+            self.capabilities.allowed.clone()
+        };
+        let profile_name = normalize_optional_string(Some(&self.capabilities.profile))
+            .unwrap_or_else(|| legacy_effective_profile_name().to_owned());
+        let audit_provider = self
+            .audit_provenance
+            .as_ref()
+            .and_then(|audit| normalize_optional_string(Some(&audit.provider)))
+            .unwrap_or_else(|| "unknown".into());
+        let mut capability_profiles = BTreeMap::new();
+        capability_profiles.insert(
+            profile_name,
+            SubagentCapabilityProfile {
+                capabilities: allowed_capabilities.clone(),
+                sandbox: self.sandbox.clone(),
+                allowed_mcp_servers: self.mcp.allowed_servers.clone(),
+            },
+        );
+
+        InheritedSubagentPolicy {
+            default_model: default_model.clone(),
+            allowed_models: BTreeSet::from([default_model]),
+            default_max_turns: self.max_turns.max(1),
+            max_turns: self.max_turns.max(1),
+            default_timeout_ms: self.timeout_ms.max(1),
+            max_timeout_ms: self.timeout_ms.max(1),
+            capability_profiles,
+            allowed_capabilities,
+            max_depth: self.depth.max(default_subagent_depth()),
+            max_parallel_subagents: self.max_parallel_subagents.max(1),
+            sandbox: self.sandbox.clone(),
+            allowed_mcp_servers: self.mcp.allowed_servers.clone(),
+            audit_provider,
+        }
+    }
+}
+
+impl EffectiveSubagentSpec {
+    /// Build the runtime constraints a nested child would inherit from
+    /// this already-resolved spec.
+    #[must_use]
+    pub fn inherited_constraints(
+        &self,
+        active_parallel_subagents: u32,
+    ) -> InheritedSubagentConstraints {
+        InheritedSubagentConstraints {
+            policy: self.inherited_policy.clone(),
+            current_depth: self.depth,
+            active_parallel_subagents,
+        }
+    }
 }
 
 /// Policy hook surface for subagent spawn resolution.
@@ -369,6 +714,26 @@ pub trait SubagentSpawnPolicy: Send + Sync {
         constraints: &InheritedSubagentConstraints,
     ) -> Result<u64>;
 
+    /// Resolve the authoritative nested-subagent sibling budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current parent has already exhausted its
+    /// inherited parallel-subagent budget.
+    fn resolve_max_parallel_subagents(
+        &self,
+        requested: Option<u32>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32>;
+
+    /// Resolve the authoritative child depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the inherited depth ceiling is already
+    /// exhausted.
+    fn resolve_depth(&self, constraints: &InheritedSubagentConstraints) -> Result<u32>;
+
     /// Resolve the authoritative capability selection.
     ///
     /// # Errors
@@ -381,6 +746,43 @@ pub trait SubagentSpawnPolicy: Send + Sync {
         requested: &SubagentCapabilityRequest,
         constraints: &InheritedSubagentConstraints,
     ) -> Result<EffectiveSubagentCapabilities>;
+
+    /// Resolve the authoritative sandbox policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capability profile is unknown.
+    fn resolve_sandbox(
+        &self,
+        profile: &str,
+        requested: Option<&SubagentSandboxPolicy>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<SubagentSandboxPolicy>;
+
+    /// Resolve the authoritative MCP policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capability profile is unknown or if the
+    /// request names MCP servers outside that profile.
+    fn resolve_mcp(
+        &self,
+        profile: &str,
+        requested: Option<&SubagentMcpRequest>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentMcpPolicy>;
+
+    /// Resolve the authoritative audit provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deployment cannot construct a trusted
+    /// audit context for the resolved child model.
+    fn resolve_audit_provenance(
+        &self,
+        model: &str,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<AuditProvenance>;
 }
 
 /// Default server-side subagent spawn policy.
@@ -399,11 +801,11 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         requested: Option<&str>,
         constraints: &InheritedSubagentConstraints,
     ) -> Result<String> {
-        let requested_model = requested.unwrap_or(constraints.default_model.as_str());
-        if constraints.allowed_models.contains(requested_model) {
+        let requested_model = requested.unwrap_or(constraints.policy.default_model.as_str());
+        if constraints.policy.allowed_models.contains(requested_model) {
             Ok(requested_model.to_owned())
         } else {
-            Ok(constraints.default_model.clone())
+            Ok(constraints.policy.default_model.clone())
         }
     }
 
@@ -412,12 +814,12 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         requested: Option<u32>,
         constraints: &InheritedSubagentConstraints,
     ) -> Result<u32> {
-        let requested = requested.unwrap_or(constraints.default_max_turns);
+        let requested = requested.unwrap_or(constraints.policy.default_max_turns);
         ensure!(
             requested > 0,
             "requested max_turns must be greater than zero"
         );
-        Ok(requested.min(constraints.max_turns))
+        Ok(requested.min(constraints.policy.max_turns))
     }
 
     fn resolve_timeout_ms(
@@ -425,12 +827,38 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         requested: Option<u64>,
         constraints: &InheritedSubagentConstraints,
     ) -> Result<u64> {
-        let requested = requested.unwrap_or(constraints.default_timeout_ms);
+        let requested = requested.unwrap_or(constraints.policy.default_timeout_ms);
         ensure!(
             requested > 0,
             "requested timeout_ms must be greater than zero",
         );
-        Ok(requested.min(constraints.max_timeout_ms))
+        Ok(requested.min(constraints.policy.max_timeout_ms))
+    }
+
+    fn resolve_max_parallel_subagents(
+        &self,
+        requested: Option<u32>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        ensure!(
+            constraints.active_parallel_subagents < constraints.policy.max_parallel_subagents,
+            "parallel subagent budget exhausted ({}/{})",
+            constraints.active_parallel_subagents,
+            constraints.policy.max_parallel_subagents,
+        );
+        Ok(requested
+            .unwrap_or(constraints.policy.max_parallel_subagents)
+            .min(constraints.policy.max_parallel_subagents))
+    }
+
+    fn resolve_depth(&self, constraints: &InheritedSubagentConstraints) -> Result<u32> {
+        ensure!(
+            constraints.current_depth < constraints.policy.max_depth,
+            "subagent depth limit exceeded ({}/{})",
+            constraints.current_depth,
+            constraints.policy.max_depth,
+        );
+        Ok(constraints.current_depth.saturating_add(1))
     }
 
     fn resolve_capabilities(
@@ -440,6 +868,7 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
     ) -> Result<EffectiveSubagentCapabilities> {
         let profile_name = requested.profile.trim();
         let profile = constraints
+            .policy
             .capability_profiles
             .get(profile_name)
             .with_context(|| format!("unknown capability profile `{profile_name}`"))?;
@@ -463,7 +892,7 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         };
 
         let allowed = requested_capabilities
-            .intersection(&constraints.allowed_capabilities)
+            .intersection(&constraints.policy.allowed_capabilities)
             .cloned()
             .collect::<BTreeSet<_>>();
 
@@ -476,6 +905,70 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
             profile: profile_name.to_owned(),
             allowed,
         })
+    }
+
+    fn resolve_sandbox(
+        &self,
+        profile: &str,
+        requested: Option<&SubagentSandboxPolicy>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<SubagentSandboxPolicy> {
+        let profile = constraints
+            .policy
+            .capability_profiles
+            .get(profile)
+            .with_context(|| format!("unknown capability profile `{profile}`"))?;
+        let requested = requested.unwrap_or(&profile.sandbox);
+        Ok(constraints
+            .policy
+            .sandbox
+            .narrow_to(&profile.sandbox)
+            .narrow_to(requested))
+    }
+
+    fn resolve_mcp(
+        &self,
+        profile: &str,
+        requested: Option<&SubagentMcpRequest>,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentMcpPolicy> {
+        let profile = constraints
+            .policy
+            .capability_profiles
+            .get(profile)
+            .with_context(|| format!("unknown capability profile `{profile}`"))?;
+        let requested_servers =
+            if let Some(allowlist) = requested.and_then(|requested| requested.allowlist.as_ref()) {
+                let invalid_allowlist: Vec<_> = allowlist
+                    .difference(&profile.allowed_mcp_servers)
+                    .cloned()
+                    .collect();
+                ensure!(
+                    invalid_allowlist.is_empty(),
+                    "MCP allowlist can only narrow profile servers; unsupported entries: {}",
+                    invalid_allowlist.join(", "),
+                );
+                allowlist.clone()
+            } else {
+                profile.allowed_mcp_servers.clone()
+            };
+
+        let allowed_servers = requested_servers
+            .intersection(&constraints.policy.allowed_mcp_servers)
+            .cloned()
+            .collect();
+        Ok(EffectiveSubagentMcpPolicy { allowed_servers })
+    }
+
+    fn resolve_audit_provenance(
+        &self,
+        model: &str,
+        constraints: &InheritedSubagentConstraints,
+    ) -> Result<AuditProvenance> {
+        Ok(AuditProvenance::new(
+            constraints.policy.audit_provider.clone(),
+            model.to_owned(),
+        ))
     }
 }
 
@@ -513,9 +1006,27 @@ pub fn resolve_subagent_spec(
     let timeout_ms = policy
         .resolve_timeout_ms(request.timeout_ms, constraints)
         .context("resolve subagent timeout_ms")?;
+    let max_parallel_subagents = policy
+        .resolve_max_parallel_subagents(request.max_parallel_subagents, constraints)
+        .context("resolve subagent max_parallel_subagents")?;
+    let depth = policy
+        .resolve_depth(constraints)
+        .context("resolve subagent depth")?;
     let capabilities = policy
         .resolve_capabilities(&request.capabilities, constraints)
         .context("resolve subagent capabilities")?;
+    let profile_name = capabilities.profile.as_str();
+    let sandbox = policy
+        .resolve_sandbox(profile_name, request.sandbox.as_ref(), constraints)
+        .context("resolve subagent sandbox")?;
+    let mcp = policy
+        .resolve_mcp(profile_name, request.mcp.as_ref(), constraints)
+        .context("resolve subagent MCP policy")?;
+    let audit_provenance = policy
+        .resolve_audit_provenance(&model, constraints)
+        .context("resolve subagent audit provenance")?;
+    let inherited_model = model.clone();
+    let inherited_allowed_mcp_servers = mcp.allowed_servers.clone();
 
     Ok(EffectiveSubagentSpec {
         task: request.task.trim().to_owned(),
@@ -523,7 +1034,27 @@ pub fn resolve_subagent_spec(
         model,
         max_turns,
         timeout_ms,
+        depth,
+        max_parallel_subagents,
         nickname: normalize_optional_string(request.nickname.as_deref()),
+        sandbox: sandbox.clone(),
+        mcp,
+        audit_provenance: Some(audit_provenance),
+        inherited_policy: InheritedSubagentPolicy {
+            default_model: inherited_model.clone(),
+            allowed_models: BTreeSet::from([inherited_model]),
+            default_max_turns: max_turns,
+            max_turns,
+            default_timeout_ms: timeout_ms,
+            max_timeout_ms: timeout_ms,
+            capability_profiles: constraints.policy.capability_profiles.clone(),
+            allowed_capabilities: capabilities.allowed.clone(),
+            max_depth: constraints.policy.max_depth,
+            max_parallel_subagents,
+            sandbox,
+            allowed_mcp_servers: inherited_allowed_mcp_servers,
+            audit_provider: constraints.policy.audit_provider.clone(),
+        },
         capabilities,
     })
 }
@@ -649,6 +1180,7 @@ pub async fn resolve_subagent_bootstrap(
         .spawn_index
         .context("running subagent task missing spawn_index")?;
     let pending_tool = pending_subagent_tool_call(&parent, spawn_index)?;
+    ensure_confirm_tier_subagent_tool(&pending_tool)?;
     let subagent_name = canonical_subagent_name(&pending_tool.name).to_owned();
 
     Ok(SubagentTaskBootstrap {
@@ -746,6 +1278,7 @@ pub async fn spawn_subagent_invocation(
     );
     let pending_tool =
         spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
+    ensure_confirm_tier_subagent_tool(&pending_tool)?;
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
     }
@@ -1110,6 +1643,22 @@ fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {
     if let Some(timeout_ms) = request.timeout_ms {
         ensure!(timeout_ms > 0, "timeout_ms must be greater than zero");
     }
+    for capability in &request.capabilities.allowlist {
+        ensure!(
+            !capability.trim().is_empty(),
+            "capability allowlist cannot contain blank identifiers",
+        );
+    }
+    if let Some(mcp) = request.mcp.as_ref()
+        && let Some(allowlist) = mcp.allowlist.as_ref()
+    {
+        for server in allowlist {
+            ensure!(
+                !server.trim().is_empty(),
+                "MCP allowlist cannot contain blank identifiers",
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1118,4 +1667,27 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+const fn legacy_effective_profile_name() -> &'static str {
+    "__legacy_effective__"
+}
+
+const fn legacy_unavailable_capability() -> &'static str {
+    "__legacy_unavailable__"
+}
+
+const fn default_subagent_depth() -> u32 {
+    1
+}
+
+fn ensure_confirm_tier_subagent_tool(
+    tool_call: &agent_sdk_core::PendingToolCallInfo,
+) -> Result<()> {
+    ensure!(
+        tool_call.tier == ToolTier::Confirm,
+        "subagent spawn `{}` must remain confirm-tier in the server model",
+        tool_call.name,
+    );
+    Ok(())
 }
