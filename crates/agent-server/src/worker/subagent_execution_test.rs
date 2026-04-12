@@ -3,8 +3,9 @@
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn, resume_from_children};
 use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentSpec, SpawnedSubagentInvocation,
-    SubagentInvocationDeps, SubagentResult, SubagentResultDeps, SubagentTaskOutcome,
-    execute_subagent_task, resolve_subagent_bootstrap, spawn_subagent_invocation,
+    SubagentInvocationDeps, SubagentResult, SubagentResultDeps, SubagentSummary,
+    SubagentTaskOutcome, execute_subagent_task, resolve_subagent_bootstrap,
+    spawn_subagent_invocation,
 };
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
@@ -526,6 +527,26 @@ async fn materialize_subagent_result(
     assert_eq!(structured.child_thread_id, spawned.child_thread.thread_id);
     assert_eq!(structured.child_root_task_id, spawned.child_root_task.id);
     assert_eq!(structured.subagent_task_id, spawned.invocation_task.id);
+    assert_parent_summary_progress_events(stores, spawned, &structured.summary).await?;
+    assert_persisted_invocation_result(stores, spawned).await?;
+
+    Ok(subagent_outcome)
+}
+
+struct ExpectedSubagentProgress<'a> {
+    spawned: &'a SpawnedSubagentInvocation,
+    completed: bool,
+    success: bool,
+    current_turn: u32,
+    tool_count: u32,
+    total_tokens: u64,
+}
+
+async fn assert_parent_summary_progress_events(
+    stores: &TestStores,
+    spawned: &SpawnedSubagentInvocation,
+    summary: &SubagentSummary,
+) -> Result<()> {
     let parent_events = stores
         .events
         .get_events(&spawned.parent_task.thread_id)
@@ -536,77 +557,83 @@ async fn materialize_subagent_result(
             .iter()
             .all(|event| matches!(event.event, AgentEvent::SubagentProgress { .. }))
     );
-    let spawned_child_root = spawned.child_root_task.id.to_string();
-    let spawned_subagent_task = spawned.invocation_task.id.to_string();
-    match &parent_events[0].event {
-        AgentEvent::SubagentProgress {
-            child_thread_id,
-            child_root_task_id,
-            subagent_task_id,
-            completed,
-            success,
-            current_turn,
-            tool_count,
-            total_tokens,
-            ..
-        } => {
-            assert_eq!(
-                child_thread_id.as_ref(),
-                Some(&spawned.child_thread.thread_id)
-            );
-            assert_eq!(
-                child_root_task_id.as_deref(),
-                Some(spawned_child_root.as_str())
-            );
-            assert_eq!(
-                subagent_task_id.as_deref(),
-                Some(spawned_subagent_task.as_str())
-            );
-            assert!(!completed);
-            assert!(!success);
-            assert_eq!(*current_turn, Some(0));
-            assert_eq!(*tool_count, 0);
-            assert_eq!(*total_tokens, 0);
-        }
-        other => anyhow::bail!("expected spawn SubagentProgress, got {other:?}"),
-    }
-    match &parent_events[1].event {
-        AgentEvent::SubagentProgress {
-            child_thread_id,
-            child_root_task_id,
-            subagent_task_id,
-            completed,
-            success,
-            current_turn,
-            tool_count,
-            total_tokens,
-            ..
-        } => {
-            assert_eq!(
-                child_thread_id.as_ref(),
-                Some(&spawned.child_thread.thread_id)
-            );
-            assert_eq!(
-                child_root_task_id.as_deref(),
-                Some(spawned_child_root.as_str())
-            );
-            assert_eq!(
-                subagent_task_id.as_deref(),
-                Some(spawned_subagent_task.as_str())
-            );
-            assert!(*completed);
-            assert!(*success);
-            assert_eq!(*current_turn, Some(structured.summary.total_turns));
-            assert_eq!(*tool_count, structured.summary.tool_count);
-            assert_eq!(
-                *total_tokens,
-                u64::from(structured.summary.total_usage.input_tokens)
-                    + u64::from(structured.summary.total_usage.output_tokens)
-            );
-        }
-        other => anyhow::bail!("expected completion SubagentProgress, got {other:?}"),
-    }
 
+    assert_subagent_progress_event(
+        &parent_events[0].event,
+        "spawn",
+        &ExpectedSubagentProgress {
+            spawned,
+            completed: false,
+            success: false,
+            current_turn: 0,
+            tool_count: 0,
+            total_tokens: 0,
+        },
+    )?;
+    assert_subagent_progress_event(
+        &parent_events[1].event,
+        "completion",
+        &ExpectedSubagentProgress {
+            spawned,
+            completed: true,
+            success: true,
+            current_turn: summary.total_turns,
+            tool_count: summary.tool_count,
+            total_tokens: u64::from(summary.total_usage.input_tokens)
+                + u64::from(summary.total_usage.output_tokens),
+        },
+    )?;
+
+    Ok(())
+}
+
+fn assert_subagent_progress_event(
+    event: &AgentEvent,
+    phase: &str,
+    expected: &ExpectedSubagentProgress<'_>,
+) -> Result<()> {
+    let child_root_task_id = expected.spawned.child_root_task.id.to_string();
+    let subagent_task_id = expected.spawned.invocation_task.id.to_string();
+
+    match event {
+        AgentEvent::SubagentProgress {
+            child_thread_id,
+            child_root_task_id: actual_child_root_task_id,
+            subagent_task_id: actual_subagent_task_id,
+            completed,
+            success,
+            current_turn,
+            tool_count,
+            total_tokens,
+            ..
+        } => {
+            assert_eq!(
+                child_thread_id.as_ref(),
+                Some(&expected.spawned.child_thread.thread_id)
+            );
+            assert_eq!(
+                actual_child_root_task_id.as_deref(),
+                Some(child_root_task_id.as_str())
+            );
+            assert_eq!(
+                actual_subagent_task_id.as_deref(),
+                Some(subagent_task_id.as_str())
+            );
+            assert_eq!(*completed, expected.completed);
+            assert_eq!(*success, expected.success);
+            assert_eq!(*current_turn, Some(expected.current_turn));
+            assert_eq!(*tool_count, expected.tool_count);
+            assert_eq!(*total_tokens, expected.total_tokens);
+            Ok(())
+        }
+        other => anyhow::bail!("expected {phase} SubagentProgress, got {other:?}"),
+    }
+}
+
+async fn assert_persisted_invocation_result(
+    stores: &TestStores,
+    spawned: &SpawnedSubagentInvocation,
+) -> Result<()> {
     let persisted_invocation = stores
         .tasks
         .get(&spawned.invocation_task.id)
@@ -618,7 +645,7 @@ async fn materialize_subagent_result(
     let persisted_tool_result: ToolResult = serde_json::from_value(persisted_payload)?;
     assert_eq!(persisted_tool_result.output, "child final response");
 
-    Ok(subagent_outcome)
+    Ok(())
 }
 
 #[tokio::test]
