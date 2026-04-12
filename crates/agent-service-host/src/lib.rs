@@ -68,7 +68,10 @@ pub mod config;
 pub mod grpc;
 pub mod health;
 pub mod host;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod proto;
 pub mod runtime;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod stores;

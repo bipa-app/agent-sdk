@@ -1804,17 +1804,21 @@ mod tests {
         AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
         ToolCallExecutor,
     };
+    #[cfg(feature = "postgres")]
     use agent_sdk_core::ThreadId;
     use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
     use agent_sdk_providers::LlmProvider;
+    #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
     use anyhow::{Context, Result, anyhow, bail};
     use async_trait::async_trait;
     use serde_json::json;
+    #[cfg(feature = "postgres")]
     use sqlx::{Connection, PgConnection};
     use tonic::transport::Channel;
+    #[cfg(feature = "postgres")]
     use uuid::Uuid;
 
     type ControlClient = pb::agent_control_service_client::AgentControlServiceClient<Channel>;
@@ -1967,6 +1971,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     fn message_text(message: &pb::ConversationMessage) -> Option<&str> {
         match message.content.as_ref() {
             Some(pb::conversation_message::Content::Text(text)) => Some(text.as_str()),
@@ -1974,6 +1979,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     fn drop_test_schema(database_url: String, schema: String) {
         let _ = std::thread::spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -1994,17 +2000,21 @@ mod tests {
         .join();
     }
 
+    // ── Postgres-specific test infrastructure and integration tests ───
+    #[cfg(feature = "postgres")]
     struct PostgresTestSchema {
         schema: String,
         database_url: String,
     }
 
+    #[cfg(feature = "postgres")]
     impl Drop for PostgresTestSchema {
         fn drop(&mut self) {
             drop_test_schema(self.database_url.clone(), self.schema.clone());
         }
     }
 
+    #[cfg(feature = "postgres")]
     async fn postgres_test_config() -> Result<Option<(ServiceConfig, PostgresTestSchema)>> {
         let Ok(database_url) =
             std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
@@ -2040,6 +2050,7 @@ mod tests {
         )))
     }
 
+    #[cfg(feature = "postgres")]
     async fn inspection_stores(config: &ServiceConfig) -> Result<StoreRegistry> {
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
             Vec::new(),
@@ -2053,12 +2064,14 @@ mod tests {
         Ok(stores)
     }
 
+    #[cfg(feature = "postgres")]
     fn empty_definition_registry() -> Arc<dyn AgentDefinitionRegistry> {
         Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
             Vec::new(),
         )))
     }
 
+    #[cfg(feature = "postgres")]
     fn postgres_text_runtime(response_id: &str, text: &str) -> Result<Arc<ExecutionRuntime>> {
         runtime_with(
             Arc::new(ScriptedProvider::new(vec![text_response(
@@ -2069,6 +2082,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "postgres")]
     async fn start_postgres_daemon_with_text(
         config: ServiceConfig,
         response_id: &str,
@@ -2213,6 +2227,7 @@ mod tests {
             .tasks)
     }
 
+    #[cfg(feature = "postgres")]
     async fn wait_for_committed_turns(
         control: &ControlClient,
         thread_id: &str,
@@ -2240,11 +2255,13 @@ mod tests {
         .await
     }
 
+    #[cfg(feature = "postgres")]
     struct PersistedPostgresState {
         inspection: StoreRegistry,
         thread_key: ThreadId,
     }
 
+    #[cfg(feature = "postgres")]
     async fn run_first_postgres_daemon_pass(daemon: &LocalDaemon) -> Result<(String, String)> {
         let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
         let thread_id = create_thread(&mut control, "create-postgres-thread").await?;
@@ -2309,6 +2326,7 @@ mod tests {
         Ok((thread_id, tasks[0].task_id.clone()))
     }
 
+    #[cfg(feature = "postgres")]
     async fn inspect_first_postgres_restart_state(
         config: &ServiceConfig,
         thread_id: &str,
@@ -2363,6 +2381,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "postgres")]
     async fn assert_postgres_state_after_restart(
         control: &mut ControlClient,
         events: &mut EventClient,
@@ -2413,6 +2432,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "postgres")]
     async fn submit_second_postgres_turn(
         control: &mut ControlClient,
         events: &mut EventClient,
@@ -2463,6 +2483,7 @@ mod tests {
         Ok(second_task.task_id)
     }
 
+    #[cfg(feature = "postgres")]
     async fn run_second_postgres_daemon_pass(
         daemon: &LocalDaemon,
         thread_id: &str,
@@ -2474,6 +2495,7 @@ mod tests {
         submit_second_postgres_turn(&mut control, &mut events, thread_id).await
     }
 
+    #[cfg(feature = "postgres")]
     async fn assert_second_postgres_persistence(
         persisted: &PersistedPostgresState,
         second_task_id: &str,
@@ -2822,6 +2844,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "postgres")]
     async fn local_daemon_postgres_restart_preserves_durable_core_and_exposes_event_gap()
     -> Result<()> {
         let Some((config, _schema_guard)) = postgres_test_config().await? else {
