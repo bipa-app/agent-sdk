@@ -92,7 +92,7 @@ Each backend reports which of the 10 store surfaces are durable
 | `message_store` | ❌ | ✅ | ✅ |
 | `attempt_store` | ❌ | ✅ | ✅ |
 | `checkpoint_store` | ❌ | ✅ | ✅ |
-| `event_repo` | ❌ | �� | ✅ |
+| `event_repo` | ❌ | ✅ | ✅ |
 | `execution_intent_store` | ❌ | ❌ (in-memory fallback) | ❌ (in-memory fallback) |
 | `tool_audit_store` | ❌ | ❌ (in-memory fallback) | ❌ (in-memory fallback) |
 | `outbox_store` | ❌ | ✅ | ✅ |

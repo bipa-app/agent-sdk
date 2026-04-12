@@ -175,8 +175,13 @@ const TASK_COLUMNS: &str = r"
 
 impl SqliteDurableStore {
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
+        // BEGIN IMMEDIATE acquires the RESERVED lock up front so that
+        // under WAL mode we fail fast with plain SQLITE_BUSY (which
+        // busy_timeout retries) rather than SQLITE_BUSY_SNAPSHOT on
+        // upgrade from a deferred read snapshot to a write (which
+        // busy_timeout does not retry).  See the module-level docs.
         self.pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("begin sqlite durable-core transaction")
     }
@@ -1981,34 +1986,54 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn clear(&self) -> Result<()> {
-        // SQLite does not support TRUNCATE CASCADE. Delete in FK order.
+        // SQLite does not support TRUNCATE CASCADE, and
+        // `agent_sdk_tasks` carries a self-referential FK with
+        // ON DELETE RESTRICT — RESTRICT is enforced per-row, so bulk
+        // DELETEs fail even when the set is internally consistent.
+        // Disable FK enforcement for the duration of the wipe.  The
+        // PRAGMA must run on a connection outside of any transaction
+        // and is scoped to that connection, so we acquire a single
+        // connection and run every statement on it.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquire sqlite connection for clear")?;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .context("disable sqlite foreign_keys for clear")?;
         sqlx::query!("DELETE FROM agent_sdk_turn_checkpoints")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_message_commits")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_turn_attempts")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_message_heads")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_committed_events")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_outbox")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_retention_cursors")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_tasks")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query!("DELETE FROM agent_sdk_threads")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .context("re-enable sqlite foreign_keys after clear")?;
         Ok(())
     }
 }

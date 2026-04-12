@@ -217,18 +217,34 @@ impl StorageConfig {
     pub fn sqlite_database_url(&self) -> Result<String> {
         match &self.backend {
             StorageBackend::Sqlite { path } => {
-                if let Some(path) = path {
-                    Ok(format!("sqlite://{path}?mode=rwc"))
+                let db_path = if let Some(path) = path {
+                    std::path::PathBuf::from(path)
                 } else {
-                    let dir = dirs_default_sqlite_dir()?;
-                    std::fs::create_dir_all(&dir)
-                        .with_context(|| format!("create sqlite data dir {}", dir.display()))?;
-                    let db_path = dir.join("agent-sdk.db");
-                    Ok(format!("sqlite://{}?mode=rwc", db_path.display()))
+                    dirs_default_sqlite_dir()?.join("agent-sdk.db")
+                };
+                if let Some(parent) = db_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create sqlite data dir {}", parent.display()))?;
                 }
+                Ok(format!("sqlite://{}?mode=rwc", sqlite_url_path(&db_path)))
             }
             _ => bail!("sqlite_database_url is only valid when storage.backend=sqlite"),
         }
+    }
+}
+
+/// Normalise a filesystem path for embedding in a `sqlite://` URL.
+///
+/// On Windows `PathBuf::display()` emits backslashes which sqlx/url reject;
+/// substitute forward slashes so the URL parser accepts the result.
+fn sqlite_url_path(path: &std::path::Path) -> String {
+    let rendered = path.display().to_string();
+    if std::path::MAIN_SEPARATOR == '/' {
+        rendered
+    } else {
+        rendered.replace(std::path::MAIN_SEPARATOR, "/")
     }
 }
 

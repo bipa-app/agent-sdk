@@ -396,6 +396,60 @@ mod tests {
         Ok(())
     }
 
+    /// Clear wipes every task — including parent/child chains guarded
+    /// by ON DELETE RESTRICT self-referential FKs on `SQLite`.
+    async fn test_clear_with_parent_child(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let root = fresh_root("conformance-clear", 100);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(160),
+                t_plus(101),
+            )
+            .await?;
+
+        let spec = ChildSpawnSpec { max_attempts: 3 };
+        let payload = SuspensionPayload {
+            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+                agent_sdk_core::AgentContinuation {
+                    thread_id: thread_id("conformance-clear"),
+                    turn: 1,
+                    total_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                    turn_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                    pending_tool_calls: vec![],
+                    awaiting_index: 0,
+                    completed_results: vec![],
+                    state: agent_sdk_core::AgentState::new(thread_id("conformance-clear")),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: vec![],
+                },
+            ),
+            suspended_messages: vec![],
+        };
+        let (_parent, children) = task_store
+            .spawn_tool_children(&root.id, &worker, &lease, vec![spec], payload, t_plus(102))
+            .await?;
+        assert_eq!(children.len(), 1);
+
+        // Clear must succeed despite parent→child and child→parent FK edges.
+        task_store.clear().await?;
+        assert!(task_store.get(&root.id).await?.is_none());
+        assert!(task_store.get(&children[0].id).await?.is_none());
+        Ok(())
+    }
+
     // ── Backend runners ──────────────────────────────────────────────
 
     // ── In-memory backend ────────────────────────────────────────────
@@ -466,6 +520,12 @@ mod tests {
     async fn conformance_in_memory_retry_exhaustion() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_retry_exhaustion(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_clear_parent_child() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_clear_with_parent_child(s.task.as_ref()).await
     }
 
     struct InMemoryStores {
@@ -565,5 +625,12 @@ mod tests {
     async fn conformance_sqlite_retry_exhaustion() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_retry_exhaustion(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_clear_parent_child() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_clear_with_parent_child(&store).await
     }
 }
