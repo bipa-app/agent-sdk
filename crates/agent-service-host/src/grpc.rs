@@ -236,12 +236,6 @@ impl GrpcShared {
                     child_task_ids: child_ids.iter().map(ToString::to_string).collect(),
                 }),
             ),
-            TaskState::SubagentInvocation { invocation } => Some(
-                pb::task_snapshot::StateDetail::SubagentInvocation(pb::SubagentInvocationState {
-                    child_thread_id: invocation.child_thread_id.0.clone(),
-                    child_root_task_id: invocation.child_root_task_id.to_string(),
-                }),
-            ),
             TaskState::AwaitingConfirmation {
                 continuation,
                 prepared_operation,

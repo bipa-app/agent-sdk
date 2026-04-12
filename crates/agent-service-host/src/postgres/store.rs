@@ -2228,6 +2228,7 @@ FOR UPDATE SKIP LOCKED
         let SubagentInvocationSpawn {
             child_thread_id,
             spec,
+            child_root_input,
             payload,
             spawn_index,
         } = spawn;
@@ -2238,8 +2239,9 @@ FOR UPDATE SKIP LOCKED
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
         ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
 
-        let child_root = AgentTask::new_root_turn(
+        let child_root = AgentTask::new_root_turn_with_input(
             child_thread_id.clone(),
+            child_root_input,
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         );
