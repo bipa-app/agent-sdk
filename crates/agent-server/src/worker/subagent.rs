@@ -649,6 +649,7 @@ pub async fn resolve_subagent_bootstrap(
         .spawn_index
         .context("running subagent task missing spawn_index")?;
     let pending_tool = pending_subagent_tool_call(&parent, spawn_index)?;
+    let subagent_name = canonical_subagent_name(&pending_tool.name).to_owned();
 
     Ok(SubagentTaskBootstrap {
         invocation_task: task.clone(),
@@ -657,7 +658,7 @@ pub async fn resolve_subagent_bootstrap(
         worker_id,
         lease_id,
         subagent_id: pending_tool.id,
-        subagent_name: pending_tool.name,
+        subagent_name,
         child_thread_id: linkage.child_thread_id,
         child_root_task_id: linkage.child_root_task_id,
         spec: linkage.spec,
@@ -783,9 +784,10 @@ pub async fn spawn_subagent_invocation(
         child_thread.thread_id,
         child_root_task.thread_id,
     );
+    let subagent_name = canonical_subagent_name(&pending_tool.name);
     let started_event = build_parent_progress_event(&SubagentProgressSnapshot {
         subagent_id: &pending_tool.id,
-        subagent_name: &pending_tool.name,
+        subagent_name,
         spec: &linkage.spec,
         child_thread_id: &child_thread.thread_id,
         child_root_task_id: &child_root_task.id,
@@ -796,14 +798,15 @@ pub async fn spawn_subagent_invocation(
         tool_count: 0,
         total_tokens: 0,
     });
-    let committed_events = commit_parent_subagent_progress(
+    let committed_events = commit_parent_subagent_progress_if_possible(
         deps.event_repo,
         &parent_task.thread_id,
         started_event,
         now,
+        "spawn",
+        &pending_tool.id,
     )
-    .await
-    .unwrap_or_default();
+    .await;
 
     Ok(SpawnedSubagentInvocation {
         parent_task,
@@ -920,6 +923,25 @@ async fn commit_parent_subagent_progress(
     ])
 }
 
+async fn commit_parent_subagent_progress_if_possible(
+    event_repo: &dyn EventRepository,
+    parent_thread_id: &ThreadId,
+    event: AgentEvent,
+    now: OffsetDateTime,
+    phase: &str,
+    subagent_id: &str,
+) -> Vec<CommittedEvent> {
+    match commit_parent_subagent_progress(event_repo, parent_thread_id, event, now).await {
+        Ok(events) => events,
+        Err(error) => {
+            log::warn!(
+                "Failed to commit parent subagent progress event (phase={phase}, parent_thread={parent_thread_id:?}, subagent_id={subagent_id}): {error}"
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn pending_subagent_tool_call(
     parent: &AgentTask,
     spawn_index: u32,
@@ -943,6 +965,10 @@ fn pending_subagent_tool_call(
         continuation.pending_tool_calls.len(),
     );
     Ok(continuation.pending_tool_calls[spawn_index].clone())
+}
+
+fn canonical_subagent_name(tool_name: &str) -> &str {
+    tool_name.strip_prefix("subagent_").unwrap_or(tool_name)
 }
 
 fn subagent_total_tokens(usage: &TokenUsage) -> u64 {
@@ -1054,9 +1080,15 @@ async fn commit_completed_subagent_progress(
         total_tokens: subagent_total_tokens(&summary.total_usage),
     });
 
-    commit_parent_subagent_progress(deps.event_repo, &bootstrap.thread_id, completed_event, now)
-        .await
-        .unwrap_or_default()
+    commit_parent_subagent_progress_if_possible(
+        deps.event_repo,
+        &bootstrap.thread_id,
+        completed_event,
+        now,
+        "completion",
+        &bootstrap.subagent_id,
+    )
+    .await
 }
 
 fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {

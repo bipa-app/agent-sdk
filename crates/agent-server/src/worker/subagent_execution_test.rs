@@ -122,6 +122,49 @@ impl LlmProvider for MockToolCallProvider {
     }
 }
 
+struct FailingEventRepository;
+
+#[async_trait]
+impl EventRepository for FailingEventRepository {
+    async fn commit_event(
+        &self,
+        _thread_id: &ThreadId,
+        _event: AgentEvent,
+        _now: OffsetDateTime,
+    ) -> Result<crate::journal::CommittedEvent> {
+        anyhow::bail!("synthetic event commit failure");
+    }
+
+    async fn commit_event_batch(
+        &self,
+        _thread_id: &ThreadId,
+        _events: Vec<AgentEvent>,
+        _now: OffsetDateTime,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        anyhow::bail!("synthetic event batch commit failure");
+    }
+
+    async fn next_sequence(&self, _thread_id: &ThreadId) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn get_events(
+        &self,
+        _thread_id: &ThreadId,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_events_in_range(
+        &self,
+        _thread_id: &ThreadId,
+        _after_sequence: u64,
+        _up_to_sequence: u64,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        Ok(Vec::new())
+    }
+}
+
 struct TestStores {
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
@@ -535,6 +578,7 @@ async fn materialize_subagent_result(
 
 struct ExpectedSubagentProgress<'a> {
     spawned: &'a SpawnedSubagentInvocation,
+    subagent_name: &'a str,
     completed: bool,
     success: bool,
     current_turn: u32,
@@ -563,6 +607,7 @@ async fn assert_parent_summary_progress_events(
         "spawn",
         &ExpectedSubagentProgress {
             spawned,
+            subagent_name: "researcher",
             completed: false,
             success: false,
             current_turn: 0,
@@ -575,6 +620,7 @@ async fn assert_parent_summary_progress_events(
         "completion",
         &ExpectedSubagentProgress {
             spawned,
+            subagent_name: "researcher",
             completed: true,
             success: true,
             current_turn: summary.total_turns,
@@ -597,9 +643,11 @@ fn assert_subagent_progress_event(
 
     match event {
         AgentEvent::SubagentProgress {
+            subagent_name,
             child_thread_id,
             child_root_task_id: actual_child_root_task_id,
             subagent_task_id: actual_subagent_task_id,
+            tool_name,
             completed,
             success,
             current_turn,
@@ -607,6 +655,7 @@ fn assert_subagent_progress_event(
             total_tokens,
             ..
         } => {
+            assert_eq!(subagent_name, expected.subagent_name);
             assert_eq!(
                 child_thread_id.as_ref(),
                 Some(&expected.spawned.child_thread.thread_id)
@@ -619,6 +668,7 @@ fn assert_subagent_progress_event(
                 actual_subagent_task_id.as_deref(),
                 Some(subagent_task_id.as_str())
             );
+            assert_eq!(tool_name, expected.subagent_name);
             assert_eq!(*completed, expected.completed);
             assert_eq!(*success, expected.success);
             assert_eq!(*current_turn, Some(expected.current_turn));
@@ -692,6 +742,61 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
         structured.error_details.as_deref(),
         Some("subagent execution was cancelled")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_tolerates_parent_progress_commit_failures() -> Result<()> {
+    let stores = TestStores::new();
+    let parent_thread_id = ThreadId::from_string("t-parent-subagent-progress-failure");
+    let (parent, worker, lease) =
+        create_running_parent_root(&stores.tasks, &parent_thread_id).await?;
+
+    let spawned: SpawnedSubagentInvocation = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        child_spawn(&parent_thread_id),
+        &SubagentInvocationDeps {
+            task_store: &stores.tasks,
+            thread_store: &stores.threads,
+            event_repo: &stores.events,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    let persisted_child_root = run_child_until_ready_to_resume(&stores, &spawned).await?;
+    resume_child_root_to_completion(&stores, &spawned, &persisted_child_root).await?;
+
+    let invocation_running = stores
+        .tasks
+        .try_acquire_task(
+            &spawned.invocation_task.id,
+            WorkerId::from_string("w-subagent-failing-progress"),
+            LeaseId::from_string("l-subagent-failing-progress"),
+            t_plus(60),
+            t_plus(9),
+        )
+        .await?
+        .context("claim invocation task")?;
+    let subagent_bootstrap = resolve_subagent_bootstrap(invocation_running, &stores.tasks).await?;
+    let failing_events = FailingEventRepository;
+    let subagent_outcome = execute_subagent_task(
+        subagent_bootstrap,
+        &SubagentResultDeps {
+            task_store: &stores.tasks,
+            thread_store: &stores.threads,
+            message_store: &stores.messages,
+            event_repo: &failing_events,
+        },
+        t_plus(10),
+    )
+    .await?;
+
+    assert!(subagent_outcome.tool_result.success);
+    assert!(subagent_outcome.committed_events.is_empty());
 
     Ok(())
 }

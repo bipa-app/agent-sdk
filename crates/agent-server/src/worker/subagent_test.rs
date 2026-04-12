@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::{
@@ -25,6 +26,49 @@ fn set(values: &[&str]) -> BTreeSet<String> {
 
 fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}")
+}
+
+struct FailingEventRepository;
+
+#[async_trait]
+impl EventRepository for FailingEventRepository {
+    async fn commit_event(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _event: AgentEvent,
+        _now: OffsetDateTime,
+    ) -> Result<crate::journal::CommittedEvent> {
+        anyhow::bail!("synthetic event commit failure");
+    }
+
+    async fn commit_event_batch(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _events: Vec<AgentEvent>,
+        _now: OffsetDateTime,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        anyhow::bail!("synthetic event batch commit failure");
+    }
+
+    async fn next_sequence(&self, _thread_id: &agent_sdk_core::ThreadId) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn get_events(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_events_in_range(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _after_sequence: u64,
+        _up_to_sequence: u64,
+    ) -> Result<Vec<crate::journal::CommittedEvent>> {
+        Ok(Vec::new())
+    }
 }
 
 fn sample_constraints() -> InheritedSubagentConstraints {
@@ -626,9 +670,11 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
     let expected_subagent_task_id = created.invocation_task.id.to_string();
     match &parent_events[0].event {
         AgentEvent::SubagentProgress {
+            subagent_name,
             child_thread_id,
             child_root_task_id,
             subagent_task_id,
+            tool_name,
             completed,
             success,
             current_turn,
@@ -636,6 +682,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
             total_tokens,
             ..
         } => {
+            assert_eq!(subagent_name, "researcher");
             assert_eq!(
                 child_thread_id.as_ref(),
                 Some(&created.child_thread.thread_id)
@@ -648,6 +695,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
                 subagent_task_id.as_deref(),
                 Some(expected_subagent_task_id.as_str())
             );
+            assert_eq!(tool_name, "researcher");
             assert!(!completed);
             assert!(!success);
             assert_eq!(*current_turn, Some(0));
@@ -656,6 +704,61 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
         }
         other => anyhow::bail!("expected SubagentProgress event, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = FailingEventRepository;
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let task = "Inspect durable linkage";
+    let spec = EffectiveSubagentSpec {
+        task: task.into(),
+        prompt: "Stay in read-only mode.".into(),
+        model: "claude-sonnet-4-5-20250929".into(),
+        max_turns: 5,
+        timeout_ms: 15_000,
+        nickname: Some("Scout".into()),
+        capabilities: EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["read_file", "rg"]),
+        },
+    };
+
+    let child_thread_id = agent_sdk_core::ThreadId::new();
+    let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        SubagentInvocationSpawn {
+            child_thread_id,
+            spec: spec.clone(),
+            child_root_input: child_root_input(task),
+            spawn_index: 0,
+            payload: parent_suspension_payload(&parent.thread_id, task),
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    assert_spawned_invocation_contract(
+        &task_store,
+        &thread_store,
+        &parent,
+        &created,
+        &spec,
+        "Stay in read-only mode.\n\nInspect durable linkage",
+    )
+    .await?;
+    assert!(created.committed_events.is_empty());
 
     Ok(())
 }
