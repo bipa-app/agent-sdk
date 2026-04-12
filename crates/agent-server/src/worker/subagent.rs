@@ -337,26 +337,6 @@ pub struct InheritedSubagentPolicy {
     pub audit_provider: String,
 }
 
-impl Default for InheritedSubagentPolicy {
-    fn default() -> Self {
-        Self {
-            default_model: "unknown".into(),
-            allowed_models: BTreeSet::from(["unknown".into()]),
-            default_max_turns: 1,
-            max_turns: 1,
-            default_timeout_ms: 1,
-            max_timeout_ms: 1,
-            capability_profiles: BTreeMap::new(),
-            allowed_capabilities: BTreeSet::new(),
-            max_depth: 0,
-            max_parallel_subagents: 0,
-            sandbox: SubagentSandboxPolicy::default(),
-            allowed_mcp_servers: BTreeSet::new(),
-            audit_provider: "unknown".into(),
-        }
-    }
-}
-
 impl InheritedSubagentPolicy {
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -532,6 +512,7 @@ pub struct EffectiveSubagentMcpPolicy {
 /// invocation tasks or child threads. It is the only spec the server
 /// should treat as authoritative when creating durable subagent work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "EffectiveSubagentSpecWire")]
 pub struct EffectiveSubagentSpec {
     /// Task the subagent should perform.
     pub task: String,
@@ -562,10 +543,117 @@ pub struct EffectiveSubagentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_provenance: Option<AuditProvenance>,
     /// Durable inherited policy ceiling for later nested spawns.
-    #[serde(default)]
     pub inherited_policy: InheritedSubagentPolicy,
     /// Effective capability selection.
     pub capabilities: EffectiveSubagentCapabilities,
+}
+
+#[derive(Deserialize)]
+struct EffectiveSubagentSpecWire {
+    task: String,
+    prompt: String,
+    model: String,
+    max_turns: u32,
+    timeout_ms: u64,
+    #[serde(default = "default_subagent_depth")]
+    depth: u32,
+    #[serde(default)]
+    max_parallel_subagents: u32,
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    sandbox: SubagentSandboxPolicy,
+    #[serde(default)]
+    mcp: EffectiveSubagentMcpPolicy,
+    #[serde(default)]
+    audit_provenance: Option<AuditProvenance>,
+    #[serde(default)]
+    inherited_policy: Option<InheritedSubagentPolicy>,
+    capabilities: EffectiveSubagentCapabilities,
+}
+
+impl From<EffectiveSubagentSpecWire> for EffectiveSubagentSpec {
+    fn from(wire: EffectiveSubagentSpecWire) -> Self {
+        let inherited_policy = wire
+            .inherited_policy
+            .clone()
+            .unwrap_or_else(|| wire.legacy_inherited_policy());
+        let EffectiveSubagentSpecWire {
+            task,
+            prompt,
+            model,
+            max_turns,
+            timeout_ms,
+            depth,
+            max_parallel_subagents,
+            nickname,
+            sandbox,
+            mcp,
+            audit_provenance,
+            inherited_policy: _,
+            capabilities,
+        } = wire;
+
+        Self {
+            task,
+            prompt,
+            model,
+            max_turns,
+            timeout_ms,
+            depth,
+            max_parallel_subagents,
+            nickname,
+            sandbox,
+            mcp,
+            audit_provenance,
+            inherited_policy,
+            capabilities,
+        }
+    }
+}
+
+impl EffectiveSubagentSpecWire {
+    fn legacy_inherited_policy(&self) -> InheritedSubagentPolicy {
+        let default_model =
+            normalize_optional_string(Some(&self.model)).unwrap_or_else(|| "unknown".into());
+        let allowed_capabilities = if self.capabilities.allowed.is_empty() {
+            BTreeSet::from([legacy_unavailable_capability().to_owned()])
+        } else {
+            self.capabilities.allowed.clone()
+        };
+        let profile_name = normalize_optional_string(Some(&self.capabilities.profile))
+            .unwrap_or_else(|| legacy_effective_profile_name().to_owned());
+        let audit_provider = self
+            .audit_provenance
+            .as_ref()
+            .and_then(|audit| normalize_optional_string(Some(&audit.provider)))
+            .unwrap_or_else(|| "unknown".into());
+        let mut capability_profiles = BTreeMap::new();
+        capability_profiles.insert(
+            profile_name,
+            SubagentCapabilityProfile {
+                capabilities: allowed_capabilities.clone(),
+                sandbox: self.sandbox.clone(),
+                allowed_mcp_servers: self.mcp.allowed_servers.clone(),
+            },
+        );
+
+        InheritedSubagentPolicy {
+            default_model: default_model.clone(),
+            allowed_models: BTreeSet::from([default_model]),
+            default_max_turns: self.max_turns.max(1),
+            max_turns: self.max_turns.max(1),
+            default_timeout_ms: self.timeout_ms.max(1),
+            max_timeout_ms: self.timeout_ms.max(1),
+            capability_profiles,
+            allowed_capabilities,
+            max_depth: self.depth.max(default_subagent_depth()),
+            max_parallel_subagents: self.max_parallel_subagents,
+            sandbox: self.sandbox.clone(),
+            allowed_mcp_servers: self.mcp.allowed_servers.clone(),
+            audit_provider,
+        }
+    }
 }
 
 impl EffectiveSubagentSpec {
@@ -1579,6 +1667,14 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+const fn legacy_effective_profile_name() -> &'static str {
+    "__legacy_effective__"
+}
+
+const fn legacy_unavailable_capability() -> &'static str {
+    "__legacy_unavailable__"
 }
 
 const fn default_subagent_depth() -> u32 {

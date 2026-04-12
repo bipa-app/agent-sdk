@@ -199,6 +199,57 @@ fn effective_spec_round_trips_through_json() -> Result<()> {
 }
 
 #[test]
+fn legacy_effective_spec_without_inherited_policy_deserializes_fail_closed() -> Result<()> {
+    let spec = sample_spec("Summarize the storage contract");
+    let mut json = serde_json::to_value(&spec)?;
+    let object = json
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected effective spec JSON object"))?;
+    object.remove("inherited_policy");
+
+    let legacy: EffectiveSubagentSpec = serde_json::from_value(json)?;
+    let profile = legacy
+        .inherited_policy
+        .capability_profiles
+        .get("research")
+        .ok_or_else(|| anyhow!("expected derived legacy profile"))?;
+
+    assert_eq!(
+        legacy.inherited_policy.allowed_models,
+        set(&[legacy.model.as_str()])
+    );
+    assert_eq!(
+        legacy.inherited_policy.allowed_capabilities,
+        legacy.capabilities.allowed
+    );
+    assert_eq!(legacy.inherited_policy.max_depth, legacy.depth);
+    assert_eq!(
+        legacy.inherited_policy.max_parallel_subagents,
+        legacy.max_parallel_subagents
+    );
+    assert_eq!(profile.capabilities, legacy.capabilities.allowed);
+    assert_eq!(profile.sandbox, legacy.sandbox);
+    assert_eq!(profile.allowed_mcp_servers, legacy.mcp.allowed_servers);
+
+    let err = resolve_subagent_spec(
+        &SubagentSpawnRequest::new(
+            "Inspect durable bootstrap",
+            SubagentCapabilityRequest::new("research"),
+        ),
+        &legacy.inherited_constraints(0),
+        &ServerSubagentSpawnPolicy,
+    )
+    .err()
+    .ok_or_else(|| anyhow!("expected legacy fallback constraints to fail closed"))?;
+    assert!(
+        error_text(&err).contains("depth limit exceeded"),
+        "unexpected error: {err:#}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn resolution_is_deterministic_for_same_inputs() -> Result<()> {
     let constraints = sample_constraints();
     let request = SubagentSpawnRequest::new(
