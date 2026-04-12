@@ -170,6 +170,7 @@ mod tests {
             "agent_sdk_tasks_runnable_fifo_idx",
             "agent_sdk_tasks_running_lease_expiry_idx",
             "agent_sdk_tasks_root_tree_idx",
+            "agent_sdk_tasks_subagent_child_root_waiting_idx",
             "agent_sdk_threads_active_idx",
             "agent_sdk_turn_checkpoints_latest_by_thread_idx",
             "agent_sdk_committed_events_replay_idx",
