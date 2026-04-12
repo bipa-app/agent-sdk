@@ -231,15 +231,19 @@ The `StorageBackend` enum gains a `Sqlite` variant:
 pub enum StorageBackend {
     #[default]
     InMemory,
+    Postgres,
     Sqlite {
         /// Path to the database file.
         /// Default: `$XDG_DATA_HOME/agent-sdk/agent-sdk.db`
         /// (macOS: `~/Library/Application Support/agent-sdk/agent-sdk.db`)
         path: Option<String>,
     },
-    // Postgres { url: String },  // future
 }
 ```
+
+Postgres connection settings live in a sibling `PostgresStorageConfig`
+struct (database URL, pool size, schema), keeping `StorageBackend` a
+plain backend selector.
 
 YAML configuration:
 
@@ -276,17 +280,9 @@ retention:
   checkpoint_max_per_thread: 50
 ```
 
-Additionally, the local backend respects an optional maximum database
-size.  When exceeded, the oldest completed tasks and their associated
-data are purged:
-
-```yaml
-storage:
-  backend:
-    sqlite:
-      path: null           # use platform default
-      max_size_mb: 512     # optional; null = unlimited
-```
+A size-cap policy (e.g. `max_size_mb` with oldest-first purge) is a
+potential follow-up but is **not** part of the initial scaffolding —
+`StorageBackend::Sqlite` currently exposes only a `path` field.
 
 ### Implementation structure
 

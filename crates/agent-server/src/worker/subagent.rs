@@ -935,7 +935,11 @@ async fn commit_parent_subagent_progress_if_possible(
         Ok(events) => events,
         Err(error) => {
             log::warn!(
-                "Failed to commit parent subagent progress event (phase={phase}, parent_thread={parent_thread_id:?}, subagent_id={subagent_id}): {error}"
+                phase,
+                parent_thread:? = parent_thread_id,
+                subagent_id,
+                error:? = error;
+                "Failed to commit parent subagent progress event"
             );
             Vec::new()
         }

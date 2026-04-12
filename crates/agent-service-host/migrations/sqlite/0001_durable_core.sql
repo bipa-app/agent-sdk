@@ -39,6 +39,13 @@ CREATE TABLE agent_sdk_tasks (
     CONSTRAINT agent_sdk_tasks_root_fk
         FOREIGN KEY (root_id) REFERENCES agent_sdk_tasks(id)
         ON DELETE RESTRICT,
+    -- SQLite does not support ALTER TABLE ADD CONSTRAINT for foreign
+    -- keys, but it DOES allow forward-referencing the parent table in
+    -- an inline CREATE TABLE FK because the constraint is evaluated at
+    -- DML time rather than DDL time. agent_sdk_threads is created below.
+    CONSTRAINT agent_sdk_tasks_thread_fk
+        FOREIGN KEY (thread_id) REFERENCES agent_sdk_threads(thread_id)
+        ON DELETE RESTRICT,
     CONSTRAINT agent_sdk_tasks_kind_check
         CHECK (kind IN ('root_turn', 'tool_runtime', 'subagent')),
     CONSTRAINT agent_sdk_tasks_status_check
@@ -219,6 +226,10 @@ CREATE INDEX agent_sdk_tasks_running_lease_expiry_idx
 CREATE INDEX agent_sdk_tasks_root_tree_idx
     ON agent_sdk_tasks (root_id, depth, created_at, id);
 
+CREATE INDEX agent_sdk_tasks_subagent_child_root_waiting_idx
+    ON agent_sdk_tasks (json_extract(state_json, '$.invocation.child_root_task_id'))
+    WHERE kind = 'subagent' AND status = 'waiting_on_children';
+
 CREATE TABLE agent_sdk_threads (
     thread_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -244,10 +255,8 @@ CREATE INDEX agent_sdk_threads_active_idx
     ON agent_sdk_threads (thread_id)
     WHERE status = 'active';
 
--- SQLite does not support ALTER TABLE ADD CONSTRAINT for foreign keys.
--- The thread FK on agent_sdk_tasks is enforced by application logic
--- and by the ordering guarantee: threads are always created before
--- tasks referencing them.
+-- The thread FK on agent_sdk_tasks is declared inline above; SQLite
+-- evaluates FK constraints at DML time, so forward references are safe.
 
 CREATE TABLE agent_sdk_message_heads (
     thread_id TEXT PRIMARY KEY,
