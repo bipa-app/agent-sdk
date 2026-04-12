@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, llm};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -38,8 +39,8 @@ use time::OffsetDateTime;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, LeaseId, SubagentInvocationSpawn, TaskKind, TaskStatus,
-    Thread, ThreadStore, WorkerId,
+    AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
+    SubagentInvocationSpawn, TaskKind, TaskStatus, Thread, ThreadStore, WorkerId,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -532,6 +533,7 @@ pub fn resolve_subagent_spec(
 pub struct SubagentInvocationDeps<'a> {
     pub task_store: &'a dyn AgentTaskStore,
     pub thread_store: &'a dyn ThreadStore,
+    pub event_repo: &'a dyn EventRepository,
 }
 
 /// Durable records created for one subagent spawn.
@@ -540,6 +542,7 @@ pub struct SpawnedSubagentInvocation {
     pub invocation_task: AgentTask,
     pub child_thread: Thread,
     pub child_root_task: AgentTask,
+    pub committed_events: Vec<CommittedEvent>,
 }
 
 /// Structured summary materialized from a terminal child thread.
@@ -572,6 +575,8 @@ pub struct SubagentTaskBootstrap {
     pub task_id: AgentTaskId,
     pub worker_id: WorkerId,
     pub lease_id: LeaseId,
+    pub subagent_id: String,
+    pub subagent_name: String,
     pub child_thread_id: ThreadId,
     pub child_root_task_id: AgentTaskId,
     pub spec: EffectiveSubagentSpec,
@@ -583,6 +588,7 @@ pub struct SubagentResultDeps<'a> {
     pub task_store: &'a dyn AgentTaskStore,
     pub thread_store: &'a dyn ThreadStore,
     pub message_store: &'a dyn MessageProjectionStore,
+    pub event_repo: &'a dyn EventRepository,
 }
 
 /// Successful completion of a `subagent` invocation task.
@@ -591,6 +597,7 @@ pub struct SubagentTaskOutcome {
     pub parent_task: Option<AgentTask>,
     pub subagent_result: SubagentResult,
     pub tool_result: ToolResult,
+    pub committed_events: Vec<CommittedEvent>,
 }
 
 /// Resolve a running `subagent` invocation task into trusted
@@ -633,11 +640,15 @@ pub async fn resolve_subagent_bootstrap(
         .parent_id
         .as_ref()
         .context("subagent task missing parent_id")?;
-    let _parent = task_store
+    let parent = task_store
         .get(parent_id)
         .await
         .context("failed to read subagent parent task")?
         .with_context(|| format!("subagent parent task {parent_id} does not exist"))?;
+    let spawn_index = task
+        .spawn_index
+        .context("running subagent task missing spawn_index")?;
+    let pending_tool = pending_subagent_tool_call(&parent, spawn_index)?;
 
     Ok(SubagentTaskBootstrap {
         invocation_task: task.clone(),
@@ -645,6 +656,8 @@ pub async fn resolve_subagent_bootstrap(
         task_id: task.id.clone(),
         worker_id,
         lease_id,
+        subagent_id: pending_tool.id.clone(),
+        subagent_name: pending_tool.name.clone(),
         child_thread_id: linkage.child_thread_id,
         child_root_task_id: linkage.child_root_task_id,
         spec: linkage.spec,
@@ -754,12 +767,34 @@ pub async fn execute_subagent_task(
         )
         .await
         .context("complete subagent invocation task")?;
+    let completed_event = build_parent_progress_event(
+        &bootstrap.subagent_id,
+        &bootstrap.subagent_name,
+        &bootstrap.spec,
+        &bootstrap.child_thread_id,
+        &bootstrap.child_root_task_id,
+        &bootstrap.task_id,
+        true,
+        subagent_result.summary.success,
+        subagent_result.summary.total_turns,
+        subagent_result.summary.tool_count,
+        subagent_total_tokens(&subagent_result.summary.total_usage),
+    );
+    let committed_events = commit_parent_subagent_progress(
+        deps.event_repo,
+        &bootstrap.thread_id,
+        completed_event,
+        now,
+    )
+    .await
+    .unwrap_or_default();
 
     Ok(SubagentTaskOutcome {
         invocation_task,
         parent_task,
         subagent_result,
         tool_result,
+        committed_events,
     })
 }
 
@@ -801,6 +836,8 @@ pub async fn spawn_subagent_invocation(
         spawn_index_usize < pending_tool_count,
         "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
     );
+    let pending_tool =
+        spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
     }
@@ -839,12 +876,34 @@ pub async fn spawn_subagent_invocation(
         child_thread.thread_id,
         child_root_task.thread_id,
     );
+    let started_event = build_parent_progress_event(
+        &pending_tool.id,
+        &pending_tool.name,
+        &linkage.spec,
+        &child_thread.thread_id,
+        &child_root_task.id,
+        &invocation_task.id,
+        false,
+        false,
+        0,
+        0,
+        0,
+    );
+    let committed_events = commit_parent_subagent_progress(
+        deps.event_repo,
+        &parent_task.thread_id,
+        started_event,
+        now,
+    )
+    .await
+    .unwrap_or_default();
 
     Ok(SpawnedSubagentInvocation {
         parent_task,
         invocation_task,
         child_thread,
         child_root_task,
+        committed_events,
     })
 }
 
@@ -904,6 +963,81 @@ fn build_parent_tool_result(result: &SubagentResult) -> Result<ToolResult> {
         documents: Vec::new(),
         duration_ms: Some(result.summary.duration_ms),
     })
+}
+
+fn build_parent_progress_event(
+    subagent_id: &str,
+    subagent_name: &str,
+    spec: &EffectiveSubagentSpec,
+    child_thread_id: &ThreadId,
+    child_root_task_id: &AgentTaskId,
+    subagent_task_id: &AgentTaskId,
+    completed: bool,
+    success: bool,
+    current_turn: u32,
+    tool_count: u32,
+    total_tokens: u64,
+) -> AgentEvent {
+    AgentEvent::SubagentProgress {
+        subagent_id: subagent_id.to_owned(),
+        subagent_name: subagent_name.to_owned(),
+        nickname: spec.nickname.clone(),
+        child_thread_id: Some(child_thread_id.clone()),
+        child_root_task_id: Some(child_root_task_id.to_string()),
+        subagent_task_id: Some(subagent_task_id.to_string()),
+        max_turns: Some(spec.max_turns),
+        current_turn: Some(current_turn),
+        model: Some(spec.model.clone()),
+        tool_name: subagent_name.to_owned(),
+        tool_context: spec.task.clone(),
+        completed,
+        success,
+        tool_count,
+        total_tokens,
+    }
+}
+
+async fn commit_parent_subagent_progress(
+    event_repo: &dyn EventRepository,
+    parent_thread_id: &ThreadId,
+    event: AgentEvent,
+    now: OffsetDateTime,
+) -> Result<Vec<CommittedEvent>> {
+    Ok(vec![
+        event_repo
+            .commit_event(parent_thread_id, event, now)
+            .await
+            .context("commit parent subagent progress event")?,
+    ])
+}
+
+fn pending_subagent_tool_call(
+    parent: &AgentTask,
+    spawn_index: u32,
+) -> Result<agent_sdk_core::PendingToolCallInfo> {
+    let spawn_index = usize::try_from(spawn_index).context("subagent spawn_index exceeds usize")?;
+    let continuation = match &parent.state {
+        crate::journal::task_state::TaskState::WaitingOnChildren { continuation, .. }
+        | crate::journal::task_state::TaskState::ReadyToResume { continuation, .. } => {
+            &continuation.payload
+        }
+        other => {
+            anyhow::bail!(
+                "subagent parent task {} missing continuation state, got {other:?}",
+                parent.id,
+            );
+        }
+    };
+    ensure!(
+        spawn_index < continuation.pending_tool_calls.len(),
+        "subagent spawn_index {spawn_index} out of bounds for {} parent pending tool calls",
+        continuation.pending_tool_calls.len(),
+    );
+    Ok(continuation.pending_tool_calls[spawn_index].clone())
+}
+
+fn subagent_total_tokens(usage: &TokenUsage) -> u64 {
+    u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
 }
 
 fn elapsed_ms(start: OffsetDateTime, end: OffsetDateTime) -> u64 {

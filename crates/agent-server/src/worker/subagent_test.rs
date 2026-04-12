@@ -4,10 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow};
 
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::{
     AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
     SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
 };
+use agent_sdk_core::events::AgentEvent;
 use time::{Duration, OffsetDateTime};
 
 use super::subagent::{
@@ -570,6 +572,7 @@ async fn assert_spawned_invocation_contract(
 async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<()> {
     let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
     let task = "Inspect durable linkage";
     let spec = EffectiveSubagentSpec {
@@ -600,6 +603,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
+            event_repo: &event_repo,
         },
         t_plus(2),
     )
@@ -613,5 +617,45 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
         &spec,
         "Stay in read-only mode.\n\nInspect durable linkage",
     )
-    .await
+    .await?;
+
+    assert_eq!(created.committed_events.len(), 1);
+    let parent_events = event_repo.get_events(&parent.thread_id).await?;
+    assert_eq!(parent_events.len(), 1);
+    let expected_child_root_task_id = created.child_root_task.id.to_string();
+    let expected_subagent_task_id = created.invocation_task.id.to_string();
+    match &parent_events[0].event {
+        AgentEvent::SubagentProgress {
+            child_thread_id,
+            child_root_task_id,
+            subagent_task_id,
+            completed,
+            success,
+            current_turn,
+            tool_count,
+            total_tokens,
+            ..
+        } => {
+            assert_eq!(
+                child_thread_id.as_ref(),
+                Some(&created.child_thread.thread_id)
+            );
+            assert_eq!(
+                child_root_task_id.as_deref(),
+                Some(expected_child_root_task_id.as_str())
+            );
+            assert_eq!(
+                subagent_task_id.as_deref(),
+                Some(expected_subagent_task_id.as_str())
+            );
+            assert!(!completed);
+            assert!(!success);
+            assert_eq!(*current_turn, Some(0));
+            assert_eq!(*tool_count, 0);
+            assert_eq!(*total_tokens, 0);
+        }
+        other => anyhow::bail!("expected SubagentProgress event, got {other:?}"),
+    }
+
+    Ok(())
 }

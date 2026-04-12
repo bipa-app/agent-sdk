@@ -8,7 +8,7 @@ use super::subagent::{
 };
 use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
-use crate::journal::event_repository::InMemoryEventRepository;
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -22,7 +22,7 @@ use agent_sdk_core::llm::{
 };
 use agent_sdk_core::{
     AgentContinuation, AgentState, PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, ToolTier,
-    llm,
+    events::AgentEvent, llm,
 };
 use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result};
@@ -158,6 +158,7 @@ impl TestStores {
             task_store: &self.tasks,
             thread_store: &self.threads,
             message_store: &self.messages,
+            event_repo: &self.events,
         }
     }
 }
@@ -525,6 +526,86 @@ async fn materialize_subagent_result(
     assert_eq!(structured.child_thread_id, spawned.child_thread.thread_id);
     assert_eq!(structured.child_root_task_id, spawned.child_root_task.id);
     assert_eq!(structured.subagent_task_id, spawned.invocation_task.id);
+    let parent_events = stores
+        .events
+        .get_events(&spawned.parent_task.thread_id)
+        .await?;
+    assert_eq!(parent_events.len(), 2);
+    assert!(
+        parent_events
+            .iter()
+            .all(|event| matches!(event.event, AgentEvent::SubagentProgress { .. }))
+    );
+    let spawned_child_root = spawned.child_root_task.id.to_string();
+    let spawned_subagent_task = spawned.invocation_task.id.to_string();
+    match &parent_events[0].event {
+        AgentEvent::SubagentProgress {
+            child_thread_id,
+            child_root_task_id,
+            subagent_task_id,
+            completed,
+            success,
+            current_turn,
+            tool_count,
+            total_tokens,
+            ..
+        } => {
+            assert_eq!(
+                child_thread_id.as_ref(),
+                Some(&spawned.child_thread.thread_id)
+            );
+            assert_eq!(
+                child_root_task_id.as_deref(),
+                Some(spawned_child_root.as_str())
+            );
+            assert_eq!(
+                subagent_task_id.as_deref(),
+                Some(spawned_subagent_task.as_str())
+            );
+            assert!(!completed);
+            assert!(!success);
+            assert_eq!(*current_turn, Some(0));
+            assert_eq!(*tool_count, 0);
+            assert_eq!(*total_tokens, 0);
+        }
+        other => anyhow::bail!("expected spawn SubagentProgress, got {other:?}"),
+    }
+    match &parent_events[1].event {
+        AgentEvent::SubagentProgress {
+            child_thread_id,
+            child_root_task_id,
+            subagent_task_id,
+            completed,
+            success,
+            current_turn,
+            tool_count,
+            total_tokens,
+            ..
+        } => {
+            assert_eq!(
+                child_thread_id.as_ref(),
+                Some(&spawned.child_thread.thread_id)
+            );
+            assert_eq!(
+                child_root_task_id.as_deref(),
+                Some(spawned_child_root.as_str())
+            );
+            assert_eq!(
+                subagent_task_id.as_deref(),
+                Some(spawned_subagent_task.as_str())
+            );
+            assert!(*completed);
+            assert!(*success);
+            assert_eq!(*current_turn, Some(structured.summary.total_turns));
+            assert_eq!(*tool_count, structured.summary.tool_count);
+            assert_eq!(
+                *total_tokens,
+                u64::from(structured.summary.total_usage.input_tokens)
+                    + u64::from(structured.summary.total_usage.output_tokens)
+            );
+        }
+        other => anyhow::bail!("expected completion SubagentProgress, got {other:?}"),
+    }
 
     let persisted_invocation = stores
         .tasks
@@ -555,6 +636,7 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
         &SubagentInvocationDeps {
             task_store: &stores.tasks,
             thread_store: &stores.threads,
+            event_repo: &stores.events,
         },
         t_plus(2),
     )
@@ -650,6 +732,7 @@ async fn child_thread_reuses_root_turn_and_tool_runtime_before_materializing_par
         &SubagentInvocationDeps {
             task_store: &stores.tasks,
             thread_store: &stores.threads,
+            event_repo: &stores.events,
         },
         t_plus(2),
     )
@@ -658,6 +741,25 @@ async fn child_thread_reuses_root_turn_and_tool_runtime_before_materializing_par
     let persisted_child_root = run_child_until_ready_to_resume(&stores, &spawned).await?;
     resume_child_root_to_completion(&stores, &spawned, &persisted_child_root).await?;
     let subagent_outcome = materialize_subagent_result(&stores, &spawned).await?;
+    let child_events = stores
+        .events
+        .get_events(&spawned.child_thread.thread_id)
+        .await?;
+    assert!(
+        child_events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::ToolCallStart { .. }))
+    );
+    assert!(
+        child_events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::ToolCallEnd { .. }))
+    );
+    assert!(
+        child_events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::Done { .. }))
+    );
     let parent_ready = subagent_outcome
         .parent_task
         .clone()

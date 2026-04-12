@@ -678,7 +678,12 @@ async fn execute_subagent_task_entry(task: AgentTask, stores: &StoreRegistry) ->
     };
 
     match execute_subagent_task(bootstrap, &stores.subagent_result_deps(), now).await {
-        Ok(SubagentTaskOutcome { .. }) => Ok(()),
+        Ok(SubagentTaskOutcome {
+            committed_events, ..
+        }) => {
+            publish_events(stores, &committed_events);
+            Ok(())
+        }
         Err(err) => {
             stores
                 .task_store
