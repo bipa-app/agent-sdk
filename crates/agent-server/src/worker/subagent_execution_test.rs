@@ -319,10 +319,10 @@ fn child_spawn(thread_id: &ThreadId) -> crate::journal::SubagentInvocationSpawn 
     }
 }
 
-async fn run_child_until_ready_to_resume(
+async fn suspend_child_root_on_tool_call(
     stores: &TestStores,
     spawned: &SpawnedSubagentInvocation,
-) -> Result<AgentTask> {
+) -> Result<Vec<AgentTask>> {
     let child_running = stores
         .tasks
         .try_acquire_task(
@@ -358,6 +358,15 @@ async fn run_child_until_ready_to_resume(
         anyhow::bail!("expected child root to suspend on tool call");
     };
     assert_eq!(tool_tasks.len(), 1);
+
+    Ok(tool_tasks)
+}
+
+async fn run_child_until_ready_to_resume(
+    stores: &TestStores,
+    spawned: &SpawnedSubagentInvocation,
+) -> Result<AgentTask> {
+    let tool_tasks = suspend_child_root_on_tool_call(stores, spawned).await?;
 
     let tool_running = stores
         .tasks
@@ -471,7 +480,7 @@ async fn resume_child_root_to_completion(
     Ok(())
 }
 
-async fn materialize_subagent_result(
+async fn execute_subagent_invocation(
     stores: &TestStores,
     spawned: &SpawnedSubagentInvocation,
 ) -> Result<SubagentTaskOutcome> {
@@ -487,8 +496,14 @@ async fn materialize_subagent_result(
         .await?
         .context("claim invocation task")?;
     let subagent_bootstrap = resolve_subagent_bootstrap(invocation_running, &stores.tasks).await?;
-    let subagent_outcome =
-        execute_subagent_task(subagent_bootstrap, &stores.subagent_deps(), t_plus(10)).await?;
+    execute_subagent_task(subagent_bootstrap, &stores.subagent_deps(), t_plus(10)).await
+}
+
+async fn materialize_subagent_result(
+    stores: &TestStores,
+    spawned: &SpawnedSubagentInvocation,
+) -> Result<SubagentTaskOutcome> {
+    let subagent_outcome = execute_subagent_invocation(stores, spawned).await?;
     assert_eq!(
         subagent_outcome.invocation_task.status,
         crate::journal::task::TaskStatus::Completed
@@ -523,6 +538,53 @@ async fn materialize_subagent_result(
     assert_eq!(persisted_tool_result.output, "child final response");
 
     Ok(subagent_outcome)
+}
+
+#[tokio::test]
+async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result<()> {
+    let stores = TestStores::new();
+    let parent_thread_id = ThreadId::from_string("t-parent-subagent-cancel");
+    let (parent, worker, lease) =
+        create_running_parent_root(&stores.tasks, &parent_thread_id).await?;
+
+    let spawned: SpawnedSubagentInvocation = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        child_spawn(&parent_thread_id),
+        &SubagentInvocationDeps {
+            task_store: &stores.tasks,
+            thread_store: &stores.threads,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    let tool_tasks = suspend_child_root_on_tool_call(&stores, &spawned).await?;
+    let transitioned = stores
+        .tasks
+        .cancel_tree(&spawned.child_root_task.id, t_plus(5))
+        .await?;
+    assert!(transitioned.contains(&spawned.child_root_task.id));
+    assert!(transitioned.contains(&tool_tasks[0].id));
+
+    let subagent_outcome = execute_subagent_invocation(&stores, &spawned).await?;
+    assert!(!subagent_outcome.tool_result.success);
+
+    let result_data = subagent_outcome
+        .tool_result
+        .data
+        .context("subagent tool result data missing")?;
+    let structured: SubagentResult =
+        serde_json::from_value(result_data).context("decode cancelled SubagentResult")?;
+    assert_eq!(structured.summary.tool_count, 0);
+    assert!(!structured.summary.success);
+    assert_eq!(
+        structured.error_details.as_deref(),
+        Some("subagent execution was cancelled")
+    );
+
+    Ok(())
 }
 
 async fn resume_parent_after_subagent(

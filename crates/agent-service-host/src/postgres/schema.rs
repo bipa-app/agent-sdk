@@ -298,6 +298,12 @@ const AGENT_SDK_TASK_INDEXES: &[IndexContract] = &[
         predicate: None,
         purpose: "Keeps task-tree traversals and root-scoped inspection predictable.",
     },
+    IndexContract {
+        name: "agent_sdk_tasks_subagent_child_root_waiting_idx",
+        key_columns: "((state_json -> 'invocation' ->> 'child_root_task_id'))",
+        predicate: Some("kind = 'subagent' AND status = 'waiting_on_children'"),
+        purpose: "Makes linked subagent invocation wake-ups an indexed lookup on child root completion.",
+    },
 ];
 
 const AGENT_SDK_THREAD_COLUMNS: &[ColumnContract] = &[

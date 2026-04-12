@@ -714,7 +714,10 @@ pub async fn execute_subagent_task(
     let tool_count = u32::try_from(
         thread_tasks
             .iter()
-            .filter(|task| task.kind == TaskKind::ToolRuntime)
+            .filter(|task| {
+                task.kind == TaskKind::ToolRuntime
+                    && matches!(task.status, TaskStatus::Completed | TaskStatus::Failed)
+            })
             .count(),
     )
     .context("child tool count exceeds u32")?;

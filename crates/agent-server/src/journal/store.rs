@@ -1239,7 +1239,8 @@ impl Inner {
             .fail_with_reason(reason, now)
             .context("fail_row_closed: fail_with_reason transition failed")?;
         self.rebalance_after_row_change(old, &failed);
-        self.by_id.insert(failed.id.clone(), failed);
+        self.by_id.insert(failed.id.clone(), failed.clone());
+        let _ = self.propagate_terminal_child_transition(&failed, now, "fail_row_closed")?;
         Ok(())
     }
 
@@ -1323,7 +1324,8 @@ impl Inner {
             .cancel(now)
             .context("cancel_tree: cancel transition failed")?;
         self.rebalance_after_row_change(&old, &cancelled);
-        self.by_id.insert(cancelled.id.clone(), cancelled);
+        self.by_id.insert(cancelled.id.clone(), cancelled.clone());
+        let _ = self.propagate_terminal_child_transition(&cancelled, now, "cancel_tree")?;
         Ok(true)
     }
 
@@ -1379,6 +1381,17 @@ impl Inner {
         self.rebalance_after_row_change(&old_child, &new_child);
         self.by_id.insert(new_child.id.clone(), new_child.clone());
 
+        let parent = self.propagate_terminal_child_transition(&new_child, now, error_prefix)?;
+
+        Ok((new_child, parent))
+    }
+
+    fn propagate_terminal_child_transition(
+        &mut self,
+        new_child: &AgentTask,
+        now: OffsetDateTime,
+        error_prefix: &'static str,
+    ) -> Result<Option<AgentTask>> {
         // Phase 2.6 recompute: the parent's counter is derived from
         // the `by_parent` index so a double-complete or a dropped
         // complete cannot silently corrupt it. If the parent has
@@ -1387,13 +1400,11 @@ impl Inner {
         // finish), we still let the child's terminal transition
         // land but leave the parent alone — the parent has already
         // been moved to a terminal status and must not be reopened.
-        let parent = if let Some(parent_id) = &new_child.parent_id {
+        if let Some(parent_id) = &new_child.parent_id {
             let Some(old_parent) = self.by_id.get(parent_id).cloned() else {
-                // A missing parent row is an internal bookkeeping
-                // bug — the cross-row insert guard refuses to accept
-                // a child with an unknown parent. Surface it loud.
                 return Err(anyhow!(
-                    "{error_prefix}: child {child_id} references missing parent {parent_id}"
+                    "{error_prefix}: child {} references missing parent {parent_id}",
+                    new_child.id
                 ));
             };
             if old_parent.status == TaskStatus::WaitingOnChildren {
@@ -1406,20 +1417,15 @@ impl Inner {
                     })?;
                 self.rebalance_after_row_change(&old_parent, &new_parent);
                 self.by_id.insert(new_parent.id.clone(), new_parent.clone());
-                Some(new_parent)
+                Ok(Some(new_parent))
             } else {
-                // Parent has already left the waiting state — e.g. a
-                // tree-cancel, an earlier recompute that resumed it,
-                // or a manual transition. Leave it alone.
-                Some(old_parent)
+                Ok(Some(old_parent))
             }
         } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
-            self.resume_linked_subagent_invocation(&new_child, now, error_prefix)?
+            self.resume_linked_subagent_invocation(new_child, now, error_prefix)
         } else {
-            None
-        };
-
-        Ok((new_child, parent))
+            Ok(None)
+        }
     }
 
     fn resume_linked_subagent_invocation(
@@ -6314,6 +6320,61 @@ mod tests {
         }]
     }
 
+    async fn spawn_subagent_fixture(
+        store: &InMemoryAgentTaskStore,
+        thread_name: &str,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let (parent, worker, lease) = running_root_for_spawn(store, thread_name).await?;
+        let parent_id = parent.id.clone();
+        let child_thread_id = thread(&format!("{thread_name}-child"));
+        store
+            .spawn_subagent_invocation(
+                &parent_id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id,
+                    spec: sample_subagent_spec(),
+                    child_root_input: sample_subagent_input(),
+                    spawn_index: 0,
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation(thread_name),
+                        suspended_messages: Vec::new(),
+                    },
+                },
+                t_plus(2),
+            )
+            .await
+    }
+
+    async fn exhaust_retry_budget(
+        store: &InMemoryAgentTaskStore,
+        task_id: &AgentTaskId,
+        max_attempts: u32,
+        worker_prefix: &str,
+        start_secs: i64,
+    ) -> Result<Vec<RecoveryRecord>> {
+        let mut last_sweep = Vec::new();
+        for attempt in 0..max_attempts {
+            let offset = i64::from(attempt) * 10;
+            let running = store
+                .try_acquire_task(
+                    task_id,
+                    WorkerId::from_string(format!("{worker_prefix}-{attempt}")),
+                    LeaseId::from_string(format!("l-{worker_prefix}-{attempt}")),
+                    t_plus(start_secs + offset + 5),
+                    t_plus(start_secs + offset + 1),
+                )
+                .await?
+                .with_context(|| format!("claim {task_id} attempt {}", attempt + 1))?;
+            assert_eq!(running.status, TaskStatus::Running);
+            last_sweep = store
+                .release_expired_leases(t_plus(start_secs + offset + 6))
+                .await?;
+        }
+        Ok(last_sweep)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_tool_children_creates_batch_and_parks_parent() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
@@ -6658,6 +6719,82 @@ mod tests {
             .context("claim resumed invocation")?;
         assert_eq!(claimed_invocation.status, TaskStatus::Running);
         assert!(claimed_invocation.state.subagent_invocation().is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_on_child_root_wakes_linked_subagent_invocation() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-subagent-cancel").await?;
+
+        let transitioned = store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        assert_eq!(transitioned, vec![child_root.id.clone()]);
+
+        let resumed_invocation = store
+            .get(&invocation.id)
+            .await?
+            .context("invocation exists after cancel")?;
+        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
+        assert_eq!(resumed_invocation.pending_child_count, 0);
+        assert!(resumed_invocation.state.subagent_invocation().is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_closed_subagent_paths_keep_invocation_and_parent_runnable() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-subagent-fail-closed").await?;
+
+        let child_sweep = exhaust_retry_budget(
+            &store,
+            &child_root.id,
+            child_root.max_attempts,
+            "w-child",
+            3,
+        )
+        .await?;
+        assert_eq!(
+            child_sweep,
+            vec![RecoveryRecord::failed_closed(
+                child_root.id.clone(),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            )],
+        );
+
+        let resumed_invocation = store
+            .get(&invocation.id)
+            .await?
+            .context("invocation exists after child fail-closed")?;
+        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
+        assert_eq!(resumed_invocation.pending_child_count, 0);
+
+        let invocation_sweep = exhaust_retry_budget(
+            &store,
+            &invocation.id,
+            invocation.max_attempts,
+            "w-subagent",
+            40,
+        )
+        .await?;
+        assert_eq!(
+            invocation_sweep,
+            vec![RecoveryRecord::failed_closed(
+                invocation.id.clone(),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            )],
+        );
+
+        let resumed_parent = store.get(&parent.id).await?.context("parent exists")?;
+        assert_eq!(resumed_parent.status, TaskStatus::Pending);
+        assert_eq!(resumed_parent.pending_child_count, 0);
+        assert!(matches!(
+            resumed_parent.state,
+            TaskState::ReadyToResume { .. }
+        ));
 
         Ok(())
     }

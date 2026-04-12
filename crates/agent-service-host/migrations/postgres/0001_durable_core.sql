@@ -210,6 +210,10 @@ CREATE INDEX agent_sdk_tasks_running_lease_expiry_idx
 CREATE INDEX agent_sdk_tasks_root_tree_idx
     ON agent_sdk_tasks (root_id, depth, created_at, id);
 
+CREATE INDEX agent_sdk_tasks_subagent_child_root_waiting_idx
+    ON agent_sdk_tasks ((state_json -> 'invocation' ->> 'child_root_task_id'))
+    WHERE kind = 'subagent' AND status = 'waiting_on_children';
+
 CREATE TABLE agent_sdk_threads (
     thread_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
