@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sdk_outbox SET status = 'claimed', claimed_by = ?2, claimed_at = ?3 WHERE id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "0b7cb254b3b1a83c09848b3525f87e13892a9a1dcef25b4513c2c950107fa65d"
+}

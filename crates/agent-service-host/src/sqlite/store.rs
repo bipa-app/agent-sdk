@@ -6,8 +6,11 @@
 //! - **No row-level locking.** `SQLite` serialises all writes at the
 //!   database level. `BEGIN IMMEDIATE` replaces `FOR UPDATE` / `SKIP
 //!   LOCKED`.
-//! - **Runtime SQL only.** Uses `sqlx::query()` with `.bind()` instead
-//!   of the compile-time `sqlx::query!()` macro.
+//! - **Compile-time checked writes.** INSERT / UPDATE / DELETE use
+//!   `sqlx::query!()` macros for compile-time SQL validation.  SELECT
+//!   queries use runtime `sqlx::query_as::<_, Record>()` with
+//!   `#[derive(FromRow)]` because `SQLite`'s weak type system requires
+//!   verbose column-level type annotations in `query_as!()`.
 //! - **TEXT for timestamps and JSON.** `SQLite` stores `OffsetDateTime`
 //!   as ISO 8601 TEXT and JSON values as TEXT.
 
@@ -18,7 +21,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
@@ -118,7 +121,7 @@ impl SqliteDurableStore {
                         let row = sqlx::query("PRAGMA journal_mode = WAL")
                             .fetch_one(&mut *conn)
                             .await?;
-                        let mode: String = row.get(0);
+                        let mode: String = sqlx::Row::get(&row, 0);
                         if mode != "wal" {
                             return Err(sqlx::Error::Protocol(format!(
                                 "failed to enable WAL mode: got '{mode}'"
@@ -184,7 +187,12 @@ impl SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<()> {
         let bootstrap = Thread::new(thread_id.clone(), now);
-        sqlx::query(
+        let thread_id_key = thread_key(&bootstrap.thread_id);
+        let status_wire = enum_to_wire(&bootstrap.status)?;
+        let committed_turns = i64::from(bootstrap.committed_turns);
+        let input_tokens = i64::from(bootstrap.total_usage.input_tokens);
+        let output_tokens = i64::from(bootstrap.total_usage.output_tokens);
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id, status, committed_turns,
@@ -192,14 +200,14 @@ INSERT INTO agent_sdk_threads (
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT (thread_id) DO NOTHING
 ",
+            thread_id_key,
+            status_wire,
+            committed_turns,
+            input_tokens,
+            output_tokens,
+            bootstrap.created_at,
+            bootstrap.updated_at,
         )
-        .bind(thread_key(&bootstrap.thread_id))
-        .bind(enum_to_wire(&bootstrap.status)?)
-        .bind(i64::from(bootstrap.committed_turns))
-        .bind(i64::from(bootstrap.total_usage.input_tokens))
-        .bind(i64::from(bootstrap.total_usage.output_tokens))
-        .bind(bootstrap.created_at)
-        .bind(bootstrap.updated_at)
         .execute(&mut **tx)
         .await
         .context("bootstrap thread row")?;
@@ -242,7 +250,12 @@ WHERE thread_id = ?1
     }
 
     async fn upsert_thread_tx(tx: &mut Transaction<'_, Sqlite>, thread: &Thread) -> Result<()> {
-        sqlx::query(
+        let thread_id_key = thread_key(&thread.thread_id);
+        let status_wire = enum_to_wire(&thread.status)?;
+        let committed_turns = i64::from(thread.committed_turns);
+        let input_tokens = i64::from(thread.total_usage.input_tokens);
+        let output_tokens = i64::from(thread.total_usage.output_tokens);
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_threads (
     thread_id, status, committed_turns,
@@ -255,14 +268,14 @@ ON CONFLICT (thread_id) DO UPDATE SET
     total_output_tokens = excluded.total_output_tokens,
     updated_at = excluded.updated_at
 ",
+            thread_id_key,
+            status_wire,
+            committed_turns,
+            input_tokens,
+            output_tokens,
+            thread.created_at,
+            thread.updated_at,
         )
-        .bind(thread_key(&thread.thread_id))
-        .bind(enum_to_wire(&thread.status)?)
-        .bind(i64::from(thread.committed_turns))
-        .bind(i64::from(thread.total_usage.input_tokens))
-        .bind(i64::from(thread.total_usage.output_tokens))
-        .bind(thread.created_at)
-        .bind(thread.updated_at)
         .execute(&mut **tx)
         .await
         .context("upsert thread")?;
@@ -317,7 +330,10 @@ WHERE thread_id = ?1
         tx: &mut Transaction<'_, Sqlite>,
         projection: &MessageProjection,
     ) -> Result<()> {
-        sqlx::query(
+        let thread_id_key = thread_key(&projection.thread_id);
+        let history_json = json_to_value(&projection.messages, "message head history")?;
+        let version = i64_from_u64(projection.version, "message head version")?;
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_message_heads (thread_id, history_json, version, created_at, updated_at)
 VALUES (?1, ?2, ?3, ?4, ?5)
@@ -326,12 +342,12 @@ ON CONFLICT (thread_id) DO UPDATE SET
     version = excluded.version,
     updated_at = excluded.updated_at
 ",
+            thread_id_key,
+            history_json,
+            version,
+            projection.created_at,
+            projection.updated_at,
         )
-        .bind(thread_key(&projection.thread_id))
-        .bind(json_to_value(&projection.messages, "message head history")?)
-        .bind(i64_from_u64(projection.version, "message head version")?)
-        .bind(projection.created_at)
-        .bind(projection.updated_at)
         .execute(&mut **tx)
         .await
         .context("upsert message head")?;
@@ -347,19 +363,24 @@ ON CONFLICT (thread_id) DO UPDATE SET
         messages: &[llm::Message],
         now: OffsetDateTime,
     ) -> Result<()> {
-        sqlx::query(
+        let thread_id_key = thread_key(thread_id);
+        let turn_number_i64 = i64::from(turn_number);
+        let task_id_str = task_id.as_str();
+        let head_version_after = i64_from_u64(version, "message commit version")?;
+        let batch_json = json_to_value(messages, "message commit messages")?;
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_message_commits
     (thread_id, turn_number, task_id, head_version_after, batch_json, committed_at)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ",
+            thread_id_key,
+            turn_number_i64,
+            task_id_str,
+            head_version_after,
+            batch_json,
+            now,
         )
-        .bind(thread_key(thread_id))
-        .bind(i64::from(turn_number))
-        .bind(task_id.as_str())
-        .bind(i64_from_u64(version, "message commit version")?)
-        .bind(json_to_value(messages, "message commit messages")?)
-        .bind(now)
         .execute(&mut **tx)
         .await
         .context("insert message commit")?;
@@ -409,7 +430,20 @@ WHERE id = ?1
         tx: &mut Transaction<'_, Sqlite>,
         attempt: &TurnAttempt,
     ) -> Result<()> {
-        sqlx::query(
+        let id = attempt.id.as_str();
+        let task_id = attempt.task_id.as_str();
+        let attempt_number = i64::from(attempt.attempt_number);
+        let response_id = attempt.response_id.as_deref();
+        let response_model = attempt.response_model.as_deref();
+        let stop_reason = optional_enum_to_wire(attempt.stop_reason.as_ref())?;
+        let outcome = optional_enum_to_wire(attempt.outcome.as_ref())?;
+        let input_tokens = attempt.input_tokens.map(i64::from);
+        let output_tokens = attempt.output_tokens.map(i64::from);
+        let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
+        let duration_ms = attempt
+            .duration_ms
+            .map(|v| i64::try_from(v).expect("duration_ms fits i64"));
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_attempts (
     id, task_id, attempt_number, provider, requested_model,
@@ -418,27 +452,23 @@ INSERT INTO agent_sdk_turn_attempts (
     cached_input_tokens, opened_at, closed_at, duration_ms
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
 ",
-        )
-        .bind(attempt.id.as_str())
-        .bind(attempt.task_id.as_str())
-        .bind(i64::from(attempt.attempt_number))
-        .bind(&attempt.provider)
-        .bind(&attempt.requested_model)
-        .bind(&attempt.request_blob)
-        .bind(&attempt.response_blob)
-        .bind(attempt.response_id.as_deref())
-        .bind(attempt.response_model.as_deref())
-        .bind(optional_enum_to_wire(attempt.stop_reason.as_ref())?)
-        .bind(optional_enum_to_wire(attempt.outcome.as_ref())?)
-        .bind(attempt.input_tokens.map(i64::from))
-        .bind(attempt.output_tokens.map(i64::from))
-        .bind(attempt.cached_input_tokens.map(i64::from))
-        .bind(attempt.opened_at)
-        .bind(attempt.closed_at)
-        .bind(
-            attempt
-                .duration_ms
-                .map(|v| i64::try_from(v).expect("duration_ms fits i64")),
+            id,
+            task_id,
+            attempt_number,
+            attempt.provider,
+            attempt.requested_model,
+            attempt.request_blob,
+            attempt.response_blob,
+            response_id,
+            response_model,
+            stop_reason,
+            outcome,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            attempt.opened_at,
+            attempt.closed_at,
+            duration_ms,
         )
         .execute(&mut **tx)
         .await
@@ -450,7 +480,18 @@ INSERT INTO agent_sdk_turn_attempts (
         tx: &mut Transaction<'_, Sqlite>,
         attempt: &TurnAttempt,
     ) -> Result<()> {
-        let result = sqlx::query(
+        let id = attempt.id.as_str();
+        let response_id = attempt.response_id.as_deref();
+        let response_model = attempt.response_model.as_deref();
+        let stop_reason = optional_enum_to_wire(attempt.stop_reason.as_ref())?;
+        let outcome = optional_enum_to_wire(attempt.outcome.as_ref())?;
+        let input_tokens = attempt.input_tokens.map(i64::from);
+        let output_tokens = attempt.output_tokens.map(i64::from);
+        let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
+        let duration_ms = attempt
+            .duration_ms
+            .map(|v| i64::try_from(v).expect("duration_ms fits i64"));
+        let result = sqlx::query!(
             r"
 UPDATE agent_sdk_turn_attempts SET
     response_blob = ?2, response_id = ?3, response_model = ?4,
@@ -458,21 +499,17 @@ UPDATE agent_sdk_turn_attempts SET
     cached_input_tokens = ?9, closed_at = ?10, duration_ms = ?11
 WHERE id = ?1
 ",
-        )
-        .bind(attempt.id.as_str())
-        .bind(&attempt.response_blob)
-        .bind(attempt.response_id.as_deref())
-        .bind(attempt.response_model.as_deref())
-        .bind(optional_enum_to_wire(attempt.stop_reason.as_ref())?)
-        .bind(optional_enum_to_wire(attempt.outcome.as_ref())?)
-        .bind(attempt.input_tokens.map(i64::from))
-        .bind(attempt.output_tokens.map(i64::from))
-        .bind(attempt.cached_input_tokens.map(i64::from))
-        .bind(attempt.closed_at)
-        .bind(
-            attempt
-                .duration_ms
-                .map(|v| i64::try_from(v).expect("duration_ms fits i64")),
+            id,
+            attempt.response_blob,
+            response_id,
+            response_model,
+            stop_reason,
+            outcome,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            attempt.closed_at,
+            duration_ms,
         )
         .execute(&mut **tx)
         .await
@@ -505,23 +542,30 @@ WHERE id = ?1
         tx: &mut Transaction<'_, Sqlite>,
         checkpoint: &Checkpoint,
     ) -> Result<()> {
-        sqlx::query(
+        let id = checkpoint.id.as_str();
+        let thread_id_key = thread_key(&checkpoint.thread_id);
+        let turn_number = i64::from(checkpoint.turn_number);
+        let task_id = checkpoint.task_id.as_str();
+        let messages_json = json_to_value(&checkpoint.messages, "checkpoint messages")?;
+        let turn_input_tokens = i64::from(checkpoint.turn_usage.input_tokens);
+        let turn_output_tokens = i64::from(checkpoint.turn_usage.output_tokens);
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_checkpoints (
     id, thread_id, turn_number, task_id, messages_json,
     agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ",
+            id,
+            thread_id_key,
+            turn_number,
+            task_id,
+            messages_json,
+            checkpoint.agent_state_snapshot,
+            turn_input_tokens,
+            turn_output_tokens,
+            checkpoint.created_at,
         )
-        .bind(checkpoint.id.as_str())
-        .bind(thread_key(&checkpoint.thread_id))
-        .bind(i64::from(checkpoint.turn_number))
-        .bind(checkpoint.task_id.as_str())
-        .bind(json_to_value(&checkpoint.messages, "checkpoint messages")?)
-        .bind(&checkpoint.agent_state_snapshot)
-        .bind(i64::from(checkpoint.turn_usage.input_tokens))
-        .bind(i64::from(checkpoint.turn_usage.output_tokens))
-        .bind(checkpoint.created_at)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("insert checkpoint {}", checkpoint.id))?;
@@ -554,7 +598,22 @@ INSERT INTO agent_sdk_turn_checkpoints (
     }
 
     async fn insert_task_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
-        sqlx::query(
+        let id = task.id.as_str();
+        let kind = enum_to_wire(&task.kind)?;
+        let status = enum_to_wire(&task.status)?;
+        let parent_id = task.parent_id.as_ref().map(AgentTaskId::as_str);
+        let root_id = task.root_id.as_str();
+        let depth = i64::from(task.depth);
+        let thread_id_key = thread_key(&task.thread_id);
+        let submitted_input_json = json_to_value(&task.submitted_input, "task submitted input")?;
+        let worker_id = task.worker_id.as_ref().map(WorkerId::as_str);
+        let lease_id = task.lease_id.as_ref().map(LeaseId::as_str);
+        let state_json = json_to_value(&task.state, "task state")?;
+        let attempt = i64::from(task.attempt);
+        let max_attempts = i64::from(task.max_attempts);
+        let pending_child_count = i64::from(task.pending_child_count);
+        let spawn_index = task.spawn_index.map(i64::from);
+        sqlx::query!(
             r"
 INSERT INTO agent_sdk_tasks (
     id, kind, status, parent_id, root_id, depth, thread_id,
@@ -567,32 +626,29 @@ INSERT INTO agent_sdk_tasks (
     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
 )
 ",
+            id,
+            kind,
+            status,
+            parent_id,
+            root_id,
+            depth,
+            thread_id_key,
+            submitted_input_json,
+            worker_id,
+            lease_id,
+            task.lease_expires_at,
+            task.last_heartbeat_at,
+            state_json,
+            attempt,
+            max_attempts,
+            task.last_error,
+            pending_child_count,
+            spawn_index,
+            task.result_payload,
+            task.created_at,
+            task.updated_at,
+            task.completed_at,
         )
-        .bind(task.id.as_str())
-        .bind(enum_to_wire(&task.kind)?)
-        .bind(enum_to_wire(&task.status)?)
-        .bind(task.parent_id.as_ref().map(AgentTaskId::as_str))
-        .bind(task.root_id.as_str())
-        .bind(i64::from(task.depth))
-        .bind(thread_key(&task.thread_id))
-        .bind(json_to_value(
-            &task.submitted_input,
-            "task submitted input",
-        )?)
-        .bind(task.worker_id.as_ref().map(WorkerId::as_str))
-        .bind(task.lease_id.as_ref().map(LeaseId::as_str))
-        .bind(task.lease_expires_at)
-        .bind(task.last_heartbeat_at)
-        .bind(json_to_value(&task.state, "task state")?)
-        .bind(i64::from(task.attempt))
-        .bind(i64::from(task.max_attempts))
-        .bind(task.last_error.clone())
-        .bind(i64::from(task.pending_child_count))
-        .bind(task.spawn_index.map(i64::from))
-        .bind(task.result_payload.clone())
-        .bind(task.created_at)
-        .bind(task.updated_at)
-        .bind(task.completed_at)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("insert task {}", task.id))?;
@@ -600,7 +656,22 @@ INSERT INTO agent_sdk_tasks (
     }
 
     async fn update_task_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
-        let result = sqlx::query(
+        let id = task.id.as_str();
+        let kind = enum_to_wire(&task.kind)?;
+        let status = enum_to_wire(&task.status)?;
+        let parent_id = task.parent_id.as_ref().map(AgentTaskId::as_str);
+        let root_id = task.root_id.as_str();
+        let depth = i64::from(task.depth);
+        let thread_id_key = thread_key(&task.thread_id);
+        let submitted_input_json = json_to_value(&task.submitted_input, "task submitted input")?;
+        let worker_id = task.worker_id.as_ref().map(WorkerId::as_str);
+        let lease_id = task.lease_id.as_ref().map(LeaseId::as_str);
+        let state_json = json_to_value(&task.state, "task state")?;
+        let attempt = i64::from(task.attempt);
+        let max_attempts = i64::from(task.max_attempts);
+        let pending_child_count = i64::from(task.pending_child_count);
+        let spawn_index = task.spawn_index.map(i64::from);
+        let result = sqlx::query!(
             r"
 UPDATE agent_sdk_tasks SET
     kind = ?2, status = ?3, parent_id = ?4, root_id = ?5,
@@ -612,32 +683,29 @@ UPDATE agent_sdk_tasks SET
     created_at = ?20, updated_at = ?21, completed_at = ?22
 WHERE id = ?1
 ",
+            id,
+            kind,
+            status,
+            parent_id,
+            root_id,
+            depth,
+            thread_id_key,
+            submitted_input_json,
+            worker_id,
+            lease_id,
+            task.lease_expires_at,
+            task.last_heartbeat_at,
+            state_json,
+            attempt,
+            max_attempts,
+            task.last_error,
+            pending_child_count,
+            spawn_index,
+            task.result_payload,
+            task.created_at,
+            task.updated_at,
+            task.completed_at,
         )
-        .bind(task.id.as_str())
-        .bind(enum_to_wire(&task.kind)?)
-        .bind(enum_to_wire(&task.status)?)
-        .bind(task.parent_id.as_ref().map(AgentTaskId::as_str))
-        .bind(task.root_id.as_str())
-        .bind(i64::from(task.depth))
-        .bind(thread_key(&task.thread_id))
-        .bind(json_to_value(
-            &task.submitted_input,
-            "task submitted input",
-        )?)
-        .bind(task.worker_id.as_ref().map(WorkerId::as_str))
-        .bind(task.lease_id.as_ref().map(LeaseId::as_str))
-        .bind(task.lease_expires_at)
-        .bind(task.last_heartbeat_at)
-        .bind(json_to_value(&task.state, "task state")?)
-        .bind(i64::from(task.attempt))
-        .bind(i64::from(task.max_attempts))
-        .bind(task.last_error.clone())
-        .bind(i64::from(task.pending_child_count))
-        .bind(task.spawn_index.map(i64::from))
-        .bind(task.result_payload.clone())
-        .bind(task.created_at)
-        .bind(task.updated_at)
-        .bind(task.completed_at)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("update task {}", task.id))?;
@@ -694,7 +762,9 @@ WHERE id = ?1
         }
 
         if task.kind == TaskKind::RootTurn && task.status.blocks_root_admission() {
-            let existing: Option<(String,)> = sqlx::query_as(
+            let thread_id_key = thread_key(&task.thread_id);
+            let task_id_str = task.id.as_str();
+            let existing = sqlx::query_scalar!(
                 r"
 SELECT id FROM agent_sdk_tasks
 WHERE thread_id = ?1 AND kind = 'root_turn'
@@ -702,13 +772,14 @@ WHERE thread_id = ?1 AND kind = 'root_turn'
   AND id <> ?2
 LIMIT 1
 ",
+                thread_id_key,
+                task_id_str,
             )
-            .bind(thread_key(&task.thread_id))
-            .bind(task.id.as_str())
             .fetch_optional(&mut **tx)
             .await
-            .with_context(|| format!("check blocking root slot for thread {}", task.thread_id))?;
-            if let Some((existing_id,)) = existing {
+            .with_context(|| format!("check blocking root slot for thread {}", task.thread_id))?
+            .flatten();
+            if let Some(existing_id) = existing {
                 return Err(anyhow!(
                     "insert rejected: thread {} already has active root task {}",
                     task.thread_id,
@@ -777,7 +848,9 @@ LIMIT 1
         }
 
         if task.kind == TaskKind::RootTurn && task.status.blocks_root_admission() {
-            let current: Option<(String,)> = sqlx::query_as(
+            let thread_id_key = thread_key(&task.thread_id);
+            let task_id_str = task.id.as_str();
+            let current = sqlx::query_scalar!(
                 r"
 SELECT id FROM agent_sdk_tasks
 WHERE thread_id = ?1 AND kind = 'root_turn'
@@ -785,13 +858,14 @@ WHERE thread_id = ?1 AND kind = 'root_turn'
   AND id <> ?2
 LIMIT 1
 ",
+                thread_id_key,
+                task_id_str,
             )
-            .bind(thread_key(&task.thread_id))
-            .bind(task.id.as_str())
             .fetch_optional(&mut **tx)
             .await
-            .with_context(|| format!("check competing root slot for thread {}", task.thread_id))?;
-            if let Some((current_id,)) = current {
+            .with_context(|| format!("check competing root slot for thread {}", task.thread_id))?
+            .flatten();
+            if let Some(current_id) = current {
                 return Err(anyhow!(
                     "update rejected: thread {} already has a different active root task {}",
                     task.thread_id,
@@ -806,14 +880,15 @@ LIMIT 1
         tx: &mut Transaction<'_, Sqlite>,
         parent_id: &AgentTaskId,
     ) -> Result<u32> {
-        let row = sqlx::query(
+        let parent_id_str = parent_id.as_str();
+        let record = sqlx::query!(
             r"SELECT COUNT(*) AS cnt FROM agent_sdk_tasks WHERE parent_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+            parent_id_str,
         )
-        .bind(parent_id.as_str())
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("count live children for {parent_id}"))?;
-        let live: i64 = row.get("cnt");
+        let live: i64 = record.cnt;
         u32_from_i64(live, "live child count")
     }
 
@@ -901,14 +976,15 @@ LIMIT 1
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
     ) -> Result<u64> {
-        let row = sqlx::query(
+        let thread_id_key = thread_key(thread_id);
+        let record = sqlx::query!(
             r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = ?1",
+            thread_id_key,
         )
-        .bind(thread_key(thread_id))
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
-        let next: i64 = row.get("next_seq");
+        let next: i64 = record.next_seq;
         u64::try_from(next).context("event next_sequence (tx) out of range")
     }
 
@@ -925,15 +1001,18 @@ LIMIT 1
             let event_id = uuid::Uuid::now_v7();
             let event_json = json_to_value(&event, "committed event batch payload")?;
 
-            sqlx::query(
+            let event_id_str = event_id.to_string();
+            let thread_id_key = thread_key(thread_id);
+            let sequence = i64_from_u64(seq, "event batch sequence")?;
+            sqlx::query!(
                 r"INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)
 VALUES (?1, ?2, ?3, ?4, ?5)",
+                event_id_str,
+                thread_id_key,
+                sequence,
+                event_json,
+                now,
             )
-            .bind(event_id.to_string())
-            .bind(thread_key(thread_id))
-            .bind(i64_from_u64(seq, "event batch sequence")?)
-            .bind(event_json)
-            .bind(now)
             .execute(&mut **tx)
             .await
             .with_context(|| format!("insert committed event seq {seq} for {thread_id}"))?;
@@ -960,21 +1039,26 @@ VALUES (?1, ?2, ?3, ?4, ?5)",
             let id = OutboxRowId::new();
             let payload_json = json_to_value(&event.to_envelope(), "outbox relay payload")?;
 
-            sqlx::query(
+            let id_str = id.as_str();
+            let thread_id_key = thread_key(&event.thread_id);
+            let event_id_str = event.event_id.to_string();
+            let sequence = i64_from_u64(event.sequence, "outbox sequence")?;
+            let max_attempts_i64 = i64::from(max_attempts);
+            sqlx::query!(
                 r"
 INSERT INTO agent_sdk_outbox
     (id, thread_id, event_id, sequence, status, payload_json, created_at,
      next_attempt_at, attempt_count, max_attempts)
 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 0, ?7)
 ",
+                id_str,
+                thread_id_key,
+                event_id_str,
+                sequence,
+                payload_json,
+                now,
+                max_attempts_i64,
             )
-            .bind(id.as_str())
-            .bind(thread_key(&event.thread_id))
-            .bind(event.event_id.to_string())
-            .bind(i64_from_u64(event.sequence, "outbox sequence")?)
-            .bind(&payload_json)
-            .bind(now)
-            .bind(i64::from(max_attempts))
             .execute(&mut **tx)
             .await
             .with_context(|| format!("insert outbox row for event seq {}", event.sequence))?;
@@ -1144,12 +1228,15 @@ impl AgentTaskStore for SqliteDurableStore {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at).await?;
 
-        let id_exists: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE id = ?1 LIMIT 1")
-                .bind(task.id.as_str())
-                .fetch_optional(&mut *tx)
-                .await
-                .with_context(|| format!("check existing task {}", task.id))?;
+        let task_id_str = task.id.as_str();
+        let id_exists = sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = ?1 LIMIT 1",
+            task_id_str
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("check existing task {}", task.id))?
+        .flatten();
         if id_exists.is_some() {
             return Err(anyhow!(
                 "submit_root_turn rejected: task id {} already exists",
@@ -1157,18 +1244,20 @@ impl AgentTaskStore for SqliteDurableStore {
             ));
         }
 
-        let thread_has_blocking_root: bool = sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1")
-            .bind(thread_key(&task.thread_id))
+        let blocking_check_key = thread_key(&task.thread_id);
+        let thread_has_blocking_root: bool = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
             .fetch_optional(&mut *tx)
             .await
             .with_context(|| format!("check active root slot for {}", task.thread_id))?
+            .flatten()
             .is_some();
 
-        let thread_has_queued_roots: bool = sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' LIMIT 1")
-            .bind(thread_key(&task.thread_id))
+        let queued_check_key = thread_key(&task.thread_id);
+        let thread_has_queued_roots: bool = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' LIMIT 1", queued_check_key)
             .fetch_optional(&mut *tx)
             .await
             .with_context(|| format!("check queued roots for {}", task.thread_id))?
+            .flatten()
             .is_some();
 
         let admitted = if thread_has_blocking_root || thread_has_queued_roots {
@@ -1265,11 +1354,12 @@ impl AgentTaskStore for SqliteDurableStore {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
 
-        let blocking: Option<(String,)> = sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1")
-            .bind(thread_key(thread_id))
+        let blocking_check_key = thread_key(thread_id);
+        let blocking = sqlx::query_scalar!("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1", blocking_check_key)
             .fetch_optional(&mut *tx)
             .await
-            .with_context(|| format!("check blocking root for {thread_id}"))?;
+            .with_context(|| format!("check blocking root for {thread_id}"))?
+            .flatten();
         if blocking.is_some() {
             return Ok(None);
         }
@@ -1625,14 +1715,15 @@ impl AgentTaskStore for SqliteDurableStore {
                 "spawn rejected: child thread {child_thread_id} does not exist"
             ));
         }
-        let existing_task: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1")
-                .bind(thread_key(&child_thread_id))
-                .fetch_optional(&mut *tx)
-                .await
-                .with_context(|| {
-                    format!("check existing tasks for child thread {child_thread_id}")
-                })?;
+        let child_thread_key = thread_key(&child_thread_id);
+        let existing_task = sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1",
+            child_thread_key
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?
+        .flatten();
         if existing_task.is_some() {
             return Err(anyhow!(
                 "spawn rejected: child thread {child_thread_id} already has tasks"
@@ -1891,31 +1982,31 @@ impl AgentTaskStore for SqliteDurableStore {
 
     async fn clear(&self) -> Result<()> {
         // SQLite does not support TRUNCATE CASCADE. Delete in FK order.
-        sqlx::query("DELETE FROM agent_sdk_turn_checkpoints")
+        sqlx::query!("DELETE FROM agent_sdk_turn_checkpoints")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_message_commits")
+        sqlx::query!("DELETE FROM agent_sdk_message_commits")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_turn_attempts")
+        sqlx::query!("DELETE FROM agent_sdk_turn_attempts")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_message_heads")
+        sqlx::query!("DELETE FROM agent_sdk_message_heads")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_committed_events")
+        sqlx::query!("DELETE FROM agent_sdk_committed_events")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_outbox")
+        sqlx::query!("DELETE FROM agent_sdk_outbox")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_retention_cursors")
+        sqlx::query!("DELETE FROM agent_sdk_retention_cursors")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_tasks")
+        sqlx::query!("DELETE FROM agent_sdk_tasks")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM agent_sdk_threads")
+        sqlx::query!("DELETE FROM agent_sdk_threads")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -2110,13 +2201,16 @@ impl CheckpointStore for SqliteDurableStore {
         let checkpoint = Checkpoint::new(params)?;
         let mut tx = self.begin().await?;
         // Duplicate check
-        let dup: Option<(String,)> = sqlx::query_as(
+        let dup_thread_key = thread_key(&checkpoint.thread_id);
+        let dup_turn_number = i64::from(checkpoint.turn_number);
+        let dup = sqlx::query_scalar!(
             "SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
+            dup_thread_key,
+            dup_turn_number,
         )
-        .bind(thread_key(&checkpoint.thread_id))
-        .bind(i64::from(checkpoint.turn_number))
         .fetch_optional(&mut *tx)
-        .await?;
+        .await?
+        .flatten();
         if dup.is_some() {
             return Err(anyhow!(
                 "duplicate checkpoint for thread {} turn {}",
@@ -2221,12 +2315,12 @@ impl EventRepository for SqliteDurableStore {
     }
 
     async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
-        let row = sqlx::query("SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = ?1")
-            .bind(thread_key(thread_id))
+        let thread_id_key = thread_key(thread_id);
+        let record = sqlx::query!("SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = ?1", thread_id_key)
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("next event sequence for {thread_id}"))?;
-        let next: i64 = row.get("next_seq");
+        let next: i64 = record.next_seq;
         u64::try_from(next).context("event next_sequence out of range")
     }
 
@@ -2313,16 +2407,21 @@ impl OutboxStore for SqliteDurableStore {
         let mut result = Vec::with_capacity(rows.len());
         for params in rows {
             let id = OutboxRowId::new();
-            sqlx::query(
+            let id_str: &str = id.as_str();
+            let thread_key = thread_key(&params.thread_id);
+            let event_id_str = params.event_id.to_string();
+            let sequence = i64_from_u64(params.sequence, "outbox sequence")?;
+            let max_attempts = i64::from(params.max_attempts);
+            sqlx::query!(
                 r"INSERT INTO agent_sdk_outbox (id, thread_id, event_id, sequence, status, payload_json, created_at, next_attempt_at, attempt_count, max_attempts) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 0, ?7)",
+                id_str,
+                thread_key,
+                event_id_str,
+                sequence,
+                params.payload_json,
+                params.now,
+                max_attempts,
             )
-            .bind(id.as_str())
-            .bind(thread_key(&params.thread_id))
-            .bind(params.event_id.to_string())
-            .bind(i64_from_u64(params.sequence, "outbox sequence")?)
-            .bind(&params.payload_json)
-            .bind(params.now)
-            .bind(i64::from(params.max_attempts))
             .execute(&mut *tx)
             .await
             .with_context(|| format!("insert outbox row {id}"))?;
@@ -2357,26 +2456,26 @@ impl OutboxStore for SqliteDurableStore {
         // pending IDs in the desired order, UPDATE them, then SELECT
         // the claimed rows back.
         let mut tx = self.begin().await?;
-        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM agent_sdk_outbox WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY next_attempt_at, id LIMIT ?2")
-            .bind(now)
-            .bind(i64::from(limit))
+        let limit_i64 = i64::from(limit);
+        let ids: Vec<String> = sqlx::query_scalar!("SELECT id FROM agent_sdk_outbox WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY next_attempt_at, id LIMIT ?2", now, limit_i64)
             .fetch_all(&mut *tx)
             .await
-            .context("select pending outbox rows")?;
+            .context("select pending outbox rows")?
+            .into_iter()
+            .flatten()
+            .collect();
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        for (id,) in &ids {
-            sqlx::query("UPDATE agent_sdk_outbox SET status = 'claimed', claimed_by = ?2, claimed_at = ?3 WHERE id = ?1")
-                .bind(id.as_str())
-                .bind(worker_id)
-                .bind(now)
+        for id in &ids {
+            let id_str = id.as_str();
+            sqlx::query!("UPDATE agent_sdk_outbox SET status = 'claimed', claimed_by = ?2, claimed_at = ?3 WHERE id = ?1", id_str, worker_id, now)
                 .execute(&mut *tx)
                 .await
                 .with_context(|| format!("claim outbox row {id}"))?;
         }
         let mut rows = Vec::with_capacity(ids.len());
-        for (id,) in &ids {
+        for id in &ids {
             let record = sqlx::query_as::<_, OutboxRecord>(
                 "SELECT id, thread_id, event_id, sequence, status, payload_json, created_at, next_attempt_at, attempt_count, max_attempts, last_error, claimed_by, claimed_at, delivered_at FROM agent_sdk_outbox WHERE id = ?1",
             )
@@ -2392,9 +2491,8 @@ impl OutboxStore for SqliteDurableStore {
     }
 
     async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
-        let result = sqlx::query("UPDATE agent_sdk_outbox SET status = 'delivered', delivered_at = ?2 WHERE id = ?1 AND status <> 'delivered' AND status <> 'expired'")
-            .bind(id.as_str())
-            .bind(now)
+        let id_str = id.as_str();
+        let result = sqlx::query!("UPDATE agent_sdk_outbox SET status = 'delivered', delivered_at = ?2 WHERE id = ?1 AND status <> 'delivered' AND status <> 'expired'", id_str, now)
             .execute(&self.pool)
             .await
             .with_context(|| format!("mark outbox row {id} delivered"))?;
@@ -2412,7 +2510,8 @@ impl OutboxStore for SqliteDurableStore {
         next_attempt_at: OffsetDateTime,
         _now: OffsetDateTime,
     ) -> Result<()> {
-        let result = sqlx::query(
+        let id_str = id.as_str();
+        let result = sqlx::query!(
             r"
 UPDATE agent_sdk_outbox SET
     attempt_count = attempt_count + 1,
@@ -2423,10 +2522,10 @@ UPDATE agent_sdk_outbox SET
     claimed_at = CASE WHEN attempt_count + 1 >= max_attempts THEN claimed_at ELSE NULL END
 WHERE id = ?1 AND status NOT IN ('delivered', 'expired')
 ",
+            id_str,
+            error,
+            next_attempt_at,
         )
-        .bind(id.as_str())
-        .bind(error)
-        .bind(next_attempt_at)
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
@@ -2460,12 +2559,12 @@ WHERE id = ?1 AND status NOT IN ('delivered', 'expired')
     }
 
     async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
-        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = ?1 AND status IN ('pending', 'claimed')")
-            .bind(thread_key(thread_id))
+        let thread_id_key = thread_key(thread_id);
+        let record = sqlx::query!("SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = ?1 AND status IN ('pending', 'claimed')", thread_id_key)
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("count pending outbox rows for {thread_id}"))?;
-        let count: i64 = row.get("cnt");
+        let count: i64 = record.cnt;
         u64::try_from(count).context("outbox pending count out of range")
     }
 }
@@ -2496,34 +2595,34 @@ impl RetentionStore for SqliteDurableStore {
         let mut tx = self.begin().await?;
         let new_floor_i64 = i64_from_u64(new_floor, "retention floor")?;
 
-        let current = sqlx::query(
+        let retention_key = thread_key(thread_id);
+        let current = sqlx::query!(
             "SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
+            retention_key,
         )
-        .bind(thread_key(thread_id))
         .fetch_optional(&mut *tx)
         .await
         .with_context(|| format!("read retention floor for {thread_id}"))?;
         if let Some(row) = current {
-            let current_floor: i64 = row.get("retention_floor");
+            let current_floor: i64 = row.retention_floor;
             ensure!(
                 new_floor_i64 >= current_floor,
                 "retention floor can only advance: current {current_floor}, requested {new_floor}"
             );
         }
 
-        sqlx::query("INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (thread_id) DO UPDATE SET retention_floor = excluded.retention_floor, updated_at = excluded.updated_at")
-            .bind(thread_key(thread_id))
-            .bind(new_floor_i64)
-            .bind(now)
+        let upsert_key = thread_key(thread_id);
+        sqlx::query!("INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (thread_id) DO UPDATE SET retention_floor = excluded.retention_floor, updated_at = excluded.updated_at", upsert_key, new_floor_i64, now)
             .execute(&mut *tx)
             .await
             .with_context(|| format!("advance retention floor for {thread_id}"))?;
 
-        sqlx::query(
+        let purge_key = thread_key(thread_id);
+        sqlx::query!(
             "DELETE FROM agent_sdk_committed_events WHERE thread_id = ?1 AND sequence < ?2",
+            purge_key,
+            new_floor_i64,
         )
-        .bind(thread_key(thread_id))
-        .bind(new_floor_i64)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("purge events below floor {new_floor} for {thread_id}"))?;

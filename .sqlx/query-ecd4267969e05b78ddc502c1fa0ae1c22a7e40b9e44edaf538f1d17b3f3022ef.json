@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "retention_floor",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ecd4267969e05b78ddc502c1fa0ae1c22a7e40b9e44edaf538f1d17b3f3022ef"
+}

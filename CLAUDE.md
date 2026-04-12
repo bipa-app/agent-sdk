@@ -194,13 +194,22 @@ let value = some_option.context("value was None")?;
 
 This rule applies to both production code AND tests. In tests, return `Result<()>` and use `?`.
 
-## sqlx and Postgres Development (CRITICAL)
+## sqlx and Database Development (CRITICAL)
 
 ### Always use typed sqlx macros
 
-**Use `sqlx::query!` and `sqlx::query_as!` macros** for all Postgres queries in
+**Use `sqlx::query!` and `sqlx::query_as!` macros** for all database queries in
 `agent-service-host`. These macros provide compile-time SQL validation and type
 checking. Never use the untyped `sqlx::query(...)` string form.
+
+**Postgres backend:** All queries use compile-time macros (`query!`,
+`query_as!`, `query_scalar!`).
+
+**SQLite backend:** INSERT / UPDATE / DELETE / scalar SELECT queries use
+compile-time macros.  Complex SELECT queries that map to `FromRow` record
+types use runtime `sqlx::query_as::<_, RecordType>()` because SQLite's
+weak type system requires verbose per-column type annotations in
+`query_as!()`.
 
 ```rust
 // BAD: untyped query — no compile-time checking
@@ -235,24 +244,28 @@ scripts/postgres18-dev.sh url
 # → postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
 ```
 
-### sqlx Offline Cache
+### sqlx Offline Cache (dual-backend)
 
 Normal builds use `SQLX_OFFLINE=true` (set in `.cargo/config.toml`). The
-`.sqlx/` directory holds cached query metadata so builds work without a live
-database.
+`.sqlx/` directory holds cached query metadata for **both** Postgres and
+SQLite backends so builds work without a live database.
 
 **After adding or changing any `sqlx::query!` / `sqlx::query_as!` call, you must
-refresh the offline cache:**
+refresh the offline cache for the affected backend(s):**
 
 ```bash
-# Apply migrations + regenerate .sqlx/ cache
+# Postgres queries — regenerate .sqlx/ cache
 scripts/postgres18-dev.sh prepare
 
-# Or manually:
-scripts/postgres18-dev.sh wait
-SQLX_OFFLINE=false DATABASE_URL="postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk" \
-  cargo sqlx prepare --workspace -- -p agent-service-host --all-targets
+# SQLite queries — regenerate .sqlx/ cache (merges with Postgres entries)
+scripts/sqlite-dev.sh prepare
 ```
+
+**Important:** `cargo sqlx prepare` wipes `.sqlx/` before writing. The
+`sqlite-dev.sh prepare` script handles this by backing up existing entries
+before running and merging them back afterward.  Always run the Postgres
+prepare first, then the SQLite prepare (or just run the SQLite script which
+preserves Postgres entries automatically).
 
 ### Running Postgres Integration Tests
 

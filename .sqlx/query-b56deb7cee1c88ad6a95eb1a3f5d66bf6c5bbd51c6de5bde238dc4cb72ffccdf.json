@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "b56deb7cee1c88ad6a95eb1a3f5d66bf6c5bbd51c6de5bde238dc4cb72ffccdf"
+}

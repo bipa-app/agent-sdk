@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_threads (\n    thread_id, status, committed_turns,\n    total_input_tokens, total_output_tokens, created_at, updated_at\n) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\nON CONFLICT (thread_id) DO NOTHING\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "8310b21f303ffc54ab0a18379d0df099dd32f9fb72ad9dc599c712b847ef3df4"
+}

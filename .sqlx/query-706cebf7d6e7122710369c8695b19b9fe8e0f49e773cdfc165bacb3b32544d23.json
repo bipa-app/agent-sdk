@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_committed_events (event_id, thread_id, sequence, event_json, committed_at)\nVALUES (?1, ?2, ?3, ?4, ?5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "706cebf7d6e7122710369c8695b19b9fe8e0f49e773cdfc165bacb3b32544d23"
+}

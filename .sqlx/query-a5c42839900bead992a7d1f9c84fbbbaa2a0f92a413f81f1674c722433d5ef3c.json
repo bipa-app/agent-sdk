@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_message_commits\n    (thread_id, turn_number, task_id, head_version_after, batch_json, committed_at)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "a5c42839900bead992a7d1f9c84fbbbaa2a0f92a413f81f1674c722433d5ef3c"
+}
