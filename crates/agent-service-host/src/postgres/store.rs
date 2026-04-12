@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
@@ -54,7 +54,6 @@ use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
 };
 use agent_server::journal::turn_attempt_store::TurnAttemptStore;
-use agent_server::worker::definition::RuntimePolicy;
 
 use super::migrations::apply_durable_core_migrations;
 
@@ -71,18 +70,61 @@ impl PostgresDurableStore {
         Self { pool }
     }
 
+    /// Build a lazily connecting Postgres pool.
+    ///
+    /// The returned store does not perform network I/O until first
+    /// use. Call [`Self::migrate`] during startup to verify the
+    /// database is reachable and the durable-core schema is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database URL is invalid or the schema
+    /// name is malformed.
+    pub fn connect_lazy(
+        database_url: &str,
+        max_connections: u32,
+        schema: Option<&str>,
+    ) -> Result<Self> {
+        ensure!(max_connections > 0, "postgres max_connections must be > 0");
+
+        let connect_options: PgConnectOptions = database_url
+            .parse()
+            .context("parse postgres durable store connection string")?;
+
+        let mut pool_options = PgPoolOptions::new().max_connections(max_connections);
+
+        if let Some(schema_name) = schema {
+            validate_schema_name(schema_name)?;
+            let schema_name = schema_name.to_owned();
+            pool_options = pool_options.after_connect(move |conn, _meta| {
+                let schema_name = schema_name.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+                        .bind(&schema_name)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        Ok(Self::from_pool(
+            pool_options.connect_lazy_with(connect_options),
+        ))
+    }
+
     /// Connect to Postgres and apply the durable-core migrations.
     ///
     /// # Errors
     ///
     /// Returns an error if the pool cannot be created or migrations fail.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(database_url)
+        let store = Self::connect_lazy(database_url, 8, None)?;
+        store
+            .pool
+            .acquire()
             .await
             .context("connect postgres durable store")?;
-        let store = Self::from_pool(pool);
         store.migrate().await?;
         Ok(store)
     }
@@ -1085,74 +1127,6 @@ WHERE parent_id = $1
         u32_from_i64(live, "live child count")
     }
 
-    async fn load_spawn_parent_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-    ) -> Result<AgentTask> {
-        let parent = Self::load_task_tx(tx, parent_id, true)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if parent.status != TaskStatus::Running {
-            let status = parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if parent.kind.is_leaf() {
-            let parent_kind = parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
-        Ok(parent)
-    }
-
-    async fn ensure_empty_child_thread_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        child_thread_id: &ThreadId,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        Self::bootstrap_thread_row_tx(tx, child_thread_id, now).await?;
-        let _ = Self::lock_thread_tx(tx, child_thread_id).await?;
-        let existing_child_thread_task: Option<String> = sqlx::query_scalar!(
-            r"
-SELECT id
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-LIMIT 1
-FOR UPDATE
-",
-            thread_key(child_thread_id),
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
-        if existing_child_thread_task.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child thread id {child_thread_id} already has tasks"
-            ));
-        }
-        Ok(())
-    }
-
     async fn apply_task_terminal_transition_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_id: &AgentTaskId,
@@ -1193,25 +1167,12 @@ FOR UPDATE
             .with_context(|| format!("{error_prefix}: terminal transition failed"))?;
         Self::update_task_tx(tx, &new_child).await?;
 
-        let parent =
-            Self::propagate_terminal_child_transition_tx(tx, &new_child, now, error_prefix).await?;
-
-        Ok((new_child, parent))
-    }
-
-    async fn propagate_terminal_child_transition_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        new_child: &AgentTask,
-        now: OffsetDateTime,
-        error_prefix: &'static str,
-    ) -> Result<Option<AgentTask>> {
-        if let Some(parent_id) = &new_child.parent_id {
+        let parent = if let Some(parent_id) = &new_child.parent_id {
             let old_parent = Self::load_task_tx(tx, parent_id, true)
                 .await?
                 .ok_or_else(|| {
                     anyhow!(
-                        "{error_prefix}: child {} references missing parent {parent_id}",
-                        new_child.id
+                        "{error_prefix}: child {child_id} references missing parent {parent_id}"
                     )
                 })?;
             if old_parent.status == TaskStatus::WaitingOnChildren {
@@ -1223,74 +1184,15 @@ FOR UPDATE
                         format!("{error_prefix}: recompute_pending_children transition failed")
                     })?;
                 Self::update_task_tx(tx, &new_parent).await?;
-                Ok(Some(new_parent))
+                Some(new_parent)
             } else {
-                Ok(Some(old_parent))
+                Some(old_parent)
             }
-        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
-            let Some(old_invocation) =
-                Self::load_linked_subagent_invocation_tx(tx, &new_child.id).await?
-            else {
-                return Ok(None);
-            };
-            let new_invocation = old_invocation
-                .clone()
-                .recompute_pending_children(0, now)
-                .with_context(|| {
-                    format!("{error_prefix}: subagent invocation resume transition failed")
-                })?;
-            Self::update_task_tx(tx, &new_invocation).await?;
-            Ok(Some(new_invocation))
         } else {
-            Ok(None)
-        }
-    }
+            None
+        };
 
-    async fn load_linked_subagent_invocation_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        child_root_id: &AgentTaskId,
-    ) -> Result<Option<AgentTask>> {
-        let record = sqlx::query_as!(
-            TaskRecord,
-            r#"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    created_at,
-    updated_at,
-    completed_at
-FROM agent_sdk_tasks
-WHERE kind = 'subagent'
-  AND status = 'waiting_on_children'
-  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
-FOR UPDATE
-            "#,
-            child_root_id.as_str(),
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .with_context(|| {
-            format!("load linked subagent invocation for child root {child_root_id}")
-        })?;
-
-        record.map(TryInto::try_into).transpose()
+        Ok((new_child, parent))
     }
 
     async fn load_subtree_tx(
@@ -1415,6 +1317,107 @@ FOR UPDATE
             committed_events: Vec::new(),
         })
     }
+}
+
+fn validate_schema_name(schema: &str) -> Result<()> {
+    ensure!(!schema.is_empty(), "postgres schema cannot be empty");
+    ensure!(
+        schema
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "postgres schema must contain only ASCII letters, digits, or underscores",
+    );
+    ensure!(
+        schema
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_'),
+        "postgres schema must start with an ASCII letter or underscore",
+    );
+    Ok(())
+}
+
+fn validate_subagent_spawn_parent(
+    parent: &AgentTask,
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+) -> Result<()> {
+    if parent.status != TaskStatus::Running {
+        let status = parent.status;
+        return Err(anyhow!(
+            "spawn rejected: task {parent_id} is not running (status {status:?})"
+        ));
+    }
+    match &parent.worker_id {
+        Some(current) if current == worker => {}
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: worker mismatch on task {parent_id}"
+            ));
+        }
+    }
+    match &parent.lease_id {
+        Some(current) if current == lease => {}
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: lease mismatch on task {parent_id}"
+            ));
+        }
+    }
+    if parent.kind.is_leaf() {
+        let parent_kind = parent.kind;
+        return Err(anyhow!(
+            "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_child_thread_available_for_spawn_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    child_thread_id: &ThreadId,
+) -> Result<()> {
+    let child_thread = PostgresDurableStore::lock_thread_tx(tx, child_thread_id).await?;
+    if child_thread.is_none() {
+        return Err(anyhow!(
+            "spawn rejected: child thread {child_thread_id} does not exist"
+        ));
+    }
+
+    let existing_child_thread_task = sqlx::query_scalar::<_, String>(
+        r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+LIMIT 1
+",
+    )
+    .bind(thread_key(child_thread_id))
+    .fetch_optional(tx.as_mut())
+    .await
+    .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
+    if existing_child_thread_task.is_some() {
+        return Err(anyhow!(
+            "spawn rejected: child thread id {child_thread_id} already has tasks"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn ensure_spawn_task_id_available_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &AgentTaskId,
+    label: &str,
+) -> Result<()> {
+    let existing_task = PostgresDurableStore::load_task_tx(tx, task_id, false).await?;
+    if existing_task.is_some() {
+        return Err(anyhow!(
+            "spawn rejected: {label} task id {task_id} already exists"
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1839,13 +1842,6 @@ FOR UPDATE
                     .fail_with_reason(reason, now)
                     .context("try_acquire_task: fail-closed transition failed")?;
                 Self::update_task_tx(&mut tx, &failed).await?;
-                let _ = Self::propagate_terminal_child_transition_tx(
-                    &mut tx,
-                    &failed,
-                    now,
-                    "try_acquire_task",
-                )
-                .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -1945,13 +1941,6 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
-                    let _ = Self::propagate_terminal_child_transition_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "acquire_next_runnable",
-                    )
-                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -2055,13 +2044,6 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("release_expired_leases: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
-                    let _ = Self::propagate_terminal_child_transition_tx(
-                        &mut tx,
-                        &failed,
-                        now,
-                        "release_expired_leases",
-                    )
-                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -2166,7 +2148,37 @@ FOR UPDATE SKIP LOCKED
         }
 
         let mut tx = self.begin().await?;
-        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
 
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -2216,29 +2228,22 @@ FOR UPDATE SKIP LOCKED
         let SubagentInvocationSpawn {
             child_thread_id,
             spec,
-            child_root_input,
-            spawn_index,
             payload,
+            spawn_index,
         } = spawn;
 
-        let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
-        Self::ensure_empty_child_thread_tx(&mut tx, &child_thread_id, now).await?;
-
-        let child_root = AgentTask::new_root_turn_with_input(
-            child_thread_id.clone(),
-            child_root_input,
-            now,
-            RuntimePolicy::server_default().max_attempts,
-        );
-        if Self::load_task_tx(&mut tx, &child_root.id, false)
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
-            .is_some()
-        {
-            return Err(anyhow!(
-                "spawn rejected: child root task id {} already exists",
-                child_root.id
-            ));
-        }
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+        ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
+
+        let child_root = AgentTask::new_root_turn(
+            child_thread_id.clone(),
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
+        ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
 
         let invocation = AgentTask::new_subagent_invocation(
             &old_parent,
@@ -2252,15 +2257,7 @@ FOR UPDATE SKIP LOCKED
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
-        if Self::load_task_tx(&mut tx, &invocation.id, false)
-            .await?
-            .is_some()
-        {
-            return Err(anyhow!(
-                "spawn rejected: invocation task id {} already exists",
-                invocation.id
-            ));
-        }
+        ensure_spawn_task_id_available_tx(&mut tx, &invocation.id, "invocation").await?;
 
         let new_parent = old_parent
             .clone()
@@ -2268,7 +2265,6 @@ FOR UPDATE SKIP LOCKED
             .context("spawn rejected: wait_on_children transition failed")?;
         Self::update_task_tx(&mut tx, &new_parent).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
-        Self::enforce_insert_cross_row_invariants_tx(&mut tx, &child_root).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
         tx.commit()
             .await
@@ -2368,13 +2364,6 @@ FOR UPDATE SKIP LOCKED
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
-            let _ = Self::propagate_terminal_child_transition_tx(
-                &mut tx,
-                &cancelled,
-                now,
-                "cancel_tree",
-            )
-            .await?;
             transitioned.push(cancelled.id);
         }
         tx.commit().await.context("commit cancel_tree")?;
@@ -3809,7 +3798,6 @@ mod tests {
     use agent_server::journal::turn_attempt::{CloseAttemptParams, OpenAttemptParams};
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
     use agent_server::journal::{AgentTask, LeaseId, TaskStatus, TurnAttemptOutcome, WorkerId};
-    use agent_server::worker::subagent::{EffectiveSubagentCapabilities, EffectiveSubagentSpec};
 
     use super::*;
 
@@ -3852,163 +3840,7 @@ mod tests {
         }
     }
 
-    fn sample_subagent_spec() -> EffectiveSubagentSpec {
-        EffectiveSubagentSpec {
-            task: "Inspect durable linkage".into(),
-            prompt: "Stay in read-only mode.".into(),
-            model: "claude-sonnet-4-5-20250929".into(),
-            max_turns: 5,
-            timeout_ms: 15_000,
-            nickname: Some("Scout".into()),
-            capabilities: EffectiveSubagentCapabilities {
-                profile: "research".into(),
-                allowed: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
-            },
-        }
-    }
-
-    fn sample_subagent_input() -> Vec<SubmittedInputItem> {
-        vec![SubmittedInputItem::Text {
-            text: "Stay in read-only mode.\n\nInspect durable linkage".into(),
-        }]
-    }
-
-    fn sample_subagent_payload(thread_name: &str) -> SuspensionPayload {
-        let thread_id = thread_id(thread_name);
-        SuspensionPayload {
-            continuation: ContinuationEnvelope::wrap(agent_sdk_core::AgentContinuation {
-                thread_id: thread_id.clone(),
-                turn: 1,
-                total_usage: TokenUsage::default(),
-                turn_usage: TokenUsage::default(),
-                pending_tool_calls: vec![agent_sdk_core::PendingToolCallInfo {
-                    id: "call_subagent".into(),
-                    name: "subagent_researcher".into(),
-                    display_name: "Subagent: Researcher".into(),
-                    tier: agent_sdk_core::ToolTier::Confirm,
-                    input: serde_json::json!({"task": "Inspect durable linkage"}),
-                    effective_input: serde_json::json!({"task": "Inspect durable linkage"}),
-                    listen_context: None,
-                }],
-                awaiting_index: 0,
-                completed_results: Vec::new(),
-                state: agent_sdk_core::AgentState::new(thread_id),
-                response_id: None,
-                stop_reason: None,
-                response_content: Vec::new(),
-            }),
-            suspended_messages: Vec::new(),
-        }
-    }
-
-    async fn running_root_for_spawn(
-        store: &TestStore,
-        thread_name: &str,
-    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
-        let parent = fresh_root(thread_name, 0);
-        let parent_id = parent.id.clone();
-        store.submit_root_turn(parent).await?;
-        let worker = WorkerId::from_string("w-parent");
-        let lease = LeaseId::from_string("l-parent");
-        let claimed = store
-            .try_acquire_task(
-                &parent_id,
-                worker.clone(),
-                lease.clone(),
-                t_plus(60),
-                t_plus(1),
-            )
-            .await?
-            .context("claim parent root")?;
-        Ok((claimed, worker, lease))
-    }
-
-    async fn spawn_subagent_fixture(
-        store: &TestStore,
-        thread_name: &str,
-    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
-        let (parent, worker, lease) = running_root_for_spawn(store, thread_name).await?;
-        let (parked_parent, invocation, child_root) = store
-            .spawn_subagent_invocation(
-                &parent.id,
-                &worker,
-                &lease,
-                SubagentInvocationSpawn {
-                    child_thread_id: thread_id(&format!("{thread_name}-child")),
-                    spec: sample_subagent_spec(),
-                    child_root_input: sample_subagent_input(),
-                    spawn_index: 0,
-                    payload: sample_subagent_payload(thread_name),
-                },
-                t_plus(2),
-            )
-            .await?;
-        Ok((parked_parent, invocation, child_root))
-    }
-
-    async fn exhaust_retry_budget(
-        store: &TestStore,
-        task_id: &AgentTaskId,
-        max_attempts: u32,
-        worker_prefix: &str,
-        start_secs: i64,
-    ) -> Result<Vec<RecoveryRecord>> {
-        let mut last_sweep = Vec::new();
-        for attempt in 0..max_attempts {
-            let offset = i64::from(attempt) * 10;
-            let running = store
-                .try_acquire_task(
-                    task_id,
-                    WorkerId::from_string(format!("{worker_prefix}-{attempt}")),
-                    LeaseId::from_string(format!("l-{worker_prefix}-{attempt}")),
-                    t_plus(start_secs + offset + 5),
-                    t_plus(start_secs + offset + 1),
-                )
-                .await?
-                .with_context(|| format!("claim {task_id} attempt {}", attempt + 1))?;
-            assert_eq!(running.status, TaskStatus::Running);
-            last_sweep = store
-                .release_expired_leases(t_plus(start_secs + offset + 6))
-                .await?;
-        }
-        Ok(last_sweep)
-    }
-
-    /// RAII guard that wraps a [`PostgresDurableStore`] and drops the
-    /// test schema on destruction so schemas don't accumulate across
-    /// local `cargo test` runs.
-    struct TestStore {
-        store: PostgresDurableStore,
-        schema: String,
-        database_url: String,
-    }
-
-    impl std::ops::Deref for TestStore {
-        type Target = PostgresDurableStore;
-        fn deref(&self) -> &Self::Target {
-            &self.store
-        }
-    }
-
-    impl Drop for TestStore {
-        fn drop(&mut self) {
-            let schema = self.schema.clone();
-            let url = self.database_url.clone();
-            // All Postgres tests run on the multi_thread runtime, so
-            // block_in_place is safe here.
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    if let Ok(mut conn) = PgConnection::connect(&url).await {
-                        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                            .execute(&mut conn)
-                            .await;
-                    }
-                });
-            });
-        }
-    }
-
-    async fn test_store() -> Result<Option<TestStore>> {
+    async fn test_store() -> Result<Option<PostgresDurableStore>> {
         let Ok(database_url) = env::var("TEST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         else {
             return Ok(None);
@@ -4042,11 +3874,7 @@ mod tests {
             .migrate()
             .await
             .context("migrate postgres test store")?;
-        Ok(Some(TestStore {
-            store,
-            schema,
-            database_url,
-        }))
+        Ok(Some(store))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4058,14 +3886,14 @@ mod tests {
         let count = 10usize;
         let mut handles = Vec::with_capacity(count);
         for idx in 0..count {
-            let cloned = store.store.clone();
+            let store = store.clone();
             handles.push(tokio::spawn(async move {
                 let root = AgentTask::new_root_turn(
                     thread_id("t-pg-race"),
                     t_plus(i64::try_from(idx).context("idx to i64")?),
                     3,
                 );
-                cloned.submit_root_turn(root).await
+                store.submit_root_turn(root).await
             }));
         }
 
@@ -4127,9 +3955,9 @@ mod tests {
         let count = 8usize;
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
-            let cloned = store.store.clone();
+            let store = store.clone();
             handles.push(tokio::spawn(async move {
-                cloned
+                store
                     .promote_next_queued_root(&thread_id("t-pg-promo"), t_plus(4))
                     .await
             }));
@@ -4253,7 +4081,7 @@ mod tests {
         assert!(result.is_none(), "every head must be failed closed");
 
         for id in &ids {
-            let row = AgentTaskStore::get(&*store, id)
+            let row = AgentTaskStore::get(&store, id)
                 .await
                 .context("get exhausted row")?
                 .context("row exists")?;
@@ -4319,7 +4147,7 @@ mod tests {
             .context("fault injection should fail")?;
         assert!(format!("{err:#}").contains("injected postgres completed-turn failure"));
 
-        let attempt_after = TurnAttemptStore::get(&*store, &attempt.id)
+        let attempt_after = TurnAttemptStore::get(&store, &attempt.id)
             .await?
             .context("attempt after")?;
         assert!(
@@ -4327,16 +4155,16 @@ mod tests {
             "attempt close should have rolled back"
         );
 
-        let thread = ThreadStore::get(&*store, &running.thread_id)
+        let thread = ThreadStore::get(&store, &running.thread_id)
             .await?
             .context("thread row should exist from task bootstrap")?;
         assert_eq!(thread.committed_turns, 0);
         assert_eq!(thread.total_usage, TokenUsage::default());
 
-        let projection = MessageProjectionStore::get(&*store, &running.thread_id).await?;
+        let projection = MessageProjectionStore::get(&store, &running.thread_id).await?;
         assert!(projection.is_none(), "message head must roll back");
 
-        let checkpoints = CheckpointStore::list_by_thread(&*store, &running.thread_id).await?;
+        let checkpoints = CheckpointStore::list_by_thread(&store, &running.thread_id).await?;
         assert!(checkpoints.is_empty(), "checkpoint insert must roll back");
 
         Ok(())
@@ -4381,10 +4209,10 @@ mod tests {
                 }],
                 now: t_plus(2),
             },
-            &*store,
-            &*store,
-            &*store,
-            &*store,
+            &store,
+            &store,
+            &store,
+            &store,
             &event_repo,
         )
         .await?;
@@ -4393,90 +4221,8 @@ mod tests {
         assert_eq!(outcome.checkpoint.turn_number, 1);
         assert!(outcome.closed_attempt.is_closed());
 
-        let history = MessageProjectionStore::get_history(&*store, &running.thread_id).await?;
+        let history = MessageProjectionStore::get_history(&store, &running.thread_id).await?;
         assert_eq!(history.len(), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancel_tree_on_child_root_wakes_linked_subagent_invocation() -> Result<()> {
-        let Some(store) = test_store().await? else {
-            return Ok(());
-        };
-
-        let (_parent, invocation, child_root) =
-            spawn_subagent_fixture(&store, "t-pg-subagent-cancel").await?;
-
-        let transitioned = store.cancel_tree(&child_root.id, t_plus(3)).await?;
-        assert_eq!(transitioned, vec![child_root.id.clone()]);
-
-        let resumed_invocation = AgentTaskStore::get(&*store, &invocation.id)
-            .await?
-            .context("invocation exists after cancel")?;
-        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
-        assert_eq!(resumed_invocation.pending_child_count, 0);
-        assert!(resumed_invocation.state.subagent_invocation().is_some());
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fail_closed_subagent_paths_keep_invocation_and_parent_runnable() -> Result<()> {
-        let Some(store) = test_store().await? else {
-            return Ok(());
-        };
-
-        let (parent, invocation, child_root) =
-            spawn_subagent_fixture(&store, "t-pg-subagent-fail-closed").await?;
-
-        let child_sweep = exhaust_retry_budget(
-            &store,
-            &child_root.id,
-            child_root.max_attempts,
-            "w-child",
-            3,
-        )
-        .await?;
-        assert_eq!(
-            child_sweep,
-            vec![RecoveryRecord::failed_closed(
-                child_root.id.clone(),
-                FailureReason::LeaseExpiredBudgetExhausted,
-            )],
-        );
-
-        let resumed_invocation = AgentTaskStore::get(&*store, &invocation.id)
-            .await?
-            .context("invocation exists after child fail-closed")?;
-        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
-        assert_eq!(resumed_invocation.pending_child_count, 0);
-
-        let invocation_sweep = exhaust_retry_budget(
-            &store,
-            &invocation.id,
-            invocation.max_attempts,
-            "w-subagent",
-            40,
-        )
-        .await?;
-        assert_eq!(
-            invocation_sweep,
-            vec![RecoveryRecord::failed_closed(
-                invocation.id.clone(),
-                FailureReason::LeaseExpiredBudgetExhausted,
-            )],
-        );
-
-        let resumed_parent = AgentTaskStore::get(&*store, &parent.id)
-            .await?
-            .context("parent exists")?;
-        assert_eq!(resumed_parent.status, TaskStatus::Pending);
-        assert_eq!(resumed_parent.pending_child_count, 0);
-        assert!(matches!(
-            resumed_parent.state,
-            agent_server::journal::task_state::TaskState::ReadyToResume { .. }
-        ));
 
         Ok(())
     }

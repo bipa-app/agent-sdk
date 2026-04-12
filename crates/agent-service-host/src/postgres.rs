@@ -1,17 +1,18 @@
-//! Contract-first `PostgreSQL` backend shape for the current durable core.
+//! `PostgreSQL` backend for the current durable core.
 //!
-//! ENG-7984 is intentionally **not** the runtime SQL implementation.
-//! Instead this module fixes the durable contract that implementation
-//! work will target:
+//! This module keeps the contract-first pieces reviewable while also
+//! housing the runtime SQL implementation for the currently supported
+//! durable surfaces:
 //!
 //! - `sqlx`-managed migration SQL for the current Phase 2-4 durable core,
 //! - explicit table / constraint / index metadata, and
-//! - repository boundaries aligned to the existing journal store traits.
+//! - repository boundaries aligned to the existing journal store traits,
+//! - the `sqlx` durable-core store used by the host when
+//!   `storage.backend=postgres`.
 //!
-//! The service host still only instantiates the in-memory backend today.
-//! This module exists so the future `sqlx`-backed Postgres backend can land against a
-//! stable, already-reviewed schema contract instead of reopening the
-//! data model during implementation.
+//! The remaining host surfaces without a Postgres implementation
+//! (execution intents and tool audit) stay explicit in the store
+//! registry as in-memory fallbacks until follow-up work lands.
 
 pub mod migrations;
 pub mod repository;

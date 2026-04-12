@@ -67,6 +67,9 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?
         .block_on(async move {
+            host.initialize()
+                .await
+                .context("initializing service host")?;
             if grpc_enabled {
                 let grpc = GrpcTransport::new(stores, runtime, health, shutdown, lease_duration);
                 tokio::try_join!(host.run(), grpc.serve(grpc_addr))?;
