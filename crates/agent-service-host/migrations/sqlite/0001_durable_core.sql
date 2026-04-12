@@ -5,7 +5,7 @@
 --   BIGINT                → INTEGER (SQLite INTEGER is 64-bit signed)
 --   json-typeof function  → json_type(col)
 --   col ? 'key'           → json_extract(col, '$.key') IS NOT NULL
---   col ->> 'key'         → json_extract(col, '$.kind')
+--   col ->> 'key'         → json_extract(col, '$.key')
 --   DEFERRABLE            → removed (not supported by SQLite)
 --
 -- PRAGMA foreign_keys = ON must be set at connection time.

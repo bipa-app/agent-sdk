@@ -1,14 +1,14 @@
-//! `sqlx`-backed SQLite implementation of the durable-core stores.
+//! `sqlx`-backed `SQLite` implementation of the durable-core stores.
 //!
 //! This backend mirrors the [`crate::postgres::store::PostgresDurableStore`]
-//! semantics with SQLite dialect adjustments. It uses `BEGIN IMMEDIATE`
+//! semantics with `SQLite` dialect adjustments. It uses `BEGIN IMMEDIATE`
 //! for all write transactions instead of row-level `FOR UPDATE` locks,
 //! since the local backend assumes single-process ownership.
 //!
 //! All trait implementations will be added in follow-up PRs:
-//!   - ENG-8001: AgentTaskStore, ThreadStore, MessageProjectionStore
-//!   - ENG-8002: EventRepository, OutboxStore, RetentionStore
-//!   - ENG-8003: TurnAttemptStore, CheckpointStore, StoreRegistry wiring
+//!   - ENG-8001: `AgentTaskStore`, `ThreadStore`, `MessageProjectionStore`
+//!   - ENG-8002: `EventRepository`, `OutboxStore`, `RetentionStore`
+//!   - ENG-8003: `TurnAttemptStore`, `CheckpointStore`, `StoreRegistry` wiring
 
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
@@ -16,11 +16,11 @@ use sqlx::sqlite::SqlitePoolOptions;
 
 use super::migrations::apply_durable_core_migrations;
 
-/// `sqlx`-backed SQLite durable-core store.
+/// `sqlx`-backed `SQLite` durable-core store.
 ///
 /// A single instance implements all 10 store traits via the shared
 /// connection pool, just like [`crate::postgres::store::PostgresDurableStore`]
-/// does for Postgres.
+/// does for `PostgreSQL`.
 #[derive(Clone)]
 pub struct SqliteDurableStore {
     pool: SqlitePool,
@@ -33,11 +33,11 @@ impl SqliteDurableStore {
         Self { pool }
     }
 
-    /// Connect to a SQLite database and apply the durable-core migrations.
+    /// Connect to a `SQLite` database and apply the durable-core migrations.
     ///
-    /// The `database_url` is a SQLite connection string. Use `":memory:"`
-    /// for an ephemeral in-memory database (useful for tests) or a file
-    /// path like `"sqlite:///path/to/agent-sdk.db"`.
+    /// The `database_url` is a `SQLite` connection string. Use
+    /// `"sqlite::memory:"` for an ephemeral in-memory database (useful
+    /// for tests) or a file path like `"sqlite:///path/to/agent-sdk.db"`.
     ///
     /// WAL mode is enabled at connection time for concurrent read access.
     /// `PRAGMA foreign_keys = ON` is enforced on every connection.
@@ -82,7 +82,7 @@ impl SqliteDurableStore {
 
     /// Borrow the underlying connection pool.
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
+    pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 }

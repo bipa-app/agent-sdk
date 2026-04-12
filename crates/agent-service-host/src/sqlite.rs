@@ -1,26 +1,26 @@
-//! SQLite embedded storage backend for local durability.
+//! `SQLite` embedded storage backend for local durability.
 //!
 //! This module provides [`SqliteDurableStore`] — a single struct that
 //! implements all 10 store traits the journal and worker layers consume,
-//! backed by an embedded SQLite database in WAL mode.
+//! backed by an embedded `SQLite` database in WAL mode.
 //!
 //! # Architecture
 //!
-//! The SQLite backend mirrors the Postgres backend's architecture:
+//! The `SQLite` backend mirrors the `PostgreSQL` backend's architecture:
 //!
 //! - **Same store traits.** Every trait in [`crate::stores::StoreRegistry`]
 //!   is implemented by the same concrete type.
 //! - **Same domain transitions.** All state-machine logic uses the shared
 //!   pure-Rust helpers (`AgentTask::mark_running`, `Thread::apply_committed_turn`,
-//!   etc.) — the SQLite backend only provides persistence and locking.
-//! - **Separate migrations.** SQLite-dialect SQL lives in `migrations/sqlite/`,
-//!   independently versioned from the Postgres migrations but tested for
+//!   etc.) — the `SQLite` backend only provides persistence and locking.
+//! - **Separate migrations.** `SQLite`-dialect SQL lives in `migrations/sqlite/`,
+//!   independently versioned from the `PostgreSQL` migrations but tested for
 //!   structural parity.
 //!
 //! # Locking model
 //!
-//! SQLite in WAL mode serialises writes at the database level. The
-//! Postgres `FOR UPDATE` / `SKIP LOCKED` row-level locking patterns are
+//! `SQLite` in WAL mode serialises writes at the database level. The
+//! `PostgreSQL` `FOR UPDATE` / `SKIP LOCKED` row-level locking patterns are
 //! replaced by `BEGIN IMMEDIATE`, which acquires the write lock at
 //! transaction start. This is acceptable for the single-process local
 //! use case.
@@ -28,7 +28,7 @@
 //! # Feature flag
 //!
 //! This entire module is gated behind the `sqlite` cargo feature so
-//! server builds that only need Postgres do not pull in the SQLite
+//! server builds that only need `PostgreSQL` do not pull in the `SQLite`
 //! dependency.
 
 pub mod migrations;
@@ -80,10 +80,7 @@ mod tests {
         ensure!(
             migrations.len() == 2,
             "expected 2 executable migrations, got {:?}",
-            migrations
-                .iter()
-                .map(|m| m.version)
-                .collect::<Vec<_>>(),
+            migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
         );
         ensure!(
             migrations[0].version == 1,
@@ -151,10 +148,7 @@ mod tests {
         ];
 
         for name in required_constraints {
-            ensure!(
-                sql_bundle.contains(name),
-                "missing constraint: {name}",
-            );
+            ensure!(sql_bundle.contains(name), "missing constraint: {name}",);
         }
         Ok(())
     }
@@ -184,18 +178,14 @@ mod tests {
         ];
 
         for name in required_indexes {
-            ensure!(
-                sql_bundle.contains(name),
-                "missing index: {name}",
-            );
+            ensure!(sql_bundle.contains(name), "missing index: {name}",);
         }
         Ok(())
     }
 
     #[tokio::test]
     async fn sqlite_migrations_apply_to_in_memory_database() -> Result<()> {
-        let store = super::SqliteDurableStore::connect("sqlite::memory:")
-            .await?;
+        let store = super::SqliteDurableStore::connect("sqlite::memory:").await?;
 
         // Verify all 9 tables exist by querying sqlite_master.
         let tables: Vec<(String,)> = sqlx::query_as(

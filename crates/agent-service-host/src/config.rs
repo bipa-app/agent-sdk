@@ -99,13 +99,13 @@ pub enum StorageBackend {
     /// Durable-core task, thread, message, attempt, and checkpoint
     /// state lives in `PostgreSQL`.
     Postgres,
-    /// Embedded SQLite database in WAL mode.  Designed for desktop and
+    /// Embedded `SQLite` database in WAL mode.  Designed for desktop and
     /// CLI processes that own a single data directory.  State survives
     /// process restarts.
     ///
     /// Gated behind the `sqlite` cargo feature.
     Sqlite {
-        /// Path to the SQLite database file.
+        /// Path to the `SQLite` database file.
         ///
         /// When `None`, the store uses a platform-default data directory:
         /// - Linux: `$XDG_DATA_HOME/agent-sdk/agent-sdk.db`

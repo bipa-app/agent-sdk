@@ -274,11 +274,7 @@ impl StoreRegistry {
             }
             StorageBackend::Sqlite { .. } => {
                 // SQLite backend wiring lands in ENG-8003.
-                // For now, fail at runtime with a clear message.
-                anyhow::bail!(
-                    "SQLite storage backend requires the `sqlite` feature flag \
-                     and is not yet fully wired — see ENG-8003"
-                )
+                anyhow::bail!("SQLite storage backend is not yet fully wired — see ENG-8003")
             }
         }
     }

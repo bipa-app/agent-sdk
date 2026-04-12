@@ -1,6 +1,6 @@
-//! `sqlx`-managed migration bundle for the SQLite durable contract.
+//! `sqlx`-managed migration bundle for the `SQLite` durable contract.
 //!
-//! Mirrors the Postgres migration bundle in
+//! Mirrors the `PostgreSQL` migration bundle in
 //! [`crate::postgres::migrations`] but loads from the `migrations/sqlite/`
 //! directory. The two migration sets evolve independently but are tested
 //! for structural parity.
@@ -29,7 +29,7 @@ const EVENT_JOURNAL_OUTBOX_SQL: &str = include_str!(concat!(
     "/migrations/sqlite/0002_event_journal_outbox.sql"
 ));
 
-/// `sqlx`-managed migration bundle for the SQLite durable contract.
+/// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
 const MIGRATIONS: [SqliteMigration; 2] = [
@@ -45,15 +45,15 @@ const MIGRATIONS: [SqliteMigration; 2] = [
     },
 ];
 
-/// The reviewable executable migration bundle for the SQLite durable core.
+/// The reviewable executable migration bundle for the `SQLite` durable core.
 #[must_use]
 pub const fn durable_core_migrations() -> &'static [SqliteMigration] {
     &MIGRATIONS
 }
 
-/// Apply the embedded `sqlx` migration bundle to a live SQLite pool.
+/// Apply the embedded `sqlx` migration bundle to a live `SQLite` pool.
 ///
-/// This is the runtime entry point the SQLite backend calls at startup
+/// This is the runtime entry point the `SQLite` backend calls at startup
 /// before instantiating store trait implementations.
 ///
 /// # Errors

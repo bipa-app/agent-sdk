@@ -42,7 +42,7 @@ html2text = "0.14"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "sqlite", "runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
 
 # dev
 tempfile = "3"
