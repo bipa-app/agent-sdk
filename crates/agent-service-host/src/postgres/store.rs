@@ -3817,7 +3817,38 @@ mod tests {
         }
     }
 
-    async fn test_store() -> Result<Option<PostgresDurableStore>> {
+    fn drop_test_schema(database_url: String, schema: String) {
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = PgConnection::connect(&database_url).await else {
+                    return;
+                };
+                let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                    .execute(&mut conn)
+                    .await;
+            });
+        })
+        .join();
+    }
+
+    struct PostgresTestSchema {
+        schema: String,
+        database_url: String,
+    }
+
+    impl Drop for PostgresTestSchema {
+        fn drop(&mut self) {
+            drop_test_schema(self.database_url.clone(), self.schema.clone());
+        }
+    }
+
+    async fn test_store() -> Result<Option<(PostgresDurableStore, PostgresTestSchema)>> {
         let Ok(database_url) = env::var("TEST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         else {
             return Ok(None);
@@ -3851,12 +3882,18 @@ mod tests {
             .migrate()
             .await
             .context("migrate postgres test store")?;
-        Ok(Some(store))
+        Ok(Some((
+            store,
+            PostgresTestSchema {
+                schema,
+                database_url,
+            },
+        )))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_submits_on_same_thread_serialize_with_exactly_one_pending() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 
@@ -3907,7 +3944,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_promotes_fire_exactly_once_after_slot_frees() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 
@@ -3960,7 +3997,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn try_acquire_task_is_exclusive_across_two_workers() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 
@@ -4007,7 +4044,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn acquire_next_runnable_commits_fail_closed_heads_before_returning_none() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 
@@ -4083,7 +4120,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn completed_turn_transaction_rolls_back_partial_writes_on_error() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 
@@ -4149,7 +4186,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_completed_turn_uses_atomic_postgres_hook() -> Result<()> {
-        let Some(store) = test_store().await? else {
+        let Some((store, _schema_guard)) = test_store().await? else {
             return Ok(());
         };
 

@@ -1968,7 +1968,38 @@ mod tests {
         }
     }
 
-    async fn postgres_test_config() -> Result<Option<ServiceConfig>> {
+    fn drop_test_schema(database_url: String, schema: String) {
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = PgConnection::connect(&database_url).await else {
+                    return;
+                };
+                let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                    .execute(&mut conn)
+                    .await;
+            });
+        })
+        .join();
+    }
+
+    struct PostgresTestSchema {
+        schema: String,
+        database_url: String,
+    }
+
+    impl Drop for PostgresTestSchema {
+        fn drop(&mut self) {
+            drop_test_schema(self.database_url.clone(), self.schema.clone());
+        }
+    }
+
+    async fn postgres_test_config() -> Result<Option<(ServiceConfig, PostgresTestSchema)>> {
         let Ok(database_url) =
             std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
         else {
@@ -1984,17 +2015,23 @@ mod tests {
             .await
             .with_context(|| format!("create grpc test schema {schema}"))?;
 
-        Ok(Some(ServiceConfig {
-            storage: crate::config::StorageConfig {
-                backend: crate::config::StorageBackend::Postgres,
-                postgres: crate::config::PostgresStorageConfig {
-                    database_url: Some(database_url),
-                    schema: Some(schema),
-                    max_connections: 8,
+        Ok(Some((
+            ServiceConfig {
+                storage: crate::config::StorageConfig {
+                    backend: crate::config::StorageBackend::Postgres,
+                    postgres: crate::config::PostgresStorageConfig {
+                        database_url: Some(database_url.clone()),
+                        schema: Some(schema.clone()),
+                        max_connections: 8,
+                    },
                 },
+                ..ServiceConfig::default()
             },
-            ..ServiceConfig::default()
-        }))
+            PostgresTestSchema {
+                schema,
+                database_url,
+            },
+        )))
     }
 
     async fn inspection_stores(config: &ServiceConfig) -> Result<StoreRegistry> {
@@ -2781,7 +2818,7 @@ mod tests {
     #[tokio::test]
     async fn local_daemon_postgres_restart_preserves_durable_core_and_exposes_event_gap()
     -> Result<()> {
-        let Some(config) = postgres_test_config().await? else {
+        let Some((config, _schema_guard)) = postgres_test_config().await? else {
             return Ok(());
         };
         let daemon1 = start_postgres_daemon_with_text(
