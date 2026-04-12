@@ -99,10 +99,12 @@ impl PostgresDurableStore {
             pool_options = pool_options.after_connect(move |conn, _meta| {
                 let schema_name = schema_name.clone();
                 Box::pin(async move {
-                    sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
-                        .bind(&schema_name)
-                        .execute(conn)
-                        .await?;
+                    let _ = sqlx::query_scalar!(
+                        "SELECT pg_catalog.set_config('search_path', $1, false)",
+                        schema_name,
+                    )
+                    .fetch_one(conn)
+                    .await?;
                     Ok(())
                 })
             });
@@ -1385,15 +1387,15 @@ async fn ensure_child_thread_available_for_spawn_tx(
         ));
     }
 
-    let existing_child_thread_task = sqlx::query_scalar::<_, String>(
+    let existing_child_thread_task = sqlx::query_scalar!(
         r"
 SELECT id
 FROM agent_sdk_tasks
 WHERE thread_id = $1
 LIMIT 1
 ",
+        thread_key(child_thread_id),
     )
-    .bind(thread_key(child_thread_id))
     .fetch_optional(tx.as_mut())
     .await
     .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
@@ -2151,34 +2153,7 @@ FOR UPDATE SKIP LOCKED
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
             .await?
             .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
+        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
