@@ -3,7 +3,7 @@
 //! This module defines backend-agnostic test functions that verify the
 //! critical correctness invariants of the journal and checkpoint stores.
 //! Each test function accepts trait-object references so they can be
-//! invoked against the in-memory, SQLite, and PostgreSQL backends from
+//! invoked against the in-memory, `SQLite`, and `PostgreSQL` backends from
 //! the same code path.
 //!
 //! # Covered invariants
@@ -105,7 +105,7 @@ mod tests {
         Ok(())
     }
 
-    /// Lease acquisition via try_acquire_task.
+    /// Lease acquisition via `try_acquire_task`.
     async fn test_lease_acquisition(task_store: &dyn AgentTaskStore) -> Result<()> {
         let root = fresh_root("conformance-lease", 20);
         let _ = task_store.submit_root_turn(root.clone()).await?;

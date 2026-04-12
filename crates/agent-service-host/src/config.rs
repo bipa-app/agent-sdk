@@ -363,10 +363,9 @@ fn dirs_default_sqlite_dir() -> Result<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.local/share")
-        });
+        let base = std::env::var("XDG_DATA_HOME")
+            .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.local/share")))
+            .context("neither XDG_DATA_HOME nor HOME is set")?;
         Ok(PathBuf::from(base).join("agent-sdk"))
     }
     #[cfg(target_os = "windows")]

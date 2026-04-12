@@ -547,7 +547,9 @@ fn build_sqlite_store(database_url: &str) -> Result<Arc<SqliteDurableStore>> {
     };
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return handle.block_on(connect());
+        // block_in_place yields the current executor thread so
+        // block_on does not panic inside an active Tokio runtime.
+        return tokio::task::block_in_place(|| handle.block_on(connect()));
     }
 
     tokio::runtime::Builder::new_current_thread()
