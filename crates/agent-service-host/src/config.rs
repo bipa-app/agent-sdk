@@ -99,8 +99,20 @@ pub enum StorageBackend {
     /// Durable-core task, thread, message, attempt, and checkpoint
     /// state lives in `PostgreSQL`.
     Postgres,
-    // Future variants (gated by feature flags):
-    // Redis { url: String },
+    /// Embedded SQLite database in WAL mode.  Designed for desktop and
+    /// CLI processes that own a single data directory.  State survives
+    /// process restarts.
+    ///
+    /// Gated behind the `sqlite` cargo feature.
+    Sqlite {
+        /// Path to the SQLite database file.
+        ///
+        /// When `None`, the store uses a platform-default data directory:
+        /// - Linux: `$XDG_DATA_HOME/agent-sdk/agent-sdk.db`
+        /// - macOS: `~/Library/Application Support/agent-sdk/agent-sdk.db`
+        /// - Windows: `%LOCALAPPDATA%\agent-sdk\agent-sdk.db`
+        path: Option<String>,
+    },
 }
 
 /// `PostgreSQL` backend settings.
@@ -189,7 +201,7 @@ impl StorageConfig {
     pub fn postgres_settings(&self) -> Result<&PostgresStorageConfig> {
         match self.backend {
             StorageBackend::Postgres => Ok(&self.postgres),
-            StorageBackend::InMemory => {
+            StorageBackend::InMemory | StorageBackend::Sqlite { .. } => {
                 bail!("storage.postgres is only valid when storage.backend=postgres")
             }
         }
@@ -444,6 +456,58 @@ retention:
         let re_yaml = serde_yaml::to_string(&config)?;
         let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
         assert_eq!(re_config.worker.pool_size, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_minimal_yaml() -> Result<()> {
+        // serde_yaml 0.9 uses YAML tags for struct enum variants.
+        let yaml = r"
+storage:
+  backend: !sqlite
+    path: null
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(matches!(
+            config.storage.backend,
+            StorageBackend::Sqlite { path: None }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_explicit_path_yaml() -> Result<()> {
+        let yaml = r#"
+storage:
+  backend: !sqlite
+    path: "/tmp/test.db"
+"#;
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        match &config.storage.backend {
+            StorageBackend::Sqlite { path } => {
+                assert_eq!(path.as_deref(), Some("/tmp/test.db"));
+            }
+            other => panic!("expected Sqlite, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_round_trips_through_yaml() -> Result<()> {
+        let yaml = r#"
+storage:
+  backend: !sqlite
+    path: "/data/agent-sdk.db"
+"#;
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
+        match &re_config.storage.backend {
+            StorageBackend::Sqlite { path } => {
+                assert_eq!(path.as_deref(), Some("/data/agent-sdk.db"));
+            }
+            other => panic!("expected Sqlite, got {other:?}"),
+        }
         Ok(())
     }
 }

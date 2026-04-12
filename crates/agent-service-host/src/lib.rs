@@ -71,4 +71,6 @@ pub mod host;
 pub mod postgres;
 pub mod proto;
 pub mod runtime;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod stores;

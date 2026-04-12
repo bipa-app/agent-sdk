@@ -10,6 +10,10 @@ publish = false
 name = "agent-service-host"
 path = "src/main.rs"
 
+[features]
+default = []
+sqlite = ["sqlx/sqlite"]
+
 [dependencies]
 agent-sdk-core.workspace = true
 agent-sdk-tools.workspace = true
