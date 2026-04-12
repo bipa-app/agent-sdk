@@ -38,7 +38,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -206,6 +206,30 @@ impl StorageConfig {
             }
         }
     }
+
+    /// Return the SQLite database URL when the backend is selected.
+    ///
+    /// When no explicit path is provided, returns a platform-default
+    /// data directory path.
+    ///
+    /// # Errors
+    /// Returns an error if the backend is not `sqlite`.
+    pub fn sqlite_database_url(&self) -> Result<String> {
+        match &self.backend {
+            StorageBackend::Sqlite { path } => {
+                if let Some(path) = path {
+                    Ok(format!("sqlite://{path}?mode=rwc"))
+                } else {
+                    let dir = dirs_default_sqlite_dir()?;
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("create sqlite data dir {}", dir.display()))?;
+                    let db_path = dir.join("agent-sdk.db");
+                    Ok(format!("sqlite://{}?mode=rwc", db_path.display()))
+                }
+            }
+            _ => bail!("sqlite_database_url is only valid when storage.backend=sqlite"),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -320,6 +344,40 @@ pub struct RetentionConfig {
     pub event_ttl_secs: Option<u64>,
     /// Maximum checkpoints per thread.  `None` = no limit.
     pub checkpoint_max_per_thread: Option<u32>,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Platform-default SQLite data directory
+// ─────────────────────────────────────────────────────────────────────
+
+/// Return the platform-default data directory for SQLite.
+///
+/// - Linux:   `$XDG_DATA_HOME/agent-sdk` (defaults to `~/.local/share/agent-sdk`)
+/// - macOS:   `~/Library/Application Support/agent-sdk`
+/// - Windows: `%LOCALAPPDATA%\agent-sdk`
+fn dirs_default_sqlite_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join("Library/Application Support/agent-sdk"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share")
+        });
+        Ok(PathBuf::from(base).join("agent-sdk"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("LOCALAPPDATA").context("LOCALAPPDATA not set")?;
+        Ok(PathBuf::from(base).join("agent-sdk"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("unsupported platform for default SQLite data directory")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
