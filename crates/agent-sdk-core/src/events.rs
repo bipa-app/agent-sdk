@@ -122,19 +122,25 @@ pub enum AgentEvent {
         subagent_name: String,
         /// Human-friendly nickname assigned by the parent (e.g., "Zara")
         nickname: Option<String>,
+        /// Durable child thread reference, when available.
+        child_thread_id: Option<ThreadId>,
+        /// Durable child root task reference, when available.
+        child_root_task_id: Option<String>,
+        /// Durable parent-visible invocation task reference, when available.
+        subagent_task_id: Option<String>,
         /// Maximum turns configured for this subagent
         max_turns: Option<u32>,
         /// Current turn number of the subagent
         current_turn: Option<u32>,
         /// Model being used by the subagent
         model: Option<String>,
-        /// Tool name that just started or completed
+        /// Summary label associated with the latest subagent update.
         tool_name: String,
-        /// Brief context for the tool (e.g., file path, pattern)
+        /// Brief context associated with the latest subagent update.
         tool_context: String,
-        /// Whether the tool completed (false = started, true = ended)
+        /// Whether the summarized update represents terminal completion.
         completed: bool,
-        /// Whether the tool succeeded (only meaningful if completed)
+        /// Whether the subagent succeeded (only meaningful if completed)
         success: bool,
         /// Current total tool count for this subagent
         tool_count: u32,
