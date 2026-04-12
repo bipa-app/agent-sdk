@@ -194,16 +194,66 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
 
 #[cfg(feature = "sqlite")]
 const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
-    StorageSurfaceStatus { surface: "task_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "thread_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "message_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "attempt_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "checkpoint_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "event_repo", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "execution_intent_store", backend: "in_memory", persists_restart: false, note: "execution intents remain process-local until a durable backend is implemented" },
-    StorageSurfaceStatus { surface: "tool_audit_store", backend: "in_memory", persists_restart: false, note: "tool audit events remain process-local until a durable backend is implemented" },
-    StorageSurfaceStatus { surface: "outbox_store", backend: "sqlite", persists_restart: true, note: "" },
-    StorageSurfaceStatus { surface: "retention_store", backend: "sqlite", persists_restart: true, note: "" },
+    StorageSurfaceStatus {
+        surface: "task_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "thread_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "message_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "attempt_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "checkpoint_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "event_repo",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "execution_intent_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "execution intents remain process-local until a durable backend is implemented",
+    },
+    StorageSurfaceStatus {
+        surface: "tool_audit_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "tool audit events remain process-local until a durable backend is implemented",
+    },
+    StorageSurfaceStatus {
+        surface: "outbox_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "retention_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
 ];
 
 // ─────────────────────────────────────────────────────────────────────
@@ -216,7 +266,7 @@ enum RegistryBackend {
     #[cfg(feature = "postgres")]
     Postgres(PostgresBackend),
     #[cfg(feature = "sqlite")]
-    Sqlite(SqliteBackend),
+    Sqlite,
 }
 
 #[cfg(feature = "postgres")]
@@ -239,12 +289,6 @@ impl PostgresBackend {
             .await?;
         Ok(())
     }
-}
-
-#[cfg(feature = "sqlite")]
-#[derive(Clone)]
-struct SqliteBackend {
-    store: Arc<SqliteDurableStore>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -317,9 +361,7 @@ impl StoreRegistry {
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
-                    anyhow::bail!(
-                        "SQLite storage backend requires the `sqlite` feature flag"
-                    )
+                    anyhow::bail!("SQLite storage backend requires the `sqlite` feature flag")
                 }
             }
         }
@@ -337,7 +379,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(backend) => backend.initialize().await,
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite(_) => {
+            RegistryBackend::Sqlite => {
                 // Migrations are applied during connect().
                 Ok(())
             }
@@ -352,7 +394,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => "postgres",
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite(_) => "sqlite",
+            RegistryBackend::Sqlite => "sqlite",
         }
     }
 
@@ -364,7 +406,7 @@ impl StoreRegistry {
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => &POSTGRES_SURFACES,
             #[cfg(feature = "sqlite")]
-            RegistryBackend::Sqlite(_) => &SQLITE_SURFACES,
+            RegistryBackend::Sqlite => &SQLITE_SURFACES,
         }
     }
 
@@ -436,12 +478,10 @@ impl StoreRegistry {
             execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store: durable_store.clone(),
-            retention_store: durable_store.clone(),
+            retention_store: durable_store,
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
-            backend: RegistryBackend::Sqlite(SqliteBackend {
-                store: durable_store,
-            }),
+            backend: RegistryBackend::Sqlite,
         })
     }
 

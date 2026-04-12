@@ -125,7 +125,13 @@ mod tests {
 
         // Second acquire on the same task should return None.
         let second = task_store
-            .try_acquire_task(&root.id, WorkerId::new(), LeaseId::new(), expires, t_plus(22))
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                expires,
+                t_plus(22),
+            )
             .await?;
         assert!(second.is_none());
         Ok(())
@@ -138,7 +144,13 @@ mod tests {
         let worker = WorkerId::new();
         let lease = LeaseId::new();
         let _ = task_store
-            .try_acquire_task(&root.id, worker.clone(), lease.clone(), t_plus(40), t_plus(31))
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(40),
+                t_plus(31),
+            )
             .await?;
 
         let refreshed = task_store
@@ -153,7 +165,13 @@ mod tests {
         let root = fresh_root("conformance-expiry", 40);
         let _ = task_store.submit_root_turn(root.clone()).await?;
         let _ = task_store
-            .try_acquire_task(&root.id, WorkerId::new(), LeaseId::new(), t_plus(42), t_plus(41))
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(42),
+                t_plus(41),
+            )
             .await?;
 
         // Sweep after lease expires.
@@ -214,9 +232,7 @@ mod tests {
                     output_tokens: 50,
                     cached_input_tokens: 0,
                 },
-                messages: vec![
-                    agent_sdk_core::llm::Message::assistant("test response"),
-                ],
+                messages: vec![agent_sdk_core::llm::Message::assistant("test response")],
                 turn_usage,
                 agent_state_snapshot: serde_json::json!({}),
                 events: vec![],
@@ -246,7 +262,13 @@ mod tests {
         let worker = WorkerId::new();
         let lease = LeaseId::new();
         let _ = task_store
-            .try_acquire_task(&root.id, worker.clone(), lease.clone(), t_plus(90), t_plus(61))
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
             .await?;
 
         let spec = ChildSpawnSpec { max_attempts: 3 };
@@ -255,8 +277,14 @@ mod tests {
                 agent_sdk_core::AgentContinuation {
                     thread_id: thread_id("conformance-children"),
                     turn: 1,
-                    total_usage: TokenUsage { input_tokens: 0, output_tokens: 0 },
-                    turn_usage: TokenUsage { input_tokens: 0, output_tokens: 0 },
+                    total_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                    turn_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
                     completed_results: vec![],
@@ -269,14 +297,7 @@ mod tests {
             suspended_messages: vec![],
         };
         let (parent, children) = task_store
-            .spawn_tool_children(
-                &root.id,
-                &worker,
-                &lease,
-                vec![spec],
-                payload,
-                t_plus(62),
-            )
+            .spawn_tool_children(&root.id, &worker, &lease, vec![spec], payload, t_plus(62))
             .await?;
         assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
         assert_eq!(children.len(), 1);
@@ -304,7 +325,13 @@ mod tests {
         let worker = WorkerId::new();
         let lease = LeaseId::new();
         let _ = task_store
-            .try_acquire_task(&root.id, worker.clone(), lease.clone(), t_plus(100), t_plus(71))
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(100),
+                t_plus(71),
+            )
             .await?;
 
         let cancelled = task_store.cancel_tree(&root.id, t_plus(72)).await?;
@@ -352,7 +379,13 @@ mod tests {
 
         // Acquire (attempt 1) and let the lease expire.
         let _ = task_store
-            .try_acquire_task(&root.id, WorkerId::new(), LeaseId::new(), t_plus(91), t_plus(90))
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(91),
+                t_plus(90),
+            )
             .await?;
         let records = task_store.release_expired_leases(t_plus(92)).await?;
         assert_eq!(records.len(), 1);
@@ -364,36 +397,6 @@ mod tests {
     }
 
     // ── Backend runners ──────────────────────────────────────────────
-
-    /// Run the full conformance suite against a set of stores.
-    async fn run_conformance_suite(
-        task_store: &dyn AgentTaskStore,
-        thread_store: &dyn ThreadStore,
-        message_store: &dyn MessageProjectionStore,
-        attempt_store: &dyn TurnAttemptStore,
-        checkpoint_store: &dyn CheckpointStore,
-        event_repo: &dyn EventRepository,
-    ) -> Result<()> {
-        test_root_admission(task_store).await?;
-        test_root_fifo_queueing(task_store).await?;
-        test_lease_acquisition(task_store).await?;
-        test_heartbeat(task_store).await?;
-        test_lease_expiry_sweep(task_store).await?;
-        test_completed_turn_commit(
-            task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
-        )
-        .await?;
-        test_child_spawn_and_resume(task_store).await?;
-        test_cancel_tree(task_store).await?;
-        test_promote_queued_root(task_store).await?;
-        test_retry_exhaustion(task_store).await?;
-        Ok(())
-    }
 
     // ── In-memory backend ────────────────────────────────────────────
 
@@ -430,7 +433,15 @@ mod tests {
     #[tokio::test]
     async fn conformance_in_memory_completed_turn() -> Result<()> {
         let s = fresh_in_memory_stores();
-        test_completed_turn_commit(s.task.as_ref(), s.thread.as_ref(), s.message.as_ref(), s.attempt.as_ref(), s.checkpoint.as_ref(), s.event.as_ref()).await
+        test_completed_turn_commit(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.message.as_ref(),
+            s.attempt.as_ref(),
+            s.checkpoint.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
     }
 
     #[tokio::test]

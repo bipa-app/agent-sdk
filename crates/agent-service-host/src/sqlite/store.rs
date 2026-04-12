@@ -41,8 +41,8 @@ use agent_server::journal::recovery::{
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload,
-    TaskKind, TaskStatus, WorkerId,
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
+    WorkerId,
 };
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
@@ -241,10 +241,7 @@ WHERE thread_id = ?1
         record.map(TryInto::try_into).transpose()
     }
 
-    async fn upsert_thread_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        thread: &Thread,
-    ) -> Result<()> {
+    async fn upsert_thread_tx(tx: &mut Transaction<'_, Sqlite>, thread: &Thread) -> Result<()> {
         sqlx::query(
             r"
 INSERT INTO agent_sdk_threads (
@@ -289,13 +286,12 @@ WHERE thread_id = ?1
         .await
         .with_context(|| format!("get message head for {thread_id}"))?;
 
-        match record {
-            Some(r) => r.try_into(),
-            None => {
-                let fresh = MessageProjection::new(thread_id.clone(), now);
-                Self::upsert_message_head_tx(tx, &fresh).await?;
-                Ok(fresh)
-            }
+        if let Some(r) = record {
+            r.try_into()
+        } else {
+            let fresh = MessageProjection::new(thread_id.clone(), now);
+            Self::upsert_message_head_tx(tx, &fresh).await?;
+            Ok(fresh)
         }
     }
 
@@ -439,7 +435,11 @@ INSERT INTO agent_sdk_turn_attempts (
         .bind(attempt.cached_input_tokens.map(i64::from))
         .bind(attempt.opened_at)
         .bind(attempt.closed_at)
-        .bind(attempt.duration_ms.map(|v| v as i64))
+        .bind(
+            attempt
+                .duration_ms
+                .map(|v| i64::try_from(v).expect("duration_ms fits i64")),
+        )
         .execute(&mut **tx)
         .await
         .with_context(|| format!("insert attempt {}", attempt.id))?;
@@ -469,11 +469,19 @@ WHERE id = ?1
         .bind(attempt.output_tokens.map(i64::from))
         .bind(attempt.cached_input_tokens.map(i64::from))
         .bind(attempt.closed_at)
-        .bind(attempt.duration_ms.map(|v| v as i64))
+        .bind(
+            attempt
+                .duration_ms
+                .map(|v| i64::try_from(v).expect("duration_ms fits i64")),
+        )
         .execute(&mut **tx)
         .await
         .with_context(|| format!("update attempt {}", attempt.id))?;
-        ensure!(result.rows_affected() == 1, "update attempt affected {} rows", result.rows_affected());
+        ensure!(
+            result.rows_affected() == 1,
+            "update attempt affected {} rows",
+            result.rows_affected()
+        );
         Ok(())
     }
 
@@ -545,10 +553,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
         record.map(TryInto::try_into).transpose()
     }
 
-    async fn insert_task_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        task: &AgentTask,
-    ) -> Result<()> {
+    async fn insert_task_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
         sqlx::query(
             r"
 INSERT INTO agent_sdk_tasks (
@@ -570,7 +575,10 @@ INSERT INTO agent_sdk_tasks (
         .bind(task.root_id.as_str())
         .bind(i64::from(task.depth))
         .bind(thread_key(&task.thread_id))
-        .bind(json_to_value(&task.submitted_input, "task submitted input")?)
+        .bind(json_to_value(
+            &task.submitted_input,
+            "task submitted input",
+        )?)
         .bind(task.worker_id.as_ref().map(WorkerId::as_str))
         .bind(task.lease_id.as_ref().map(LeaseId::as_str))
         .bind(task.lease_expires_at)
@@ -591,10 +599,7 @@ INSERT INTO agent_sdk_tasks (
         Ok(())
     }
 
-    async fn update_task_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        task: &AgentTask,
-    ) -> Result<()> {
+    async fn update_task_tx(tx: &mut Transaction<'_, Sqlite>, task: &AgentTask) -> Result<()> {
         let result = sqlx::query(
             r"
 UPDATE agent_sdk_tasks SET
@@ -615,7 +620,10 @@ WHERE id = ?1
         .bind(task.root_id.as_str())
         .bind(i64::from(task.depth))
         .bind(thread_key(&task.thread_id))
-        .bind(json_to_value(&task.submitted_input, "task submitted input")?)
+        .bind(json_to_value(
+            &task.submitted_input,
+            "task submitted input",
+        )?)
         .bind(task.worker_id.as_ref().map(WorkerId::as_str))
         .bind(task.lease_id.as_ref().map(LeaseId::as_str))
         .bind(task.lease_expires_at)
@@ -633,7 +641,12 @@ WHERE id = ?1
         .execute(&mut **tx)
         .await
         .with_context(|| format!("update task {}", task.id))?;
-        ensure!(result.rows_affected() == 1, "update task affected {} rows for {}", result.rows_affected(), task.id);
+        ensure!(
+            result.rows_affected() == 1,
+            "update task affected {} rows for {}",
+            result.rows_affected(),
+            task.id
+        );
         Ok(())
     }
 
@@ -641,26 +654,42 @@ WHERE id = ?1
         tx: &mut Transaction<'_, Sqlite>,
         task: &AgentTask,
     ) -> Result<()> {
-        task.validate().context("insert rejected: task failed schema validation")?;
+        task.validate()
+            .context("insert rejected: task failed schema validation")?;
         Self::bootstrap_thread_row_tx(tx, &task.thread_id, task.created_at).await?;
 
         if let Some(parent_id) = &task.parent_id {
-            let parent = Self::load_task_tx(tx, parent_id)
-                .await?
-                .ok_or_else(|| anyhow!("insert rejected: child task references unknown parent {parent_id}"))?;
+            let parent = Self::load_task_tx(tx, parent_id).await?.ok_or_else(|| {
+                anyhow!("insert rejected: child task references unknown parent {parent_id}")
+            })?;
             if parent.kind.is_leaf() {
                 let parent_kind = parent.kind;
-                return Err(anyhow!("insert rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"));
+                return Err(anyhow!(
+                    "insert rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+                ));
             }
             if parent.thread_id != task.thread_id {
-                return Err(anyhow!("insert rejected: child thread_id {} does not match parent thread_id {}", task.thread_id, parent.thread_id));
+                return Err(anyhow!(
+                    "insert rejected: child thread_id {} does not match parent thread_id {}",
+                    task.thread_id,
+                    parent.thread_id
+                ));
             }
             if parent.root_id != task.root_id {
-                return Err(anyhow!("insert rejected: child root_id {} does not match parent root_id {}", task.root_id, parent.root_id));
+                return Err(anyhow!(
+                    "insert rejected: child root_id {} does not match parent root_id {}",
+                    task.root_id,
+                    parent.root_id
+                ));
             }
             let expected_depth = parent.depth.saturating_add(1);
             if task.depth != expected_depth {
-                return Err(anyhow!("insert rejected: child depth {} must be parent.depth + 1 ({} + 1 = {})", task.depth, parent.depth, expected_depth));
+                return Err(anyhow!(
+                    "insert rejected: child depth {} must be parent.depth + 1 ({} + 1 = {})",
+                    task.depth,
+                    parent.depth,
+                    expected_depth
+                ));
             }
         }
 
@@ -680,7 +709,11 @@ LIMIT 1
             .await
             .with_context(|| format!("check blocking root slot for thread {}", task.thread_id))?;
             if let Some((existing_id,)) = existing {
-                return Err(anyhow!("insert rejected: thread {} already has active root task {}", task.thread_id, existing_id));
+                return Err(anyhow!(
+                    "insert rejected: thread {} already has active root task {}",
+                    task.thread_id,
+                    existing_id
+                ));
             }
         }
 
@@ -691,18 +724,57 @@ LIMIT 1
         tx: &mut Transaction<'_, Sqlite>,
         task: &AgentTask,
     ) -> Result<AgentTask> {
-        task.validate().context("update rejected: task failed schema validation")?;
+        task.validate()
+            .context("update rejected: task failed schema validation")?;
         let old = Self::load_task_tx(tx, &task.id)
             .await?
             .ok_or_else(|| anyhow!("update rejected: task {} does not exist", task.id))?;
 
-        if old.kind != task.kind { return Err(anyhow!("update rejected: task kind is immutable (was {:?}, got {:?})", old.kind, task.kind)); }
-        if old.parent_id != task.parent_id { return Err(anyhow!("update rejected: parent_id is immutable (was {:?}, got {:?})", old.parent_id, task.parent_id)); }
-        if old.root_id != task.root_id { return Err(anyhow!("update rejected: root_id is immutable (was {}, got {})", old.root_id, task.root_id)); }
-        if old.depth != task.depth { return Err(anyhow!("update rejected: depth is immutable (was {}, got {})", old.depth, task.depth)); }
-        if old.thread_id != task.thread_id { return Err(anyhow!("update rejected: thread_id is immutable (was {}, got {})", old.thread_id, task.thread_id)); }
-        if old.created_at != task.created_at { return Err(anyhow!("update rejected: created_at is immutable")); }
-        if old.max_attempts != task.max_attempts { return Err(anyhow!("update rejected: max_attempts is immutable (was {}, got {})", old.max_attempts, task.max_attempts)); }
+        if old.kind != task.kind {
+            return Err(anyhow!(
+                "update rejected: task kind is immutable (was {:?}, got {:?})",
+                old.kind,
+                task.kind
+            ));
+        }
+        if old.parent_id != task.parent_id {
+            return Err(anyhow!(
+                "update rejected: parent_id is immutable (was {:?}, got {:?})",
+                old.parent_id,
+                task.parent_id
+            ));
+        }
+        if old.root_id != task.root_id {
+            return Err(anyhow!(
+                "update rejected: root_id is immutable (was {}, got {})",
+                old.root_id,
+                task.root_id
+            ));
+        }
+        if old.depth != task.depth {
+            return Err(anyhow!(
+                "update rejected: depth is immutable (was {}, got {})",
+                old.depth,
+                task.depth
+            ));
+        }
+        if old.thread_id != task.thread_id {
+            return Err(anyhow!(
+                "update rejected: thread_id is immutable (was {}, got {})",
+                old.thread_id,
+                task.thread_id
+            ));
+        }
+        if old.created_at != task.created_at {
+            return Err(anyhow!("update rejected: created_at is immutable"));
+        }
+        if old.max_attempts != task.max_attempts {
+            return Err(anyhow!(
+                "update rejected: max_attempts is immutable (was {}, got {})",
+                old.max_attempts,
+                task.max_attempts
+            ));
+        }
 
         if task.kind == TaskKind::RootTurn && task.status.blocks_root_admission() {
             let current: Option<(String,)> = sqlx::query_as(
@@ -720,7 +792,11 @@ LIMIT 1
             .await
             .with_context(|| format!("check competing root slot for thread {}", task.thread_id))?;
             if let Some((current_id,)) = current {
-                return Err(anyhow!("update rejected: thread {} already has a different active root task {}", task.thread_id, current_id));
+                return Err(anyhow!(
+                    "update rejected: thread {} already has a different active root task {}",
+                    task.thread_id,
+                    current_id
+                ));
             }
         }
         Ok(old)
@@ -755,15 +831,25 @@ LIMIT 1
             .ok_or_else(|| anyhow!("{error_prefix} rejected: task {child_id} does not exist"))?;
         if old_child.status != TaskStatus::Running {
             let status = old_child.status;
-            return Err(anyhow!("{error_prefix} rejected: task {child_id} is not running (status {status:?})"));
+            return Err(anyhow!(
+                "{error_prefix} rejected: task {child_id} is not running (status {status:?})"
+            ));
         }
         match &old_child.worker_id {
             Some(current) if current == worker => {}
-            _ => return Err(anyhow!("{error_prefix} rejected: worker mismatch on task {child_id}")),
+            _ => {
+                return Err(anyhow!(
+                    "{error_prefix} rejected: worker mismatch on task {child_id}"
+                ));
+            }
         }
         match &old_child.lease_id {
             Some(current) if current == lease => {}
-            _ => return Err(anyhow!("{error_prefix} rejected: lease mismatch on task {child_id}")),
+            _ => {
+                return Err(anyhow!(
+                    "{error_prefix} rejected: lease mismatch on task {child_id}"
+                ));
+            }
         }
 
         let new_child = transition(old_child.clone())
@@ -771,13 +857,17 @@ LIMIT 1
         Self::update_task_tx(tx, &new_child).await?;
 
         let parent = if let Some(parent_id) = &new_child.parent_id {
-            let old_parent = Self::load_task_tx(tx, parent_id)
-                .await?
-                .ok_or_else(|| anyhow!("{error_prefix}: child {child_id} references missing parent {parent_id}"))?;
+            let old_parent = Self::load_task_tx(tx, parent_id).await?.ok_or_else(|| {
+                anyhow!("{error_prefix}: child {child_id} references missing parent {parent_id}")
+            })?;
             if old_parent.status == TaskStatus::WaitingOnChildren {
                 let live = Self::load_live_child_count_tx(tx, parent_id).await?;
-                let new_parent = old_parent.clone().recompute_pending_children(live, now)
-                    .with_context(|| format!("{error_prefix}: recompute_pending_children transition failed"))?;
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .with_context(|| {
+                        format!("{error_prefix}: recompute_pending_children transition failed")
+                    })?;
                 Self::update_task_tx(tx, &new_parent).await?;
                 Some(new_parent)
             } else {
@@ -909,7 +999,7 @@ VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 0, ?7)
         Ok(rows)
     }
 
-    /// Atomic completed-turn transaction for SQLite.
+    /// Atomic completed-turn transaction for `SQLite`.
     async fn commit_completed_turn_atomic_inner(
         &self,
         params: CompletedTurnCommit,
@@ -987,19 +1077,31 @@ fn validate_subagent_spawn_parent(
 ) -> Result<()> {
     if parent.status != TaskStatus::Running {
         let status = parent.status;
-        return Err(anyhow!("spawn rejected: task {parent_id} is not running (status {status:?})"));
+        return Err(anyhow!(
+            "spawn rejected: task {parent_id} is not running (status {status:?})"
+        ));
     }
     match &parent.worker_id {
         Some(current) if current == worker => {}
-        _ => return Err(anyhow!("spawn rejected: worker mismatch on task {parent_id}")),
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: worker mismatch on task {parent_id}"
+            ));
+        }
     }
     match &parent.lease_id {
         Some(current) if current == lease => {}
-        _ => return Err(anyhow!("spawn rejected: lease mismatch on task {parent_id}")),
+        _ => {
+            return Err(anyhow!(
+                "spawn rejected: lease mismatch on task {parent_id}"
+            ));
+        }
     }
     if parent.kind.is_leaf() {
         let parent_kind = parent.kind;
-        return Err(anyhow!("spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"));
+        return Err(anyhow!(
+            "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+        ));
     }
     Ok(())
 }
@@ -1017,31 +1119,42 @@ impl AgentTaskStore for SqliteDurableStore {
     async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask> {
         if task.kind != TaskKind::RootTurn {
             let kind = task.kind;
-            return Err(anyhow!("submit_root_turn rejected: expected root_turn, got {kind:?}"));
+            return Err(anyhow!(
+                "submit_root_turn rejected: expected root_turn, got {kind:?}"
+            ));
         }
         if task.status != TaskStatus::Pending {
             let status = task.status;
-            return Err(anyhow!("submit_root_turn rejected: new root must start in Pending (got {status:?})"));
+            return Err(anyhow!(
+                "submit_root_turn rejected: new root must start in Pending (got {status:?})"
+            ));
         }
         if task.attempt != 0 {
             let attempt = task.attempt;
-            return Err(anyhow!("submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"));
+            return Err(anyhow!(
+                "submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"
+            ));
         }
         if !task.is_root() {
             return Err(anyhow!("submit_root_turn rejected: task must be a root"));
         }
-        task.validate().context("submit_root_turn rejected: task failed schema validation")?;
+        task.validate()
+            .context("submit_root_turn rejected: task failed schema validation")?;
 
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at).await?;
 
-        let id_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE id = ?1 LIMIT 1")
-            .bind(task.id.as_str())
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("check existing task {}", task.id))?;
+        let id_exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE id = ?1 LIMIT 1")
+                .bind(task.id.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| format!("check existing task {}", task.id))?;
         if id_exists.is_some() {
-            return Err(anyhow!("submit_root_turn rejected: task id {} already exists", task.id));
+            return Err(anyhow!(
+                "submit_root_turn rejected: task id {} already exists",
+                task.id
+            ));
         }
 
         let thread_has_blocking_root: bool = sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') LIMIT 1")
@@ -1084,7 +1197,9 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 ORDER BY created_at, id");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 ORDER BY created_at, id"
+        );
         let records = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(thread_key(thread_id))
             .fetch_all(&self.pool)
@@ -1094,7 +1209,9 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE parent_id = ?1 ORDER BY created_at, id");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE parent_id = ?1 ORDER BY created_at, id"
+        );
         let records = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(parent_id.as_str())
             .fetch_all(&self.pool)
@@ -1105,7 +1222,9 @@ impl AgentTaskStore for SqliteDurableStore {
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
         let status_wire = enum_to_wire(&status)?;
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = ?1 ORDER BY created_at, id");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = ?1 ORDER BY created_at, id"
+        );
         let records = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(status_wire)
             .fetch_all(&self.pool)
@@ -1115,7 +1234,9 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') ORDER BY created_at, id LIMIT 1");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') ORDER BY created_at, id LIMIT 1"
+        );
         let record = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(thread_key(thread_id))
             .fetch_optional(&self.pool)
@@ -1125,7 +1246,9 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id"
+        );
         let records = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(thread_key(thread_id))
             .fetch_all(&self.pool)
@@ -1134,7 +1257,11 @@ impl AgentTaskStore for SqliteDurableStore {
         records.into_iter().map(TryInto::try_into).collect()
     }
 
-    async fn promote_next_queued_root(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Option<AgentTask>> {
+    async fn promote_next_queued_root(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
 
@@ -1147,7 +1274,9 @@ impl AgentTaskStore for SqliteDurableStore {
             return Ok(None);
         }
 
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id LIMIT 1");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id LIMIT 1"
+        );
         let queued = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(thread_key(thread_id))
             .fetch_optional(&mut *tx)
@@ -1157,43 +1286,73 @@ impl AgentTaskStore for SqliteDurableStore {
             return Ok(None);
         };
         let queued = AgentTask::try_from(queued)?;
-        let promoted = queued.clone().promote_to_pending(now).context("promote rejected: promotion transition failed")?;
+        let promoted = queued
+            .clone()
+            .promote_to_pending(now)
+            .context("promote rejected: promotion transition failed")?;
         Self::update_task_tx(&mut tx, &promoted).await?;
-        tx.commit().await.context("commit promote_next_queued_root")?;
+        tx.commit()
+            .await
+            .context("commit promote_next_queued_root")?;
         Ok(Some(promoted))
     }
 
-    async fn try_acquire_task(&self, id: &AgentTaskId, worker: WorkerId, lease: LeaseId, expires_at: OffsetDateTime, now: OffsetDateTime) -> Result<Option<AgentTask>> {
+    async fn try_acquire_task(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
         let mut tx = self.begin().await?;
         let Some(old) = Self::load_task_tx(&mut tx, id).await? else {
             return Ok(None);
         };
-        if !old.status.can_be_leased() { return Ok(None); }
+        if !old.status.can_be_leased() {
+            return Ok(None);
+        }
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let failed = old.clone().fail_with_reason(reason, now).context("try_acquire_task: fail-closed transition failed")?;
+                let failed = old
+                    .clone()
+                    .fail_with_reason(reason, now)
+                    .context("try_acquire_task: fail-closed transition failed")?;
                 Self::update_task_tx(&mut tx, &failed).await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
             RecoveryAction::Requeue => {
-                return Err(anyhow!("try_acquire_task: recovery matrix produced Requeue for acquisition-time row {id}"));
+                return Err(anyhow!(
+                    "try_acquire_task: recovery matrix produced Requeue for acquisition-time row {id}"
+                ));
             }
         }
-        let claimed = old.clone().mark_running(worker, lease, expires_at, now).context("try_acquire_task rejected: mark_running transition failed")?;
+        let claimed = old
+            .clone()
+            .mark_running(worker, lease, expires_at, now)
+            .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
         tx.commit().await.context("commit try_acquire_task")?;
         Ok(Some(claimed))
     }
 
-    async fn acquire_next_runnable(&self, worker: WorkerId, lease: LeaseId, expires_at: OffsetDateTime, now: OffsetDateTime) -> Result<Option<AgentTask>> {
+    async fn acquire_next_runnable(
+        &self,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
         // SQLite has no SKIP LOCKED; the single-process model means
         // database-level locking is sufficient. We loop to skip
         // fail-closed rows, same as the Postgres backend.
         loop {
             let mut tx = self.begin().await?;
-            let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'pending' ORDER BY created_at, id LIMIT 1");
+            let sql = format!(
+                "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'pending' ORDER BY created_at, id LIMIT 1"
+            );
             let record = sqlx::query_as::<_, TaskRecord>(&sql)
                 .fetch_optional(&mut *tx)
                 .await
@@ -1204,34 +1363,60 @@ impl AgentTaskStore for SqliteDurableStore {
             let old = AgentTask::try_from(record)?;
             if !old.status.can_be_leased() {
                 let status = old.status;
-                return Err(anyhow!("acquire_next_runnable: runnable index held non-pending row {} in status {status:?}", old.id));
+                return Err(anyhow!(
+                    "acquire_next_runnable: runnable index held non-pending row {} in status {status:?}",
+                    old.id
+                ));
             }
 
             match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
                 RecoveryAction::NoAction => {
-                    let claimed = old.clone().mark_running(worker.clone(), lease.clone(), expires_at, now)
-                        .context("acquire_next_runnable rejected: mark_running transition failed")?;
+                    let claimed = old
+                        .clone()
+                        .mark_running(worker.clone(), lease.clone(), expires_at, now)
+                        .context(
+                            "acquire_next_runnable rejected: mark_running transition failed",
+                        )?;
                     Self::update_task_tx(&mut tx, &claimed).await?;
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old.clone().fail_with_reason(reason, now).context("acquire_next_runnable: fail-closed transition failed")?;
+                    let failed = old
+                        .clone()
+                        .fail_with_reason(reason, now)
+                        .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
-                    tx.commit().await.context("commit fail-closed runnable head")?;
+                    tx.commit()
+                        .await
+                        .context("commit fail-closed runnable head")?;
                 }
                 RecoveryAction::Requeue => {
-                    return Err(anyhow!("acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {}", old.id));
+                    return Err(anyhow!(
+                        "acquire_next_runnable: recovery matrix produced Requeue for acquisition-time row {}",
+                        old.id
+                    ));
                 }
             }
         }
     }
 
-    async fn heartbeat_task(&self, id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, expires_at: OffsetDateTime, now: OffsetDateTime) -> Result<AgentTask> {
+    async fn heartbeat_task(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("heartbeat rejected: task {id} does not exist"))?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("heartbeat rejected: task {id} does not exist"))?;
         let mut refreshed = old.clone();
-        refreshed.touch_heartbeat(worker, lease, expires_at, now).context("heartbeat rejected")?;
+        refreshed
+            .touch_heartbeat(worker, lease, expires_at, now)
+            .context("heartbeat rejected")?;
         Self::update_task_tx(&mut tx, &refreshed).await?;
         tx.commit().await.context("commit heartbeat_task")?;
         Ok(refreshed)
@@ -1239,7 +1424,9 @@ impl AgentTaskStore for SqliteDurableStore {
 
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
         let mut tx = self.begin().await?;
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'running' AND lease_expires_at <= ?1 ORDER BY lease_expires_at, id");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'running' AND lease_expires_at <= ?1 ORDER BY lease_expires_at, id"
+        );
         let expired = sqlx::query_as::<_, TaskRecord>(&sql)
             .bind(now)
             .fetch_all(&mut *tx)
@@ -1251,21 +1438,33 @@ impl AgentTaskStore for SqliteDurableStore {
             let old = AgentTask::try_from(record)?;
             if old.status != TaskStatus::Running {
                 let status = old.status;
-                return Err(anyhow!("release_expired_leases: expiry index held non-running row {} in status {status:?}", old.id));
+                return Err(anyhow!(
+                    "release_expired_leases: expiry index held non-running row {} in status {status:?}",
+                    old.id
+                ));
             }
             let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
                 RecoveryAction::Requeue => {
-                    let released_row = old.clone().release_lease(now).context("release_expired_leases: release transition failed")?;
+                    let released_row = old
+                        .clone()
+                        .release_lease(now)
+                        .context("release_expired_leases: release transition failed")?;
                     Self::update_task_tx(&mut tx, &released_row).await?;
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let failed = old.clone().fail_with_reason(reason, now).context("release_expired_leases: fail-closed transition failed")?;
+                    let failed = old
+                        .clone()
+                        .fail_with_reason(reason, now)
+                        .context("release_expired_leases: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
-                    return Err(anyhow!("release_expired_leases: recovery matrix produced NoAction for expired row {}", old.id));
+                    return Err(anyhow!(
+                        "release_expired_leases: recovery matrix produced NoAction for expired row {}",
+                        old.id
+                    ));
                 }
             };
             released.push(record);
@@ -1275,130 +1474,309 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(released)
     }
 
-    async fn pause_on_children(&self, id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, child_count: u32, payload: SuspensionPayload, now: OffsetDateTime) -> Result<AgentTask> {
+    async fn pause_on_children(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        child_count: u32,
+        payload: SuspensionPayload,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-        if old.status != TaskStatus::Running { let status = old.status; return Err(anyhow!("pause rejected: task {id} is not running (status {status:?})")); }
-        match &old.worker_id { Some(current) if current == worker => {} _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")), }
-        match &old.lease_id { Some(current) if current == lease => {} _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")), }
-        let paused = old.clone().wait_on_children(child_count, payload, Vec::new(), now).context("pause rejected: wait_on_children transition failed")?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "pause rejected: task {id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
+        }
+        let paused = old
+            .clone()
+            .wait_on_children(child_count, payload, Vec::new(), now)
+            .context("pause rejected: wait_on_children transition failed")?;
         Self::update_task_tx(&mut tx, &paused).await?;
         tx.commit().await.context("commit pause_on_children")?;
         Ok(paused)
     }
 
-    async fn pause_on_confirmation(&self, id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, continuation: ContinuationEnvelope, prepared_operation: Option<ListenExecutionContext>, now: OffsetDateTime) -> Result<AgentTask> {
+    async fn pause_on_confirmation(
+        &self,
+        id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        continuation: ContinuationEnvelope,
+        prepared_operation: Option<ListenExecutionContext>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
-        if old.status != TaskStatus::Running { let status = old.status; return Err(anyhow!("pause rejected: task {id} is not running (status {status:?})")); }
-        match &old.worker_id { Some(current) if current == worker => {} _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")), }
-        match &old.lease_id { Some(current) if current == lease => {} _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")), }
-        let paused = old.clone().await_confirmation(continuation, prepared_operation, now).context("pause rejected: await_confirmation transition failed")?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("pause rejected: task {id} does not exist"))?;
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "pause rejected: task {id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => return Err(anyhow!("pause rejected: worker mismatch on task {id}")),
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => return Err(anyhow!("pause rejected: lease mismatch on task {id}")),
+        }
+        let paused = old
+            .clone()
+            .await_confirmation(continuation, prepared_operation, now)
+            .context("pause rejected: await_confirmation transition failed")?;
         Self::update_task_tx(&mut tx, &paused).await?;
         tx.commit().await.context("commit pause_on_confirmation")?;
         Ok(paused)
     }
 
-    async fn spawn_tool_children(&self, parent_id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, specs: Vec<ChildSpawnSpec>, payload: SuspensionPayload, now: OffsetDateTime) -> Result<(AgentTask, Vec<AgentTask>)> {
-        if specs.is_empty() { return Err(anyhow!("spawn rejected: specs must be non-empty")); }
+    async fn spawn_tool_children(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        specs: Vec<ChildSpawnSpec>,
+        payload: SuspensionPayload,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<AgentTask>)> {
+        if specs.is_empty() {
+            return Err(anyhow!("spawn rejected: specs must be non-empty"));
+        }
         let mut tx = self.begin().await?;
-        let old_parent = Self::load_task_tx(&mut tx, parent_id).await?.ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        let old_parent = Self::load_task_tx(&mut tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
-            let mut child = AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts).context("spawn rejected: new_child failed")?;
-            child.spawn_index = Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
+            let mut child =
+                AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts)
+                    .context("spawn rejected: new_child failed")?;
+            child.spawn_index =
+                Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
             let existing = Self::load_task_tx(&mut tx, &child.id).await?;
             if existing.is_some() || children.iter().any(|e: &AgentTask| e.id == child.id) {
-                return Err(anyhow!("spawn rejected: child id {} already exists", child.id));
+                return Err(anyhow!(
+                    "spawn rejected: child id {} already exists",
+                    child.id
+                ));
             }
             children.push(child);
         }
 
-        let child_count = u32::try_from(children.len()).context("spawn rejected: child count exceeds u32::MAX")?;
+        let child_count = u32::try_from(children.len())
+            .context("spawn rejected: child count exceeds u32::MAX")?;
         let child_ids = children.iter().map(|c| c.id.clone()).collect();
-        let new_parent = old_parent.clone().wait_on_children(child_count, payload, child_ids, now).context("spawn rejected: wait_on_children transition failed")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
         Self::update_task_tx(&mut tx, &new_parent).await?;
-        for child in &children { Self::insert_task_tx(&mut tx, child).await?; }
+        for child in &children {
+            Self::insert_task_tx(&mut tx, child).await?;
+        }
         tx.commit().await.context("commit spawn_tool_children")?;
         Ok((new_parent, children))
     }
 
-    async fn spawn_subagent_invocation(&self, parent_id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, spawn: SubagentInvocationSpawn, now: OffsetDateTime) -> Result<(AgentTask, AgentTask, AgentTask)> {
+    async fn spawn_subagent_invocation(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawn: SubagentInvocationSpawn,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         let mut tx = self.begin().await?;
-        let SubagentInvocationSpawn { child_thread_id, spec, child_root_input, payload, spawn_index } = spawn;
+        let SubagentInvocationSpawn {
+            child_thread_id,
+            spec,
+            child_root_input,
+            payload,
+            spawn_index,
+        } = spawn;
 
-        let old_parent = Self::load_task_tx(&mut tx, parent_id).await?.ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        let old_parent = Self::load_task_tx(&mut tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
 
         // Verify child thread exists
         let child_thread = Self::get_thread_tx(&mut tx, &child_thread_id).await?;
         if child_thread.is_none() {
-            return Err(anyhow!("spawn rejected: child thread {child_thread_id} does not exist"));
+            return Err(anyhow!(
+                "spawn rejected: child thread {child_thread_id} does not exist"
+            ));
         }
-        let existing_task: Option<(String,)> = sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1")
-            .bind(thread_key(&child_thread_id))
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?;
+        let existing_task: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1")
+                .bind(thread_key(&child_thread_id))
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!("check existing tasks for child thread {child_thread_id}")
+                })?;
         if existing_task.is_some() {
-            return Err(anyhow!("spawn rejected: child thread {child_thread_id} already has tasks"));
+            return Err(anyhow!(
+                "spawn rejected: child thread {child_thread_id} already has tasks"
+            ));
         }
 
-        let child_root = AgentTask::new_root_turn_with_input(child_thread_id.clone(), child_root_input, now, AgentTask::DEFAULT_MAX_ATTEMPTS);
+        let child_root = AgentTask::new_root_turn_with_input(
+            child_thread_id.clone(),
+            child_root_input,
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        );
         let existing = Self::load_task_tx(&mut tx, &child_root.id).await?;
-        if existing.is_some() { return Err(anyhow!("spawn rejected: child root id {} already exists", child_root.id)); }
+        if existing.is_some() {
+            return Err(anyhow!(
+                "spawn rejected: child root id {} already exists",
+                child_root.id
+            ));
+        }
 
         let invocation = AgentTask::new_subagent_invocation(
             &old_parent,
-            SubagentInvocationState { spec, child_thread_id, child_root_task_id: child_root.id.clone() },
+            SubagentInvocationState {
+                spec,
+                child_thread_id,
+                child_root_task_id: child_root.id.clone(),
+            },
             spawn_index,
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
-        ).context("spawn rejected: new_subagent_invocation failed")?;
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
         let existing = Self::load_task_tx(&mut tx, &invocation.id).await?;
-        if existing.is_some() { return Err(anyhow!("spawn rejected: invocation id {} already exists", invocation.id)); }
+        if existing.is_some() {
+            return Err(anyhow!(
+                "spawn rejected: invocation id {} already exists",
+                invocation.id
+            ));
+        }
 
-        let new_parent = old_parent.clone().wait_on_children(1, payload, vec![invocation.id.clone()], now).context("spawn rejected: wait_on_children transition failed")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(1, payload, vec![invocation.id.clone()], now)
+            .context("spawn rejected: wait_on_children transition failed")?;
         Self::update_task_tx(&mut tx, &new_parent).await?;
         Self::insert_task_tx(&mut tx, &invocation).await?;
         Self::insert_task_tx(&mut tx, &child_root).await?;
-        tx.commit().await.context("commit spawn_subagent_invocation")?;
+        tx.commit()
+            .await
+            .context("commit spawn_subagent_invocation")?;
         Ok((new_parent, invocation, child_root))
     }
 
-    async fn complete_task(&self, child_id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, now: OffsetDateTime) -> Result<(AgentTask, Option<AgentTask>)> {
+    async fn complete_task(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(&mut tx, child_id, worker, lease, now, "complete_task", |child| child.complete(now)).await?;
+        let result = Self::apply_task_terminal_transition_tx(
+            &mut tx,
+            child_id,
+            worker,
+            lease,
+            now,
+            "complete_task",
+            |child| child.complete(now),
+        )
+        .await?;
         tx.commit().await.context("commit complete_task")?;
         Ok(result)
     }
 
-    async fn complete_task_with_result(&self, child_id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, result_payload: serde_json::Value, now: OffsetDateTime) -> Result<(AgentTask, Option<AgentTask>)> {
+    async fn complete_task_with_result(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        result_payload: serde_json::Value,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(&mut tx, child_id, worker, lease, now, "complete_task_with_result", move |child| child.complete_with_result(result_payload, now)).await?;
-        tx.commit().await.context("commit complete_task_with_result")?;
+        let result = Self::apply_task_terminal_transition_tx(
+            &mut tx,
+            child_id,
+            worker,
+            lease,
+            now,
+            "complete_task_with_result",
+            move |child| child.complete_with_result(result_payload, now),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit complete_task_with_result")?;
         Ok(result)
     }
 
-    async fn fail_task(&self, child_id: &AgentTaskId, worker: &WorkerId, lease: &LeaseId, error: String, now: OffsetDateTime) -> Result<(AgentTask, Option<AgentTask>)> {
+    async fn fail_task(
+        &self,
+        child_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(&mut tx, child_id, worker, lease, now, "fail_task", move |child| child.fail(error, now)).await?;
+        let result = Self::apply_task_terminal_transition_tx(
+            &mut tx,
+            child_id,
+            worker,
+            lease,
+            now,
+            "fail_task",
+            move |child| child.fail(error, now),
+        )
+        .await?;
         tx.commit().await.context("commit fail_task")?;
         Ok(result)
     }
 
-    async fn cancel_tree(&self, root_id: &AgentTaskId, now: OffsetDateTime) -> Result<Vec<AgentTaskId>> {
+    async fn cancel_tree(
+        &self,
+        root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<AgentTaskId>> {
         let mut tx = self.begin().await?;
         let Some(_) = Self::load_task_tx(&mut tx, root_id).await? else {
-            return Err(anyhow!("cancel_tree rejected: task {root_id} does not exist"));
+            return Err(anyhow!(
+                "cancel_tree rejected: task {root_id} does not exist"
+            ));
         };
         let subtree = Self::load_subtree_tx(&mut tx, root_id).await?;
         let mut transitioned = Vec::with_capacity(subtree.len());
         for row in subtree {
-            if row.status.is_terminal() { continue; }
-            let cancelled = row.clone().cancel(now).context("cancel_tree: cancel transition failed")?;
+            if row.status.is_terminal() {
+                continue;
+            }
+            let cancelled = row
+                .clone()
+                .cancel(now)
+                .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
             transitioned.push(cancelled.id);
         }
@@ -1406,53 +1784,106 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(transitioned)
     }
 
-    async fn resume_from_confirmation(&self, id: &AgentTaskId, now: OffsetDateTime) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+    async fn resume_from_confirmation(
+        &self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("resume rejected: task {id} does not exist"))?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("resume rejected: task {id} does not exist"))?;
         if old.status != TaskStatus::AwaitingConfirmation {
             let status = old.status;
-            return Err(anyhow!("resume rejected: task {id} is not awaiting confirmation (status {status:?})"));
+            return Err(anyhow!(
+                "resume rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
         }
-        let (resumed, prepared_operation) = old.clone().resume_from_confirmation(now).context("resume rejected: resume_from_confirmation transition failed")?;
+        let (resumed, prepared_operation) = old
+            .clone()
+            .resume_from_confirmation(now)
+            .context("resume rejected: resume_from_confirmation transition failed")?;
         Self::update_task_tx(&mut tx, &resumed).await?;
-        tx.commit().await.context("commit resume_from_confirmation")?;
+        tx.commit()
+            .await
+            .context("commit resume_from_confirmation")?;
         Ok((resumed, prepared_operation))
     }
 
-    async fn approve_confirmation_and_acquire(&self, id: &AgentTaskId, worker: WorkerId, lease: LeaseId, expires_at: OffsetDateTime, now: OffsetDateTime) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
+    async fn approve_confirmation_and_acquire(
+        &self,
+        id: &AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("approve rejected: task {id} does not exist"))?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("approve rejected: task {id} does not exist"))?;
         if old.status != TaskStatus::AwaitingConfirmation {
             let status = old.status;
-            return Err(anyhow!("approve rejected: task {id} is not awaiting confirmation (status {status:?})"));
+            return Err(anyhow!(
+                "approve rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
         }
-        let (resumed, prepared_operation) = old.clone().resume_from_confirmation(now).context("approve rejected: resume_from_confirmation transition failed")?;
-        let claimed = resumed.mark_running(worker, lease, expires_at, now).context("approve rejected: mark_running transition failed")?;
+        let (resumed, prepared_operation) = old
+            .clone()
+            .resume_from_confirmation(now)
+            .context("approve rejected: resume_from_confirmation transition failed")?;
+        let claimed = resumed
+            .mark_running(worker, lease, expires_at, now)
+            .context("approve rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
-        tx.commit().await.context("commit approve_confirmation_and_acquire")?;
+        tx.commit()
+            .await
+            .context("commit approve_confirmation_and_acquire")?;
         Ok((claimed, prepared_operation))
     }
 
-    async fn reject_confirmation(&self, id: &AgentTaskId, error: String, now: OffsetDateTime) -> Result<(AgentTask, Option<AgentTask>)> {
+    async fn reject_confirmation(
+        &self,
+        id: &AgentTaskId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
+        let old = Self::load_task_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
         if old.status != TaskStatus::AwaitingConfirmation {
             let status = old.status;
-            return Err(anyhow!("reject_confirmation rejected: task {id} is not awaiting confirmation (status {status:?})"));
+            return Err(anyhow!(
+                "reject_confirmation rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
         }
-        let failed = old.clone().fail(error, now).context("reject_confirmation: fail transition failed")?;
+        let failed = old
+            .clone()
+            .fail(error, now)
+            .context("reject_confirmation: fail transition failed")?;
         Self::update_task_tx(&mut tx, &failed).await?;
 
         let parent = if let Some(parent_id) = &failed.parent_id {
-            let old_parent = Self::load_task_tx(&mut tx, parent_id).await?
-                .ok_or_else(|| anyhow!("reject_confirmation: child {id} references missing parent {parent_id}"))?;
+            let old_parent = Self::load_task_tx(&mut tx, parent_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("reject_confirmation: child {id} references missing parent {parent_id}")
+                })?;
             if old_parent.status == TaskStatus::WaitingOnChildren {
                 let live = Self::load_live_child_count_tx(&mut tx, parent_id).await?;
-                let new_parent = old_parent.clone().recompute_pending_children(live, now).context("reject_confirmation: recompute_pending_children failed")?;
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .context("reject_confirmation: recompute_pending_children failed")?;
                 Self::update_task_tx(&mut tx, &new_parent).await?;
                 Some(new_parent)
-            } else { Some(old_parent) }
-        } else { None };
+            } else {
+                Some(old_parent)
+            }
+        } else {
+            None
+        };
 
         tx.commit().await.context("commit reject_confirmation")?;
         Ok((failed, parent))
@@ -1460,15 +1891,33 @@ impl AgentTaskStore for SqliteDurableStore {
 
     async fn clear(&self) -> Result<()> {
         // SQLite does not support TRUNCATE CASCADE. Delete in FK order.
-        sqlx::query("DELETE FROM agent_sdk_turn_checkpoints").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_message_commits").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_turn_attempts").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_message_heads").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_committed_events").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_outbox").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_retention_cursors").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_tasks").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM agent_sdk_threads").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM agent_sdk_turn_checkpoints")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_message_commits")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_turn_attempts")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_message_heads")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_committed_events")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_outbox")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_retention_cursors")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_tasks")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agent_sdk_threads")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -1486,7 +1935,9 @@ impl ThreadStore for SqliteDurableStore {
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
-        let thread = Self::get_thread_tx(&mut tx, thread_id).await?.context("thread missing after bootstrap")?;
+        let thread = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .context("thread missing after bootstrap")?;
         tx.commit().await.context("commit get_or_create thread")?;
         Ok(thread)
     }
@@ -1495,10 +1946,17 @@ impl ThreadStore for SqliteDurableStore {
         self.get_thread_pool(thread_id).await
     }
 
-    async fn commit_turn(&self, thread_id: &ThreadId, turn_usage: &TokenUsage, now: OffsetDateTime) -> Result<Thread> {
+    async fn commit_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_usage: &TokenUsage,
+        now: OffsetDateTime,
+    ) -> Result<Thread> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
-        let old = Self::get_thread_tx(&mut tx, thread_id).await?.context("thread missing after bootstrap")?;
+        let old = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .context("thread missing after bootstrap")?;
         let thread = old.apply_committed_turn(turn_usage, now)?;
         Self::upsert_thread_tx(&mut tx, &thread).await?;
         tx.commit().await.context("commit thread turn")?;
@@ -1507,7 +1965,9 @@ impl ThreadStore for SqliteDurableStore {
 
     async fn mark_completed(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut tx = self.begin().await?;
-        let old = Self::get_thread_tx(&mut tx, thread_id).await?.ok_or_else(|| anyhow!("thread {thread_id} does not exist"))?;
+        let old = Self::get_thread_tx(&mut tx, thread_id)
+            .await?
+            .ok_or_else(|| anyhow!("thread {thread_id} does not exist"))?;
         let completed = old.mark_completed(now)?;
         Self::upsert_thread_tx(&mut tx, &completed).await?;
         tx.commit().await.context("commit mark_completed thread")?;
@@ -1531,11 +1991,17 @@ impl ThreadStore for SqliteDurableStore {
 
 #[async_trait]
 impl MessageProjectionStore for SqliteDurableStore {
-    async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<MessageProjection> {
+    async fn get_or_create(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
-        tx.commit().await.context("commit get_or_create message head")?;
+        tx.commit()
+            .await
+            .context("commit get_or_create message head")?;
         Ok(projection)
     }
 
@@ -1544,10 +2010,19 @@ impl MessageProjectionStore for SqliteDurableStore {
     }
 
     async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
-        Ok(self.get_message_head_pool(thread_id).await?.map(|p| p.messages).unwrap_or_default())
+        Ok(self
+            .get_message_head_pool(thread_id)
+            .await?
+            .map(|p| p.messages)
+            .unwrap_or_default())
     }
 
-    async fn commit_messages(&self, thread_id: &ThreadId, messages: Vec<llm::Message>, now: OffsetDateTime) -> Result<MessageProjection> {
+    async fn commit_messages(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
@@ -1557,7 +2032,12 @@ impl MessageProjectionStore for SqliteDurableStore {
         Ok(updated)
     }
 
-    async fn replace_history(&self, thread_id: &ThreadId, messages: Vec<llm::Message>, now: OffsetDateTime) -> Result<MessageProjection> {
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
@@ -1582,9 +2062,16 @@ impl TurnAttemptStore for SqliteDurableStore {
         Ok(attempt)
     }
 
-    async fn close_attempt(&self, id: &TurnAttemptId, params: CloseAttemptParams, now: OffsetDateTime) -> Result<TurnAttempt> {
+    async fn close_attempt(
+        &self,
+        id: &TurnAttemptId,
+        params: CloseAttemptParams,
+        now: OffsetDateTime,
+    ) -> Result<TurnAttempt> {
         let mut tx = self.begin().await?;
-        let old = Self::get_attempt_tx(&mut tx, id).await?.ok_or_else(|| anyhow!("attempt not found: {id}"))?;
+        let old = Self::get_attempt_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| anyhow!("attempt not found: {id}"))?;
         let closed = old.close(params, now)?;
         Self::update_attempt_tx(&mut tx, &closed).await?;
         tx.commit().await.context("commit close_attempt")?;
@@ -1623,13 +2110,19 @@ impl CheckpointStore for SqliteDurableStore {
         let checkpoint = Checkpoint::new(params)?;
         let mut tx = self.begin().await?;
         // Duplicate check
-        let dup: Option<(String,)> = sqlx::query_as("SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2")
-            .bind(thread_key(&checkpoint.thread_id))
-            .bind(i64::from(checkpoint.turn_number))
-            .fetch_optional(&mut *tx)
-            .await?;
+        let dup: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
+        )
+        .bind(thread_key(&checkpoint.thread_id))
+        .bind(i64::from(checkpoint.turn_number))
+        .fetch_optional(&mut *tx)
+        .await?;
         if dup.is_some() {
-            return Err(anyhow!("duplicate checkpoint for thread {} turn {}", checkpoint.thread_id, checkpoint.turn_number));
+            return Err(anyhow!(
+                "duplicate checkpoint for thread {} turn {}",
+                checkpoint.thread_id,
+                checkpoint.turn_number
+            ));
         }
         Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
         tx.commit().await.context("commit checkpoint insert")?;
@@ -1640,7 +2133,11 @@ impl CheckpointStore for SqliteDurableStore {
         self.get_checkpoint_pool(id).await
     }
 
-    async fn get_by_turn(&self, thread_id: &ThreadId, turn_number: u32) -> Result<Option<Checkpoint>> {
+    async fn get_by_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_number: u32,
+    ) -> Result<Option<Checkpoint>> {
         let record = sqlx::query_as::<_, CheckpointRecord>(
             r"SELECT id, thread_id, turn_number, task_id, messages_json, agent_state_snapshot, turn_input_tokens, turn_output_tokens, created_at FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND turn_number = ?2",
         )
@@ -1681,7 +2178,10 @@ impl CheckpointStore for SqliteDurableStore {
 
 #[async_trait]
 impl AtomicCompletedTurnCommitter for SqliteDurableStore {
-    async fn commit_completed_turn_atomic(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+    async fn commit_completed_turn_atomic(
+        &self,
+        params: CompletedTurnCommit,
+    ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params).await
     }
 }
@@ -1696,12 +2196,22 @@ impl EventRepository for SqliteDurableStore {
         Some(self)
     }
 
-    async fn commit_event(&self, thread_id: &ThreadId, event: AgentEvent, now: OffsetDateTime) -> Result<CommittedEvent> {
+    async fn commit_event(
+        &self,
+        thread_id: &ThreadId,
+        event: AgentEvent,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
         let mut committed = self.commit_event_batch(thread_id, vec![event], now).await?;
         Ok(committed.remove(0))
     }
 
-    async fn commit_event_batch(&self, thread_id: &ThreadId, events: Vec<AgentEvent>, now: OffsetDateTime) -> Result<Vec<CommittedEvent>> {
+    async fn commit_event_batch(
+        &self,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
         ensure!(!events.is_empty(), "cannot commit an empty event batch");
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
@@ -1731,7 +2241,12 @@ impl EventRepository for SqliteDurableStore {
         records.into_iter().map(TryInto::try_into).collect()
     }
 
-    async fn get_events_in_range(&self, thread_id: &ThreadId, after_sequence: u64, up_to_sequence: u64) -> Result<Vec<CommittedEvent>> {
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>> {
         let records = sqlx::query_as::<_, CommittedEventRecord>(
             "SELECT event_id, thread_id, sequence, event_json, committed_at FROM agent_sdk_committed_events WHERE thread_id = ?1 AND sequence > ?2 AND sequence <= ?3 ORDER BY sequence",
         )
@@ -1751,14 +2266,38 @@ impl EventRepository for SqliteDurableStore {
 
 #[async_trait]
 impl AtomicEventOutboxCommitter for SqliteDurableStore {
-    async fn commit_events_with_outbox(&self, params: EventOutboxCommit) -> Result<EventOutboxCommitOutcome> {
-        ensure!(!params.events.is_empty(), "cannot commit an empty event batch");
+    async fn commit_events_with_outbox(
+        &self,
+        params: EventOutboxCommit,
+    ) -> Result<EventOutboxCommitOutcome> {
+        ensure!(
+            !params.events.is_empty(),
+            "cannot commit an empty event batch"
+        );
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
-        let committed = Self::insert_events_tx(&mut tx, &params.thread_id, params.events, start_seq, params.now).await?;
-        let outbox_rows = Self::insert_outbox_rows_tx(&mut tx, &committed, params.outbox_max_attempts, params.now).await?;
-        tx.commit().await.context("commit atomic events + outbox transaction")?;
-        Ok(EventOutboxCommitOutcome { committed_events: committed, outbox_rows })
+        let committed = Self::insert_events_tx(
+            &mut tx,
+            &params.thread_id,
+            params.events,
+            start_seq,
+            params.now,
+        )
+        .await?;
+        let outbox_rows = Self::insert_outbox_rows_tx(
+            &mut tx,
+            &committed,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit atomic events + outbox transaction")?;
+        Ok(EventOutboxCommitOutcome {
+            committed_events: committed,
+            outbox_rows,
+        })
     }
 }
 
@@ -1788,19 +2327,32 @@ impl OutboxStore for SqliteDurableStore {
             .await
             .with_context(|| format!("insert outbox row {id}"))?;
             result.push(OutboxRow {
-                id, thread_id: params.thread_id, event_id: params.event_id,
-                sequence: params.sequence, status: OutboxStatus::Pending,
-                payload_json: params.payload_json, created_at: params.now,
-                next_attempt_at: params.now, attempt_count: 0,
-                max_attempts: params.max_attempts, last_error: None,
-                claimed_by: None, claimed_at: None, delivered_at: None,
+                id,
+                thread_id: params.thread_id,
+                event_id: params.event_id,
+                sequence: params.sequence,
+                status: OutboxStatus::Pending,
+                payload_json: params.payload_json,
+                created_at: params.now,
+                next_attempt_at: params.now,
+                attempt_count: 0,
+                max_attempts: params.max_attempts,
+                last_error: None,
+                claimed_by: None,
+                claimed_at: None,
+                delivered_at: None,
             });
         }
         tx.commit().await.context("commit outbox batch insert")?;
         Ok(result)
     }
 
-    async fn claim_pending(&self, worker_id: &str, limit: u32, now: OffsetDateTime) -> Result<Vec<OutboxRow>> {
+    async fn claim_pending(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<OutboxRow>> {
         // SQLite has no SKIP LOCKED / UPDATE RETURNING, so we SELECT
         // pending IDs in the desired order, UPDATE them, then SELECT
         // the claimed rows back.
@@ -1846,11 +2398,20 @@ impl OutboxStore for SqliteDurableStore {
             .execute(&self.pool)
             .await
             .with_context(|| format!("mark outbox row {id} delivered"))?;
-        ensure!(result.rows_affected() > 0, "outbox row not found or already terminal: {id}");
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}"
+        );
         Ok(())
     }
 
-    async fn mark_failed(&self, id: &OutboxRowId, error: &str, next_attempt_at: OffsetDateTime, _now: OffsetDateTime) -> Result<()> {
+    async fn mark_failed(
+        &self,
+        id: &OutboxRowId,
+        error: &str,
+        next_attempt_at: OffsetDateTime,
+        _now: OffsetDateTime,
+    ) -> Result<()> {
         let result = sqlx::query(
             r"
 UPDATE agent_sdk_outbox SET
@@ -1869,7 +2430,10 @@ WHERE id = ?1 AND status NOT IN ('delivered', 'expired')
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
-        ensure!(result.rows_affected() > 0, "outbox row not found or already terminal: {id}");
+        ensure!(
+            result.rows_affected() > 0,
+            "outbox row not found or already terminal: {id}"
+        );
         Ok(())
     }
 
@@ -1923,18 +2487,28 @@ impl RetentionStore for SqliteDurableStore {
         record.map(TryInto::try_into).transpose()
     }
 
-    async fn advance_floor(&self, thread_id: &ThreadId, new_floor: u64, now: OffsetDateTime) -> Result<RetentionCursor> {
+    async fn advance_floor(
+        &self,
+        thread_id: &ThreadId,
+        new_floor: u64,
+        now: OffsetDateTime,
+    ) -> Result<RetentionCursor> {
         let mut tx = self.begin().await?;
         let new_floor_i64 = i64_from_u64(new_floor, "retention floor")?;
 
-        let current = sqlx::query("SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1")
-            .bind(thread_key(thread_id))
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("read retention floor for {thread_id}"))?;
+        let current = sqlx::query(
+            "SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
+        )
+        .bind(thread_key(thread_id))
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
         if let Some(row) = current {
             let current_floor: i64 = row.get("retention_floor");
-            ensure!(new_floor_i64 >= current_floor, "retention floor can only advance: current {current_floor}, requested {new_floor}");
+            ensure!(
+                new_floor_i64 >= current_floor,
+                "retention floor can only advance: current {current_floor}, requested {new_floor}"
+            );
         }
 
         sqlx::query("INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (thread_id) DO UPDATE SET retention_floor = excluded.retention_floor, updated_at = excluded.updated_at")
@@ -1945,15 +2519,23 @@ impl RetentionStore for SqliteDurableStore {
             .await
             .with_context(|| format!("advance retention floor for {thread_id}"))?;
 
-        sqlx::query("DELETE FROM agent_sdk_committed_events WHERE thread_id = ?1 AND sequence < ?2")
-            .bind(thread_key(thread_id))
-            .bind(new_floor_i64)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("purge events below floor {new_floor} for {thread_id}"))?;
+        sqlx::query(
+            "DELETE FROM agent_sdk_committed_events WHERE thread_id = ?1 AND sequence < ?2",
+        )
+        .bind(thread_key(thread_id))
+        .bind(new_floor_i64)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge events below floor {new_floor} for {thread_id}"))?;
 
-        tx.commit().await.context("commit retention floor advance")?;
-        Ok(RetentionCursor { thread_id: thread_id.clone(), retention_floor: new_floor, updated_at: now })
+        tx.commit()
+            .await
+            .context("commit retention floor advance")?;
+        Ok(RetentionCursor {
+            thread_id: thread_id.clone(),
+            retention_floor: new_floor,
+            updated_at: now,
+        })
     }
 }
 
@@ -2008,13 +2590,17 @@ impl TryFrom<TaskRecord> for AgentTask {
             max_attempts: u32_from_i64(r.max_attempts, "task max_attempts")?,
             last_error: r.last_error,
             pending_child_count: u32_from_i64(r.pending_child_count, "task pending_child_count")?,
-            spawn_index: r.spawn_index.map(|v| u32_from_i64(v, "task spawn_index")).transpose()?,
+            spawn_index: r
+                .spawn_index
+                .map(|v| u32_from_i64(v, "task spawn_index"))
+                .transpose()?,
             result_payload: r.result_payload,
             created_at: r.created_at,
             updated_at: r.updated_at,
             completed_at: r.completed_at,
         };
-        task.validate().context("rehydrate task from sqlite row validation")?;
+        task.validate()
+            .context("rehydrate task from sqlite row validation")?;
         Ok(task)
     }
 }
@@ -2044,7 +2630,9 @@ impl TryFrom<ThreadRecord> for Thread {
             created_at: r.created_at,
             updated_at: r.updated_at,
         };
-        thread.validate().context("rehydrate thread from sqlite row validation")?;
+        thread
+            .validate()
+            .context("rehydrate thread from sqlite row validation")?;
         Ok(thread)
     }
 }
@@ -2105,16 +2693,36 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
             response_blob: r.response_blob,
             response_id: r.response_id,
             response_model: r.response_model,
-            stop_reason: r.stop_reason.map(|v| enum_from_wire(&v, "turn attempt stop_reason")).transpose()?,
-            outcome: r.outcome.map(|v| enum_from_wire(&v, "turn attempt outcome")).transpose()?,
-            input_tokens: r.input_tokens.map(|v| u32_from_i64(v, "turn attempt input_tokens")).transpose()?,
-            output_tokens: r.output_tokens.map(|v| u32_from_i64(v, "turn attempt output_tokens")).transpose()?,
-            cached_input_tokens: r.cached_input_tokens.map(|v| u32_from_i64(v, "turn attempt cached_input_tokens")).transpose()?,
+            stop_reason: r
+                .stop_reason
+                .map(|v| enum_from_wire(&v, "turn attempt stop_reason"))
+                .transpose()?,
+            outcome: r
+                .outcome
+                .map(|v| enum_from_wire(&v, "turn attempt outcome"))
+                .transpose()?,
+            input_tokens: r
+                .input_tokens
+                .map(|v| u32_from_i64(v, "turn attempt input_tokens"))
+                .transpose()?,
+            output_tokens: r
+                .output_tokens
+                .map(|v| u32_from_i64(v, "turn attempt output_tokens"))
+                .transpose()?,
+            cached_input_tokens: r
+                .cached_input_tokens
+                .map(|v| u32_from_i64(v, "turn attempt cached_input_tokens"))
+                .transpose()?,
             opened_at: r.opened_at,
             closed_at: r.closed_at,
-            duration_ms: r.duration_ms.map(|v| u64_from_i64(v, "turn attempt duration_ms")).transpose()?,
+            duration_ms: r
+                .duration_ms
+                .map(|v| u64_from_i64(v, "turn attempt duration_ms"))
+                .transpose()?,
         };
-        attempt.validate().context("rehydrate turn attempt from sqlite row validation")?;
+        attempt
+            .validate()
+            .context("rehydrate turn attempt from sqlite row validation")?;
         Ok(attempt)
     }
 }
@@ -2148,7 +2756,9 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
             },
             created_at: r.created_at,
         };
-        checkpoint.validate().context("rehydrate checkpoint from sqlite row validation")?;
+        checkpoint
+            .validate()
+            .context("rehydrate checkpoint from sqlite row validation")?;
         Ok(checkpoint)
     }
 }
@@ -2251,7 +2861,9 @@ fn json_from_value<T: DeserializeOwned>(value: serde_json::Value, label: &str) -
 
 fn enum_to_wire<T: Serialize>(value: &T) -> Result<String> {
     let v = serde_json::to_value(value).context("serialize enum to wire string")?;
-    let wire = v.as_str().context("enum wire value did not serialize as a string")?;
+    let wire = v
+        .as_str()
+        .context("enum wire value did not serialize as a string")?;
     Ok(wire.to_owned())
 }
 

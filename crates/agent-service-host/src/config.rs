@@ -207,7 +207,7 @@ impl StorageConfig {
         }
     }
 
-    /// Return the SQLite database URL when the backend is selected.
+    /// Return the `SQLite` database URL when the backend is selected.
     ///
     /// When no explicit path is provided, returns a platform-default
     /// data directory path.
@@ -350,7 +350,7 @@ pub struct RetentionConfig {
 // Platform-default SQLite data directory
 // ─────────────────────────────────────────────────────────────────────
 
-/// Return the platform-default data directory for SQLite.
+/// Return the platform-default data directory for `SQLite`.
 ///
 /// - Linux:   `$XDG_DATA_HOME/agent-sdk` (defaults to `~/.local/share/agent-sdk`)
 /// - macOS:   `~/Library/Application Support/agent-sdk`
