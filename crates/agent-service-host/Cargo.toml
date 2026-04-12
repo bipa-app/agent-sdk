@@ -11,7 +11,8 @@ name = "agent-service-host"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["postgres"]
+postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 
 [dependencies]

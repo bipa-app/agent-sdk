@@ -21,7 +21,9 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+#[cfg(feature = "postgres")]
+use anyhow::Context;
+use anyhow::Result;
 
 use agent_server::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 use agent_server::journal::event_notifier::EventNotifier;
@@ -38,7 +40,10 @@ use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEv
 use agent_server::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use agent_server::worker::registry::AgentDefinitionRegistry;
 
-use super::config::{PostgresStorageConfig, StorageBackend, StorageConfig};
+#[cfg(feature = "postgres")]
+use super::config::PostgresStorageConfig;
+use super::config::{StorageBackend, StorageConfig};
+#[cfg(feature = "postgres")]
 use super::postgres::store::PostgresDurableStore;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -121,6 +126,7 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
     },
 ];
 
+#[cfg(feature = "postgres")]
 const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
@@ -191,15 +197,18 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
 #[derive(Clone)]
 enum RegistryBackend {
     InMemory,
+    #[cfg(feature = "postgres")]
     Postgres(PostgresBackend),
 }
 
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 struct PostgresBackend {
     store: Arc<PostgresDurableStore>,
     init_once: Arc<tokio::sync::OnceCell<()>>,
 }
 
+#[cfg(feature = "postgres")]
 impl PostgresBackend {
     async fn initialize(&self) -> Result<()> {
         self.init_once
@@ -269,8 +278,13 @@ impl StoreRegistry {
     ) -> Result<Self> {
         match config.backend {
             StorageBackend::InMemory => Ok(Self::in_memory(definition_registry)),
+            #[cfg(feature = "postgres")]
             StorageBackend::Postgres => {
                 Self::postgres(config.postgres_settings()?, definition_registry)
+            }
+            #[cfg(not(feature = "postgres"))]
+            StorageBackend::Postgres => {
+                anyhow::bail!("PostgreSQL storage backend requires the `postgres` feature flag")
             }
             StorageBackend::Sqlite { .. } => {
                 // SQLite backend wiring lands in ENG-8003.
@@ -288,6 +302,7 @@ impl StoreRegistry {
     pub async fn initialize(&self) -> Result<()> {
         match &self.backend {
             RegistryBackend::InMemory => Ok(()),
+            #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(backend) => backend.initialize().await,
         }
     }
@@ -297,6 +312,7 @@ impl StoreRegistry {
     pub const fn backend_name(&self) -> &'static str {
         match self.backend {
             RegistryBackend::InMemory => "in_memory",
+            #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => "postgres",
         }
     }
@@ -306,6 +322,7 @@ impl StoreRegistry {
     pub const fn durability_report(&self) -> &'static [StorageSurfaceStatus] {
         match self.backend {
             RegistryBackend::InMemory => &IN_MEMORY_SURFACES,
+            #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => &POSTGRES_SURFACES,
         }
     }
@@ -333,6 +350,7 @@ impl StoreRegistry {
         }
     }
 
+    #[cfg(feature = "postgres")]
     fn postgres(
         config: &PostgresStorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
@@ -389,6 +407,7 @@ impl StoreRegistry {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDurableStore>> {
     let database_url = config.resolved_database_url()?;
     let max_connections = config.max_connections;
@@ -463,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "postgres")]
     fn from_config_postgres_reports_remaining_non_durable_surfaces() -> anyhow::Result<()> {
         let config = StorageConfig {
             backend: StorageBackend::Postgres,
