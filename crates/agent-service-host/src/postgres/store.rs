@@ -2938,7 +2938,8 @@ impl PostgresDurableStore {
         )
         .fetch_optional(&mut **tx)
         .await
-        .with_context(|| format!("lock thread row for event sequence allocation on {thread_id}"))?;
+        .with_context(|| format!("lock thread row for event sequence allocation on {thread_id}"))?
+        .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
 
         let record = sqlx::query!(
             r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = $1",
@@ -3175,7 +3176,12 @@ RETURNING id, thread_id, event_id, sequence, status, payload_json,
         .await
         .context("claim pending outbox rows")?;
 
-        records.into_iter().map(TryInto::try_into).collect()
+        let mut rows: Vec<OutboxRow> = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_>>()?;
+        rows.sort_by_key(|r| (r.next_attempt_at, r.id.clone()));
+        Ok(rows)
     }
 
     async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
