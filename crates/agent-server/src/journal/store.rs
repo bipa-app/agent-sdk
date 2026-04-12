@@ -6287,7 +6287,11 @@ mod tests {
     //   round-trip through the serialized wire form.
 
     use crate::journal::task::ChildSpawnSpec;
-    use crate::worker::subagent::{EffectiveSubagentCapabilities, EffectiveSubagentSpec};
+    use crate::worker::subagent::{
+        EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+        InheritedSubagentPolicy, SubagentSandboxPolicy,
+    };
+    use agent_sdk_core::audit::AuditProvenance;
 
     /// Spawn a parent root, lease it, and return
     /// `(parent, worker, lease)` so Phase 2.6 tests can exercise
@@ -6306,7 +6310,41 @@ mod tests {
             model: "claude-sonnet-4-5-20250929".into(),
             max_turns: 5,
             timeout_ms: 15_000,
+            depth: 1,
+            max_parallel_subagents: 1,
             nickname: Some("Scout".into()),
+            sandbox: SubagentSandboxPolicy::read_only(),
+            mcp: EffectiveSubagentMcpPolicy {
+                allowed_servers: std::collections::BTreeSet::from(["docs".to_owned()]),
+            },
+            audit_provenance: Some(AuditProvenance::new(
+                "anthropic",
+                "claude-sonnet-4-5-20250929",
+            )),
+            inherited_policy: InheritedSubagentPolicy {
+                default_model: "claude-sonnet-4-5-20250929".into(),
+                allowed_models: std::collections::BTreeSet::from([String::from(
+                    "claude-sonnet-4-5-20250929",
+                )]),
+                default_max_turns: 5,
+                max_turns: 5,
+                default_timeout_ms: 15_000,
+                max_timeout_ms: 15_000,
+                capability_profiles: std::collections::BTreeMap::from([(
+                    "research".into(),
+                    crate::worker::subagent::SubagentCapabilityProfile {
+                        capabilities: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
+                        sandbox: SubagentSandboxPolicy::read_only(),
+                        allowed_mcp_servers: std::collections::BTreeSet::from(["docs".to_owned()]),
+                    },
+                )]),
+                allowed_capabilities: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
+                max_depth: 3,
+                max_parallel_subagents: 1,
+                sandbox: SubagentSandboxPolicy::read_only(),
+                allowed_mcp_servers: std::collections::BTreeSet::from(["docs".to_owned()]),
+                audit_provider: "anthropic".into(),
+            },
             capabilities: EffectiveSubagentCapabilities {
                 profile: "research".into(),
                 allowed: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
