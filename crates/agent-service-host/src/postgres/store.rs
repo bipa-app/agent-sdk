@@ -54,6 +54,7 @@ use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
 };
 use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+use agent_server::worker::definition::RuntimePolicy;
 
 use super::migrations::apply_durable_core_migrations;
 
@@ -1192,12 +1193,25 @@ FOR UPDATE
             .with_context(|| format!("{error_prefix}: terminal transition failed"))?;
         Self::update_task_tx(tx, &new_child).await?;
 
-        let parent = if let Some(parent_id) = &new_child.parent_id {
+        let parent =
+            Self::propagate_terminal_child_transition_tx(tx, &new_child, now, error_prefix).await?;
+
+        Ok((new_child, parent))
+    }
+
+    async fn propagate_terminal_child_transition_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        new_child: &AgentTask,
+        now: OffsetDateTime,
+        error_prefix: &'static str,
+    ) -> Result<Option<AgentTask>> {
+        if let Some(parent_id) = &new_child.parent_id {
             let old_parent = Self::load_task_tx(tx, parent_id, true)
                 .await?
                 .ok_or_else(|| {
                     anyhow!(
-                        "{error_prefix}: child {child_id} references missing parent {parent_id}"
+                        "{error_prefix}: child {} references missing parent {parent_id}",
+                        new_child.id
                     )
                 })?;
             if old_parent.status == TaskStatus::WaitingOnChildren {
@@ -1209,15 +1223,74 @@ FOR UPDATE
                         format!("{error_prefix}: recompute_pending_children transition failed")
                     })?;
                 Self::update_task_tx(tx, &new_parent).await?;
-                Some(new_parent)
+                Ok(Some(new_parent))
             } else {
-                Some(old_parent)
+                Ok(Some(old_parent))
             }
+        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+            let Some(old_invocation) =
+                Self::load_linked_subagent_invocation_tx(tx, &new_child.id).await?
+            else {
+                return Ok(None);
+            };
+            let new_invocation = old_invocation
+                .clone()
+                .recompute_pending_children(0, now)
+                .with_context(|| {
+                    format!("{error_prefix}: subagent invocation resume transition failed")
+                })?;
+            Self::update_task_tx(tx, &new_invocation).await?;
+            Ok(Some(new_invocation))
         } else {
-            None
-        };
+            Ok(None)
+        }
+    }
 
-        Ok((new_child, parent))
+    async fn load_linked_subagent_invocation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        child_root_id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r#"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE kind = 'subagent'
+  AND status = 'waiting_on_children'
+  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
+FOR UPDATE
+            "#,
+            child_root_id.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| {
+            format!("load linked subagent invocation for child root {child_root_id}")
+        })?;
+
+        record.map(TryInto::try_into).transpose()
     }
 
     async fn load_subtree_tx(
@@ -1766,6 +1839,13 @@ FOR UPDATE
                     .fail_with_reason(reason, now)
                     .context("try_acquire_task: fail-closed transition failed")?;
                 Self::update_task_tx(&mut tx, &failed).await?;
+                let _ = Self::propagate_terminal_child_transition_tx(
+                    &mut tx,
+                    &failed,
+                    now,
+                    "try_acquire_task",
+                )
+                .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -1865,6 +1945,13 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    let _ = Self::propagate_terminal_child_transition_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -1968,6 +2055,13 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("release_expired_leases: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    let _ = Self::propagate_terminal_child_transition_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "release_expired_leases",
+                    )
+                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -2122,17 +2216,19 @@ FOR UPDATE SKIP LOCKED
         let SubagentInvocationSpawn {
             child_thread_id,
             spec,
-            payload,
+            child_root_input,
             spawn_index,
+            payload,
         } = spawn;
 
         let old_parent = Self::load_spawn_parent_tx(&mut tx, parent_id, worker, lease).await?;
         Self::ensure_empty_child_thread_tx(&mut tx, &child_thread_id, now).await?;
 
-        let child_root = AgentTask::new_root_turn(
+        let child_root = AgentTask::new_root_turn_with_input(
             child_thread_id.clone(),
+            child_root_input,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            RuntimePolicy::server_default().max_attempts,
         );
         if Self::load_task_tx(&mut tx, &child_root.id, false)
             .await?
@@ -2272,6 +2368,13 @@ FOR UPDATE SKIP LOCKED
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
+            let _ = Self::propagate_terminal_child_transition_tx(
+                &mut tx,
+                &cancelled,
+                now,
+                "cancel_tree",
+            )
+            .await?;
             transitioned.push(cancelled.id);
         }
         tx.commit().await.context("commit cancel_tree")?;
@@ -3700,6 +3803,7 @@ mod tests {
     use agent_server::journal::turn_attempt::{CloseAttemptParams, OpenAttemptParams};
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
     use agent_server::journal::{AgentTask, LeaseId, TaskStatus, TurnAttemptOutcome, WorkerId};
+    use agent_server::worker::subagent::{EffectiveSubagentCapabilities, EffectiveSubagentSpec};
 
     use super::*;
 
@@ -3740,6 +3844,128 @@ mod tests {
             request_blob: serde_json::json!({"messages": []}),
             now: t0(),
         }
+    }
+
+    fn sample_subagent_spec() -> EffectiveSubagentSpec {
+        EffectiveSubagentSpec {
+            task: "Inspect durable linkage".into(),
+            prompt: "Stay in read-only mode.".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_turns: 5,
+            timeout_ms: 15_000,
+            nickname: Some("Scout".into()),
+            capabilities: EffectiveSubagentCapabilities {
+                profile: "research".into(),
+                allowed: ["read_file", "rg"].into_iter().map(str::to_owned).collect(),
+            },
+        }
+    }
+
+    fn sample_subagent_input() -> Vec<SubmittedInputItem> {
+        vec![SubmittedInputItem::Text {
+            text: "Stay in read-only mode.\n\nInspect durable linkage".into(),
+        }]
+    }
+
+    fn sample_subagent_payload(thread_name: &str) -> SuspensionPayload {
+        let thread_id = thread_id(thread_name);
+        SuspensionPayload {
+            continuation: ContinuationEnvelope::wrap(agent_sdk_core::AgentContinuation {
+                thread_id: thread_id.clone(),
+                turn: 1,
+                total_usage: TokenUsage::default(),
+                turn_usage: TokenUsage::default(),
+                pending_tool_calls: vec![agent_sdk_core::PendingToolCallInfo {
+                    id: "call_subagent".into(),
+                    name: "subagent_researcher".into(),
+                    display_name: "Subagent: Researcher".into(),
+                    tier: agent_sdk_core::ToolTier::Confirm,
+                    input: serde_json::json!({"task": "Inspect durable linkage"}),
+                    effective_input: serde_json::json!({"task": "Inspect durable linkage"}),
+                    listen_context: None,
+                }],
+                awaiting_index: 0,
+                completed_results: Vec::new(),
+                state: agent_sdk_core::AgentState::new(thread_id),
+                response_id: None,
+                stop_reason: None,
+                response_content: Vec::new(),
+            }),
+            suspended_messages: Vec::new(),
+        }
+    }
+
+    async fn running_root_for_spawn(
+        store: &TestStore,
+        thread_name: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        let parent = fresh_root(thread_name, 0);
+        let parent_id = parent.id.clone();
+        store.submit_root_turn(parent).await?;
+        let worker = WorkerId::from_string("w-parent");
+        let lease = LeaseId::from_string("l-parent");
+        let claimed = store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await?
+            .context("claim parent root")?;
+        Ok((claimed, worker, lease))
+    }
+
+    async fn spawn_subagent_fixture(
+        store: &TestStore,
+        thread_name: &str,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let (parent, worker, lease) = running_root_for_spawn(store, thread_name).await?;
+        let (parked_parent, invocation, child_root) = store
+            .spawn_subagent_invocation(
+                &parent.id,
+                &worker,
+                &lease,
+                SubagentInvocationSpawn {
+                    child_thread_id: thread_id(&format!("{thread_name}-child")),
+                    spec: sample_subagent_spec(),
+                    child_root_input: sample_subagent_input(),
+                    spawn_index: 0,
+                    payload: sample_subagent_payload(thread_name),
+                },
+                t_plus(2),
+            )
+            .await?;
+        Ok((parked_parent, invocation, child_root))
+    }
+
+    async fn exhaust_retry_budget(
+        store: &TestStore,
+        task_id: &AgentTaskId,
+        max_attempts: u32,
+        worker_prefix: &str,
+        start_secs: i64,
+    ) -> Result<Vec<RecoveryRecord>> {
+        let mut last_sweep = Vec::new();
+        for attempt in 0..max_attempts {
+            let offset = i64::from(attempt) * 10;
+            let running = store
+                .try_acquire_task(
+                    task_id,
+                    WorkerId::from_string(format!("{worker_prefix}-{attempt}")),
+                    LeaseId::from_string(format!("l-{worker_prefix}-{attempt}")),
+                    t_plus(start_secs + offset + 5),
+                    t_plus(start_secs + offset + 1),
+                )
+                .await?
+                .with_context(|| format!("claim {task_id} attempt {}", attempt + 1))?;
+            assert_eq!(running.status, TaskStatus::Running);
+            last_sweep = store
+                .release_expired_leases(t_plus(start_secs + offset + 6))
+                .await?;
+        }
+        Ok(last_sweep)
     }
 
     /// RAII guard that wraps a [`PostgresDurableStore`] and drops the
@@ -4163,6 +4389,88 @@ mod tests {
 
         let history = MessageProjectionStore::get_history(&*store, &running.thread_id).await?;
         assert_eq!(history.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_on_child_root_wakes_linked_subagent_invocation() -> Result<()> {
+        let Some(store) = test_store().await? else {
+            return Ok(());
+        };
+
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-pg-subagent-cancel").await?;
+
+        let transitioned = store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        assert_eq!(transitioned, vec![child_root.id.clone()]);
+
+        let resumed_invocation = AgentTaskStore::get(&*store, &invocation.id)
+            .await?
+            .context("invocation exists after cancel")?;
+        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
+        assert_eq!(resumed_invocation.pending_child_count, 0);
+        assert!(resumed_invocation.state.subagent_invocation().is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_closed_subagent_paths_keep_invocation_and_parent_runnable() -> Result<()> {
+        let Some(store) = test_store().await? else {
+            return Ok(());
+        };
+
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-pg-subagent-fail-closed").await?;
+
+        let child_sweep = exhaust_retry_budget(
+            &store,
+            &child_root.id,
+            child_root.max_attempts,
+            "w-child",
+            3,
+        )
+        .await?;
+        assert_eq!(
+            child_sweep,
+            vec![RecoveryRecord::failed_closed(
+                child_root.id.clone(),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            )],
+        );
+
+        let resumed_invocation = AgentTaskStore::get(&*store, &invocation.id)
+            .await?
+            .context("invocation exists after child fail-closed")?;
+        assert_eq!(resumed_invocation.status, TaskStatus::Pending);
+        assert_eq!(resumed_invocation.pending_child_count, 0);
+
+        let invocation_sweep = exhaust_retry_budget(
+            &store,
+            &invocation.id,
+            invocation.max_attempts,
+            "w-subagent",
+            40,
+        )
+        .await?;
+        assert_eq!(
+            invocation_sweep,
+            vec![RecoveryRecord::failed_closed(
+                invocation.id.clone(),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            )],
+        );
+
+        let resumed_parent = AgentTaskStore::get(&*store, &parent.id)
+            .await?
+            .context("parent exists")?;
+        assert_eq!(resumed_parent.status, TaskStatus::Pending);
+        assert_eq!(resumed_parent.pending_child_count, 0);
+        assert!(matches!(
+            resumed_parent.state,
+            agent_server::journal::task_state::TaskState::ReadyToResume { .. }
+        ));
 
         Ok(())
     }

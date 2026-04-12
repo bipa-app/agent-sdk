@@ -160,12 +160,16 @@ pub enum TaskState {
         prepared_operation: Option<ListenExecutionContext>,
     },
 
-    /// Durable state for a `subagent` invocation task that is parked
-    /// on the spawned child thread.
+    /// Durable state for a `subagent` invocation task that supervises
+    /// the spawned child thread.
     ///
     /// The invocation task owns the authoritative spawn spec plus the
     /// durable child-thread / child-root linkage needed for replay,
-    /// inspection, and recovery.
+    /// inspection, and recovery. The same payload is preserved while
+    /// the invocation is parked in `WaitingOnChildren` and later when
+    /// the child thread has drained and the invocation becomes
+    /// runnable in `Pending` / `Running` to materialize the final
+    /// parent-facing result.
     SubagentInvocation {
         /// Authoritative spawn spec plus durable child linkage.
         invocation: Box<SubagentInvocationState>,
@@ -221,11 +225,11 @@ impl TaskState {
     pub const fn required_status(&self) -> Option<TaskStatus> {
         match self {
             Self::None => None,
-            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => {
-                Some(TaskStatus::WaitingOnChildren)
+            Self::WaitingOnChildren { .. } => Some(TaskStatus::WaitingOnChildren),
+            Self::SubagentInvocation { .. } | Self::ReadyToResume { .. } => {
+                Some(TaskStatus::Pending)
             }
             Self::AwaitingConfirmation { .. } => Some(TaskStatus::AwaitingConfirmation),
-            Self::ReadyToResume { .. } => Some(TaskStatus::Pending),
         }
     }
 
@@ -240,7 +244,8 @@ impl TaskState {
     pub const fn compatible_statuses_label(&self) -> &'static str {
         match self {
             Self::None => "any non-paused status",
-            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => "WaitingOnChildren",
+            Self::WaitingOnChildren { .. } => "WaitingOnChildren",
+            Self::SubagentInvocation { .. } => "WaitingOnChildren, Pending, or Running",
             Self::AwaitingConfirmation { .. } => "AwaitingConfirmation",
             Self::ReadyToResume { .. } => "Pending or Running",
         }
@@ -248,10 +253,11 @@ impl TaskState {
 
     /// Returns `true` when the state may legally coexist with `status`.
     ///
-    /// [`TaskState::ReadyToResume`] is the only non-terminal payload
-    /// that intentionally spans two statuses: `Pending` while the row
+    /// [`TaskState::ReadyToResume`] and [`TaskState::SubagentInvocation`]
+    /// intentionally span multiple statuses: `Pending` while the row
     /// waits in the runnable queue and `Running` after acquisition
-    /// while the worker resumes the suspended turn.
+    /// while the worker resumes the suspended turn or materializes the
+    /// final subagent result.
     #[must_use]
     pub const fn is_compatible_with_status(&self, status: TaskStatus) -> bool {
         match self {
@@ -259,8 +265,12 @@ impl TaskState {
                 status,
                 TaskStatus::WaitingOnChildren | TaskStatus::AwaitingConfirmation
             ),
-            Self::WaitingOnChildren { .. } | Self::SubagentInvocation { .. } => {
-                matches!(status, TaskStatus::WaitingOnChildren)
+            Self::WaitingOnChildren { .. } => matches!(status, TaskStatus::WaitingOnChildren),
+            Self::SubagentInvocation { .. } => {
+                matches!(
+                    status,
+                    TaskStatus::WaitingOnChildren | TaskStatus::Pending | TaskStatus::Running
+                )
             }
             Self::AwaitingConfirmation { .. } => {
                 matches!(status, TaskStatus::AwaitingConfirmation)
@@ -466,17 +476,20 @@ mod tests {
     }
 
     #[test]
-    fn subagent_invocation_state_pins_waiting_status_and_exposes_linkage() -> Result<()> {
+    fn subagent_invocation_state_exposes_linkage_and_supports_resume_statuses() -> Result<()> {
         let invocation = sample_subagent_invocation();
         let state = TaskState::SubagentInvocation {
             invocation: Box::new(invocation.clone()),
         };
-        assert_eq!(state.required_status(), Some(TaskStatus::WaitingOnChildren));
+        assert_eq!(state.required_status(), Some(TaskStatus::Pending));
         let linked = state
             .subagent_invocation()
             .context("subagent invocation linkage should be present")?;
         assert_eq!(linked.child_thread_id, invocation.child_thread_id);
         assert_eq!(linked.child_root_task_id, invocation.child_root_task_id);
+        assert!(state.is_compatible_with_status(TaskStatus::WaitingOnChildren));
+        assert!(state.is_compatible_with_status(TaskStatus::Pending));
+        assert!(state.is_compatible_with_status(TaskStatus::Running));
         assert!(state.continuation().is_none());
         assert!(state.prepared_operation().is_none());
         Ok(())
@@ -555,10 +568,7 @@ mod tests {
             serde_json::to_value(&recovered)?,
             serde_json::to_value(&subagent)?
         );
-        assert_eq!(
-            recovered.required_status(),
-            Some(TaskStatus::WaitingOnChildren)
-        );
+        assert_eq!(recovered.required_status(), Some(TaskStatus::Pending));
         assert!(recovered.subagent_invocation().is_some());
 
         // ReadyToResume — durably persisted on Pending parents after

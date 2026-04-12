@@ -243,7 +243,7 @@ const AGENT_SDK_TASK_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_tasks_waiting_state_check",
-        invariant: "Paused-state JSON kind must be a non-null known value; `waiting_on_children` and `subagent_invocation` rows require `status = waiting_on_children` with a positive pending-child count; terminal rows reset state kind to `none`; `ready_to_resume` is valid only for pending/running rows and never for queued rows.",
+        invariant: "Paused-state JSON kind must be a non-null known value; `waiting_on_children` rows require `status = waiting_on_children` with a positive pending-child count; `subagent_invocation` rows are either still waiting (`status = waiting_on_children`, positive pending-child count) or ready to materialize (`status in {pending,running}`, zero pending-child count); terminal rows reset state kind to `none`; `ready_to_resume` is valid only for pending/running rows and never for queued rows.",
     },
 ];
 
@@ -297,6 +297,12 @@ const AGENT_SDK_TASK_INDEXES: &[IndexContract] = &[
         key_columns: "(root_id, depth, created_at, id)",
         predicate: None,
         purpose: "Keeps task-tree traversals and root-scoped inspection predictable.",
+    },
+    IndexContract {
+        name: "agent_sdk_tasks_subagent_child_root_waiting_idx",
+        key_columns: "((state_json -> 'invocation' ->> 'child_root_task_id'))",
+        predicate: Some("kind = 'subagent' AND status = 'waiting_on_children'"),
+        purpose: "Makes linked subagent invocation wake-ups an indexed lookup on child root completion.",
     },
 ];
 

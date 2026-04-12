@@ -458,60 +458,64 @@ async fn running_parent_root(
     Ok((claimed, worker, lease))
 }
 
-#[tokio::test]
-async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<()> {
-    let task_store = InMemoryAgentTaskStore::new();
-    let thread_store = InMemoryThreadStore::new();
-    let (parent, worker, lease) = running_parent_root(&task_store).await?;
-    let spec = EffectiveSubagentSpec {
-        task: "Inspect durable linkage".into(),
-        prompt: "Stay in read-only mode.".into(),
-        model: "claude-sonnet-4-5-20250929".into(),
-        max_turns: 5,
-        timeout_ms: 15_000,
-        nickname: Some("Scout".into()),
-        capabilities: EffectiveSubagentCapabilities {
-            profile: "research".into(),
-            allowed: set(&["read_file", "rg"]),
-        },
+fn child_root_input(task: &str) -> Vec<crate::journal::task::SubmittedInputItem> {
+    vec![crate::journal::task::SubmittedInputItem::Text {
+        text: format!("Stay in read-only mode.\n\n{task}"),
+    }]
+}
+
+fn parent_suspension_payload(
+    parent_thread_id: &agent_sdk_core::ThreadId,
+    task: &str,
+) -> SuspensionPayload {
+    let tool_call = agent_sdk_core::PendingToolCallInfo {
+        id: "call_subagent".into(),
+        name: "subagent_researcher".into(),
+        display_name: "Subagent: Researcher".into(),
+        tier: agent_sdk_core::ToolTier::Confirm,
+        input: serde_json::json!({ "task": task }),
+        effective_input: serde_json::json!({ "task": task }),
+        listen_context: None,
     };
-
-    let child_thread_id = agent_sdk_core::ThreadId::new();
-    let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
-        &parent.id,
-        &worker,
-        &lease,
-        SubagentInvocationSpawn {
-            child_thread_id,
-            spawn_index: 0,
-            spec: spec.clone(),
-            payload: SuspensionPayload {
-                continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                    agent_sdk_core::AgentContinuation {
-                        thread_id: parent.thread_id.clone(),
-                        turn: 1,
-                        total_usage: agent_sdk_core::TokenUsage::default(),
-                        turn_usage: agent_sdk_core::TokenUsage::default(),
-                        pending_tool_calls: Vec::new(),
-                        awaiting_index: 0,
-                        completed_results: Vec::new(),
-                        state: agent_sdk_core::AgentState::new(parent.thread_id.clone()),
-                        response_id: None,
-                        stop_reason: None,
-                        response_content: Vec::new(),
-                    },
-                ),
-                suspended_messages: Vec::new(),
+    SuspensionPayload {
+        continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+            agent_sdk_core::AgentContinuation {
+                thread_id: parent_thread_id.clone(),
+                turn: 1,
+                total_usage: agent_sdk_core::TokenUsage::default(),
+                turn_usage: agent_sdk_core::TokenUsage::default(),
+                pending_tool_calls: vec![tool_call],
+                awaiting_index: 0,
+                completed_results: Vec::new(),
+                state: agent_sdk_core::AgentState::new(parent_thread_id.clone()),
+                response_id: None,
+                stop_reason: None,
+                response_content: Vec::new(),
             },
-        },
-        &SubagentInvocationDeps {
-            task_store: &task_store,
-            thread_store: &thread_store,
-        },
-        t_plus(2),
-    )
-    .await?;
+        ),
+        suspended_messages: Vec::new(),
+    }
+}
 
+fn submitted_text(task: &AgentTask) -> Result<String> {
+    task.submitted_input
+        .iter()
+        .map(|item| match item {
+            crate::journal::task::SubmittedInputItem::Text { text } => Ok(text.clone()),
+            other => anyhow::bail!("unexpected submitted input item: {other:?}"),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("\n"))
+}
+
+async fn assert_spawned_invocation_contract(
+    task_store: &InMemoryAgentTaskStore,
+    thread_store: &InMemoryThreadStore,
+    parent: &AgentTask,
+    created: &SpawnedSubagentInvocation,
+    spec: &EffectiveSubagentSpec,
+    expected_text: &str,
+) -> Result<()> {
     assert_eq!(created.parent_task.status, TaskStatus::WaitingOnChildren);
     assert_eq!(created.parent_task.pending_child_count, 1);
     assert_eq!(created.invocation_task.kind, TaskKind::Subagent);
@@ -519,21 +523,24 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
         created.invocation_task.status,
         TaskStatus::WaitingOnChildren
     );
+    assert_eq!(created.invocation_task.spawn_index, Some(0));
     assert_eq!(created.invocation_task.parent_id.as_ref(), Some(&parent.id));
     assert_eq!(created.invocation_task.thread_id, parent.thread_id);
     assert_eq!(created.child_root_task.kind, TaskKind::RootTurn);
     assert_eq!(created.child_root_task.status, TaskStatus::Pending);
     assert!(created.child_root_task.parent_id.is_none());
+    assert_eq!(submitted_text(&created.child_root_task)?, expected_text);
     assert_eq!(
         created.child_thread.thread_id,
         created.child_root_task.thread_id
     );
+
     let linkage = created
         .invocation_task
         .state
         .subagent_invocation()
         .ok_or_else(|| anyhow!("invocation linkage missing"))?;
-    assert_eq!(linkage.spec, spec);
+    assert_eq!(linkage.spec, *spec);
     assert_eq!(linkage.child_thread_id, created.child_thread.thread_id);
     assert_eq!(linkage.child_root_task_id, created.child_root_task.id);
 
@@ -557,4 +564,54 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let task = "Inspect durable linkage";
+    let spec = EffectiveSubagentSpec {
+        task: task.into(),
+        prompt: "Stay in read-only mode.".into(),
+        model: "claude-sonnet-4-5-20250929".into(),
+        max_turns: 5,
+        timeout_ms: 15_000,
+        nickname: Some("Scout".into()),
+        capabilities: EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["read_file", "rg"]),
+        },
+    };
+
+    let child_thread_id = agent_sdk_core::ThreadId::new();
+    let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        SubagentInvocationSpawn {
+            child_thread_id,
+            spec: spec.clone(),
+            child_root_input: child_root_input(task),
+            spawn_index: 0,
+            payload: parent_suspension_payload(&parent.thread_id, task),
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    assert_spawned_invocation_contract(
+        &task_store,
+        &thread_store,
+        &parent,
+        &created,
+        &spec,
+        "Stay in read-only mode.\n\nInspect durable linkage",
+    )
+    .await
 }
