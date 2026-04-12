@@ -152,6 +152,19 @@ CREATE TABLE agent_sdk_tasks (
                     AND pending_child_count > 0
                 )
                 OR (
+                    json_extract(state_json, '$.kind') = 'subagent_invocation'
+                    AND (
+                        (
+                            status = 'waiting_on_children'
+                            AND pending_child_count > 0
+                        )
+                        OR (
+                            status IN ('pending', 'running')
+                            AND pending_child_count = 0
+                        )
+                    )
+                )
+                OR (
                     json_extract(state_json, '$.kind') = 'awaiting_confirmation'
                     AND status = 'awaiting_confirmation'
                     AND pending_child_count = 0

@@ -246,13 +246,13 @@ YAML configuration:
 ```yaml
 # Minimal — uses platform-default data directory
 storage:
-  backend: sqlite
+  backend: !sqlite
+    path: null
 
 # Explicit path
 storage:
-  backend:
-    sqlite:
-      path: "/home/user/.local/share/agent-sdk/agent-sdk.db"
+  backend: !sqlite
+    path: "/home/user/.local/share/agent-sdk/agent-sdk.db"
 ```
 
 #### Default data directory resolution

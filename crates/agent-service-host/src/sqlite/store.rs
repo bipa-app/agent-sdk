@@ -11,8 +11,8 @@
 //!   - ENG-8003: `TurnAttemptStore`, `CheckpointStore`, `StoreRegistry` wiring
 
 use anyhow::{Context, Result};
-use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{Row, SqlitePool};
 
 use super::migrations::apply_durable_core_migrations;
 
@@ -28,8 +28,19 @@ pub struct SqliteDurableStore {
 
 impl SqliteDurableStore {
     /// Construct the store from an existing pool.
+    ///
+    /// # Safety contract
+    ///
+    /// The pool **must** have been configured with `after_connect` hooks
+    /// that execute at minimum:
+    ///
+    /// - `PRAGMA foreign_keys = ON`
+    /// - `PRAGMA busy_timeout = 5000` (or equivalent)
+    ///
+    /// Passing a plain unconfigured pool will silently disable foreign-key
+    /// enforcement. Prefer [`connect`](Self::connect) for production use.
     #[must_use]
-    pub const fn from_pool(pool: SqlitePool) -> Self {
+    pub(crate) const fn from_pool(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -39,20 +50,41 @@ impl SqliteDurableStore {
     /// `"sqlite::memory:"` for an ephemeral in-memory database (useful
     /// for tests) or a file path like `"sqlite:///path/to/agent-sdk.db"`.
     ///
-    /// WAL mode is enabled at connection time for concurrent read access.
+    /// For file-backed databases, WAL mode is enabled at connection time
+    /// for concurrent read access. In-memory databases do not support WAL
+    /// and use their native journal mode instead.
+    ///
     /// `PRAGMA foreign_keys = ON` is enforced on every connection.
     ///
     /// # Errors
     ///
-    /// Returns an error if the pool cannot be created or migrations fail.
+    /// Returns an error if the pool cannot be created, WAL mode cannot be
+    /// activated on a file-backed database, or migrations fail.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        let is_memory = database_url.contains(":memory:");
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .after_connect(|conn, _meta| {
+            // In-memory databases are per-connection in SQLite. Use a
+            // single connection so migrations and queries share the
+            // same schema. File-backed databases can use multiple
+            // connections under WAL mode.
+            .max_connections(if is_memory { 1 } else { 4 })
+            .after_connect(move |conn, _meta| {
                 Box::pin(async move {
-                    sqlx::query("PRAGMA journal_mode = WAL")
-                        .execute(&mut *conn)
-                        .await?;
+                    // WAL mode: only attempt on file-backed databases.
+                    // In-memory databases do not support WAL and
+                    // silently return 'memory' — that is expected.
+                    if !is_memory {
+                        let row = sqlx::query("PRAGMA journal_mode = WAL")
+                            .fetch_one(&mut *conn)
+                            .await?;
+                        let mode: String = row.get(0);
+                        if mode != "wal" {
+                            return Err(sqlx::Error::Protocol(format!(
+                                "failed to enable WAL mode: got '{mode}'"
+                            )));
+                        }
+                    }
                     sqlx::query("PRAGMA foreign_keys = ON")
                         .execute(&mut *conn)
                         .await?;
