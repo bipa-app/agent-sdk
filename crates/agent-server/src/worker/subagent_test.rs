@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
@@ -206,6 +206,7 @@ fn legacy_effective_spec_without_inherited_policy_deserializes_fail_closed() -> 
         .as_object_mut()
         .ok_or_else(|| anyhow!("expected effective spec JSON object"))?;
     object.remove("inherited_policy");
+    object.remove("max_parallel_subagents");
 
     let legacy: EffectiveSubagentSpec = serde_json::from_value(json)?;
     let profile = legacy
@@ -223,10 +224,8 @@ fn legacy_effective_spec_without_inherited_policy_deserializes_fail_closed() -> 
         legacy.capabilities.allowed
     );
     assert_eq!(legacy.inherited_policy.max_depth, legacy.depth);
-    assert_eq!(
-        legacy.inherited_policy.max_parallel_subagents,
-        legacy.max_parallel_subagents
-    );
+    assert_eq!(legacy.max_parallel_subagents, 0);
+    assert_eq!(legacy.inherited_policy.max_parallel_subagents, 1);
     assert_eq!(profile.capabilities, legacy.capabilities.allowed);
     assert_eq!(profile.sandbox, legacy.sandbox);
     assert_eq!(profile.allowed_mcp_servers, legacy.mcp.allowed_servers);
@@ -543,6 +542,8 @@ fn blank_allowed_capability_is_rejected() -> Result<()> {
 
 struct FixedPolicy;
 
+struct AliasingPolicy;
+
 impl SubagentSpawnPolicy for FixedPolicy {
     fn resolve_model(
         &self,
@@ -620,6 +621,96 @@ impl SubagentSpawnPolicy for FixedPolicy {
     }
 }
 
+impl SubagentSpawnPolicy for AliasingPolicy {
+    fn resolve_model(
+        &self,
+        _requested: Option<&str>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<String> {
+        Ok("gpt-5".into())
+    }
+
+    fn resolve_max_turns(
+        &self,
+        _requested: Option<u32>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        Ok(3)
+    }
+
+    fn resolve_timeout_ms(
+        &self,
+        _requested: Option<u64>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u64> {
+        Ok(5_000)
+    }
+
+    fn resolve_capabilities(
+        &self,
+        requested: &SubagentCapabilityRequest,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentCapabilities> {
+        ensure!(
+            requested.profile == "research-lite",
+            "expected alias input, got `{}`",
+            requested.profile
+        );
+        Ok(EffectiveSubagentCapabilities {
+            profile: "research".into(),
+            allowed: set(&["rg"]),
+        })
+    }
+
+    fn resolve_max_parallel_subagents(
+        &self,
+        _requested: Option<u32>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<u32> {
+        Ok(1)
+    }
+
+    fn resolve_depth(&self, _constraints: &InheritedSubagentConstraints) -> Result<u32> {
+        Ok(2)
+    }
+
+    fn resolve_sandbox(
+        &self,
+        profile: &str,
+        _requested: Option<&SubagentSandboxPolicy>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<SubagentSandboxPolicy> {
+        ensure!(
+            profile == "research",
+            "sandbox received unresolved profile `{profile}`"
+        );
+        Ok(SubagentSandboxPolicy::read_only())
+    }
+
+    fn resolve_mcp(
+        &self,
+        profile: &str,
+        _requested: Option<&SubagentMcpRequest>,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<EffectiveSubagentMcpPolicy> {
+        ensure!(
+            profile == "research",
+            "mcp received unresolved profile `{profile}`"
+        );
+        Ok(EffectiveSubagentMcpPolicy {
+            allowed_servers: set(&["docs"]),
+        })
+    }
+
+    fn resolve_audit_provenance(
+        &self,
+        model: &str,
+        _constraints: &InheritedSubagentConstraints,
+    ) -> Result<AuditProvenance> {
+        Ok(AuditProvenance::new("anthropic", model))
+    }
+}
+
 #[test]
 fn custom_policy_hooks_drive_effective_resolution() -> Result<()> {
     let constraints = sample_constraints();
@@ -636,6 +727,22 @@ fn custom_policy_hooks_drive_effective_resolution() -> Result<()> {
     assert_eq!(spec.depth, 2);
     assert_eq!(spec.max_parallel_subagents, 1);
     assert_eq!(spec.capabilities.allowed, set(&["rg"]));
+    assert_eq!(spec.mcp.allowed_servers, set(&["docs"]));
+
+    Ok(())
+}
+
+#[test]
+fn resolved_capability_profile_name_drives_sandbox_and_mcp_resolution() -> Result<()> {
+    let constraints = sample_constraints();
+    let request = SubagentSpawnRequest::new(
+        "Search for schema regressions",
+        SubagentCapabilityRequest::new("research-lite"),
+    );
+
+    let spec = resolve_subagent_spec(&request, &constraints, &AliasingPolicy)?;
+    assert_eq!(spec.capabilities.profile, "research");
+    assert_eq!(spec.sandbox, SubagentSandboxPolicy::read_only());
     assert_eq!(spec.mcp.allowed_servers, set(&["docs"]));
 
     Ok(())

@@ -648,7 +648,7 @@ impl EffectiveSubagentSpecWire {
             capability_profiles,
             allowed_capabilities,
             max_depth: self.depth.max(default_subagent_depth()),
-            max_parallel_subagents: self.max_parallel_subagents,
+            max_parallel_subagents: self.max_parallel_subagents.max(1),
             sandbox: self.sandbox.clone(),
             allowed_mcp_servers: self.mcp.allowed_servers.clone(),
             audit_provider,
@@ -1015,7 +1015,7 @@ pub fn resolve_subagent_spec(
     let capabilities = policy
         .resolve_capabilities(&request.capabilities, constraints)
         .context("resolve subagent capabilities")?;
-    let profile_name = request.capabilities.profile.trim();
+    let profile_name = capabilities.profile.as_str();
     let sandbox = policy
         .resolve_sandbox(profile_name, request.sandbox.as_ref(), constraints)
         .context("resolve subagent sandbox")?;
