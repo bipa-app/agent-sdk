@@ -25,11 +25,22 @@
 //!   event_ttl_secs: null
 //!   checkpoint_max_per_thread: null
 //! ```
+//!
+//! PostgreSQL-backed durable-core config:
+//!
+//! ```yaml
+//! storage:
+//!   backend: postgres
+//!   postgres:
+//!     database_url: postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
+//!     schema: agent_service_host
+//!     max_connections: 8
+//! ```
 
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -85,9 +96,69 @@ pub enum StorageBackend {
     /// and integration tests.  State is lost on restart.
     #[default]
     InMemory,
+    /// Durable-core task, thread, message, attempt, and checkpoint
+    /// state lives in `PostgreSQL`.
+    Postgres,
     // Future variants (gated by feature flags):
-    // Postgres { url: String },
     // Redis { url: String },
+}
+
+/// `PostgreSQL` backend settings.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostgresStorageConfig {
+    /// Connection string used for the durable-core tables.
+    ///
+    /// If omitted, the host falls back to the `DATABASE_URL`
+    /// environment variable.
+    pub database_url: Option<String>,
+    /// Optional schema/search-path to use for the durable-core tables.
+    pub schema: Option<String>,
+    /// Maximum pooled Postgres connections for the durable-core store.
+    pub max_connections: u32,
+}
+
+impl PostgresStorageConfig {
+    pub(crate) const fn is_default(&self) -> bool {
+        self.database_url.is_none() && self.schema.is_none() && self.max_connections == 8
+    }
+
+    /// Resolve the database URL for runtime use.
+    ///
+    /// # Errors
+    /// Returns an error if neither `database_url` nor `DATABASE_URL`
+    /// is available.
+    pub fn resolved_database_url(&self) -> Result<String> {
+        if let Some(url) = &self.database_url {
+            return Ok(url.clone());
+        }
+
+        std::env::var("DATABASE_URL")
+            .context("storage.postgres.database_url is unset and DATABASE_URL is not available")
+    }
+}
+
+impl Default for PostgresStorageConfig {
+    fn default() -> Self {
+        Self {
+            database_url: None,
+            schema: None,
+            max_connections: 8,
+        }
+    }
+}
+
+impl std::fmt::Debug for PostgresStorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresStorageConfig")
+            .field(
+                "database_url",
+                &self.database_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("schema", &self.schema)
+            .field("max_connections", &self.max_connections)
+            .finish()
+    }
 }
 
 /// Storage configuration.
@@ -96,12 +167,31 @@ pub enum StorageBackend {
 pub struct StorageConfig {
     /// The backend to instantiate.
     pub backend: StorageBackend,
+    /// PostgreSQL-specific settings.
+    #[serde(skip_serializing_if = "PostgresStorageConfig::is_default")]
+    pub postgres: PostgresStorageConfig,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: StorageBackend::InMemory,
+            postgres: PostgresStorageConfig::default(),
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Return the Postgres settings when the backend is selected.
+    ///
+    /// # Errors
+    /// Returns an error if the backend is not `postgres`.
+    pub fn postgres_settings(&self) -> Result<&PostgresStorageConfig> {
+        match self.backend {
+            StorageBackend::Postgres => Ok(&self.postgres),
+            StorageBackend::InMemory => {
+                bail!("storage.postgres is only valid when storage.backend=postgres")
+            }
         }
     }
 }
@@ -272,6 +362,44 @@ transport:
     fn storage_backend_in_memory_is_default() {
         let config = ServiceConfig::default();
         assert!(matches!(config.storage.backend, StorageBackend::InMemory));
+    }
+
+    #[test]
+    fn postgres_storage_config_redacts_database_url_in_debug() {
+        let config = PostgresStorageConfig {
+            database_url: Some("postgres://secret-user:secret-pass@example.com/db".into()),
+            schema: Some("agent_service_host".into()),
+            max_connections: 12,
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret-pass"));
+    }
+
+    #[test]
+    fn postgres_backend_yaml_parses() -> Result<()> {
+        let yaml = r"
+storage:
+  backend: postgres
+  postgres:
+    database_url: postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
+    schema: host_tests
+    max_connections: 16
+";
+
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(matches!(config.storage.backend, StorageBackend::Postgres));
+        assert_eq!(
+            config.storage.postgres.database_url.as_deref(),
+            Some("postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk"),
+        );
+        assert_eq!(
+            config.storage.postgres.schema.as_deref(),
+            Some("host_tests")
+        );
+        assert_eq!(config.storage.postgres.max_connections, 16);
+        Ok(())
     }
 
     #[test]
