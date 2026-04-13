@@ -262,3 +262,32 @@ pub const fn event_journal_repository_boundaries() -> &'static [RepositoryBounda
 pub const fn event_journal_units_of_work() -> &'static [UnitOfWorkContract] {
     EVENT_JOURNAL_UNITS_OF_WORK
 }
+
+// =====================================================================
+// Tool audit repository boundary (migration 0004)
+// =====================================================================
+
+const TOOL_AUDIT_READS: &[&str] = &["list_by_operation", "list_by_task", "list_by_thread"];
+const TOOL_AUDIT_WRITES: &[&str] = &["record_event"];
+
+const TOOL_AUDIT_REPOSITORIES: &[RepositoryBoundary] = &[RepositoryBoundary {
+    name: "tool_audit_repository",
+    store_trait: "agent_server::journal::tool_audit::ToolAuditEventStore",
+    tables: &["agent_sdk_tool_audit_events"],
+    reads: TOOL_AUDIT_READS,
+    writes: TOOL_AUDIT_WRITES,
+    invariants: &[
+        "tool audit events are append-only; no UPDATE or DELETE by application code",
+        "the database assigns `seq` so insertion order is preserved across restarts even when `recorded_at` collides",
+        "lifecycle queries return rows ordered by `(recorded_at, seq)` ascending",
+        "inputs, outputs, and errors are redacted by the application before durable write",
+        "the `kind` discriminant and the embedded `kind_payload.kind` must agree (enforced by a CHECK)",
+    ],
+    transaction_notes: "`record_event` is a single-row INSERT. Lifecycle queries are read-only and may use the pool directly. The table is intentionally FK-free so audit writes never block or cascade behind task/thread mutations.",
+}];
+
+/// Repository boundaries for the tool audit surface.
+#[must_use]
+pub const fn tool_audit_repository_boundaries() -> &'static [RepositoryBoundary] {
+    TOOL_AUDIT_REPOSITORIES
+}

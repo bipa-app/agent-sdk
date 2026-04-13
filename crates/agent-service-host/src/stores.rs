@@ -36,6 +36,8 @@ use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+use agent_server::journal::tool_audit::RedactingToolAuditEventStore;
 use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEventStore};
 use agent_server::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use agent_server::worker::registry::AgentDefinitionRegistry;
@@ -174,9 +176,9 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "tool_audit_store",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "tool audit events remain process-local until a durable backend is implemented",
+        backend: "postgres",
+        persists_restart: true,
+        note: "redaction policy applied before durable write",
     },
     StorageSurfaceStatus {
         surface: "outbox_store",
@@ -238,9 +240,9 @@ const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "tool_audit_store",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "tool audit events remain process-local until a durable backend is implemented",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "redaction policy applied before durable write",
     },
     StorageSurfaceStatus {
         surface: "outbox_store",
@@ -439,6 +441,9 @@ impl StoreRegistry {
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
         let durable_store = build_postgres_store(config)?;
+        let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
+            RedactingToolAuditEventStore::baseline(durable_store.clone()),
+        );
 
         Ok(Self {
             task_store: durable_store.clone(),
@@ -448,7 +453,7 @@ impl StoreRegistry {
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
             execution_intent_store: durable_store.clone(),
-            tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
+            tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
             definition_registry,
@@ -467,6 +472,9 @@ impl StoreRegistry {
     ) -> Result<Self> {
         let database_url = config.sqlite_database_url()?;
         let durable_store = build_sqlite_store(&database_url)?;
+        let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
+            RedactingToolAuditEventStore::baseline(durable_store.clone()),
+        );
 
         Ok(Self {
             task_store: durable_store.clone(),
@@ -476,7 +484,7 @@ impl StoreRegistry {
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
             execution_intent_store: durable_store.clone(),
-            tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
+            tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store,
             definition_registry,
@@ -618,7 +626,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "postgres")]
-    fn from_config_postgres_reports_remaining_non_durable_surfaces() -> anyhow::Result<()> {
+    fn from_config_postgres_reports_every_surface_durable() -> anyhow::Result<()> {
         let config = StorageConfig {
             backend: StorageBackend::Postgres,
             postgres: PostgresStorageConfig {
@@ -658,13 +666,63 @@ mod tests {
         assert!(outbox_surface.persists_restart);
         assert_eq!(outbox_surface.backend, "postgres");
 
+        let tool_audit_surface = stores
+            .durability_report()
+            .iter()
+            .find(|surface| surface.surface == "tool_audit_store")
+            .context("missing tool_audit_store surface")?;
+        assert!(tool_audit_surface.persists_restart);
+        assert_eq!(tool_audit_surface.backend, "postgres");
+        assert_eq!(
+            tool_audit_surface.note,
+            "redaction policy applied before durable write"
+        );
+
         let nondurable_surfaces = stores
             .durability_report()
             .iter()
             .filter(|surface| !surface.persists_restart)
             .map(|surface| surface.surface)
             .collect::<Vec<_>>();
-        assert_eq!(nondurable_surfaces, vec!["tool_audit_store"]);
+        assert!(
+            nondurable_surfaces.is_empty(),
+            "every postgres surface should now be durable, but found: {nondurable_surfaces:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn from_config_sqlite_reports_every_surface_durable() -> anyhow::Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let config = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(tmp.path().display().to_string()),
+            },
+            ..StorageConfig::default()
+        };
+
+        let stores = StoreRegistry::from_config(&config, sample_registry())?;
+        assert_eq!(stores.backend_name(), "sqlite");
+
+        let tool_audit_surface = stores
+            .durability_report()
+            .iter()
+            .find(|surface| surface.surface == "tool_audit_store")
+            .context("missing tool_audit_store surface")?;
+        assert!(tool_audit_surface.persists_restart);
+        assert_eq!(tool_audit_surface.backend, "sqlite");
+
+        let nondurable_surfaces = stores
+            .durability_report()
+            .iter()
+            .filter(|surface| !surface.persists_restart)
+            .map(|surface| surface.surface)
+            .collect::<Vec<_>>();
+        assert!(
+            nondurable_surfaces.is_empty(),
+            "every sqlite surface should now be durable, but found: {nondurable_surfaces:?}",
+        );
         Ok(())
     }
 

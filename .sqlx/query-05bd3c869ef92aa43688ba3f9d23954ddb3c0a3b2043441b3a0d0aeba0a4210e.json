@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    id, operation_id, task_id, parent_task_id, thread_id,\n    tool_call_id, tool_name, effect_class, kind_payload,\n    provider, model, input, output, error, recorded_at\nFROM agent_sdk_tool_audit_events\nWHERE operation_id = $1\nORDER BY recorded_at ASC, seq ASC\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "operation_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "task_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "parent_task_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "thread_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "tool_call_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "tool_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "effect_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "kind_payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "output",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "05bd3c869ef92aa43688ba3f9d23954ddb3c0a3b2043441b3a0d0aeba0a4210e"
+}

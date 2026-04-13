@@ -10,9 +10,8 @@
 //! - the `sqlx` durable-core store used by the host when
 //!   `storage.backend=postgres`.
 //!
-//! The remaining host surfaces without a Postgres implementation
-//! (execution intents and tool audit) stay explicit in the store
-//! registry as in-memory fallbacks until follow-up work lands.
+//! The host surface that previously lagged behind the durable backend
+//! (`tool_audit_store`) now lands durably under migration 0004.
 
 pub mod migrations;
 pub mod repository;
@@ -27,12 +26,15 @@ mod tests {
 
     use super::migrations::{
         DURABLE_CORE_MIGRATOR, durable_core_migrations, event_journal_outbox_migration,
+        tool_audit_events_migration,
     };
     use super::repository::{
         completed_turn_units_of_work, event_journal_repository_boundaries,
-        event_journal_units_of_work, repository_boundaries,
+        event_journal_units_of_work, repository_boundaries, tool_audit_repository_boundaries,
     };
-    use super::schema::{durable_core_tables, event_journal_outbox_tables};
+    use super::schema::{
+        durable_core_tables, event_journal_outbox_tables, tool_audit_event_tables,
+    };
 
     #[test]
     fn durable_core_migrations_cover_every_declared_table_constraint_and_index() -> Result<()> {
@@ -75,8 +77,8 @@ mod tests {
     fn executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 3,
-            "expected 3 executable migrations (durable core + event journal + execution intents), got {:?}",
+            migrations.len() == 4,
+            "expected 4 executable migrations (durable core + event journal + execution intents + tool audit events), got {:?}",
             migrations
                 .iter()
                 .map(|migration| migration.version)
@@ -96,6 +98,11 @@ mod tests {
             migrations[2].version == 3,
             "expected execution intents migration version 3, got {}",
             migrations[2].version,
+        );
+        ensure!(
+            migrations[3].version == 4,
+            "expected tool audit events migration version 4, got {}",
+            migrations[3].version,
         );
         Ok(())
     }
@@ -280,6 +287,81 @@ mod tests {
         ensure!(
             actual == expected,
             "event journal repository traits mismatch: expected {expected:?}, got {actual:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_audit_migration_covers_every_declared_table_constraint_and_index() -> Result<()> {
+        let sql = tool_audit_events_migration();
+
+        for table in tool_audit_event_tables() {
+            ensure!(
+                sql.contains(&format!("CREATE TABLE {}", table.name)),
+                "missing CREATE TABLE for {}",
+                table.name,
+            );
+
+            for constraint in table.constraints {
+                ensure!(
+                    sql.contains(constraint.name),
+                    "missing constraint {} for {}",
+                    constraint.name,
+                    table.name,
+                );
+            }
+
+            for index in table.indexes {
+                ensure!(
+                    sql.contains(index.name),
+                    "missing index {} for {}",
+                    index.name,
+                    table.name,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn tool_audit_repository_contracts_cover_store_trait() -> Result<()> {
+        let boundaries = tool_audit_repository_boundaries();
+        let actual: BTreeSet<_> = boundaries.iter().map(|b| b.store_trait).collect();
+        let expected = BTreeSet::from(["agent_server::journal::tool_audit::ToolAuditEventStore"]);
+        ensure!(
+            actual == expected,
+            "tool audit repository traits mismatch: expected {expected:?}, got {actual:?}",
+        );
+
+        let boundary = boundaries
+            .iter()
+            .find(|b| b.store_trait == "agent_server::journal::tool_audit::ToolAuditEventStore")
+            .context("missing tool_audit_repository boundary")?;
+        ensure!(
+            boundary.tables == ["agent_sdk_tool_audit_events"],
+            "tool audit repository tables drifted: {:?}",
+            boundary.tables,
+        );
+        ensure!(
+            boundary.writes == ["record_event"],
+            "tool audit repository writes drifted: {:?}",
+            boundary.writes,
+        );
+        ensure!(
+            boundary.reads == ["list_by_operation", "list_by_task", "list_by_thread"],
+            "tool audit repository reads drifted: {:?}",
+            boundary.reads,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_audit_discriminant_and_payload_must_agree() -> Result<()> {
+        let sql = tool_audit_events_migration();
+        ensure!(
+            sql.contains("kind_payload ->> 'kind' = kind"),
+            "tool audit table must cross-check kind discriminant against payload",
         );
         Ok(())
     }

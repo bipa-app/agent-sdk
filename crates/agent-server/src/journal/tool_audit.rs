@@ -32,11 +32,12 @@ use agent_sdk_core::ThreadId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::execution_intent::ToolEffectClass;
+use super::redaction::{RedactionPolicy, redact_error, redact_string, redact_value};
 use super::task::AgentTaskId;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -478,6 +479,96 @@ impl ToolAuditEventStore for InMemoryToolAuditEventStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Redaction decorator
+// ─────────────────────────────────────────────────────────────────────
+
+/// Returns a copy of `event` with its redactable fields run through
+/// the provided [`RedactionPolicy`].
+///
+/// Redacted fields:
+/// - [`ToolAuditEvent::input`] via [`redact_value`]
+/// - [`ToolAuditEvent::output`] via [`redact_string`]
+/// - [`ToolAuditEvent::error`] via [`redact_error`]
+/// - The `error` string carried by the
+///   [`ToolAuditEventKind::Failed`] variant, also via [`redact_error`],
+///   since failed tool executions can surface raw provider error text.
+///
+/// Non-redactable fields (identity, provenance, lifecycle kind) are
+/// copied unchanged so the audit trail still answers "what happened and
+/// in what order" without leaking secrets.
+#[must_use]
+pub fn redact_event(event: &ToolAuditEvent, policy: &RedactionPolicy) -> ToolAuditEvent {
+    let kind = match &event.kind {
+        ToolAuditEventKind::Failed { error } => ToolAuditEventKind::Failed {
+            error: redact_error(error, policy),
+        },
+        other => other.clone(),
+    };
+
+    ToolAuditEvent {
+        id: event.id.clone(),
+        operation_id: event.operation_id.clone(),
+        task_id: event.task_id.clone(),
+        parent_task_id: event.parent_task_id.clone(),
+        thread_id: event.thread_id.clone(),
+        tool_call_id: event.tool_call_id.clone(),
+        tool_name: event.tool_name.clone(),
+        effect_class: event.effect_class,
+        kind,
+        provider: event.provider.clone(),
+        model: event.model.clone(),
+        input: event.input.as_ref().map(|v| redact_value(v, policy)),
+        output: event.output.as_deref().map(|s| redact_string(s, policy)),
+        error: event.error.as_deref().map(|s| redact_error(s, policy)),
+        recorded_at: event.recorded_at,
+    }
+}
+
+/// Decorator that applies a [`RedactionPolicy`] to every event on its
+/// way into durable storage, and passes reads through unchanged.
+///
+/// Writes are the only path that must redact: once rows are persisted,
+/// reading them back does not re-introduce the un-redacted payload.
+pub struct RedactingToolAuditEventStore {
+    inner: Arc<dyn ToolAuditEventStore>,
+    policy: RedactionPolicy,
+}
+
+impl RedactingToolAuditEventStore {
+    /// Wrap an inner store with the supplied redaction policy.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ToolAuditEventStore>, policy: RedactionPolicy) -> Self {
+        Self { inner, policy }
+    }
+
+    /// Wrap an inner store using [`RedactionPolicy::baseline`].
+    #[must_use]
+    pub fn baseline(inner: Arc<dyn ToolAuditEventStore>) -> Self {
+        Self::new(inner, RedactionPolicy::baseline())
+    }
+}
+
+#[async_trait]
+impl ToolAuditEventStore for RedactingToolAuditEventStore {
+    async fn record_event(&self, event: &ToolAuditEvent) -> anyhow::Result<()> {
+        let redacted = redact_event(event, &self.policy);
+        self.inner.record_event(&redacted).await
+    }
+
+    async fn list_by_operation(&self, operation_id: &str) -> anyhow::Result<Vec<ToolAuditEvent>> {
+        self.inner.list_by_operation(operation_id).await
+    }
+
+    async fn list_by_task(&self, task_id: &AgentTaskId) -> anyhow::Result<Vec<ToolAuditEvent>> {
+        self.inner.list_by_task(task_id).await
+    }
+
+    async fn list_by_thread(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<ToolAuditEvent>> {
+        self.inner.list_by_thread(thread_id).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
@@ -787,6 +878,122 @@ mod tests {
         for window in events.windows(2) {
             assert!(window[0].recorded_at <= window[1].recorded_at);
         }
+
+        Ok(())
+    }
+
+    // ── Redaction decorator ─────────────────────────────────────
+
+    const REDACTED_MARKER_VALUE: &str = "[REDACTED]";
+
+    fn sample_params_sensitive(
+        kind: ToolAuditEventKind,
+        now: OffsetDateTime,
+    ) -> ToolAuditEventParams {
+        let mut params = sample_params(kind, now);
+        params.input = Some(serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer sk-secret' https://x",
+            "api_key": "sk-abc123",
+            "normal": "hello",
+        }));
+        params.output = Some("sk-leaked-token".into());
+        params.error = Some("Bearer eyJ-token".into());
+        params
+    }
+
+    #[test]
+    fn redact_event_redacts_input_output_and_failed_error() {
+        let policy = RedactionPolicy::baseline();
+        let event = ToolAuditEvent::new(sample_params_sensitive(
+            ToolAuditEventKind::Failed {
+                error: "sk-failure-token".into(),
+            },
+            t0(),
+        ));
+        let redacted = redact_event(&event, &policy);
+
+        let input = redacted.input.as_ref().expect("input present");
+        assert_eq!(input["api_key"], REDACTED_MARKER_VALUE);
+        assert_eq!(input["normal"], "hello");
+
+        assert_eq!(redacted.output.as_deref(), Some(REDACTED_MARKER_VALUE));
+        // Baseline error_level is None, so the top-level error field and the
+        // error string inside the Failed variant both pass through unchanged.
+        assert_eq!(redacted.error.as_deref(), Some("Bearer eyJ-token"));
+
+        match redacted.kind {
+            ToolAuditEventKind::Failed { error } => {
+                assert_eq!(error, "sk-failure-token");
+            }
+            other => panic!("expected Failed variant, got {other:?}"),
+        }
+
+        // Identity and provenance survive redaction untouched.
+        assert_eq!(redacted.id, event.id);
+        assert_eq!(redacted.operation_id, event.operation_id);
+        assert_eq!(redacted.provider, "anthropic");
+    }
+
+    #[test]
+    fn redact_event_with_full_policy_masks_failed_error() {
+        let policy = RedactionPolicy::full();
+        let event = ToolAuditEvent::new(sample_params_sensitive(
+            ToolAuditEventKind::Failed {
+                error: "sk-failure-token".into(),
+            },
+            t0(),
+        ));
+        let redacted = redact_event(&event, &policy);
+
+        match redacted.kind {
+            ToolAuditEventKind::Failed { error } => assert_eq!(error, REDACTED_MARKER_VALUE),
+            other => panic!("expected Failed variant, got {other:?}"),
+        }
+        assert_eq!(
+            redacted.input.as_ref().expect("input present"),
+            &serde_json::json!(REDACTED_MARKER_VALUE),
+        );
+        assert_eq!(redacted.output.as_deref(), Some(REDACTED_MARKER_VALUE));
+        assert_eq!(redacted.error.as_deref(), Some(REDACTED_MARKER_VALUE));
+    }
+
+    #[tokio::test]
+    async fn redacting_store_applies_policy_before_inner_write() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemoryToolAuditEventStore::new());
+        let store = RedactingToolAuditEventStore::baseline(inner.clone());
+
+        let event =
+            ToolAuditEvent::new(sample_params_sensitive(ToolAuditEventKind::Completed, t0()));
+        store.record_event(&event).await?;
+
+        let stored = inner.all_events()?;
+        assert_eq!(stored.len(), 1);
+        let stored = &stored[0];
+        assert_eq!(stored.output.as_deref(), Some(REDACTED_MARKER_VALUE));
+        assert_eq!(
+            stored.input.as_ref().expect("input present")["api_key"],
+            REDACTED_MARKER_VALUE,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redacting_store_read_paths_pass_through() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemoryToolAuditEventStore::new());
+        let store = RedactingToolAuditEventStore::baseline(inner.clone());
+        let event = ToolAuditEvent::new(sample_params(ToolAuditEventKind::Dispatched, t0()));
+        store.record_event(&event).await?;
+
+        let op_events = store.list_by_operation(&event.operation_id).await?;
+        assert_eq!(op_events.len(), 1);
+        assert_eq!(op_events[0].id, event.id);
+
+        let task_events = store.list_by_task(&event.task_id).await?;
+        assert_eq!(task_events.len(), 1);
+
+        let thread_events = store.list_by_thread(&event.thread_id).await?;
+        assert_eq!(thread_events.len(), 1);
 
         Ok(())
     }

@@ -1166,3 +1166,176 @@ const EXECUTION_INTENT_TABLES: &[TableContract] = &[TableContract {
 pub const fn execution_intent_tables() -> &'static [TableContract] {
     EXECUTION_INTENT_TABLES
 }
+
+// =====================================================================
+// Tool audit events table (migration 0004)
+// =====================================================================
+
+const AGENT_SDK_TOOL_AUDIT_EVENT_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Primary event identity (`tae_<uuid>` wire form).",
+    },
+    ColumnContract {
+        name: "seq",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Database-assigned monotonic insertion sequence. Stable tie-breaker for `recorded_at` collisions.",
+    },
+    ColumnContract {
+        name: "operation_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Operation identity (`child_task_id:tool_call_id`).",
+    },
+    ColumnContract {
+        name: "task_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Child task that owns this tool execution.",
+    },
+    ColumnContract {
+        name: "parent_task_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Parent root-turn task that spawned the child.",
+    },
+    ColumnContract {
+        name: "thread_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Thread the task family is bound to.",
+    },
+    ColumnContract {
+        name: "tool_call_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Raw LLM-assigned tool call id.",
+    },
+    ColumnContract {
+        name: "tool_name",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Tool name.",
+    },
+    ColumnContract {
+        name: "effect_class",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Tool effect classification (`replay_safe`, `side_effecting`, `resumable`).",
+    },
+    ColumnContract {
+        name: "kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Lifecycle event discriminant. Constrained to the known `ToolAuditEventKind` variants.",
+    },
+    ColumnContract {
+        name: "kind_payload",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Full serialized `ToolAuditEventKind` including any variant-specific payload (reason, error).",
+    },
+    ColumnContract {
+        name: "provider",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Provider identifier (e.g. `anthropic`, `openai`).",
+    },
+    ColumnContract {
+        name: "model",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Model identifier as reported by the provider for the turn that dispatched the tool.",
+    },
+    ColumnContract {
+        name: "input",
+        sql_type: "JSONB",
+        nullable: true,
+        notes: "Redacted tool input snapshot. NULL when the event kind carries no input.",
+    },
+    ColumnContract {
+        name: "output",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Redacted tool output. NULL when the event kind carries no output.",
+    },
+    ColumnContract {
+        name: "error",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Redacted error detail. NULL when the event kind carries no error.",
+    },
+    ColumnContract {
+        name: "recorded_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the event was recorded (supplied by the caller, not the database).",
+    },
+];
+
+const AGENT_SDK_TOOL_AUDIT_EVENT_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_tool_audit_events_seq_key",
+        invariant: "`seq` is the durable monotonic sequence; no two rows share a value.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tool_audit_events_effect_class_check",
+        invariant: "Only known effect classes can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tool_audit_events_kind_check",
+        invariant: "Only known lifecycle event kinds can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tool_audit_events_kind_payload_check",
+        invariant: "The serialized kind payload is a JSON object carrying the full tagged enum.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_tool_audit_events_kind_payload_discriminant_check",
+        invariant: "The payload's embedded `kind` must match the discriminant column.",
+    },
+];
+
+const AGENT_SDK_TOOL_AUDIT_EVENT_INDEXES: &[IndexContract] = &[
+    IndexContract {
+        name: "agent_sdk_tool_audit_events_by_operation_idx",
+        key_columns: "(operation_id, seq)",
+        predicate: None,
+        purpose: "Streams the lifecycle for a single operation in insertion order without a sort step.",
+    },
+    IndexContract {
+        name: "agent_sdk_tool_audit_events_by_task_idx",
+        key_columns: "(task_id, seq)",
+        predicate: None,
+        purpose: "Streams every audit event for a child task in insertion order.",
+    },
+    IndexContract {
+        name: "agent_sdk_tool_audit_events_by_thread_idx",
+        key_columns: "(thread_id, seq)",
+        predicate: None,
+        purpose: "Streams every audit event within a thread (covers cross-task audit queries).",
+    },
+    IndexContract {
+        name: "agent_sdk_tool_audit_events_by_recorded_at_idx",
+        key_columns: "(recorded_at)",
+        predicate: None,
+        purpose: "Time-range queries for operational inspection and retention scans.",
+    },
+];
+
+const TOOL_AUDIT_EVENT_TABLES: &[TableContract] = &[TableContract {
+    name: "agent_sdk_tool_audit_events",
+    purpose: "Durable append-only tool audit lifecycle events for child-task execution.",
+    columns: AGENT_SDK_TOOL_AUDIT_EVENT_COLUMNS,
+    constraints: AGENT_SDK_TOOL_AUDIT_EVENT_CONSTRAINTS,
+    indexes: AGENT_SDK_TOOL_AUDIT_EVENT_INDEXES,
+}];
+
+/// Tables introduced by the tool audit events migration (0004).
+#[must_use]
+pub const fn tool_audit_event_tables() -> &'static [TableContract] {
+    TOOL_AUDIT_EVENT_TABLES
+}
