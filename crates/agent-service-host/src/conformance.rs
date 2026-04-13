@@ -33,7 +33,7 @@
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
     use agent_sdk_core::audit::AuditProvenance;
@@ -78,7 +78,10 @@ mod tests {
         assert_eq!(admitted.status, TaskStatus::Pending);
         assert_eq!(admitted.id, root.id);
 
-        let fetched = task_store.get(&root.id).await?.expect("root should exist");
+        let fetched = task_store
+            .get(&root.id)
+            .await?
+            .context("root should exist")?;
         assert_eq!(fetched.status, TaskStatus::Pending);
         Ok(())
     }
@@ -95,9 +98,11 @@ mod tests {
         let admitted2 = task_store.submit_root_turn(root2).await?;
         assert_eq!(admitted2.status, TaskStatus::Queued);
 
-        let active = task_store.active_root_for_thread(&thread_id(tid)).await?;
-        assert!(active.is_some());
-        assert_eq!(active.unwrap().id, admitted1.id);
+        let active = task_store
+            .active_root_for_thread(&thread_id(tid))
+            .await?
+            .context("active root missing")?;
+        assert_eq!(active.id, admitted1.id);
 
         let queued = task_store.list_queued_roots(&thread_id(tid)).await?;
         assert_eq!(queued.len(), 1);
@@ -117,7 +122,7 @@ mod tests {
         let acquired = task_store
             .try_acquire_task(&root.id, worker.clone(), lease.clone(), expires, t_plus(21))
             .await?;
-        let acquired = acquired.expect("should acquire");
+        let acquired = acquired.context("should acquire")?;
         assert_eq!(acquired.status, TaskStatus::Running);
         assert_eq!(acquired.worker_id, Some(worker.clone()));
         assert_eq!(acquired.lease_id, Some(lease.clone()));
@@ -180,7 +185,7 @@ mod tests {
         assert!(matches!(records[0].action, RecoveryAction::Requeue));
 
         // Task should be back to Pending.
-        let task = task_store.get(&root.id).await?.expect("task exists");
+        let task = task_store.get(&root.id).await?.context("task exists")?;
         assert_eq!(task.status, TaskStatus::Pending);
         Ok(())
     }
@@ -249,9 +254,11 @@ mod tests {
         assert_eq!(outcome.thread.committed_turns, 1);
         assert_eq!(outcome.checkpoint.turn_number, 1);
 
-        let latest = checkpoint_store.get_latest_by_thread(&tid).await?;
-        assert!(latest.is_some());
-        assert_eq!(latest.unwrap().turn_number, 1);
+        let latest = checkpoint_store
+            .get_latest_by_thread(&tid)
+            .await?
+            .context("latest checkpoint missing")?;
+        assert_eq!(latest.turn_number, 1);
         Ok(())
     }
 
@@ -313,7 +320,7 @@ mod tests {
             .complete_task(&child.id, &cw, &cl, t_plus(64))
             .await?;
         assert_eq!(completed_child.status, TaskStatus::Completed);
-        let resumed = resumed_parent.expect("parent should be returned");
+        let resumed = resumed_parent.context("parent should be returned")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
         Ok(())
     }
@@ -338,7 +345,7 @@ mod tests {
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0], root.id);
 
-        let task = task_store.get(&root.id).await?.expect("task exists");
+        let task = task_store.get(&root.id).await?.context("task exists")?;
         assert_eq!(task.status, TaskStatus::Cancelled);
         Ok(())
     }
@@ -365,7 +372,7 @@ mod tests {
         let promoted = task_store
             .promote_next_queued_root(&thread_id(tid), t_plus(84))
             .await?;
-        let promoted = promoted.expect("should promote");
+        let promoted = promoted.context("should promote")?;
         assert_eq!(promoted.id, r2.id);
         assert_eq!(promoted.status, TaskStatus::Pending);
         Ok(())
@@ -391,7 +398,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
 
-        let task = task_store.get(&root.id).await?.expect("task exists");
+        let task = task_store.get(&root.id).await?.context("task exists")?;
         assert_eq!(task.status, TaskStatus::Failed);
         Ok(())
     }

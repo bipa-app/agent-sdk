@@ -447,7 +447,8 @@ WHERE id = ?1
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let duration_ms = attempt
             .duration_ms
-            .map(|v| i64::try_from(v).expect("duration_ms fits i64"));
+            .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
+            .transpose()?;
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_attempts (
@@ -495,7 +496,8 @@ INSERT INTO agent_sdk_turn_attempts (
         let cached_input_tokens = attempt.cached_input_tokens.map(i64::from);
         let duration_ms = attempt
             .duration_ms
-            .map(|v| i64::try_from(v).expect("duration_ms fits i64"));
+            .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
+            .transpose()?;
         let result = sqlx::query!(
             r"
 UPDATE agent_sdk_turn_attempts SET

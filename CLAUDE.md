@@ -209,7 +209,11 @@ checking. Never use the untyped `sqlx::query(...)` string form.
 compile-time macros.  Complex SELECT queries that map to `FromRow` record
 types use runtime `sqlx::query_as::<_, RecordType>()` because SQLite's
 weak type system requires verbose per-column type annotations in
-`query_as!()`.
+`query_as!()`.  Connection-setup `PRAGMA` statements (e.g.
+`PRAGMA journal_mode`, `PRAGMA foreign_keys`, `PRAGMA busy_timeout`) also
+use the runtime `sqlx::query()` form — sqlx's offline macros cannot
+validate `PRAGMA` syntax because PRAGMAs are not part of the application
+schema sqlx introspects.
 
 ```rust
 // BAD: untyped query — no compile-time checking

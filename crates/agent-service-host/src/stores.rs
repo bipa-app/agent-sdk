@@ -538,25 +538,29 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
 
 #[cfg(feature = "sqlite")]
 fn build_sqlite_store(database_url: &str) -> Result<Arc<SqliteDurableStore>> {
+    // SqliteDurableStore::connect is async (runs PRAGMAs and
+    // migrations), but `from_config` is a sync constructor.  We
+    // cannot call `Handle::block_on` directly inside an active
+    // runtime (panic), and `tokio::task::block_in_place` only works
+    // on the multi_thread flavor — `#[tokio::test]` defaults to
+    // current_thread and would panic there.  Spawning a dedicated
+    // OS thread with its own current_thread runtime works
+    // regardless of the caller's runtime flavor (or absence of one).
     let url = database_url.to_owned();
-    let connect = || async {
-        SqliteDurableStore::connect(&url)
-            .await
-            .map(Arc::new)
-            .context("connect sqlite durable store")
-    };
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        // block_in_place yields the current executor thread so
-        // block_on does not panic inside an active Tokio runtime.
-        return tokio::task::block_in_place(|| handle.block_on(connect()));
-    }
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for sqlite store bootstrap")?
-        .block_on(connect())
+    std::thread::spawn(move || -> Result<Arc<SqliteDurableStore>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for sqlite store bootstrap")?
+            .block_on(async {
+                SqliteDurableStore::connect(&url)
+                    .await
+                    .map(Arc::new)
+                    .context("connect sqlite durable store")
+            })
+    })
+    .join()
+    .map_err(|panic| anyhow::anyhow!("sqlite connect thread panicked: {panic:?}"))?
 }
 
 // ─────────────────────────────────────────────────────────────────────
