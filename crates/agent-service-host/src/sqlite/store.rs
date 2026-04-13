@@ -962,6 +962,40 @@ LIMIT 1
         Ok((new_child, parent))
     }
 
+    /// After a child task transitions to a terminal state, wake its
+    /// `WaitingOnChildren` parent (if any) by recomputing
+    /// `pending_child_count`.  Without this, a parent with a single
+    /// fail-closed child stays in `WaitingOnChildren` forever
+    /// because no future `complete_task`/`fail_task` call will fire
+    /// to decrement the counter — a liveness deadlock.
+    async fn propagate_terminal_to_parent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        child: &AgentTask,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        let Some(parent_id) = &child.parent_id else {
+            return Ok(());
+        };
+        let old_parent = Self::load_task_tx(tx, parent_id).await?.ok_or_else(|| {
+            anyhow!(
+                "{error_prefix}: child {child_id} references missing parent {parent_id}",
+                child_id = child.id,
+            )
+        })?;
+        if old_parent.status != TaskStatus::WaitingOnChildren {
+            return Ok(());
+        }
+        let live = Self::load_live_child_count_tx(tx, parent_id).await?;
+        let new_parent = old_parent
+            .recompute_pending_children(live, now)
+            .with_context(|| {
+                format!("{error_prefix}: recompute_pending_children transition failed")
+            })?;
+        Self::update_task_tx(tx, &new_parent).await?;
+        Ok(())
+    }
+
     async fn load_subtree_tx(
         tx: &mut Transaction<'_, Sqlite>,
         root_id: &AgentTaskId,
@@ -1417,6 +1451,8 @@ impl AgentTaskStore for SqliteDurableStore {
                     .fail_with_reason(reason, now)
                     .context("try_acquire_task: fail-closed transition failed")?;
                 Self::update_task_tx(&mut tx, &failed).await?;
+                Self::propagate_terminal_to_parent_tx(&mut tx, &failed, now, "try_acquire_task")
+                    .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -1484,6 +1520,13 @@ impl AgentTaskStore for SqliteDurableStore {
                         .fail_with_reason(reason, now)
                         .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    Self::propagate_terminal_to_parent_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -1555,6 +1598,13 @@ impl AgentTaskStore for SqliteDurableStore {
                         .fail_with_reason(reason, now)
                         .context("release_expired_leases: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    Self::propagate_terminal_to_parent_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "release_expired_leases",
+                    )
+                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -1990,12 +2040,20 @@ impl AgentTaskStore for SqliteDurableStore {
     async fn clear(&self) -> Result<()> {
         // SQLite does not support TRUNCATE CASCADE, and
         // `agent_sdk_tasks` carries a self-referential FK with
-        // ON DELETE RESTRICT — RESTRICT is enforced per-row, so bulk
-        // DELETEs fail even when the set is internally consistent.
-        // Disable FK enforcement for the duration of the wipe.  The
-        // PRAGMA must run on a connection outside of any transaction
-        // and is scoped to that connection, so we acquire a single
-        // connection and run every statement on it.
+        // ON DELETE RESTRICT — RESTRICT is enforced per-row even when
+        // `defer_foreign_keys` is on, so bulk DELETEs fail even when
+        // the set is internally consistent.  Disable FK enforcement
+        // for the duration of the wipe.  Connection PRAGMAs cannot
+        // run inside a transaction and are scoped to the connection,
+        // so we acquire one and run every statement on it.
+        //
+        // Critical: `PRAGMA foreign_keys = OFF` is connection-level
+        // session state.  If we returned the connection to the pool
+        // with FKs still off, the next acquirer would silently
+        // bypass referential integrity.  We therefore re-enable FKs
+        // unconditionally — even when the DELETE sequence errors —
+        // by collecting the deletion result and running the restore
+        // PRAGMA before propagating any error.
         let mut conn = self
             .pool
             .acquire()
@@ -2005,6 +2063,22 @@ impl AgentTaskStore for SqliteDurableStore {
             .execute(&mut *conn)
             .await
             .context("disable sqlite foreign_keys for clear")?;
+
+        let delete_result = Self::clear_tables(&mut conn).await;
+
+        let restore_result = sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .context("re-enable sqlite foreign_keys after clear");
+
+        delete_result?;
+        restore_result?;
+        Ok(())
+    }
+}
+
+impl SqliteDurableStore {
+    async fn clear_tables(conn: &mut sqlx::SqliteConnection) -> Result<()> {
         sqlx::query!("DELETE FROM agent_sdk_turn_checkpoints")
             .execute(&mut *conn)
             .await?;
@@ -2032,10 +2106,6 @@ impl AgentTaskStore for SqliteDurableStore {
         sqlx::query!("DELETE FROM agent_sdk_threads")
             .execute(&mut *conn)
             .await?;
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *conn)
-            .await
-            .context("re-enable sqlite foreign_keys after clear")?;
         Ok(())
     }
 }

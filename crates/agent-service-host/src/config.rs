@@ -228,23 +228,41 @@ impl StorageConfig {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("create sqlite data dir {}", parent.display()))?;
                 }
-                Ok(format!("sqlite://{}?mode=rwc", sqlite_url_path(&db_path)))
+                Ok(sqlite_url(&db_path))
             }
             _ => bail!("sqlite_database_url is only valid when storage.backend=sqlite"),
         }
     }
 }
 
-/// Normalise a filesystem path for embedding in a `sqlite://` URL.
+/// Build a `sqlite://` connection URL for the given filesystem path.
 ///
-/// On Windows `PathBuf::display()` emits backslashes which sqlx/url reject;
-/// substitute forward slashes so the URL parser accepts the result.
-fn sqlite_url_path(path: &std::path::Path) -> String {
-    let rendered = path.display().to_string();
-    if std::path::MAIN_SEPARATOR == '/' {
-        rendered
+/// Two structural pitfalls must be avoided:
+/// 1. On Windows, `PathBuf::display()` emits backslashes that sqlx's URL
+///    parser rejects — substitute forward slashes.
+/// 2. Per RFC 3986, the `//` after the scheme introduces an authority
+///    component that ends at the next `/`.  For Unix absolute paths
+///    starting with `/`, `sqlite://` + `/tmp/foo` naturally produces
+///    `sqlite:///tmp/foo` (empty authority).  For Windows drive-letter
+///    paths like `C:/Users/...`, `sqlite://` + `C:/...` would parse
+///    `C` as the host and silently drop the drive letter; we therefore
+///    prepend an extra `/` so the URL becomes `sqlite:///C:/...`.
+///
+/// Relative paths use the opaque `sqlite:` form (no `//`) so the path
+/// does not get mistaken for an authority.
+fn sqlite_url(path: &std::path::Path) -> String {
+    let mut rendered = path.display().to_string();
+    if std::path::MAIN_SEPARATOR != '/' {
+        rendered = rendered.replace(std::path::MAIN_SEPARATOR, "/");
+    }
+    if path.is_absolute() {
+        if !rendered.starts_with('/') {
+            // Windows drive-letter form (e.g. `C:/Users/...`).
+            rendered.insert(0, '/');
+        }
+        format!("sqlite://{rendered}?mode=rwc")
     } else {
-        rendered.replace(std::path::MAIN_SEPARATOR, "/")
+        format!("sqlite:{rendered}?mode=rwc")
     }
 }
 
@@ -582,5 +600,33 @@ storage:
             other => panic!("expected Sqlite, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_url_unix_absolute_uses_three_slashes() {
+        let url = sqlite_url(std::path::Path::new("/var/lib/agent-sdk.db"));
+        assert_eq!(url, "sqlite:///var/lib/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_windows_drive_letter_keeps_drive() {
+        // Construct a synthetic absolute Windows path; on this platform
+        // it won't be detected as absolute, so call the inner builder
+        // logic directly.
+        let path = std::path::Path::new("C:/Users/me/agent-sdk.db");
+        let mut rendered = path.display().to_string().replace('\\', "/");
+        if !rendered.starts_with('/') {
+            rendered.insert(0, '/');
+        }
+        let url = format!("sqlite://{rendered}?mode=rwc");
+        // The drive letter must survive intact behind the empty
+        // authority — i.e. three slashes before the drive letter.
+        assert_eq!(url, "sqlite:///C:/Users/me/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_relative_uses_opaque_form() {
+        let url = sqlite_url(std::path::Path::new("local.db"));
+        assert_eq!(url, "sqlite:local.db?mode=rwc");
     }
 }

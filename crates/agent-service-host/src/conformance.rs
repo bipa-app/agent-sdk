@@ -403,6 +403,82 @@ mod tests {
         Ok(())
     }
 
+    /// When a child's lease expires past `max_attempts`, the recovery
+    /// path must wake its `WaitingOnChildren` parent — otherwise the
+    /// parent stays blocked forever (no future complete/fail event
+    /// will fire to decrement `pending_child_count`).
+    async fn test_fail_closed_child_wakes_parent(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let parent = AgentTask::new_root_turn(thread_id("conformance-orphan"), t_plus(200), 3);
+        let _ = task_store.submit_root_turn(parent.clone()).await?;
+        let pw = WorkerId::new();
+        let pl = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(&parent.id, pw.clone(), pl.clone(), t_plus(260), t_plus(201))
+            .await?;
+
+        // Spawn a single child with max_attempts=1 so its first lease
+        // expiry fail-closes it.
+        let payload = SuspensionPayload {
+            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+                agent_sdk_core::AgentContinuation {
+                    thread_id: thread_id("conformance-orphan"),
+                    turn: 1,
+                    total_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                    turn_usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                    pending_tool_calls: vec![],
+                    awaiting_index: 0,
+                    completed_results: vec![],
+                    state: agent_sdk_core::AgentState::new(thread_id("conformance-orphan")),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: vec![],
+                },
+            ),
+            suspended_messages: vec![],
+        };
+        let (_parent, children) = task_store
+            .spawn_tool_children(
+                &parent.id,
+                &pw,
+                &pl,
+                vec![ChildSpawnSpec { max_attempts: 1 }],
+                payload,
+                t_plus(202),
+            )
+            .await?;
+        let child = &children[0];
+
+        // Acquire child, let lease expire, then sweep.  attempt=1 ==
+        // max_attempts triggers FailClosed.
+        let _ = task_store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(210),
+                t_plus(203),
+            )
+            .await?;
+        let records = task_store.release_expired_leases(t_plus(211)).await?;
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
+
+        // Child must be Failed and parent must have woken up to
+        // Pending with no live children.
+        let child_after = task_store.get(&child.id).await?.context("child exists")?;
+        assert_eq!(child_after.status, TaskStatus::Failed);
+        let parent_after = task_store.get(&parent.id).await?.context("parent exists")?;
+        assert_eq!(parent_after.pending_child_count, 0);
+        assert_eq!(parent_after.status, TaskStatus::Pending);
+        Ok(())
+    }
+
     /// Clear wipes every task — including parent/child chains guarded
     /// by ON DELETE RESTRICT self-referential FKs on `SQLite`.
     async fn test_clear_with_parent_child(task_store: &dyn AgentTaskStore) -> Result<()> {
@@ -535,6 +611,12 @@ mod tests {
         test_clear_with_parent_child(s.task.as_ref()).await
     }
 
+    #[tokio::test]
+    async fn conformance_in_memory_fail_closed_child_wakes_parent() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_fail_closed_child_wakes_parent(s.task.as_ref()).await
+    }
+
     struct InMemoryStores {
         task: std::sync::Arc<dyn AgentTaskStore>,
         thread: std::sync::Arc<dyn ThreadStore>,
@@ -639,5 +721,12 @@ mod tests {
     async fn conformance_sqlite_clear_parent_child() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_clear_with_parent_child(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_fail_closed_child_wakes_parent() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_fail_closed_child_wakes_parent(&store).await
     }
 }

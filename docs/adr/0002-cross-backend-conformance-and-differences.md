@@ -106,7 +106,7 @@ across all backends until dedicated durable implementations are added.
 | Backend | `AgentTaskStore::clear()` implementation |
 |---------|------------------------------------------|
 | **In-memory** | `inner.write().await` + clear all hashmaps |
-| **SQLite** | `DELETE FROM` each table in FK order |
+| **SQLite** | `PRAGMA foreign_keys = OFF`, `DELETE FROM` each table, `PRAGMA foreign_keys = ON` (FK enforcement is suspended for the wipe because `agent_sdk_tasks`'s self-referential `ON DELETE RESTRICT` FKs are checked per-row) |
 | **PostgreSQL** | `TRUNCATE TABLE ... CASCADE` |
 
 ### Outbox claim behaviour
