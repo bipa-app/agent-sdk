@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_execution_intents\nSET status     = ?2,\n    error      = ?3,\n    updated_at = ?4\nWHERE operation_id = ?1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "7444d28fd3e240b7c5619fa41a63a3c1a547740d0a123e46ef707e28974673ed"
+}

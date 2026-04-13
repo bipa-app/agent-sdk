@@ -33,6 +33,7 @@ use agent_server::journal::event_outbox_transaction::{
     AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
 };
 use agent_server::journal::event_repository::EventRepository;
+use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::outbox::{
@@ -2632,6 +2633,7 @@ TRUNCATE TABLE
     agent_sdk_turn_checkpoints,
     agent_sdk_message_commits,
     agent_sdk_message_heads,
+    agent_sdk_execution_intents,
     agent_sdk_tasks,
     agent_sdk_threads
 CASCADE
@@ -3535,6 +3537,113 @@ SET retention_floor = EXCLUDED.retention_floor,
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// ExecutionIntentStore
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ExecutionIntentStore for PostgresDurableStore {
+    async fn persist_intent(&self, intent: &ExecutionIntent) -> Result<()> {
+        let effect_class_wire = enum_to_wire(&intent.effect_class)?;
+        let status_wire = enum_to_wire(&intent.status)?;
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_execution_intents (
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (operation_id) DO UPDATE SET
+    status     = EXCLUDED.status,
+    error      = EXCLUDED.error,
+    updated_at = EXCLUDED.updated_at
+",
+            intent.operation_id.as_str(),
+            effect_class_wire,
+            intent.tool_call_id,
+            intent.child_task_id.as_str(),
+            intent.tool_name,
+            intent.input,
+            status_wire,
+            intent.error,
+            intent.created_at,
+            intent.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("persist execution intent {}", intent.operation_id))?;
+        Ok(())
+    }
+
+    async fn update_intent(&self, intent: &ExecutionIntent) -> Result<()> {
+        let status_wire = enum_to_wire(&intent.status)?;
+
+        let result = sqlx::query!(
+            r"
+UPDATE agent_sdk_execution_intents
+SET status     = $2,
+    error      = $3,
+    updated_at = $4
+WHERE operation_id = $1
+",
+            intent.operation_id.as_str(),
+            status_wire,
+            intent.error,
+            intent.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("update execution intent {}", intent.operation_id))?;
+
+        ensure!(
+            result.rows_affected() == 1,
+            "update execution intent affected {} rows for {}",
+            result.rows_affected(),
+            intent.operation_id
+        );
+        Ok(())
+    }
+
+    async fn get_intent(&self, operation_id: &OperationId) -> Result<Option<ExecutionIntent>> {
+        let record = sqlx::query_as!(
+            ExecutionIntentRecord,
+            r"
+SELECT
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+FROM agent_sdk_execution_intents
+WHERE operation_id = $1
+",
+            operation_id.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get execution intent {operation_id}"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn get_intent_by_task(
+        &self,
+        child_task_id: &AgentTaskId,
+    ) -> Result<Option<ExecutionIntent>> {
+        let record = sqlx::query_as!(
+            ExecutionIntentRecord,
+            r"
+SELECT
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+FROM agent_sdk_execution_intents
+WHERE child_task_id = $1
+",
+            child_task_id.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get execution intent by task {child_task_id}"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct TaskRecord {
     id: String,
@@ -3856,6 +3965,39 @@ impl TryFrom<RetentionCursorRecord> for RetentionCursor {
     }
 }
 
+#[derive(Debug, FromRow)]
+struct ExecutionIntentRecord {
+    operation_id: String,
+    effect_class: String,
+    tool_call_id: String,
+    child_task_id: String,
+    tool_name: String,
+    input: serde_json::Value,
+    status: String,
+    error: Option<String>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl TryFrom<ExecutionIntentRecord> for ExecutionIntent {
+    type Error = anyhow::Error;
+
+    fn try_from(record: ExecutionIntentRecord) -> Result<Self> {
+        Ok(Self {
+            operation_id: OperationId(record.operation_id),
+            effect_class: enum_from_wire(&record.effect_class, "execution intent effect_class")?,
+            tool_call_id: record.tool_call_id,
+            child_task_id: AgentTaskId::from_string(record.child_task_id),
+            tool_name: record.tool_name,
+            input: record.input,
+            status: enum_from_wire(&record.status, "execution intent status")?,
+            error: record.error,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+    }
+}
+
 const fn thread_key(thread_id: &ThreadId) -> &str {
     thread_id.0.as_str()
 }
@@ -3940,6 +4082,7 @@ mod tests {
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::commit_completed_turn;
     use agent_server::journal::event_repository::InMemoryEventRepository;
+    use agent_server::journal::execution_intent::ExecutionIntentStore;
     use agent_server::journal::message_store::MessageProjectionStore;
     use agent_server::journal::recovery::FailureReason;
     use agent_server::journal::store::AgentTaskStore;
@@ -4409,6 +4552,219 @@ mod tests {
 
         let history = MessageProjectionStore::get_history(&store, &running.thread_id).await?;
         assert_eq!(history.len(), 2);
+
+        Ok(())
+    }
+
+    // ── ExecutionIntentStore ─────────────────────────────────────
+
+    fn make_test_intent(task_name: &str, secs: i64) -> ExecutionIntent {
+        use agent_server::journal::execution_intent::{IntentStatus, ToolEffectClass};
+
+        let task_id = AgentTaskId::from_string(format!("task_{task_name}"));
+        let op_id = OperationId::new(&task_id, "call_1");
+        ExecutionIntent {
+            operation_id: op_id,
+            effect_class: ToolEffectClass::SideEffecting,
+            tool_call_id: "call_1".into(),
+            child_task_id: task_id,
+            tool_name: "test_tool".into(),
+            input: serde_json::json!({"key": "value"}),
+            status: IntentStatus::Pending,
+            error: None,
+            created_at: t_plus(secs),
+            updated_at: t_plus(secs),
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_intent_persist_and_get_by_operation_id() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let intent = make_test_intent("persist_op", 10);
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("intent should be present after persist")?;
+        assert_eq!(loaded.operation_id, intent.operation_id);
+        assert_eq!(loaded.tool_name, "test_tool");
+        assert_eq!(
+            loaded.status,
+            agent_server::journal::execution_intent::IntentStatus::Pending
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_persist_and_get_by_task() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let intent = make_test_intent("persist_task", 11);
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent_by_task(&intent.child_task_id)
+            .await?
+            .context("intent should be present by task id")?;
+        assert_eq!(loaded.child_task_id, intent.child_task_id);
+        assert_eq!(loaded.operation_id, intent.operation_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_update_transitions_status() -> Result<()> {
+        use agent_server::journal::execution_intent::IntentStatus;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut intent = make_test_intent("update_status", 12);
+        store.persist_intent(&intent).await?;
+
+        intent.mark_started(t_plus(13));
+        store.update_intent(&intent).await?;
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after update to started")?;
+        assert_eq!(loaded.status, IntentStatus::Started);
+
+        intent.mark_completed(t_plus(14));
+        store.update_intent(&intent).await?;
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after update to completed")?;
+        assert_eq!(loaded.status, IntentStatus::Completed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_failed_stores_error() -> Result<()> {
+        use agent_server::journal::execution_intent::IntentStatus;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut intent = make_test_intent("failed_error", 15);
+        store.persist_intent(&intent).await?;
+
+        intent.mark_started(t_plus(16));
+        store.update_intent(&intent).await?;
+
+        intent.mark_failed("something went wrong", t_plus(17));
+        store.update_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after failed")?;
+        assert_eq!(loaded.status, IntentStatus::Failed);
+        assert_eq!(loaded.error.as_deref(), Some("something went wrong"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_restart_recovery() -> Result<()> {
+        let Some((store, guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let intent = make_test_intent("restart", 20);
+        store.persist_intent(&intent).await?;
+
+        // Simulate restart by creating a new store from the same pool.
+        let store2 = PostgresDurableStore::from_pool(store.pool().clone());
+
+        let loaded = store2
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("intent should survive reconnection")?;
+        assert_eq!(loaded.operation_id, intent.operation_id);
+
+        let loaded_by_task = store2
+            .get_intent_by_task(&intent.child_task_id)
+            .await?
+            .context("intent should be findable by task after reconnect")?;
+        assert_eq!(loaded_by_task.operation_id, intent.operation_id);
+
+        drop(guard);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_duplicate_persist_is_upsert_safe() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let mut intent = make_test_intent("upsert", 25);
+        store.persist_intent(&intent).await?;
+
+        // Persist again with updated status — ON CONFLICT should succeed.
+        intent.mark_started(t_plus(26));
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after upsert")?;
+        assert_eq!(
+            loaded.status,
+            agent_server::journal::execution_intent::IntentStatus::Started
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_get_nonexistent_returns_none() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let op_id = OperationId("nonexistent:call".into());
+        assert!(store.get_intent(&op_id).await?.is_none());
+        assert!(
+            store
+                .get_intent_by_task(&AgentTaskId::from_string("no_such_task"))
+                .await?
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_clear_removes_rows() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let intent = make_test_intent("clear", 30);
+        store.persist_intent(&intent).await?;
+
+        AgentTaskStore::clear(&store).await?;
+
+        assert!(store.get_intent(&intent.operation_id).await?.is_none());
+        assert!(
+            store
+                .get_intent_by_task(&intent.child_task_id)
+                .await?
+                .is_none()
+        );
 
         Ok(())
     }

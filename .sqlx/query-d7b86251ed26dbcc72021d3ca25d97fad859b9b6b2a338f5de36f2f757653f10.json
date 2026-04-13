@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    operation_id, effect_class, tool_call_id, child_task_id,\n    tool_name, input, status, error, created_at, updated_at\nFROM agent_sdk_execution_intents\nWHERE operation_id = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "operation_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "effect_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "tool_call_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "child_task_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "tool_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d7b86251ed26dbcc72021d3ca25d97fad859b9b6b2a338f5de36f2f757653f10"
+}

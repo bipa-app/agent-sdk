@@ -72,11 +72,11 @@ mod tests {
     }
 
     #[test]
-    fn executable_migration_bundle_contains_both_migrations() -> Result<()> {
+    fn executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 2,
-            "expected 2 executable migrations (durable core + event journal), got {:?}",
+            migrations.len() == 3,
+            "expected 3 executable migrations (durable core + event journal + execution intents), got {:?}",
             migrations
                 .iter()
                 .map(|migration| migration.version)
@@ -91,6 +91,11 @@ mod tests {
             migrations[1].version == 2,
             "expected event journal migration version 2, got {}",
             migrations[1].version,
+        );
+        ensure!(
+            migrations[2].version == 3,
+            "expected execution intents migration version 3, got {}",
+            migrations[2].version,
         );
         Ok(())
     }
