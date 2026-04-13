@@ -1993,7 +1993,6 @@ impl AgentTaskStore for SqliteDurableStore {
             }
             let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let cancelled = row
-                .clone()
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
