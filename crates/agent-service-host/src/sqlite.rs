@@ -63,6 +63,7 @@ mod tests {
             "agent_sdk_outbox",
             "agent_sdk_retention_cursors",
             "agent_sdk_execution_intents",
+            "agent_sdk_tool_audit_events",
         ];
 
         for table in expected_tables {
@@ -79,8 +80,8 @@ mod tests {
     fn sqlite_executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 3,
-            "expected 3 executable migrations, got {:?}",
+            migrations.len() == 4,
+            "expected 4 executable migrations, got {:?}",
             migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
         );
         ensure!(
@@ -97,6 +98,11 @@ mod tests {
             migrations[2].version == 3,
             "expected version 3, got {}",
             migrations[2].version,
+        );
+        ensure!(
+            migrations[3].version == 4,
+            "expected version 4, got {}",
+            migrations[3].version,
         );
         Ok(())
     }
@@ -213,6 +219,7 @@ mod tests {
             "agent_sdk_outbox",
             "agent_sdk_retention_cursors",
             "agent_sdk_execution_intents",
+            "agent_sdk_tool_audit_events",
         ]
         .into_iter()
         .map(String::from)

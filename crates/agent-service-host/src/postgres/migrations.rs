@@ -47,11 +47,15 @@ const EXECUTION_INTENTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0003_execution_intents.sql"
 ));
+const TOOL_AUDIT_EVENTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0004_tool_audit_events.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 3] = [
+const MIGRATIONS: [PostgresMigration; 4] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -66,6 +70,11 @@ const MIGRATIONS: [PostgresMigration; 3] = [
         version: "0003",
         summary: "durable execution intent records for guarded tool execution",
         sql: EXECUTION_INTENTS_SQL,
+    },
+    PostgresMigration {
+        version: "0004",
+        summary: "durable tool audit events for child-task execution lifecycle",
+        sql: TOOL_AUDIT_EVENTS_SQL,
     },
 ];
 
@@ -101,4 +110,10 @@ pub const fn event_journal_outbox_migration() -> &'static str {
 #[must_use]
 pub const fn execution_intents_migration() -> &'static str {
     EXECUTION_INTENTS_SQL
+}
+
+/// The reviewable tool audit events migration SQL.
+#[must_use]
+pub const fn tool_audit_events_migration() -> &'static str {
+    TOOL_AUDIT_EVENTS_SQL
 }

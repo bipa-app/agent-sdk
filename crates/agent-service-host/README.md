@@ -53,15 +53,22 @@ isolated durable-core tables inside one physical database.
 
 Startup applies the embedded durable-core migrations before the host
 starts serving work. The Postgres pool is shared across the task,
-thread, message, turn-attempt, checkpoint, event-journal, outbox, and
-retention stores.
+thread, message, turn-attempt, checkpoint, event-journal, outbox,
+retention, execution-intent, and tool-audit stores.
 
-The current Postgres backend is intentionally partial. These host
-surfaces still remain process-local in-memory state and do not survive
-restart:
+All SQL-backed host surfaces now survive process restart. When
+`storage.backend=postgres` or `storage.backend=sqlite`, the store
+registry reports every surface as durable in its startup health
+snapshot. The in-memory backend is still available for tests and local
+development, and continues to report every surface as process-local.
 
-- execution intent store
-- tool audit store
+### Tool audit redaction
 
-The host logs each of those gaps when `storage.backend=postgres` so the
-deployment shape is explicit.
+Tool audit events are written through a
+[`RedactingToolAuditEventStore`](../agent-server/src/journal/tool_audit.rs)
+wrapper that applies the default durable-write policy: baseline
+redaction for the event's `input`, `output`, and `error` fields
+(including the `error` carried by the `Failed` lifecycle variant)
+before they reach the durable table. Read paths return the
+already-redacted rows, so sensitive tool data never lands in durable
+storage even if an operator replays or exports audit history.

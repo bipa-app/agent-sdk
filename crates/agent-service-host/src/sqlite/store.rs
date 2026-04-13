@@ -51,6 +51,7 @@ use agent_server::journal::task::{
 use agent_server::journal::task_state::SubagentInvocationState;
 use agent_server::journal::thread::Thread;
 use agent_server::journal::thread_store::ThreadStore;
+use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
 };
@@ -2187,6 +2188,9 @@ impl SqliteDurableStore {
         sqlx::query!("DELETE FROM agent_sdk_execution_intents")
             .execute(&mut *conn)
             .await?;
+        sqlx::query!("DELETE FROM agent_sdk_tool_audit_events")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query!("DELETE FROM agent_sdk_tasks")
             .execute(&mut *conn)
             .await?;
@@ -2934,6 +2938,117 @@ WHERE child_task_id = ?1
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// ToolAuditEventStore
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ToolAuditEventStore for SqliteDurableStore {
+    async fn record_event(&self, event: &ToolAuditEvent) -> Result<()> {
+        let kind_payload = json_to_value(&event.kind, "tool audit event kind_payload")
+            .with_context(|| format!("serialize tool audit event {} kind", event.id.as_str()))?;
+        let kind_str = event.kind.as_str();
+        let effect_class_wire = enum_to_wire(&event.effect_class)?;
+        let id = event.id.as_str();
+        let task_id = event.task_id.as_str();
+        let parent_task_id = event.parent_task_id.as_str();
+        let thread_id = thread_key(&event.thread_id);
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_tool_audit_events (
+    id, operation_id, task_id, parent_task_id, thread_id,
+    tool_call_id, tool_name, effect_class, kind, kind_payload,
+    provider, model, input, output, error, recorded_at
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5,
+    ?6, ?7, ?8, ?9, ?10,
+    ?11, ?12, ?13, ?14, ?15, ?16
+)
+",
+            id,
+            event.operation_id,
+            task_id,
+            parent_task_id,
+            thread_id,
+            event.tool_call_id,
+            event.tool_name,
+            effect_class_wire,
+            kind_str,
+            kind_payload,
+            event.provider,
+            event.model,
+            event.input,
+            event.output,
+            event.error,
+            event.recorded_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("record tool audit event {id}"))?;
+        Ok(())
+    }
+
+    async fn list_by_operation(&self, operation_id: &str) -> Result<Vec<ToolAuditEvent>> {
+        let rows = sqlx::query_as::<_, ToolAuditEventRecord>(
+            r"
+SELECT
+    id, operation_id, task_id, parent_task_id, thread_id,
+    tool_call_id, tool_name, effect_class, kind_payload,
+    provider, model, input, output, error, recorded_at
+FROM agent_sdk_tool_audit_events
+WHERE operation_id = ?1
+ORDER BY seq ASC
+",
+        )
+        .bind(operation_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list tool audit events by operation {operation_id}"))?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn list_by_task(&self, task_id: &AgentTaskId) -> Result<Vec<ToolAuditEvent>> {
+        let key = task_id.as_str();
+        let rows = sqlx::query_as::<_, ToolAuditEventRecord>(
+            r"
+SELECT
+    id, operation_id, task_id, parent_task_id, thread_id,
+    tool_call_id, tool_name, effect_class, kind_payload,
+    provider, model, input, output, error, recorded_at
+FROM agent_sdk_tool_audit_events
+WHERE task_id = ?1
+ORDER BY seq ASC
+",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list tool audit events by task {task_id}"))?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<ToolAuditEvent>> {
+        let key = thread_key(thread_id);
+        let rows = sqlx::query_as::<_, ToolAuditEventRecord>(
+            r"
+SELECT
+    id, operation_id, task_id, parent_task_id, thread_id,
+    tool_call_id, tool_name, effect_class, kind_payload,
+    provider, model, input, output, error, recorded_at
+FROM agent_sdk_tool_audit_events
+WHERE thread_id = ?1
+ORDER BY seq ASC
+",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list tool audit events by thread {thread_id}"))?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Record types
 // ─────────────────────────────────────────────────────────────────────
 
@@ -3269,6 +3384,48 @@ impl TryFrom<ExecutionIntentRecord> for ExecutionIntent {
     }
 }
 
+#[derive(Debug, FromRow)]
+struct ToolAuditEventRecord {
+    id: String,
+    operation_id: String,
+    task_id: String,
+    parent_task_id: String,
+    thread_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    effect_class: String,
+    kind_payload: serde_json::Value,
+    provider: String,
+    model: String,
+    input: Option<serde_json::Value>,
+    output: Option<String>,
+    error: Option<String>,
+    recorded_at: OffsetDateTime,
+}
+
+impl TryFrom<ToolAuditEventRecord> for ToolAuditEvent {
+    type Error = anyhow::Error;
+    fn try_from(r: ToolAuditEventRecord) -> Result<Self> {
+        Ok(Self {
+            id: ToolAuditEventId::from_string(r.id),
+            operation_id: r.operation_id,
+            task_id: AgentTaskId::from_string(r.task_id),
+            parent_task_id: AgentTaskId::from_string(r.parent_task_id),
+            thread_id: ThreadId::from_string(r.thread_id),
+            tool_call_id: r.tool_call_id,
+            tool_name: r.tool_name,
+            effect_class: enum_from_wire(&r.effect_class, "tool audit effect_class")?,
+            kind: json_from_value(r.kind_payload, "tool audit event kind")?,
+            provider: r.provider,
+            model: r.model,
+            input: r.input,
+            output: r.output,
+            error: r.error,
+            recorded_at: r.recorded_at,
+        })
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Wire format helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -3319,6 +3476,7 @@ mod tests {
     use anyhow::{Context, Result};
     use time::Duration;
 
+    use agent_sdk_core::ThreadId;
     use agent_server::journal::execution_intent::{
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
     };
@@ -3522,6 +3680,259 @@ mod tests {
                 .await?
                 .is_none()
         );
+
+        Ok(())
+    }
+
+    // ── ToolAuditEventStore ──────────────────────────────────────
+
+    fn tool_audit_event_fixture(
+        operation_id: &str,
+        task: &str,
+        thread: &str,
+        kind: agent_server::journal::tool_audit::ToolAuditEventKind,
+        secs: i64,
+    ) -> agent_server::journal::tool_audit::ToolAuditEvent {
+        use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventParams};
+
+        ToolAuditEvent::new(ToolAuditEventParams {
+            operation_id: operation_id.into(),
+            task_id: AgentTaskId::from_string(format!("task_{task}")),
+            parent_task_id: AgentTaskId::from_string(format!("task_{task}_parent")),
+            thread_id: ThreadId::from_string(format!("thread_{thread}")),
+            tool_call_id: format!("call_{task}"),
+            tool_name: "transfer".into(),
+            effect_class: ToolEffectClass::SideEffecting,
+            kind,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            input: Some(serde_json::json!({"amount": 100, "api_key": "sk-1234"})),
+            output: None,
+            error: None,
+            now: t_plus(secs),
+        })
+    }
+
+    #[tokio::test]
+    async fn tool_audit_lifecycle_ordering_survives_restart() -> Result<()> {
+        use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
+
+        let tmp = tempfile::NamedTempFile::new()?;
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().display());
+
+        let store = SqliteDurableStore::connect(&url).await?;
+
+        let operation = "task_lifecycle:call_1";
+        let lifecycle = [
+            (ToolAuditEventKind::Dispatched, 10),
+            (ToolAuditEventKind::ConfirmationRequested, 11),
+            (ToolAuditEventKind::ConfirmationApproved, 12),
+            (ToolAuditEventKind::ExecutionStarted, 13),
+            (ToolAuditEventKind::Completed, 14),
+        ];
+        for (kind, secs) in lifecycle {
+            let event = tool_audit_event_fixture(operation, "life", "life", kind, secs);
+            ToolAuditEventStore::record_event(&store, &event).await?;
+        }
+
+        drop(store);
+        let reopened = SqliteDurableStore::connect(&url).await?;
+        let events = ToolAuditEventStore::list_by_operation(&reopened, operation).await?;
+        assert_eq!(events.len(), 5);
+        let kinds: Vec<&'static str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "dispatched",
+                "confirmation_requested",
+                "confirmation_approved",
+                "execution_started",
+                "completed",
+            ],
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_audit_queries_follow_durable_sequence_when_timestamps_skew() -> Result<()> {
+        use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let dispatched = tool_audit_event_fixture(
+            "task_skew:call_1",
+            "skew",
+            "skew",
+            ToolAuditEventKind::Dispatched,
+            20,
+        );
+        let completed = tool_audit_event_fixture(
+            "task_skew:call_1",
+            "skew",
+            "skew",
+            ToolAuditEventKind::Completed,
+            10,
+        );
+
+        ToolAuditEventStore::record_event(&store, &dispatched).await?;
+        ToolAuditEventStore::record_event(&store, &completed).await?;
+
+        let op_kinds: Vec<_> = store
+            .list_by_operation(&dispatched.operation_id)
+            .await?
+            .into_iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(op_kinds, vec!["dispatched", "completed"]);
+
+        let task_kinds: Vec<_> = ToolAuditEventStore::list_by_task(&store, &dispatched.task_id)
+            .await?
+            .into_iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(task_kinds, vec!["dispatched", "completed"]);
+
+        let thread_kinds: Vec<_> =
+            ToolAuditEventStore::list_by_thread(&store, &dispatched.thread_id)
+                .await?
+                .into_iter()
+                .map(|event| event.kind.as_str())
+                .collect();
+        assert_eq!(thread_kinds, vec!["dispatched", "completed"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_audit_provenance_persists_across_query_paths() -> Result<()> {
+        use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let event = tool_audit_event_fixture(
+            "task_prov:call_1",
+            "prov",
+            "prov",
+            ToolAuditEventKind::Dispatched,
+            20,
+        );
+        ToolAuditEventStore::record_event(&store, &event).await?;
+
+        let op_events = store.list_by_operation(&event.operation_id).await?;
+        assert_eq!(op_events.len(), 1);
+        let loaded = &op_events[0];
+        assert_eq!(loaded.id, event.id);
+        assert_eq!(loaded.provider, "anthropic");
+        assert_eq!(loaded.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(loaded.parent_task_id, event.parent_task_id);
+
+        let by_task = ToolAuditEventStore::list_by_task(&store, &event.task_id).await?;
+        assert_eq!(by_task.len(), 1);
+        assert_eq!(by_task[0].id, event.id);
+
+        let by_thread = ToolAuditEventStore::list_by_thread(&store, &event.thread_id).await?;
+        assert_eq!(by_thread.len(), 1);
+        assert_eq!(by_thread[0].id, event.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_audit_query_isolates_by_task_and_thread() -> Result<()> {
+        use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let e_a = tool_audit_event_fixture(
+            "task_a:call_1",
+            "a",
+            "shared",
+            ToolAuditEventKind::Dispatched,
+            30,
+        );
+        let e_b = tool_audit_event_fixture(
+            "task_b:call_1",
+            "b",
+            "shared",
+            ToolAuditEventKind::Dispatched,
+            31,
+        );
+        let e_other = tool_audit_event_fixture(
+            "task_c:call_1",
+            "c",
+            "elsewhere",
+            ToolAuditEventKind::Dispatched,
+            32,
+        );
+        ToolAuditEventStore::record_event(&store, &e_a).await?;
+        ToolAuditEventStore::record_event(&store, &e_b).await?;
+        ToolAuditEventStore::record_event(&store, &e_other).await?;
+
+        let by_task = ToolAuditEventStore::list_by_task(&store, &e_a.task_id).await?;
+        assert_eq!(by_task.len(), 1);
+
+        let by_thread = ToolAuditEventStore::list_by_thread(&store, &e_a.thread_id).await?;
+        assert_eq!(by_thread.len(), 2, "two events on shared thread");
+
+        let elsewhere = ToolAuditEventStore::list_by_thread(&store, &e_other.thread_id).await?;
+        assert_eq!(elsewhere.len(), 1);
+
+        let unknown = store.list_by_operation("task_none:call_none").await?;
+        assert!(unknown.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_audit_redaction_decorator_scrubs_before_durable_write() -> Result<()> {
+        use agent_server::journal::redaction::REDACTED_MARKER;
+        use agent_server::journal::tool_audit::{
+            RedactingToolAuditEventStore, ToolAuditEvent, ToolAuditEventKind, ToolAuditEventParams,
+            ToolAuditEventStore,
+        };
+        use std::sync::Arc;
+
+        let store = Arc::new(SqliteDurableStore::connect("sqlite::memory:").await?);
+        let decorator = RedactingToolAuditEventStore::baseline(store.clone());
+
+        let params = ToolAuditEventParams {
+            operation_id: "task_redact:call_1".into(),
+            task_id: AgentTaskId::from_string("task_redact"),
+            parent_task_id: AgentTaskId::from_string("task_redact_parent"),
+            thread_id: ThreadId::from_string("thread_redact"),
+            tool_call_id: "call_1".into(),
+            tool_name: "transfer".into(),
+            effect_class: ToolEffectClass::SideEffecting,
+            kind: ToolAuditEventKind::Failed {
+                error: "Bearer provider-secret".into(),
+            },
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-5-20250929".into(),
+            input: Some(serde_json::json!({
+                "command": "transfer",
+                "api_key": "sk-secret",
+                "normal": "ok",
+            })),
+            output: Some("sk-output-token".into()),
+            error: Some("sk-top-level-error".into()),
+            now: t_plus(40),
+        };
+        let event = ToolAuditEvent::new(params);
+        decorator.record_event(&event).await?;
+
+        let stored = store.list_by_operation(&event.operation_id).await?;
+        assert_eq!(stored.len(), 1);
+        let stored = &stored[0];
+        let input = stored.input.as_ref().context("input present")?;
+        assert_eq!(input["api_key"], REDACTED_MARKER);
+        assert_eq!(input["normal"], "ok");
+        assert_eq!(stored.output.as_deref(), Some(REDACTED_MARKER));
+        assert_eq!(stored.error.as_deref(), Some(REDACTED_MARKER));
+        match &stored.kind {
+            ToolAuditEventKind::Failed { error } => assert_eq!(error, REDACTED_MARKER),
+            other => anyhow::bail!("expected Failed audit kind, got {other:?}"),
+        }
 
         Ok(())
     }
