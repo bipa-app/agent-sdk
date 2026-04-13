@@ -425,6 +425,7 @@ mod tests {
         updated.total_usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         };
         store.save(&updated).await?;
 
@@ -504,6 +505,7 @@ mod tests {
             total_usage: TokenUsage {
                 input_tokens: 500,
                 output_tokens: 200,
+                ..Default::default()
             },
             metadata: std::collections::HashMap::default(),
             created_at: time::OffsetDateTime::now_utc(),

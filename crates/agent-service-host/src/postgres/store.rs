@@ -3954,6 +3954,7 @@ impl TryFrom<ThreadRecord> for Thread {
             total_usage: TokenUsage {
                 input_tokens: u32_from_i64(record.total_input_tokens, "thread input tokens")?,
                 output_tokens: u32_from_i64(record.total_output_tokens, "thread output tokens")?,
+                ..Default::default()
             },
             created_at: record.created_at,
             updated_at: record.updated_at,
@@ -4090,6 +4091,7 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
                     record.turn_output_tokens,
                     "checkpoint turn_output_tokens",
                 )?,
+                ..Default::default()
             },
             created_at: record.created_at,
         };
@@ -4695,6 +4697,7 @@ mod tests {
                     turn_usage: TokenUsage {
                         input_tokens: 120,
                         output_tokens: 60,
+                        ..Default::default()
                     },
                     agent_state_snapshot: serde_json::json!({"turn": 1}),
                     events: Vec::new(),
@@ -4761,6 +4764,7 @@ mod tests {
                 turn_usage: TokenUsage {
                     input_tokens: 120,
                     output_tokens: 60,
+                    ..Default::default()
                 },
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: vec![AgentEvent::Start {

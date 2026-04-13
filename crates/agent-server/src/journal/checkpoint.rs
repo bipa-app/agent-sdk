@@ -239,6 +239,7 @@ mod tests {
             turn_usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             now: t0(),
         }

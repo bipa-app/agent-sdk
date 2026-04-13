@@ -233,6 +233,7 @@ mod tests {
         TokenUsage {
             input_tokens: input,
             output_tokens: output,
+            ..Default::default()
         }
     }
 
