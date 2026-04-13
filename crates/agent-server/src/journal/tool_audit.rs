@@ -24,7 +24,7 @@
 //! # Redaction
 //!
 //! Tool inputs and outputs may contain sensitive data. The
-//! [`RedactionPolicy`](super::redaction::RedactionPolicy) module provides
+//! [`RedactionPolicy`] module provides
 //! baseline redaction rules that should be applied before persisting
 //! audit events to durable storage.
 
