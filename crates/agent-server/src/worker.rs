@@ -106,6 +106,8 @@ mod guarded_execution_test;
 #[cfg(test)]
 mod mutation_safety_test;
 #[cfg(test)]
+mod nested_restart_regression;
+#[cfg(test)]
 mod replay_coverage_test;
 #[cfg(test)]
 mod root_turn_test;
