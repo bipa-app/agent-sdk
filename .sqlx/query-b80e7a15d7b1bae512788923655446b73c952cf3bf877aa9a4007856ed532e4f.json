@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\n  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\nFOR UPDATE\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE kind = 'subagent'\n  AND status = 'waiting_on_children'\n  AND state_json -> 'invocation' ->> 'child_root_task_id' = $1\nFOR UPDATE SKIP LOCKED\n",
   "describe": {
     "columns": [
       {
@@ -144,5 +144,5 @@
       true
     ]
   },
-  "hash": "0e7227f36fdb061ae3bb7f10ad3f6fbb02fe1f9b4292dfd15d5f309a1294f752"
+  "hash": "b80e7a15d7b1bae512788923655446b73c952cf3bf877aa9a4007856ed532e4f"
 }

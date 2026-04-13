@@ -1242,6 +1242,17 @@ WHERE parent_id = $1
     /// `resume_linked_subagent_invocation` and ensures that when a
     /// child-thread root reaches a terminal state (cancelled, failed,
     /// completed), the parent-thread invocation is unblocked.
+    ///
+    /// Uses `FOR UPDATE SKIP LOCKED` to prevent the circular wait that
+    /// would otherwise occur when `cancel_tree(parent_root)` and
+    /// `cancel_tree(child_root)` run concurrently: the parent's BFS
+    /// locks the invocation row first and then follows the linkage to
+    /// the child-root, while the child's cancel path locks the
+    /// child-root first and then reaches for the invocation row. If
+    /// the invocation is already locked by a concurrent parent
+    /// cancellation, that transaction will cancel the invocation
+    /// outright, so skipping the wakeup here is semantically
+    /// equivalent and cannot leave the invocation stuck.
     async fn resume_linked_subagent_invocation_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_root_id: &AgentTaskId,
@@ -1277,7 +1288,7 @@ FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
   AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
-FOR UPDATE
+FOR UPDATE SKIP LOCKED
 ",
             child_root_id.as_str(),
         )
@@ -1292,7 +1303,6 @@ FOR UPDATE
         };
         let old_invocation: AgentTask = record.try_into()?;
         let new_invocation = old_invocation
-            .clone()
             .recompute_pending_children(0, now)
             .context("cancel_tree: subagent invocation resume transition failed")?;
         Self::update_task_tx(tx, &new_invocation).await?;
