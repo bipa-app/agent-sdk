@@ -66,8 +66,12 @@ case "$command" in
     restore_backup
     trap - EXIT
 
-    sqlite_count=$(grep -rl '"SQLite"' .sqlx/query-*.json 2>/dev/null | wc -l | tr -d ' ')
-    pg_count=$(grep -rl '"PostgreSQL"' .sqlx/query-*.json 2>/dev/null | wc -l | tr -d ' ')
+    # grep exits 1 when no matches exist; under `set -euo pipefail`
+    # that would abort the script *after* a successful prepare and
+    # report a false failure.  Fall back to 0 on no-match so the
+    # summary line always prints.
+    sqlite_count=$(grep -rl '"SQLite"' .sqlx/query-*.json 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    pg_count=$(grep -rl '"PostgreSQL"' .sqlx/query-*.json 2>/dev/null | wc -l | tr -d ' ' || echo 0)
     echo "✓ SQLite offline cache updated (${sqlite_count} SQLite + ${pg_count} Postgres queries)."
     ;;
   url)

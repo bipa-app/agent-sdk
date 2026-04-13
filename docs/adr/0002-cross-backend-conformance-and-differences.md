@@ -39,6 +39,8 @@ runs identical test logic against each backend, covering:
 | 8 | Cancel tree | Cancellation propagates to all descendants |
 | 9 | Queued root promotion | Completed root promotes FIFO head |
 | 10 | Retry exhaustion | Budget-exhausted row is failed closed |
+| 11 | Fail-closed child wakes parent | Recovery-path fail-close propagates to `WaitingOnChildren` parent |
+| 12 | Clear with parent-child | `clear()` wipes parent/child chains despite `ON DELETE RESTRICT` self-FKs |
 
 All tests use the same `async fn` test functions parameterised by
 `&dyn AgentTaskStore` (and related trait objects), ensuring no backend

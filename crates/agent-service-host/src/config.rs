@@ -255,12 +255,27 @@ fn sqlite_url(path: &std::path::Path) -> String {
     if std::path::MAIN_SEPARATOR != '/' {
         rendered = rendered.replace(std::path::MAIN_SEPARATOR, "/");
     }
-    if path.is_absolute() {
-        if !rendered.starts_with('/') {
-            // Windows drive-letter form (e.g. `C:/Users/...`).
-            rendered.insert(0, '/');
-        }
-        format!("sqlite://{rendered}?mode=rwc")
+    sqlite_url_from_rendered(&rendered, path.is_absolute())
+}
+
+/// Format the connection URL for a path that has already been rendered
+/// as a `/`-separated string.  The `is_absolute` flag is supplied by the
+/// caller because `Path::is_absolute` is platform-dependent — on Linux
+/// it returns `false` for a Windows drive-letter path like
+/// `C:/Users/...`, which makes the Windows branch untestable when the
+/// decision is made inside this helper.  Factoring the flag out lets
+/// unit tests exercise the Windows branch regardless of host OS.
+fn sqlite_url_from_rendered(rendered: &str, is_absolute: bool) -> String {
+    if is_absolute {
+        let normalised = if rendered.starts_with('/') {
+            rendered.to_owned()
+        } else {
+            // Windows drive-letter form (e.g. `C:/Users/...`) — the
+            // leading `/` gives us an empty authority so the drive
+            // letter survives in the URL path.
+            format!("/{rendered}")
+        };
+        format!("sqlite://{normalised}?mode=rwc")
     } else {
         format!("sqlite:{rendered}?mode=rwc")
     }
@@ -610,18 +625,23 @@ storage:
 
     #[test]
     fn sqlite_url_windows_drive_letter_keeps_drive() {
-        // Construct a synthetic absolute Windows path; on this platform
-        // it won't be detected as absolute, so call the inner builder
-        // logic directly.
-        let path = std::path::Path::new("C:/Users/me/agent-sdk.db");
-        let mut rendered = path.display().to_string().replace('\\', "/");
-        if !rendered.starts_with('/') {
-            rendered.insert(0, '/');
-        }
-        let url = format!("sqlite://{rendered}?mode=rwc");
-        // The drive letter must survive intact behind the empty
-        // authority — i.e. three slashes before the drive letter.
+        // Drive-letter paths are not absolute on Linux, so call the
+        // inner helper directly with is_absolute=true (as Windows
+        // would report) to exercise the real URL-formation logic.
+        let url = sqlite_url_from_rendered("C:/Users/me/agent-sdk.db", true);
         assert_eq!(url, "sqlite:///C:/Users/me/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_from_rendered_unix_absolute() {
+        let url = sqlite_url_from_rendered("/var/lib/agent-sdk.db", true);
+        assert_eq!(url, "sqlite:///var/lib/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_from_rendered_relative_uses_opaque_form() {
+        let url = sqlite_url_from_rendered("local.db", false);
+        assert_eq!(url, "sqlite:local.db?mode=rwc");
     }
 
     #[test]

@@ -8,19 +8,27 @@
 //!
 //! # Covered invariants
 //!
-//! 1. **Root admission** — at most one blocking root per thread; FIFO
-//!    queueing of additional submissions.
-//! 2. **Lease acquisition** — `try_acquire_task` / `acquire_next_runnable`
-//!    move `Pending` → `Running` with correct lease fields.
-//! 3. **Heartbeat and expiry** — heartbeats extend leases; expired
-//!    leases are swept and either requeued or failed closed.
-//! 4. **Completed-turn commit** — atomic thread advance, message
+//! 1. **Root admission** — at most one blocking root per thread.
+//! 2. **FIFO queueing** — second root on same thread gets `Queued`;
+//!    order preserved.
+//! 3. **Lease acquisition** — `try_acquire_task` /
+//!    `acquire_next_runnable` move `Pending` → `Running` with correct
+//!    lease fields.
+//! 4. **Heartbeat** — heartbeats extend lease expiry.
+//! 5. **Lease expiry sweep** — expired leases are requeued.
+//! 6. **Completed-turn commit** — atomic thread advance, message
 //!    projection, attempt close, and checkpoint creation.
-//! 5. **Checkpoint recovery** — latest checkpoint for a thread matches
-//!    the last committed turn.
-//! 6. **Child spawn and resume** — parent pauses on children;
+//! 7. **Child spawn and resume** — parent pauses on children;
 //!    completing all children makes parent runnable again.
-//! 7. **Cancel tree** — cancellation propagates to all descendants.
+//! 8. **Cancel tree** — cancellation propagates to all descendants.
+//! 9. **Queued root promotion** — completing an active root promotes
+//!    the FIFO head.
+//! 10. **Retry exhaustion** — budget-exhausted row is failed closed.
+//! 11. **Fail-closed child wakes parent** — recovery-path fail-close
+//!     propagates to `WaitingOnChildren` parent so it does not stay
+//!     blocked forever.
+//! 12. **Clear with parent-child** — `clear()` wipes parent/child
+//!     chains despite `ON DELETE RESTRICT` self-referential FKs.
 //!
 //! # Backend-specific differences (documented, not hidden)
 //!
