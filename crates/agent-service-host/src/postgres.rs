@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn event_journal_migration_covers_every_declared_table_constraint_and_index() -> Result<()> {
         // Outbox/event-journal tables are introduced in 0002 and
-        // extended by Phase 8.1's 0004 (kind discriminator + advisory
+        // extended by Phase 8.1's 0005 (kind discriminator + advisory
         // payload contract).  Concatenate both so the schema checker
         // sees the full declared surface.
         let sql = format!(
@@ -412,6 +412,24 @@ mod tests {
         ensure!(
             sql.contains("REFERENCES agent_sdk_committed_events(event_id)"),
             "outbox FK must reference committed_events.event_id",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_kind_migration_rewrites_legacy_payloads_to_advisory_shape() -> Result<()> {
+        let sql = outbox_message_kind_migration();
+        ensure!(
+            sql.contains("jsonb_build_object"),
+            "outbox kind migration must rebuild legacy payload_json values",
+        );
+        ensure!(
+            sql.contains("'thread_id', thread_id"),
+            "legacy payload rewrite must preserve thread_id",
+        );
+        ensure!(
+            sql.contains("'last_sequence', sequence"),
+            "legacy payload rewrite must preserve the last committed sequence",
         );
         Ok(())
     }

@@ -42,7 +42,9 @@ mod tests {
 
     use anyhow::{Result, ensure};
 
-    use super::migrations::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+    use super::migrations::{
+        DURABLE_CORE_MIGRATOR, durable_core_migrations, outbox_message_kind_migration,
+    };
 
     #[test]
     fn sqlite_migrations_cover_every_expected_table() -> Result<()> {
@@ -149,6 +151,16 @@ mod tests {
         for name in required_constraints {
             ensure!(sql_bundle.contains(name), "missing constraint: {name}",);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_outbox_kind_migration_rewrites_legacy_payloads_to_advisory_shape() -> Result<()> {
+        let sql = outbox_message_kind_migration();
+        ensure!(
+            sql.contains("json_object('thread_id', thread_id, 'last_sequence', sequence)"),
+            "SQLite outbox kind migration must rebuild legacy payload_json values",
+        );
         Ok(())
     }
 

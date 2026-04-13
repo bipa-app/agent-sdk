@@ -1,4 +1,4 @@
--- SQLite-dialect mirror of postgres/0004_outbox_message_kind.sql.
+-- SQLite-dialect mirror of postgres/0005_outbox_message_kind.sql.
 --
 -- ENG-7965: Phase 8.1 — Transactional Outbox Contract and Message Kinds.
 --
@@ -103,7 +103,8 @@ CREATE TABLE agent_sdk_outbox (
 -- ---------------------------------------------------------------------
 -- 4. Backfill from the legacy table.  Every legacy row was logically
 --    a thread_events_available message (the only kind written by
---    ENG-7986), so we hard-code the kind during the copy.
+--    ENG-7986), so we hard-code the kind during the copy and rewrite
+--    payload_json into the Phase 8.1 advisory shape.
 -- ---------------------------------------------------------------------
 
 INSERT INTO agent_sdk_outbox (
@@ -113,7 +114,8 @@ INSERT INTO agent_sdk_outbox (
 )
 SELECT
     id, 'thread_events_available', thread_id, event_id, sequence,
-    status, payload_json, created_at, next_attempt_at, attempt_count,
+    status, json_object('thread_id', thread_id, 'last_sequence', sequence),
+    created_at, next_attempt_at, attempt_count,
     max_attempts, last_error, claimed_by, claimed_at, delivered_at
 FROM agent_sdk_outbox_legacy;
 

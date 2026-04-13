@@ -4,7 +4,7 @@
 -- `sqlx::migrate!`.  Read this alongside:
 --
 --   migrations/postgres/0002_event_journal_outbox.sql
---   migrations/postgres/0004_outbox_message_kind.sql
+--   migrations/postgres/0005_outbox_message_kind.sql
 --   crates/agent-server/src/journal/outbox.rs
 --   crates/agent-server/src/journal/outbox_message.rs
 --   crates/agent-server/src/journal/event_outbox_transaction.rs
