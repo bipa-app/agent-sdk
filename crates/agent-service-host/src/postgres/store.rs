@@ -1129,6 +1129,42 @@ WHERE parent_id = $1
         u32_from_i64(live, "live child count")
     }
 
+    /// After a child task transitions to a terminal state, wake its
+    /// `WaitingOnChildren` parent (if any) by recomputing
+    /// `pending_child_count`.  Without this, a parent with a single
+    /// fail-closed child stays in `WaitingOnChildren` forever
+    /// because no future `complete_task`/`fail_task` call will fire
+    /// to decrement the counter — a liveness deadlock.
+    async fn propagate_terminal_to_parent_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        child: &AgentTask,
+        now: OffsetDateTime,
+        error_prefix: &str,
+    ) -> Result<()> {
+        let Some(parent_id) = &child.parent_id else {
+            return Ok(());
+        };
+        let old_parent = Self::load_task_tx(tx, parent_id, true)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{error_prefix}: child {child_id} references missing parent {parent_id}",
+                    child_id = child.id,
+                )
+            })?;
+        if old_parent.status != TaskStatus::WaitingOnChildren {
+            return Ok(());
+        }
+        let live = Self::load_live_child_count_tx(tx, parent_id).await?;
+        let new_parent = old_parent
+            .recompute_pending_children(live, now)
+            .with_context(|| {
+                format!("{error_prefix}: recompute_pending_children transition failed")
+            })?;
+        Self::update_task_tx(tx, &new_parent).await?;
+        Ok(())
+    }
+
     async fn apply_task_terminal_transition_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_id: &AgentTaskId,
@@ -1844,6 +1880,8 @@ FOR UPDATE
                     .fail_with_reason(reason, now)
                     .context("try_acquire_task: fail-closed transition failed")?;
                 Self::update_task_tx(&mut tx, &failed).await?;
+                Self::propagate_terminal_to_parent_tx(&mut tx, &failed, now, "try_acquire_task")
+                    .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -1943,6 +1981,13 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("acquire_next_runnable: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    Self::propagate_terminal_to_parent_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -2046,6 +2091,13 @@ FOR UPDATE SKIP LOCKED
                         .fail_with_reason(reason, now)
                         .context("release_expired_leases: fail-closed transition failed")?;
                     Self::update_task_tx(&mut tx, &failed).await?;
+                    Self::propagate_terminal_to_parent_tx(
+                        &mut tx,
+                        &failed,
+                        now,
+                        "release_expired_leases",
+                    )
+                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {

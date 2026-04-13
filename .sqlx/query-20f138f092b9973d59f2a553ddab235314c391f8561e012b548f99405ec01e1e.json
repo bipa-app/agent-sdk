@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_retention_cursors (thread_id, retention_floor, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT (thread_id) DO UPDATE SET retention_floor = excluded.retention_floor, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "20f138f092b9973d59f2a553ddab235314c391f8561e012b548f99405ec01e1e"
+}

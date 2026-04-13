@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_committed_events WHERE thread_id = ?1 AND sequence < ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "bfbf5cd272bad89c1d9977b424d070cb580fbbad72ab168780d3942c91a71ef7"
+}

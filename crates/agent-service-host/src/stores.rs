@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 use anyhow::Context;
 use anyhow::Result;
 
@@ -45,6 +45,8 @@ use super::config::PostgresStorageConfig;
 use super::config::{StorageBackend, StorageConfig};
 #[cfg(feature = "postgres")]
 use super::postgres::store::PostgresDurableStore;
+#[cfg(feature = "sqlite")]
+use super::sqlite::store::SqliteDurableStore;
 
 // ─────────────────────────────────────────────────────────────────────
 // Durability surface report
@@ -190,6 +192,70 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     },
 ];
 
+#[cfg(feature = "sqlite")]
+const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
+    StorageSurfaceStatus {
+        surface: "task_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "thread_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "message_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "attempt_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "checkpoint_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "event_repo",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "execution_intent_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "execution intents remain process-local until a durable backend is implemented",
+    },
+    StorageSurfaceStatus {
+        surface: "tool_audit_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "tool audit events remain process-local until a durable backend is implemented",
+    },
+    StorageSurfaceStatus {
+        surface: "outbox_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "retention_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+];
+
 // ─────────────────────────────────────────────────────────────────────
 // Backend state
 // ─────────────────────────────────────────────────────────────────────
@@ -199,6 +265,8 @@ enum RegistryBackend {
     InMemory,
     #[cfg(feature = "postgres")]
     Postgres(PostgresBackend),
+    #[cfg(feature = "sqlite")]
+    Sqlite,
 }
 
 #[cfg(feature = "postgres")]
@@ -287,8 +355,14 @@ impl StoreRegistry {
                 anyhow::bail!("PostgreSQL storage backend requires the `postgres` feature flag")
             }
             StorageBackend::Sqlite { .. } => {
-                // SQLite backend wiring lands in ENG-8003.
-                anyhow::bail!("SQLite storage backend is not yet fully wired — see ENG-8003")
+                #[cfg(feature = "sqlite")]
+                {
+                    Self::sqlite(config, definition_registry)
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    anyhow::bail!("SQLite storage backend requires the `sqlite` feature flag")
+                }
             }
         }
     }
@@ -304,6 +378,11 @@ impl StoreRegistry {
             RegistryBackend::InMemory => Ok(()),
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(backend) => backend.initialize().await,
+            #[cfg(feature = "sqlite")]
+            RegistryBackend::Sqlite => {
+                // Migrations are applied during connect().
+                Ok(())
+            }
         }
     }
 
@@ -314,6 +393,8 @@ impl StoreRegistry {
             RegistryBackend::InMemory => "in_memory",
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => "postgres",
+            #[cfg(feature = "sqlite")]
+            RegistryBackend::Sqlite => "sqlite",
         }
     }
 
@@ -324,6 +405,8 @@ impl StoreRegistry {
             RegistryBackend::InMemory => &IN_MEMORY_SURFACES,
             #[cfg(feature = "postgres")]
             RegistryBackend::Postgres(_) => &POSTGRES_SURFACES,
+            #[cfg(feature = "sqlite")]
+            RegistryBackend::Sqlite => &SQLITE_SURFACES,
         }
     }
 
@@ -377,6 +460,31 @@ impl StoreRegistry {
         })
     }
 
+    #[cfg(feature = "sqlite")]
+    fn sqlite(
+        config: &StorageConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+    ) -> Result<Self> {
+        let database_url = config.sqlite_database_url()?;
+        let durable_store = build_sqlite_store(&database_url)?;
+
+        Ok(Self {
+            task_store: durable_store.clone(),
+            thread_store: durable_store.clone(),
+            message_store: durable_store.clone(),
+            attempt_store: durable_store.clone(),
+            checkpoint_store: durable_store.clone(),
+            event_repo: durable_store.clone(),
+            execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
+            tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
+            outbox_store: durable_store.clone(),
+            retention_store: durable_store,
+            definition_registry,
+            event_notifier: Arc::new(EventNotifier::new()),
+            backend: RegistryBackend::Sqlite,
+        })
+    }
+
     /// Build a [`agent_server::worker::root_turn::RootTurnDeps`] from
     /// the registry's stores.
     ///
@@ -426,6 +534,33 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
         .build()
         .context("build tokio runtime for postgres store bootstrap")?
         .block_on(async { build() })
+}
+
+#[cfg(feature = "sqlite")]
+fn build_sqlite_store(database_url: &str) -> Result<Arc<SqliteDurableStore>> {
+    // SqliteDurableStore::connect is async (runs PRAGMAs and
+    // migrations), but `from_config` is a sync constructor.  We
+    // cannot call `Handle::block_on` directly inside an active
+    // runtime (panic), and `tokio::task::block_in_place` only works
+    // on the multi_thread flavor — `#[tokio::test]` defaults to
+    // current_thread and would panic there.  Spawning a dedicated
+    // OS thread with its own current_thread runtime works
+    // regardless of the caller's runtime flavor (or absence of one).
+    let url = database_url.to_owned();
+    std::thread::spawn(move || -> Result<Arc<SqliteDurableStore>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for sqlite store bootstrap")?
+            .block_on(async {
+                SqliteDurableStore::connect(&url)
+                    .await
+                    .map(Arc::new)
+                    .context("connect sqlite durable store")
+            })
+    })
+    .join()
+    .map_err(|panic| anyhow::anyhow!("sqlite connect thread panicked: {panic:?}"))?
 }
 
 // ─────────────────────────────────────────────────────────────────────

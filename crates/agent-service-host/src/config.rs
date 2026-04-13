@@ -38,7 +38,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -206,6 +206,79 @@ impl StorageConfig {
             }
         }
     }
+
+    /// Return the `SQLite` database URL when the backend is selected.
+    ///
+    /// When no explicit path is provided, returns a platform-default
+    /// data directory path.
+    ///
+    /// # Errors
+    /// Returns an error if the backend is not `sqlite`.
+    pub fn sqlite_database_url(&self) -> Result<String> {
+        match &self.backend {
+            StorageBackend::Sqlite { path } => {
+                let db_path = if let Some(path) = path {
+                    std::path::PathBuf::from(path)
+                } else {
+                    dirs_default_sqlite_dir()?.join("agent-sdk.db")
+                };
+                if let Some(parent) = db_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create sqlite data dir {}", parent.display()))?;
+                }
+                Ok(sqlite_url(&db_path))
+            }
+            _ => bail!("sqlite_database_url is only valid when storage.backend=sqlite"),
+        }
+    }
+}
+
+/// Build a `sqlite://` connection URL for the given filesystem path.
+///
+/// Two structural pitfalls must be avoided:
+/// 1. On Windows, `PathBuf::display()` emits backslashes that sqlx's URL
+///    parser rejects — substitute forward slashes.
+/// 2. Per RFC 3986, the `//` after the scheme introduces an authority
+///    component that ends at the next `/`.  For Unix absolute paths
+///    starting with `/`, `sqlite://` + `/tmp/foo` naturally produces
+///    `sqlite:///tmp/foo` (empty authority).  For Windows drive-letter
+///    paths like `C:/Users/...`, `sqlite://` + `C:/...` would parse
+///    `C` as the host and silently drop the drive letter; we therefore
+///    prepend an extra `/` so the URL becomes `sqlite:///C:/...`.
+///
+/// Relative paths use the opaque `sqlite:` form (no `//`) so the path
+/// does not get mistaken for an authority.
+fn sqlite_url(path: &std::path::Path) -> String {
+    let mut rendered = path.display().to_string();
+    if std::path::MAIN_SEPARATOR != '/' {
+        rendered = rendered.replace(std::path::MAIN_SEPARATOR, "/");
+    }
+    sqlite_url_from_rendered(&rendered, path.is_absolute())
+}
+
+/// Format the connection URL for a path that has already been rendered
+/// as a `/`-separated string.  The `is_absolute` flag is supplied by the
+/// caller because `Path::is_absolute` is platform-dependent — on Linux
+/// it returns `false` for a Windows drive-letter path like
+/// `C:/Users/...`, which makes the Windows branch untestable when the
+/// decision is made inside this helper.  Factoring the flag out lets
+/// unit tests exercise the Windows branch regardless of host OS.
+fn sqlite_url_from_rendered(rendered: &str, is_absolute: bool) -> String {
+    if is_absolute {
+        let normalised = if rendered.starts_with('/') {
+            rendered.to_owned()
+        } else {
+            // Windows drive-letter form (e.g. `C:/Users/...`) — the
+            // leading `/` gives us an empty authority so the drive
+            // letter survives in the URL path.
+            format!("/{rendered}")
+        };
+        format!("sqlite://{normalised}?mode=rwc")
+    } else {
+        format!("sqlite:{rendered}?mode=rwc")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -320,6 +393,39 @@ pub struct RetentionConfig {
     pub event_ttl_secs: Option<u64>,
     /// Maximum checkpoints per thread.  `None` = no limit.
     pub checkpoint_max_per_thread: Option<u32>,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Platform-default SQLite data directory
+// ─────────────────────────────────────────────────────────────────────
+
+/// Return the platform-default data directory for `SQLite`.
+///
+/// - Linux:   `$XDG_DATA_HOME/agent-sdk` (defaults to `~/.local/share/agent-sdk`)
+/// - macOS:   `~/Library/Application Support/agent-sdk`
+/// - Windows: `%LOCALAPPDATA%\agent-sdk`
+fn dirs_default_sqlite_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join("Library/Application Support/agent-sdk"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var("XDG_DATA_HOME")
+            .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.local/share")))
+            .context("neither XDG_DATA_HOME nor HOME is set")?;
+        Ok(PathBuf::from(base).join("agent-sdk"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("LOCALAPPDATA").context("LOCALAPPDATA not set")?;
+        Ok(PathBuf::from(base).join("agent-sdk"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("unsupported platform for default SQLite data directory")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -509,5 +615,38 @@ storage:
             other => panic!("expected Sqlite, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_url_unix_absolute_uses_three_slashes() {
+        let url = sqlite_url(std::path::Path::new("/var/lib/agent-sdk.db"));
+        assert_eq!(url, "sqlite:///var/lib/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_windows_drive_letter_keeps_drive() {
+        // Drive-letter paths are not absolute on Linux, so call the
+        // inner helper directly with is_absolute=true (as Windows
+        // would report) to exercise the real URL-formation logic.
+        let url = sqlite_url_from_rendered("C:/Users/me/agent-sdk.db", true);
+        assert_eq!(url, "sqlite:///C:/Users/me/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_from_rendered_unix_absolute() {
+        let url = sqlite_url_from_rendered("/var/lib/agent-sdk.db", true);
+        assert_eq!(url, "sqlite:///var/lib/agent-sdk.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_from_rendered_relative_uses_opaque_form() {
+        let url = sqlite_url_from_rendered("local.db", false);
+        assert_eq!(url, "sqlite:local.db?mode=rwc");
+    }
+
+    #[test]
+    fn sqlite_url_relative_uses_opaque_form() {
+        let url = sqlite_url(std::path::Path::new("local.db"));
+        assert_eq!(url, "sqlite:local.db?mode=rwc");
     }
 }
