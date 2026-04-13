@@ -861,7 +861,7 @@ pub trait AgentTaskStore: Send + Sync {
 
     /// Cancel `root_id` and every descendant in its subtree under a
     /// single store write, producing a fully-terminal subtree in
-    /// deterministic depth-first order.
+    /// deterministic breadth-first (level) order.
     ///
     /// This is the Phase 2.6 cancellation-tree entry point, extended
     /// by Phase 7.6 to cascade across thread boundaries through
@@ -1293,9 +1293,11 @@ impl Inner {
     ///
     /// Depth is bounded by the actual journal tree, and `by_parent`
     /// is append-only within a root's lifetime, so the walk
-    /// terminates naturally without needing a visited set — but
-    /// defense-in-depth, we still dedupe via a `BTreeSet` so a
-    /// corrupted journal cannot hang the walk.
+    /// terminates naturally without needing a visited set for
+    /// single-thread trees — but with Phase 7.6 cross-thread
+    /// linkage the `visited` `BTreeSet` is the primary termination
+    /// guarantee: it prevents infinite loops if cyclic subagent
+    /// references ever appear in a corrupted journal.
     fn collect_subtree(&self, root_id: &AgentTaskId) -> Vec<AgentTaskId> {
         let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
         let mut out: Vec<AgentTaskId> = Vec::new();
@@ -8125,14 +8127,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn failed_subagent_child_root_maps_to_error_tool_result() -> Result<()> {
-        // Acceptance criterion: "Failed child threads resolve into
-        // deterministic error tool results instead of hard-failing
-        // the parent task by default."
-        //
+    async fn failed_child_root_wakes_invocation_as_pending() -> Result<()> {
         // When a child root fails, the invocation task wakes up and
-        // becomes runnable. The materialization then produces a
-        // success=false ToolResult with the error message.
+        // becomes runnable (Pending) with pending_child_count == 0,
+        // so the worker can materialize the failure into a
+        // deterministic error tool result on its next turn.
+        //
+        // NOTE: ToolResult materialization is tested at the worker
+        // layer, not here — this test covers the store-level state
+        // transition only.
         let store = InMemoryAgentTaskStore::new();
         let (parent, invocation, child_root) = spawn_subagent_fixture(&store, "t-fail-map").await?;
 

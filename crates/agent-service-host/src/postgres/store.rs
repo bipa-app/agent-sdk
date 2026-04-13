@@ -2382,9 +2382,37 @@ FOR UPDATE SKIP LOCKED
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
-        let subtree = Self::load_subtree_tx(&mut tx, root_id).await?;
-        let mut transitioned = Vec::with_capacity(subtree.len());
-        for row in subtree {
+
+        // Phase 7.6: iteratively load subtrees, following
+        // SubagentInvocation linkage across thread boundaries.
+        // Each pass loads one root_id's subtree; any
+        // SubagentInvocation tasks in that subtree contribute
+        // their child_root_task_id to the next frontier.
+        let mut visited_roots: std::collections::BTreeSet<AgentTaskId> =
+            std::collections::BTreeSet::new();
+        let mut frontier: std::collections::VecDeque<AgentTaskId> =
+            std::collections::VecDeque::new();
+        frontier.push_back(root_id.clone());
+        let mut all_tasks: Vec<AgentTask> = Vec::new();
+
+        while let Some(subtree_root) = frontier.pop_front() {
+            if !visited_roots.insert(subtree_root.clone()) {
+                continue;
+            }
+            let subtree = Self::load_subtree_tx(&mut tx, &subtree_root).await?;
+            for task in &subtree {
+                if let Some(invocation) = task.state.subagent_invocation() {
+                    let child_root = &invocation.child_root_task_id;
+                    if !visited_roots.contains(child_root) {
+                        frontier.push_back(child_root.clone());
+                    }
+                }
+            }
+            all_tasks.extend(subtree);
+        }
+
+        let mut transitioned = Vec::with_capacity(all_tasks.len());
+        for row in all_tasks {
             if row.status.is_terminal() {
                 continue;
             }
