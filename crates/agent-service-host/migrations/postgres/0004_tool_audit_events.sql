@@ -5,11 +5,10 @@
 -- Rows are append-only: the application never updates or deletes a row
 -- once it is written.
 --
--- Ordering: `recorded_at` alone is not a safe sort key because two
--- events on the same operation can share a wall-clock timestamp when the
--- caller constructs them inside the same call site.  A monotonic
--- `seq` column supplies a stable tie-breaker so `ORDER BY recorded_at,
--- seq` yields a deterministic audit trail across restarts.
+-- Ordering: `recorded_at` is caller-supplied metadata and can skew
+-- across workers during recovery or failover. A monotonic `seq` column
+-- therefore serves as the durable ordering key, and read paths sort by
+-- `seq` rather than by wall-clock time.
 --
 -- Indexes cover the three required query paths: by operation, by task,
 -- and by thread, each extended with `seq` so the planner can stream

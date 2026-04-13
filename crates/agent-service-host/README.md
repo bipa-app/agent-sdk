@@ -66,10 +66,9 @@ development, and continues to report every surface as process-local.
 
 Tool audit events are written through a
 [`RedactingToolAuditEventStore`](../agent-server/src/journal/tool_audit.rs)
-wrapper that applies
-[`RedactionPolicy::baseline()`](../agent-server/src/journal/redaction.rs)
-to the event's `input`, `output`, and `error` fields (including the
-`error` carried by the `Failed` lifecycle variant) before they reach the
-durable table. Read paths return the already-redacted rows, so sensitive
-tool data never lands in durable storage even if an operator replays or
-exports audit history.
+wrapper that applies the default durable-write policy: baseline
+redaction for the event's `input`, `output`, and `error` fields
+(including the `error` carried by the `Failed` lifecycle variant)
+before they reach the durable table. Read paths return the
+already-redacted rows, so sensitive tool data never lands in durable
+storage even if an operator replays or exports audit history.

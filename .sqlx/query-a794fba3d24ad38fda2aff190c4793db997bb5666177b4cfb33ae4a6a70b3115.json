@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id, operation_id, task_id, parent_task_id, thread_id,\n    tool_call_id, tool_name, effect_class, kind_payload,\n    provider, model, input, output, error, recorded_at\nFROM agent_sdk_tool_audit_events\nWHERE task_id = $1\nORDER BY recorded_at ASC, seq ASC\n",
+  "query": "\nSELECT\n    id, operation_id, task_id, parent_task_id, thread_id,\n    tool_call_id, tool_name, effect_class, kind_payload,\n    provider, model, input, output, error, recorded_at\nFROM agent_sdk_tool_audit_events\nWHERE thread_id = $1\nORDER BY seq ASC\n",
   "describe": {
     "columns": [
       {
@@ -102,5 +102,5 @@
       false
     ]
   },
-  "hash": "6e8a422e4d78f32dda79145ea219aa112fb9c9a998a7ec07e561504c228ba7ed"
+  "hash": "a794fba3d24ad38fda2aff190c4793db997bb5666177b4cfb33ae4a6a70b3115"
 }

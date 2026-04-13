@@ -2997,7 +2997,7 @@ SELECT
     provider, model, input, output, error, recorded_at
 FROM agent_sdk_tool_audit_events
 WHERE operation_id = ?1
-ORDER BY recorded_at ASC, seq ASC
+ORDER BY seq ASC
 ",
         )
         .bind(operation_id)
@@ -3017,7 +3017,7 @@ SELECT
     provider, model, input, output, error, recorded_at
 FROM agent_sdk_tool_audit_events
 WHERE task_id = ?1
-ORDER BY recorded_at ASC, seq ASC
+ORDER BY seq ASC
 ",
         )
         .bind(key)
@@ -3037,7 +3037,7 @@ SELECT
     provider, model, input, output, error, recorded_at
 FROM agent_sdk_tool_audit_events
 WHERE thread_id = ?1
-ORDER BY recorded_at ASC, seq ASC
+ORDER BY seq ASC
 ",
         )
         .bind(key)
@@ -3755,6 +3755,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_audit_queries_follow_durable_sequence_when_timestamps_skew() -> Result<()> {
+        use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let dispatched = tool_audit_event_fixture(
+            "task_skew:call_1",
+            "skew",
+            "skew",
+            ToolAuditEventKind::Dispatched,
+            20,
+        );
+        let completed = tool_audit_event_fixture(
+            "task_skew:call_1",
+            "skew",
+            "skew",
+            ToolAuditEventKind::Completed,
+            10,
+        );
+
+        ToolAuditEventStore::record_event(&store, &dispatched).await?;
+        ToolAuditEventStore::record_event(&store, &completed).await?;
+
+        let op_kinds: Vec<_> = store
+            .list_by_operation(&dispatched.operation_id)
+            .await?
+            .into_iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(op_kinds, vec!["dispatched", "completed"]);
+
+        let task_kinds: Vec<_> = ToolAuditEventStore::list_by_task(&store, &dispatched.task_id)
+            .await?
+            .into_iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(task_kinds, vec!["dispatched", "completed"]);
+
+        let thread_kinds: Vec<_> =
+            ToolAuditEventStore::list_by_thread(&store, &dispatched.thread_id)
+                .await?
+                .into_iter()
+                .map(|event| event.kind.as_str())
+                .collect();
+        assert_eq!(thread_kinds, vec!["dispatched", "completed"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tool_audit_provenance_persists_across_query_paths() -> Result<()> {
         use agent_server::journal::tool_audit::{ToolAuditEventKind, ToolAuditEventStore};
 
@@ -3854,7 +3904,9 @@ mod tests {
             tool_call_id: "call_1".into(),
             tool_name: "transfer".into(),
             effect_class: ToolEffectClass::SideEffecting,
-            kind: ToolAuditEventKind::Completed,
+            kind: ToolAuditEventKind::Failed {
+                error: "Bearer provider-secret".into(),
+            },
             provider: "anthropic".into(),
             model: "claude-sonnet-4-5-20250929".into(),
             input: Some(serde_json::json!({
@@ -3863,7 +3915,7 @@ mod tests {
                 "normal": "ok",
             })),
             output: Some("sk-output-token".into()),
-            error: Some("unrelated".into()),
+            error: Some("sk-top-level-error".into()),
             now: t_plus(40),
         };
         let event = ToolAuditEvent::new(params);
@@ -3876,6 +3928,11 @@ mod tests {
         assert_eq!(input["api_key"], REDACTED_MARKER);
         assert_eq!(input["normal"], "ok");
         assert_eq!(stored.output.as_deref(), Some(REDACTED_MARKER));
+        assert_eq!(stored.error.as_deref(), Some(REDACTED_MARKER));
+        match &stored.kind {
+            ToolAuditEventKind::Failed { error } => assert_eq!(error, REDACTED_MARKER),
+            other => anyhow::bail!("expected Failed audit kind, got {other:?}"),
+        }
 
         Ok(())
     }

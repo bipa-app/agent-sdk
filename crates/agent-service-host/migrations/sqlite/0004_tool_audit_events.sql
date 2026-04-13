@@ -4,8 +4,9 @@
 --
 -- SQLite only allows AUTOINCREMENT on an INTEGER PRIMARY KEY, so `seq`
 -- serves as the physical primary key and `id` carries the logical
--- `tae_<uuid>` identity as a UNIQUE constraint.  Ordering remains
--- `ORDER BY recorded_at, seq`, which matches the Postgres behaviour.
+-- `tae_<uuid>` identity as a UNIQUE constraint. Read paths order by
+-- `seq`, matching Postgres and preserving durable write order even when
+-- caller-supplied timestamps skew across workers.
 --
 -- Redaction policy: input / output / error columns are written **after**
 -- the application applies its `RedactionPolicy`, so this table must

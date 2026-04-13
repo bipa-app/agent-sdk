@@ -37,7 +37,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::execution_intent::ToolEffectClass;
-use super::redaction::{RedactionPolicy, redact_error, redact_string, redact_value};
+use super::redaction::{
+    RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
+};
 use super::task::AgentTaskId;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -318,23 +320,23 @@ pub trait ToolAuditEventStore: Send + Sync {
     async fn record_event(&self, event: &ToolAuditEvent) -> anyhow::Result<()>;
 
     /// List all events for a given operation (tool call lifecycle),
-    /// ordered by `recorded_at` ascending.
+    /// ordered by durable write order.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
     async fn list_by_operation(&self, operation_id: &str) -> anyhow::Result<Vec<ToolAuditEvent>>;
 
-    /// List all events for a given child task, ordered by
-    /// `recorded_at` ascending.
+    /// List all events for a given child task, ordered by durable write
+    /// order.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
     async fn list_by_task(&self, task_id: &AgentTaskId) -> anyhow::Result<Vec<ToolAuditEvent>>;
 
-    /// List all events for a given thread, ordered by
-    /// `recorded_at` ascending.
+    /// List all events for a given thread, ordered by durable write
+    /// order.
     ///
     /// # Errors
     ///
@@ -524,6 +526,14 @@ pub fn redact_event(event: &ToolAuditEvent, policy: &RedactionPolicy) -> ToolAud
     }
 }
 
+#[must_use]
+fn durable_store_redaction_policy() -> RedactionPolicy {
+    RedactionPolicy {
+        error_level: RedactionLevel::Baseline,
+        ..RedactionPolicy::baseline()
+    }
+}
+
 /// Decorator that applies a [`RedactionPolicy`] to every event on its
 /// way into durable storage, and passes reads through unchanged.
 ///
@@ -541,10 +551,11 @@ impl RedactingToolAuditEventStore {
         Self { inner, policy }
     }
 
-    /// Wrap an inner store using [`RedactionPolicy::baseline`].
+    /// Wrap an inner store using the default durable-write redaction
+    /// policy: baseline redaction for input, output, and error fields.
     #[must_use]
     pub fn baseline(inner: Arc<dyn ToolAuditEventStore>) -> Self {
-        Self::new(inner, RedactionPolicy::baseline())
+        Self::new(inner, durable_store_redaction_policy())
     }
 }
 
@@ -902,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_event_redacts_input_output_and_failed_error() {
+    fn redact_event_redacts_input_and_output_under_baseline_policy() {
         let policy = RedactionPolicy::baseline();
         let event = ToolAuditEvent::new(sample_params_sensitive(
             ToolAuditEventKind::Failed {
@@ -962,8 +973,12 @@ mod tests {
         let inner = Arc::new(InMemoryToolAuditEventStore::new());
         let store = RedactingToolAuditEventStore::baseline(inner.clone());
 
-        let event =
-            ToolAuditEvent::new(sample_params_sensitive(ToolAuditEventKind::Completed, t0()));
+        let event = ToolAuditEvent::new(sample_params_sensitive(
+            ToolAuditEventKind::Failed {
+                error: "sk-failure-token".into(),
+            },
+            t0(),
+        ));
         store.record_event(&event).await?;
 
         let stored = inner.all_events()?;
@@ -974,6 +989,13 @@ mod tests {
             stored.input.as_ref().expect("input present")["api_key"],
             REDACTED_MARKER_VALUE,
         );
+        assert_eq!(stored.error.as_deref(), Some(REDACTED_MARKER_VALUE));
+        match &stored.kind {
+            ToolAuditEventKind::Failed { error } => {
+                assert_eq!(error, REDACTED_MARKER_VALUE);
+            }
+            other => panic!("expected Failed variant, got {other:?}"),
+        }
 
         Ok(())
     }
