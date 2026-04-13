@@ -43,11 +43,15 @@ const EVENT_JOURNAL_OUTBOX_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0002_event_journal_outbox.sql"
 ));
+const EXECUTION_INTENTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0003_execution_intents.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 2] = [
+const MIGRATIONS: [PostgresMigration; 3] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -57,6 +61,11 @@ const MIGRATIONS: [PostgresMigration; 2] = [
         version: "0002",
         summary: "event journal, transactional outbox, and retention cursors",
         sql: EVENT_JOURNAL_OUTBOX_SQL,
+    },
+    PostgresMigration {
+        version: "0003",
+        summary: "durable execution intent records for guarded tool execution",
+        sql: EXECUTION_INTENTS_SQL,
     },
 ];
 
@@ -86,4 +95,10 @@ pub async fn apply_durable_core_migrations(pool: &PgPool) -> Result<()> {
 #[must_use]
 pub const fn event_journal_outbox_migration() -> &'static str {
     EVENT_JOURNAL_OUTBOX_SQL
+}
+
+/// The reviewable execution intents migration SQL.
+#[must_use]
+pub const fn execution_intents_migration() -> &'static str {
+    EXECUTION_INTENTS_SQL
 }

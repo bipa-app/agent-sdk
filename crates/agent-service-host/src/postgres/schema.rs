@@ -1063,3 +1063,106 @@ const EVENT_JOURNAL_OUTBOX_TABLES: &[TableContract] = &[
 pub const fn event_journal_outbox_tables() -> &'static [TableContract] {
     EVENT_JOURNAL_OUTBOX_TABLES
 }
+
+// =====================================================================
+// Execution intent table (migration 0003)
+// =====================================================================
+
+const AGENT_SDK_EXECUTION_INTENT_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "operation_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Primary key. Combines child_task_id and tool_call_id.",
+    },
+    ColumnContract {
+        name: "effect_class",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Tool effect classification (`replay_safe`, `side_effecting`, `resumable`).",
+    },
+    ColumnContract {
+        name: "tool_call_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Raw LLM-assigned tool call id.",
+    },
+    ColumnContract {
+        name: "child_task_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Child task that owns this execution.",
+    },
+    ColumnContract {
+        name: "tool_name",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Tool name.",
+    },
+    ColumnContract {
+        name: "input",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Tool input snapshot for audit and replay verification.",
+    },
+    ColumnContract {
+        name: "status",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Intent lifecycle status (`pending`, `started`, `completed`, `failed`).",
+    },
+    ColumnContract {
+        name: "error",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Error message when status is `failed`.",
+    },
+    ColumnContract {
+        name: "created_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the intent was first persisted.",
+    },
+    ColumnContract {
+        name: "updated_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "When the intent last changed status.",
+    },
+];
+
+const AGENT_SDK_EXECUTION_INTENT_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_effect_class_check",
+        invariant: "Only known effect classes can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_status_check",
+        invariant: "Only known intent statuses can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_error_check",
+        invariant: "Only `failed` rows carry `error`; every `failed` row must carry one.",
+    },
+];
+
+const AGENT_SDK_EXECUTION_INTENT_INDEXES: &[IndexContract] = &[IndexContract {
+    name: "agent_sdk_execution_intents_by_child_task_idx",
+    key_columns: "(child_task_id)",
+    predicate: None,
+    purpose: "Supports restart-recovery lookup by child task id.",
+}];
+
+const EXECUTION_INTENT_TABLES: &[TableContract] = &[TableContract {
+    name: "agent_sdk_execution_intents",
+    purpose: "Durable execution intent records for the Phase 5.2 fail-closed guarded tool execution contract.",
+    columns: AGENT_SDK_EXECUTION_INTENT_COLUMNS,
+    constraints: AGENT_SDK_EXECUTION_INTENT_CONSTRAINTS,
+    indexes: AGENT_SDK_EXECUTION_INTENT_INDEXES,
+}];
+
+/// Tables introduced by the execution intents migration (0003).
+#[must_use]
+pub const fn execution_intent_tables() -> &'static [TableContract] {
+    EXECUTION_INTENT_TABLES
+}

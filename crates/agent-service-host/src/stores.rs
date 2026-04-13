@@ -168,9 +168,9 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "execution intents remain process-local until a durable backend is implemented",
+        backend: "postgres",
+        persists_restart: true,
+        note: "",
     },
     StorageSurfaceStatus {
         surface: "tool_audit_store",
@@ -232,9 +232,9 @@ const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "execution intents remain process-local until a durable backend is implemented",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
     },
     StorageSurfaceStatus {
         surface: "tool_audit_store",
@@ -447,7 +447,7 @@ impl StoreRegistry {
             attempt_store: durable_store.clone(),
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
-            execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
+            execution_intent_store: durable_store.clone(),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
@@ -475,7 +475,7 @@ impl StoreRegistry {
             attempt_store: durable_store.clone(),
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
-            execution_intent_store: Arc::new(InMemoryExecutionIntentStore::new()),
+            execution_intent_store: durable_store.clone(),
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store: durable_store.clone(),
             retention_store: durable_store,
@@ -664,10 +664,7 @@ mod tests {
             .filter(|surface| !surface.persists_restart)
             .map(|surface| surface.surface)
             .collect::<Vec<_>>();
-        assert_eq!(
-            nondurable_surfaces,
-            vec!["execution_intent_store", "tool_audit_store"]
-        );
+        assert_eq!(nondurable_surfaces, vec!["tool_audit_store"]);
         Ok(())
     }
 

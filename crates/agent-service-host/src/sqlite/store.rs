@@ -33,6 +33,7 @@ use agent_server::journal::event_outbox_transaction::{
     AtomicEventOutboxCommitter, EventOutboxCommit, EventOutboxCommitOutcome,
 };
 use agent_server::journal::event_repository::EventRepository;
+use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::outbox::{
@@ -2819,6 +2820,117 @@ impl RetentionStore for SqliteDurableStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// ExecutionIntentStore
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ExecutionIntentStore for SqliteDurableStore {
+    async fn persist_intent(&self, intent: &ExecutionIntent) -> Result<()> {
+        let effect_class_wire = enum_to_wire(&intent.effect_class)?;
+        let status_wire = enum_to_wire(&intent.status)?;
+        let input_json = json_to_value(&intent.input, "execution intent input")?;
+        let op_id = intent.operation_id.as_str();
+        let child_task = intent.child_task_id.as_str();
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_execution_intents (
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT (operation_id) DO UPDATE SET
+    status     = excluded.status,
+    error      = excluded.error,
+    updated_at = excluded.updated_at
+",
+            op_id,
+            effect_class_wire,
+            intent.tool_call_id,
+            child_task,
+            intent.tool_name,
+            input_json,
+            status_wire,
+            intent.error,
+            intent.created_at,
+            intent.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("persist execution intent {}", intent.operation_id))?;
+        Ok(())
+    }
+
+    async fn update_intent(&self, intent: &ExecutionIntent) -> Result<()> {
+        let status_wire = enum_to_wire(&intent.status)?;
+        let op_id = intent.operation_id.as_str();
+
+        let result = sqlx::query!(
+            r"
+UPDATE agent_sdk_execution_intents
+SET status     = ?2,
+    error      = ?3,
+    updated_at = ?4
+WHERE operation_id = ?1
+",
+            op_id,
+            status_wire,
+            intent.error,
+            intent.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("update execution intent {}", intent.operation_id))?;
+
+        ensure!(
+            result.rows_affected() == 1,
+            "update execution intent affected {} rows for {}",
+            result.rows_affected(),
+            intent.operation_id
+        );
+        Ok(())
+    }
+
+    async fn get_intent(&self, operation_id: &OperationId) -> Result<Option<ExecutionIntent>> {
+        let op_id = operation_id.as_str();
+        let record = sqlx::query_as::<_, ExecutionIntentRecord>(
+            r"
+SELECT
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+FROM agent_sdk_execution_intents
+WHERE operation_id = ?1
+",
+        )
+        .bind(op_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get execution intent {operation_id}"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    async fn get_intent_by_task(
+        &self,
+        child_task_id: &AgentTaskId,
+    ) -> Result<Option<ExecutionIntent>> {
+        let task_id = child_task_id.as_str();
+        let record = sqlx::query_as::<_, ExecutionIntentRecord>(
+            r"
+SELECT
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at
+FROM agent_sdk_execution_intents
+WHERE child_task_id = ?1
+",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get execution intent by task {child_task_id}"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Record types
 // ─────────────────────────────────────────────────────────────────────
 
@@ -3122,6 +3234,38 @@ impl TryFrom<RetentionCursorRecord> for RetentionCursor {
     }
 }
 
+#[derive(Debug, FromRow)]
+struct ExecutionIntentRecord {
+    operation_id: String,
+    effect_class: String,
+    tool_call_id: String,
+    child_task_id: String,
+    tool_name: String,
+    input: serde_json::Value,
+    status: String,
+    error: Option<String>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl TryFrom<ExecutionIntentRecord> for ExecutionIntent {
+    type Error = anyhow::Error;
+    fn try_from(r: ExecutionIntentRecord) -> Result<Self> {
+        Ok(Self {
+            operation_id: OperationId(r.operation_id),
+            effect_class: enum_from_wire(&r.effect_class, "execution intent effect_class")?,
+            tool_call_id: r.tool_call_id,
+            child_task_id: AgentTaskId::from_string(r.child_task_id),
+            tool_name: r.tool_name,
+            input: r.input,
+            status: enum_from_wire(&r.status, "execution intent status")?,
+            error: r.error,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Wire format helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -3165,4 +3309,196 @@ fn u64_from_i64(value: i64, label: &str) -> Result<u64> {
 
 fn i64_from_u64(value: u64, label: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{label} out of range for i64: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{Context, Result};
+    use time::Duration;
+
+    use agent_server::journal::execution_intent::{
+        ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
+    };
+    use agent_server::journal::task::AgentTaskId;
+
+    use super::SqliteDurableStore;
+
+    fn t0() -> time::OffsetDateTime {
+        time::OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
+    }
+
+    fn t_plus(secs: i64) -> time::OffsetDateTime {
+        t0() + Duration::seconds(secs)
+    }
+
+    fn make_test_intent(task_name: &str, secs: i64) -> ExecutionIntent {
+        let task_id = AgentTaskId::from_string(format!("task_{task_name}"));
+        let op_id = OperationId::new(&task_id, "call_1");
+        ExecutionIntent {
+            operation_id: op_id,
+            effect_class: ToolEffectClass::SideEffecting,
+            tool_call_id: "call_1".into(),
+            child_task_id: task_id,
+            tool_name: "test_tool".into(),
+            input: serde_json::json!({"key": "value"}),
+            status: IntentStatus::Pending,
+            error: None,
+            created_at: t_plus(secs),
+            updated_at: t_plus(secs),
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_intent_persist_and_get_by_operation_id() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let intent = make_test_intent("persist_op", 10);
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("intent should be present after persist")?;
+        assert_eq!(loaded.operation_id, intent.operation_id);
+        assert_eq!(loaded.tool_name, "test_tool");
+        assert_eq!(loaded.status, IntentStatus::Pending);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_persist_and_get_by_task() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let intent = make_test_intent("persist_task", 11);
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent_by_task(&intent.child_task_id)
+            .await?
+            .context("intent should be present by task id")?;
+        assert_eq!(loaded.child_task_id, intent.child_task_id);
+        assert_eq!(loaded.operation_id, intent.operation_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_update_transitions_status() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let mut intent = make_test_intent("update_status", 12);
+        store.persist_intent(&intent).await?;
+
+        intent.mark_started(t_plus(13));
+        store.update_intent(&intent).await?;
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after update to started")?;
+        assert_eq!(loaded.status, IntentStatus::Started);
+
+        intent.mark_completed(t_plus(14));
+        store.update_intent(&intent).await?;
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after update to completed")?;
+        assert_eq!(loaded.status, IntentStatus::Completed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_failed_stores_error() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let mut intent = make_test_intent("failed_error", 15);
+        store.persist_intent(&intent).await?;
+
+        intent.mark_started(t_plus(16));
+        store.update_intent(&intent).await?;
+
+        intent.mark_failed("something went wrong", t_plus(17));
+        store.update_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after failed")?;
+        assert_eq!(loaded.status, IntentStatus::Failed);
+        assert_eq!(loaded.error.as_deref(), Some("something went wrong"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_restart_recovery() -> Result<()> {
+        // Use a file-backed database so the data persists across connections.
+        let db_path = std::env::temp_dir().join(format!(
+            "agent_sdk_intent_restart_{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let store = SqliteDurableStore::connect(&url).await?;
+        let intent = make_test_intent("restart", 20);
+        store.persist_intent(&intent).await?;
+        drop(store);
+
+        // Reconnect — simulates restart.
+        let store2 = SqliteDurableStore::connect(&url).await?;
+        let loaded = store2
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("intent should survive reconnection")?;
+        assert_eq!(loaded.operation_id, intent.operation_id);
+
+        let loaded_by_task = store2
+            .get_intent_by_task(&intent.child_task_id)
+            .await?
+            .context("intent should be findable by task after reconnect")?;
+        assert_eq!(loaded_by_task.operation_id, intent.operation_id);
+
+        drop(store2);
+        let _ = std::fs::remove_file(&db_path);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_duplicate_persist_is_upsert_safe() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let mut intent = make_test_intent("upsert", 25);
+        store.persist_intent(&intent).await?;
+
+        // Persist again with updated status — ON CONFLICT should succeed.
+        intent.mark_started(t_plus(26));
+        store.persist_intent(&intent).await?;
+
+        let loaded = store
+            .get_intent(&intent.operation_id)
+            .await?
+            .context("should exist after upsert")?;
+        assert_eq!(loaded.status, IntentStatus::Started);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_get_nonexistent_returns_none() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let op_id = OperationId("nonexistent:call".into());
+        assert!(store.get_intent(&op_id).await?.is_none());
+        assert!(
+            store
+                .get_intent_by_task(&AgentTaskId::from_string("no_such_task"))
+                .await?
+                .is_none()
+        );
+
+        Ok(())
+    }
 }
