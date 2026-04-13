@@ -2633,6 +2633,7 @@ TRUNCATE TABLE
     agent_sdk_turn_checkpoints,
     agent_sdk_message_commits,
     agent_sdk_message_heads,
+    agent_sdk_execution_intents,
     agent_sdk_tasks,
     agent_sdk_threads
 CASCADE
@@ -4739,6 +4740,28 @@ mod tests {
         assert!(
             store
                 .get_intent_by_task(&AgentTaskId::from_string("no_such_task"))
+                .await?
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_clear_removes_rows() -> Result<()> {
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let intent = make_test_intent("clear", 30);
+        store.persist_intent(&intent).await?;
+
+        AgentTaskStore::clear(&store).await?;
+
+        assert!(store.get_intent(&intent.operation_id).await?.is_none());
+        assert!(
+            store
+                .get_intent_by_task(&intent.child_task_id)
                 .await?
                 .is_none()
         );

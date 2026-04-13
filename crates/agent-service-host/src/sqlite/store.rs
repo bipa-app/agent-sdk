@@ -2184,6 +2184,9 @@ impl SqliteDurableStore {
         sqlx::query!("DELETE FROM agent_sdk_retention_cursors")
             .execute(&mut *conn)
             .await?;
+        sqlx::query!("DELETE FROM agent_sdk_execution_intents")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query!("DELETE FROM agent_sdk_tasks")
             .execute(&mut *conn)
             .await?;
@@ -3319,6 +3322,7 @@ mod tests {
     use agent_server::journal::execution_intent::{
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
     };
+    use agent_server::journal::store::AgentTaskStore;
     use agent_server::journal::task::AgentTaskId;
 
     use super::SqliteDurableStore;
@@ -3495,6 +3499,26 @@ mod tests {
         assert!(
             store
                 .get_intent_by_task(&AgentTaskId::from_string("no_such_task"))
+                .await?
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_intent_clear_removes_rows() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+
+        let intent = make_test_intent("clear", 30);
+        store.persist_intent(&intent).await?;
+
+        AgentTaskStore::clear(&store).await?;
+
+        assert!(store.get_intent(&intent.operation_id).await?.is_none());
+        assert!(
+            store
+                .get_intent_by_task(&intent.child_task_id)
                 .await?
                 .is_none()
         );
