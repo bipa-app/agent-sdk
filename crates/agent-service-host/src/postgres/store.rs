@@ -1247,22 +1247,40 @@ WHERE parent_id = $1
         child_root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        let maybe_record = sqlx::query_as::<_, TaskRecord>(
+        let maybe_record = sqlx::query_as!(
+            TaskRecord,
             r"
 SELECT
-    id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, worker_id, lease_id, lease_expires_at,
-    last_heartbeat_at, state_json, attempt, max_attempts, last_error,
-    pending_child_count, spawn_index, result_payload,
-    created_at, updated_at, completed_at
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    created_at,
+    updated_at,
+    completed_at
 FROM agent_sdk_tasks
 WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
   AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
 FOR UPDATE
 ",
+            child_root_id.as_str(),
         )
-        .bind(child_root_id.as_str())
         .fetch_optional(&mut **tx)
         .await
         .with_context(|| {
