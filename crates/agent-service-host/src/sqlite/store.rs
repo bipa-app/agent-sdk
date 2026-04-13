@@ -996,6 +996,45 @@ LIMIT 1
         Ok(())
     }
 
+    /// Phase 7.6: find a `Subagent` invocation task that is
+    /// `WaitingOnChildren` and whose `SubagentInvocation` state
+    /// links to the given `child_root_id`, then wake it to `Pending`
+    /// via `recompute_pending_children(0, now)`.
+    ///
+    /// This mirrors the in-memory store's
+    /// `resume_linked_subagent_invocation` and ensures that when a
+    /// child-thread root reaches a terminal state (cancelled, failed,
+    /// completed), the parent-thread invocation is unblocked.
+    async fn resume_linked_subagent_invocation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        child_root_id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks \
+             WHERE kind = 'subagent' \
+               AND status = 'waiting_on_children' \
+               AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1"
+        );
+        let maybe_record = sqlx::query_as::<_, TaskRecord>(&sql)
+            .bind(child_root_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await
+            .with_context(|| {
+                format!("resume_linked_subagent_invocation: lookup for child_root {child_root_id}")
+            })?;
+
+        let Some(record) = maybe_record else {
+            return Ok(None);
+        };
+        let old_invocation: AgentTask = record.try_into()?;
+        let new_invocation = old_invocation
+            .recompute_pending_children(0, now)
+            .context("cancel_tree: subagent invocation resume transition failed")?;
+        Self::update_task_tx(tx, &new_invocation).await?;
+        Ok(Some(new_invocation))
+    }
+
     async fn load_subtree_tx(
         tx: &mut Transaction<'_, Sqlite>,
         root_id: &AgentTaskId,
@@ -1915,19 +1954,63 @@ impl AgentTaskStore for SqliteDurableStore {
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
-        let subtree = Self::load_subtree_tx(&mut tx, root_id).await?;
-        let mut transitioned = Vec::with_capacity(subtree.len());
-        for row in subtree {
+
+        // Phase 7.6: iteratively load subtrees, following
+        // SubagentInvocation linkage across thread boundaries.
+        // Each pass loads one root_id's subtree; any
+        // SubagentInvocation tasks in that subtree contribute
+        // their child_root_task_id to the next frontier.
+        let mut visited_roots: std::collections::BTreeSet<AgentTaskId> =
+            std::collections::BTreeSet::new();
+        let mut frontier: std::collections::VecDeque<AgentTaskId> =
+            std::collections::VecDeque::new();
+        frontier.push_back(root_id.clone());
+        let mut all_tasks: Vec<AgentTask> = Vec::new();
+
+        while let Some(subtree_root) = frontier.pop_front() {
+            if !visited_roots.insert(subtree_root.clone()) {
+                continue;
+            }
+            let subtree = Self::load_subtree_tx(&mut tx, &subtree_root).await?;
+            for task in &subtree {
+                if let Some(invocation) = task.state.subagent_invocation() {
+                    let child_root = &invocation.child_root_task_id;
+                    if !visited_roots.contains(child_root) {
+                        frontier.push_back(child_root.clone());
+                    }
+                }
+            }
+            all_tasks.extend(subtree);
+        }
+
+        let mut transitioned = Vec::with_capacity(all_tasks.len());
+        // Track cancelled root-turn roots so we can wake their
+        // linked invocations afterward.
+        let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
+        for row in all_tasks {
             if row.status.is_terminal() {
                 continue;
             }
+            let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let cancelled = row
-                .clone()
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
+            if is_root_turn_root {
+                cancelled_root_ids.push(cancelled.id.clone());
+            }
             transitioned.push(cancelled.id);
         }
+
+        // Phase 7.6: wake linked SubagentInvocation tasks that were
+        // WaitingOnChildren on a now-cancelled child root. This
+        // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
+        for cancelled_child_root in &cancelled_root_ids {
+            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
+        }
+
         tx.commit().await.context("commit cancel_tree")?;
         Ok(transitioned)
     }
