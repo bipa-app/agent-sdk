@@ -169,8 +169,11 @@
 //!   double-complete or a dropped-complete cannot corrupt it —
 //!   the recompute always produces the correct live count.
 //! - [`AgentTaskStore::cancel_tree`] walks the `by_parent` index
-//!   transitively from `root_id` and atomically cancels every
-//!   non-terminal descendant (and the root itself) via
+//!   transitively from `root_id` **and** follows
+//!   [`crate::journal::TaskState::SubagentInvocation`] linkage so
+//!   cancellation cascades across thread boundaries into nested
+//!   subagent trees (Phase 7.6). Each step atomically cancels
+//!   every non-terminal descendant (and the root itself) via
 //!   [`AgentTask::cancel`]. Leases on `Running` rows are dropped
 //!   as part of the transition, so a stale worker's next
 //!   heartbeat / [`AgentTaskStore::complete_task`] /
@@ -860,11 +863,16 @@ pub trait AgentTaskStore: Send + Sync {
     /// single store write, producing a fully-terminal subtree in
     /// deterministic depth-first order.
     ///
-    /// This is the Phase 2.6 cancellation-tree entry point. A
+    /// This is the Phase 2.6 cancellation-tree entry point, extended
+    /// by Phase 7.6 to cascade across thread boundaries through
+    /// [`crate::journal::TaskState::SubagentInvocation`] linkage. A
     /// successful call:
     ///
     /// 1. Walks the `by_parent` index transitively from `root_id`
-    ///    to collect every live descendant id.
+    ///    to collect every live descendant id. When a task carries
+    ///    [`crate::journal::TaskState::SubagentInvocation`] state, the
+    ///    linked `child_root_task_id` is followed so cancellation
+    ///    reaches child-thread roots and their descendants.
     /// 2. Transitions each non-terminal row via [`AgentTask::cancel`]
     ///    in the order `[root, child_1, child_2, ..., grandchildren,
     ///    ...]`. Each cancel drops the row's lease (if any), removes
@@ -1276,6 +1284,13 @@ impl Inner {
     /// and the order only drives the returned transitioned-id
     /// slice.
     ///
+    /// Phase 7.6 extends the walk to follow
+    /// [`TaskState::SubagentInvocation`] linkage: when a task
+    /// carries durable subagent invocation state the linked
+    /// `child_root_task_id` is added to the BFS frontier so
+    /// cancellation cascades across thread boundaries into nested
+    /// subagent trees.
+    ///
     /// Depth is bounded by the actual journal tree, and `by_parent`
     /// is append-only within a root's lifetime, so the walk
     /// terminates naturally without needing a visited set — but
@@ -1291,10 +1306,21 @@ impl Inner {
             if !visited.insert(id.clone()) {
                 continue;
             }
-            if !self.by_id.contains_key(&id) {
+            let Some(task) = self.by_id.get(&id) else {
                 continue;
-            }
+            };
             out.push(id.clone());
+
+            // Phase 7.6: follow subagent invocation linkage so
+            // cancellation cascades across thread boundaries into
+            // child-thread root tasks and their descendants.
+            if let Some(invocation) = task.state.subagent_invocation() {
+                let child_root = &invocation.child_root_task_id;
+                if !visited.contains(child_root) {
+                    frontier.push_back(child_root.clone());
+                }
+            }
+
             if let Some(children) = self.by_parent.get(&id) {
                 for child_id in children {
                     if !visited.contains(child_id) {
@@ -7882,6 +7908,306 @@ mod tests {
             format!("{err:#}").contains("does not exist"),
             "unexpected: {err:#}"
         );
+        Ok(())
+    }
+
+    // ── Phase 7.6: Cascade cancellation across subagent trees ─────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_cascades_through_subagent_invocation_to_child_thread() -> Result<()> {
+        // Acceptance criterion: "Parent cancellation stops the entire
+        // descendant subagent tree deterministically."
+        //
+        // Topology: parent (root_turn) → invocation (subagent) → child_root (root_turn, different thread)
+        // cancel_tree(parent) must cancel all three.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-cascade-parent").await?;
+
+        let transitioned = store.cancel_tree(&parent.id, t_plus(10)).await?;
+
+        // All three tasks must have been transitioned.
+        assert!(
+            transitioned.contains(&parent.id),
+            "parent must be in transitioned set"
+        );
+        assert!(
+            transitioned.contains(&invocation.id),
+            "invocation must be in transitioned set"
+        );
+        assert!(
+            transitioned.contains(&child_root.id),
+            "child_root must be in transitioned set"
+        );
+        assert_eq!(transitioned.len(), 3);
+
+        // Every task must be in terminal Cancelled state.
+        let parent_after = store.get(&parent.id).await?.context("parent exists")?;
+        assert_eq!(parent_after.status, TaskStatus::Cancelled);
+
+        let invocation_after = store
+            .get(&invocation.id)
+            .await?
+            .context("invocation exists")?;
+        assert_eq!(invocation_after.status, TaskStatus::Cancelled);
+
+        let child_after = store.get(&child_root.id).await?.context("child exists")?;
+        assert_eq!(child_after.status, TaskStatus::Cancelled);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_cascades_through_nested_subagent_trees() -> Result<()> {
+        // Acceptance criterion: "Nested subagents follow the same
+        // cancellation and failure rules recursively."
+        //
+        // Topology:
+        //   grandparent (root_turn, thread A)
+        //     → invocation_1 (subagent, thread A)
+        //       → child_root_1 (root_turn, thread B)
+        //         → invocation_2 (subagent, thread B)
+        //           → grandchild_root (root_turn, thread C)
+        //
+        // cancel_tree(grandparent) must cancel all five.
+        let store = InMemoryAgentTaskStore::new();
+
+        // Level 1: grandparent → invocation_1 → child_root_1
+        let (grandparent, inv1, child1) = spawn_subagent_fixture(&store, "t-nested-gp").await?;
+
+        // Level 2: child_root_1 is Pending on its child thread.
+        // Acquire it, then spawn a nested subagent.
+        let child1_running = store
+            .try_acquire_task(
+                &child1.id,
+                WorkerId::from_string("w-child1"),
+                LeaseId::from_string("l-child1"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await?
+            .context("claim child_root_1")?;
+        assert_eq!(child1_running.status, TaskStatus::Running);
+
+        let child_thread_2 = thread("t-nested-gc");
+        let (child1_waiting, inv2, grandchild) = store
+            .spawn_subagent_invocation(
+                &child1.id,
+                &WorkerId::from_string("w-child1"),
+                &LeaseId::from_string("l-child1"),
+                SubagentInvocationSpawn {
+                    child_thread_id: child_thread_2,
+                    spec: sample_subagent_spec(),
+                    child_root_input: sample_subagent_input(),
+                    spawn_index: 0,
+                    payload: SuspensionPayload {
+                        continuation: sample_continuation("t-nested-gp-child"),
+                        suspended_messages: Vec::new(),
+                    },
+                },
+                t_plus(4),
+            )
+            .await
+            .context("spawn nested subagent")?;
+        assert_eq!(child1_waiting.status, TaskStatus::WaitingOnChildren);
+
+        // Now cancel the entire tree from the grandparent.
+        let transitioned = store.cancel_tree(&grandparent.id, t_plus(20)).await?;
+
+        // All five tasks must be cancelled.
+        assert_eq!(
+            transitioned.len(),
+            5,
+            "five tasks must be transitioned: {transitioned:?}"
+        );
+        for id in [
+            &grandparent.id,
+            &inv1.id,
+            &child1.id,
+            &inv2.id,
+            &grandchild.id,
+        ] {
+            assert!(
+                transitioned.contains(id),
+                "task {id} must be in transitioned set"
+            );
+            let task = store
+                .get(id)
+                .await?
+                .with_context(|| format!("{id} exists"))?;
+            assert_eq!(
+                task.status,
+                TaskStatus::Cancelled,
+                "task {id} must be Cancelled"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_idempotent_on_already_cancelled_subagent_tree() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-cascade-idempotent").await?;
+
+        // First cancel.
+        let first = store.cancel_tree(&parent.id, t_plus(10)).await?;
+        assert_eq!(first.len(), 3);
+
+        // Second cancel — all tasks are already terminal.
+        let second = store.cancel_tree(&parent.id, t_plus(11)).await?;
+        assert!(
+            second.is_empty(),
+            "second cancel must be a no-op on terminal rows"
+        );
+
+        // All tasks still Cancelled.
+        for id in [&parent.id, &invocation.id, &child_root.id] {
+            let task = store
+                .get(id)
+                .await?
+                .with_context(|| format!("{id} exists"))?;
+            assert_eq!(task.status, TaskStatus::Cancelled);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_with_running_child_thread_root_drops_lease() -> Result<()> {
+        // Verify that cascading cancellation through a subagent invocation
+        // drops the lease on a running child-thread root, so stale workers
+        // fail CAS on their next heartbeat.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, _invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-cascade-lease").await?;
+
+        // Acquire and run the child root.
+        let child_running = store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::from_string("w-child"),
+                LeaseId::from_string("l-child"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await?
+            .context("claim child root")?;
+        assert_eq!(child_running.status, TaskStatus::Running);
+
+        // Cancel from the parent.
+        store.cancel_tree(&parent.id, t_plus(10)).await?;
+
+        // Child root lease is dropped.
+        let child_after = store.get(&child_root.id).await?.context("child exists")?;
+        assert_eq!(child_after.status, TaskStatus::Cancelled);
+        assert!(child_after.worker_id.is_none());
+        assert!(child_after.lease_id.is_none());
+
+        // Stale worker cannot heartbeat.
+        let err = store
+            .heartbeat_task(
+                &child_root.id,
+                &WorkerId::from_string("w-child"),
+                &LeaseId::from_string("l-child"),
+                t_plus(120),
+                t_plus(11),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid transition"),
+            "stale heartbeat should fail: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_subagent_child_root_maps_to_error_tool_result() -> Result<()> {
+        // Acceptance criterion: "Failed child threads resolve into
+        // deterministic error tool results instead of hard-failing
+        // the parent task by default."
+        //
+        // When a child root fails, the invocation task wakes up and
+        // becomes runnable. The materialization then produces a
+        // success=false ToolResult with the error message.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, invocation, child_root) = spawn_subagent_fixture(&store, "t-fail-map").await?;
+
+        // Acquire child root.
+        let _child_running = store
+            .try_acquire_task(
+                &child_root.id,
+                WorkerId::from_string("w-child"),
+                LeaseId::from_string("l-child"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await?
+            .context("claim child root")?;
+
+        // Fail the child root with a specific error.
+        let (failed_child, _) = store
+            .fail_task(
+                &child_root.id,
+                &WorkerId::from_string("w-child"),
+                &LeaseId::from_string("l-child"),
+                "max turns exhausted: 5/5".to_owned(),
+                t_plus(5),
+            )
+            .await
+            .context("fail child root")?;
+        assert_eq!(failed_child.status, TaskStatus::Failed);
+        assert_eq!(
+            failed_child.last_error.as_deref(),
+            Some("max turns exhausted: 5/5")
+        );
+
+        // The invocation task should now be runnable (Pending) because
+        // its only child reached terminal state.
+        let inv_after = store
+            .get(&invocation.id)
+            .await?
+            .context("invocation exists")?;
+        assert_eq!(inv_after.status, TaskStatus::Pending);
+        assert_eq!(inv_after.pending_child_count, 0);
+
+        // The parent should still be WaitingOnChildren (waiting on the invocation).
+        let parent_after = store.get(&parent.id).await?.context("parent exists")?;
+        assert_eq!(parent_after.status, TaskStatus::WaitingOnChildren);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_subagent_child_root_maps_to_deterministic_result() -> Result<()> {
+        // Acceptance criterion: "Timeout and max-turn exhaustion map
+        // into deterministic failed subagent results."
+        //
+        // When a child root is cancelled, the invocation wakes and
+        // becomes runnable with its SubagentInvocation state preserved.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, invocation, child_root) =
+            spawn_subagent_fixture(&store, "t-cancel-map").await?;
+
+        // Cancel only the child root (simulating a timeout cancellation).
+        let transitioned = store.cancel_tree(&child_root.id, t_plus(5)).await?;
+        assert_eq!(transitioned, vec![child_root.id.clone()]);
+
+        // Invocation should wake up (Pending, SubagentInvocation state preserved).
+        let inv_after = store
+            .get(&invocation.id)
+            .await?
+            .context("invocation exists")?;
+        assert_eq!(inv_after.status, TaskStatus::Pending);
+        assert!(inv_after.state.subagent_invocation().is_some());
+
+        // Parent should still be waiting on the invocation.
+        let parent_after = store.get(&parent.id).await?.context("parent exists")?;
+        assert_eq!(parent_after.status, TaskStatus::WaitingOnChildren);
+
         Ok(())
     }
 
