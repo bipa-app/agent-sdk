@@ -1021,9 +1021,7 @@ LIMIT 1
             .fetch_optional(&mut **tx)
             .await
             .with_context(|| {
-                format!(
-                    "resume_linked_subagent_invocation: lookup for child_root {child_root_id}"
-                )
+                format!("resume_linked_subagent_invocation: lookup for child_root {child_root_id}")
             })?;
 
         let Some(record) = maybe_record else {
@@ -2008,16 +2006,10 @@ impl AgentTaskStore for SqliteDurableStore {
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
         // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
         for cancelled_child_root in &cancelled_root_ids {
-            let woken = Self::resume_linked_subagent_invocation_tx(
-                &mut tx,
-                cancelled_child_root,
-                now,
-            )
-            .await?;
-            if let Some(invocation) = woken {
-                transitioned.push(invocation.id);
-            }
+            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
         }
 
         tx.commit().await.context("commit cancel_tree")?;

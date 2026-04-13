@@ -1248,7 +1248,7 @@ WHERE parent_id = $1
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let maybe_record = sqlx::query_as::<_, TaskRecord>(
-            r#"
+            r"
 SELECT
     id, kind, status, parent_id, root_id, depth, thread_id,
     submitted_input_json, worker_id, lease_id, lease_expires_at,
@@ -1260,7 +1260,7 @@ WHERE kind = 'subagent'
   AND status = 'waiting_on_children'
   AND state_json -> 'invocation' ->> 'child_root_task_id' = $1
 FOR UPDATE
-"#,
+",
         )
         .bind(child_root_id.as_str())
         .fetch_optional(&mut **tx)
@@ -2467,8 +2467,7 @@ FOR UPDATE SKIP LOCKED
             if row.status.is_terminal() {
                 continue;
             }
-            let is_root_turn_root =
-                row.kind == TaskKind::RootTurn && row.is_root();
+            let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let cancelled = row
                 .clone()
                 .cancel(now)
@@ -2483,16 +2482,10 @@ FOR UPDATE SKIP LOCKED
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
         // mirrors the in-memory store's resume_linked_subagent_invocation.
+        // The woken invocation transitions to Pending (not Cancelled),
+        // so it must NOT be added to the transitioned vec.
         for cancelled_child_root in &cancelled_root_ids {
-            let woken = Self::resume_linked_subagent_invocation_tx(
-                &mut tx,
-                cancelled_child_root,
-                now,
-            )
-            .await?;
-            if let Some(invocation) = woken {
-                transitioned.push(invocation.id);
-            }
+            Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
         }
 
         tx.commit().await.context("commit cancel_tree")?;
