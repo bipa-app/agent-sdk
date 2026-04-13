@@ -1,7 +1,7 @@
 //! Logical outbox message kinds and their advisory payload shapes.
 //!
 //! Phase 8.1 of the rewrite locks the contract for what may be written
-//! into [`agent_sdk_outbox`].  The outbox is the **only** path through
+//! into `agent_sdk_outbox`.  The outbox is the **only** path through
 //! which the server hands work to a broker — there is no direct publish
 //! from worker code.  This module defines what those handoffs are
 //! allowed to mean.
@@ -173,7 +173,7 @@ impl OutboxMessage {
     }
 
     /// Serialise the payload to a JSON value suitable for the
-    /// `payload_json` column of [`agent_sdk_outbox`].
+    /// `payload_json` column of `agent_sdk_outbox`.
     ///
     /// # Errors
     /// Returns an error if serialisation fails (it should not under

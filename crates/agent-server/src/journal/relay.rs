@@ -9,7 +9,8 @@
 //!   dispatches them through a publisher, and updates row status.
 //!
 //! It also defines [`TaskWakeupEmitter`], the analogue of
-//! [`AtomicEventOutboxCommitter`] for task-journal mutations:
+//! [`super::event_outbox_transaction::AtomicEventOutboxCommitter`] for
+//! task-journal mutations:
 //! same-transaction insertion of a `task_wakeup` row when a task
 //! becomes runnable.  The trait ships in 8.1; durable backends will
 //! implement it in subsequent phases as the task journal acquires the
