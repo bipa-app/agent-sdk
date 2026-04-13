@@ -1,33 +1,81 @@
--- ENG-7984 follow-up notes: these are durable-contract notes, not an
--- executable migration yet.
+-- ENG-7984 / ENG-7986 / ENG-7965 contract notes for the durable
+-- event journal and transactional outbox.  Not an executable
+-- migration — `notes/` is intentionally excluded from
+-- `sqlx::migrate!`.  Read this alongside:
 --
--- Future table: agent_sdk_committed_events
--- --------------------------------
+--   migrations/postgres/0002_event_journal_outbox.sql
+--   migrations/postgres/0004_outbox_message_kind.sql
+--   crates/agent-server/src/journal/outbox.rs
+--   crates/agent-server/src/journal/outbox_message.rs
+--   crates/agent-server/src/journal/event_outbox_transaction.rs
+--   crates/agent-server/src/journal/relay.rs
+--   crates/agent-server/src/journal/broker.rs
+--
+-- Table: agent_sdk_committed_events
+-- ---------------------------------
 -- Purpose:
---   Preserve the Phase 6 event repository's durable commit surface with
---   a thread-scoped sequence number.
+--   Authoritative thread-scoped event log.  The (thread_id, sequence)
+--   pair is the durable unique key; replay always reads from this
+--   table, never from the outbox.
 --
 -- Required contract:
---   * `(thread_id, sequence)` unique key
 --   * append-only writes
---   * batch insert in the same SQL transaction as the state changes that
---     produced the events
---   * replay window query ordered by `(thread_id, sequence)`
+--   * batch insert in the same SQL transaction as the state changes
+--     that produced the events
+--   * replay window query ordered by (thread_id, sequence)
 --
--- Future table: agent_sdk_outbox
--- --------------------
+-- Table: agent_sdk_outbox  (Phase 8.1, ENG-7965)
+-- ----------------------------------------------
 -- Purpose:
 --   Hold relay work for AMQP / pub-sub delivery without weakening the
---   journal's commit guarantees.
+--   journal's commit guarantees.  Carries advisory references only —
+--   never the body of the durable state it advertises.
 --
 -- Required contract:
---   * rows are inserted in the same SQL transaction as the durable
---     journal mutation that triggered them
---   * relay workers claim by status + next_attempt_at ordering
---   * delivery is idempotent at the consumer boundary
---   * terminal durable state never depends on successful outbox relay
+--   * Rows are inserted in the same SQL transaction as the durable
+--     mutation that triggered them:
+--       - kind = 'thread_events_available' rows are written by the
+--         AtomicEventOutboxCommitter::commit_events_with_outbox path
+--         alongside agent_sdk_committed_events.  Coalesced — exactly
+--         one row per commit batch, carrying the highest event_id /
+--         sequence in the batch.
+--       - kind = 'task_wakeup' rows are written by the
+--         TaskWakeupEmitter trait (in-memory in 8.1; durable backends
+--         pick this up in subsequent phases) alongside the
+--         agent_sdk_tasks mutation that made the task runnable.
+--         These rows carry NULL event_id / sequence; the consumer
+--         resolves the task by reading agent_sdk_tasks.
+--   * Relay workers claim by status + next_attempt_at ordering.
+--   * Relay delivery is idempotent at the consumer boundary; the
+--     broker may republish, drop, or coalesce messages.
+--   * Terminal durable state never depends on successful outbox relay.
+--
+-- Payload contract (Phase 8.1):
+--   * payload_json is the serialised matching *Payload struct from
+--     crates/agent-server/src/journal/outbox_message.rs.
+--   * Payload bodies are reference-only:
+--       - TaskWakeupPayload          → { task_id, thread_id }
+--       - ThreadEventsAvailablePayload → { thread_id, last_sequence }
+--   * The payload MUST NOT carry the kind discriminator — the kind
+--     lives in the outbox `kind` column and broker message header so
+--     consumers can route without parsing the body.
+--   * Consumers MUST resolve durable state by reading the journal
+--     (events table or task store), not by trusting the payload as
+--     authoritative.
 --
 -- Ordering note:
---   committed_events must remain the source of truth for thread-scoped
---   sequence order. The outbox is a delivery buffer, not the authority
---   for replay or ordering semantics.
+--   committed_events remains the source of truth for thread-scoped
+--   sequence order.  The outbox is a delivery buffer; queue order is
+--   not authoritative and broker republishes are permitted.
+--
+-- Table: agent_sdk_retention_cursors
+-- ----------------------------------
+-- Purpose:
+--   Per-thread retention floor.  Replay clients check the floor to
+--   detect retention gaps; the janitor advances the floor and purges
+--   old events atomically.
+--
+-- Required contract:
+--   * Floor advances monotonically (never moves backward).
+--   * Purge of agent_sdk_committed_events rows below the floor
+--     happens in the same transaction as the floor advance.

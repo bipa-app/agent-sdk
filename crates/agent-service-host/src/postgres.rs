@@ -26,7 +26,7 @@ mod tests {
 
     use super::migrations::{
         DURABLE_CORE_MIGRATOR, durable_core_migrations, event_journal_outbox_migration,
-        tool_audit_events_migration,
+        outbox_message_kind_migration, tool_audit_events_migration,
     };
     use super::repository::{
         completed_turn_units_of_work, event_journal_repository_boundaries,
@@ -77,33 +77,20 @@ mod tests {
     fn executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 4,
-            "expected 4 executable migrations (durable core + event journal + execution intents + tool audit events), got {:?}",
+            migrations.len() == 5,
+            "expected 5 executable migrations (durable core + event journal + execution intents + tool audit events + outbox kind), got {:?}",
             migrations
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
         );
-        ensure!(
-            migrations[0].version == 1,
-            "expected durable core migration version 1, got {}",
-            migrations[0].version,
-        );
-        ensure!(
-            migrations[1].version == 2,
-            "expected event journal migration version 2, got {}",
-            migrations[1].version,
-        );
-        ensure!(
-            migrations[2].version == 3,
-            "expected execution intents migration version 3, got {}",
-            migrations[2].version,
-        );
-        ensure!(
-            migrations[3].version == 4,
-            "expected tool audit events migration version 4, got {}",
-            migrations[3].version,
-        );
+        for (idx, expected) in (1_i64..=5).enumerate() {
+            ensure!(
+                migrations[idx].version == expected,
+                "expected migration version {expected}, got {}",
+                migrations[idx].version,
+            );
+        }
         Ok(())
     }
 
@@ -244,7 +231,15 @@ mod tests {
 
     #[test]
     fn event_journal_migration_covers_every_declared_table_constraint_and_index() -> Result<()> {
-        let sql = event_journal_outbox_migration();
+        // Outbox/event-journal tables are introduced in 0002 and
+        // extended by Phase 8.1's 0004 (kind discriminator + advisory
+        // payload contract).  Concatenate both so the schema checker
+        // sees the full declared surface.
+        let sql = format!(
+            "{}\n{}",
+            event_journal_outbox_migration(),
+            outbox_message_kind_migration(),
+        );
 
         for table in event_journal_outbox_tables() {
             ensure!(

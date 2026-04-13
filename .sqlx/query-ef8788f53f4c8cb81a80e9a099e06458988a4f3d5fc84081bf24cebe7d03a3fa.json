@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT id, thread_id, event_id, sequence, status, payload_json,\n       created_at, next_attempt_at, attempt_count, max_attempts,\n       last_error, claimed_by, claimed_at, delivered_at\nFROM agent_sdk_outbox\nWHERE id = $1\n",
+  "query": "\nUPDATE agent_sdk_outbox\nSET status = 'claimed', claimed_by = $1, claimed_at = $2\nWHERE id IN (\n    SELECT id FROM agent_sdk_outbox\n    WHERE status = 'pending' AND next_attempt_at <= $2\n    ORDER BY next_attempt_at, id\n    LIMIT $3\n    FOR UPDATE SKIP LOCKED\n)\nRETURNING id, kind, thread_id, event_id, sequence, status, payload_json,\n          created_at, next_attempt_at, attempt_count, max_attempts,\n          last_error, claimed_by, claimed_at, delivered_at\n",
   "describe": {
     "columns": [
       {
@@ -10,80 +10,88 @@
       },
       {
         "ordinal": 1,
-        "name": "thread_id",
+        "name": "kind",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
-        "name": "event_id",
+        "name": "thread_id",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
+        "name": "event_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
         "name": "sequence",
         "type_info": "Int8"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "payload_json",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "next_attempt_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "attempt_count",
         "type_info": "Int8"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "max_attempts",
         "type_info": "Int8"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "last_error",
         "type_info": "Text"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "claimed_by",
         "type_info": "Text"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "claimed_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "delivered_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "Timestamptz",
+        "Int8"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false,
+      true,
+      true,
       false,
       false,
       false,
@@ -96,5 +104,5 @@
       true
     ]
   },
-  "hash": "413246440c91b121b38173fc40aefe4ef15e7a4ca60a6a6f887b2f95bdfdc16b"
+  "hash": "ef8788f53f4c8cb81a80e9a099e06458988a4f3d5fc84081bf24cebe7d03a3fa"
 }

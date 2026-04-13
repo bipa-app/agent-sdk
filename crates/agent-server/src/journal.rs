@@ -559,6 +559,7 @@
 //! - [`live_tail::LiveTailConfig`] controls buffer capacity and grace
 //!   period duration.
 
+pub mod broker;
 pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod commit;
@@ -576,10 +577,12 @@ mod live_tail_test;
 pub mod message;
 pub mod message_store;
 pub mod outbox;
+pub mod outbox_message;
 #[cfg(test)]
 mod persistence_regression;
 pub mod recovery;
 pub mod redaction;
+pub mod relay;
 #[cfg(test)]
 mod replay_test;
 pub mod retention;
@@ -594,6 +597,7 @@ pub mod tool_audit;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
 
+pub use broker::{BrokerAdapter, InMemoryBrokerAdapter};
 pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
@@ -617,11 +621,18 @@ pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use outbox::{
     InMemoryOutboxStore, NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
 };
+pub use outbox_message::{
+    OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
+};
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
 pub use redaction::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
+};
+pub use relay::{
+    BrokerPublisher, InMemoryTaskWakeupEmitter, OutboxRelayWorker, Publisher, RelayTick,
+    RelayWorker, RetryBackoff, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};

@@ -36,11 +36,15 @@ const TOOL_AUDIT_EVENTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0004_tool_audit_events.sql"
 ));
+const OUTBOX_MESSAGE_KIND_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0005_outbox_message_kind.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 4] = [
+const MIGRATIONS: [SqliteMigration; 5] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -60,6 +64,11 @@ const MIGRATIONS: [SqliteMigration; 4] = [
         version: "0004",
         summary: "durable tool audit events for child-task execution lifecycle",
         sql: TOOL_AUDIT_EVENTS_SQL,
+    },
+    SqliteMigration {
+        version: "0005",
+        summary: "Phase 8.1 outbox message kind discriminator and advisory payload contract",
+        sql: OUTBOX_MESSAGE_KIND_SQL,
     },
 ];
 
@@ -101,4 +110,10 @@ pub const fn execution_intents_migration() -> &'static str {
 #[must_use]
 pub const fn tool_audit_events_migration() -> &'static str {
     TOOL_AUDIT_EVENTS_SQL
+}
+
+/// The reviewable Phase 8.1 outbox message-kind migration SQL.
+#[must_use]
+pub const fn outbox_message_kind_migration() -> &'static str {
+    OUTBOX_MESSAGE_KIND_SQL
 }

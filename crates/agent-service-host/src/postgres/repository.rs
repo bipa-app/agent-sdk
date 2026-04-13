@@ -212,15 +212,16 @@ const EVENT_JOURNAL_REPOSITORIES: &[RepositoryBoundary] = &[
         reads: OUTBOX_READS,
         writes: OUTBOX_WRITES,
         invariants: &[
-            "outbox rows are created only inside an event-commit transaction",
+            "Phase 8.1: rows are created only inside the durable transaction that wrote the state they advertise (events for `thread_events_available`, task journal mutation for `task_wakeup`)",
             "the outbox is a delivery buffer, not the authority for ordering",
             "relay workers claim by `next_attempt_at` ordering for fair scheduling",
             "terminal durable state never depends on successful relay",
-            "delivery is idempotent at the consumer boundary",
+            "delivery is idempotent at the consumer boundary; the broker may republish",
+            "queue payloads are advisory: they carry only durable references, never the body of the state they advertise",
             "claim fields (claimed_by, claimed_at) are all-or-nothing",
             "failed/expired rows always carry a last_error message",
         ],
-        transaction_notes: "`insert_batch` participates in the same SQL transaction as `commit_event_batch`. Claim, deliver, and fail operations are independent single-row mutations. Stale-claim sweeps may reclaim rows whose relay worker has died.",
+        transaction_notes: "`insert_batch` participates in the same SQL transaction as the journal mutation that triggered the row — `commit_event_batch` for `thread_events_available`, the task-journal mutation for `task_wakeup`. Claim, deliver, and fail operations are independent single-row mutations. Stale-claim sweeps may reclaim rows whose relay worker has died.",
     },
     RepositoryBoundary {
         name: "retention_repository",
@@ -242,7 +243,7 @@ const EVENT_JOURNAL_UNITS_OF_WORK: &[UnitOfWorkContract] = &[
     UnitOfWorkContract {
         name: "commit_events_with_outbox",
         tables: &["agent_sdk_committed_events", "agent_sdk_outbox"],
-        requirement: "Insert committed events and their corresponding outbox rows in one SQL transaction. Either all rows commit or none do. This is the only path that creates outbox rows.",
+        requirement: "Phase 8.1: insert committed events and exactly one coalesced `thread_events_available` outbox row in one SQL transaction. The single row references the highest committed event in the batch and carries an advisory `{thread_id, last_sequence}` payload. Either all rows commit or none do.",
     },
     UnitOfWorkContract {
         name: "advance_retention_floor",
