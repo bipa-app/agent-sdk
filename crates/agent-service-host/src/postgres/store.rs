@@ -3377,10 +3377,9 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
         .await
         .with_context(|| format!("mark outbox row {id} delivered"))?;
 
-        ensure!(
-            result.rows_affected() > 0,
-            "outbox row not found or already terminal: {id}",
-        );
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -3428,10 +3427,9 @@ WHERE id = $1 AND status NOT IN ('delivered', 'expired')
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
 
-        ensure!(
-            result.rows_affected() > 0,
-            "outbox row not found or already terminal: {id}",
-        );
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -3463,7 +3461,7 @@ SELECT id, kind, thread_id, event_id, sequence, status, payload_json,
        last_error, claimed_by, claimed_at, delivered_at
 FROM agent_sdk_outbox
 WHERE thread_id = $1
-ORDER BY sequence
+ORDER BY sequence NULLS LAST, id
 ",
             thread_key(thread_id),
         )
@@ -5387,6 +5385,135 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_mark_delivered_is_noop_when_row_was_cascade_deleted() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-delivered-missing");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+        let row_id = outcome
+            .outbox_row
+            .context("outbox row should exist for committed event batch")?
+            .id;
+
+        RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
+        assert!(OutboxStore::get(&store, &row_id).await?.is_none());
+
+        OutboxStore::mark_delivered(&store, &row_id, t_plus(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_mark_failed_is_noop_when_row_was_cascade_deleted() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-failed-missing");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+        let row_id = outcome
+            .outbox_row
+            .context("outbox row should exist for committed event batch")?
+            .id;
+
+        RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
+        assert!(OutboxStore::get(&store, &row_id).await?.is_none());
+
+        OutboxStore::mark_failed(&store, &row_id, "timeout", t_plus(3), t_plus(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
+        };
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-order");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+
+        let task_id = AgentTaskId::new();
+        let payload = OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id,
+            thread_id: thread_id.clone(),
+        })
+        .to_payload_json()?;
+        OutboxStore::insert_batch(
+            &store,
+            vec![NewOutboxRow {
+                kind: OutboxMessageKind::TaskWakeup,
+                thread_id: thread_id.clone(),
+                event_id: None,
+                sequence: None,
+                payload_json: payload,
+                max_attempts: 3,
+                now: t_plus(1),
+            }],
+        )
+        .await?;
+
+        let rows = OutboxStore::list_by_thread(&store, &thread_id).await?;
+        let kinds: Vec<OutboxMessageKind> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::TaskWakeup,
+            ]
+        );
 
         Ok(())
     }

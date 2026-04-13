@@ -442,7 +442,11 @@ mod tests {
     impl Publisher for FlakyPublisher {
         async fn publish_row(&self, _row: &OutboxRow) -> Result<()> {
             let still_failing = {
-                let mut remaining = self.failures_remaining.lock().expect("lock poisoned");
+                let mut remaining = self
+                    .failures_remaining
+                    .lock()
+                    .ok()
+                    .context("lock poisoned")?;
                 if *remaining > 0 {
                     *remaining -= 1;
                     true

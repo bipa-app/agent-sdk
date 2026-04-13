@@ -476,7 +476,7 @@ impl OutboxStore for InMemoryOutboxStore {
             .cloned()
             .collect();
         drop(inner);
-        rows.sort_by_key(|r| r.sequence);
+        rows.sort_by_key(|r| (r.sequence.is_none(), r.sequence, r.id.clone()));
         Ok(rows)
     }
 
@@ -521,47 +521,53 @@ mod tests {
         ThreadId::from_string("t-outbox-a")
     }
 
-    fn thread_events_payload(thread_id: &ThreadId, last_sequence: u64) -> serde_json::Value {
+    fn thread_events_payload(
+        thread_id: &ThreadId,
+        last_sequence: u64,
+    ) -> Result<serde_json::Value> {
         OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
             thread_id: thread_id.clone(),
             last_sequence,
         })
         .to_payload_json()
-        .expect("serialise thread_events_available payload")
+        .context("serialise thread_events_available payload")
     }
 
-    fn task_wakeup_payload(task_id: &AgentTaskId, thread_id: &ThreadId) -> serde_json::Value {
+    fn task_wakeup_payload(
+        task_id: &AgentTaskId,
+        thread_id: &ThreadId,
+    ) -> Result<serde_json::Value> {
         OutboxMessage::TaskWakeup(TaskWakeupPayload {
             task_id: task_id.clone(),
             thread_id: thread_id.clone(),
         })
         .to_payload_json()
-        .expect("serialise task_wakeup payload")
+        .context("serialise task_wakeup payload")
     }
 
-    fn sample_new_row(thread_id: &ThreadId, seq: u64, now: OffsetDateTime) -> NewOutboxRow {
-        NewOutboxRow {
+    fn sample_new_row(thread_id: &ThreadId, seq: u64, now: OffsetDateTime) -> Result<NewOutboxRow> {
+        Ok(NewOutboxRow {
             kind: OutboxMessageKind::ThreadEventsAvailable,
             thread_id: thread_id.clone(),
             event_id: Some(uuid::Uuid::now_v7()),
             sequence: Some(seq),
-            payload_json: thread_events_payload(thread_id, seq),
+            payload_json: thread_events_payload(thread_id, seq)?,
             max_attempts: 3,
             now,
-        }
+        })
     }
 
-    fn sample_task_wakeup_row(thread_id: &ThreadId, now: OffsetDateTime) -> NewOutboxRow {
+    fn sample_task_wakeup_row(thread_id: &ThreadId, now: OffsetDateTime) -> Result<NewOutboxRow> {
         let task_id = AgentTaskId::new();
-        NewOutboxRow {
+        Ok(NewOutboxRow {
             kind: OutboxMessageKind::TaskWakeup,
             thread_id: thread_id.clone(),
             event_id: None,
             sequence: None,
-            payload_json: task_wakeup_payload(&task_id, thread_id),
+            payload_json: task_wakeup_payload(&task_id, thread_id)?,
             max_attempts: 3,
             now,
-        }
+        })
     }
 
     #[tokio::test]
@@ -569,8 +575,8 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         let rows = store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
@@ -595,7 +601,7 @@ mod tests {
     async fn claim_pending_transitions_to_claimed() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
 
         let claimed = store.claim_pending("worker-1", 10, t_plus(1)).await?;
@@ -610,9 +616,9 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
-                sample_new_row(&thread_a(), 2, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
+                sample_new_row(&thread_a(), 2, t0())?,
             ])
             .await?;
 
@@ -625,7 +631,7 @@ mod tests {
     async fn mark_delivered_transitions_to_terminal() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -634,7 +640,7 @@ mod tests {
 
         store.mark_delivered(id, t_plus(2)).await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
         assert!(row.delivered_at.is_some());
         Ok(())
@@ -644,7 +650,7 @@ mod tests {
     async fn mark_failed_retries_within_budget() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -653,7 +659,7 @@ mod tests {
             .mark_failed(id, "connection refused", t_plus(60), t_plus(2))
             .await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Pending);
         assert_eq!(row.attempt_count, 1);
         // Pending rows must have NULL last_error per the outbox_error_check constraint.
@@ -664,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn mark_failed_expires_when_budget_exhausted() -> Result<()> {
         let store = InMemoryOutboxStore::new();
-        let mut params = sample_new_row(&thread_a(), 0, t0());
+        let mut params = sample_new_row(&thread_a(), 0, t0())?;
         params.max_attempts = 1;
         let rows = store.insert_batch(vec![params]).await?;
         let id = &rows[0].id;
@@ -674,7 +680,7 @@ mod tests {
             .mark_failed(id, "timeout", t_plus(60), t_plus(2))
             .await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Expired);
         assert!(row.status.is_terminal());
         Ok(())
@@ -684,7 +690,7 @@ mod tests {
     async fn mark_delivered_is_idempotent_on_terminal() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -692,7 +698,7 @@ mod tests {
         store.mark_delivered(id, t_plus(2)).await?;
         store.mark_delivered(id, t_plus(3)).await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
         Ok(())
     }
@@ -702,8 +708,8 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
@@ -721,9 +727,9 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 2, t0()),
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 2, t0())?,
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
@@ -739,7 +745,7 @@ mod tests {
     async fn task_wakeup_row_skips_event_references() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_task_wakeup_row(&thread_a(), t0())])
+            .insert_batch(vec![sample_task_wakeup_row(&thread_a(), t0())?])
             .await?;
 
         assert_eq!(rows.len(), 1);
@@ -760,7 +766,7 @@ mod tests {
     async fn thread_events_row_carries_event_references() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 7, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 7, t0())?])
             .await?;
 
         assert_eq!(rows[0].kind, OutboxMessageKind::ThreadEventsAvailable);
@@ -779,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn invariant_rejects_thread_events_without_sequence() -> Result<()> {
         let store = InMemoryOutboxStore::new();
-        let mut row = sample_new_row(&thread_a(), 0, t0());
+        let mut row = sample_new_row(&thread_a(), 0, t0())?;
         row.sequence = None;
         let result = store.insert_batch(vec![row]).await;
         assert!(
@@ -792,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn invariant_rejects_task_wakeup_with_event_references() -> Result<()> {
         let store = InMemoryOutboxStore::new();
-        let mut row = sample_task_wakeup_row(&thread_a(), t0());
+        let mut row = sample_task_wakeup_row(&thread_a(), t0())?;
         row.event_id = Some(uuid::Uuid::now_v7());
         let result = store.insert_batch(vec![row]).await;
         assert!(
@@ -807,24 +813,24 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_task_wakeup_row(&thread_a(), t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_task_wakeup_row(&thread_a(), t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
         let rows = store.list_by_thread(&thread_a()).await?;
-        // `list_by_thread` sorts by sequence; task_wakeup rows (None
-        // sequence) sort before numeric sequences in our helper since
-        // None < Some(_) for Option<u64>.  This is informational, not
-        // a load-bearing contract — the relay worker uses
-        // `claim_pending` which orders by next_attempt_at.
-        let task_wakeup_present = rows.iter().any(|r| r.kind == OutboxMessageKind::TaskWakeup);
-        let thread_events_present = rows
-            .iter()
-            .any(|r| r.kind == OutboxMessageKind::ThreadEventsAvailable);
-        assert!(task_wakeup_present);
-        assert!(thread_events_present);
+        let kinds: Vec<OutboxMessageKind> = rows.iter().map(|r| r.kind).collect();
+        let seqs: Vec<Option<u64>> = rows.iter().map(|r| r.sequence).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::TaskWakeup,
+            ]
+        );
+        assert_eq!(seqs, vec![Some(0), Some(1), None]);
         Ok(())
     }
 
@@ -835,7 +841,7 @@ mod tests {
         // payload body, which is explicitly out of contract.
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let payload = rows[0]
             .payload_json
