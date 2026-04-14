@@ -35,7 +35,7 @@
 //! The nudge itself is just a [`tokio::sync::Notify`] — it buffers one
 //! permit and wakes at most one idle worker.  Every worker that receives
 //! the nudge runs
-//! [`AgentTaskStore::acquire_next_runnable`](super::store::AgentTaskStore::acquire_next_runnable),
+//! [`AgentTaskStore::acquire_next_runnable`],
 //! which is the single place the
 //! `Pending → Running` CAS lives.  Two consumers that deliver the same
 //! wakeup therefore resolve into **exactly one execution**: whichever
@@ -52,7 +52,7 @@
 //!    to a single worker awakening (any extra permits fold into the
 //!    same one).
 //! 3. The `Pending → Running` CAS in
-//!    [`AgentTaskStore::acquire_next_runnable`](super::store::AgentTaskStore::acquire_next_runnable)
+//!    [`AgentTaskStore::acquire_next_runnable`]
 //!    is serialised by the store write lock — two workers racing on
 //!    the same row observe exactly one `Some(task)` winner.
 //!
@@ -63,9 +63,9 @@
 //! # Fallback sweeps
 //!
 //! The worker pool's acquisition ticker (see
-//! [`agent_service_host::config::WorkerConfig::acquisition_interval`])
+//! `agent_service_host::config::WorkerConfig::acquisition_interval`)
 //! runs every `acquisition_interval_secs` and calls
-//! [`AgentTaskStore::acquire_next_runnable`](super::store::AgentTaskStore::acquire_next_runnable)
+//! [`AgentTaskStore::acquire_next_runnable`]
 //! unconditionally.  If the broker is unreachable or a wakeup is lost
 //! in-flight, the ticker still fires and the work still moves.
 //! `WakeupSignal` is therefore purely a latency optimisation — every
