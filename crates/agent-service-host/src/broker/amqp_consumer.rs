@@ -39,12 +39,15 @@
 //!
 //! The consumer's `run` future is driven until a
 //! [`CancellationToken`] fires.  When it fires the consumer stops
-//! pulling new deliveries, flushes any in-flight ack / nack, cancels
-//! the broker-side consumer subscription, and closes the channel.
-//! Any delivery that was mid-handler when cancel arrived is **nacked
-//! with requeue** so the journal-backed contract stays intact — the
-//! broker will redeliver and another consumer (this pod's next boot
-//! or a sibling pod) will re-check the journal.
+//! pulling new deliveries, cancels the broker-side consumer
+//! subscription, and closes the channel.  The biased `select!` only
+//! observes cancellation between loop iterations, so a
+//! `handle_delivery` call that is already in flight runs to
+//! completion with its normal outcome: success → `ack`, handler error
+//! → `nack` with requeue.  Any deliveries that were buffered in the
+//! consumer stream but never pulled are requeued automatically when
+//! the channel is closed, so the journal-backed contract still holds:
+//! the broker redelivers and the next consumer re-checks the journal.
 
 use std::sync::Arc;
 
@@ -177,7 +180,17 @@ impl AmqpTaskWakeupConsumer {
             "task wakeup consumer starting",
         );
 
-        let (channel, mut consumer) = self.open_consumer().await?;
+        // Race the connection handshake against cancellation so a
+        // shutdown that fires while the broker is unreachable does not
+        // stall the drain behind the OS TCP SYN timeout.
+        let (channel, mut consumer) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                info!("task wakeup consumer cancelled during connection establishment");
+                return Ok(());
+            }
+            result = self.open_consumer() => result?,
+        };
         let consumer_tag = consumer.tag().to_string();
 
         loop {

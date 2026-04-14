@@ -281,12 +281,26 @@ async fn supervise_amqp_consumer(
 
 /// Handle returned by [`WakeupScheduler::spawn`].
 ///
-/// Drops cancel the scheduler's loops; prefer an explicit
-/// [`Self::shutdown`] so the caller can await drain.
+/// Dropping the handle fires the shared [`CancellationToken`] so the
+/// scheduler's loops exit on their own, but does **not** await their
+/// drain — the tasks are detached.  Prefer an explicit
+/// [`Self::shutdown`] so the caller can await drain and surface any
+/// background-task errors.
 pub struct WakeupSchedulerHandle {
     cancel: CancellationToken,
     fallback: Option<JoinHandle<()>>,
     consumer: Option<JoinHandle<Result<()>>>,
+}
+
+impl Drop for WakeupSchedulerHandle {
+    fn drop(&mut self) {
+        // `CancellationToken` clones share state, so cancelling here
+        // signals every clone held by the sweep and consumer tasks —
+        // which matches the struct-level doc guarantee.  The tasks
+        // themselves are detached; callers that need drain semantics
+        // must use `shutdown`.
+        self.cancel.cancel();
+    }
 }
 
 impl WakeupSchedulerHandle {
