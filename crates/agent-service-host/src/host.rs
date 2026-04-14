@@ -153,6 +153,21 @@ impl ServiceHost {
                 "storage.postgres.max_connections must be > 0"
             );
         }
+        if config.relay.enabled {
+            anyhow::ensure!(config.relay.batch_size > 0, "relay.batch_size must be > 0");
+            anyhow::ensure!(
+                config.relay.poll_interval_secs > 0,
+                "relay.poll_interval_secs must be > 0"
+            );
+            anyhow::ensure!(
+                config.relay.claim_lease_secs > 0,
+                "relay.claim_lease_secs must be > 0"
+            );
+            anyhow::ensure!(
+                config.relay.reclaim_interval_secs > 0,
+                "relay.reclaim_interval_secs must be > 0"
+            );
+        }
         Ok(())
     }
 

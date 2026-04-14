@@ -48,6 +48,7 @@ use agent_server::journal::broker::BrokerAdapter;
 use agent_server::journal::outbox_message::{OutboxMessage, OutboxMessageKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use lapin::message::BasicReturnMessage;
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions};
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::{FieldTable, ShortString};
@@ -229,6 +230,45 @@ impl AmqpBrokerAdapter {
         }
         Ok(state)
     }
+
+    async fn invalidate_channel(&self) {
+        *self.channel.lock().await = None;
+    }
+
+    async fn publish_with_confirm(
+        &self,
+        routing_key: &str,
+        payload: &[u8],
+        properties: BasicProperties,
+    ) -> Result<Confirmation> {
+        let mut slot = self.channel.lock().await;
+        let confirm_future = {
+            let state = self.ensure_channel(&mut slot).await?;
+            debug!(
+                exchange = %self.config.exchange,
+                routing_key = %routing_key,
+                "publishing outbox message",
+            );
+            state
+                .channel
+                .basic_publish(
+                    &self.config.exchange,
+                    routing_key,
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..BasicPublishOptions::default()
+                    },
+                    payload,
+                    properties,
+                )
+                .await
+                .context("send AMQP basic.publish frame")?
+        };
+        // Drop the channel lock before awaiting the confirmation so
+        // other publishers can pipeline their sends while we wait.
+        drop(slot);
+        confirm_future.await.context("await AMQP publisher confirm")
+    }
 }
 
 #[async_trait]
@@ -247,45 +287,32 @@ impl BrokerAdapter for AmqpBrokerAdapter {
             // to disk before acking when the target queue is durable.
             .with_delivery_mode(2);
 
-        let mut slot = self.channel.lock().await;
-        let confirm_future = {
-            let state = self.ensure_channel(&mut slot).await?;
-            debug!(
-                exchange = %self.config.exchange,
-                routing_key = %routing_key,
-                kind = %message.kind(),
-                "publishing outbox message",
-            );
-            state
-                .channel
-                .basic_publish(
-                    &self.config.exchange,
-                    &routing_key,
-                    BasicPublishOptions::default(),
-                    &payload,
-                    properties,
-                )
-                .await
-                .context("send AMQP basic.publish frame")?
-        };
-        // Drop the channel lock before awaiting the confirmation so
-        // other publishers can pipeline their sends while we wait.
-        drop(slot);
-        let result = confirm_future
+        let result = match self
+            .publish_with_confirm(&routing_key, &payload, properties)
             .await
-            .context("await AMQP publisher confirm")?;
+        {
+            Ok(result) => result,
+            Err(err) => {
+                self.invalidate_channel().await;
+                return Err(err);
+            }
+        };
 
         match result {
-            Confirmation::Ack(_) => Ok(()),
+            Confirmation::Ack(None) => Ok(()),
+            Confirmation::Ack(Some(returned)) => {
+                Err(unroutable_publish_error(&routing_key, &returned))
+            }
             Confirmation::Nack(_) => {
                 // Drop the channel so the next publish reconnects; a
                 // nack typically signals a routing or resource problem
                 // the broker wants us to notice.
                 warn!("AMQP broker nacked publish; dropping channel for reconnect");
-                *self.channel.lock().await = None;
+                self.invalidate_channel().await;
                 anyhow::bail!("AMQP broker nacked publish")
             }
             Confirmation::NotRequested => {
+                self.invalidate_channel().await;
                 anyhow::bail!(
                     "AMQP publisher confirms were not enabled on the channel; cannot guarantee delivery",
                 )
@@ -312,6 +339,14 @@ fn redact_url(url: &str) -> String {
     )
 }
 
+fn unroutable_publish_error(routing_key: &str, returned: &BasicReturnMessage) -> anyhow::Error {
+    anyhow::anyhow!(
+        "AMQP broker returned unroutable publish for routing key {routing_key}: {} ({})",
+        returned.reply_text,
+        returned.reply_code,
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
@@ -319,6 +354,9 @@ fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lapin::acker::Acker;
+    use lapin::message::Delivery;
+    use lapin::types::ShortString;
 
     #[test]
     fn routing_key_embeds_kind() {
@@ -384,5 +422,38 @@ mod tests {
             ExchangeKind::from(AmqpExchangeKind::Fanout),
             ExchangeKind::Fanout
         ));
+    }
+
+    #[test]
+    fn publish_uses_mandatory_routing() {
+        let options = BasicPublishOptions {
+            mandatory: true,
+            ..BasicPublishOptions::default()
+        };
+        assert!(options.mandatory);
+        assert!(!options.immediate);
+    }
+
+    #[test]
+    fn unroutable_publish_error_mentions_routing_key_and_reply() {
+        let returned = BasicReturnMessage {
+            delivery: Delivery {
+                delivery_tag: 0,
+                exchange: ShortString::from("agent_sdk.outbox"),
+                routing_key: ShortString::from("agent_sdk.outbox.task_wakeup"),
+                redelivered: false,
+                properties: BasicProperties::default(),
+                data: Vec::new(),
+                acker: Acker::mock(),
+            },
+            reply_code: 312,
+            reply_text: ShortString::from("NO_ROUTE"),
+        };
+
+        let error = unroutable_publish_error("agent_sdk.outbox.task_wakeup", &returned);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("agent_sdk.outbox.task_wakeup"));
+        assert!(rendered.contains("NO_ROUTE"));
+        assert!(rendered.contains("312"));
     }
 }

@@ -41,10 +41,10 @@
 //! what [`OutboxStore::reclaim_expired_claims`] — added in Phase 8.2 —
 //! does, and it runs here under two triggers:
 //!
-//! 1. **On startup**, with `claim_lease = ZERO`, so every row currently
-//!    marked `Claimed` is returned to `Pending` before the worker
-//!    enters the backfill loop.  This is safe because a fresh worker
-//!    has no legitimate active claims.
+//! 1. **On startup**, with the configured `claim_lease`, so rows
+//!    abandoned by a previously-crashed worker are reclaimed before
+//!    the new worker enters the backfill loop without stealing fresh
+//!    claims from still-live peers during a rolling restart.
 //! 2. **Periodically during steady state**, with the configured
 //!    `claim_lease`, so rows claimed by siblings that subsequently
 //!    crashed get rescued automatically.
@@ -177,19 +177,24 @@ impl RelayScheduler {
     }
 
     /// Reclaim every currently-`Claimed` row before the relay starts
-    /// processing new work.  Used on startup after a crash to return
-    /// stuck rows to `Pending`.
+    /// processing new work when the claim lease has already expired.
+    /// Used on startup after a crash to return stuck rows to `Pending`
+    /// without stealing fresh claims from still-live peers.
     ///
     /// # Errors
     /// Returns an error if the store reclaim query fails.
     pub async fn reclaim_on_startup(&self, now: OffsetDateTime) -> Result<u64> {
         let reclaimed = self
             .store
-            .reclaim_expired_claims(now, TimeDuration::ZERO)
+            .reclaim_expired_claims(now, self.config.claim_lease)
             .await
             .context("startup reclaim of outbox claims")?;
         if reclaimed > 0 {
-            info!(reclaimed, "reclaimed crashed-worker claims before backfill",);
+            info!(
+                reclaimed,
+                claim_lease_secs = self.config.claim_lease.whole_seconds(),
+                "reclaimed stale outbox claims before backfill",
+            );
         }
         Ok(reclaimed)
     }
@@ -234,6 +239,9 @@ impl RelayScheduler {
                 claimed = tick.claimed,
                 "relay backfill tick",
             );
+            if tick.failed > 0 || tick.expired > 0 {
+                self.mark_degraded();
+            }
 
             if tick.claimed == 0 {
                 info!(
@@ -243,7 +251,11 @@ impl RelayScheduler {
                     expired = outcome.expired,
                     "relay backfill drained",
                 );
-                self.mark_healthy();
+                if outcome.failed > 0 || outcome.expired > 0 {
+                    self.mark_degraded();
+                } else {
+                    self.mark_healthy();
+                }
                 return Ok(outcome);
             }
         }
@@ -262,6 +274,10 @@ impl RelayScheduler {
     ) {
         info!(worker_id = %self.config.worker_id, "relay steady state starting");
         let mut reclaim_timer = tokio::time::interval(self.config.reclaim_interval);
+        let mut latency_layer_degraded = self
+            .health
+            .as_ref()
+            .is_some_and(|health| health.snapshot().latency_layer == LatencyLayerHealth::Degraded);
         // The first tick fires immediately — skip it so we don't
         // reclaim right after the startup reclaim already ran.
         reclaim_timer.tick().await;
@@ -288,6 +304,7 @@ impl RelayScheduler {
                         Ok(_) => {}
                         Err(err) => {
                             warn!(error = %err, "claim reclaim failed");
+                            latency_layer_degraded = true;
                             self.mark_degraded();
                         }
                     }
@@ -297,7 +314,9 @@ impl RelayScheduler {
                         Ok(tick) if tick.claimed == 0 => {
                             // No work — sleep out the poll interval,
                             // unless we're shutting down.
-                            self.mark_healthy();
+                            if !latency_layer_degraded {
+                                self.mark_healthy();
+                            }
                             tokio::select! {
                                 () = cancel.cancelled() => {
                                     info!("relay steady state shutting down");
@@ -314,10 +333,17 @@ impl RelayScheduler {
                                 claimed = tick.claimed,
                                 "relay steady-state tick",
                             );
-                            self.mark_healthy();
+                            if tick.failed > 0 || tick.expired > 0 {
+                                latency_layer_degraded = true;
+                                self.mark_degraded();
+                            } else {
+                                latency_layer_degraded = false;
+                                self.mark_healthy();
+                            }
                         }
                         Err(err) => {
                             warn!(error = %err, "relay tick failed");
+                            latency_layer_degraded = true;
                             self.mark_degraded();
                             // Back off before retrying so we don't pin
                             // a CPU spinning through a broken broker.
@@ -667,10 +693,10 @@ mod tests {
             },
         );
         second
-            .reclaim_on_startup(t0() + TimeDuration::seconds(10))
+            .reclaim_on_startup(t0() + TimeDuration::seconds(40))
             .await?;
         let outcome = second
-            .run_backfill(&cancel, || t0() + TimeDuration::seconds(10))
+            .run_backfill(&cancel, || t0() + TimeDuration::seconds(40))
             .await?;
 
         // Second worker must republish every reclaimed row.
@@ -689,6 +715,32 @@ mod tests {
         }
         // Keep broker2 alive to silence unused warnings.
         drop(broker2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_reclaim_skips_live_claims_from_other_workers() -> Result<()> {
+        let store: Arc<dyn OutboxStore> = Arc::new(InMemoryOutboxStore::new());
+        seed_rows(&store, 1).await?;
+        store.claim_pending("worker-live", 8, t0()).await?;
+
+        let scheduler = RelayScheduler::new(
+            Arc::clone(&store),
+            Arc::new(InMemoryBrokerAdapter::new()),
+            RelaySchedulerConfig {
+                claim_lease: TimeDuration::seconds(30),
+                ..test_config()
+            },
+        );
+        let reclaimed = scheduler
+            .reclaim_on_startup(t0() + TimeDuration::seconds(10))
+            .await?;
+        assert_eq!(reclaimed, 0);
+
+        let rows = store.list_by_thread(&thread_id()).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, OutboxStatus::Claimed);
+        assert_eq!(rows[0].claimed_by.as_deref(), Some("worker-live"));
         Ok(())
     }
 
@@ -742,6 +794,35 @@ mod tests {
         for row in rows {
             assert_eq!(row.status, OutboxStatus::Delivered);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_publish_marks_latency_layer_degraded() -> Result<()> {
+        let store: Arc<dyn OutboxStore> = Arc::new(InMemoryOutboxStore::new());
+        seed_rows(&store, 1).await?;
+        let health = HealthSurface::shared();
+
+        let publisher: Arc<dyn Publisher> = Arc::new(AlwaysFailPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let worker: Arc<dyn RelayWorker> = Arc::new(OutboxRelayWorker::new(
+            Arc::clone(&store),
+            publisher,
+            16,
+            RetryBackoff::fixed_seconds(30),
+        ));
+        let scheduler = RelayScheduler::with_worker(Arc::clone(&store), worker, test_config())
+            .with_health(Arc::clone(&health));
+
+        let outcome = scheduler
+            .run_backfill(&CancellationToken::new(), t0)
+            .await?;
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(
+            health.snapshot().latency_layer,
+            LatencyLayerHealth::Degraded
+        );
         Ok(())
     }
 }
