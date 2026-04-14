@@ -210,8 +210,58 @@ fn spawn_amqp_consumer_if_enabled(
         return None;
     }
     let config = section.config.clone();
-    let consumer = AmqpTaskWakeupConsumer::new(config, handler);
-    Some(tokio::spawn(async move { consumer.run(cancel).await }))
+    Some(tokio::spawn(async move {
+        supervise_amqp_consumer(config, handler, cancel).await
+    }))
+}
+
+/// Supervise the AMQP consumer, restarting it after broker-side stream
+/// close or transient error with a bounded backoff.
+///
+/// The consumer is purely a latency optimisation — the worker
+/// acquisition ticker and [`FallbackWakeupSweep`] keep the journal
+/// moving while the consumer is down.  This supervisor exists only so
+/// the fast path recovers on its own after a broker restart, network
+/// blip, or channel recycle.
+#[cfg(feature = "amqp")]
+async fn supervise_amqp_consumer(
+    config: AmqpTaskWakeupConsumerConfig,
+    handler: Arc<dyn TaskWakeupHandler>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let consumer = AmqpTaskWakeupConsumer::new(config.clone(), Arc::clone(&handler));
+        match consumer.run(cancel.clone()).await {
+            Ok(()) if cancel.is_cancelled() => return Ok(()),
+            Ok(()) => {
+                warn!(
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "task wakeup consumer exited cleanly; restarting after backoff",
+                );
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "task wakeup consumer exited with error; restarting after backoff",
+                );
+            }
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -237,9 +287,18 @@ impl WakeupSchedulerHandle {
 
     /// Cancel the scheduler and await its drain.
     ///
+    /// Panics or errors from the background tasks are logged at
+    /// `warn!` level and swallowed — the consumer is a latency
+    /// optimisation and the fallback sweep is unconditional, so
+    /// shutdown should never fail the host's top-level drain.  The
+    /// `Result` is kept so the signature matches
+    /// [`crate::relay::RelaySchedulerHandle::shutdown`] and so future
+    /// error paths can be added without churning callers.
+    ///
     /// # Errors
-    /// Returns an error if either background task panicked or the
-    /// consumer exited with a non-transient error.
+    /// Currently never returns `Err`.  Callers should still use `?`
+    /// to stay forward-compatible if a future change propagates
+    /// errors instead of logging them.
     pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
         if let Some(handle) = self.fallback.take()

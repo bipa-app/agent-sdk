@@ -206,7 +206,7 @@ impl AmqpTaskWakeupConsumer {
                                 .context("AMQP task wakeup consumer stream error"));
                         }
                         None => {
-                            info!("task wakeup consumer stream closed by broker; reconnecting on next poll cycle");
+                            info!("task wakeup consumer stream closed by broker; exiting so the supervisor can restart with a fresh connection");
                             self.invalidate_connection().await;
                             return Ok(());
                         }
@@ -223,7 +223,7 @@ impl AmqpTaskWakeupConsumer {
                 *slot = Some(self.open_connection().await?);
             }
             slot.as_ref()
-                .expect("connection state populated above")
+                .context("connection state populated above")?
                 .channel
                 .clone()
         };
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn config_round_trips_through_yaml() {
+    fn config_round_trips_through_yaml() -> Result<()> {
         let config = AmqpTaskWakeupConsumerConfig {
             queue: "agent_sdk.wakeup.test".into(),
             consumer_tag_prefix: "pod-one".into(),
@@ -452,12 +452,14 @@ mod tests {
             bind_queue: true,
             ..AmqpTaskWakeupConsumerConfig::default()
         };
-        let yaml = serde_yaml::to_string(&config).expect("serialise");
-        let parsed: AmqpTaskWakeupConsumerConfig = serde_yaml::from_str(&yaml).expect("round trip");
+        let yaml = serde_yaml::to_string(&config).context("serialise")?;
+        let parsed: AmqpTaskWakeupConsumerConfig =
+            serde_yaml::from_str(&yaml).context("round trip")?;
         assert_eq!(parsed.queue, config.queue);
         assert_eq!(parsed.consumer_tag_prefix, config.consumer_tag_prefix);
         assert!(parsed.declare_queue);
         assert!(parsed.bind_queue);
+        Ok(())
     }
 
     #[test]
