@@ -155,6 +155,12 @@ impl ServiceHost {
                 "storage.postgres.max_connections must be > 0"
             );
         }
+        if config.wakeup.enabled {
+            anyhow::ensure!(
+                config.wakeup.fallback_interval_secs > 0,
+                "wakeup.fallback_interval_secs must be > 0"
+            );
+        }
         if config.relay.enabled {
             anyhow::ensure!(config.relay.batch_size > 0, "relay.batch_size must be > 0");
             anyhow::ensure!(

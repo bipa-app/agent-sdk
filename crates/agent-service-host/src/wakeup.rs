@@ -231,6 +231,9 @@ async fn supervise_amqp_consumer(
 ) -> Result<()> {
     const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Runs that last at least this long are considered "stable" and
+    /// reset the backoff so a later disconnect reconnects fast.
+    const STABILITY_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
 
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -238,6 +241,7 @@ async fn supervise_amqp_consumer(
             return Ok(());
         }
         let consumer = AmqpTaskWakeupConsumer::new(config.clone(), Arc::clone(&handler));
+        let started = std::time::Instant::now();
         match consumer.run(cancel.clone()).await {
             Ok(()) if cancel.is_cancelled() => return Ok(()),
             Ok(()) => {
@@ -253,6 +257,13 @@ async fn supervise_amqp_consumer(
                     "task wakeup consumer exited with error; restarting after backoff",
                 );
             }
+        }
+
+        // Reset the backoff once a run has proven stable so a later
+        // transient disconnect reconnects at the fast path instead of
+        // inheriting a saturated backoff from an earlier failure storm.
+        if started.elapsed() >= STABILITY_THRESHOLD {
+            backoff = INITIAL_BACKOFF;
         }
 
         tokio::select! {

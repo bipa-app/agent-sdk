@@ -773,7 +773,7 @@ mod tests {
         cancel.cancel();
         sweep_handle.await?;
         waiter_cancel.cancel();
-        let _ = waiter.await;
+        waiter.await?;
         assert!(
             fired.load(Ordering::SeqCst) >= 2,
             "fallback sweep should have fired at least twice in 100 ms",
