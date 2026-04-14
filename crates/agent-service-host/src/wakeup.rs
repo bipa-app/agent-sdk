@@ -329,6 +329,7 @@ impl WakeupSchedulerHandle {
 mod tests {
     use super::*;
     use agent_server::journal::CapturingTaskWakeupHandler;
+    use anyhow::Context;
     use std::time::Duration as StdDuration;
 
     #[test]
@@ -340,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn wakeup_config_round_trips_through_yaml() {
+    fn wakeup_config_round_trips_through_yaml() -> Result<()> {
         let yaml = r"
 enabled: true
 fallback_interval_secs: 20
@@ -352,7 +353,8 @@ amqp_consumer:
     declare_queue: true
     bind_queue: true
 ";
-        let config: WakeupConfig = serde_yaml::from_str(yaml).expect("parse");
+        let config: WakeupConfig =
+            serde_yaml::from_str(yaml).context("parse wakeup config yaml")?;
         assert!(config.enabled);
         assert_eq!(config.fallback_interval_secs, 20);
         #[cfg(feature = "amqp")]
@@ -362,10 +364,11 @@ amqp_consumer:
             assert!(config.amqp_consumer.config.declare_queue);
             assert!(config.amqp_consumer.config.bind_queue);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn fallback_sweep_pulses_independently_of_consumer() {
+    async fn fallback_sweep_pulses_independently_of_consumer() -> Result<()> {
         // No AMQP consumer enabled — only the fallback sweep should
         // keep the signal alive.  We drive the scheduler through the
         // test helper so the sweep's interval can live in
@@ -396,11 +399,12 @@ amqp_consumer:
         );
 
         cancel.cancel();
-        handle.shutdown().await.expect("clean shutdown");
+        handle.shutdown().await.context("clean shutdown")?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handle_shutdown_is_idempotent() {
+    async fn handle_shutdown_is_idempotent() -> Result<()> {
         let handler: Arc<dyn TaskWakeupHandler> = Arc::new(CapturingTaskWakeupHandler::new());
         let signal = WakeupSignal::shared();
         let scheduler = WakeupScheduler::new(
@@ -417,7 +421,8 @@ amqp_consumer:
         let handle = scheduler.spawn(cancel.clone());
         // Shutdown via the handle; cancel token should already be fired
         // when shutdown returns so calling cancel again is a no-op.
-        handle.shutdown().await.expect("clean shutdown");
+        handle.shutdown().await.context("clean shutdown")?;
         assert!(cancel.is_cancelled());
+        Ok(())
     }
 }

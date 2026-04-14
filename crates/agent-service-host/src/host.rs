@@ -316,7 +316,6 @@ impl ServiceHost {
                 runtime: Arc::clone(&self.runtime),
                 lease_duration: self.config.worker.lease_duration(),
                 poll_interval: self.config.worker.acquisition_interval(),
-                health: Arc::clone(&self.health),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
             };
@@ -550,8 +549,6 @@ struct WorkerLoopParams {
     runtime: Arc<ExecutionRuntime>,
     lease_duration: time::Duration,
     poll_interval: std::time::Duration,
-    #[allow(dead_code)] // retained for future health-plumbing parity with the sweep loop
-    health: Arc<HealthSurface>,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
 }
@@ -578,7 +575,6 @@ async fn worker_loop(params: WorkerLoopParams) {
         runtime,
         lease_duration,
         poll_interval,
-        health: _health,
         wakeup_signal,
         cancel,
     } = params;

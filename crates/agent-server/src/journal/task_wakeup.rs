@@ -516,7 +516,7 @@ impl TaskWakeupHandler for CapturingTaskWakeupHandler {
 mod tests {
     use super::*;
     use crate::journal::store::InMemoryAgentTaskStore;
-    use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, WorkerId};
+    use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
     use agent_sdk_core::ThreadId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
@@ -730,19 +730,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capturing_handler_surfaces_errors_for_retry_testing() {
+    async fn capturing_handler_surfaces_errors_for_retry_testing() -> Result<()> {
         let handler = CapturingTaskWakeupHandler::new();
         handler.fail_with("simulated lookup failure").await;
         let payload = TaskWakeupPayload {
             task_id: AgentTaskId::new(),
             thread_id: sample_thread(),
         };
-        let err = handler
-            .handle_payload(&payload, t0())
-            .await
-            .expect_err("handler configured to fail");
+        let Err(err) = handler.handle_payload(&payload, t0()).await else {
+            anyhow::bail!("expected handler to fail, got Ok");
+        };
         let rendered = format!("{err:#}");
         assert!(rendered.contains("simulated lookup failure"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -791,9 +791,6 @@ mod tests {
         };
         let outcome = dispatch_payload(&handler, &payload, t0()).await?;
         assert_eq!(outcome, TaskWakeupOutcome::Missing);
-        // TaskKind is unused here, but keep the import live for future
-        // parity with other wakeup-centric tests.
-        let _ = TaskKind::RootTurn;
         Ok(())
     }
 }
