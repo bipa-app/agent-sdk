@@ -56,7 +56,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 
 use super::outbox_message::OutboxMessageKind;
@@ -281,6 +281,30 @@ pub trait OutboxStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<()>;
 
+    /// Return stale `Claimed` rows to `Pending` so they can be retried.
+    ///
+    /// A claim is "stale" when the worker that claimed it has been holding
+    /// the row for longer than `claim_lease` — typically because the
+    /// worker crashed between a successful broker publish and the
+    /// matching `mark_delivered` write.  Pass `claim_lease = 0` to reclaim
+    /// every currently-claimed row unconditionally (used at worker
+    /// startup after a crash).
+    ///
+    /// Reclaim is intentionally *not* a failure: `attempt_count` is
+    /// preserved, `last_error` stays NULL, and `next_attempt_at` is reset
+    /// to `now` so the row is eligible for immediate re-pickup.  The
+    /// broker already guarantees at-least-once; the possible duplicate
+    /// republish is the whole point of the pattern.
+    ///
+    /// Implementations MUST NOT reclaim terminal rows (`Delivered`,
+    /// `Expired`) and MUST return the number of rows actually reclaimed
+    /// so callers can decide whether to log or escalate.
+    async fn reclaim_expired_claims(
+        &self,
+        now: OffsetDateTime,
+        claim_lease: Duration,
+    ) -> Result<u64>;
+
     /// Retrieve an outbox row by its ID.
     async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>>;
 
@@ -460,6 +484,40 @@ impl OutboxStore for InMemoryOutboxStore {
         Ok(())
     }
 
+    async fn reclaim_expired_claims(
+        &self,
+        now: OffsetDateTime,
+        claim_lease: Duration,
+    ) -> Result<u64> {
+        let mut inner = self.inner.write().await;
+        let mut reclaimed = 0u64;
+        for row in inner.rows.values_mut() {
+            if row.status != OutboxStatus::Claimed {
+                continue;
+            }
+            // Treat missing claimed_at as "stale immediately" — the row
+            // can only have reached `Claimed` through `claim_pending`,
+            // which always stamps `claimed_at`, but being lenient here
+            // keeps the reclaim path robust against any backend that
+            // fills in the status differently (or rows rewritten by a
+            // migration).
+            let claimed_at = row.claimed_at.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            if claimed_at + claim_lease > now {
+                continue;
+            }
+            row.status = OutboxStatus::Pending;
+            row.claimed_by = None;
+            row.claimed_at = None;
+            // Reset the retry clock to `now` so the row is immediately
+            // eligible for re-pickup instead of waiting out the
+            // original `next_attempt_at`.
+            row.next_attempt_at = now;
+            reclaimed += 1;
+        }
+        drop(inner);
+        Ok(reclaimed)
+    }
+
     async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>> {
         let inner = self.inner.read().await;
         let result = inner.rows.get(&id.0).cloned();
@@ -507,7 +565,6 @@ mod tests {
     };
     use crate::journal::task::AgentTaskId;
     use anyhow::Context;
-    use time::Duration;
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
@@ -831,6 +888,132 @@ mod tests {
             ]
         );
         assert_eq!(seqs, vec![Some(0), Some(1), None]);
+        Ok(())
+    }
+
+    // ── Phase 8.2: reclaim for crash recovery ───────────────────────
+
+    #[tokio::test]
+    async fn reclaim_resets_stale_claims_to_pending() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        // Claim at t+1.  Lease is 10s; at t+30 the claim is stale.
+        store.claim_pending("crashed-worker", 10, t_plus(1)).await?;
+        let reclaimed = store
+            .reclaim_expired_claims(t_plus(30), Duration::seconds(10))
+            .await?;
+        assert_eq!(reclaimed, 1);
+
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.status, OutboxStatus::Pending);
+        assert!(row.claimed_by.is_none());
+        assert!(row.claimed_at.is_none());
+        // Attempt count is preserved — reclaim is NOT a failure.
+        assert_eq!(row.attempt_count, 0);
+        // next_attempt_at is reset to now so the row is immediately pickable.
+        assert_eq!(row.next_attempt_at, t_plus(30));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_with_zero_lease_reclaims_all_claimed_rows() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        store
+            .insert_batch(vec![
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
+                sample_new_row(&thread_a(), 2, t0())?,
+            ])
+            .await?;
+
+        store.claim_pending("crashed-worker", 10, t_plus(1)).await?;
+        let reclaimed = store
+            .reclaim_expired_claims(t_plus(1), Duration::ZERO)
+            .await?;
+        assert_eq!(reclaimed, 3);
+
+        // All rows should be re-claimable by a new worker.
+        let rows = store.claim_pending("new-worker", 10, t_plus(2)).await?;
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row.claimed_by.as_deref(), Some("new-worker"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_skips_rows_whose_lease_has_not_expired() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        store.claim_pending("live-worker", 10, t_plus(1)).await?;
+        // At t+5 the lease (10s) is still live.
+        let reclaimed = store
+            .reclaim_expired_claims(t_plus(5), Duration::seconds(10))
+            .await?;
+        assert_eq!(reclaimed, 0);
+
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.status, OutboxStatus::Claimed);
+        assert_eq!(row.claimed_by.as_deref(), Some("live-worker"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_skips_terminal_rows() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        store.claim_pending("worker-1", 10, t_plus(1)).await?;
+        store.mark_delivered(id, t_plus(2)).await?;
+
+        let reclaimed = store
+            .reclaim_expired_claims(t_plus(100), Duration::ZERO)
+            .await?;
+        assert_eq!(reclaimed, 0);
+
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.status, OutboxStatus::Delivered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_preserves_attempt_count_unlike_mark_failed() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        // Simulate one failed delivery, then a crashed second attempt.
+        store.claim_pending("worker-1", 10, t_plus(1)).await?;
+        store
+            .mark_failed(id, "first failure", t_plus(30), t_plus(2))
+            .await?;
+        // The first failure bumped attempt_count to 1; now claim again.
+        store.claim_pending("worker-1", 10, t_plus(60)).await?;
+        let mid = store.get(id).await?.context("row should exist")?;
+        assert_eq!(mid.attempt_count, 1);
+        assert_eq!(mid.status, OutboxStatus::Claimed);
+
+        // Second attempt crashes — reclaim must not charge another attempt.
+        let reclaimed = store
+            .reclaim_expired_claims(t_plus(120), Duration::seconds(10))
+            .await?;
+        assert_eq!(reclaimed, 1);
+        let after = store.get(id).await?.context("row should exist")?;
+        assert_eq!(after.status, OutboxStatus::Pending);
+        assert_eq!(after.attempt_count, 1, "reclaim must not charge an attempt");
         Ok(())
     }
 

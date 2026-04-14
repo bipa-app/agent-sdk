@@ -64,6 +64,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod broker;
 pub mod config;
 pub mod grpc;
 pub mod health;
@@ -71,6 +72,7 @@ pub mod host;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod proto;
+pub mod relay;
 pub mod runtime;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;

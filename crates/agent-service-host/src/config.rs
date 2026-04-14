@@ -62,6 +62,8 @@ pub struct ServiceConfig {
     pub transport: TransportConfig,
     /// Data retention policies.
     pub retention: RetentionConfig,
+    /// Outbox relay + broker configuration.
+    pub relay: RelayConfig,
 }
 
 impl ServiceConfig {
@@ -378,6 +380,97 @@ impl Default for TransportConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Relay (Phase 8.2: AMQP outbox relay)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Outbox relay and broker configuration.
+///
+/// When `enabled` is `false` (the default) the service host does not
+/// spawn a relay — the outbox still receives rows from journal
+/// commits, but no worker publishes them.  This keeps the host trivial
+/// to run in environments where the broker is not yet provisioned
+/// (local development, CI) while keeping the configuration surface
+/// ready for deploys to flip the switch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayConfig {
+    /// Whether the relay scheduler runs.
+    pub enabled: bool,
+    /// Stable worker identifier recorded on every claim.
+    ///
+    /// `None` means "generate a fresh one at startup" — suitable for
+    /// single-process deploys.  Multi-instance deploys should pin a
+    /// hostname or pod identifier here so claim reclaims can attribute
+    /// stuck rows to a specific crashed worker.
+    pub worker_id: Option<String>,
+    /// Maximum rows claimed per relay tick.
+    pub batch_size: u32,
+    /// Seconds between steady-state relay ticks when there is no backlog.
+    pub poll_interval_secs: u64,
+    /// Seconds a claim is considered valid before a reclaim sweep
+    /// treats it as abandoned by a crashed worker.
+    pub claim_lease_secs: u64,
+    /// Seconds between periodic claim-reclaim sweeps.
+    pub reclaim_interval_secs: u64,
+    /// Seconds to wait before retrying a failed publish.
+    pub retry_backoff_secs: u64,
+    /// Which broker adapter to compose into the relay.
+    pub broker: BrokerConfig,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            worker_id: None,
+            batch_size: 128,
+            poll_interval_secs: 2,
+            claim_lease_secs: 60,
+            reclaim_interval_secs: 30,
+            retry_backoff_secs: 30,
+            broker: BrokerConfig::default(),
+        }
+    }
+}
+
+impl RelayConfig {
+    /// Steady-state poll interval as a [`std::time::Duration`].
+    #[must_use]
+    pub const fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_interval_secs)
+    }
+
+    /// Reclaim sweep interval as a [`std::time::Duration`].
+    #[must_use]
+    pub const fn reclaim_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.reclaim_interval_secs)
+    }
+
+    /// Claim-lease duration as a [`time::Duration`].
+    #[must_use]
+    pub fn claim_lease(&self) -> time::Duration {
+        let secs = i64::try_from(self.claim_lease_secs).unwrap_or(i64::MAX);
+        time::Duration::seconds(secs)
+    }
+}
+
+/// Broker-adapter selection.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerConfig {
+    /// In-process broker double.  Messages are dropped on the floor
+    /// after being recorded by the in-memory adapter — useful for
+    /// running the host without a real broker in tests or local dev.
+    #[default]
+    InMemory,
+    /// AMQP 0.9.1 broker (typically `RabbitMQ`).
+    ///
+    /// Requires the `amqp` feature.
+    #[cfg(feature = "amqp")]
+    Amqp(crate::broker::amqp::AmqpBrokerConfig),
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Retention
 // ─────────────────────────────────────────────────────────────────────
 
@@ -648,5 +741,75 @@ storage:
     fn sqlite_url_relative_uses_opaque_form() {
         let url = sqlite_url(std::path::Path::new("local.db"));
         assert_eq!(url, "sqlite:local.db?mode=rwc");
+    }
+
+    #[test]
+    fn relay_defaults_are_disabled_with_in_memory_broker() {
+        let config = RelayConfig::default();
+        assert!(!config.enabled);
+        assert!(matches!(config.broker, BrokerConfig::InMemory));
+        assert_eq!(config.batch_size, 128);
+        assert_eq!(config.poll_interval_secs, 2);
+        assert_eq!(config.reclaim_interval_secs, 30);
+        assert_eq!(config.claim_lease_secs, 60);
+    }
+
+    #[test]
+    fn relay_duration_helpers() {
+        let config = RelayConfig::default();
+        assert_eq!(config.poll_interval(), std::time::Duration::from_secs(2));
+        assert_eq!(
+            config.reclaim_interval(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(config.claim_lease(), time::Duration::seconds(60));
+    }
+
+    #[test]
+    fn relay_yaml_in_memory_broker_round_trips() -> Result<()> {
+        let yaml = r"
+relay:
+  enabled: true
+  batch_size: 32
+  poll_interval_secs: 5
+  claim_lease_secs: 45
+  broker: in_memory
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(config.relay.enabled);
+        assert_eq!(config.relay.batch_size, 32);
+        assert_eq!(config.relay.poll_interval_secs, 5);
+        assert_eq!(config.relay.claim_lease_secs, 45);
+        assert!(matches!(config.relay.broker, BrokerConfig::InMemory));
+        Ok(())
+    }
+
+    #[cfg(feature = "amqp")]
+    #[test]
+    fn relay_yaml_amqp_broker_parses() -> Result<()> {
+        let yaml = r#"
+relay:
+  enabled: true
+  broker: !amqp
+    url: "amqp://user:pass@broker.internal:5672/prod"
+    exchange: "agent_sdk.outbox"
+    exchange_kind: topic
+    declare_exchange: false
+    routing_key_prefix: "agent_sdk.outbox"
+"#;
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(config.relay.enabled);
+        match config.relay.broker {
+            BrokerConfig::Amqp(amqp) => {
+                assert_eq!(
+                    amqp.url.as_deref(),
+                    Some("amqp://user:pass@broker.internal:5672/prod")
+                );
+                assert_eq!(amqp.exchange, "agent_sdk.outbox");
+                assert!(!amqp.declare_exchange);
+            }
+            BrokerConfig::InMemory => panic!("expected AMQP broker"),
+        }
+        Ok(())
     }
 }
