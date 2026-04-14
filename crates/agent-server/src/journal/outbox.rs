@@ -286,9 +286,9 @@ pub trait OutboxStore: Send + Sync {
     /// A claim is "stale" when the worker that claimed it has been holding
     /// the row for longer than `claim_lease` — typically because the
     /// worker crashed between a successful broker publish and the
-    /// matching `mark_delivered` write.  Pass `claim_lease = 0` to reclaim
-    /// every currently-claimed row unconditionally (used at worker
-    /// startup after a crash).
+    /// matching `mark_delivered` write.  Pass `claim_lease = 0` only when
+    /// the caller intentionally wants to reclaim every currently-claimed
+    /// row unconditionally.
     ///
     /// Reclaim is intentionally *not* a failure: `attempt_count` is
     /// preserved, `last_error` stays NULL, and `next_attempt_at` is reset

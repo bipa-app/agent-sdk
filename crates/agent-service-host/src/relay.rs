@@ -12,9 +12,9 @@
 //! # Lifecycle
 //!
 //! ```text
-//!   ┌────────────────── startup reclaim ──────────────────┐
-//!   │ every currently-`Claimed` row → `Pending` (Ph. 8.2) │
-//!   └─────────────────────────────────────────────────────┘
+//!   ┌──────────────────── startup reclaim ─────────────────────┐
+//!   │ rows with `claimed_at <= now - claim_lease` → `Pending` │
+//!   └──────────────────────────────────────────────────────────┘
 //!                            │
 //!                            ▼
 //!   ┌─────────────── backfill drain ──────────────┐
@@ -300,8 +300,11 @@ impl RelayScheduler {
                                 reclaimed = count,
                                 "reclaimed stale outbox claims — other worker likely crashed",
                             );
+                            latency_layer_degraded = false;
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            latency_layer_degraded = false;
+                        }
                         Err(err) => {
                             warn!(error = %err, "claim reclaim failed");
                             latency_layer_degraded = true;
@@ -744,6 +747,106 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Default)]
+    struct IdleWorker;
+
+    #[async_trait]
+    impl RelayWorker for IdleWorker {
+        async fn tick(&self, _worker_id: &str, _now: OffsetDateTime) -> Result<RelayTick> {
+            Ok(RelayTick::default())
+        }
+    }
+
+    struct FlakyReclaimStore {
+        inner: InMemoryOutboxStore,
+        failures_remaining: AtomicUsize,
+        reclaim_calls: AtomicUsize,
+    }
+
+    impl FlakyReclaimStore {
+        fn new(failures: usize) -> Self {
+            Self {
+                inner: InMemoryOutboxStore::new(),
+                failures_remaining: AtomicUsize::new(failures),
+                reclaim_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn reclaim_calls(&self) -> usize {
+            self.reclaim_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OutboxStore for FlakyReclaimStore {
+        async fn insert_batch(
+            &self,
+            rows: Vec<agent_server::journal::outbox::NewOutboxRow>,
+        ) -> Result<Vec<agent_server::journal::outbox::OutboxRow>> {
+            self.inner.insert_batch(rows).await
+        }
+
+        async fn claim_pending(
+            &self,
+            worker_id: &str,
+            limit: u32,
+            now: OffsetDateTime,
+        ) -> Result<Vec<agent_server::journal::outbox::OutboxRow>> {
+            self.inner.claim_pending(worker_id, limit, now).await
+        }
+
+        async fn mark_delivered(
+            &self,
+            id: &agent_server::journal::outbox::OutboxRowId,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            self.inner.mark_delivered(id, now).await
+        }
+
+        async fn mark_failed(
+            &self,
+            id: &agent_server::journal::outbox::OutboxRowId,
+            error: &str,
+            next_attempt_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            self.inner
+                .mark_failed(id, error, next_attempt_at, now)
+                .await
+        }
+
+        async fn reclaim_expired_claims(
+            &self,
+            now: OffsetDateTime,
+            claim_lease: TimeDuration,
+        ) -> Result<u64> {
+            self.reclaim_calls.fetch_add(1, Ordering::SeqCst);
+            if self.failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                anyhow::bail!("transient reclaim failure");
+            }
+            self.inner.reclaim_expired_claims(now, claim_lease).await
+        }
+
+        async fn get(
+            &self,
+            id: &agent_server::journal::outbox::OutboxRowId,
+        ) -> Result<Option<agent_server::journal::outbox::OutboxRow>> {
+            self.inner.get(id).await
+        }
+
+        async fn list_by_thread(
+            &self,
+            thread_id: &ThreadId,
+        ) -> Result<Vec<agent_server::journal::outbox::OutboxRow>> {
+            self.inner.list_by_thread(thread_id).await
+        }
+
+        async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
+            self.inner.count_pending(thread_id).await
+        }
+    }
+
     // ── Delivered rows are marked only AFTER broker ack ─────────────
 
     #[tokio::test]
@@ -823,6 +926,43 @@ mod tests {
             health.snapshot().latency_layer,
             LatencyLayerHealth::Degraded
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn steady_state_recovers_after_transient_reclaim_failure_on_idle_queue() -> Result<()> {
+        let concrete_store = Arc::new(FlakyReclaimStore::new(1));
+        let store: Arc<dyn OutboxStore> = concrete_store.clone();
+        let health = HealthSurface::shared();
+        health.set_latency_layer(LatencyLayerHealth::Healthy);
+
+        let scheduler = RelayScheduler::with_worker(
+            store,
+            Arc::new(IdleWorker),
+            RelaySchedulerConfig {
+                poll_interval: StdDuration::from_millis(10),
+                reclaim_interval: StdDuration::from_millis(10),
+                ..test_config()
+            },
+        )
+        .with_health(Arc::clone(&health));
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            scheduler
+                .run_steady_state(&cancel_clone, OffsetDateTime::now_utc)
+                .await;
+        });
+
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        cancel.cancel();
+        handle.await?;
+
+        assert!(
+            concrete_store.reclaim_calls() >= 2,
+            "expected one failed reclaim and at least one successful retry",
+        );
+        assert_eq!(health.snapshot().latency_layer, LatencyLayerHealth::Healthy);
         Ok(())
     }
 }
