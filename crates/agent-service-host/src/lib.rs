@@ -77,6 +77,7 @@ pub mod runtime;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod stores;
+pub mod wakeup;
 
 #[cfg(test)]
 mod conformance;

@@ -25,5 +25,7 @@
 
 #[cfg(feature = "amqp")]
 pub mod amqp;
+#[cfg(feature = "amqp")]
+pub mod amqp_consumer;
 
 pub use agent_server::journal::broker::{BrokerAdapter, InMemoryBrokerAdapter};
