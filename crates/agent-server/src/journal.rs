@@ -590,6 +590,7 @@ pub mod staged;
 pub mod store;
 pub mod task;
 pub mod task_state;
+pub mod task_wakeup;
 pub mod thread;
 pub mod thread_recover;
 pub mod thread_store;
@@ -642,6 +643,10 @@ pub use task::{
     TaskStatus, WorkerId,
 };
 pub use task_state::{SubagentInvocationState, TaskState};
+pub use task_wakeup::{
+    CapturingTaskWakeupHandler, FallbackWakeupSweep, JournalTaskWakeupHandler, TaskWakeupHandler,
+    TaskWakeupOutcome, WakeupSignal, dispatch_payload,
+};
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};

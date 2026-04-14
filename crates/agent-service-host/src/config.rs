@@ -64,6 +64,8 @@ pub struct ServiceConfig {
     pub retention: RetentionConfig,
     /// Outbox relay + broker configuration.
     pub relay: RelayConfig,
+    /// Task-wakeup consumer + fallback sweep configuration.
+    pub wakeup: crate::wakeup::WakeupConfig,
 }
 
 impl ServiceConfig {
