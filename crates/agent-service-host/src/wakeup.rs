@@ -3,15 +3,15 @@
 //! Phase 8.3 closes the "broker as nudge, journal as authority" loop:
 //! the broker path stays a latency optimisation and the worker pool
 //! keeps owning execution through
-//! [`AgentTaskStore::acquire_next_runnable`].  This module glues three
+//! `AgentTaskStore::acquire_next_runnable`.  This module glues three
 //! primitives into the shape the host composes on startup:
 //!
-//! 1. A shared [`WakeupSignal`](agent_server::journal::WakeupSignal)
+//! 1. A shared [`agent_server::journal::WakeupSignal`]
 //!    workers park on.
-//! 2. A [`TaskWakeupHandler`](agent_server::journal::TaskWakeupHandler)
+//! 2. A [`agent_server::journal::TaskWakeupHandler`]
 //!    that re-checks the journal for every advisory payload.
 //! 3. A consumer / sweep pair that pokes the signal: the AMQP consumer
-//!    (fast path) and the periodic [`FallbackWakeupSweep`](agent_server::journal::FallbackWakeupSweep)
+//!    (fast path) and the periodic [`agent_server::journal::FallbackWakeupSweep`]
 //!    (belt and suspenders).
 //!
 //! The worker loop in [`crate::host`] races a per-worker ticker against

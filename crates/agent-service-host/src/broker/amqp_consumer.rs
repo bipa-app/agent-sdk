@@ -5,15 +5,15 @@
 //! four things on every delivery:
 //!
 //! 1. Deserialises the JSON payload into
-//!    [`TaskWakeupPayload`](agent_server::journal::outbox_message::TaskWakeupPayload).
+//!    [`agent_server::journal::outbox_message::TaskWakeupPayload`].
 //! 2. Calls a [`TaskWakeupHandler`] to re-check durable state.  That
 //!    handler is the single place where the journal is consulted.
 //! 3. Acks (or nacks) the broker message based on the result.
 //! 4. Logs the outcome so operators can reason about delivery flow.
 //!
 //! Execution itself is always driven by the worker pool in
-//! [`agent_service_host::host`], which consumes the nudge via the
-//! shared [`WakeupSignal`](agent_server::journal::WakeupSignal) and
+//! [`crate::host`], which consumes the nudge via the
+//! shared [`agent_server::journal::WakeupSignal`] and
 //! then runs `AgentTaskStore::acquire_next_runnable`.  Two duplicate
 //! deliveries therefore resolve into a single execution: one CAS
 //! winner, plus any number of losers that observe `Ok(None)` and go
