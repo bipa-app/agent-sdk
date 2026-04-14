@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sdk_outbox SET status = 'pending', claimed_by = NULL, claimed_at = NULL, next_attempt_at = ?1 WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at <= ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3f17b3001845d12eea498efbd7cb4cbf70c06f3eed8683227a353c6458e6bb3d"
+}

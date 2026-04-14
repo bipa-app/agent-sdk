@@ -2756,6 +2756,23 @@ WHERE id = ?1 AND status NOT IN ('delivered', 'expired')
         Ok(())
     }
 
+    async fn reclaim_expired_claims(
+        &self,
+        now: OffsetDateTime,
+        claim_lease: time::Duration,
+    ) -> Result<u64> {
+        let threshold = now - claim_lease;
+        let result = sqlx::query!(
+            r"UPDATE agent_sdk_outbox SET status = 'pending', claimed_by = NULL, claimed_at = NULL, next_attempt_at = ?1 WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at <= ?2",
+            now,
+            threshold,
+        )
+        .execute(&self.pool)
+        .await
+        .context("reclaim expired outbox claims")?;
+        Ok(result.rows_affected())
+    }
+
     async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>> {
         let record = sqlx::query_as::<_, OutboxRecord>(
             "SELECT id, kind, thread_id, event_id, sequence, status, payload_json, created_at, next_attempt_at, attempt_count, max_attempts, last_error, claimed_by, claimed_at, delivered_at FROM agent_sdk_outbox WHERE id = ?1",
@@ -4258,6 +4275,90 @@ mod tests {
                 OutboxMessageKind::TaskWakeup,
             ]
         );
+
+        Ok(())
+    }
+
+    // ── Phase 8.2: reclaim for crash recovery ────────────────────────
+
+    #[tokio::test]
+    async fn outbox_reclaim_returns_stale_claimed_rows_to_pending() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_server::journal::event_outbox_transaction::{
+            AtomicEventOutboxCommitter, EventOutboxCommit,
+        };
+        use agent_server::journal::outbox::{OutboxStatus, OutboxStore};
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-reclaim-stale");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+
+        let claimed = OutboxStore::claim_pending(&store, "worker-a", 10, t_plus(1)).await?;
+        assert_eq!(claimed.len(), 1);
+        let id = claimed[0].id.clone();
+
+        let reclaimed =
+            OutboxStore::reclaim_expired_claims(&store, t_plus(30), time::Duration::seconds(10))
+                .await?;
+        assert_eq!(reclaimed, 1);
+
+        let row = OutboxStore::get(&store, &id)
+            .await?
+            .context("row should still exist")?;
+        assert_eq!(row.status, OutboxStatus::Pending);
+        assert!(row.claimed_by.is_none());
+        assert!(row.claimed_at.is_none());
+        assert_eq!(row.attempt_count, 0);
+
+        let reclaimed_rows = OutboxStore::claim_pending(&store, "worker-b", 10, t_plus(31)).await?;
+        assert_eq!(reclaimed_rows.len(), 1);
+        assert_eq!(reclaimed_rows[0].id, id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_reclaim_skips_live_claims() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_server::journal::event_outbox_transaction::{
+            AtomicEventOutboxCommitter, EventOutboxCommit,
+        };
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-reclaim-live");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_live", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+
+        OutboxStore::claim_pending(&store, "worker-live", 10, t_plus(1)).await?;
+
+        let reclaimed =
+            OutboxStore::reclaim_expired_claims(&store, t_plus(6), time::Duration::seconds(30))
+                .await?;
+        assert_eq!(reclaimed, 0);
 
         Ok(())
     }

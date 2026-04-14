@@ -64,10 +64,13 @@ use agent_server::worker::{
     resume_from_children,
 };
 
-use super::config::ServiceConfig;
-use super::health::HealthSurface;
+use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
+use super::config::{BrokerConfig, ServiceConfig};
+use super::health::{HealthSurface, LatencyLayerHealth};
+use super::relay::{RelayScheduler, RelaySchedulerConfig};
 use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
+use agent_server::journal::relay::RetryBackoff;
 
 // ─────────────────────────────────────────────────────────────────────
 // ServiceHost
@@ -150,6 +153,21 @@ impl ServiceHost {
                 "storage.postgres.max_connections must be > 0"
             );
         }
+        if config.relay.enabled {
+            anyhow::ensure!(config.relay.batch_size > 0, "relay.batch_size must be > 0");
+            anyhow::ensure!(
+                config.relay.poll_interval_secs > 0,
+                "relay.poll_interval_secs must be > 0"
+            );
+            anyhow::ensure!(
+                config.relay.claim_lease_secs > 0,
+                "relay.claim_lease_secs must be > 0"
+            );
+            anyhow::ensure!(
+                config.relay.reclaim_interval_secs > 0,
+                "relay.reclaim_interval_secs must be > 0"
+            );
+        }
         Ok(())
     }
 
@@ -220,6 +238,7 @@ impl ServiceHost {
             acquisition_interval_secs = self.config.worker.acquisition_interval_secs,
             grpc_enabled = self.config.transport.grpc_enabled,
             http_enabled = self.config.transport.http_enabled,
+            relay_enabled = self.config.relay.enabled,
             "service host starting",
         );
 
@@ -272,12 +291,36 @@ impl ServiceHost {
             worker_handles.push(handle);
         }
 
+        // ── Spawn relay scheduler ────────────────────────────────
+        let relay_handle = if self.config.relay.enabled {
+            let broker = build_broker_adapter(&self.config.relay.broker)
+                .context("building relay broker adapter")?;
+            let scheduler_config = build_relay_scheduler_config(&self.config.relay);
+            let scheduler = RelayScheduler::new(
+                Arc::clone(&self.stores.outbox_store),
+                broker,
+                scheduler_config,
+            )
+            .with_health(Arc::clone(&self.health));
+            // Inherit the host's shutdown token so SIGINT/SIGTERM drains
+            // the relay along with the rest of the service.
+            Some(scheduler.spawn(self.shutdown.clone()))
+        } else {
+            self.health
+                .set_latency_layer(LatencyLayerHealth::NotConfigured);
+            None
+        };
+
         // ── Mark healthy ─────────────────────────────────────────
         self.health.set_sweep_alive(true);
         self.health.set_workers_alive(true);
         self.health.set_core(super::health::CoreHealth::Healthy);
 
-        info!(pool_size, "service host ready");
+        info!(
+            pool_size,
+            relay_enabled = self.config.relay.enabled,
+            "service host ready",
+        );
 
         // ── Wait for shutdown ────────────────────────────────────
         #[cfg(unix)]
@@ -302,9 +345,57 @@ impl ServiceHost {
                 .with_context(|| format!("worker {idx} panicked during shutdown"))?;
         }
 
+        if let Some(handle) = relay_handle
+            && let Err(err) = handle.shutdown().await
+        {
+            warn!(error = %err, "relay scheduler exited with error");
+        }
+
         info!("service host stopped");
         Ok(())
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Relay wiring helpers
+// ─────────────────────────────────────────────────────────────────────
+
+fn build_broker_adapter(config: &BrokerConfig) -> Result<Arc<dyn BrokerAdapter>> {
+    match config {
+        BrokerConfig::InMemory => {
+            warn!(
+                "relay is enabled with the in-memory broker adapter — \
+                 messages will be recorded in-process but not delivered anywhere",
+            );
+            Ok(Arc::new(InMemoryBrokerAdapter::new()))
+        }
+        #[cfg(feature = "amqp")]
+        BrokerConfig::Amqp(amqp_config) => {
+            super::broker::amqp::AmqpBrokerAdapter::arc(amqp_config.clone())
+                .context("constructing AMQP broker adapter")
+        }
+    }
+}
+
+fn build_relay_scheduler_config(config: &super::config::RelayConfig) -> RelaySchedulerConfig {
+    let worker_id = config
+        .worker_id
+        .clone()
+        .unwrap_or_else(default_relay_worker_id);
+    let retry_backoff_secs = config.retry_backoff_secs;
+    RelaySchedulerConfig {
+        worker_id,
+        batch_size: config.batch_size,
+        poll_interval: config.poll_interval(),
+        claim_lease: config.claim_lease(),
+        reclaim_interval: config.reclaim_interval(),
+        retry_backoff: RetryBackoff::fixed_seconds(retry_backoff_secs),
+    }
+}
+
+fn default_relay_worker_id() -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("relay-{}", &suffix[..12])
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1151,6 +1242,115 @@ mod tests {
         // Cancel immediately — all 8 workers must drain cleanly.
         token.cancel();
         host.run().await?;
+        Ok(())
+    }
+
+    // ── Phase 8.2: relay wiring ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn relay_disabled_marks_latency_layer_not_configured() -> Result<()> {
+        use crate::health::LatencyLayerHealth;
+
+        // Default config has relay.enabled = false — latency layer
+        // should stay NotConfigured throughout the host lifecycle.
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let health = Arc::clone(host.health());
+        let token = host.shutdown_token();
+
+        let handle = tokio::spawn(async move { host.run().await });
+        // Give the host a beat to reach the "ready" marker.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let snap = health.snapshot();
+        assert_eq!(
+            snap.latency_layer,
+            LatencyLayerHealth::NotConfigured,
+            "disabled relay should leave latency layer unconfigured",
+        );
+
+        token.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_enabled_drains_outbox_and_marks_layer_healthy() -> Result<()> {
+        use crate::config::{BrokerConfig, RelayConfig};
+        use crate::health::LatencyLayerHealth;
+        use agent_sdk_core::ThreadId;
+        use agent_server::journal::outbox::NewOutboxRow;
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+        };
+
+        let config = ServiceConfig {
+            relay: RelayConfig {
+                enabled: true,
+                worker_id: Some("host-test-relay".into()),
+                batch_size: 8,
+                poll_interval_secs: 1,
+                claim_lease_secs: 30,
+                reclaim_interval_secs: 30,
+                retry_backoff_secs: 0,
+                broker: BrokerConfig::InMemory,
+            },
+            ..ServiceConfig::default()
+        };
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+
+        // Seed an outbox row before the host starts so the backfill
+        // phase has something to drain.  The in-memory backend does
+        // not enforce the thread_id FK, so we can insert directly.
+        let thread_id = ThreadId::from_string("t-host-relay-backfill");
+        let stores = host.stores().clone();
+        let payload = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+            thread_id: thread_id.clone(),
+            last_sequence: 0,
+        })
+        .to_payload_json()?;
+        stores
+            .outbox_store
+            .insert_batch(vec![NewOutboxRow {
+                kind: OutboxMessageKind::ThreadEventsAvailable,
+                thread_id: thread_id.clone(),
+                event_id: Some(uuid::Uuid::now_v7()),
+                sequence: Some(0),
+                payload_json: payload,
+                max_attempts: 3,
+                now: time::OffsetDateTime::now_utc(),
+            }])
+            .await?;
+
+        let health = Arc::clone(host.health());
+        let token = host.shutdown_token();
+        let handle = tokio::spawn(async move { host.run().await });
+
+        // Wait for the relay to drain + steady-state tick.  Poll up to
+        // two seconds so the test is not flaky on slow CI.
+        let mut healthy = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if health.snapshot().latency_layer == LatencyLayerHealth::Healthy {
+                healthy = true;
+                break;
+            }
+        }
+        assert!(
+            healthy,
+            "relay should have marked latency layer healthy within 2s",
+        );
+
+        // The outbox row should have been delivered by the relay.
+        let rows = stores.outbox_store.list_by_thread(&thread_id).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status,
+            agent_server::journal::outbox::OutboxStatus::Delivered,
+        );
+
+        token.cancel();
+        handle.await??;
         Ok(())
     }
 }

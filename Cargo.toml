@@ -43,6 +43,7 @@ base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
+lapin = { version = "3", default-features = false, features = ["rustls"] }
 
 # dev
 tempfile = "3"
