@@ -3184,6 +3184,7 @@ impl TryFrom<ThreadRecord> for Thread {
             total_usage: TokenUsage {
                 input_tokens: u32_from_i64(r.total_input_tokens, "thread input tokens")?,
                 output_tokens: u32_from_i64(r.total_output_tokens, "thread output tokens")?,
+                ..Default::default()
             },
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -3311,6 +3312,7 @@ impl TryFrom<CheckpointRecord> for Checkpoint {
             turn_usage: TokenUsage {
                 input_tokens: u32_from_i64(r.turn_input_tokens, "checkpoint turn_input_tokens")?,
                 output_tokens: u32_from_i64(r.turn_output_tokens, "checkpoint turn_output_tokens")?,
+                ..Default::default()
             },
             created_at: r.created_at,
         };

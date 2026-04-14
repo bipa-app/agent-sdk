@@ -238,6 +238,7 @@ where
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     });
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();

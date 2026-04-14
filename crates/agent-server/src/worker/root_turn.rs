@@ -347,6 +347,8 @@ async fn commit_text_only_turn(
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cached_input_tokens: response.usage.cached_input_tokens,
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
     };
 
     let drained_messages = inputs
@@ -600,6 +602,14 @@ async fn buffer_turn_messages(
                 .total_usage
                 .output_tokens
                 .saturating_add(response.usage.output_tokens),
+            cached_input_tokens: current_state
+                .total_usage
+                .cached_input_tokens
+                .saturating_add(response.usage.cached_input_tokens),
+            cache_creation_input_tokens: current_state
+                .total_usage
+                .cache_creation_input_tokens
+                .saturating_add(response.usage.cache_creation_input_tokens),
         },
         ..current_state
     };
@@ -897,6 +907,8 @@ async fn build_continuation(
     let turn_usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cached_input_tokens: response.usage.cached_input_tokens,
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
     };
 
     let total_usage = TokenUsage {
@@ -908,6 +920,14 @@ async fn build_continuation(
             .total_usage
             .output_tokens
             .saturating_add(turn_usage.output_tokens),
+        cached_input_tokens: current_state
+            .total_usage
+            .cached_input_tokens
+            .saturating_add(turn_usage.cached_input_tokens),
+        cache_creation_input_tokens: current_state
+            .total_usage
+            .cache_creation_input_tokens
+            .saturating_add(turn_usage.cache_creation_input_tokens),
     };
 
     let updated_state = AgentState {
@@ -1114,6 +1134,16 @@ async fn buffer_resumed_assistant(
                 .total_usage
                 .output_tokens
                 .saturating_add(response.usage.output_tokens),
+            cached_input_tokens: continuation
+                .state
+                .total_usage
+                .cached_input_tokens
+                .saturating_add(response.usage.cached_input_tokens),
+            cache_creation_input_tokens: continuation
+                .state
+                .total_usage
+                .cache_creation_input_tokens
+                .saturating_add(response.usage.cache_creation_input_tokens),
         },
         ..continuation.state.clone()
     };
@@ -1176,6 +1206,14 @@ async fn commit_resumed_turn(
             .turn_usage
             .output_tokens
             .saturating_add(response.usage.output_tokens),
+        cached_input_tokens: continuation
+            .turn_usage
+            .cached_input_tokens
+            .saturating_add(response.usage.cached_input_tokens),
+        cache_creation_input_tokens: continuation
+            .turn_usage
+            .cache_creation_input_tokens
+            .saturating_add(response.usage.cache_creation_input_tokens),
     };
 
     let drained_messages = inputs
@@ -1460,6 +1498,14 @@ fn build_resume_continuation(
             .turn_usage
             .output_tokens
             .saturating_add(response.usage.output_tokens),
+        cached_input_tokens: prior
+            .turn_usage
+            .cached_input_tokens
+            .saturating_add(response.usage.cached_input_tokens),
+        cache_creation_input_tokens: prior
+            .turn_usage
+            .cache_creation_input_tokens
+            .saturating_add(response.usage.cache_creation_input_tokens),
     };
 
     let new_total_usage = TokenUsage {
@@ -1473,6 +1519,16 @@ fn build_resume_continuation(
             .total_usage
             .output_tokens
             .saturating_add(response.usage.output_tokens),
+        cached_input_tokens: prior
+            .state
+            .total_usage
+            .cached_input_tokens
+            .saturating_add(response.usage.cached_input_tokens),
+        cache_creation_input_tokens: prior
+            .state
+            .total_usage
+            .cache_creation_input_tokens
+            .saturating_add(response.usage.cache_creation_input_tokens),
     };
 
     let updated_state = AgentState {

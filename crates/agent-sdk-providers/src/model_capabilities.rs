@@ -661,6 +661,7 @@ mod tests {
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
             .unwrap();
         assert!((cost - 0.0075).abs() < f64::EPSILON);
@@ -674,6 +675,7 @@ mod tests {
                 input_tokens: 2_000,
                 output_tokens: 1_000,
                 cached_input_tokens: 1_000,
+                cache_creation_input_tokens: 0,
             })
             .unwrap();
         assert!((cost - 0.01775).abs() < f64::EPSILON);

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Workspace compatibility for cached token usage fields** - Updated server and host token usage fixtures, stores, and turn accounting so the new cached-input and cache-creation fields compile across all targets and continue accumulating real provider-reported values.
+
 - **Inline payload capture on LLM spans** - `ObservabilityStore` inline capture decisions now set `gen_ai.input.messages` and `gen_ai.output.messages` on LLM spans, and payload capture failures add a `payload_capture_failed` event without failing the agent run.
 
 - **Cancelled outcomes in observability spans** - Root and turn-level observability instrumentation now records `cancelled` outcomes instead of omitting cancellation states.
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Switched from `tracing` to `log` crate** - The SDK now uses the standard `log` crate instead of `tracing` for logging, making it compatible with any logging framework that implements `log` (e.g., `env_logger`, `simple_logger`, `fern`).
 
 ### Added
+
+- **Cached token usage observability** - OpenTelemetry spans now emit `gen_ai.usage.cache_creation.input_tokens` and `gen_ai.usage.cache_read.input_tokens`, and provider usage mappings preserve cache-read and cache-creation token breakdowns.
 
 - **`TurnSummary` server-facing outcome contract (ENG-7914)** - Every `TurnOutcome` variant except `Error` now carries a structured `TurnSummary` alongside the legacy per-variant fields. The summary captures provider/model provenance, response ID, stop reason, tool-call count, wall-clock duration, and the `TurnOptions` used for the turn. This is the authoritative Phase 1 contract later server phases (journal, workers, transport, storage) build on. Use `TurnOutcome::summary()` to extract it, or pattern-match on the `summary` field directly.
 

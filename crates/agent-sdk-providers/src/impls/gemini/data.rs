@@ -219,6 +219,7 @@ impl ApiUsageMetadata {
             input_tokens: self.prompt,
             output_tokens: self.candidates,
             cached_input_tokens: self.cached_content,
+            cache_creation_input_tokens: 0,
         }
     }
 }
@@ -668,6 +669,21 @@ mod tests {
         });
         assert_eq!(usage.prompt, 100);
         assert_eq!(usage.candidates, 50);
+    }
+
+    #[test]
+    fn test_usage_metadata_into_usage() {
+        let usage = ApiUsageMetadata {
+            prompt: 120,
+            candidates: 30,
+            cached_content: 40,
+        }
+        .into_usage();
+
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 
     #[test]

@@ -310,6 +310,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         };
         let result = convert_output_messages(&response);
@@ -335,6 +336,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         };
         let result = convert_output_messages(&response);

@@ -229,6 +229,7 @@ mod tests {
         let turn_usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
+            ..Default::default()
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
@@ -295,10 +296,12 @@ mod tests {
                     total_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     turn_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
@@ -434,10 +437,12 @@ mod tests {
                     total_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     turn_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
@@ -513,10 +518,12 @@ mod tests {
                     total_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     turn_usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                     pending_tool_calls: vec![],
                     awaiting_index: 0,

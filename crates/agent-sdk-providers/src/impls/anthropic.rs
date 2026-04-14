@@ -447,6 +447,7 @@ impl LlmProvider for AnthropicProvider {
                 input_tokens: api_response.usage.total_input_tokens(),
                 output_tokens: api_response.usage.output,
                 cached_input_tokens: api_response.usage.cached_input_tokens(),
+                cache_creation_input_tokens: api_response.usage.cache_creation_input_tokens(),
             },
         }))
     }
@@ -578,6 +579,7 @@ impl LlmProvider for AnthropicProvider {
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
             let mut cached_input_tokens: u32 = 0;
+            let mut cache_creation_input_tokens: u32 = 0;
             // Track tool IDs by block index for correlating input deltas
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
@@ -643,6 +645,7 @@ impl LlmProvider for AnthropicProvider {
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut cached_input_tokens,
+                        &mut cache_creation_input_tokens,
                         &mut tool_ids,
                         &mut pending_stop_reason,
                     ) {
@@ -687,6 +690,7 @@ impl LlmProvider for AnthropicProvider {
                     &mut input_tokens,
                     &mut output_tokens,
                     &mut cached_input_tokens,
+                    &mut cache_creation_input_tokens,
                     &mut tool_ids,
                     &mut pending_stop_reason,
                 ) {

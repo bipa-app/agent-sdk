@@ -49,6 +49,7 @@ impl TestProvider {
                 input_tokens: 10,
                 output_tokens: 20,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         })
     }
@@ -68,7 +69,20 @@ impl TestProvider {
                 input_tokens: 15,
                 output_tokens: 25,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
+        })
+    }
+
+    fn text_response_with_usage(text: &str, usage: Usage) -> ChatOutcome {
+        ChatOutcome::Success(ChatResponse {
+            id: "resp_cached".to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            model: "test-model".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage,
         })
     }
 }
@@ -539,6 +553,166 @@ async fn llm_span_emitted_with_model_name() -> Result<()> {
     );
     assert!(get_attr(llm, attrs::GEN_AI_USAGE_INPUT_TOKENS).is_some());
     assert!(get_attr(llm, attrs::GEN_AI_USAGE_OUTPUT_TOKENS).is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn llm_span_emits_cached_token_attributes() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
+        "cached",
+        Usage {
+            input_tokens: 180,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+        },
+    )]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_USAGE_INPUT_TOKENS).as_deref(),
+        Some("180"),
+    );
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_USAGE_OUTPUT_TOKENS).as_deref(),
+        Some("50"),
+    );
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS).as_deref(),
+        Some("20"),
+    );
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS).as_deref(),
+        Some("10"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_span_emits_aggregated_cached_token_attributes() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
+        "cached",
+        Usage {
+            input_tokens: 180,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+        },
+    )]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    assert_eq!(
+        get_attr(root, attrs::GEN_AI_USAGE_INPUT_TOKENS).as_deref(),
+        Some("180"),
+    );
+    assert_eq!(
+        get_attr(root, attrs::GEN_AI_USAGE_OUTPUT_TOKENS).as_deref(),
+        Some("50"),
+    );
+    assert_eq!(
+        get_attr(root, attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS).as_deref(),
+        Some("20"),
+    );
+    assert_eq!(
+        get_attr(root, attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS).as_deref(),
+        Some("10"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_span_emits_cached_token_attributes() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response_with_usage(
+        "cached",
+        Usage {
+            input_tokens: 180,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+        },
+    )]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let turn = find_span_in_trace(&trace_spans, "agent.turn")?;
+
+    assert_eq!(
+        get_attr(turn, attrs::SDK_TURN_INPUT_TOKENS).as_deref(),
+        Some("180"),
+    );
+    assert_eq!(
+        get_attr(turn, attrs::SDK_TURN_OUTPUT_TOKENS).as_deref(),
+        Some("50"),
+    );
+    assert_eq!(
+        get_attr(turn, attrs::SDK_TURN_CACHE_READ_INPUT_TOKENS).as_deref(),
+        Some("20"),
+    );
+    assert_eq!(
+        get_attr(turn, attrs::SDK_TURN_CACHE_CREATION_INPUT_TOKENS).as_deref(),
+        Some("10"),
+    );
 
     Ok(())
 }

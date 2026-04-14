@@ -9,7 +9,7 @@ use super::provider_name;
 use super::spans;
 use crate::llm::LlmProvider;
 use crate::tools::ToolRegistry;
-use crate::types::{AgentConfig, AgentInput, ThreadId};
+use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage};
 
 /// Start the root `invoke_agent` span.
 pub fn start_root_span<Ctx, P>(
@@ -52,8 +52,7 @@ where
 pub fn end_root_span(
     span: &mut BoxedSpan,
     total_turns: usize,
-    input_tokens: u64,
-    output_tokens: u64,
+    total_usage: &TokenUsage,
     outcome: &'static str,
 ) {
     span.set_attribute(KeyValue::new(
@@ -62,11 +61,19 @@ pub fn end_root_span(
     ));
     span.set_attribute(KeyValue::new(
         attrs::GEN_AI_USAGE_INPUT_TOKENS,
-        i64::try_from(input_tokens).unwrap_or(0),
+        i64::from(total_usage.input_tokens),
     ));
     span.set_attribute(KeyValue::new(
         attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
-        i64::try_from(output_tokens).unwrap_or(0),
+        i64::from(total_usage.output_tokens),
+    ));
+    span.set_attribute(KeyValue::new(
+        attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        i64::from(total_usage.cached_input_tokens),
+    ));
+    span.set_attribute(KeyValue::new(
+        attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        i64::from(total_usage.cache_creation_input_tokens),
     ));
     span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
     if outcome == "error" {
