@@ -1,18 +1,35 @@
-//! Transactional outbox for durable event relay.
+//! Transactional outbox for durable broker relay.
 //!
-//! The outbox is a delivery buffer — not the authority for replay or
-//! ordering.  `agent_sdk_committed_events` owns the canonical
-//! thread-scoped sequence; the outbox merely holds relay work so an
-//! AMQP or pub-sub worker can deliver notifications without weakening
-//! the journal's commit guarantees.
+//! The outbox is a delivery buffer — never the authority for replay or
+//! ordering.  `agent_sdk_committed_events` owns canonical thread-scoped
+//! event order; `agent_sdk_tasks` owns canonical task state.  The
+//! outbox merely holds *advisory* relay work so an AMQP or pub-sub
+//! worker can publish hints without weakening the journal's commit
+//! guarantees.
 //!
 //! # Transactional semantics
 //!
 //! Outbox rows are inserted in the **same SQL transaction** as the
-//! durable journal mutation that produced the events.  If the
-//! transaction commits, the outbox rows exist; if it rolls back,
-//! neither events nor outbox rows are visible.  This is the core
-//! guarantee that makes the outbox pattern safe.
+//! durable journal mutation that produced them.  If the transaction
+//! commits, the matching outbox row exists; if it rolls back, neither
+//! the journal mutation nor the outbox row is visible.  This is the
+//! core guarantee that makes the outbox pattern safe.
+//!
+//! # Logical kinds (Phase 8.1)
+//!
+//! Every row carries a [`OutboxMessageKind`] that tells the relay
+//! worker what shape the payload has and which downstream subscribers
+//! care about it.  See [`super::outbox_message`] for the full kind
+//! enumeration and the advisory-payload contract.
+//!
+//! # Coalescing
+//!
+//! - `thread_events_available` rows are coalesced **per commit batch**
+//!   — one row per `commit_events_with_outbox` call regardless of how
+//!   many events landed.  The payload's `last_sequence` is the highest
+//!   sequence the consumer is guaranteed to be able to read.
+//! - `task_wakeup` rows are emitted **per task transition**, since
+//!   each task lookup is independent on the consumer side.
 //!
 //! # Relay lifecycle
 //!
@@ -30,8 +47,8 @@
 //!
 //! # Idempotent consumption
 //!
-//! Consumers track the last-processed `(thread_id, sequence)` and
-//! ignore duplicate deliveries.  The relay is at-least-once by design.
+//! Consumers track their own per-thread cursor and ignore duplicate
+//! deliveries.  The relay is at-least-once by design.
 
 use agent_sdk_core::ThreadId;
 use anyhow::{Result, ensure};
@@ -41,6 +58,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
+
+use super::outbox_message::OutboxMessageKind;
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity
@@ -129,22 +148,40 @@ impl std::fmt::Display for OutboxStatus {
 // Row
 // ─────────────────────────────────────────────────────────────────────
 
-/// A single outbox row: a notification that an event needs relay.
+/// A single outbox row: an advisory notification awaiting relay.
+///
+/// `event_id` and `sequence` are populated for
+/// [`OutboxMessageKind::ThreadEventsAvailable`] rows, which reference
+/// the highest committed event in the triggering batch.  They are
+/// `None` for [`OutboxMessageKind::TaskWakeup`] rows, which reference
+/// only the task / thread carried in `payload_json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     /// Unique outbox row identity.
     pub id: OutboxRowId,
-    /// Thread the event belongs to.
+    /// Logical kind of the message this row carries.
+    pub kind: OutboxMessageKind,
+    /// Thread the message refers to.
     pub thread_id: ThreadId,
-    /// The committed event's globally unique ID.
-    pub event_id: uuid::Uuid,
-    /// Copy of the event's thread-scoped sequence for ordering.
-    pub sequence: u64,
+    /// Highest committed event in the triggering batch (only set for
+    /// `ThreadEventsAvailable` rows).
+    #[serde(default)]
+    pub event_id: Option<uuid::Uuid>,
+    /// Highest committed sequence in the triggering batch (only set
+    /// for `ThreadEventsAvailable` rows).
+    #[serde(default)]
+    pub sequence: Option<u64>,
     /// Relay lifecycle status.
     pub status: OutboxStatus,
-    /// Self-contained relay payload (serialised event envelope).
+    /// Advisory payload: durable references only, no body data.
+    ///
+    /// Always shaped as the matching `*Payload` struct in
+    /// [`super::outbox_message`].  Use
+    /// [`OutboxMessage::from_payload_json`](super::outbox_message::OutboxMessage::from_payload_json)
+    /// to decode.
     pub payload_json: serde_json::Value,
-    /// When the outbox row was created (same transaction as event commit).
+    /// When the outbox row was created (same transaction as the
+    /// triggering journal mutation).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When the relay should next attempt delivery.
@@ -167,10 +204,17 @@ pub struct OutboxRow {
 }
 
 /// Parameters for inserting a new outbox row.
+///
+/// For `ThreadEventsAvailable` rows, `event_id` and `sequence` MUST be
+/// `Some` and refer to the highest committed event in the triggering
+/// batch.  For `TaskWakeup` rows, both MUST be `None` — the
+/// transactional rule is enforced at the database layer via a CHECK
+/// constraint.
 pub struct NewOutboxRow {
+    pub kind: OutboxMessageKind,
     pub thread_id: ThreadId,
-    pub event_id: uuid::Uuid,
-    pub sequence: u64,
+    pub event_id: Option<uuid::Uuid>,
+    pub sequence: Option<u64>,
     pub payload_json: serde_json::Value,
     pub max_attempts: u32,
     pub now: OffsetDateTime,
@@ -180,25 +224,34 @@ pub struct NewOutboxRow {
 // Trait
 // ─────────────────────────────────────────────────────────────────────
 
-/// Transactional outbox store for durable event relay.
+/// Transactional outbox store for durable broker relay.
 ///
-/// Rows are inserted in the same SQL transaction as committed events.
-/// Relay workers claim pending rows, attempt delivery, and mark them
-/// as delivered or failed.
+/// Rows are inserted in the same SQL transaction as the journal
+/// mutation that produced them.  Relay workers claim pending rows,
+/// attempt delivery, and mark them as delivered or failed.
 ///
 /// # Contract
 ///
-/// - Rows are created only inside an event-commit transaction.
+/// - Rows are created only inside a transaction that also writes the
+///   durable state they advertise (committed events for
+///   `ThreadEventsAvailable`, task-journal mutations for
+///   `TaskWakeup`).
 /// - `claim_pending` returns rows ordered by `next_attempt_at` so
 ///   older failures are retried before newer rows.
 /// - `mark_delivered` and `mark_failed` are idempotent on terminal rows.
 /// - Terminal durable state never depends on successful relay.
+/// - Workers MUST NOT publish to a broker outside this contract; the
+///   outbox is the only authoritative path.
 #[async_trait]
 pub trait OutboxStore: Send + Sync {
     /// Insert one or more outbox rows.
     ///
-    /// In the Postgres backend, this runs inside the same transaction
-    /// as the corresponding `commit_event_batch`.
+    /// In durable backends, callers are expected to invoke this
+    /// inside the same SQL transaction as the journal mutation that
+    /// advertised the row — see
+    /// [`AtomicEventOutboxCommitter`](super::event_outbox_transaction::AtomicEventOutboxCommitter)
+    /// for the events path.  The in-memory implementation accepts
+    /// stand-alone calls so tests can construct fixtures.
     async fn insert_batch(&self, rows: Vec<NewOutboxRow>) -> Result<Vec<OutboxRow>>;
 
     /// Claim up to `limit` pending rows for relay, ordered by
@@ -239,6 +292,30 @@ pub trait OutboxStore: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Invariants
+// ─────────────────────────────────────────────────────────────────────
+
+/// Returns true iff the `(event_id, sequence)` pairing is consistent
+/// with `kind`.
+///
+/// `ThreadEventsAvailable` rows MUST carry both references; `TaskWakeup`
+/// rows MUST carry neither.  The `Postgres` / `SQLite` migrations enforce
+/// the same invariant via CHECK constraints; this helper lets in-memory
+/// stores and durable backends reject violations *before* hitting the
+/// database, with a clearer error message.
+#[must_use]
+pub const fn kind_payload_invariants_hold(
+    kind: OutboxMessageKind,
+    event_id: Option<uuid::Uuid>,
+    sequence: Option<u64>,
+) -> bool {
+    match kind {
+        OutboxMessageKind::ThreadEventsAvailable => event_id.is_some() && sequence.is_some(),
+        OutboxMessageKind::TaskWakeup => event_id.is_none() && sequence.is_none(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // In-memory implementation
 // ─────────────────────────────────────────────────────────────────────
 
@@ -271,8 +348,15 @@ impl OutboxStore for InMemoryOutboxStore {
         let mut result = Vec::with_capacity(rows.len());
 
         for params in rows {
+            ensure!(
+                kind_payload_invariants_hold(params.kind, params.event_id, params.sequence),
+                "outbox row of kind {} has incompatible event_id/sequence",
+                params.kind,
+            );
+
             let row = OutboxRow {
                 id: OutboxRowId::new(),
+                kind: params.kind,
                 thread_id: params.thread_id,
                 event_id: params.event_id,
                 sequence: params.sequence,
@@ -392,7 +476,7 @@ impl OutboxStore for InMemoryOutboxStore {
             .cloned()
             .collect();
         drop(inner);
-        rows.sort_by_key(|r| r.sequence);
+        rows.sort_by_key(|r| (r.sequence.is_none(), r.sequence, r.id.clone()));
         Ok(rows)
     }
 
@@ -418,7 +502,11 @@ impl OutboxStore for InMemoryOutboxStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::events::AgentEvent;
+    use crate::journal::outbox_message::{
+        OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
+    };
+    use crate::journal::task::AgentTaskId;
+    use anyhow::Context;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -433,19 +521,53 @@ mod tests {
         ThreadId::from_string("t-outbox-a")
     }
 
-    fn sample_payload() -> serde_json::Value {
-        serde_json::to_value(AgentEvent::text("msg_1", "hello")).unwrap_or_default()
+    fn thread_events_payload(
+        thread_id: &ThreadId,
+        last_sequence: u64,
+    ) -> Result<serde_json::Value> {
+        OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+            thread_id: thread_id.clone(),
+            last_sequence,
+        })
+        .to_payload_json()
+        .context("serialise thread_events_available payload")
     }
 
-    fn sample_new_row(thread_id: &ThreadId, seq: u64, now: OffsetDateTime) -> NewOutboxRow {
-        NewOutboxRow {
+    fn task_wakeup_payload(
+        task_id: &AgentTaskId,
+        thread_id: &ThreadId,
+    ) -> Result<serde_json::Value> {
+        OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id: task_id.clone(),
             thread_id: thread_id.clone(),
-            event_id: uuid::Uuid::now_v7(),
-            sequence: seq,
-            payload_json: sample_payload(),
+        })
+        .to_payload_json()
+        .context("serialise task_wakeup payload")
+    }
+
+    fn sample_new_row(thread_id: &ThreadId, seq: u64, now: OffsetDateTime) -> Result<NewOutboxRow> {
+        Ok(NewOutboxRow {
+            kind: OutboxMessageKind::ThreadEventsAvailable,
+            thread_id: thread_id.clone(),
+            event_id: Some(uuid::Uuid::now_v7()),
+            sequence: Some(seq),
+            payload_json: thread_events_payload(thread_id, seq)?,
             max_attempts: 3,
             now,
-        }
+        })
+    }
+
+    fn sample_task_wakeup_row(thread_id: &ThreadId, now: OffsetDateTime) -> Result<NewOutboxRow> {
+        let task_id = AgentTaskId::new();
+        Ok(NewOutboxRow {
+            kind: OutboxMessageKind::TaskWakeup,
+            thread_id: thread_id.clone(),
+            event_id: None,
+            sequence: None,
+            payload_json: task_wakeup_payload(&task_id, thread_id)?,
+            max_attempts: 3,
+            now,
+        })
     }
 
     #[tokio::test]
@@ -453,8 +575,8 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         let rows = store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
@@ -479,7 +601,7 @@ mod tests {
     async fn claim_pending_transitions_to_claimed() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
 
         let claimed = store.claim_pending("worker-1", 10, t_plus(1)).await?;
@@ -494,9 +616,9 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
-                sample_new_row(&thread_a(), 2, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
+                sample_new_row(&thread_a(), 2, t0())?,
             ])
             .await?;
 
@@ -509,7 +631,7 @@ mod tests {
     async fn mark_delivered_transitions_to_terminal() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -518,7 +640,7 @@ mod tests {
 
         store.mark_delivered(id, t_plus(2)).await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
         assert!(row.delivered_at.is_some());
         Ok(())
@@ -528,7 +650,7 @@ mod tests {
     async fn mark_failed_retries_within_budget() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -537,7 +659,7 @@ mod tests {
             .mark_failed(id, "connection refused", t_plus(60), t_plus(2))
             .await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Pending);
         assert_eq!(row.attempt_count, 1);
         // Pending rows must have NULL last_error per the outbox_error_check constraint.
@@ -548,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn mark_failed_expires_when_budget_exhausted() -> Result<()> {
         let store = InMemoryOutboxStore::new();
-        let mut params = sample_new_row(&thread_a(), 0, t0());
+        let mut params = sample_new_row(&thread_a(), 0, t0())?;
         params.max_attempts = 1;
         let rows = store.insert_batch(vec![params]).await?;
         let id = &rows[0].id;
@@ -558,7 +680,7 @@ mod tests {
             .mark_failed(id, "timeout", t_plus(60), t_plus(2))
             .await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Expired);
         assert!(row.status.is_terminal());
         Ok(())
@@ -568,7 +690,7 @@ mod tests {
     async fn mark_delivered_is_idempotent_on_terminal() -> Result<()> {
         let store = InMemoryOutboxStore::new();
         let rows = store
-            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())])
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
             .await?;
         let id = &rows[0].id;
 
@@ -576,7 +698,7 @@ mod tests {
         store.mark_delivered(id, t_plus(2)).await?;
         store.mark_delivered(id, t_plus(3)).await?;
 
-        let row = store.get(id).await?.expect("row should exist");
+        let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
         Ok(())
     }
@@ -586,8 +708,8 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
@@ -605,15 +727,127 @@ mod tests {
         let store = InMemoryOutboxStore::new();
         store
             .insert_batch(vec![
-                sample_new_row(&thread_a(), 2, t0()),
-                sample_new_row(&thread_a(), 0, t0()),
-                sample_new_row(&thread_a(), 1, t0()),
+                sample_new_row(&thread_a(), 2, t0())?,
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
             ])
             .await?;
 
         let rows = store.list_by_thread(&thread_a()).await?;
-        let seqs: Vec<u64> = rows.iter().map(|r| r.sequence).collect();
-        assert_eq!(seqs, vec![0, 1, 2]);
+        let seqs: Vec<Option<u64>> = rows.iter().map(|r| r.sequence).collect();
+        assert_eq!(seqs, vec![Some(0), Some(1), Some(2)]);
+        Ok(())
+    }
+
+    // ── Phase 8.1 contract assertions ───────────────────────────────
+
+    #[tokio::test]
+    async fn task_wakeup_row_skips_event_references() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_task_wakeup_row(&thread_a(), t0())?])
+            .await?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, OutboxMessageKind::TaskWakeup);
+        assert!(rows[0].event_id.is_none());
+        assert!(rows[0].sequence.is_none());
+
+        // The advisory payload must round-trip back to the original.
+        let message = OutboxMessage::from_payload_json(rows[0].kind, rows[0].payload_json.clone())?;
+        let OutboxMessage::TaskWakeup(payload) = message else {
+            panic!("expected TaskWakeup, got {message:?}");
+        };
+        assert_eq!(payload.thread_id, thread_a());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_events_row_carries_event_references() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 7, t0())?])
+            .await?;
+
+        assert_eq!(rows[0].kind, OutboxMessageKind::ThreadEventsAvailable);
+        assert!(rows[0].event_id.is_some());
+        assert_eq!(rows[0].sequence, Some(7));
+
+        let message = OutboxMessage::from_payload_json(rows[0].kind, rows[0].payload_json.clone())?;
+        let OutboxMessage::ThreadEventsAvailable(payload) = message else {
+            panic!("expected ThreadEventsAvailable, got {message:?}");
+        };
+        assert_eq!(payload.thread_id, thread_a());
+        assert_eq!(payload.last_sequence, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invariant_rejects_thread_events_without_sequence() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let mut row = sample_new_row(&thread_a(), 0, t0())?;
+        row.sequence = None;
+        let result = store.insert_batch(vec![row]).await;
+        assert!(
+            result.is_err(),
+            "ThreadEventsAvailable rows must carry sequence references",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invariant_rejects_task_wakeup_with_event_references() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let mut row = sample_task_wakeup_row(&thread_a(), t0())?;
+        row.event_id = Some(uuid::Uuid::now_v7());
+        let result = store.insert_batch(vec![row]).await;
+        assert!(
+            result.is_err(),
+            "TaskWakeup rows must NOT carry event_id references",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        store
+            .insert_batch(vec![
+                sample_new_row(&thread_a(), 0, t0())?,
+                sample_task_wakeup_row(&thread_a(), t0())?,
+                sample_new_row(&thread_a(), 1, t0())?,
+            ])
+            .await?;
+
+        let rows = store.list_by_thread(&thread_a()).await?;
+        let kinds: Vec<OutboxMessageKind> = rows.iter().map(|r| r.kind).collect();
+        let seqs: Vec<Option<u64>> = rows.iter().map(|r| r.sequence).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::TaskWakeup,
+            ]
+        );
+        assert_eq!(seqs, vec![Some(0), Some(1), None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payload_object_does_not_carry_kind_tag() -> Result<()> {
+        // The kind lives in the outbox column; embedding it inside the
+        // payload would invite consumers to derive routing from the
+        // payload body, which is explicitly out of contract.
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let payload = rows[0]
+            .payload_json
+            .as_object()
+            .context("payload must be a JSON object")?;
+        assert!(payload.get("kind").is_none());
         Ok(())
     }
 }

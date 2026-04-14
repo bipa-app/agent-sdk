@@ -54,12 +54,16 @@ use tokio::sync::RwLock;
 #[async_trait]
 pub trait EventRepository: Send + Sync {
     /// Optional backend-specific hook for atomically committing events
-    /// and outbox rows in one transaction.
+    /// and the matching coalesced advisory outbox row in one
+    /// transaction.
     ///
     /// In-memory stores leave this as `None`; durable backends such as
-    /// Postgres override it to surface the
+    /// `Postgres` and `SQLite` override it to surface the
     /// [`commit_events_with_outbox`](super::event_outbox_transaction::AtomicEventOutboxCommitter::commit_events_with_outbox)
-    /// unit of work.
+    /// unit of work.  Phase 8.1: every call writes exactly one
+    /// [`OutboxMessageKind::ThreadEventsAvailable`](super::outbox_message::OutboxMessageKind::ThreadEventsAvailable)
+    /// outbox row carrying an advisory `{thread_id, last_sequence}`
+    /// payload.
     #[must_use]
     fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
         None

@@ -861,22 +861,28 @@ const AGENT_SDK_OUTBOX_COLUMNS: &[ColumnContract] = &[
         notes: "Primary outbox row identity (`outbox_<uuid>` wire form).",
     },
     ColumnContract {
+        name: "kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Phase 8.1 logical kind: `task_wakeup` or `thread_events_available`.",
+    },
+    ColumnContract {
         name: "thread_id",
         sql_type: "TEXT",
         nullable: false,
-        notes: "Thread the event belongs to.",
+        notes: "Thread the message refers to.",
     },
     ColumnContract {
         name: "event_id",
         sql_type: "TEXT",
-        nullable: false,
-        notes: "References `agent_sdk_committed_events.event_id`.",
+        nullable: true,
+        notes: "References `agent_sdk_committed_events.event_id`. Set for `thread_events_available` rows; NULL for `task_wakeup`.",
     },
     ColumnContract {
         name: "sequence",
         sql_type: "BIGINT",
-        nullable: false,
-        notes: "Copy of the event's thread-scoped sequence for ordering.",
+        nullable: true,
+        notes: "Highest committed sequence in the triggering batch. Set for `thread_events_available` rows; NULL for `task_wakeup`.",
     },
     ColumnContract {
         name: "status",
@@ -888,7 +894,7 @@ const AGENT_SDK_OUTBOX_COLUMNS: &[ColumnContract] = &[
         name: "payload_json",
         sql_type: "JSONB",
         nullable: false,
-        notes: "Self-contained relay payload (serialised event envelope).",
+        notes: "Phase 8.1 advisory payload — durable references only, never authoritative state.",
     },
     ColumnContract {
         name: "created_at",
@@ -947,7 +953,15 @@ const AGENT_SDK_OUTBOX_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_outbox_event_fk",
-        invariant: "Every outbox row references a committed event.",
+        invariant: "When set, `event_id` references a committed event (NULL allowed for `task_wakeup` rows).",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_kind_check",
+        invariant: "Phase 8.1 limits `kind` to `task_wakeup` or `thread_events_available`.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_outbox_kind_payload_check",
+        invariant: "`thread_events_available` rows carry both event_id and sequence; `task_wakeup` rows carry neither.",
     },
     ConstraintContract {
         name: "agent_sdk_outbox_status_check",
@@ -955,7 +969,7 @@ const AGENT_SDK_OUTBOX_CONSTRAINTS: &[ConstraintContract] = &[
     },
     ConstraintContract {
         name: "agent_sdk_outbox_sequence_check",
-        invariant: "Outbox sequence (copied from event) is non-negative.",
+        invariant: "When set, outbox sequence (copied from event) is non-negative.",
     },
     ConstraintContract {
         name: "agent_sdk_outbox_attempt_bounds_check",
@@ -985,6 +999,12 @@ const AGENT_SDK_OUTBOX_INDEXES: &[IndexContract] = &[
         key_columns: "(next_attempt_at, id)",
         predicate: Some("status = 'pending'"),
         purpose: "Relay worker scan for pending delivery work, ordered by next_attempt_at.",
+    },
+    IndexContract {
+        name: "agent_sdk_outbox_relay_scan_by_kind_idx",
+        key_columns: "(kind, next_attempt_at, id)",
+        predicate: Some("status = 'pending'"),
+        purpose: "Phase 8.1 partial index so the scheduler can drain by kind without scanning every pending row.",
     },
     IndexContract {
         name: "agent_sdk_outbox_by_thread_idx",

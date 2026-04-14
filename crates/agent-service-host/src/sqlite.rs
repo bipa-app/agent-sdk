@@ -42,7 +42,9 @@ mod tests {
 
     use anyhow::{Result, ensure};
 
-    use super::migrations::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+    use super::migrations::{
+        DURABLE_CORE_MIGRATOR, durable_core_migrations, outbox_message_kind_migration,
+    };
 
     #[test]
     fn sqlite_migrations_cover_every_expected_table() -> Result<()> {
@@ -80,30 +82,17 @@ mod tests {
     fn sqlite_executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 4,
-            "expected 4 executable migrations, got {:?}",
+            migrations.len() == 5,
+            "expected 5 executable migrations, got {:?}",
             migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
         );
-        ensure!(
-            migrations[0].version == 1,
-            "expected version 1, got {}",
-            migrations[0].version,
-        );
-        ensure!(
-            migrations[1].version == 2,
-            "expected version 2, got {}",
-            migrations[1].version,
-        );
-        ensure!(
-            migrations[2].version == 3,
-            "expected version 3, got {}",
-            migrations[2].version,
-        );
-        ensure!(
-            migrations[3].version == 4,
-            "expected version 4, got {}",
-            migrations[3].version,
-        );
+        for (idx, expected) in (1_i64..=5).enumerate() {
+            ensure!(
+                migrations[idx].version == expected,
+                "expected version {expected}, got {}",
+                migrations[idx].version,
+            );
+        }
         Ok(())
     }
 
@@ -162,6 +151,16 @@ mod tests {
         for name in required_constraints {
             ensure!(sql_bundle.contains(name), "missing constraint: {name}",);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_outbox_kind_migration_rewrites_legacy_payloads_to_advisory_shape() -> Result<()> {
+        let sql = outbox_message_kind_migration();
+        ensure!(
+            sql.contains("json_object('thread_id', thread_id, 'last_sequence', sequence)"),
+            "SQLite outbox kind migration must rebuild legacy payload_json values",
+        );
         Ok(())
     }
 

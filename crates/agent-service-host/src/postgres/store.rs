@@ -36,8 +36,12 @@ use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
+use agent_server::journal::outbox::kind_payload_invariants_hold;
 use agent_server::journal::outbox::{
     NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
+};
+use agent_server::journal::outbox_message::{
+    OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
     RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
@@ -3135,55 +3139,75 @@ VALUES ($1, $2, $3, $4, $5)
         Ok(committed)
     }
 
-    /// Insert outbox rows into an existing transaction.
-    async fn insert_outbox_rows_tx(
+    /// Insert the coalesced advisory outbox row for a freshly
+    /// committed event batch.
+    ///
+    /// Phase 8.1 contract: exactly one
+    /// `OutboxMessageKind::ThreadEventsAvailable` row per batch.  The
+    /// row references the highest committed event in the batch so the
+    /// FK to `agent_sdk_committed_events` stays sound, and carries an
+    /// advisory payload of `{thread_id, last_sequence}`.
+    async fn insert_thread_events_outbox_row_tx(
         tx: &mut Transaction<'_, Postgres>,
         committed: &[CommittedEvent],
         max_attempts: u32,
         now: OffsetDateTime,
-    ) -> Result<Vec<OutboxRow>> {
-        let mut rows = Vec::with_capacity(committed.len());
-        for event in committed {
-            let id = OutboxRowId::new();
-            let payload_json = json_to_value(&event.to_envelope(), "outbox relay payload")?;
+    ) -> Result<OutboxRow> {
+        let last = committed
+            .last()
+            .context("event batch must contain at least one event")?;
 
-            sqlx::query!(
-                r"
+        let id = OutboxRowId::new();
+        let payload_message = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+            thread_id: last.thread_id.clone(),
+            last_sequence: last.sequence,
+        });
+        let payload_json = payload_message
+            .to_payload_json()
+            .context("serialise thread_events_available advisory payload")?;
+        let last_sequence_i64 = i64_from_u64(last.sequence, "outbox sequence")?;
+
+        sqlx::query!(
+            r"
 INSERT INTO agent_sdk_outbox
-    (id, thread_id, event_id, sequence, status, payload_json, created_at,
-     next_attempt_at, attempt_count, max_attempts)
-VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
+    (id, kind, thread_id, event_id, sequence, status, payload_json,
+     created_at, next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 ",
-                id.as_str(),
-                thread_key(&event.thread_id),
-                event.event_id.to_string(),
-                i64_from_u64(event.sequence, "outbox sequence")?,
-                payload_json,
-                now,
-                i64::from(max_attempts),
+            id.as_str(),
+            thread_key(&last.thread_id),
+            last.event_id.to_string(),
+            last_sequence_i64,
+            payload_json,
+            now,
+            i64::from(max_attempts),
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "insert thread_events_available outbox row for batch ending at seq {}",
+                last.sequence,
             )
-            .execute(&mut **tx)
-            .await
-            .with_context(|| format!("insert outbox row for event seq {}", event.sequence))?;
+        })?;
 
-            rows.push(OutboxRow {
-                id,
-                thread_id: event.thread_id.clone(),
-                event_id: event.event_id,
-                sequence: event.sequence,
-                status: OutboxStatus::Pending,
-                payload_json,
-                created_at: now,
-                next_attempt_at: now,
-                attempt_count: 0,
-                max_attempts,
-                last_error: None,
-                claimed_by: None,
-                claimed_at: None,
-                delivered_at: None,
-            });
-        }
-        Ok(rows)
+        Ok(OutboxRow {
+            id,
+            kind: OutboxMessageKind::ThreadEventsAvailable,
+            thread_id: last.thread_id.clone(),
+            event_id: Some(last.event_id),
+            sequence: Some(last.sequence),
+            status: OutboxStatus::Pending,
+            payload_json,
+            created_at: now,
+            next_attempt_at: now,
+            attempt_count: 0,
+            max_attempts,
+            last_error: None,
+            claimed_by: None,
+            claimed_at: None,
+            delivered_at: None,
+        })
     }
 }
 
@@ -3213,7 +3237,7 @@ impl AtomicEventOutboxCommitter for PostgresDurableStore {
             params.now,
         )
         .await?;
-        let outbox_rows = Self::insert_outbox_rows_tx(
+        let outbox_row = Self::insert_thread_events_outbox_row_tx(
             &mut tx,
             &committed,
             params.outbox_max_attempts,
@@ -3227,7 +3251,7 @@ impl AtomicEventOutboxCommitter for PostgresDurableStore {
 
         Ok(EventOutboxCommitOutcome {
             committed_events: committed,
-            outbox_rows,
+            outbox_row: Some(outbox_row),
         })
     }
 }
@@ -3245,18 +3269,30 @@ impl OutboxStore for PostgresDurableStore {
         let mut result = Vec::with_capacity(rows.len());
 
         for params in rows {
+            ensure!(
+                kind_payload_invariants_hold(params.kind, params.event_id, params.sequence),
+                "outbox row of kind {} has incompatible event_id/sequence",
+                params.kind,
+            );
             let id = OutboxRowId::new();
+            let event_id_str = params.event_id.map(|uuid| uuid.to_string());
+            let sequence_i64 = params
+                .sequence
+                .map(|seq| i64_from_u64(seq, "outbox sequence"))
+                .transpose()?;
+
             sqlx::query!(
                 r"
 INSERT INTO agent_sdk_outbox
-    (id, thread_id, event_id, sequence, status, payload_json, created_at,
-     next_attempt_at, attempt_count, max_attempts)
-VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
+    (id, kind, thread_id, event_id, sequence, status, payload_json,
+     created_at, next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $7, 0, $8)
 ",
                 id.as_str(),
+                params.kind.as_str(),
                 thread_key(&params.thread_id),
-                params.event_id.to_string(),
-                i64_from_u64(params.sequence, "outbox sequence")?,
+                event_id_str.as_deref(),
+                sequence_i64,
                 params.payload_json,
                 params.now,
                 i64::from(params.max_attempts),
@@ -3267,6 +3303,7 @@ VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 
             result.push(OutboxRow {
                 id,
+                kind: params.kind,
                 thread_id: params.thread_id,
                 event_id: params.event_id,
                 sequence: params.sequence,
@@ -3306,7 +3343,7 @@ WHERE id IN (
     LIMIT $3
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, thread_id, event_id, sequence, status, payload_json,
+RETURNING id, kind, thread_id, event_id, sequence, status, payload_json,
           created_at, next_attempt_at, attempt_count, max_attempts,
           last_error, claimed_by, claimed_at, delivered_at
 ",
@@ -3340,10 +3377,9 @@ WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
         .await
         .with_context(|| format!("mark outbox row {id} delivered"))?;
 
-        ensure!(
-            result.rows_affected() > 0,
-            "outbox row not found or already terminal: {id}",
-        );
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -3391,10 +3427,9 @@ WHERE id = $1 AND status NOT IN ('delivered', 'expired')
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
 
-        ensure!(
-            result.rows_affected() > 0,
-            "outbox row not found or already terminal: {id}",
-        );
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -3402,7 +3437,7 @@ WHERE id = $1 AND status NOT IN ('delivered', 'expired')
         let record = sqlx::query_as!(
             OutboxRecord,
             r"
-SELECT id, thread_id, event_id, sequence, status, payload_json,
+SELECT id, kind, thread_id, event_id, sequence, status, payload_json,
        created_at, next_attempt_at, attempt_count, max_attempts,
        last_error, claimed_by, claimed_at, delivered_at
 FROM agent_sdk_outbox
@@ -3421,12 +3456,12 @@ WHERE id = $1
         let records = sqlx::query_as!(
             OutboxRecord,
             r"
-SELECT id, thread_id, event_id, sequence, status, payload_json,
+SELECT id, kind, thread_id, event_id, sequence, status, payload_json,
        created_at, next_attempt_at, attempt_count, max_attempts,
        last_error, claimed_by, claimed_at, delivered_at
 FROM agent_sdk_outbox
 WHERE thread_id = $1
-ORDER BY sequence
+ORDER BY sequence NULLS LAST, id
 ",
             thread_key(thread_id),
         )
@@ -4061,9 +4096,10 @@ impl TryFrom<CommittedEventRecord> for CommittedEvent {
 #[derive(Debug, FromRow)]
 struct OutboxRecord {
     id: String,
+    kind: String,
     thread_id: String,
-    event_id: String,
-    sequence: i64,
+    event_id: Option<String>,
+    sequence: Option<i64>,
     status: String,
     payload_json: serde_json::Value,
     created_at: OffsetDateTime,
@@ -4080,11 +4116,22 @@ impl TryFrom<OutboxRecord> for OutboxRow {
     type Error = anyhow::Error;
 
     fn try_from(record: OutboxRecord) -> Result<Self> {
+        let event_id = record
+            .event_id
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .context("parse outbox event UUID")?;
+        let sequence = record
+            .sequence
+            .map(|seq| u64_from_i64(seq, "outbox sequence"))
+            .transpose()?;
         Ok(Self {
             id: OutboxRowId::from_string(record.id),
+            kind: OutboxMessageKind::parse_wire(&record.kind).context("parse outbox kind")?,
             thread_id: ThreadId::from_string(record.thread_id),
-            event_id: uuid::Uuid::parse_str(&record.event_id).context("parse outbox event UUID")?,
-            sequence: u64_from_i64(record.sequence, "outbox sequence")?,
+            event_id,
+            sequence,
             status: enum_from_wire(&record.status, "outbox status")?,
             payload_json: record.payload_json,
             created_at: record.created_at,
@@ -5187,6 +5234,286 @@ mod tests {
             ToolAuditEventKind::Failed { error } => assert_eq!(error, REDACTED_MARKER),
             other => anyhow::bail!("expected Failed audit kind, got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    // ── Phase 8.1: outbox advisory contract ─────────────────────────
+
+    #[tokio::test]
+    async fn commit_events_with_outbox_emits_one_thread_events_advisory_per_batch() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+        };
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-coalesce");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![
+                    AgentEvent::text("msg_a", "first"),
+                    AgentEvent::text("msg_b", "second"),
+                    AgentEvent::text("msg_c", "third"),
+                ],
+                outbox_max_attempts: 5,
+                now: t0(),
+            },
+        )
+        .await?;
+
+        assert_eq!(outcome.committed_events.len(), 3);
+        let row = outcome
+            .outbox_row
+            .as_ref()
+            .context("Phase 8.1 contract: outbox_row must be present")?;
+        assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
+        assert_eq!(row.thread_id, thread_id);
+        assert_eq!(row.sequence, Some(2));
+        assert_eq!(row.event_id, Some(outcome.committed_events[2].event_id),);
+
+        // Advisory payload must round-trip back to the typed message.
+        let message = OutboxMessage::from_payload_json(row.kind, row.payload_json.clone())?;
+        assert_eq!(
+            message,
+            OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                thread_id: thread_id.clone(),
+                last_sequence: 2,
+            }),
+        );
+
+        // Exactly one outbox row should exist for the thread — not three.
+        let rows = OutboxStore::list_by_thread(&store, &thread_id).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, OutboxMessageKind::ThreadEventsAvailable);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_insert_batch_accepts_task_wakeup_with_null_event_refs() -> Result<()> {
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
+        };
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-task-wakeup");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let task_id = AgentTaskId::new();
+        let payload = OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id: task_id.clone(),
+            thread_id: thread_id.clone(),
+        })
+        .to_payload_json()?;
+
+        let rows = OutboxStore::insert_batch(
+            &store,
+            vec![NewOutboxRow {
+                kind: OutboxMessageKind::TaskWakeup,
+                thread_id: thread_id.clone(),
+                event_id: None,
+                sequence: None,
+                payload_json: payload.clone(),
+                max_attempts: 3,
+                now: t0(),
+            }],
+        )
+        .await?;
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, OutboxMessageKind::TaskWakeup);
+        assert!(row.event_id.is_none());
+        assert!(row.sequence.is_none());
+
+        let stored = OutboxStore::get(&store, &row.id)
+            .await?
+            .context("row missing after insert")?;
+        assert_eq!(stored.kind, OutboxMessageKind::TaskWakeup);
+        assert!(stored.event_id.is_none());
+        assert!(stored.sequence.is_none());
+        assert_eq!(stored.payload_json, payload);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_insert_batch_rejects_task_wakeup_with_event_id() -> Result<()> {
+        use agent_server::journal::outbox_message::{OutboxMessageKind, TaskWakeupPayload};
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-task-wakeup-bad");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let task_id = AgentTaskId::new();
+        let payload = serde_json::to_value(&TaskWakeupPayload {
+            task_id,
+            thread_id: thread_id.clone(),
+        })?;
+
+        let result = OutboxStore::insert_batch(
+            &store,
+            vec![NewOutboxRow {
+                kind: OutboxMessageKind::TaskWakeup,
+                thread_id,
+                // Phase 8.1 contract: TaskWakeup rows must NOT carry
+                // event references; the in-memory invariant rejects
+                // this before it reaches Postgres.
+                event_id: Some(uuid::Uuid::now_v7()),
+                sequence: None,
+                payload_json: payload,
+                max_attempts: 3,
+                now: t0(),
+            }],
+        )
+        .await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_mark_delivered_is_noop_when_row_was_cascade_deleted() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-delivered-missing");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+        let row_id = outcome
+            .outbox_row
+            .context("outbox row should exist for committed event batch")?
+            .id;
+
+        RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
+        assert!(OutboxStore::get(&store, &row_id).await?.is_none());
+
+        OutboxStore::mark_delivered(&store, &row_id, t_plus(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_mark_failed_is_noop_when_row_was_cascade_deleted() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-failed-missing");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        let outcome = AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+        let row_id = outcome
+            .outbox_row
+            .context("outbox row should exist for committed event batch")?
+            .id;
+
+        RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
+        assert!(OutboxStore::get(&store, &row_id).await?.is_none());
+
+        OutboxStore::mark_failed(&store, &row_id, "timeout", t_plus(3), t_plus(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
+        use agent_server::journal::event_outbox_transaction::EventOutboxCommit;
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
+        };
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-outbox-order");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        AtomicEventOutboxCommitter::commit_events_with_outbox(
+            &store,
+            EventOutboxCommit {
+                thread_id: thread_id.clone(),
+                events: vec![AgentEvent::text("msg_a", "first")],
+                outbox_max_attempts: 3,
+                now: t0(),
+            },
+        )
+        .await?;
+
+        let task_id = AgentTaskId::new();
+        let payload = OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id,
+            thread_id: thread_id.clone(),
+        })
+        .to_payload_json()?;
+        OutboxStore::insert_batch(
+            &store,
+            vec![NewOutboxRow {
+                kind: OutboxMessageKind::TaskWakeup,
+                thread_id: thread_id.clone(),
+                event_id: None,
+                sequence: None,
+                payload_json: payload,
+                max_attempts: 3,
+                now: t_plus(1),
+            }],
+        )
+        .await?;
+
+        let rows = OutboxStore::list_by_thread(&store, &thread_id).await?;
+        let kinds: Vec<OutboxMessageKind> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OutboxMessageKind::ThreadEventsAvailable,
+                OutboxMessageKind::TaskWakeup,
+            ]
+        );
 
         Ok(())
     }
