@@ -22,12 +22,14 @@ pub mod attachments;
 pub mod impls;
 pub mod model_capabilities;
 pub mod provider;
+pub mod refresh;
 pub mod router;
 pub mod search;
 pub mod streaming;
 
 // Convenience re-exports — provider trait and streaming
 pub use provider::{LlmProvider, collect_stream};
+pub use refresh::{RefreshingProvider, is_unauthorized_error};
 pub use router::{ModelRouter, ModelTier, TaskComplexity};
 pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
 
