@@ -1,6 +1,6 @@
 # Contributing to Agent SDK
 
-Thank you for your interest in contributing to Agent SDK! This document provides guidelines and instructions for contributing.
+This repository is maintained internally at Bipa. It is not open to public contributions. This document describes the internal workflow for engineers working on the SDK.
 
 ## Code of Conduct
 
@@ -8,13 +8,13 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ## Getting Started
 
-1. Fork the repository
-2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/agent-sdk.git`
-3. Create a feature branch: `git checkout -b my-feature`
-4. Make your changes
-5. Run the quality checks (see below)
-6. Commit your changes
-7. Push to your fork and submit a pull request
+1. Sync your local checkout with the current `main` branch
+2. Create a feature branch from `main`
+3. Make your changes
+4. Run the quality checks (see below)
+5. Commit your changes
+6. Push your branch to the private repository
+7. Open an internal pull request for review
 
 ## Development Setup
 
@@ -37,7 +37,7 @@ cargo test
 
 ## Code Quality
 
-Before submitting a pull request, ensure your code passes all quality checks:
+Before submitting an internal pull request, ensure your code passes all quality checks:
 
 ```bash
 # Type check
@@ -159,7 +159,7 @@ When reporting issues, please include:
 
 ## Feature Requests
 
-Feature requests are welcome! Please open an issue describing:
+Feature requests are welcome. Open an internal issue describing:
 
 - The problem you're trying to solve
 - Your proposed solution
@@ -167,4 +167,4 @@ Feature requests are welcome! Please open an issue describing:
 
 ## License
 
-By contributing to Agent SDK, you agree that your contributions will be licensed under the Apache License, Version 2.0.
+Contributions to this repository are internal Bipa contributions made under the contributor's employment or contractor agreement. Do not add third-party code, assets, or documentation unless Bipa has the rights required to use and redistribute them.

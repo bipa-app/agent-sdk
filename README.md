@@ -1,13 +1,10 @@
 # Agent SDK
 
-[![Crates.io](https://img.shields.io/crates/v/agent-sdk.svg)](https://crates.io/crates/agent-sdk)
-[![Documentation](https://docs.rs/agent-sdk/badge.svg)](https://docs.rs/agent-sdk)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **⚠️ Early Development**: This library is in active development (v0.8.x). APIs may change between versions and there may be bugs. Use in production at your own risk. Feedback and contributions are welcome!
+> **Private repository**: This codebase is proprietary Bipa software. Historical public releases remain under the license they were originally published with, but the current line is private and is not published to crates.io.
 
 ## What is an Agent?
 
@@ -46,21 +43,38 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Installation
 
-Add to your `Cargo.toml`:
+This repository is intended for internal Bipa development. Prefer consuming it from a checked-out workspace:
 
 ```toml
 [dependencies]
-agent-sdk = "0.8"
+agent-sdk = { path = "../agent-sdk" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
 
-Or to install the latest development version from git:
+If you need to depend on it from another repository, use an authenticated private source approved by Bipa engineering.
+
+Recommended patterns for internal apps:
 
 ```toml
+# Same machine / sibling checkout
 [dependencies]
-agent-sdk = { git = "https://github.com/bipa-app/agent-sdk", branch = "main" }
+agent-sdk = { path = "../agent-sdk" }
 ```
+
+```toml
+# Private GitHub repository, pinned to main
+[dependencies]
+agent-sdk = { git = "ssh://git@github.com/bipa-app/agent-sdk.git", branch = "main" }
+```
+
+```toml
+# Private GitHub repository, pinned to an exact commit for reproducibility
+[dependencies]
+agent-sdk = { git = "ssh://git@github.com/bipa-app/agent-sdk.git", rev = "PUT_COMMIT_SHA_HERE" }
+```
+
+For CI, prefer SSH or another authenticated Git transport controlled by Bipa. Pin to a commit SHA for production apps so builds remain reproducible.
 
 ## OpenTelemetry
 
@@ -68,7 +82,7 @@ Enable the optional `otel` feature to emit OpenTelemetry spans from the agent lo
 
 ```toml
 [dependencies]
-agent-sdk = { version = "0.8", features = ["otel"] }
+agent-sdk = { path = "../agent-sdk", features = ["otel"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 # Add the exporter crate that matches your backend, for example opentelemetry-otlp.
@@ -166,12 +180,9 @@ async fn main() -> anyhow::Result<()> {
 
 ## Examples
 
-Clone the repo and run the examples:
+From an authorized checkout, run the examples from the repository root:
 
 ```bash
-git clone https://github.com/bipa-app/agent-sdk
-cd agent-sdk
-
 # Basic conversation (no tools)
 ANTHROPIC_API_KEY=your_key cargo run --example basic_agent
 
@@ -742,12 +753,12 @@ See [SECURITY.md](SECURITY.md) for the full security policy.
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for:
+This repository is maintained internally at Bipa. See [CONTRIBUTING.md](CONTRIBUTING.md) for the internal development workflow.
 
 - Development setup
 - Code quality requirements
-- Pull request process
+- Internal review process
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+This repository is proprietary and confidential. See [LICENSE](LICENSE) for the current terms.
