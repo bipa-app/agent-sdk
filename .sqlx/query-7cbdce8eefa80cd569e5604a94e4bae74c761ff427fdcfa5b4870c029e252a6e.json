@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_message_commits (\n    thread_id,\n    turn_number,\n    task_id,\n    head_version_after,\n    batch_json,\n    committed_at\n) VALUES ($1, $2, $3, $4, $5, $6)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7cbdce8eefa80cd569e5604a94e4bae74c761ff427fdcfa5b4870c029e252a6e"
+}

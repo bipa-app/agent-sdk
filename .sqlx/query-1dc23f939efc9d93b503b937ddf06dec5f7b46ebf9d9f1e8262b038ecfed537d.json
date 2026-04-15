@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS cnt FROM agent_sdk_outbox WHERE thread_id = ?1 AND status IN ('pending', 'claimed')",
+  "describe": {
+    "columns": [
+      {
+        "name": "cnt",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1dc23f939efc9d93b503b937ddf06dec5f7b46ebf9d9f1e8262b038ecfed537d"
+}

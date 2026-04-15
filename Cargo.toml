@@ -1,19 +1,26 @@
-[package]
-name = "agent-sdk"
-version = "0.8.0"
-edition = "2024"
-description = "Rust Agent SDK for building LLM agents"
-license-file = "LICENSE"
-publish = false
-readme = "README.md"
-keywords = ["agent", "llm", "ai", "anthropic", "tools"]
-categories = ["api-bindings", "asynchronous"]
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["crates/agent-service-proto"]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
+agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.8.0" }
+agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0" }
+agent-server = { path = "crates/agent-server", version = "0.8.0" }
+agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
 tokio = { version = "1.40", features = ["sync", "fs", "process", "time", "macros"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
+tonic-health = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -21,54 +28,30 @@ anyhow = "1"
 thiserror = "2"
 regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl"] }
 glob = { version = "0.3", default-features = false }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
 reqwest = { version = "0.13.1", features = ["gzip", "json", "query", "default-tls", "stream", "http2"], default-features = false }
 async-stream = "0.3"
 bytes = "1"
-log = "0.4"
+log = { version = "0.4", features = ["kv_std"] }
 url = "2"
 tokio-util = "0.7"
 html2text = "0.14"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace"], optional = true }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
+lapin = { version = "3", default-features = false, features = ["rustls"] }
 
-[features]
-default = []
-otel = ["opentelemetry"]
-
-[dev-dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
-env_logger = "0.11"
+# dev
 tempfile = "3"
+env_logger = "0.11"
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 
-[[example]]
-name = "basic_agent"
-path = "examples/basic_agent.rs"
-
-[[example]]
-name = "custom_tool"
-path = "examples/custom_tool.rs"
-
-[[example]]
-name = "custom_hooks"
-path = "examples/custom_hooks.rs"
-
-[[example]]
-name = "with_primitive_tools"
-path = "examples/with_primitive_tools.rs"
-
-[[example]]
-name = "otel"
-path = "examples/otel.rs"
-required-features = ["otel"]
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
 nursery = "warn"

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_tool_audit_events (\n    id, operation_id, task_id, parent_task_id, thread_id,\n    tool_call_id, tool_name, effect_class, kind, kind_payload,\n    provider, model, input, output, error, recorded_at\n) VALUES (\n    ?1, ?2, ?3, ?4, ?5,\n    ?6, ?7, ?8, ?9, ?10,\n    ?11, ?12, ?13, ?14, ?15, ?16\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 16
+    },
+    "nullable": []
+  },
+  "hash": "797cc48af0285ea744f0577ec832c5ff4573feea9fc9e4e41cf7d6e26fd32c0a"
+}

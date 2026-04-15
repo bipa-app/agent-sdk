@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_turn_checkpoints",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c7c40ccb720e257680f2e9c362321ad4915340e35448cb03324e4e6a4c3b198f"
+}

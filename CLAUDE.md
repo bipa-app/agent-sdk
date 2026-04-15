@@ -96,38 +96,44 @@ pub async fn find_by_id(...)
 pub async fn find_active_thread(...)
 ```
 
-## Project Structure
+## Repository Layout
+
+This is a Cargo workspace. New crates go under `crates/`.
 
 ```
-src/
-├── lib.rs              # Public API exports
-├── agent_loop.rs       # Core agent orchestration
-├── events.rs           # AgentEvent enum
-├── types.rs            # Core types (ThreadId, Config, etc.)
-├── tools.rs            # Tool trait and registry
-├── hooks.rs            # Lifecycle hooks
-├── stores.rs           # Persistence traits
-├── environment.rs      # File/command abstraction
-├── capabilities.rs     # Security model
-├── filesystem.rs       # LocalFileSystem, InMemoryFileSystem
-├── llm.rs              # LLM module root
-├── llm/
-│   ├── types.rs        # Message, ChatRequest, etc.
-│   └── router.rs       # Model routing
-├── primitive_tools.rs  # Primitive tools module root
-├── primitive_tools/
-│   ├── read.rs
-│   ├── write.rs
-│   ├── edit.rs
-│   ├── bash.rs
-│   ├── glob.rs
-│   └── grep.rs
-├── providers.rs        # Providers module root
-└── providers/
-    ├── anthropic.rs
-    └── anthropic/
-        └── data.rs
+Cargo.toml              # Virtual workspace manifest (no [package])
+crates/
+├── agent-sdk/          # Main SDK crate (published)
+│   ├── Cargo.toml      # Inherits workspace deps, lints, metadata
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── agent_loop.rs
+│   │   ├── llm.rs
+│   │   ├── llm/
+│   │   │   ├── types.rs
+│   │   │   └── router.rs
+│   │   ├── providers.rs
+│   │   └── ...
+│   └── examples/
+└── (future crates added here during Phase 0 extraction)
 ```
+
+### Workspace Conventions
+
+* **Shared dependency versions** are declared in `[workspace.dependencies]` and
+  referenced from member crates via `{ workspace = true }`.
+* **Lint policy** lives in `[workspace.lints]` and members opt in with
+  `[lints] workspace = true`.
+* **Common package metadata** (`edition`, `license`, `repository`) is shared
+  through `[workspace.package]` and inherited with `field.workspace = true`.
+
+## sdk/v2 Rewrite Workflow
+
+All rewrite work targets the **`sdk/v2`** branch.
+
+* Base branch for every rewrite PR: **`sdk/v2`**
+* New crates go under `crates/`
+* The workspace root `Cargo.toml` is a virtual manifest — no `[package]` section
 
 ## Clippy Rules
 
@@ -163,7 +169,8 @@ pub trait DataFetcher {
 
 1. **Use `anyhow::Result`** for all fallible functions
 2. **Use `time` crate** (not `chrono`) for datetime handling
-3. **Use `tracing`** for logging
+3. **Use `log`** for logging (with `kv_std` structured fields; matches the
+   pattern used in the Bipa monorepo where this SDK is integrated)
 4. **Prefer inline full paths** for clarity: `llm::Message::user("hi")`
 5. **No unsafe code** - `#[forbid(unsafe_code)]` is enforced
 6. **Never use `unwrap()` or `expect()`** - Always propagate errors with `?` and add context:
@@ -186,3 +193,87 @@ let value = some_option.context("value was None")?;
 ```
 
 This rule applies to both production code AND tests. In tests, return `Result<()>` and use `?`.
+
+## sqlx and Database Development (CRITICAL)
+
+### Always use typed sqlx macros
+
+**Use `sqlx::query!` and `sqlx::query_as!` macros** for all database queries in
+`agent-service-host`. These macros provide compile-time SQL validation and type
+checking. Never use the untyped `sqlx::query(...)` string form.
+
+**Postgres backend:** All queries use compile-time macros (`query!`,
+`query_as!`, `query_scalar!`).
+
+**SQLite backend:** INSERT / UPDATE / DELETE / scalar SELECT queries use
+compile-time macros.  Complex SELECT queries that map to `FromRow` record
+types use runtime `sqlx::query_as::<_, RecordType>()` because SQLite's
+weak type system requires verbose per-column type annotations in
+`query_as!()`.  Connection-setup `PRAGMA` statements (e.g.
+`PRAGMA journal_mode`, `PRAGMA foreign_keys`, `PRAGMA busy_timeout`) also
+use the runtime `sqlx::query()` form — sqlx's offline macros cannot
+validate `PRAGMA` syntax because PRAGMAs are not part of the application
+schema sqlx introspects.
+
+```rust
+// BAD: untyped query — no compile-time checking
+let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_sdk_tasks WHERE thread_id = $1")
+    .bind(thread_key(thread_id))
+    .fetch_one(&self.pool)
+    .await?;
+
+// GOOD: typed macro — validated at compile time
+let record = sqlx::query!(
+    r"SELECT COUNT(*) AS cnt FROM agent_sdk_tasks WHERE thread_id = $1",
+    thread_key(thread_id),
+)
+.fetch_one(&self.pool)
+.await?;
+let count = record.cnt.unwrap_or(0);
+```
+
+### Local Postgres via Docker Compose
+
+A Postgres 18 instance is available via `compose.yml`:
+
+```bash
+# Start Postgres
+scripts/postgres18-dev.sh up
+
+# Wait until healthy
+scripts/postgres18-dev.sh wait
+
+# Connection URL
+scripts/postgres18-dev.sh url
+# → postgres://agent_sdk:agent_sdk@127.0.0.1:55432/agent_sdk
+```
+
+### sqlx Offline Cache (dual-backend)
+
+Normal builds use `SQLX_OFFLINE=true` (set in `.cargo/config.toml`). The
+`.sqlx/` directory holds cached query metadata for **both** Postgres and
+SQLite backends so builds work without a live database.
+
+**After adding or changing any `sqlx::query!` / `sqlx::query_as!` call, you must
+refresh the offline cache for the affected backend(s):**
+
+```bash
+# Postgres queries — regenerate .sqlx/ cache
+scripts/postgres18-dev.sh prepare
+
+# SQLite queries — regenerate .sqlx/ cache (merges with Postgres entries)
+scripts/sqlite-dev.sh prepare
+```
+
+**Important:** `cargo sqlx prepare` wipes `.sqlx/` before writing. The
+`sqlite-dev.sh prepare` script handles this by backing up existing entries
+before running and merging them back afterward.  Always run the Postgres
+prepare first, then the SQLite prepare (or just run the SQLite script which
+preserves Postgres entries automatically).
+
+### Running Postgres Integration Tests
+
+```bash
+# Full cycle: migrate + run store tests against real Postgres
+scripts/postgres18-dev.sh test-migrations
+```

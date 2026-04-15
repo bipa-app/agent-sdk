@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_execution_intents",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "b342adf1da8007876e53d89d5e7ff33be1ffadb7c828bd504a09e8566a793dba"
+}

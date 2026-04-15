@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS cnt FROM agent_sdk_tasks WHERE parent_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+  "describe": {
+    "columns": [
+      {
+        "name": "cnt",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7565afec7f3d99ee87d2db649fd5e28e3acc3733f1afffaa7d94e46a141322cf"
+}

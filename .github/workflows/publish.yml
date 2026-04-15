@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'crates/*/Cargo.toml'
       - 'Cargo.toml'
       - 'README.md'
       - 'LICENSE'
@@ -11,6 +12,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - 'crates/*/Cargo.toml'
       - 'Cargo.toml'
       - 'README.md'
       - 'LICENSE'
@@ -28,14 +30,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify Cargo metadata blocks publication
         run: |
-          grep -q '^license-file = "LICENSE"$' Cargo.toml
-          grep -q '^publish = false$' Cargo.toml
+          if grep -q '^license = "Apache-2.0"$' Cargo.toml; then
+            echo 'workspace root still advertises Apache-2.0'
+            exit 1
+          fi
+          if grep -q '^repository = "https://github.com/bipa-app/agent-sdk"$' Cargo.toml; then
+            echo 'workspace root still advertises the public GitHub repository'
+            exit 1
+          fi
+          for manifest in crates/*/Cargo.toml; do
+            grep -q '^publish = false$' "$manifest"
+            grep -q '^license-file = "../../LICENSE"$' "$manifest"
+            if grep -q '^license\.workspace = true$' "$manifest"; then
+              echo "$manifest still inherits open-source license metadata from the workspace"
+              exit 1
+            fi
+            if grep -q '^repository\.workspace = true$' "$manifest"; then
+              echo "$manifest still inherits repository metadata from the workspace"
+              exit 1
+            fi
+            if grep -q '^license = "Apache-2.0"$' "$manifest"; then
+              echo "$manifest still advertises Apache-2.0"
+              exit 1
+            fi
+            if grep -q '^repository = "https://github.com/bipa-app/agent-sdk"$' "$manifest"; then
+              echo "$manifest still advertises the public GitHub repository"
+              exit 1
+            fi
+          done
 
       - name: Verify repository messaging is private-only
         run: |
           grep -q 'Private repository' README.md
           grep -q 'proprietary and confidential' README.md
           grep -q 'not open to public contributions' CONTRIBUTING.md
+          grep -q 'All rights reserved.' LICENSE
 
       - name: Verify workflows contain no public publish automation
         run: |

@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package agent.service.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// Shared transport types for the service-host gRPC contract.
+//
+// These messages are intentionally shaped around committed server state:
+// thread projections, task journal rows, message projections, and durable
+// confirmation state. Pre-commit worker-local state does not cross this
+// boundary.
+
+enum ThreadStatus {
+  THREAD_STATUS_UNSPECIFIED = 0;
+  THREAD_STATUS_ACTIVE = 1;
+  THREAD_STATUS_COMPLETED = 2;
+}
+
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  TASK_KIND_ROOT_TURN = 1;
+  TASK_KIND_TOOL_RUNTIME = 2;
+  TASK_KIND_SUBAGENT = 3;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_PENDING = 2;
+  TASK_STATUS_RUNNING = 3;
+  TASK_STATUS_WAITING_ON_CHILDREN = 4;
+  TASK_STATUS_AWAITING_CONFIRMATION = 5;
+  TASK_STATUS_COMPLETED = 6;
+  TASK_STATUS_FAILED = 7;
+  TASK_STATUS_CANCELLED = 8;
+}
+
+enum ToolTier {
+  TOOL_TIER_UNSPECIFIED = 0;
+  TOOL_TIER_OBSERVE = 1;
+  TOOL_TIER_CONFIRM = 2;
+}
+
+enum MessageRole {
+  MESSAGE_ROLE_UNSPECIFIED = 0;
+  MESSAGE_ROLE_USER = 1;
+  MESSAGE_ROLE_ASSISTANT = 2;
+}
+
+message TokenUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+}
+
+// Binary payload surfaced to clients.
+//
+// The Rust runtime stores these as base64 strings inside committed message
+// and tool-result payloads. The gRPC boundary uses raw bytes instead so
+// clients do not need a second decoding step.
+message BinaryAttachment {
+  string media_type = 1;
+  bytes data = 2;
+}
+
+message ToolResult {
+  bool success = 1;
+  string output = 2;
+  google.protobuf.Value data = 3;
+  repeated BinaryAttachment documents = 4;
+  optional uint64 duration_ms = 5;
+}
+
+message PreparedOperation {
+  string operation_id = 1;
+  uint64 revision = 2;
+  google.protobuf.Value snapshot = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message UserInputItem {
+  oneof item {
+    string text = 1;
+    BinaryAttachment image = 2;
+    BinaryAttachment document = 3;
+  }
+}
+
+message TextBlock {
+  string text = 1;
+}
+
+message ThinkingBlock {
+  string thinking = 1;
+  optional string signature = 2;
+}
+
+message RedactedThinkingBlock {
+  string data = 1;
+}
+
+message ToolUseBlock {
+  string tool_call_id = 1;
+  string name = 2;
+  google.protobuf.Value input = 3;
+  optional string thought_signature = 4;
+}
+
+message ToolResultBlock {
+  string tool_use_id = 1;
+  string content = 2;
+  optional bool is_error = 3;
+}
+
+message ConversationContentBlock {
+  oneof block {
+    TextBlock text = 1;
+    ThinkingBlock thinking = 2;
+    RedactedThinkingBlock redacted_thinking = 3;
+    ToolUseBlock tool_use = 4;
+    ToolResultBlock tool_result = 5;
+    BinaryAttachment image = 6;
+    BinaryAttachment document = 7;
+  }
+}
+
+message ConversationContentList {
+  repeated ConversationContentBlock items = 1;
+}
+
+message ConversationMessage {
+  MessageRole role = 1;
+
+  oneof content {
+    string text = 2;
+    ConversationContentList blocks = 3;
+  }
+}
+
+message MessageProjectionSnapshot {
+  string thread_id = 1;
+  repeated ConversationMessage messages = 2;
+  uint64 version = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// Thread projection plus event-retention metadata.
+//
+// `latest_event_sequence` and `earliest_available_event_sequence` are derived
+// from the committed event store, not the thread row itself. They exist so a
+// client that hits a retention gap can rehydrate from unary snapshots and
+// establish a fresh replay cursor without any hidden server-side session state.
+message ThreadSnapshot {
+  string thread_id = 1;
+  ThreadStatus status = 2;
+  uint32 committed_turns = 3;
+  TokenUsage total_usage = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  optional uint64 latest_event_sequence = 7;
+  optional uint64 earliest_available_event_sequence = 8;
+}
+
+message WaitingOnChildrenState {
+  repeated string child_task_ids = 1;
+}
+
+message PendingConfirmation {
+  string task_id = 1;
+  string tool_call_id = 2;
+  string tool_name = 3;
+  string display_name = 4;
+  google.protobuf.Value requested_input = 5;
+  string description = 6;
+  PreparedOperation prepared_operation = 7;
+  google.protobuf.Timestamp paused_at = 8;
+}
+
+message AwaitingConfirmationState {
+  PendingConfirmation confirmation = 1;
+}
+
+message ReadyToResumeState {
+  repeated string child_task_ids = 1;
+}
+
+// Durable state for a subagent invocation task that owns the
+// cross-thread relationship to a spawned child thread.
+//
+// Separated from WaitingOnChildrenState because the child_root_task_id
+// lives on a different thread than the invocation task itself, so clients
+// cannot resolve it via list_thread_tasks on the parent thread.
+message SubagentInvocationState {
+  string child_thread_id = 1;
+  string child_root_task_id = 2;
+}
+
+// Snapshot view of the current durable task row.
+//
+// Worker ownership and lease fields are intentionally omitted. They are
+// runtime-internal coordination details rather than committed client-facing
+// state.
+message TaskSnapshot {
+  string task_id = 1;
+  string thread_id = 2;
+  string root_task_id = 3;
+  optional string parent_task_id = 4;
+  TaskKind kind = 5;
+  TaskStatus status = 6;
+  uint32 depth = 7;
+  uint32 attempt = 8;
+  uint32 max_attempts = 9;
+  uint32 pending_child_count = 10;
+  optional string last_error = 11;
+
+  oneof state_detail {
+    WaitingOnChildrenState waiting_on_children = 13;
+    AwaitingConfirmationState awaiting_confirmation = 14;
+    ReadyToResumeState ready_to_resume = 15;
+    SubagentInvocationState subagent_invocation = 16;
+  }
+
+  google.protobuf.Timestamp created_at = 20;
+  google.protobuf.Timestamp updated_at = 21;
+  google.protobuf.Timestamp completed_at = 22;
+}
+
+message ThreadView {
+  ThreadSnapshot thread = 1;
+  TaskSnapshot active_root = 2;
+  repeated TaskSnapshot queued_roots = 3;
+}
+
+message ApprovedConfirmation {}
+
+message RejectedConfirmation {
+  string reason = 1;
+}
+
+message TimedOutConfirmation {}
+
+message ConfirmationDecision {
+  oneof decision {
+    ApprovedConfirmation approved = 1;
+    RejectedConfirmation rejected = 2;
+    TimedOutConfirmation timed_out = 3;
+  }
+}

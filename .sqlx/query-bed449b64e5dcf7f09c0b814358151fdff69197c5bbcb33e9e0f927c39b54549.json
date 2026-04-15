@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_turn_attempts SET\n    response_blob = ?2, response_id = ?3, response_model = ?4,\n    stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,\n    cached_input_tokens = ?9, closed_at = ?10, duration_ms = ?11\nWHERE id = ?1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "bed449b64e5dcf7f09c0b814358151fdff69197c5bbcb33e9e0f927c39b54549"
+}

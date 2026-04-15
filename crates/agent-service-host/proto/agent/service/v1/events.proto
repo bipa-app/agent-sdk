@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package agent.service.v1;
+
+import "agent/service/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// Replay and live-tail event transport for a single thread.
+//
+// This surface is replay-first: every `event` item is a committed event with a
+// server-owned sequence, and `after_sequence` is the only resume token. There
+// is no hidden per-connection cursor state.
+
+enum FollowMode {
+  FOLLOW_MODE_UNSPECIFIED = 0;
+  FOLLOW_MODE_REPLAY_ONLY = 1;
+  FOLLOW_MODE_REPLAY_AND_FOLLOW = 2;
+}
+
+enum ReplayRequiredReason {
+  REPLAY_REQUIRED_REASON_UNSPECIFIED = 0;
+  REPLAY_REQUIRED_REASON_SUBSCRIBER_LAGGED = 1;
+}
+
+enum StreamCloseReason {
+  STREAM_CLOSE_REASON_UNSPECIFIED = 0;
+  STREAM_CLOSE_REASON_REPLAY_EXHAUSTED = 1;
+  STREAM_CLOSE_REASON_THREAD_COMPLETED = 2;
+  STREAM_CLOSE_REASON_SERVER_SHUTDOWN = 3;
+}
+
+message StartEvent {
+  string thread_id = 1;
+  uint64 turn = 2;
+}
+
+message ThinkingEvent {
+  string message_id = 1;
+  string text = 2;
+}
+
+message ThinkingDeltaEvent {
+  string message_id = 1;
+  string delta = 2;
+}
+
+message TextDeltaEvent {
+  string message_id = 1;
+  string delta = 2;
+}
+
+message TextEvent {
+  string message_id = 1;
+  string text = 2;
+}
+
+message ToolCallStartEvent {
+  string tool_call_id = 1;
+  string name = 2;
+  string display_name = 3;
+  google.protobuf.Value input = 4;
+  ToolTier tier = 5;
+}
+
+message ToolCallEndEvent {
+  string tool_call_id = 1;
+  string name = 2;
+  string display_name = 3;
+  ToolResult result = 4;
+}
+
+message ToolProgressEvent {
+  string tool_call_id = 1;
+  string name = 2;
+  string display_name = 3;
+  string stage = 4;
+  string message = 5;
+  google.protobuf.Value data = 6;
+}
+
+message ToolRequiresConfirmationEvent {
+  string tool_call_id = 1;
+  string name = 2;
+  string display_name = 3;
+  google.protobuf.Value input = 4;
+  string description = 5;
+}
+
+message TurnCompleteEvent {
+  uint64 turn = 1;
+  TokenUsage usage = 2;
+}
+
+message DoneEvent {
+  string thread_id = 1;
+  uint64 total_turns = 2;
+  TokenUsage total_usage = 3;
+  google.protobuf.Duration duration = 4;
+}
+
+message ErrorEvent {
+  string message = 1;
+  bool recoverable = 2;
+}
+
+message RefusalEvent {
+  string message_id = 1;
+  optional string text = 2;
+}
+
+message ContextCompactedEvent {
+  uint64 original_count = 1;
+  uint64 new_count = 2;
+  uint64 original_tokens = 3;
+  uint64 new_tokens = 4;
+}
+
+message SubagentProgressEvent {
+  string subagent_id = 1;
+  string subagent_name = 2;
+  optional string nickname = 3;
+  optional uint32 max_turns = 4;
+  optional uint32 current_turn = 5;
+  optional string model = 6;
+  string tool_name = 7;
+  string tool_context = 8;
+  bool completed = 9;
+  bool success = 10;
+  uint32 tool_count = 11;
+  uint64 total_tokens = 12;
+  optional string child_thread_id = 13;
+  optional string child_root_task_id = 14;
+  optional string subagent_task_id = 15;
+}
+
+// A single committed event in per-thread sequence order.
+message EventEnvelope {
+  string event_id = 1;
+  string thread_id = 2;
+  uint64 sequence = 3;
+  google.protobuf.Timestamp commit_time = 4;
+
+  oneof event {
+    StartEvent start = 10;
+    ThinkingEvent thinking = 11;
+    ThinkingDeltaEvent thinking_delta = 12;
+    TextDeltaEvent text_delta = 13;
+    TextEvent text = 14;
+    ToolCallStartEvent tool_call_start = 15;
+    ToolCallEndEvent tool_call_end = 16;
+    ToolProgressEvent tool_progress = 17;
+    ToolRequiresConfirmationEvent tool_requires_confirmation = 18;
+    TurnCompleteEvent turn_complete = 19;
+    DoneEvent done = 20;
+    ErrorEvent error = 21;
+    RefusalEvent refusal = 22;
+    ContextCompactedEvent context_compacted = 23;
+    SubagentProgressEvent subagent_progress = 24;
+  }
+}
+
+message StreamThreadEventsRequest {
+  string thread_id = 1;
+
+  // Exclusive replay cursor. Omit to replay from the beginning of the
+  // retained event log.
+  optional uint64 after_sequence = 2;
+
+  // Replay only, or replay and then continue with committed live events.
+  // FOLLOW_MODE_UNSPECIFIED is treated as INVALID_ARGUMENT.
+  FollowMode follow_mode = 3;
+}
+
+// First frame on every successful stream.
+//
+// This does not participate in event ordering: it announces the replay window
+// the server will use for the immediately-following `event` frames.
+message ReplayOpened {
+  string thread_id = 1;
+  optional uint64 requested_after_sequence = 2;
+  optional uint64 earliest_available_sequence = 3;
+  optional uint64 replay_through_sequence = 4;
+  FollowMode follow_mode = 5;
+}
+
+// Marks the handoff point between durable replay and live follow.
+//
+// Exactly one `replay_catchup_complete` frame is emitted after a successful
+// replay window, unless the stream terminated earlier with `retention_gap`.
+message ReplayCatchupComplete {
+  string thread_id = 1;
+  optional uint64 replayed_through_sequence = 2;
+  bool following_live = 3;
+}
+
+// Terminal control frame emitted when the requested cursor predates the
+// retained event window.
+//
+// After emitting this frame the server closes the RPC normally. Clients should
+// rehydrate from unary snapshots (`GetThread`, `GetThreadMessages`,
+// `ListThreadTasks`) before opening a new stream.
+message RetentionGap {
+  string thread_id = 1;
+  optional uint64 requested_after_sequence = 2;
+  optional uint64 earliest_available_sequence = 3;
+  optional uint64 latest_available_sequence = 4;
+}
+
+// Terminal control frame emitted after the server intentionally drops live
+// follow and requires the client to reconnect via replay.
+message ReplayRequired {
+  string thread_id = 1;
+  optional uint64 last_delivered_sequence = 2;
+  ReplayRequiredReason reason = 3;
+}
+
+// Terminal control frame emitted when the server cleanly ends a stream.
+message EventStreamClosed {
+  string thread_id = 1;
+  StreamCloseReason reason = 2;
+  optional uint64 last_sequence = 3;
+}
+
+// Streaming response envelope.
+//
+// Ordering rule:
+// - Only `event` frames are sequence-ordered.
+// - Control frames (`replay_opened`, `replay_catchup_complete`,
+//   `retention_gap`, `replay_required`, `closed`) never imply a committed
+//   event sequence of their own.
+message StreamThreadEventsResponse {
+  oneof item {
+    ReplayOpened replay_opened = 1;
+    EventEnvelope event = 2;
+    ReplayCatchupComplete replay_catchup_complete = 3;
+    RetentionGap retention_gap = 4;
+    ReplayRequired replay_required = 5;
+    EventStreamClosed closed = 6;
+  }
+}
+
+service AgentEventService {
+  // Replay committed events after `after_sequence`, optionally followed by the
+  // live committed tail for the same thread.
+  //
+  // Successful stream shape:
+  // 1. `replay_opened`
+  // 2. zero or more `event` frames in strictly increasing `sequence` order
+  // 3. `replay_catchup_complete`
+  // 4. if `follow_mode == FOLLOW_MODE_REPLAY_ONLY`, `closed` with
+  //    `STREAM_CLOSE_REASON_REPLAY_EXHAUSTED` then EOF
+  // 5. otherwise zero or more live `event` frames until `replay_required`,
+  //    `closed`, transport error, or client cancellation
+  rpc StreamThreadEvents(StreamThreadEventsRequest) returns (stream StreamThreadEventsResponse);
+}

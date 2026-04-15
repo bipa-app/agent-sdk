@@ -25,9 +25,46 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Building
 
+This is a Cargo workspace. All commands run from the repo root:
+
 ```bash
 cargo build
 ```
+
+### Local Postgres 18 and SQLx
+
+The Postgres-backed service-host code uses `sqlx` compile-time checked
+queries and commits `.sqlx` metadata for offline builds. The repo ships
+with a local Postgres 18 Docker Compose setup in `compose.yml` and a
+helper script at `scripts/postgres18-dev.sh`.
+
+The helper respects `SQLX_DEV_CARGO_HOME` if you need to point SQLx prep
+at a specific Cargo cache; otherwise it falls back to the current
+`CARGO_HOME` or a temporary cache.
+
+Bring up the local database:
+
+```bash
+scripts/postgres18-dev.sh up
+scripts/postgres18-dev.sh wait
+```
+
+Refresh SQLx metadata against a fresh local database:
+
+```bash
+scripts/postgres18-dev.sh prepare
+```
+
+Validate that the current migration bundle applies cleanly and that the
+Postgres store tests pass against the local database:
+
+```bash
+scripts/postgres18-dev.sh test-migrations
+```
+
+Normal Cargo builds run with `SQLX_OFFLINE=true` via
+`.cargo/config.toml`, so if you change a compile-time checked query you
+must refresh the `.sqlx` metadata before submitting the change.
 
 ### Running Tests
 
@@ -138,6 +175,20 @@ pub fn create(params: CreateParams) { }
 ```
 
 ## Pull Request Process
+
+### sdk/v2 Rewrite PRs
+
+The SDK rewrite is developed on the **`sdk/v2`** branch. All rewrite PRs
+must target `sdk/v2` as their base branch — **not** `main`.
+
+```bash
+# Start a rewrite feature branch
+git checkout sdk/v2
+git pull --rebase origin sdk/v2
+git checkout -b feat/my-phase-0-work
+```
+
+### General PRs
 
 1. Ensure all quality checks pass
 2. Update documentation if you're changing public APIs

@@ -1,0 +1,774 @@
+//! Phase 6.2 regression tests for atomic event commit rules.
+//!
+//! Verifies that lifecycle events are committed after the state
+//! transitions they describe, returned in outcome types, and follow
+//! monotonic thread-scoped sequencing.
+
+use super::root_turn::{
+    RootTurnDeps, RootTurnOutcome, execute_root_turn, fail_root_turn, resume_from_children,
+};
+use super::tool_task::{ToolTaskOutcome, execute_tool_task, resolve_tool_bootstrap};
+use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
+use crate::journal::execution_context::build_root_worker_inputs;
+use crate::journal::message_store::InMemoryMessageProjectionStore;
+use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use crate::journal::task::{AgentTask, LeaseId, WorkerId};
+use crate::journal::thread_store::InMemoryThreadStore;
+use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
+use crate::worker::bootstrap::WorkerBootstrapContext;
+use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use agent_sdk_core::events::AgentEvent;
+use agent_sdk_core::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
+};
+use agent_sdk_core::{ThreadId, ToolResult, ToolTier};
+use agent_sdk_providers::LlmProvider;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use time::Duration;
+use tokio_util::sync::CancellationToken;
+
+// ─────────────────────────────────────────────────────────────────────
+// Shared test helpers
+// ─────────────────────────────────────────────────────────────────────
+
+fn t0() -> time::OffsetDateTime {
+    time::OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
+}
+
+fn thread_a() -> ThreadId {
+    ThreadId::from_string("t-event-commit-a")
+}
+
+fn sample_definition() -> AgentDefinition {
+    AgentDefinition {
+        provider: "anthropic".into(),
+        model: "mock-model".into(),
+        system_prompt: "You are a test assistant.".into(),
+        tools: Vec::new(),
+        max_tokens: 1024,
+        thinking: ThinkingPolicy::Disabled,
+        policy: RuntimePolicy::default(),
+    }
+}
+
+fn sample_definition_with_tools() -> AgentDefinition {
+    AgentDefinition {
+        tools: vec![Tool {
+            name: "bash".into(),
+            description: "Run a shell command".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            display_name: "Bash".into(),
+            tier: ToolTier::Observe,
+        }],
+        ..sample_definition()
+    }
+}
+
+fn sample_bootstrap(task: AgentTask) -> WorkerBootstrapContext {
+    let thread_id = task.thread_id.clone();
+    let task_id = task.id.clone();
+    WorkerBootstrapContext {
+        task,
+        definition: sample_definition(),
+        thread_id,
+        task_id,
+        worker_id: WorkerId::from_string("worker_evt"),
+        lease_id: LeaseId::from_string("lease_evt"),
+    }
+}
+
+fn sample_bootstrap_with_tools(task: AgentTask) -> WorkerBootstrapContext {
+    let thread_id = task.thread_id.clone();
+    let task_id = task.id.clone();
+    WorkerBootstrapContext {
+        task,
+        definition: sample_definition_with_tools(),
+        thread_id,
+        task_id,
+        worker_id: WorkerId::from_string("worker_evt"),
+        lease_id: LeaseId::from_string("lease_evt"),
+    }
+}
+
+struct TestStores {
+    tasks: InMemoryAgentTaskStore,
+    threads: InMemoryThreadStore,
+    messages: InMemoryMessageProjectionStore,
+    attempts: InMemoryTurnAttemptStore,
+    checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
+}
+
+impl TestStores {
+    fn new() -> Self {
+        Self {
+            tasks: InMemoryAgentTaskStore::new(),
+            threads: InMemoryThreadStore::new(),
+            messages: InMemoryMessageProjectionStore::new(),
+            attempts: InMemoryTurnAttemptStore::new(),
+            checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
+        }
+    }
+
+    fn deps(&self) -> RootTurnDeps<'_> {
+        RootTurnDeps {
+            task_store: &self.tasks,
+            thread_store: &self.threads,
+            message_store: &self.messages,
+            attempt_store: &self.attempts,
+            checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
+        }
+    }
+}
+
+fn t_plus(secs: i64) -> time::OffsetDateTime {
+    t0() + Duration::seconds(secs)
+}
+
+async fn create_and_acquire_task(
+    store: &InMemoryAgentTaskStore,
+    thread_id: &ThreadId,
+) -> Result<AgentTask> {
+    let task = AgentTask::new_root_turn(thread_id.clone(), t0(), 3);
+    let task_id = task.id.clone();
+
+    store.submit_root_turn(task).await.context("submit")?;
+
+    let acquired = store
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_evt"),
+            LeaseId::from_string("lease_evt"),
+            t_plus(300),
+            t0(),
+        )
+        .await
+        .context("acquire")?
+        .context("task should be acquirable")?;
+    Ok(acquired)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Mock providers
+// ─────────────────────────────────────────────────────────────────────
+
+struct MockTextProvider {
+    response_text: String,
+    stop_reason: Option<StopReason>,
+}
+
+impl MockTextProvider {
+    fn new(text: &str) -> Self {
+        Self {
+            response_text: text.to_owned(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
+
+    fn with_refusal(text: &str) -> Self {
+        Self {
+            response_text: text.to_owned(),
+            stop_reason: Some(StopReason::Refusal),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MockTextProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_evt_01".into(),
+            content: vec![ContentBlock::Text {
+                text: self.response_text.clone(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: self.stop_reason,
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+struct MockToolCallProvider {
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    call_count: AtomicUsize,
+}
+
+impl MockToolCallProvider {
+    fn new(tool_calls: Vec<(String, String, serde_json::Value)>) -> Self {
+        Self {
+            tool_calls,
+            call_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MockToolCallProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if call_num > 0 {
+            return Ok(ChatOutcome::Success(ChatResponse {
+                id: "msg_evt_resume".into(),
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                model: "mock-model".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 50,
+                    output_tokens: 25,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }));
+        }
+        let content: Vec<ContentBlock> = self
+            .tool_calls
+            .iter()
+            .map(|(id, name, input)| ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                thought_signature: None,
+            })
+            .collect();
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_evt_tool_01".into(),
+            content,
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
+        .await
+        .context("build inputs")?;
+
+    let provider = MockTextProvider::new("hello");
+    let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t0()).await?;
+
+    let committed_events = match outcome {
+        RootTurnOutcome::Completed {
+            committed_events, ..
+        } => committed_events,
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
+    };
+
+    // Should have Start + Text + TurnComplete + Done (4 events).
+    assert_eq!(committed_events.len(), 4, "expected 4 events");
+    assert!(
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
+        committed_events[0].event,
+    );
+    assert!(
+        matches!(&committed_events[1].event, AgentEvent::Text { .. }),
+        "event[1] should be Text, got {:?}",
+        committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::TurnComplete { .. }),
+        "event[2] should be TurnComplete, got {:?}",
+        committed_events[2].event,
+    );
+    assert!(
+        matches!(&committed_events[3].event, AgentEvent::Done { .. }),
+        "event[3] should be Done, got {:?}",
+        committed_events[3].event,
+    );
+
+    // Events should also be in the repository.
+    let repo_events = stores.events.get_events(&thread_a()).await?;
+    assert_eq!(repo_events.len(), 4);
+    for (i, evt) in repo_events.iter().enumerate() {
+        assert_eq!(evt.sequence, i as u64);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn refusal_turn_emits_refusal_event() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
+        .await
+        .context("build inputs")?;
+
+    let provider = MockTextProvider::with_refusal("I cannot do that");
+    let outcome =
+        execute_root_turn(inputs, "do something bad", &provider, &stores.deps(), t0()).await?;
+
+    let committed_events = match outcome {
+        RootTurnOutcome::Completed {
+            committed_events, ..
+        } => committed_events,
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
+    };
+
+    // Should have Start + Text + Refusal + TurnComplete + Done (5 events).
+    assert_eq!(committed_events.len(), 5, "expected 5 events");
+    assert!(
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
+        committed_events[0].event,
+    );
+    assert!(
+        matches!(&committed_events[1].event, AgentEvent::Text { .. }),
+        "event[1] should be Text, got {:?}",
+        committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::Refusal { .. }),
+        "event[2] should be Refusal, got {:?}",
+        committed_events[2].event,
+    );
+    assert!(
+        matches!(&committed_events[3].event, AgentEvent::TurnComplete { .. }),
+        "event[3] should be TurnComplete, got {:?}",
+        committed_events[3].event,
+    );
+    assert!(
+        matches!(&committed_events[4].event, AgentEvent::Done { .. }),
+        "event[4] should be Done, got {:?}",
+        committed_events[4].event,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
+        .await
+        .context("build inputs")?;
+
+    let provider = MockToolCallProvider::new(vec![
+        (
+            "tc_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        ),
+        (
+            "tc_2".into(),
+            "bash".into(),
+            serde_json::json!({"command": "pwd"}),
+        ),
+    ]);
+    let outcome =
+        execute_root_turn(inputs, "run commands", &provider, &stores.deps(), t0()).await?;
+
+    let committed_events = match outcome {
+        RootTurnOutcome::Suspended {
+            committed_events, ..
+        } => committed_events,
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
+    };
+
+    // Start + one ToolCallStart per tool call (3 events).
+    assert_eq!(committed_events.len(), 3, "expected 3 suspension events");
+    assert!(
+        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
+        "event[0] should be Start, got {:?}",
+        committed_events[0].event,
+    );
+    assert!(
+        matches!(&committed_events[1].event, AgentEvent::ToolCallStart { .. }),
+        "event[1] should be ToolCallStart, got {:?}",
+        committed_events[1].event,
+    );
+    assert!(
+        matches!(&committed_events[2].event, AgentEvent::ToolCallStart { .. }),
+        "event[2] should be ToolCallStart, got {:?}",
+        committed_events[2].event,
+    );
+
+    // Sequences should be contiguous.
+    for (i, evt) in committed_events.iter().enumerate() {
+        assert_eq!(evt.sequence, i as u64);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_completion_emits_tool_call_end() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
+        .await
+        .context("build inputs")?;
+
+    // Suspend to create child tasks.
+    let provider = MockToolCallProvider::new(vec![(
+        "tc_1".into(),
+        "bash".into(),
+        serde_json::json!({"command": "echo hi"}),
+    )]);
+    let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
+    let child_tasks = match outcome {
+        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
+    };
+
+    // Acquire and bootstrap the child.
+    let child = stores
+        .tasks
+        .try_acquire_task(
+            &child_tasks[0].id,
+            WorkerId::from_string("worker_child"),
+            LeaseId::from_string("lease_child"),
+            t_plus(300),
+            t0(),
+        )
+        .await?
+        .context("child task should be acquirable")?;
+    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+
+    // Execute the tool.
+    let cancel = CancellationToken::new();
+    let tool_outcome = execute_tool_task(
+        child_bootstrap,
+        &stores.tasks,
+        &stores.events,
+        &cancel,
+        |_tc, _collector| async {
+            Ok(ToolResult {
+                success: true,
+                output: "hi".into(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            })
+        },
+        t0(),
+    )
+    .await?;
+
+    let committed_events = match tool_outcome {
+        ToolTaskOutcome::Completed {
+            committed_events, ..
+        } => committed_events,
+        ToolTaskOutcome::Failed { .. } | ToolTaskOutcome::Cancelled => {
+            panic!("expected Completed")
+        }
+    };
+
+    // Should have exactly one ToolCallEnd event.
+    assert_eq!(committed_events.len(), 1);
+    assert!(
+        matches!(&committed_events[0].event, AgentEvent::ToolCallEnd { .. }),
+        "expected ToolCallEnd, got {:?}",
+        committed_events[0].event,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
+        .await
+        .context("build inputs")?;
+
+    let provider = MockToolCallProvider::new(vec![(
+        "tc_fail".into(),
+        "bash".into(),
+        serde_json::json!({"command": "false"}),
+    )]);
+    let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
+    let child_tasks = match outcome {
+        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
+    };
+
+    let child = stores
+        .tasks
+        .try_acquire_task(
+            &child_tasks[0].id,
+            WorkerId::from_string("worker_child"),
+            LeaseId::from_string("lease_child"),
+            t_plus(300),
+            t0(),
+        )
+        .await?
+        .context("child task should be acquirable")?;
+    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+
+    let cancel = CancellationToken::new();
+    let tool_outcome = execute_tool_task(
+        child_bootstrap,
+        &stores.tasks,
+        &stores.events,
+        &cancel,
+        |_tc, _collector| async { anyhow::bail!("tool execution failed") },
+        t0(),
+    )
+    .await?;
+
+    let committed_events = match tool_outcome {
+        ToolTaskOutcome::Failed {
+            committed_events, ..
+        } => committed_events,
+        ToolTaskOutcome::Completed { .. } | ToolTaskOutcome::Cancelled => {
+            panic!("expected Failed")
+        }
+    };
+
+    assert_eq!(committed_events.len(), 1);
+    match &committed_events[0].event {
+        AgentEvent::ToolCallEnd { result, .. } => {
+            assert!(!result.success, "failed tool should have success=false");
+        }
+        event => panic!("expected ToolCallEnd, got {event:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fail_root_turn_emits_error_event() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let worker_id = WorkerId::from_string("worker_evt");
+    let lease_id = LeaseId::from_string("lease_evt");
+
+    let err = anyhow::anyhow!("something went wrong");
+    fail_root_turn(
+        &task_id,
+        &worker_id,
+        &lease_id,
+        &thread_a(),
+        &err,
+        &stores.deps(),
+        t0(),
+    )
+    .await?;
+
+    let repo_events = stores.events.get_events(&thread_a()).await?;
+    assert_eq!(repo_events.len(), 1, "expected 1 Error event");
+    assert!(
+        matches!(&repo_events[0].event, AgentEvent::Error { .. }),
+        "expected Error, got {:?}",
+        repo_events[0].event,
+    );
+
+    Ok(())
+}
+
+/// Execute a child tool task and resume the parent, collecting all
+/// lifecycle events along the way.
+async fn execute_child_and_resume(
+    stores: &TestStores,
+    child_tasks: &[AgentTask],
+    provider: &MockToolCallProvider,
+) -> Result<()> {
+    let child = stores
+        .tasks
+        .try_acquire_task(
+            &child_tasks[0].id,
+            WorkerId::from_string("worker_child"),
+            LeaseId::from_string("lease_child"),
+            t_plus(300),
+            t0(),
+        )
+        .await?
+        .context("child task should be acquirable")?;
+    let child_bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    let cancel = CancellationToken::new();
+    execute_tool_task(
+        child_bootstrap,
+        &stores.tasks,
+        &stores.events,
+        &cancel,
+        |_tc, _collector| async {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            })
+        },
+        t0(),
+    )
+    .await?;
+
+    let parent = stores
+        .tasks
+        .get(&child_tasks[0].parent_id.as_ref().unwrap().clone())
+        .await?
+        .context("parent")?;
+
+    let parent_acq = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_resume"),
+            LeaseId::from_string("lease_resume"),
+            t_plus(300),
+            t0(),
+        )
+        .await?
+        .context("parent task should be acquirable")?;
+
+    let resume_bootstrap = WorkerBootstrapContext {
+        task: parent_acq.clone(),
+        definition: sample_definition_with_tools(),
+        thread_id: thread_a(),
+        task_id: parent_acq.id.clone(),
+        worker_id: WorkerId::from_string("worker_resume"),
+        lease_id: parent_acq.lease_id.clone().unwrap(),
+    };
+    let resume_inputs =
+        build_root_worker_inputs(resume_bootstrap, &stores.threads, &stores.checkpoints, t0())
+            .await?;
+
+    resume_from_children(resume_inputs, &parent_acq, provider, &stores.deps(), t0()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    // Step 1: suspend (emits ToolCallStart).
+    let provider = MockToolCallProvider::new(vec![(
+        "tc_seq".into(),
+        "bash".into(),
+        serde_json::json!({"command": "echo"}),
+    )]);
+    let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
+    let child_tasks = match outcome {
+        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
+        RootTurnOutcome::Completed { .. } => panic!("expected Suspended, got Completed"),
+    };
+
+    // Steps 2-3: execute child tool + resume parent.
+    execute_child_and_resume(&stores, &child_tasks, &provider).await?;
+
+    // Verify all events have strictly monotonic sequences.
+    // Expected: Start → ToolCallStart → ToolCallEnd → Text → TurnComplete → Done
+    let all_events = stores.events.get_events(&thread_a()).await?;
+    assert!(
+        all_events.len() >= 6,
+        "expected at least 6 events (Start + ToolCallStart + ToolCallEnd + Text + TurnComplete + Done), got {}",
+        all_events.len(),
+    );
+
+    for i in 1..all_events.len() {
+        assert_eq!(
+            all_events[i].sequence,
+            all_events[i - 1].sequence + 1,
+            "events at index {}/{} have non-contiguous sequences: {} vs {}",
+            i - 1,
+            i,
+            all_events[i - 1].sequence,
+            all_events[i].sequence,
+        );
+    }
+
+    // Verify event type ordering across root + tool task boundaries.
+    assert!(matches!(&all_events[0].event, AgentEvent::Start { .. }));
+    assert!(matches!(
+        &all_events[1].event,
+        AgentEvent::ToolCallStart { .. }
+    ));
+    assert!(matches!(
+        &all_events[2].event,
+        AgentEvent::ToolCallEnd { .. }
+    ));
+    assert!(matches!(&all_events[3].event, AgentEvent::Text { .. }));
+    assert!(matches!(
+        &all_events[4].event,
+        AgentEvent::TurnComplete { .. }
+    ));
+    assert!(matches!(&all_events[5].event, AgentEvent::Done { .. }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_events_returned_in_outcome_types() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let provider = MockTextProvider::new("result");
+    let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t0()).await?;
+
+    // Verify committed_events in outcome matches what's in the repository.
+    let outcome_events = match outcome {
+        RootTurnOutcome::Completed {
+            committed_events, ..
+        } => committed_events,
+        RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
+    };
+
+    let repo_events = stores.events.get_events(&thread_a()).await?;
+    assert_eq!(outcome_events.len(), repo_events.len());
+
+    for (outcome_evt, repo_evt) in outcome_events.iter().zip(repo_events.iter()) {
+        assert_eq!(outcome_evt.event_id, repo_evt.event_id);
+        assert_eq!(outcome_evt.sequence, repo_evt.sequence);
+    }
+
+    Ok(())
+}

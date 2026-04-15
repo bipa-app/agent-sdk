@@ -1,0 +1,26 @@
+[package]
+name = "agent-sdk-tools"
+version = "0.8.0"
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+description = "Tool traits, registry, hooks, and store contracts for the Agent SDK"
+
+[dependencies]
+agent-sdk-core = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+tokio-util = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

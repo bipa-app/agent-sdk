@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_committed_events",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "e6e4edf6181ce15d311bdb77b14ff2e4a1fb08c2f1a77ee78e3771fdb38336b0"
+}
