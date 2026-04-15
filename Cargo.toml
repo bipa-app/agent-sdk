@@ -10,6 +10,7 @@ edition = "2024"
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
 agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.8.0" }
 agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0" }
+agent-sdk = { path = "crates/agent-sdk", version = "0.8.0" }
 agent-server = { path = "crates/agent-server", version = "0.8.0" }
 agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
 tokio = { version = "1.40", features = ["sync", "fs", "process", "time", "macros"] }

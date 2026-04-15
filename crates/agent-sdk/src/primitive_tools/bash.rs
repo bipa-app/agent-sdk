@@ -39,7 +39,7 @@ struct BashInput {
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
 
-impl<E: Environment + 'static> Tool<()> for BashTool<E> {
+impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashTool<E> {
     type Name = PrimitiveToolName;
 
     fn name(&self) -> PrimitiveToolName {
@@ -78,7 +78,7 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: BashInput = serde_json::from_value(input.clone())
             .with_context(|| format!("Invalid input for bash tool: {input}"))?;
 
@@ -451,11 +451,11 @@ mod tests {
         let env = Arc::new(MockBashEnvironment::new());
         let tool = create_test_tool(env, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), PrimitiveToolName::Bash);
-        assert_eq!(tool.tier(), ToolTier::Confirm);
-        assert!(tool.description().contains("Execute"));
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Bash);
+        assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
+        assert!(Tool::<()>::description(&tool).contains("Execute"));
 
-        let schema = tool.input_schema();
+        let schema = Tool::<()>::input_schema(&tool);
         assert!(schema.get("properties").is_some());
         assert!(schema["properties"].get("command").is_some());
         assert!(schema["properties"].get("timeout_ms").is_some());

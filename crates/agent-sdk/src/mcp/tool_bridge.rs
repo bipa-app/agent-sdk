@@ -90,7 +90,7 @@ impl<T: McpTransport> McpToolBridge<T> {
     }
 }
 
-impl<T: McpTransport + 'static> Tool<()> for McpToolBridge<T> {
+impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToolBridge<T> {
     type Name = DynamicToolName;
 
     fn name(&self) -> DynamicToolName {
@@ -113,7 +113,7 @@ impl<T: McpTransport + 'static> Tool<()> for McpToolBridge<T> {
         self.tier
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let result = self.client.call_tool(&self.definition.name, input).await?;
 
         // Convert MCP content to output string

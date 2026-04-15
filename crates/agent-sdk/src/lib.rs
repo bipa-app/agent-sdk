@@ -339,6 +339,7 @@
 
 // ── Private modules (owned by this crate) ────────────────────────────
 mod agent_loop;
+pub mod builtin_tools;
 mod capabilities;
 pub mod context;
 mod filesystem;

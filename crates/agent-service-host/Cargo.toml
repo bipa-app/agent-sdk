@@ -45,6 +45,7 @@ url.workspace = true
 lapin = { workspace = true, optional = true }
 
 [dev-dependencies]
+agent-sdk.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 

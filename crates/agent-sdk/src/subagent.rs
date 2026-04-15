@@ -320,13 +320,16 @@ where
     ///
     /// The `parent_cancel` token links the subagent's lifecycle to its parent.
     /// Cancelling the parent token will also cancel the subagent.
-    async fn run_subagent(
+    async fn run_subagent<Ctx>(
         &self,
         task: &str,
         subagent_id: String,
-        parent_ctx: &ToolContext<()>,
+        parent_ctx: &ToolContext<Ctx>,
         parent_cancel: CancellationToken,
-    ) -> Result<SubagentResult> {
+    ) -> Result<SubagentResult>
+    where
+        Ctx: Send + Sync + 'static,
+    {
         use crate::agent_loop::AgentLoop;
 
         let start = Instant::now();
@@ -640,10 +643,10 @@ fn apply_subagent_wait_outcome(
     }
 }
 
-async fn replay_subagent_events(
+async fn replay_subagent_events<Ctx: Send + Sync + 'static>(
     event_store: &Arc<dyn EventStore>,
     thread_id: &ThreadId,
-    parent_ctx: &ToolContext<()>,
+    parent_ctx: &ToolContext<Ctx>,
     config: &SubagentConfig,
     subagent_id: &str,
     state: &mut SubagentExecutionState,
@@ -748,8 +751,8 @@ async fn replay_subagent_events(
     Ok(())
 }
 
-async fn emit_subagent_progress_if_possible(
-    parent_ctx: &ToolContext<()>,
+async fn emit_subagent_progress_if_possible<Ctx: Send + Sync + 'static>(
+    parent_ctx: &ToolContext<Ctx>,
     config: &SubagentConfig,
     update: SubagentProgressUpdate<'_>,
 ) {
@@ -758,8 +761,8 @@ async fn emit_subagent_progress_if_possible(
     }
 }
 
-async fn emit_subagent_progress(
-    parent_ctx: &ToolContext<()>,
+async fn emit_subagent_progress<Ctx: Send + Sync + 'static>(
+    parent_ctx: &ToolContext<Ctx>,
     config: &SubagentConfig,
     SubagentProgressUpdate {
         subagent_id,
@@ -953,12 +956,13 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
     }
 }
 
-impl<P, H, M, S> Tool<()> for SubagentTool<P, H, M, S>
+impl<P, H, M, S, Ctx> Tool<Ctx> for SubagentTool<P, H, M, S>
 where
     P: LlmProvider + Clone + 'static,
     H: AgentHooks + Clone + 'static,
     M: MessageStore + 'static,
     S: StateStore + 'static,
+    Ctx: Send + Sync + 'static,
 {
     type Name = DynamicToolName;
 
@@ -992,7 +996,7 @@ where
         ToolTier::Confirm
     }
 
-    async fn execute(&self, ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let task = input
             .get("task")
             .and_then(Value::as_str)
