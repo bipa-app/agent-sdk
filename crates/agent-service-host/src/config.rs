@@ -66,6 +66,8 @@ pub struct ServiceConfig {
     pub relay: RelayConfig,
     /// Task-wakeup consumer + fallback sweep configuration.
     pub wakeup: crate::wakeup::WakeupConfig,
+    /// Cross-instance thread-event watch consumer configuration.
+    pub watch: crate::watch::ThreadEventsWatchConfig,
 }
 
 impl ServiceConfig {
@@ -812,6 +814,51 @@ relay:
             }
             BrokerConfig::InMemory => panic!("expected AMQP broker"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn watch_defaults_are_disabled() {
+        // Cross-instance watch fanout is off by default so a host
+        // that has not provisioned broker queues falls back to
+        // journal-only replay (clients reconnect → durable replay).
+        let config = ServiceConfig::default();
+        assert!(!config.watch.enabled);
+    }
+
+    #[test]
+    fn watch_yaml_with_amqp_consumer_parses() -> Result<()> {
+        let yaml = r"
+watch:
+  enabled: true
+  amqp_consumer:
+    enabled: true
+    config:
+      queue: 'agent_sdk.thread_events.pod-x'
+      consumer_tag_prefix: 'pod-x-watch'
+      declare_queue: true
+      bind_queue: true
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(config.watch.enabled);
+        assert!(config.watch.amqp_consumer.enabled);
+        assert_eq!(
+            config.watch.amqp_consumer.config.queue,
+            "agent_sdk.thread_events.pod-x",
+        );
+        assert!(config.watch.amqp_consumer.config.declare_queue);
+        assert!(config.watch.amqp_consumer.config.bind_queue);
+
+        // Round-trip the parsed config through YAML to prove the
+        // serializer produces input the parser accepts.
+        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
+        assert!(re_config.watch.enabled);
+        assert!(re_config.watch.amqp_consumer.enabled);
+        assert_eq!(
+            re_config.watch.amqp_consumer.config.queue,
+            "agent_sdk.thread_events.pod-x",
+        );
         Ok(())
     }
 }
