@@ -2,8 +2,8 @@
 name = "agent-sdk-providers"
 version = "0.8.0"
 edition.workspace = true
-license.workspace = true
-repository.workspace = true
+license-file = "../../LICENSE"
+publish = false
 description = "LLM provider trait, streaming primitives, and first-party provider implementations for the Agent SDK"
 
 [dependencies]

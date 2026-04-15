@@ -2,8 +2,7 @@
 name = "agent-service-proto"
 version = "0.8.0"
 edition = "2024"
-license = "Apache-2.0"
-repository = "https://github.com/bipa-app/agent-sdk"
+license-file = "../../LICENSE"
 publish = false
 build = "build.rs"
 

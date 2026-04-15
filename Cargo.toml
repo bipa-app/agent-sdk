@@ -5,8 +5,6 @@ exclude = ["crates/agent-service-proto"]
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
-repository = "https://github.com/bipa-app/agent-sdk"
 
 [workspace.dependencies]
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }

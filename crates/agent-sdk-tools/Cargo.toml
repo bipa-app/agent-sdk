@@ -2,8 +2,8 @@
 name = "agent-sdk-tools"
 version = "0.8.0"
 edition.workspace = true
-license.workspace = true
-repository.workspace = true
+license-file = "../../LICENSE"
+publish = false
 description = "Tool traits, registry, hooks, and store contracts for the Agent SDK"
 
 [dependencies]
