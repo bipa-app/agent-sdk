@@ -860,6 +860,8 @@ watch:
             re_config.watch.amqp_consumer.config.queue,
             "agent_sdk.thread_events.pod-x",
         );
+        assert!(re_config.watch.amqp_consumer.config.declare_queue);
+        assert!(re_config.watch.amqp_consumer.config.bind_queue);
         Ok(())
     }
 }
