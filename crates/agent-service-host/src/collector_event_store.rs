@@ -15,9 +15,9 @@
 //!
 //! [`CollectorEventStore`] bridges the two worlds:  it implements
 //! [`EventStore::append`] by unwrapping the envelope and pushing the
-//! inner [`AgentEvent`] into the collector; [`commit_tool_events`]
-//! re-wraps them with the worker's authoritative sequence numbers
-//! after the state transition commits.
+//! inner [`AgentEvent`](agent_sdk_core::events::AgentEvent) into the
+//! collector; [`commit_tool_events`] re-wraps them with the worker's
+//! authoritative sequence numbers after the state transition commits.
 //!
 //! The store is **write-only** for the tool-execution path.  Read
 //! methods return empty results because tool code has no legitimate

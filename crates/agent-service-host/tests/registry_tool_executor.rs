@@ -28,19 +28,25 @@
 //!
 //! [`ToolCallExecutor`]: agent_service_host::runtime::ToolCallExecutor
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_sdk::builtin_tools::{BuiltinToolsConfig, register_builtin_tools};
 use agent_sdk::todo::TodoState;
-use agent_sdk::{AgentCapabilities, Environment, InMemoryFileSystem, ToolRegistry};
-use agent_sdk_core::types::{AgentContinuation, AgentState, PendingToolCallInfo, TokenUsage};
-use agent_sdk_core::{ContinuationEnvelope, ThreadId, ToolTier};
+use agent_sdk::{
+    AgentCapabilities, DynamicToolName, Environment, InMemoryFileSystem, Tool, ToolContext,
+    ToolRegistry, ToolResult,
+};
+use agent_sdk_core::types::{
+    AgentContinuation, AgentState, PendingToolCallInfo, TokenUsage, ToolTier,
+};
+use agent_sdk_core::{ContinuationEnvelope, ThreadId};
 use agent_server::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
 use agent_server::worker::{ToolEventCollector, ToolTaskBootstrap};
 use agent_server::{TaskKind, TaskState, TaskStatus};
 use agent_service_host::registry_tool_executor::RegistryToolExecutor;
 use agent_service_host::runtime::ToolCallExecutor;
-use serde_json::json;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -49,15 +55,27 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Populates the fields the executor actually reads
 /// (`thread_id`, `parent_task.id`, `parent_task.state`,
-/// `tool_call.{name, input}`); everything else gets a sentinel default
-/// that's valid enough to satisfy the field types.
+/// `tool_call.{name, input, effective_input}`); everything else gets
+/// a sentinel default that's valid enough to satisfy the field types.
 fn make_bootstrap(
     thread: &ThreadId,
     tool_name: &str,
-    input: serde_json::Value,
+    input: &serde_json::Value,
+) -> ToolTaskBootstrap {
+    make_bootstrap_with_context(thread, tool_name, input, input.clone(), HashMap::new())
+}
+
+fn make_bootstrap_with_context(
+    thread: &ThreadId,
+    tool_name: &str,
+    input: &serde_json::Value,
+    effective_input: serde_json::Value,
+    metadata: HashMap<String, serde_json::Value>,
 ) -> ToolTaskBootstrap {
     let parent_id = AgentTaskId("parent-task".into());
     let child_id = AgentTaskId("child-task".into());
+    let mut state = AgentState::new(thread.clone());
+    state.metadata = metadata;
 
     let continuation = ContinuationEnvelope::wrap(AgentContinuation {
         thread_id: thread.clone(),
@@ -67,7 +85,7 @@ fn make_bootstrap(
         pending_tool_calls: Vec::new(),
         awaiting_index: 0,
         completed_results: Vec::new(),
-        state: AgentState::new(thread.clone()),
+        state,
         response_id: None,
         stop_reason: None,
         response_content: Vec::new(),
@@ -127,9 +145,48 @@ fn make_bootstrap(
             display_name: tool_name.into(),
             tier: ToolTier::Observe,
             input: input.clone(),
-            effective_input: input,
+            effective_input,
             listen_context: None,
         },
+    }
+}
+
+struct ContextEchoTool;
+
+impl Tool<()> for ContextEchoTool {
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("ctx_echo")
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Context Echo"
+    }
+
+    fn description(&self) -> &'static str {
+        "Echoes input text and forwarded metadata"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(&self, ctx: &ToolContext<()>, input: Value) -> anyhow::Result<ToolResult> {
+        let text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("missing-text");
+        let user_id = ctx
+            .metadata
+            .get("user_id")
+            .and_then(Value::as_str)
+            .unwrap_or("missing-user");
+        Ok(ToolResult::success(format!("{text}:{user_id}")))
     }
 }
 
@@ -173,7 +230,7 @@ async fn executes_read_tool_end_to_end() -> anyhow::Result<()> {
     let executor = RegistryToolExecutor::with_default_factory(Arc::new(registry), ());
 
     let thread = ThreadId::from_string("t-read");
-    let bootstrap = make_bootstrap(&thread, "read", json!({"path": "/workspace/notes.txt"}));
+    let bootstrap = make_bootstrap(&thread, "read", &json!({"path": "/workspace/notes.txt"}));
 
     let result = executor
         .execute_tool_call(
@@ -214,7 +271,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
     // 1) Primitive: read.
     let result = executor
         .execute_tool_call(
-            &make_bootstrap(&thread, "read", json!({"path": "/workspace/notes.txt"})),
+            &make_bootstrap(&thread, "read", &json!({"path": "/workspace/notes.txt"})),
             ToolEventCollector::new(),
             CancellationToken::new(),
         )
@@ -229,7 +286,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
     });
     let result = executor
         .execute_tool_call(
-            &make_bootstrap(&thread, "todo_write", todos),
+            &make_bootstrap(&thread, "todo_write", &todos),
             ToolEventCollector::new(),
             CancellationToken::new(),
         )
@@ -238,7 +295,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
 
     let result = executor
         .execute_tool_call(
-            &make_bootstrap(&thread, "todo_read", json!({})),
+            &make_bootstrap(&thread, "todo_read", &json!({})),
             ToolEventCollector::new(),
             CancellationToken::new(),
         )
@@ -257,7 +314,7 @@ async fn executes_primitive_todo_and_tool_families_through_v2() -> anyhow::Resul
 async fn unknown_tool_name_returns_dispatch_error() {
     let executor = executor_with_builtins();
     let thread = ThreadId::from_string("t-unknown");
-    let bootstrap = make_bootstrap(&thread, "does_not_exist", json!({}));
+    let bootstrap = make_bootstrap(&thread, "does_not_exist", &json!({}));
 
     let err = executor
         .execute_tool_call(
@@ -268,4 +325,31 @@ async fn unknown_tool_name_returns_dispatch_error() {
         .await
         .expect_err("unknown tool must fail");
     assert!(err.to_string().contains("does_not_exist"));
+}
+
+#[tokio::test]
+async fn execute_tool_call_uses_effective_input_and_parent_metadata() -> anyhow::Result<()> {
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register(ContextEchoTool);
+    let executor = RegistryToolExecutor::with_default_factory(Arc::new(registry), ());
+    let thread = ThreadId::from_string("t-effective-input");
+    let bootstrap = make_bootstrap_with_context(
+        &thread,
+        "ctx_echo",
+        &json!({"text": "requested"}),
+        json!({"text": "effective"}),
+        HashMap::from([(String::from("user_id"), json!("u-42"))]),
+    );
+
+    let result = executor
+        .execute_tool_call(
+            &bootstrap,
+            ToolEventCollector::new(),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert!(result.success);
+    assert_eq!(result.output, "effective:u-42");
+    Ok(())
 }

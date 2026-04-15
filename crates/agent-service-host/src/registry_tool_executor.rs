@@ -12,8 +12,8 @@
 //!    from the parent task's continuation and a [`HostDependencies`]
 //!    whose event sink is a [`CollectorEventStore`] wrapping the
 //!    supplied [`ToolEventCollector`].
-//! 3. Calls [`Tool::execute`] with the pending call's input and returns
-//!    the resulting [`ToolResult`].
+//! 3. Calls [`Tool::execute`] with the pending call's
+//!    `effective_input` and returns the resulting [`ToolResult`].
 //!
 //! Progress events emitted via [`ToolContext::emit_event`] are
 //! forwarded into the worker's collector and committed by
@@ -35,7 +35,6 @@ use agent_sdk_tools::seed::{
     DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
 };
 use agent_sdk_tools::tools::ToolRegistry;
-use agent_server::TaskState;
 use agent_server::worker::{ToolEventCollector, ToolTaskBootstrap};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -108,8 +107,7 @@ where
         &self,
         tool_name: &str,
         input: serde_json::Value,
-        thread_id: agent_sdk_core::ThreadId,
-        turn: usize,
+        seed: ToolContextSeed,
         collector: ToolEventCollector,
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
@@ -117,17 +115,6 @@ where
             .registry
             .get(tool_name)
             .ok_or_else(|| anyhow!("tool '{tool_name}' is not registered on this host runtime"))?;
-
-        let seed = ToolContextSeed {
-            thread_id,
-            turn,
-            // The worker owns event sequencing via `commit_tool_events`;
-            // the authority built from this offset is only consulted by
-            // `CollectorEventStore`, which discards the envelope
-            // wrapping before forwarding to the collector.
-            sequence_offset: 0,
-            metadata: std::collections::HashMap::new(),
-        };
 
         let deps = HostDependencies {
             event_store: Arc::new(CollectorEventStore::new(collector)),
@@ -152,18 +139,12 @@ where
         collector: ToolEventCollector,
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
-        let turn = parent_turn(&bootstrap.parent_task.state).ok_or_else(|| {
-            anyhow!(
-                "parent task {} is not paused on a continuation carrying a turn number",
-                bootstrap.parent_task.id,
-            )
-        })?;
+        let seed = tool_context_seed(bootstrap)?;
 
         self.dispatch(
             &bootstrap.tool_call.name,
-            bootstrap.tool_call.input.clone(),
-            bootstrap.thread_id.clone(),
-            turn,
+            bootstrap.tool_call.effective_input.clone(),
+            seed,
             collector,
             cancel,
         )
@@ -171,20 +152,26 @@ where
     }
 }
 
-/// Extract the turn number from a parent task's paused state.
-///
-/// Tool-runtime children are only spawned while the parent is
-/// `WaitingOnChildren`, but `AwaitingConfirmation` is handled here
-/// defensively so a mis-routed child surfaces an error instead of a
-/// panic.  Unpaused states (`None`) return `None` so the caller can
-/// raise a clear dispatch error.
-fn parent_turn(state: &TaskState) -> Option<usize> {
-    match state {
-        TaskState::WaitingOnChildren { continuation, .. }
-        | TaskState::AwaitingConfirmation { continuation, .. }
-        | TaskState::ReadyToResume { continuation, .. } => Some(continuation.payload.turn),
-        TaskState::None | TaskState::SubagentInvocation { .. } => None,
-    }
+/// Reconstruct the durable [`ToolContextSeed`] for a tool-runtime child.
+fn tool_context_seed(bootstrap: &ToolTaskBootstrap) -> Result<ToolContextSeed> {
+    let continuation = bootstrap.parent_task.state.continuation().ok_or_else(|| {
+        anyhow!(
+            "parent task {} is not paused on a continuation carrying tool context",
+            bootstrap.parent_task.id,
+        )
+    })?;
+
+    Ok(ToolContextSeed {
+        thread_id: bootstrap.thread_id.clone(),
+        turn: continuation.payload.turn,
+        // The current tool-runtime bootstrap does not carry the durable
+        // event-sequence offset. `CollectorEventStore` drops the wrapped
+        // envelope before forwarding the inner event to the worker-owned
+        // collector, so the placeholder authority created from this offset
+        // is not persisted.
+        sequence_offset: 0,
+        metadata: continuation.payload.state.metadata.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -251,8 +238,12 @@ mod tests {
             .dispatch(
                 "echo",
                 json!({"text": "hello"}),
-                ThreadId::from_string("t-dispatch"),
-                3,
+                ToolContextSeed {
+                    thread_id: ThreadId::from_string("t-dispatch"),
+                    turn: 3,
+                    sequence_offset: 0,
+                    metadata: std::collections::HashMap::new(),
+                },
                 collector.clone(),
                 CancellationToken::new(),
             )
@@ -273,8 +264,12 @@ mod tests {
             .dispatch(
                 "echo",
                 json!({"text": "x"}),
-                ThreadId::from_string("t-progress"),
-                1,
+                ToolContextSeed {
+                    thread_id: ThreadId::from_string("t-progress"),
+                    turn: 1,
+                    sequence_offset: 0,
+                    metadata: std::collections::HashMap::new(),
+                },
                 collector.clone(),
                 CancellationToken::new(),
             )
@@ -296,8 +291,12 @@ mod tests {
             .dispatch(
                 "not_registered",
                 json!({}),
-                ThreadId::from_string("t-unknown"),
-                1,
+                ToolContextSeed {
+                    thread_id: ThreadId::from_string("t-unknown"),
+                    turn: 1,
+                    sequence_offset: 0,
+                    metadata: std::collections::HashMap::new(),
+                },
                 ToolEventCollector::new(),
                 CancellationToken::new(),
             )

@@ -49,7 +49,7 @@ use crate::{AgentCapabilities, Environment};
 /// The tool families with more complex constructors — in particular
 /// [`AskUserQuestionTool`](crate::user_interaction::AskUserQuestionTool)
 /// (requires a pair of mpsc channels) and
-/// [`WebSearchTool`](crate::web::WebSearchTool) (requires a typed
+/// [`WebSearchTool`] (requires a typed
 /// [`SearchProvider`]) — are **not** wired through this config to
 /// avoid over-coupling it to transport or provider choices.  Register
 /// them with [`register_web_search`] or directly against the registry.
