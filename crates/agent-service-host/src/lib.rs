@@ -70,6 +70,7 @@ pub mod config;
 pub mod grpc;
 pub mod health;
 pub mod host;
+pub mod http_health;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod proto;

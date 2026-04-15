@@ -388,13 +388,28 @@ impl RelayScheduler {
 
     fn mark_healthy(&self) {
         if let Some(health) = &self.health {
+            let was = health.snapshot().latency_layer;
             health.set_latency_layer(LatencyLayerHealth::Healthy);
+            if was == LatencyLayerHealth::Degraded {
+                info!(
+                    worker_id = %self.config.worker_id,
+                    "relay latency layer recovered — broker relay operating normally",
+                );
+            }
         }
     }
 
     fn mark_degraded(&self) {
         if let Some(health) = &self.health {
+            let was = health.snapshot().latency_layer;
             health.set_latency_layer(LatencyLayerHealth::Degraded);
+            if was != LatencyLayerHealth::Degraded {
+                warn!(
+                    worker_id = %self.config.worker_id,
+                    "relay latency layer degraded — outbox rows may accumulate; \
+                     core readiness unaffected",
+                );
+            }
         }
     }
 }
