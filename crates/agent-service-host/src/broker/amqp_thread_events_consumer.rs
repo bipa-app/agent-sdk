@@ -56,7 +56,6 @@ use lapin::options::{
 use lapin::types::FieldTable;
 use lapin::{Channel, Connection, ConnectionProperties, Consumer};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -385,8 +384,7 @@ impl AmqpThreadEventsConsumer {
             }
         };
 
-        let now = OffsetDateTime::now_utc();
-        let outcome = self.handler.handle_payload(&payload, now).await;
+        let outcome = self.handler.handle_payload(&payload).await;
 
         match outcome {
             Ok(outcome) => {

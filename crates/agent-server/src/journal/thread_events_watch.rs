@@ -67,7 +67,6 @@ use std::sync::{Arc, Mutex};
 use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
 use super::event_notifier::EventNotifier;
@@ -159,7 +158,6 @@ pub trait ThreadEventsWatchHandler: Send + Sync {
     async fn handle_payload(
         &self,
         payload: &ThreadEventsAvailablePayload,
-        now: OffsetDateTime,
     ) -> Result<ThreadEventsWatchOutcome>;
 }
 
@@ -264,7 +262,6 @@ impl ThreadEventsWatchHandler for NotifierThreadEventsWatchHandler {
     async fn handle_payload(
         &self,
         payload: &ThreadEventsAvailablePayload,
-        _now: OffsetDateTime,
     ) -> Result<ThreadEventsWatchOutcome> {
         if let Some(high_water) = self.read_high_water(&payload.thread_id)
             && payload.last_sequence <= high_water
@@ -334,9 +331,8 @@ impl ThreadEventsWatchHandler for NotifierThreadEventsWatchHandler {
 pub async fn dispatch_thread_events_payload(
     handler: &(dyn ThreadEventsWatchHandler + '_),
     payload: &ThreadEventsAvailablePayload,
-    now: OffsetDateTime,
 ) -> Result<ThreadEventsWatchOutcome> {
-    let outcome = handler.handle_payload(payload, now).await?;
+    let outcome = handler.handle_payload(payload).await?;
     match &outcome {
         ThreadEventsWatchOutcome::Forwarded {
             emitted_count,
@@ -372,74 +368,88 @@ pub async fn dispatch_thread_events_payload(
 // ─────────────────────────────────────────────────────────────────────
 // In-memory capture handler (test double)
 // ─────────────────────────────────────────────────────────────────────
+//
+// Gated behind `#[cfg(any(test, feature = "test-support"))]` so the
+// mock never reaches the release binary.  Downstream test harnesses
+// (e.g. `agent-service-host` broker-consumer tests) opt in to the
+// `test-support` feature via `[dev-dependencies]`.
 
-/// Test double that records every handled payload and lets the test
-/// control what outcome the handler reports.
-///
-/// Keeping this helper alongside the trait keeps external test
-/// harnesses (broker consumers) from having to duplicate the same mock
-/// across crates.
-#[derive(Default)]
-pub struct CapturingThreadEventsWatchHandler {
-    inner: tokio::sync::Mutex<CapturingInner>,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod test_support {
+    use super::{ThreadEventsAvailablePayload, ThreadEventsWatchHandler, ThreadEventsWatchOutcome};
+    use anyhow::Result;
+    use async_trait::async_trait;
 
-#[derive(Default)]
-struct CapturingInner {
-    payloads: Vec<ThreadEventsAvailablePayload>,
-    outcome: Option<ThreadEventsWatchOutcome>,
-    error: Option<String>,
-}
-
-impl CapturingThreadEventsWatchHandler {
-    /// Build an empty capturing handler.  Uses
-    /// [`ThreadEventsWatchOutcome::UnknownThread`] as the default reply
-    /// so a test that forgets to configure the outcome never
-    /// accidentally looks like a successful nudge.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    /// Test double that records every handled payload and lets the
+    /// test control what outcome the handler reports.
+    ///
+    /// Keeping this helper alongside the trait keeps external test
+    /// harnesses (broker consumers) from having to duplicate the same
+    /// mock across crates.
+    #[derive(Default)]
+    pub struct CapturingThreadEventsWatchHandler {
+        inner: tokio::sync::Mutex<CapturingInner>,
     }
 
-    /// Snapshot every payload delivered to the handler in arrival
-    /// order.
-    pub async fn payloads(&self) -> Vec<ThreadEventsAvailablePayload> {
-        self.inner.lock().await.payloads.clone()
+    #[derive(Default)]
+    struct CapturingInner {
+        payloads: Vec<ThreadEventsAvailablePayload>,
+        outcome: Option<ThreadEventsWatchOutcome>,
+        error: Option<String>,
     }
 
-    /// Override the outcome every future call returns.
-    pub async fn reply_with(&self, outcome: ThreadEventsWatchOutcome) {
-        let mut inner = self.inner.lock().await;
-        inner.outcome = Some(outcome);
-        inner.error = None;
-    }
-
-    /// Force every future call to fail with this error string.
-    pub async fn fail_with(&self, message: impl Into<String>) {
-        let mut inner = self.inner.lock().await;
-        inner.error = Some(message.into());
-        inner.outcome = None;
-    }
-}
-
-#[async_trait]
-impl ThreadEventsWatchHandler for CapturingThreadEventsWatchHandler {
-    async fn handle_payload(
-        &self,
-        payload: &ThreadEventsAvailablePayload,
-        _now: OffsetDateTime,
-    ) -> Result<ThreadEventsWatchOutcome> {
-        let mut inner = self.inner.lock().await;
-        inner.payloads.push(payload.clone());
-        if let Some(err) = inner.error.clone() {
-            anyhow::bail!(err);
+    impl CapturingThreadEventsWatchHandler {
+        /// Build an empty capturing handler.  Uses
+        /// [`ThreadEventsWatchOutcome::UnknownThread`] as the default
+        /// reply so a test that forgets to configure the outcome never
+        /// accidentally looks like a successful nudge.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
         }
-        Ok(inner
-            .outcome
-            .clone()
-            .unwrap_or(ThreadEventsWatchOutcome::UnknownThread))
+
+        /// Snapshot every payload delivered to the handler in arrival
+        /// order.
+        pub async fn payloads(&self) -> Vec<ThreadEventsAvailablePayload> {
+            self.inner.lock().await.payloads.clone()
+        }
+
+        /// Override the outcome every future call returns.
+        pub async fn reply_with(&self, outcome: ThreadEventsWatchOutcome) {
+            let mut inner = self.inner.lock().await;
+            inner.outcome = Some(outcome);
+            inner.error = None;
+        }
+
+        /// Force every future call to fail with this error string.
+        pub async fn fail_with(&self, message: impl Into<String>) {
+            let mut inner = self.inner.lock().await;
+            inner.error = Some(message.into());
+            inner.outcome = None;
+        }
+    }
+
+    #[async_trait]
+    impl ThreadEventsWatchHandler for CapturingThreadEventsWatchHandler {
+        async fn handle_payload(
+            &self,
+            payload: &ThreadEventsAvailablePayload,
+        ) -> Result<ThreadEventsWatchOutcome> {
+            let mut inner = self.inner.lock().await;
+            inner.payloads.push(payload.clone());
+            if let Some(err) = inner.error.clone() {
+                anyhow::bail!(err);
+            }
+            Ok(inner
+                .outcome
+                .clone()
+                .unwrap_or(ThreadEventsWatchOutcome::UnknownThread))
+        }
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::CapturingThreadEventsWatchHandler;
 
 // ─────────────────────────────────────────────────────────────────────
 // Tests
@@ -451,7 +461,7 @@ mod tests {
     use crate::journal::event_repository::InMemoryEventRepository;
     use agent_sdk_core::events::AgentEvent;
     use std::time::Duration as StdDuration;
-    use time::Duration as TimeDuration;
+    use time::{Duration as TimeDuration, OffsetDateTime};
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(1_700_000_000)
@@ -501,13 +511,10 @@ mod tests {
         );
 
         let outcome = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 2,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 2,
+            })
             .await?;
         assert_eq!(
             outcome,
@@ -544,7 +551,7 @@ mod tests {
             last_sequence: 3,
         };
 
-        let first = handler.handle_payload(&payload, t0()).await?;
+        let first = handler.handle_payload(&payload).await?;
         assert!(matches!(
             first,
             ThreadEventsWatchOutcome::Forwarded {
@@ -559,7 +566,7 @@ mod tests {
             assert_eq!(received.sequence, expected);
         }
 
-        let second = handler.handle_payload(&payload, t0()).await?;
+        let second = handler.handle_payload(&payload).await?;
         assert_eq!(
             second,
             ThreadEventsWatchOutcome::AlreadyCurrent { high_water: 3 }
@@ -587,13 +594,10 @@ mod tests {
 
         // Forward the high advisory first.
         let high = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 5,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 5,
+            })
             .await?;
         assert!(matches!(high, ThreadEventsWatchOutcome::Forwarded { .. }));
         for expected in 0..6u64 {
@@ -605,13 +609,10 @@ mod tests {
 
         // Now deliver an older advisory — high-water already covers it.
         let late = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 2,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 2,
+            })
             .await?;
         assert_eq!(
             late,
@@ -635,13 +636,10 @@ mod tests {
         );
 
         let outcome = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: ThreadId::from_string("t-does-not-exist"),
-                    last_sequence: 0,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: ThreadId::from_string("t-does-not-exist"),
+                last_sequence: 0,
+            })
             .await?;
         assert_eq!(outcome, ThreadEventsWatchOutcome::UnknownThread);
         Ok(())
@@ -664,13 +662,10 @@ mod tests {
         );
 
         let outcome = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 3,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 3,
+            })
             .await?;
         assert_eq!(
             outcome,
@@ -698,13 +693,10 @@ mod tests {
 
         // Re-deliver the advisory — the handler must now emit 2 and 3.
         let catch_up = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 3,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 3,
+            })
             .await?;
         assert_eq!(
             catch_up,
@@ -735,13 +727,10 @@ mod tests {
         );
 
         handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 1,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 1,
+            })
             .await?;
         for expected in 0..2u64 {
             let received = tokio::time::timeout(StdDuration::from_millis(100), rx.recv())
@@ -756,13 +745,10 @@ mod tests {
         repo.commit_event(&thread_a(), AgentEvent::text("msg_3", "c"), t_plus(3))
             .await?;
         let outcome = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 3,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 3,
+            })
             .await?;
         assert_eq!(
             outcome,
@@ -796,13 +782,10 @@ mod tests {
 
         // Advance thread_a only.
         handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_a(),
-                    last_sequence: 2,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_a(),
+                last_sequence: 2,
+            })
             .await?;
         for expected in 0..3u64 {
             let received = tokio::time::timeout(StdDuration::from_millis(100), rx_a.recv())
@@ -814,13 +797,10 @@ mod tests {
         // Thread B must still see a full initial replay on its own
         // advisory — the watermark is per-thread.
         handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_b(),
-                    last_sequence: 1,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_b(),
+                last_sequence: 1,
+            })
             .await?;
         for expected in 0..2u64 {
             let received = tokio::time::timeout(StdDuration::from_millis(100), rx_b.recv())
@@ -845,7 +825,7 @@ mod tests {
             thread_id: thread_a(),
             last_sequence: 0,
         };
-        let outcome = handler.handle_payload(&payload, t0()).await?;
+        let outcome = handler.handle_payload(&payload).await?;
         assert!(outcome.forwarded());
 
         let calls = handler.payloads().await;
@@ -862,7 +842,7 @@ mod tests {
             thread_id: thread_a(),
             last_sequence: 0,
         };
-        let Err(err) = handler.handle_payload(&payload, t0()).await else {
+        let Err(err) = handler.handle_payload(&payload).await else {
             anyhow::bail!("expected handler to fail, got Ok");
         };
         let rendered = format!("{err:#}");
@@ -880,7 +860,7 @@ mod tests {
             thread_id: thread_a(),
             last_sequence: 7,
         };
-        let outcome = dispatch_thread_events_payload(&handler, &payload, t0()).await?;
+        let outcome = dispatch_thread_events_payload(&handler, &payload).await?;
         assert_eq!(
             outcome,
             ThreadEventsWatchOutcome::AlreadyCurrent { high_water: 7 }

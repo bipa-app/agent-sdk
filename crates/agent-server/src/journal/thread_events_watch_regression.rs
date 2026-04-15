@@ -141,13 +141,10 @@ mod tests {
         // Deliver the advisory to instance B (simulating broker
         // fanout).  Payload carries only `(thread_id, last_sequence)`.
         let outcome = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_x(),
-                    last_sequence: a_events[2].sequence,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_x(),
+                last_sequence: a_events[2].sequence,
+            })
             .await?;
         assert_eq!(
             outcome,
@@ -193,7 +190,7 @@ mod tests {
         };
 
         // First delivery — forwarded.
-        let first = handler.handle_payload(&payload, t0()).await?;
+        let first = handler.handle_payload(&payload).await?;
         assert!(matches!(
             first,
             ThreadEventsWatchOutcome::Forwarded {
@@ -204,7 +201,7 @@ mod tests {
 
         // Duplicate delivery — broker republished after an
         // unacknowledged fetch; must be benign.
-        let second = handler.handle_payload(&payload, t0()).await?;
+        let second = handler.handle_payload(&payload).await?;
         assert_eq!(
             second,
             ThreadEventsWatchOutcome::AlreadyCurrent { high_water: 1 }
@@ -248,13 +245,10 @@ mod tests {
 
         // Deliver the high advisory first.
         let high = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_x(),
-                    last_sequence: 3,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_x(),
+                last_sequence: 3,
+            })
             .await?;
         assert!(matches!(high, ThreadEventsWatchOutcome::Forwarded { .. }));
 
@@ -266,13 +260,10 @@ mod tests {
         // Late, lower advisory arrives — the broker reordered two
         // deliveries.  High-water already covers it.
         let late = handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_x(),
-                    last_sequence: 1,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_x(),
+                last_sequence: 1,
+            })
             .await?;
         assert_eq!(
             late,
@@ -352,13 +343,10 @@ mod tests {
         // encode event bodies in the advisory contract; this test
         // records the observation rather than proves a negative.)
         handler
-            .handle_payload(
-                &ThreadEventsAvailablePayload {
-                    thread_id: thread_x(),
-                    last_sequence: committed.sequence,
-                },
-                t0(),
-            )
+            .handle_payload(&ThreadEventsAvailablePayload {
+                thread_id: thread_x(),
+                last_sequence: committed.sequence,
+            })
             .await?;
 
         // The subscriber receives the event whose text matches the

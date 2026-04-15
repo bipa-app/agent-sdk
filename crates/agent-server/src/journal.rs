@@ -651,9 +651,11 @@ pub use task_wakeup::{
     TaskWakeupOutcome, WakeupSignal, dispatch_payload,
 };
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+#[cfg(any(test, feature = "test-support"))]
+pub use thread_events_watch::CapturingThreadEventsWatchHandler;
 pub use thread_events_watch::{
-    CapturingThreadEventsWatchHandler, NotifierThreadEventsWatchHandler, ThreadEventsWatchHandler,
-    ThreadEventsWatchOutcome, dispatch_thread_events_payload,
+    NotifierThreadEventsWatchHandler, ThreadEventsWatchHandler, ThreadEventsWatchOutcome,
+    dispatch_thread_events_payload,
 };
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
