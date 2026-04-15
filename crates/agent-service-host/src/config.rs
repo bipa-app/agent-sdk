@@ -826,6 +826,7 @@ relay:
         assert!(!config.watch.enabled);
     }
 
+    #[cfg(feature = "amqp")]
     #[test]
     fn watch_yaml_with_amqp_consumer_parses() -> Result<()> {
         let yaml = r"
