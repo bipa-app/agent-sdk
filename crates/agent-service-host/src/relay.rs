@@ -274,10 +274,12 @@ impl RelayScheduler {
     ) {
         info!(worker_id = %self.config.worker_id, "relay steady state starting");
         let mut reclaim_timer = tokio::time::interval(self.config.reclaim_interval);
-        let mut latency_layer_degraded = self
+        let already_degraded = self
             .health
             .as_ref()
             .is_some_and(|health| health.snapshot().latency_layer == LatencyLayerHealth::Degraded);
+        let mut reclaim_degraded = already_degraded;
+        let mut broker_degraded = already_degraded;
         // The first tick fires immediately — skip it so we don't
         // reclaim right after the startup reclaim already ran.
         reclaim_timer.tick().await;
@@ -300,14 +302,14 @@ impl RelayScheduler {
                                 reclaimed = count,
                                 "reclaimed stale outbox claims — other worker likely crashed",
                             );
-                            latency_layer_degraded = false;
+                            reclaim_degraded = false;
                         }
                         Ok(_) => {
-                            latency_layer_degraded = false;
+                            reclaim_degraded = false;
                         }
                         Err(err) => {
                             warn!(error = %err, "claim reclaim failed");
-                            latency_layer_degraded = true;
+                            reclaim_degraded = true;
                             self.mark_degraded();
                         }
                     }
@@ -315,9 +317,7 @@ impl RelayScheduler {
                 result = self.worker.tick(&self.config.worker_id, now_fn()) => {
                     match result {
                         Ok(tick) if tick.claimed == 0 => {
-                            // No work — sleep out the poll interval,
-                            // unless we're shutting down.
-                            if !latency_layer_degraded {
+                            if !(reclaim_degraded || broker_degraded) {
                                 self.mark_healthy();
                             }
                             tokio::select! {
@@ -337,19 +337,19 @@ impl RelayScheduler {
                                 "relay steady-state tick",
                             );
                             if tick.failed > 0 || tick.expired > 0 {
-                                latency_layer_degraded = true;
+                                broker_degraded = true;
                                 self.mark_degraded();
                             } else {
-                                latency_layer_degraded = false;
-                                self.mark_healthy();
+                                broker_degraded = false;
+                                if !reclaim_degraded {
+                                    self.mark_healthy();
+                                }
                             }
                         }
                         Err(err) => {
                             warn!(error = %err, "relay tick failed");
-                            latency_layer_degraded = true;
+                            broker_degraded = true;
                             self.mark_degraded();
-                            // Back off before retrying so we don't pin
-                            // a CPU spinning through a broken broker.
                             tokio::select! {
                                 () = cancel.cancelled() => {
                                     info!("relay steady state shutting down");
@@ -388,13 +388,28 @@ impl RelayScheduler {
 
     fn mark_healthy(&self) {
         if let Some(health) = &self.health {
+            let was = health.snapshot().latency_layer;
             health.set_latency_layer(LatencyLayerHealth::Healthy);
+            if was == LatencyLayerHealth::Degraded {
+                info!(
+                    worker_id = %self.config.worker_id,
+                    "relay latency layer recovered — broker relay operating normally",
+                );
+            }
         }
     }
 
     fn mark_degraded(&self) {
         if let Some(health) = &self.health {
+            let was = health.snapshot().latency_layer;
             health.set_latency_layer(LatencyLayerHealth::Degraded);
+            if was != LatencyLayerHealth::Degraded {
+                warn!(
+                    worker_id = %self.config.worker_id,
+                    "relay latency layer degraded — outbox rows may accumulate; \
+                     core readiness unaffected",
+                );
+            }
         }
     }
 }
@@ -962,6 +977,10 @@ mod tests {
             concrete_store.reclaim_calls() >= 2,
             "expected one failed reclaim and at least one successful retry",
         );
+        // The transient reclaim failure set reclaim_degraded, but the
+        // subsequent successful reclaim cleared it.  With broker_degraded
+        // also false (IdleWorker never fails), the idle tick marks
+        // the latency layer healthy.
         assert_eq!(health.snapshot().latency_layer, LatencyLayerHealth::Healthy);
         Ok(())
     }

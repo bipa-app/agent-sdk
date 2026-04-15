@@ -67,6 +67,7 @@ use agent_server::worker::{
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
 use super::config::{BrokerConfig, ServiceConfig};
 use super::health::{HealthSurface, LatencyLayerHealth};
+use super::http_health::HttpHealthHandle;
 use super::relay::{RelayScheduler, RelaySchedulerConfig};
 use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
@@ -263,6 +264,7 @@ impl ServiceHost {
         let wakeup_handle = self.spawn_wakeup_scheduler(wakeup_signal);
         let relay_handle = self.spawn_relay_scheduler()?;
         let watch_handle = self.spawn_watch_scheduler();
+        let http_health_handle = self.spawn_http_health().await?;
 
         self.mark_healthy();
         info!(
@@ -270,6 +272,7 @@ impl ServiceHost {
             relay_enabled = self.config.relay.enabled,
             wakeup_enabled = self.config.wakeup.enabled,
             watch_enabled = self.config.watch.enabled,
+            http_health_enabled = self.config.transport.http_enabled,
             "service host ready",
         );
 
@@ -284,6 +287,7 @@ impl ServiceHost {
             wakeup_handle,
             relay_handle,
             watch_handle,
+            http_health_handle,
         )
         .await?;
         info!("service host stopped");
@@ -370,6 +374,20 @@ impl ServiceHost {
         Some(scheduler.spawn(self.shutdown.clone()))
     }
 
+    async fn spawn_http_health(&self) -> Result<Option<HttpHealthHandle>> {
+        if !self.config.transport.http_enabled {
+            return Ok(None);
+        }
+        let handle = super::http_health::spawn(
+            self.config.transport.http_addr,
+            Arc::clone(&self.health),
+            self.shutdown.clone(),
+        )
+        .await
+        .context("spawning HTTP health endpoint")?;
+        Ok(Some(handle))
+    }
+
     fn spawn_relay_scheduler(&self) -> Result<Option<super::relay::RelaySchedulerHandle>> {
         if self.config.relay.enabled {
             let broker = build_broker_adapter(&self.config.relay.broker)
@@ -404,6 +422,7 @@ impl ServiceHost {
         wakeup_handle: Option<super::wakeup::WakeupSchedulerHandle>,
         relay_handle: Option<super::relay::RelaySchedulerHandle>,
         watch_handle: Option<super::watch::ThreadEventsWatchSchedulerHandle>,
+        http_health_handle: Option<HttpHealthHandle>,
     ) -> Result<()> {
         info!("draining background tasks");
         self.health.set_workers_alive(false);
@@ -431,6 +450,11 @@ impl ServiceHost {
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "thread events watch scheduler exited with error");
+        }
+        if let Some(handle) = http_health_handle
+            && let Err(err) = handle.shutdown().await
+        {
+            warn!(error = %err, "HTTP health server exited with error");
         }
         Ok(())
     }
@@ -1758,6 +1782,329 @@ mod tests {
 
         token.cancel();
         handle.await??;
+        Ok(())
+    }
+
+    // ── Phase 8.5: degraded-mode health, readiness, and fallback ────
+    //
+    // These tests walk the four Phase 8.5 acceptance criteria:
+    //
+    // 1. Broker outage does not make the server unready when core
+    //    journal and worker paths are healthy.
+    // 2. Health reporting distinguishes core correctness from relay
+    //    degradation.
+    // 3. Execution and replay continue correctly while unpublished
+    //    outbox rows accumulate.
+    // 4. Fallback sweeps and same-instance behavior keep progress
+    //    moving without broker wakeup.
+
+    #[tokio::test]
+    async fn broker_outage_keeps_server_ready_when_core_healthy() -> Result<()> {
+        use crate::config::{BrokerConfig, RelayConfig};
+        use crate::health::{CoreHealth, LatencyLayerHealth};
+
+        // Start the host with relay enabled.  The in-memory broker
+        // adapter always succeeds, so we manually force the latency
+        // layer to Degraded to simulate a broker outage and verify
+        // that readiness stays true.
+        let config = ServiceConfig {
+            relay: RelayConfig {
+                enabled: true,
+                worker_id: Some("test-degraded".into()),
+                batch_size: 8,
+                poll_interval_secs: 60,
+                claim_lease_secs: 30,
+                reclaim_interval_secs: 60,
+                retry_backoff_secs: 0,
+                broker: BrokerConfig::InMemory,
+            },
+            ..ServiceConfig::default()
+        };
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let health = Arc::clone(host.health());
+        let token = host.shutdown_token();
+        let handle = tokio::spawn(async move { host.run().await });
+
+        // Wait for the host to become ready.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(health.snapshot().is_ready(), "host should be ready");
+
+        // Simulate broker outage by setting latency layer to Degraded.
+        health.set_latency_layer(LatencyLayerHealth::Degraded);
+        let snap = health.snapshot();
+
+        // AC1: readiness stays true when core is healthy.
+        assert!(
+            snap.is_ready(),
+            "readiness must not be affected by broker outage"
+        );
+        assert!(
+            snap.is_live(),
+            "liveness must not be affected by broker outage"
+        );
+        assert_eq!(snap.core, CoreHealth::Healthy);
+        assert_eq!(snap.latency_layer, LatencyLayerHealth::Degraded);
+
+        // AC2: aggregate status is Degraded, not Unhealthy.
+        assert_eq!(
+            snap.status,
+            crate::health::HealthStatus::Degraded,
+            "aggregate status should reflect degradation without blocking readiness",
+        );
+
+        token.cancel();
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_distinguishes_core_from_relay() -> Result<()> {
+        use crate::health::{CoreHealth, HealthStatus, LatencyLayerHealth};
+
+        // AC2: health reporting distinguishes core correctness from
+        // relay degradation.  We verify every combination.
+        let surface = crate::health::HealthSurface::shared();
+
+        // Healthy core + degraded relay → Degraded (ready, live).
+        surface.set_sweep_alive(true);
+        surface.set_workers_alive(true);
+        surface.set_core(CoreHealth::Healthy);
+        surface.set_latency_layer(LatencyLayerHealth::Degraded);
+        let snap = surface.snapshot();
+        assert_eq!(snap.status, HealthStatus::Degraded);
+        assert!(snap.is_ready());
+        assert!(snap.is_live());
+
+        // Healthy core + healthy relay → Healthy.
+        surface.set_latency_layer(LatencyLayerHealth::Healthy);
+        let snap = surface.snapshot();
+        assert_eq!(snap.status, HealthStatus::Healthy);
+
+        // Unhealthy core + healthy relay → Unhealthy (not ready).
+        surface.set_core(CoreHealth::Unhealthy);
+        surface.set_latency_layer(LatencyLayerHealth::Healthy);
+        let snap = surface.snapshot();
+        assert_eq!(snap.status, HealthStatus::Unhealthy);
+        assert!(!snap.is_ready());
+
+        // Unhealthy core + degraded relay → Unhealthy (not ready).
+        surface.set_latency_layer(LatencyLayerHealth::Degraded);
+        let snap = surface.snapshot();
+        assert_eq!(snap.status, HealthStatus::Unhealthy);
+        assert!(!snap.is_ready());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_continues_while_outbox_rows_accumulate() -> Result<()> {
+        use agent_sdk_core::ThreadId;
+        use agent_server::journal::outbox::{NewOutboxRow, OutboxStatus};
+        use agent_server::journal::outbox_message::{
+            OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+        };
+        use agent_server::journal::task::AgentTask;
+
+        // AC3: execution and replay continue correctly while
+        // unpublished outbox rows accumulate.
+        //
+        // The relay backfill phase drains on startup, so we start the
+        // host first, wait for it to become ready, then seed outbox
+        // rows.  The relay's steady-state poll is 300 s so the rows
+        // stay Pending while the worker executes the task.
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            relay: crate::config::RelayConfig {
+                enabled: true,
+                worker_id: Some("test-accumulate".into()),
+                batch_size: 8,
+                poll_interval_secs: 300,
+                claim_lease_secs: 30,
+                reclaim_interval_secs: 300,
+                retry_backoff_secs: 0,
+                broker: crate::config::BrokerConfig::InMemory,
+            },
+            ..ServiceConfig::default()
+        };
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+        let health = Arc::clone(host.health());
+        let token = host.shutdown_token();
+
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        // Wait for the host (and relay backfill) to start up.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if health.snapshot().is_ready() {
+                break;
+            }
+        }
+
+        // Seed outbox rows AFTER backfill.  They arrive in the
+        // relay's steady-state window and won't be drained for 300 s.
+        let thread = ThreadId::from_string("t-outbox-accumulate");
+        for seq in 0..5u64 {
+            let payload = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                thread_id: thread.clone(),
+                last_sequence: seq,
+            })
+            .to_payload_json()?;
+            stores
+                .outbox_store
+                .insert_batch(vec![NewOutboxRow {
+                    kind: OutboxMessageKind::ThreadEventsAvailable,
+                    thread_id: thread.clone(),
+                    event_id: Some(uuid::Uuid::now_v7()),
+                    sequence: Some(seq),
+                    payload_json: payload,
+                    max_attempts: 3,
+                    now: time::OffsetDateTime::now_utc(),
+                }])
+                .await?;
+        }
+
+        // Submit a task that the worker will execute concurrently.
+        let task = AgentTask::new_root_turn_with_input(
+            thread.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "execute despite outbox backlog".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let task_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        // Poll for task completion.
+        let mut completed = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(&task_id)
+                .await?
+                .context("task should still exist")?;
+            if row.status == agent_server::journal::task::TaskStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "task must complete even while outbox rows accumulate",
+        );
+
+        // Outbox rows should still be pending — the relay is in its
+        // 300 s steady-state sleep.
+        let outbox_rows = stores.outbox_store.list_by_thread(&thread).await?;
+        let pending_count = outbox_rows
+            .iter()
+            .filter(|r| r.status == OutboxStatus::Pending)
+            .count();
+        assert!(
+            pending_count > 0,
+            "outbox rows should still be pending while relay poll is long",
+        );
+
+        token.cancel();
+        host_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_sweep_maintains_progress_during_broker_outage() -> Result<()> {
+        use agent_sdk_core::ThreadId;
+        use agent_server::journal::task::AgentTask;
+
+        // AC4: fallback sweeps and same-instance behavior keep
+        // progress moving without broker wakeup.
+        //
+        // The wakeup scheduler is enabled with only the fallback
+        // sweep (no AMQP consumer).  The worker acquisition ticker
+        // is set very long so only the fallback sweep can nudge
+        // workers into picking up work.
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                pool_size: 1,
+                acquisition_interval_secs: 300,
+                ..Default::default()
+            },
+            wakeup: crate::wakeup::WakeupConfig {
+                enabled: true,
+                fallback_interval_secs: 1,
+                #[cfg(feature = "amqp")]
+                amqp_consumer: crate::wakeup::AmqpConsumerSection::default(),
+            },
+            // Relay enabled but with long poll so it doesn't
+            // interfere — we're testing the wakeup path.
+            relay: crate::config::RelayConfig {
+                enabled: true,
+                worker_id: Some("test-fallback".into()),
+                batch_size: 8,
+                poll_interval_secs: 300,
+                claim_lease_secs: 30,
+                reclaim_interval_secs: 300,
+                retry_backoff_secs: 0,
+                broker: crate::config::BrokerConfig::InMemory,
+            },
+            ..ServiceConfig::default()
+        };
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+        let health = Arc::clone(host.health());
+        let token = host.shutdown_token();
+
+        let thread = ThreadId::from_string("t-fallback-progress");
+        let task = AgentTask::new_root_turn_with_input(
+            thread,
+            vec![SubmittedInputItem::Text {
+                text: "progress via fallback sweep".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let task_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        // Simulate broker outage: mark latency layer degraded.
+        let host_handle = tokio::spawn(async move { host.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        health.set_latency_layer(crate::health::LatencyLayerHealth::Degraded);
+
+        // The task should still complete via the fallback sweep nudge
+        // even though the broker (latency layer) is degraded.
+        let mut completed = false;
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let row = stores
+                .task_store
+                .get(&task_id)
+                .await?
+                .context("task should still exist")?;
+            if row.status == agent_server::journal::task::TaskStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "fallback sweep must keep progress moving during broker outage",
+        );
+
+        // Verify the host is still ready despite broker degradation.
+        let snap = health.snapshot();
+        assert!(
+            snap.is_ready(),
+            "host must remain ready during broker outage",
+        );
+
+        token.cancel();
+        host_handle.await??;
         Ok(())
     }
 }

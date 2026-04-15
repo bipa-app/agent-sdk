@@ -25,12 +25,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use anyhow::Context;
+use serde::Serialize;
+
 // ─────────────────────────────────────────────────────────────────────
 // Status enums
 // ─────────────────────────────────────────────────────────────────────
 
 /// Aggregate health status used by Kubernetes-style probes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     /// Everything is operating normally.
     Healthy,
@@ -44,7 +48,8 @@ pub enum HealthStatus {
 }
 
 /// Health of the durable core (journal + workers).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoreHealth {
     /// Store is reachable, sweep loop is alive, workers are alive.
     Healthy,
@@ -56,7 +61,8 @@ pub enum CoreHealth {
 ///
 /// This is modelled as a separate axis because latency-layer outages
 /// do not affect correctness — the journal guarantees delivery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LatencyLayerHealth {
     /// Relay/broker is operating normally.
     Healthy,
@@ -74,7 +80,7 @@ pub enum LatencyLayerHealth {
 ///
 /// Cheap to construct (no heap allocation) and suitable for
 /// serialization into a probe response body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ServiceHealth {
     /// Aggregate status.
     pub status: HealthStatus,
@@ -106,6 +112,17 @@ impl ServiceHealth {
     #[must_use]
     pub fn is_live(&self) -> bool {
         self.status != HealthStatus::Unhealthy
+    }
+
+    /// Serialize this snapshot to a JSON byte vector.
+    ///
+    /// Used by the HTTP health endpoint to build the response body.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails (should not happen for
+    /// this type, but errors are propagated per project convention).
+    pub fn to_json_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(self).context("serializing ServiceHealth to JSON")
     }
 }
 
@@ -325,5 +342,37 @@ mod tests {
         surface.set_sweep_alive(true);
         let cloned = Arc::clone(&surface);
         assert!(cloned.snapshot().sweep_loop_alive);
+    }
+
+    #[test]
+    fn service_health_serializes_to_expected_json() -> anyhow::Result<()> {
+        let health = ServiceHealth {
+            status: HealthStatus::Degraded,
+            core: CoreHealth::Healthy,
+            latency_layer: LatencyLayerHealth::Degraded,
+            sweep_loop_alive: true,
+            worker_pool_alive: true,
+        };
+        let json: serde_json::Value = serde_json::from_slice(&health.to_json_bytes()?)?;
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["core"], "healthy");
+        assert_eq!(json["latency_layer"], "degraded");
+        assert_eq!(json["sweep_loop_alive"], true);
+        assert_eq!(json["worker_pool_alive"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn not_configured_latency_layer_serializes_correctly() -> anyhow::Result<()> {
+        let health = ServiceHealth {
+            status: HealthStatus::Healthy,
+            core: CoreHealth::Healthy,
+            latency_layer: LatencyLayerHealth::NotConfigured,
+            sweep_loop_alive: true,
+            worker_pool_alive: true,
+        };
+        let json: serde_json::Value = serde_json::from_slice(&health.to_json_bytes()?)?;
+        assert_eq!(json["latency_layer"], "not_configured");
+        Ok(())
     }
 }
