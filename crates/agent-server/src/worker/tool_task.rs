@@ -92,8 +92,14 @@ impl ToolEventCollector {
         }
     }
 
-    /// Drain all collected events (internal use by the worker).
-    fn drain(&self) -> Vec<AgentEvent> {
+    /// Drain all collected events, leaving the collector empty.
+    ///
+    /// Used by the worker to flush events at commit time, and by
+    /// downstream crates that wrap the collector in an adapter (such
+    /// as `agent-service-host`'s `CollectorEventStore`) to verify
+    /// forwarding behaviour.
+    #[must_use]
+    pub fn drain(&self) -> Vec<AgentEvent> {
         self.events
             .lock()
             .map(|mut e| std::mem::take(&mut *e))
