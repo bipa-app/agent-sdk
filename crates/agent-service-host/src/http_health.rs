@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -33,7 +33,8 @@ use crate::health::HealthSurface;
 /// Handle for a running HTTP health server.
 ///
 /// Cancelling the token or calling [`HttpHealthHandle::shutdown`] stops
-/// the listener and drains in-flight connections.
+/// the listener and awaits all in-flight connection tasks before
+/// returning.
 pub struct HttpHealthHandle {
     cancel: CancellationToken,
     join: JoinHandle<Result<()>>,
@@ -84,18 +85,20 @@ async fn serve_loop(
     health: Arc<HealthSurface>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let mut connections = JoinSet::new();
+
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
                 info!("HTTP health server shutting down");
-                return Ok(());
+                break;
             }
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, peer)) => {
                         let health = Arc::clone(&health);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(err) = handle_connection(stream, &health).await {
                                 debug!(%peer, error = %err, "HTTP health connection error");
                             }
@@ -108,6 +111,9 @@ async fn serve_loop(
             }
         }
     }
+
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_connection(

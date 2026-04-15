@@ -300,14 +300,10 @@ impl RelayScheduler {
                                 reclaimed = count,
                                 "reclaimed stale outbox claims — other worker likely crashed",
                             );
-                            latency_layer_degraded = false;
                         }
-                        Ok(_) => {
-                            latency_layer_degraded = false;
-                        }
+                        Ok(_) => {}
                         Err(err) => {
                             warn!(error = %err, "claim reclaim failed");
-                            latency_layer_degraded = true;
                             self.mark_degraded();
                         }
                     }
