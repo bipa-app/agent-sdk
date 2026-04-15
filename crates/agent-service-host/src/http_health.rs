@@ -103,6 +103,7 @@ async fn serve_loop(
                                 debug!(%peer, error = %err, "HTTP health connection error");
                             }
                         });
+                        while connections.try_join_next().is_some() {}
                     }
                     Err(err) => {
                         warn!(error = %err, "HTTP health accept failed");
@@ -121,9 +122,9 @@ async fn handle_connection(
     health: &HealthSurface,
 ) -> Result<()> {
     let mut buf = [0u8; 1024];
-    let n = stream
-        .read(&mut buf)
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
         .await
+        .context("HTTP health read timeout")?
         .context("reading HTTP request")?;
     if n == 0 {
         return Ok(());

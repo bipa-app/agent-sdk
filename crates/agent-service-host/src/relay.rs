@@ -304,6 +304,7 @@ impl RelayScheduler {
                         Ok(_) => {}
                         Err(err) => {
                             warn!(error = %err, "claim reclaim failed");
+                            latency_layer_degraded = true;
                             self.mark_degraded();
                         }
                     }
@@ -941,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steady_state_recovers_after_transient_reclaim_failure_on_idle_queue() -> Result<()> {
+    async fn reclaim_failure_stays_degraded_until_broker_tick_succeeds() -> Result<()> {
         let concrete_store = Arc::new(FlakyReclaimStore::new(1));
         let store: Arc<dyn OutboxStore> = concrete_store.clone();
         let health = HealthSurface::shared();
@@ -973,7 +974,13 @@ mod tests {
             concrete_store.reclaim_calls() >= 2,
             "expected one failed reclaim and at least one successful retry",
         );
-        assert_eq!(health.snapshot().latency_layer, LatencyLayerHealth::Healthy);
+        // Reclaim failure sets latency_layer_degraded, and an idle
+        // queue produces no non-empty broker ticks to clear it.
+        // Recovery requires a successful non-empty tick.
+        assert_eq!(
+            health.snapshot().latency_layer,
+            LatencyLayerHealth::Degraded
+        );
         Ok(())
     }
 }
