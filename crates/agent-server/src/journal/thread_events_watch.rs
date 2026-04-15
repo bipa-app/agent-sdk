@@ -181,6 +181,13 @@ pub struct NotifierThreadEventsWatchHandler {
     /// Per-thread highest sequence already forwarded through the
     /// notifier.  Absence means "nothing forwarded yet on this
     /// instance".
+    ///
+    /// Entries are never removed: the map grows by one key per unique
+    /// thread seen on this pod (~50 bytes/entry).  For typical deploy
+    /// cadences this is negligible; if a pod handles millions of
+    /// short-lived threads between restarts, swap for an LRU — eviction
+    /// is safe because re-seen threads replay from 0 (the documented
+    /// restart behaviour).
     high_water: Arc<Mutex<HashMap<String, u64>>>,
 }
 
