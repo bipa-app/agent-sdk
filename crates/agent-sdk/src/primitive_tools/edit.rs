@@ -34,7 +34,7 @@ struct EditInput {
     replace_all: bool,
 }
 
-impl<E: Environment + 'static> Tool<()> for EditTool<E> {
+impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for EditTool<E> {
     type Name = PrimitiveToolName;
 
     fn name(&self) -> PrimitiveToolName {
@@ -78,7 +78,7 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: EditInput =
             serde_json::from_value(input).context("Invalid input for edit tool")?;
 
@@ -473,11 +473,11 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), PrimitiveToolName::Edit);
-        assert_eq!(tool.tier(), ToolTier::Confirm);
-        assert!(tool.description().contains("Edit"));
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Edit);
+        assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
+        assert!(Tool::<()>::description(&tool).contains("Edit"));
 
-        let schema = tool.input_schema();
+        let schema = Tool::<()>::input_schema(&tool);
         assert!(schema.get("properties").is_some());
         assert!(schema["properties"].get("path").is_some());
         assert!(schema["properties"].get("old_string").is_some());

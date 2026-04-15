@@ -26,7 +26,7 @@ struct WriteInput {
     content: String,
 }
 
-impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
+impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for WriteTool<E> {
     type Name = PrimitiveToolName;
 
     fn name(&self) -> PrimitiveToolName {
@@ -62,7 +62,7 @@ impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: WriteInput =
             serde_json::from_value(input).context("Invalid input for write tool")?;
 
@@ -282,10 +282,10 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), PrimitiveToolName::Write);
-        assert_eq!(tool.tier(), ToolTier::Confirm);
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Write);
+        assert_eq!(Tool::<()>::tier(&tool), ToolTier::Confirm);
 
-        let schema = tool.input_schema();
+        let schema = Tool::<()>::input_schema(&tool);
         assert!(schema["properties"].get("path").is_some());
         assert!(schema["properties"].get("content").is_some());
     }

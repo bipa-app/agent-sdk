@@ -29,7 +29,7 @@ struct GlobInput {
     path: Option<String>,
 }
 
-impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
+impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobTool<E> {
     type Name = PrimitiveToolName;
 
     fn name(&self) -> PrimitiveToolName {
@@ -65,7 +65,7 @@ impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: GlobInput =
             serde_json::from_value(input).context("Invalid input for glob tool")?;
 
@@ -332,11 +332,11 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), PrimitiveToolName::Glob);
-        assert_eq!(tool.tier(), ToolTier::Observe);
-        assert!(tool.description().contains("glob"));
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Glob);
+        assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
+        assert!(Tool::<()>::description(&tool).contains("glob"));
 
-        let schema = tool.input_schema();
+        let schema = Tool::<()>::input_schema(&tool);
         assert!(schema.get("properties").is_some());
         assert!(schema["properties"].get("pattern").is_some());
         assert!(schema["properties"].get("path").is_some());

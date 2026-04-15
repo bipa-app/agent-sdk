@@ -53,7 +53,7 @@ mod defaults {
     }
 }
 
-impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
+impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadTool<E> {
     type Name = PrimitiveToolName;
 
     fn name(&self) -> PrimitiveToolName {
@@ -99,7 +99,7 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
         })
     }
 
-    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let input: ReadInput = serde_json::from_value(input.clone())
             .with_context(|| format!("Invalid input for read tool: {input}"))?;
 
@@ -543,10 +543,10 @@ mod tests {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
-        assert_eq!(tool.name(), PrimitiveToolName::Read);
-        assert_eq!(tool.tier(), ToolTier::Observe);
+        assert_eq!(Tool::<()>::name(&tool), PrimitiveToolName::Read);
+        assert_eq!(Tool::<()>::tier(&tool), ToolTier::Observe);
 
-        let schema = tool.input_schema();
+        let schema = Tool::<()>::input_schema(&tool);
         assert!(schema["properties"].get("path").is_some());
         assert!(schema["properties"].get("offset").is_some());
         assert!(schema["properties"].get("limit").is_some());
