@@ -4,9 +4,8 @@
 //! authority" contract for committed events.  An instance that does
 //! **not** commit the event batch learns about it through an advisory
 //! `thread_events_available` delivery, which this module turns into a
-//! local
-//! [`agent_server::journal::EventNotifier`](agent_server::journal::EventNotifier)
-//! nudge after a durable replay from the event repository.
+//! local [`agent_server::journal::EventNotifier`] nudge after a
+//! durable replay from the event repository.
 //!
 //! The broker payload never drives state on its own:
 //!
