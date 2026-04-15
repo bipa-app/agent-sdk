@@ -186,12 +186,13 @@ async fn handle_connection(
 }
 
 fn parse_request_path(request: &str) -> &str {
-    // HTTP request line: "GET /path HTTP/1.1\r\n..."
-    request
+    // HTTP request line: "GET /path?query HTTP/1.1\r\n..."
+    let target = request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/")
+        .unwrap_or("/");
+    target.split('?').next().unwrap_or("/")
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -349,6 +350,14 @@ mod tests {
             "/healthz"
         );
         assert_eq!(parse_request_path("GET /readyz HTTP/1.1\r\n"), "/readyz");
+        assert_eq!(
+            parse_request_path("GET /healthz?verbose=true HTTP/1.1\r\n"),
+            "/healthz"
+        );
+        assert_eq!(
+            parse_request_path("GET /readyz?full=1 HTTP/1.1\r\n"),
+            "/readyz"
+        );
         assert_eq!(parse_request_path(""), "/");
         assert_eq!(parse_request_path("MALFORMED"), "/");
     }
