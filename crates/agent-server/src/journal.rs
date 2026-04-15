@@ -592,6 +592,9 @@ pub mod task;
 pub mod task_state;
 pub mod task_wakeup;
 pub mod thread;
+pub mod thread_events_watch;
+#[cfg(test)]
+mod thread_events_watch_regression;
 pub mod thread_recover;
 pub mod thread_store;
 pub mod tool_audit;
@@ -648,6 +651,12 @@ pub use task_wakeup::{
     TaskWakeupOutcome, WakeupSignal, dispatch_payload,
 };
 pub use thread::{Thread, ThreadSchemaError, ThreadStatus};
+#[cfg(any(test, feature = "test-support"))]
+pub use thread_events_watch::CapturingThreadEventsWatchHandler;
+pub use thread_events_watch::{
+    NotifierThreadEventsWatchHandler, ThreadEventsWatchHandler, ThreadEventsWatchOutcome,
+    dispatch_thread_events_payload,
+};
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
 pub use thread_store::{InMemoryThreadStore, ThreadStore};
 pub use tool_audit::{

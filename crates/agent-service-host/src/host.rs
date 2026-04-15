@@ -71,8 +71,12 @@ use super::relay::{RelayScheduler, RelaySchedulerConfig};
 use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
 use super::wakeup::WakeupScheduler;
+use super::watch::ThreadEventsWatchScheduler;
 use agent_server::journal::relay::RetryBackoff;
-use agent_server::journal::{JournalTaskWakeupHandler, TaskWakeupHandler, WakeupSignal};
+use agent_server::journal::{
+    JournalTaskWakeupHandler, NotifierThreadEventsWatchHandler, TaskWakeupHandler,
+    ThreadEventsWatchHandler, WakeupSignal,
+};
 
 // ─────────────────────────────────────────────────────────────────────
 // ServiceHost
@@ -258,12 +262,14 @@ impl ServiceHost {
         let worker_handles = self.spawn_worker_pool(&wakeup_signal);
         let wakeup_handle = self.spawn_wakeup_scheduler(wakeup_signal);
         let relay_handle = self.spawn_relay_scheduler()?;
+        let watch_handle = self.spawn_watch_scheduler();
 
         self.mark_healthy();
         info!(
             pool_size = self.config.worker.pool_size,
             relay_enabled = self.config.relay.enabled,
             wakeup_enabled = self.config.wakeup.enabled,
+            watch_enabled = self.config.watch.enabled,
             "service host ready",
         );
 
@@ -272,8 +278,14 @@ impl ServiceHost {
         #[cfg(not(unix))]
         wait_for_shutdown(&self.shutdown).await?;
 
-        self.drain_background_tasks(sweep_handle, worker_handles, wakeup_handle, relay_handle)
-            .await?;
+        self.drain_background_tasks(
+            sweep_handle,
+            worker_handles,
+            wakeup_handle,
+            relay_handle,
+            watch_handle,
+        )
+        .await?;
         info!("service host stopped");
         Ok(())
     }
@@ -345,6 +357,19 @@ impl ServiceHost {
         Some(scheduler.spawn(self.shutdown.clone()))
     }
 
+    fn spawn_watch_scheduler(&self) -> Option<super::watch::ThreadEventsWatchSchedulerHandle> {
+        if !self.config.watch.enabled {
+            return None;
+        }
+        let handler: Arc<dyn ThreadEventsWatchHandler> =
+            Arc::new(NotifierThreadEventsWatchHandler::new(
+                Arc::clone(&self.stores.event_repo),
+                Arc::clone(&self.stores.event_notifier),
+            ));
+        let scheduler = ThreadEventsWatchScheduler::new(self.config.watch.clone(), handler);
+        Some(scheduler.spawn(self.shutdown.clone()))
+    }
+
     fn spawn_relay_scheduler(&self) -> Result<Option<super::relay::RelaySchedulerHandle>> {
         if self.config.relay.enabled {
             let broker = build_broker_adapter(&self.config.relay.broker)
@@ -378,6 +403,7 @@ impl ServiceHost {
         worker_handles: Vec<tokio::task::JoinHandle<()>>,
         wakeup_handle: Option<super::wakeup::WakeupSchedulerHandle>,
         relay_handle: Option<super::relay::RelaySchedulerHandle>,
+        watch_handle: Option<super::watch::ThreadEventsWatchSchedulerHandle>,
     ) -> Result<()> {
         info!("draining background tasks");
         self.health.set_workers_alive(false);
@@ -400,6 +426,11 @@ impl ServiceHost {
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "wakeup scheduler exited with error");
+        }
+        if let Some(handle) = watch_handle
+            && let Err(err) = handle.shutdown().await
+        {
+            warn!(error = %err, "thread events watch scheduler exited with error");
         }
         Ok(())
     }

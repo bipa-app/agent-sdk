@@ -46,6 +46,9 @@ lapin = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent-sdk.workspace = true
+# Re-enables `agent-server`'s test doubles (e.g.
+# `CapturingThreadEventsWatchHandler`) for host-level tests.
+agent-server = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 

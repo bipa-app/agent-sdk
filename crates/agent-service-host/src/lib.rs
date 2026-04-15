@@ -80,6 +80,7 @@ pub mod runtime;
 pub mod sqlite;
 pub mod stores;
 pub mod wakeup;
+pub mod watch;
 
 #[cfg(test)]
 mod conformance;

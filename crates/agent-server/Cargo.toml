@@ -21,6 +21,11 @@ time = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 
+[features]
+# Exposes in-crate test doubles (e.g. `CapturingThreadEventsWatchHandler`)
+# to downstream `[dev-dependencies]`.  Never enable on a release build.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
