@@ -313,7 +313,28 @@ WHERE thread_id = ?1
             r.try_into()
         } else {
             let fresh = MessageProjection::new(thread_id.clone(), now);
-            Self::upsert_message_head_tx(tx, &fresh).await?;
+            // Use INSERT … ON CONFLICT DO NOTHING (not the destructive
+            // upsert) so a concurrent commit that already wrote a real
+            // projection is never overwritten with an empty bootstrap row.
+            // Matches the Postgres lock_message_head_tx behaviour.
+            let thread_id_key = thread_key(thread_id);
+            let history_json = json_to_value(&fresh.messages, "message head bootstrap history")?;
+            let version = i64_from_u64(fresh.version, "message head bootstrap version")?;
+            sqlx::query(
+                r"
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, version, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT (thread_id) DO NOTHING
+",
+            )
+            .bind(&thread_id_key)
+            .bind(&history_json)
+            .bind(version)
+            .bind(fresh.created_at)
+            .bind(fresh.updated_at)
+            .execute(&mut **tx)
+            .await
+            .context("bootstrap message head")?;
             Ok(fresh)
         }
     }
