@@ -7,12 +7,13 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-prost = "0.13"
-prost-types = "0.13"
-tonic = { version = "0.12", features = ["transport"] }
+prost = "0.14.3"
+prost-types = "0.14.3"
+tonic = { version = "0.14.5", features = ["transport"] }
+tonic-prost = "0.14.5"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14.5"
 protoc-bin-vendored = "3"
 
 [lints.rust]

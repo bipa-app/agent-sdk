@@ -49,7 +49,7 @@ pub trait McpTransport: Send + Sync {
 }
 
 /// Default response timeout for MCP requests (60 seconds).
-const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Stdio transport for MCP servers.
 ///

@@ -50,9 +50,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lapin::message::BasicReturnMessage;
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions};
-use lapin::publisher_confirm::Confirmation;
 use lapin::types::{FieldTable, ShortString};
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
+use lapin::{
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -216,7 +217,7 @@ impl AmqpBrokerAdapter {
             state
                 .channel
                 .exchange_declare(
-                    &self.config.exchange,
+                    self.config.exchange.as_str().into(),
                     self.config.exchange_kind.into(),
                     ExchangeDeclareOptions {
                         durable: true,
@@ -252,8 +253,8 @@ impl AmqpBrokerAdapter {
             state
                 .channel
                 .basic_publish(
-                    &self.config.exchange,
-                    routing_key,
+                    self.config.exchange.as_str().into(),
+                    routing_key.into(),
                     BasicPublishOptions {
                         mandatory: true,
                         ..BasicPublishOptions::default()
@@ -354,7 +355,6 @@ fn unroutable_publish_error(routing_key: &str, returned: &BasicReturnMessage) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lapin::acker::Acker;
     use lapin::message::Delivery;
     use lapin::types::ShortString;
 
@@ -437,15 +437,13 @@ mod tests {
     #[test]
     fn unroutable_publish_error_mentions_routing_key_and_reply() {
         let returned = BasicReturnMessage {
-            delivery: Delivery {
-                delivery_tag: 0,
-                exchange: ShortString::from("agent_sdk.outbox"),
-                routing_key: ShortString::from("agent_sdk.outbox.task_wakeup"),
-                redelivered: false,
-                properties: BasicProperties::default(),
-                data: Vec::new(),
-                acker: Acker::mock(),
-            },
+            delivery: Delivery::mock(
+                0,
+                ShortString::from("agent_sdk.outbox"),
+                ShortString::from("agent_sdk.outbox.task_wakeup"),
+                false,
+                Vec::new(),
+            ),
             reply_code: 312,
             reply_text: ShortString::from("NO_ROUTE"),
         };

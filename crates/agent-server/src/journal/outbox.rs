@@ -416,7 +416,7 @@ impl OutboxStore for InMemoryOutboxStore {
             .filter(|r| r.status == OutboxStatus::Pending && r.next_attempt_at <= now)
             .collect();
 
-        claimable.sort_by(|a, b| a.next_attempt_at.cmp(&b.next_attempt_at));
+        claimable.sort_by_key(|a| a.next_attempt_at);
         claimable.truncate(limit as usize);
 
         let mut result = Vec::with_capacity(claimable.len());

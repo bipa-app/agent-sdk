@@ -207,7 +207,7 @@ pub async fn resolve_tool_bootstrap(
         TaskState::WaitingOnChildren { continuation, .. }
         | TaskState::ReadyToResume { continuation, .. } => &continuation.payload,
         other => {
-            bail!("parent task {parent_id} has unexpected state for tool bootstrap: {other:?}",)
+            bail!("parent task {parent_id} has unexpected state for tool bootstrap: {other:?}")
         }
     };
 

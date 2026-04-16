@@ -3,7 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", proto_root.display());
 
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
-    let mut config = tonic_build::Config::new();
+    let mut config = tonic_prost_build::Config::new();
     config.protoc_executable(protoc);
 
     let proto_files = [
@@ -12,10 +12,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto_root.join("agent/service/v1/errors.proto"),
     ];
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos_with_config(
+        .compile_with_config(
             config,
             &proto_files
                 .iter()
