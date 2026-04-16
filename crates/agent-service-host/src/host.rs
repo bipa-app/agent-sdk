@@ -272,7 +272,7 @@ impl ServiceHost {
             relay_enabled = self.config.relay.enabled,
             wakeup_enabled = self.config.wakeup.enabled,
             watch_enabled = self.config.watch.enabled,
-            http_health_enabled = self.config.transport.http_enabled,
+            http_enabled = self.config.transport.http_enabled,
             "service host ready",
         );
 
