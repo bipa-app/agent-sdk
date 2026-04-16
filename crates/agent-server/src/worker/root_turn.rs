@@ -60,7 +60,7 @@ use crate::journal::task::{
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::ThreadStore;
 use crate::journal::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome,
+    CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptOutcome, TurnAttemptSchemaError,
 };
 use crate::journal::turn_attempt_store::TurnAttemptStore;
 
@@ -793,11 +793,25 @@ async fn suspend_at_tool_boundary(
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
+    //    AlreadyClosed is non-fatal: a prior recovery sweep
+    //    (best_effort_close_open_attempts) may have closed the attempt
+    //    after our lease expired but before we reached this point. The
+    //    work is done — just continue with the suspension.
     let close_params = build_close_params(&response, &attempt);
-    deps.attempt_store
+    match deps
+        .attempt_store
         .close_attempt(&attempt.id, close_params, now)
         .await
-        .context("close attempt on tool suspension")?;
+    {
+        Ok(_) => {}
+        Err(e)
+            if e.downcast_ref::<TurnAttemptSchemaError>()
+                == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
+        {
+            // Recovery sweep already closed this attempt — safe to proceed.
+        }
+        Err(e) => return Err(e.context("close attempt on tool suspension")),
+    }
 
     // 2. Build the continuation envelope from current state + response.
     let continuation = build_continuation(&inputs, &response)
@@ -1395,11 +1409,26 @@ async fn suspend_resumed_turn(
     let task_id = &inputs.bootstrap.task_id;
 
     // Close the turn attempt — the LLM call succeeded.
+    //
+    // AlreadyClosed is non-fatal: a prior recovery sweep
+    // (best_effort_close_open_attempts) may have closed the attempt
+    // after our lease expired but before we reached this point. The
+    // work is done — just continue with the suspension.
     let close_params = build_close_params(&response, &attempt);
-    deps.attempt_store
+    match deps
+        .attempt_store
         .close_attempt(&attempt.id, close_params, now)
         .await
-        .context("close attempt on resumed tool suspension")?;
+    {
+        Ok(_) => {}
+        Err(e)
+            if e.downcast_ref::<TurnAttemptSchemaError>()
+                == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
+        {
+            // Recovery sweep already closed this attempt — safe to proceed.
+        }
+        Err(e) => return Err(e.context("close attempt on resumed tool suspension")),
+    }
 
     // Build a new continuation that accumulates usage from the prior
     // continuation plus the new response.
