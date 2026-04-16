@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nDELETE FROM agent_sdk_turn_checkpoints\nWHERE thread_id = $1\n  AND id NOT IN (\n      SELECT id FROM agent_sdk_turn_checkpoints\n      WHERE thread_id = $1\n      ORDER BY turn_number DESC\n      LIMIT $2\n  )\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b1cdd869ed57d5c589effec6393bece7594634f3b2b1bebab8180932cf24eff"
+}

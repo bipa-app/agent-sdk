@@ -2957,6 +2957,55 @@ ORDER BY turn_number
         .with_context(|| format!("list checkpoints for {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
+
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let threshold_i64 = i64::from(threshold);
+        let limit_i64 = i64::from(limit);
+        let rows = sqlx::query!(
+            r"SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > $1 LIMIT $2",
+            threshold_i64,
+            limit_i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads_exceeding_checkpoint_count")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ThreadId::from_string(r.thread_id))
+            .collect())
+    }
+
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64> {
+        ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
+
+        let result = sqlx::query!(
+            r"
+DELETE FROM agent_sdk_turn_checkpoints
+WHERE thread_id = $1
+  AND id NOT IN (
+      SELECT id FROM agent_sdk_turn_checkpoints
+      WHERE thread_id = $1
+      ORDER BY turn_number DESC
+      LIMIT $2
+  )
+",
+            thread_key(thread_id),
+            i64::from(keep_latest_n),
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("delete checkpoints beyond limit for {thread_id}"))?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[async_trait]
@@ -3062,6 +3111,53 @@ ORDER BY sequence
         })?;
 
         records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let records = sqlx::query!(
+            r"
+SELECT DISTINCT thread_id
+FROM agent_sdk_committed_events
+WHERE committed_at < $1
+LIMIT $2
+",
+            cutoff,
+            i64::from(limit),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads with events before cutoff")?;
+
+        Ok(records.into_iter().map(|r| ThreadId(r.thread_id)).collect())
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MAX(sequence) AS max_seq
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+  AND committed_at < $2
+",
+            thread_key(thread_id),
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("max sequence before cutoff for {thread_id}"))?;
+
+        record
+            .max_seq
+            .map(|v| u64_from_i64(v, "max_sequence_before"))
+            .transpose()
     }
 }
 
@@ -3514,6 +3610,27 @@ ORDER BY sequence NULLS LAST, id
 
         let count = record.cnt.unwrap_or(0);
         u64::try_from(count).context("outbox pending count out of range")
+    }
+
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MIN(sequence) AS min_seq
+FROM agent_sdk_outbox
+WHERE thread_id = $1
+  AND status IN ('pending', 'claimed')
+  AND sequence IS NOT NULL
+",
+            thread_key(thread_id),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min unpublished sequence for {thread_id}"))?;
+
+        record
+            .min_seq
+            .map(|v| u64_from_i64(v, "min_unpublished_sequence"))
+            .transpose()
     }
 }
 

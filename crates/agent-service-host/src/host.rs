@@ -83,6 +83,16 @@ use agent_server::journal::{
 // ServiceHost
 // ─────────────────────────────────────────────────────────────────────
 
+struct BackgroundHandles {
+    sweep: tokio::task::JoinHandle<()>,
+    workers: Vec<tokio::task::JoinHandle<()>>,
+    wakeup: Option<super::wakeup::WakeupSchedulerHandle>,
+    relay: Option<super::relay::RelaySchedulerHandle>,
+    watch: Option<super::watch::ThreadEventsWatchSchedulerHandle>,
+    janitor: Option<tokio::task::JoinHandle<()>>,
+    http_health: Option<HttpHealthHandle>,
+}
+
 /// The composed service host: stores + worker pool + sweeps +
 /// health + lifecycle.
 pub struct ServiceHost {
@@ -181,6 +191,16 @@ impl ServiceHost {
                 "relay.reclaim_interval_secs must be > 0"
             );
         }
+        if config.retention.janitor_enabled {
+            anyhow::ensure!(
+                config.retention.janitor_interval_secs > 0,
+                "retention.janitor_interval_secs must be > 0"
+            );
+            anyhow::ensure!(
+                config.retention.janitor_batch_size > 0,
+                "retention.janitor_batch_size must be > 0"
+            );
+        }
         Ok(())
     }
 
@@ -264,6 +284,7 @@ impl ServiceHost {
         let wakeup_handle = self.spawn_wakeup_scheduler(wakeup_signal);
         let relay_handle = self.spawn_relay_scheduler()?;
         let watch_handle = self.spawn_watch_scheduler();
+        let janitor_handle = self.spawn_retention_janitor();
         let http_health_handle = self.spawn_http_health().await?;
 
         self.mark_healthy();
@@ -272,6 +293,7 @@ impl ServiceHost {
             relay_enabled = self.config.relay.enabled,
             wakeup_enabled = self.config.wakeup.enabled,
             watch_enabled = self.config.watch.enabled,
+            janitor_enabled = self.config.retention.janitor_enabled,
             http_enabled = self.config.transport.http_enabled,
             "service host ready",
         );
@@ -281,14 +303,15 @@ impl ServiceHost {
         #[cfg(not(unix))]
         wait_for_shutdown(&self.shutdown).await?;
 
-        self.drain_background_tasks(
-            sweep_handle,
-            worker_handles,
-            wakeup_handle,
-            relay_handle,
-            watch_handle,
-            http_health_handle,
-        )
+        self.drain_background_tasks(BackgroundHandles {
+            sweep: sweep_handle,
+            workers: worker_handles,
+            wakeup: wakeup_handle,
+            relay: relay_handle,
+            watch: watch_handle,
+            janitor: janitor_handle,
+            http_health: http_health_handle,
+        })
         .await?;
         info!("service host stopped");
         Ok(())
@@ -415,43 +438,62 @@ impl ServiceHost {
         self.health.set_core(super::health::CoreHealth::Healthy);
     }
 
-    async fn drain_background_tasks(
-        &self,
-        sweep_handle: tokio::task::JoinHandle<()>,
-        worker_handles: Vec<tokio::task::JoinHandle<()>>,
-        wakeup_handle: Option<super::wakeup::WakeupSchedulerHandle>,
-        relay_handle: Option<super::relay::RelaySchedulerHandle>,
-        watch_handle: Option<super::watch::ThreadEventsWatchSchedulerHandle>,
-        http_health_handle: Option<HttpHealthHandle>,
-    ) -> Result<()> {
+    fn spawn_retention_janitor(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.config.retention.janitor_enabled {
+            return None;
+        }
+        let policy = agent_server::journal::RetentionPolicy {
+            event_ttl: self
+                .config
+                .retention
+                .event_ttl_secs
+                .map(std::time::Duration::from_secs),
+            checkpoint_max_per_thread: self.config.retention.checkpoint_max_per_thread,
+            batch_size: self.config.retention.janitor_batch_size,
+        };
+        Some(tokio::spawn(retention_janitor_loop(
+            self.stores.clone(),
+            policy,
+            self.config.retention.janitor_interval(),
+            self.shutdown.clone(),
+        )))
+    }
+
+    async fn drain_background_tasks(&self, handles: BackgroundHandles) -> Result<()> {
         info!("draining background tasks");
         self.health.set_workers_alive(false);
         self.health.set_sweep_alive(false);
 
-        sweep_handle
+        handles
+            .sweep
             .await
             .context("lease sweep task panicked during shutdown")?;
-        for (idx, handle) in worker_handles.into_iter().enumerate() {
+        for (idx, handle) in handles.workers.into_iter().enumerate() {
             handle
                 .await
                 .with_context(|| format!("worker {idx} panicked during shutdown"))?;
         }
-        if let Some(handle) = relay_handle
+        if let Some(handle) = handles.relay
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "relay scheduler exited with error");
         }
-        if let Some(handle) = wakeup_handle
+        if let Some(handle) = handles.wakeup
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "wakeup scheduler exited with error");
         }
-        if let Some(handle) = watch_handle
+        if let Some(handle) = handles.watch
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "thread events watch scheduler exited with error");
         }
-        if let Some(handle) = http_health_handle
+        if let Some(handle) = handles.janitor {
+            handle
+                .await
+                .context("retention janitor panicked during shutdown")?;
+        }
+        if let Some(handle) = handles.http_health
             && let Err(err) = handle.shutdown().await
         {
             warn!(error = %err, "HTTP health server exited with error");
@@ -588,6 +630,55 @@ async fn lease_sweep_loop(
                     Ok(_) => { /* nothing expired — quiet */ }
                     Err(e) => {
                         warn!(error = %e, "lease sweep failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Retention janitor loop
+// ─────────────────────────────────────────────────────────────────────
+
+async fn retention_janitor_loop(
+    stores: StoreRegistry,
+    policy: agent_server::journal::RetentionPolicy,
+    interval: std::time::Duration,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                info!("retention janitor shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                let now = time::OffsetDateTime::now_utc();
+                let deps = agent_server::journal::RetentionJanitorDeps {
+                    event_repo: stores.event_repo.as_ref(),
+                    retention_store: stores.retention_store.as_ref(),
+                    outbox_store: stores.outbox_store.as_ref(),
+                    checkpoint_store: stores.checkpoint_store.as_ref(),
+                };
+                match agent_server::journal::run_janitor_cycle(&policy, &deps, now).await {
+                    Ok(report)
+                        if report.events_purged > 0 || report.checkpoints_pruned > 0 =>
+                    {
+                        info!(
+                            threads = report.threads_scanned,
+                            events_purged = report.events_purged,
+                            checkpoints_pruned = report.checkpoints_pruned,
+                            floors_advanced = report.floors_advanced,
+                            "retention janitor cycle",
+                        );
+                    }
+                    Ok(_) => { /* nothing to clean — quiet */ }
+                    Err(e) => {
+                        warn!(error = %e, "retention janitor cycle failed");
                     }
                 }
             }

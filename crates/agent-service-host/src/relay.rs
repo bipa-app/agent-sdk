@@ -854,6 +854,10 @@ mod tests {
         async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
             self.inner.count_pending(thread_id).await
         }
+
+        async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+            self.inner.min_unpublished_sequence(thread_id).await
+        }
     }
 
     // ── Delivered rows are marked only AFTER broker ack ─────────────

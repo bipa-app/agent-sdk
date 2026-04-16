@@ -313,6 +313,16 @@ pub trait OutboxStore: Send + Sync {
 
     /// Count pending (undelivered, non-expired) rows for a thread.
     async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64>;
+
+    /// Return the lowest `sequence` among non-terminal
+    /// (`Pending` / `Claimed`) outbox rows for a thread.
+    ///
+    /// Returns `None` when no unpublished rows exist or when all
+    /// non-terminal rows are `TaskWakeup` kind (which carry no
+    /// sequence).  The retention janitor uses this bound to ensure it
+    /// never advances the event retention floor past an unpublished
+    /// outbox row.
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -550,6 +560,22 @@ impl OutboxStore for InMemoryOutboxStore {
             .count();
         drop(inner);
         Ok(count as u64)
+    }
+
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+        let inner = self.inner.read().await;
+        let min_seq = inner
+            .rows
+            .values()
+            .filter(|r| {
+                r.thread_id == *thread_id
+                    && matches!(r.status, OutboxStatus::Pending | OutboxStatus::Claimed)
+                    && r.sequence.is_some()
+            })
+            .filter_map(|r| r.sequence)
+            .min();
+        drop(inner);
+        Ok(min_seq)
     }
 }
 

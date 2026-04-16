@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND id NOT IN (SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT ?2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "d208d5f9460d5d21bf8a813a139ca2f7a61f13f28699815ef72f49bae270c801"
+}

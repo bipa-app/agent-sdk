@@ -166,6 +166,22 @@ impl EventRepository for FailingEventRepository {
     ) -> Result<Vec<crate::journal::CommittedEvent>> {
         Ok(Vec::new())
     }
+
+    async fn threads_with_events_before(
+        &self,
+        _cutoff: OffsetDateTime,
+        _limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        Ok(Vec::new())
+    }
+
+    async fn max_sequence_before(
+        &self,
+        _thread_id: &ThreadId,
+        _cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 struct TestStores {

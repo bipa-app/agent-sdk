@@ -586,6 +586,7 @@ pub mod relay;
 #[cfg(test)]
 mod replay_test;
 pub mod retention;
+pub mod retention_janitor;
 pub mod staged;
 pub mod store;
 pub mod task;
@@ -639,6 +640,9 @@ pub use relay::{
     RelayWorker, RetryBackoff, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
+pub use retention_janitor::{
+    JanitorCycleReport, RetentionJanitorDeps, RetentionPolicy, run_janitor_cycle,
+};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
 pub use task::{

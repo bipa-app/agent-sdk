@@ -104,6 +104,32 @@ pub trait CheckpointStore: Send + Sync {
     /// # Errors
     /// Returns an error if the underlying store cannot be queried.
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>>;
+
+    /// Return distinct thread IDs that have more than `threshold`
+    /// checkpoints, limited to `limit` results.
+    ///
+    /// Used by the retention janitor to discover threads eligible for
+    /// checkpoint pruning without requiring an event-TTL scan.
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>>;
+
+    /// Delete all but the newest `keep_latest_n` checkpoints for a
+    /// thread, returning the count of deleted rows.
+    ///
+    /// `keep_latest_n` must be at least 1 — the latest checkpoint is
+    /// always preserved for thread recovery.
+    ///
+    /// # Errors
+    /// - Returns an error if `keep_latest_n < 1`.
+    /// - Store-level write errors.
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -217,6 +243,67 @@ impl CheckpointStore for InMemoryCheckpointStore {
         drop(inner);
         checkpoints.sort_by_key(|c| c.turn_number);
         Ok(checkpoints)
+    }
+
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let inner = self.inner.read().await;
+        let threads: Vec<ThreadId> = inner
+            .thread_index
+            .iter()
+            .filter(|(_, ids)| ids.len() > threshold as usize)
+            .map(|(tid, _)| tid.clone())
+            .take(limit as usize)
+            .collect();
+        drop(inner);
+        Ok(threads)
+    }
+
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
+
+        let mut inner = self.inner.write().await;
+        let Some(ids) = inner.thread_index.get(thread_id) else {
+            return Ok(0);
+        };
+
+        let mut by_turn: Vec<(u32, CheckpointId)> = ids
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .checkpoints
+                    .get(id)
+                    .map(|c| (c.turn_number, id.clone()))
+            })
+            .collect();
+        by_turn.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let to_delete: Vec<CheckpointId> = by_turn
+            .into_iter()
+            .skip(keep_latest_n as usize)
+            .map(|(_, id)| id)
+            .collect();
+
+        let deleted = to_delete.len() as u64;
+        for id in &to_delete {
+            if let Some(ckpt) = inner.checkpoints.remove(id) {
+                inner
+                    .turn_uniqueness
+                    .remove(&(thread_id.clone(), ckpt.turn_number));
+            }
+        }
+        if let Some(index) = inner.thread_index.get_mut(thread_id) {
+            index.retain(|id| !to_delete.contains(id));
+        }
+        drop(inner);
+        Ok(deleted)
     }
 }
 

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MIN(sequence) AS \"min_seq: i64\" FROM agent_sdk_outbox WHERE thread_id = ?1 AND status IN ('pending', 'claimed') AND sequence IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "min_seq: i64",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "b0688fe352efe8bed46d43c34fff0f67897f3a2a3dd2dba997ec19fd5ed54b16"
+}

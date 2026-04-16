@@ -45,6 +45,7 @@
 use super::committed_event::CommittedEvent;
 use super::event_notifier::{EventNotifier, EventReceiver};
 use super::event_repository::EventRepository;
+use super::retention::RetentionStore;
 use agent_sdk_core::ThreadId;
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
@@ -70,6 +71,9 @@ pub struct EventStream {
     last_yielded: Option<u64>,
     /// Whether the replay phase has been fully drained.
     replay_drained: bool,
+    /// When set, `next()` yields a `RetentionGap` as its first item
+    /// before proceeding to replay/live.
+    retention_gap: Option<(u64, u64)>,
 }
 
 /// Outcome of [`EventStream::next`].
@@ -81,6 +85,13 @@ pub enum StreamEvent {
     /// re-establish the stream from durable storage.  The `skipped`
     /// count indicates how many events were lost.
     Lagged { skipped: u64 },
+    /// The requested `after_sequence` is below the retention floor.
+    /// Events before `retention_floor` have been purged.  The stream
+    /// continues from the floor after yielding this item.
+    RetentionGap {
+        requested_after: u64,
+        retention_floor: u64,
+    },
 }
 
 impl EventStream {
@@ -93,6 +104,15 @@ impl EventStream {
     /// Returns `None` when the live tail channel is closed (all
     /// notifiers dropped).
     pub async fn next(&mut self) -> Option<StreamEvent> {
+        // Phase 0: yield a retention gap signal if the client requested
+        // events below the retention floor.
+        if let Some((requested, floor)) = self.retention_gap.take() {
+            return Some(StreamEvent::RetentionGap {
+                requested_after: requested,
+                retention_floor: floor,
+            });
+        }
+
         // Phase 1: drain the replay buffer.
         if !self.replay_drained {
             if let Some(event) = self.next_from_replay() {
@@ -158,10 +178,31 @@ pub async fn stream_events(
     thread_id: &ThreadId,
     after_sequence: Option<u64>,
     event_repo: &dyn EventRepository,
+    retention_store: &dyn RetentionStore,
     notifier: &EventNotifier,
 ) -> Result<EventStream> {
     // Step 1: subscribe BEFORE reading durable state.
     let live_rx = notifier.subscribe(thread_id);
+
+    // Step 1.5: check the retention floor.
+    let floor = retention_store
+        .effective_floor(thread_id)
+        .await
+        .context("stream_events: read retention floor")?;
+
+    let mut retention_gap = None;
+    let effective_after = if floor > 0 {
+        match after_sequence {
+            Some(after) if after < floor => {
+                retention_gap = Some((after, floor));
+                Some(floor.saturating_sub(1))
+            }
+            None => Some(floor.saturating_sub(1)),
+            other => other,
+        }
+    } else {
+        after_sequence
+    };
 
     // Step 2: capture the committed watermark.
     //
@@ -174,9 +215,9 @@ pub async fn stream_events(
         .context("stream_events: read watermark")?;
 
     // Step 3: replay durable events in the window
-    // `(after_sequence, high_water]`.
+    // `(effective_after, high_water]`.
     //
-    // For "replay from start" (`after_sequence = None`) we load all
+    // For "replay from start" (`effective_after = None`) we load all
     // events up to the watermark via `get_events` + filter, because
     // `get_events_in_range` uses a strictly-greater-than lower bound
     // and would skip sequence 0.
@@ -184,7 +225,7 @@ pub async fn stream_events(
         Vec::new()
     } else {
         let high_water = watermark - 1;
-        match after_sequence {
+        match effective_after {
             None => {
                 // Replay from the very beginning.
                 let all = event_repo
@@ -205,7 +246,7 @@ pub async fn stream_events(
 
     // `last_yielded` seeds the dedup guard so live-tail events that
     // overlap with the replay window are skipped.
-    let initial_last_yielded = after_sequence;
+    let initial_last_yielded = effective_after.or(after_sequence);
 
     Ok(EventStream {
         replay_buffer,
@@ -213,6 +254,7 @@ pub async fn stream_events(
         live_rx,
         last_yielded: initial_last_yielded,
         replay_drained: false,
+        retention_gap,
     })
 }
 
@@ -223,6 +265,7 @@ pub async fn stream_events(
 #[cfg(test)]
 mod tests {
     use super::super::event_repository::InMemoryEventRepository;
+    use super::super::retention::InMemoryRetentionStore;
     use super::*;
     use agent_sdk_core::events::AgentEvent;
     use time::{Duration, OffsetDateTime};
@@ -254,7 +297,14 @@ mod tests {
         repo.commit_event(&thread_a(), AgentEvent::text("m3", "c"), t_plus(2))
             .await?;
 
-        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Should get all 3 from replay.
         for expected_seq in 0..3 {
@@ -279,7 +329,14 @@ mod tests {
             .await?;
 
         // Replay from after sequence 1 — should get seq 2 only.
-        let mut stream = stream_events(&thread_a(), Some(1), &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            Some(1),
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         match stream.next().await {
             Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 2),
@@ -293,7 +350,14 @@ mod tests {
         let repo = InMemoryEventRepository::new();
         let notifier = EventNotifier::new();
 
-        let stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
         // Replay buffer should be empty.
         assert!(stream.replay_buffer.is_empty());
         Ok(())
@@ -310,7 +374,14 @@ mod tests {
         repo.commit_event(&thread_a(), AgentEvent::text("m1", "a"), t0())
             .await?;
 
-        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Drain replay.
         match stream.next().await {
@@ -346,7 +417,14 @@ mod tests {
             .commit_event(&thread_a(), AgentEvent::text("m2", "b"), t_plus(1))
             .await?;
 
-        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Before draining replay, "notify" the live tail with an event
         // that's already in the replay window (simulates a commit that
@@ -390,7 +468,14 @@ mod tests {
         }
 
         // Start stream from after sequence 2.
-        let mut stream = stream_events(&thread_a(), Some(2), &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            Some(2),
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Concurrently commit more events.
         for i in 5..8 {
@@ -429,8 +514,9 @@ mod tests {
         repo.commit_event(&thread_b, AgentEvent::text("m1", "b"), t0())
             .await?;
 
-        let stream_a = stream_events(&thread_a(), None, &repo, &notifier).await?;
-        let stream_b = stream_events(&thread_b, None, &repo, &notifier).await?;
+        let retention = InMemoryRetentionStore::new();
+        let stream_a = stream_events(&thread_a(), None, &repo, &retention, &notifier).await?;
+        let stream_b = stream_events(&thread_b, None, &repo, &retention, &notifier).await?;
 
         assert_eq!(stream_a.replay_buffer.len(), 1);
         assert_eq!(stream_a.replay_buffer[0].thread_id, thread_a());
@@ -457,7 +543,14 @@ mod tests {
         }
 
         // Client reconnects after seeing sequence 2.
-        let mut stream = stream_events(&thread_a(), Some(2), &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            Some(2),
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Should replay seq 3 and 4.
         let mut replayed = Vec::new();
@@ -501,7 +594,14 @@ mod tests {
 
         // Client already has everything (after_sequence = 2, which is
         // the last committed sequence).
-        let mut stream = stream_events(&thread_a(), Some(2), &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            Some(2),
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
         assert!(stream.replay_buffer.is_empty());
 
         // Only live events should arrive.
@@ -529,7 +629,14 @@ mod tests {
         repo.commit_event(&thread_a(), AgentEvent::text("m2", "b"), t_plus(1))
             .await?;
 
-        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
         assert_eq!(stream.replay_buffer.len(), 2);
 
         // Drain replay.
@@ -561,7 +668,14 @@ mod tests {
         repo.commit_event(&thread_a(), AgentEvent::text("m1", "b"), t_plus(1))
             .await?;
 
-        let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            None,
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
 
         // Batch commit 3 more events.
         let batch = repo
@@ -586,6 +700,103 @@ mod tests {
             }
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+        Ok(())
+    }
+
+    // ── Retention gap ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn replay_below_floor_yields_retention_gap() -> Result<()> {
+        use super::super::retention::RetentionStore;
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let retention = InMemoryRetentionStore::new();
+
+        for i in 0..5i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        retention.advance_floor(&thread_a(), 3, t0()).await?;
+
+        let mut stream = stream_events(&thread_a(), Some(1), &repo, &retention, &notifier).await?;
+
+        match stream.next().await {
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => {
+                assert_eq!(requested_after, 1);
+                assert_eq!(retention_floor, 3);
+            }
+            other => panic!("expected RetentionGap, got {other:?}"),
+        }
+
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 3),
+            other => panic!("expected Event(seq=3), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_at_floor_works_normally() -> Result<()> {
+        use super::super::retention::RetentionStore;
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let retention = InMemoryRetentionStore::new();
+
+        for i in 0..5i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        retention.advance_floor(&thread_a(), 3, t0()).await?;
+
+        let mut stream = stream_events(&thread_a(), Some(3), &repo, &retention, &notifier).await?;
+
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 4),
+            other => panic!("expected Event(seq=4), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_from_none_with_floor_starts_from_floor() -> Result<()> {
+        use super::super::retention::RetentionStore;
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let retention = InMemoryRetentionStore::new();
+
+        for i in 0..5i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        retention.advance_floor(&thread_a(), 3, t0()).await?;
+
+        let mut stream = stream_events(&thread_a(), None, &repo, &retention, &notifier).await?;
+
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 3),
+            other => panic!("expected Event(seq=3) from floor, got {other:?}"),
+        }
         Ok(())
     }
 }

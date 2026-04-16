@@ -24,6 +24,7 @@ use crate::journal::event_stream::{StreamEvent, stream_events};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub};
 use crate::journal::message_store::InMemoryMessageProjectionStore;
+use crate::journal::retention::InMemoryRetentionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, LeaseId, WorkerId};
 use crate::journal::thread_store::InMemoryThreadStore;
@@ -451,7 +452,14 @@ async fn restart_replay_events_survive_notifier_recreation() -> Result<()> {
     let new_notifier = EventNotifier::new();
 
     // Reconnect client replays from the beginning.
-    let mut stream = stream_events(&thread_reg(), None, &repo, &new_notifier).await?;
+    let mut stream = stream_events(
+        &thread_reg(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &new_notifier,
+    )
+    .await?;
 
     // All 5 pre-restart events should replay.
     let mut seen = Vec::new();
@@ -475,7 +483,14 @@ async fn restart_replay_events_survive_notifier_recreation() -> Result<()> {
     }
 
     // Reconnect from after seq 3 — should get 4 and 5.
-    let mut reconnected = stream_events(&thread_reg(), Some(3), &repo, &new_notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_reg(),
+        Some(3),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &new_notifier,
+    )
+    .await?;
     let e6 = repo
         .commit_event(&thread_reg(), AgentEvent::text("m6", "post-6"), t_plus(6))
         .await?;
@@ -519,7 +534,14 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
     }
 
     // Open a stream from after seq 0.
-    let mut stream = stream_events(&thread_reg(), Some(0), &stores.events, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_reg(),
+        Some(0),
+        &stores.events,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Replay delivers seq 1.
     match stream.next().await {
@@ -628,7 +650,14 @@ async fn lagging_subscriber_disconnect_and_recovery() -> Result<()> {
 
     // Recovery: reconnect via stream_events with after_sequence = 2.
     let notifier = EventNotifier::new();
-    let mut reconnected = stream_events(&thread_reg(), Some(2), &repo, &notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_reg(),
+        Some(2),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Should replay seq 3 and 4 from durable storage.
     let mut recovered = Vec::new();
@@ -675,7 +704,14 @@ async fn fail_closed_error_event_persisted() -> Result<()> {
 
     // Error event is replayable via stream_events.
     let notifier = EventNotifier::new();
-    let mut stream = stream_events(&thread_reg(), None, &stores.events, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_reg(),
+        None,
+        &stores.events,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     match stream.next().await {
         Some(StreamEvent::Event(e)) => {
             assert!(matches!(&e.event, AgentEvent::Error { .. }));
@@ -1261,7 +1297,14 @@ async fn replay_required_reconnect_resumes_exactly() -> Result<()> {
     }
 
     // Stream from start, drain replay.
-    let mut stream = stream_events(&thread_reg(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_reg(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let mut seen = Vec::new();
     for _ in 0..2 {
         match stream.next().await {
@@ -1291,7 +1334,14 @@ async fn replay_required_reconnect_resumes_exactly() -> Result<()> {
     }
 
     // Reconnect from last seen (1).
-    let mut reconnected = stream_events(&thread_reg(), Some(1), &repo, &notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_reg(),
+        Some(1),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let mut reconnect_seen = Vec::new();
     for _ in 0..18 {
         match reconnected.next().await {
@@ -1322,7 +1372,14 @@ async fn committed_only_events_invisible_until_replay() -> Result<()> {
     notifier.notify(std::slice::from_ref(&e0));
 
     // Stream from start, drain event 0.
-    let mut stream = stream_events(&thread_reg(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_reg(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     match stream.next().await {
         Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 0),
         other => panic!("expected Event(0), got {other:?}"),
@@ -1345,7 +1402,14 @@ async fn committed_only_events_invisible_until_replay() -> Result<()> {
     }
 
     // Reconnect to recover the "ghost" event 1 via durable replay.
-    let mut reconnected = stream_events(&thread_reg(), None, &repo, &notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_reg(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let mut full = Vec::new();
     for _ in 0..3 {
         match reconnected.next().await {

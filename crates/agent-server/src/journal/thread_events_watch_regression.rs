@@ -19,6 +19,7 @@ mod tests {
     use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
     use crate::journal::event_stream::{StreamEvent, stream_events};
     use crate::journal::outbox_message::ThreadEventsAvailablePayload;
+    use crate::journal::retention::InMemoryRetentionStore;
     use crate::journal::thread_events_watch::{
         NotifierThreadEventsWatchHandler, ThreadEventsWatchHandler, ThreadEventsWatchOutcome,
     };
@@ -103,6 +104,9 @@ mod tests {
             StreamEvent::Lagged { skipped } => {
                 anyhow::bail!("unexpected Lagged({skipped}) from stream");
             }
+            StreamEvent::RetentionGap { .. } => {
+                panic!("unexpected retention gap")
+            }
         }
     }
 
@@ -121,6 +125,7 @@ mod tests {
             &thread_x(),
             None,
             fanout.repo.as_ref(),
+            &InMemoryRetentionStore::new(),
             fanout.instance_b_notifier.as_ref(),
         )
         .await?;
@@ -175,6 +180,7 @@ mod tests {
             &thread_x(),
             None,
             fanout.repo.as_ref(),
+            &InMemoryRetentionStore::new(),
             fanout.instance_b_notifier.as_ref(),
         )
         .await?;
@@ -229,6 +235,7 @@ mod tests {
             &thread_x(),
             None,
             fanout.repo.as_ref(),
+            &InMemoryRetentionStore::new(),
             fanout.instance_b_notifier.as_ref(),
         )
         .await?;
@@ -305,6 +312,7 @@ mod tests {
             &thread_x(),
             None,
             fanout.repo.as_ref(),
+            &InMemoryRetentionStore::new(),
             fanout.instance_b_notifier.as_ref(),
         )
         .await?;
@@ -330,6 +338,7 @@ mod tests {
             &thread_x(),
             None,
             fanout.repo.as_ref(),
+            &InMemoryRetentionStore::new(),
             fanout.instance_b_notifier.as_ref(),
         )
         .await?;

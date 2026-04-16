@@ -2495,6 +2495,43 @@ impl CheckpointStore for SqliteDurableStore {
         .with_context(|| format!("list checkpoints for {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
+
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let threshold_i64 = i64::from(threshold);
+        let limit_i64 = i64::from(limit);
+        let rows = sqlx::query_scalar!(
+            r"SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > ?1 LIMIT ?2",
+            threshold_i64,
+            limit_i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads_exceeding_checkpoint_count")?;
+        Ok(rows.into_iter().map(ThreadId::from_string).collect())
+    }
+
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64> {
+        ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
+        let tid = thread_key(thread_id);
+        let keep = i64::from(keep_latest_n);
+        let result = sqlx::query!(
+            r"DELETE FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND id NOT IN (SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT ?2)",
+            tid,
+            keep,
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("delete checkpoints beyond limit for {thread_id}"))?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2582,6 +2619,43 @@ impl EventRepository for SqliteDurableStore {
         .await
         .with_context(|| format!("get events in range ({after_sequence}, {up_to_sequence}] for {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let limit_i64 = i64::from(limit);
+        let rows: Vec<String> = sqlx::query_scalar!(
+            r"SELECT DISTINCT thread_id FROM agent_sdk_committed_events WHERE committed_at < ?1 LIMIT ?2",
+            cutoff,
+            limit_i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads_with_events_before")?;
+        Ok(rows.into_iter().map(ThreadId::from_string).collect())
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let tid = thread_key(thread_id);
+        let record = sqlx::query!(
+            r#"SELECT MAX(sequence) AS "max_seq: i64" FROM agent_sdk_committed_events WHERE thread_id = ?1 AND committed_at < ?2"#,
+            tid,
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("max_sequence_before for {thread_id}"))?;
+        match record.max_seq {
+            Some(v) => Ok(Some(u64_from_i64(v, "max_sequence_before")?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2824,6 +2898,21 @@ WHERE id = ?1 AND status NOT IN ('delivered', 'expired')
             .with_context(|| format!("count pending outbox rows for {thread_id}"))?;
         let count: i64 = record.cnt;
         u64::try_from(count).context("outbox pending count out of range")
+    }
+
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+        let tid = thread_key(thread_id);
+        let record = sqlx::query!(
+            r#"SELECT MIN(sequence) AS "min_seq: i64" FROM agent_sdk_outbox WHERE thread_id = ?1 AND status IN ('pending', 'claimed') AND sequence IS NOT NULL"#,
+            tid,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min_unpublished_sequence for {thread_id}"))?;
+        match record.min_seq {
+            Some(v) => Ok(Some(u64_from_i64(v, "min_unpublished_sequence")?)),
+            None => Ok(None),
+        }
     }
 }
 
