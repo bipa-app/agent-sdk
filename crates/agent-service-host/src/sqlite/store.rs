@@ -327,8 +327,8 @@ VALUES (?1, ?2, ?3, ?4, ?5)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             )
-            .bind(&thread_id_key)
-            .bind(&history_json)
+            .bind(thread_id_key)
+            .bind(history_json)
             .bind(version)
             .bind(fresh.created_at)
             .bind(fresh.updated_at)
