@@ -1133,7 +1133,7 @@ impl GrpcTransport {
     /// Returns an error if the health loop or gRPC transport cannot be served on
     /// the provided listener.
     pub async fn serve_listener(self, listener: TcpListener) -> Result<()> {
-        let (mut reporter, health_service) = tonic_health::server::health_reporter();
+        let (reporter, health_service) = tonic_health::server::health_reporter();
         let control_service = GrpcControlService {
             shared: Arc::clone(&self.shared),
         };
@@ -1977,6 +1977,15 @@ mod tests {
     fn message_text(message: &pb::ConversationMessage) -> Option<&str> {
         match message.content.as_ref() {
             Some(pb::conversation_message::Content::Text(text)) => Some(text.as_str()),
+            Some(pb::conversation_message::Content::Blocks(blocks)) => blocks
+                .items
+                .iter()
+                .find_map(|item| match item.block.as_ref() {
+                    Some(pb::conversation_content_block::Block::Text(text)) => {
+                        Some(text.text.as_str())
+                    }
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -2261,6 +2270,7 @@ mod tests {
     struct PersistedPostgresState {
         inspection: StoreRegistry,
         thread_key: ThreadId,
+        persisted_event_sequences: Vec<u64>,
     }
 
     #[cfg(feature = "postgres")]
@@ -2372,14 +2382,19 @@ mod tests {
         assert_eq!(attempts.len(), 1);
 
         let fresh_process_events = inspection.event_repo.get_events(&thread_key).await?;
+        let persisted_event_sequences = fresh_process_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
         assert!(
-            fresh_process_events.is_empty(),
-            "fresh inspection stores should start with an empty process-local event repository",
+            !persisted_event_sequences.is_empty(),
+            "fresh inspection stores should expose durable committed events across restart",
         );
 
         Ok(PersistedPostgresState {
             inspection,
             thread_key,
+            persisted_event_sequences,
         })
     }
 
@@ -2387,6 +2402,7 @@ mod tests {
     async fn assert_postgres_state_after_restart(
         control: &mut ControlClient,
         events: &mut EventClient,
+        persisted: &PersistedPostgresState,
         thread_id: &str,
         first_task_id: &str,
     ) -> Result<()> {
@@ -2425,7 +2441,8 @@ mod tests {
         let mut replay_stream =
             open_stream(events, thread_id, None, pb::FollowMode::ReplayOnly).await?;
         let replay_after_restart = collect_until_closed(&mut replay_stream).await?;
-        assert!(event_sequences(&replay_after_restart).is_empty());
+        let replay_sequences = event_sequences(&replay_after_restart);
+        assert_eq!(replay_sequences, persisted.persisted_event_sequences);
         assert!(matches!(
             replay_after_restart.last().and_then(|item| item.item.as_ref()),
             Some(StreamItem::Closed(closed))
@@ -2448,15 +2465,21 @@ mod tests {
         let second_sequences = event_sequences(&second_items);
         assert_contiguous_sequences(&second_sequences);
 
-        let messages_after = control
-            .get_thread_messages(pb::GetThreadMessagesRequest {
-                thread_id: thread_id.into(),
-            })
-            .await
-            .context("get_thread_messages after second postgres turn")?
-            .into_inner()
-            .projection
-            .context("missing message projection after second postgres turn")?;
+        let thread_id_owned = thread_id.to_owned();
+        let messages_after = wait_for(|| {
+            let mut control = control.clone();
+            let thread_id = thread_id_owned.clone();
+            async move {
+                let projection = control
+                    .get_thread_messages(pb::GetThreadMessagesRequest { thread_id })
+                    .await
+                    .context("get_thread_messages after second postgres turn")?
+                    .into_inner()
+                    .projection;
+                Ok(projection.filter(|projection| projection.messages.len() == 4))
+            }
+        })
+        .await?;
         assert_eq!(messages_after.messages.len(), 4);
         assert_eq!(
             message_text(&messages_after.messages[1]),
@@ -2488,12 +2511,19 @@ mod tests {
     #[cfg(feature = "postgres")]
     async fn run_second_postgres_daemon_pass(
         daemon: &LocalDaemon,
+        persisted: &PersistedPostgresState,
         thread_id: &str,
         first_task_id: &str,
     ) -> Result<String> {
         let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
-        assert_postgres_state_after_restart(&mut control, &mut events, thread_id, first_task_id)
-            .await?;
+        assert_postgres_state_after_restart(
+            &mut control,
+            &mut events,
+            persisted,
+            thread_id,
+            first_task_id,
+        )
+        .await?;
         submit_second_postgres_turn(&mut control, &mut events, thread_id).await
     }
 
@@ -2872,7 +2902,7 @@ mod tests {
         )
         .await?;
         let second_run =
-            run_second_postgres_daemon_pass(&daemon2, &thread_id, &first_task_id).await;
+            run_second_postgres_daemon_pass(&daemon2, &persisted, &thread_id, &first_task_id).await;
         daemon2.stop().await?;
         let second_task_id = second_run?;
 

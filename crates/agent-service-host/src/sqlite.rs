@@ -149,7 +149,7 @@ mod tests {
         ];
 
         for name in required_constraints {
-            ensure!(sql_bundle.contains(name), "missing constraint: {name}",);
+            ensure!(sql_bundle.contains(name), "missing constraint: {name}");
         }
         Ok(())
     }
@@ -190,7 +190,7 @@ mod tests {
         ];
 
         for name in required_indexes {
-            ensure!(sql_bundle.contains(name), "missing index: {name}",);
+            ensure!(sql_bundle.contains(name), "missing index: {name}");
         }
         Ok(())
     }

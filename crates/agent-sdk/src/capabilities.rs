@@ -309,18 +309,14 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 /// Simple regex matching (returns false on invalid patterns).
 /// Used for allow rules — an invalid allow pattern should not grant access.
 fn regex_match(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(text))
-        .unwrap_or(false)
+    regex::Regex::new(pattern).is_ok_and(|re| re.is_match(text))
 }
 
 /// Regex matching for deny rules — fails CLOSED on invalid patterns.
 /// An invalid deny pattern blocks everything to prevent misconfigured
 /// deny rules from silently allowing dangerous commands.
 fn regex_match_deny(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(text))
-        .unwrap_or(true) // Invalid pattern = deny (fail closed)
+    regex::Regex::new(pattern).map_or(true, |re| re.is_match(text))
 }
 
 #[cfg(test)]

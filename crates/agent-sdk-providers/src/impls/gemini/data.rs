@@ -447,20 +447,18 @@ pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static>
                     // content may be empty on safety-blocked responses
                     for part in &candidate.content.parts {
                         match part {
-                            ApiPart::Text { text, .. } => {
-                                if !text.is_empty() {
-                                    // Gemini sends complete text parts per SSE event (not
-                                    // incremental deltas like Anthropic). Keep the same
-                                    // block_index for consecutive text parts so the
-                                    // StreamAccumulator appends them into one text block.
-                                    if !in_text_block {
-                                        in_text_block = true;
-                                    }
-                                    yield Ok(StreamDelta::TextDelta {
-                                        delta: text.clone(),
-                                        block_index,
-                                    });
+                            ApiPart::Text { text, .. } if !text.is_empty() => {
+                                // Gemini sends complete text parts per SSE event (not
+                                // incremental deltas like Anthropic). Keep the same
+                                // block_index for consecutive text parts so the
+                                // StreamAccumulator appends them into one text block.
+                                if !in_text_block {
+                                    in_text_block = true;
                                 }
+                                yield Ok(StreamDelta::TextDelta {
+                                    delta: text.clone(),
+                                    block_index,
+                                });
                             }
                             ApiPart::FunctionCall { function_call, thought_signature } => {
                                 // Switching away from text — advance the block index.

@@ -512,7 +512,7 @@ mod tests {
     async fn publish_never_blocks_on_slow_subscriber() {
         let hub = LiveTailHub::with_config(LiveTailConfig {
             buffer_capacity: 5,
-            lag_grace_period: Duration::from_secs(60),
+            lag_grace_period: Duration::from_mins(1),
         });
         let _rx = hub.subscribe(&thread_a()); // Subscribe but never read.
 
@@ -694,7 +694,7 @@ mod tests {
     async fn receiver_dropped_cleans_up_lagging_subscriber() {
         let hub = LiveTailHub::with_config(LiveTailConfig {
             buffer_capacity: 2,
-            lag_grace_period: Duration::from_secs(60),
+            lag_grace_period: Duration::from_mins(1),
         });
         let rx = hub.subscribe(&thread_a());
 

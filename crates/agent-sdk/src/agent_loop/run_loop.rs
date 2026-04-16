@@ -383,7 +383,7 @@ async fn record_external_tool_execution(
     );
     execution.complete(result.clone());
     if let Err(e) = store.record_execution(execution).await {
-        warn!("Failed to record external tool execution (tool_call_id={tool_call_id}, error={e})",);
+        warn!("Failed to record external tool execution (tool_call_id={tool_call_id}, error={e})");
     }
 }
 

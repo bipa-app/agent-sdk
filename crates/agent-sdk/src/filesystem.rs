@@ -99,18 +99,12 @@ impl Environment for LocalFileSystem {
 
     async fn is_dir(&self, path: &str) -> Result<bool> {
         let path = self.resolve(path);
-        Ok(tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false))
+        Ok(tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()))
     }
 
     async fn is_file(&self, path: &str) -> Result<bool> {
         let path = self.resolve(path);
-        Ok(tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false))
+        Ok(tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()))
     }
 
     async fn create_dir(&self, path: &str) -> Result<()> {

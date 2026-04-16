@@ -313,7 +313,7 @@ async fn workers_never_blocked_during_overflow() -> Result<()> {
     let repo = InMemoryEventRepository::new();
     let hub = LiveTailHub::with_config(LiveTailConfig {
         buffer_capacity: 5,
-        lag_grace_period: Duration::from_secs(60),
+        lag_grace_period: Duration::from_mins(1),
     });
 
     // Create 10 subscribers that never read.

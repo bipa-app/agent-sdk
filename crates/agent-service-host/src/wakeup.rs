@@ -233,7 +233,7 @@ async fn supervise_amqp_consumer(
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
     /// Runs that last at least this long are considered "stable" and
     /// reset the backoff so a later disconnect reconnects fast.
-    const STABILITY_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+    const STABILITY_THRESHOLD: std::time::Duration = std::time::Duration::from_mins(1);
 
     let mut backoff = INITIAL_BACKOFF;
     loop {

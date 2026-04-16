@@ -58,7 +58,7 @@ use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, ConfirmSelectOptions,
     ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
-use lapin::types::FieldTable;
+use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Connection, ConnectionProperties, Consumer};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -200,7 +200,7 @@ impl AmqpTaskWakeupConsumer {
                     info!(%consumer_tag, "task wakeup consumer shutting down");
                     let _ = channel
                         .basic_cancel(
-                            &consumer_tag,
+                            ShortString::from(consumer_tag.clone()),
                             lapin::options::BasicCancelOptions::default(),
                         )
                         .await;
@@ -244,7 +244,7 @@ impl AmqpTaskWakeupConsumer {
         if self.config.declare_queue {
             channel
                 .queue_declare(
-                    &self.config.queue,
+                    self.config.queue.as_str().into(),
                     QueueDeclareOptions {
                         durable: true,
                         ..QueueDeclareOptions::default()
@@ -256,11 +256,12 @@ impl AmqpTaskWakeupConsumer {
         }
 
         if self.config.bind_queue {
+            let routing_key = self.config.routing_key();
             channel
                 .queue_bind(
-                    &self.config.queue,
-                    &self.config.broker.exchange,
-                    &self.config.routing_key(),
+                    self.config.queue.as_str().into(),
+                    self.config.broker.exchange.as_str().into(),
+                    routing_key.as_str().into(),
                     QueueBindOptions::default(),
                     FieldTable::default(),
                 )
@@ -268,9 +269,7 @@ impl AmqpTaskWakeupConsumer {
                 .with_context(|| {
                     format!(
                         "bind queue {} to exchange {} with routing key {}",
-                        self.config.queue,
-                        self.config.broker.exchange,
-                        self.config.routing_key(),
+                        self.config.queue, self.config.broker.exchange, routing_key,
                     )
                 })?;
         }
@@ -282,8 +281,8 @@ impl AmqpTaskWakeupConsumer {
         );
         let consumer = channel
             .basic_consume(
-                &self.config.queue,
-                &consumer_tag,
+                self.config.queue.as_str().into(),
+                consumer_tag.as_str().into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
@@ -323,7 +322,7 @@ impl AmqpTaskWakeupConsumer {
         if self.config.broker.declare_exchange {
             channel
                 .exchange_declare(
-                    &self.config.broker.exchange,
+                    self.config.broker.exchange.as_str().into(),
                     match self.config.broker.exchange_kind {
                         AmqpExchangeKind::Topic => lapin::ExchangeKind::Topic,
                         AmqpExchangeKind::Direct => lapin::ExchangeKind::Direct,

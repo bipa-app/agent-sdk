@@ -115,7 +115,7 @@ pub(super) enum ToolExecutionOutcome {
 
 pub(super) const MAX_LISTEN_UPDATES: usize = 240;
 pub(super) const LISTEN_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(super) const LISTEN_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const LISTEN_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
 
 pub(super) struct ListenReady {
     pub(super) operation_id: String,
