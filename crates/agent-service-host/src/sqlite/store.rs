@@ -1083,6 +1083,13 @@ LIMIT 1
         thread_id: &ThreadId,
     ) -> Result<u64> {
         let thread_id_key = thread_key(thread_id);
+        // Derive the next sequence from both the committed-events max
+        // AND the retention floor so that sequences never regress
+        // after the janitor purges events. Without the retention
+        // floor, a thread whose entire history has been purged would
+        // see MAX()=NULL and start re-assigning sequences from 0,
+        // making those events invisible to any subscriber seeded with
+        // `last_yielded = floor - 1`.
         let record = sqlx::query!(
             r"SELECT COALESCE(MAX(sequence) + 1, 0) AS next_seq FROM agent_sdk_committed_events WHERE thread_id = ?1",
             thread_id_key,
@@ -1090,8 +1097,23 @@ LIMIT 1
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
-        let next: i64 = record.next_seq;
-        u64::try_from(next).context("event next_sequence (tx) out of range")
+        let from_events = u64::try_from(record.next_seq)
+            .context("event next_sequence (tx) out of range")?;
+
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
+            thread_id_key,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("read retention floor (tx) for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor (tx) out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     async fn insert_events_tx(
@@ -2588,8 +2610,27 @@ impl EventRepository for SqliteDurableStore {
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("next event sequence for {thread_id}"))?;
-        let next: i64 = record.next_seq;
-        u64::try_from(next).context("event next_sequence out of range")
+        let from_events = u64::try_from(record.next_seq)
+            .context("event next_sequence out of range")?;
+
+        // When the janitor has purged all events, MAX() is NULL and
+        // `from_events` falls back to 0. The retention floor records
+        // the highest sequence already assigned, so clamping to it
+        // prevents sequence regression after a full purge.
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
+            thread_id_key,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
@@ -4328,6 +4369,52 @@ mod tests {
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
 
         OutboxStore::mark_failed(&store, &row_id, "timeout", t_plus(3), t_plus(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_sequence_does_not_regress_after_full_retention_purge() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-seq-no-regress");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        // Commit 3 events — sequences 0, 1, 2.
+        for i in 0..3 {
+            EventRepository::commit_event(
+                &store,
+                &thread_id,
+                AgentEvent::text(format!("m{i}"), "hello"),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Janitor purges every event by advancing the floor past the
+        // last assigned sequence.
+        RetentionStore::advance_floor(&store, &thread_id, 3, t_plus(3)).await?;
+        assert_eq!(
+            RetentionStore::effective_floor(&store, &thread_id).await?,
+            3,
+        );
+
+        // A new event must land at sequence >= 3, not reuse 0.
+        let fresh = EventRepository::commit_event(
+            &store,
+            &thread_id,
+            AgentEvent::text("m3", "post-purge"),
+            t_plus(4),
+        )
+        .await?;
+        assert!(
+            fresh.sequence >= 3,
+            "sequence regressed after purge: {} (expected >= 3)",
+            fresh.sequence,
+        );
         Ok(())
     }
 

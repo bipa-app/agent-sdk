@@ -193,7 +193,12 @@ pub async fn stream_events(
     let mut retention_gap = None;
     let effective_after = if floor > 0 {
         match after_sequence {
-            Some(after) if after < floor => {
+            // A genuine gap exists only when at least one sequence in
+            // `(after, floor)` is missing — i.e. `after + 1 < floor`.
+            // When `after == floor - 1`, the client has already seen
+            // every purged event and can resume seamlessly at `floor`
+            // without a (false-positive) gap signal.
+            Some(after) if after + 1 < floor => {
                 retention_gap = Some((after, floor));
                 Some(floor.saturating_sub(1))
             }
@@ -277,8 +282,18 @@ pub async fn stream_events(
     }
 
     // `last_yielded` seeds the dedup guard so live-tail events that
-    // overlap with the replay window are skipped.
-    let initial_last_yielded = effective_after.or(after_sequence);
+    // overlap with the replay window are skipped.  It must also be at
+    // least `floor_after_fetch - 1` so broadcast-channel-buffered
+    // events committed before a racing floor advance are dropped
+    // (otherwise the client would receive sub-floor events after the
+    // RetentionGap signal).
+    let mut initial_last_yielded = effective_after.or(after_sequence);
+    if floor_after_fetch > 0 {
+        let floor_minus_one = floor_after_fetch - 1;
+        initial_last_yielded = Some(
+            initial_last_yielded.map_or(floor_minus_one, |last| last.max(floor_minus_one)),
+        );
+    }
 
     Ok(EventStream {
         replay_buffer,
@@ -894,6 +909,149 @@ mod tests {
                 e.sequence
             ),
             other => panic!("expected Event(seq>=3), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_sequence_at_floor_minus_one_emits_no_gap() -> Result<()> {
+        // Boundary case: client's last-seen sequence is exactly the
+        // most-recently-purged sequence (`after == floor - 1`). The
+        // client has every purged event — no gap should be signalled.
+        use super::super::retention::RetentionStore;
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let retention = InMemoryRetentionStore::new();
+
+        for i in 0..7i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Floor = 5 (events 0..4 purged). Client reconnects with
+        // after_sequence = 4 — the last purged sequence. No gap.
+        retention.advance_floor(&thread_a(), 5, t0()).await?;
+
+        let mut stream = stream_events(&thread_a(), Some(4), &repo, &retention, &notifier).await?;
+
+        // First yielded item must be Event(seq=5), not RetentionGap.
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 5),
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => panic!(
+                "spurious RetentionGap: requested_after={requested_after}, retention_floor={retention_floor}"
+            ),
+            other => panic!("expected Event(seq=5), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn racing_floor_advance_drops_sub_floor_live_tail_events() -> Result<()> {
+        // Reproduces: after a floor advance races between subscribe
+        // and the post-fetch floor re-read, sub-floor events already
+        // buffered in the broadcast channel must be suppressed by the
+        // live-tail dedup guard. Without Fix 3, those events leak
+        // through after the RetentionGap signal.
+        use super::super::retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct RacingRetention {
+            inner: Arc<InMemoryRetentionStore>,
+            reads: AtomicU32,
+            racing_floor: u64,
+        }
+
+        #[async_trait]
+        impl RetentionStore for RacingRetention {
+            async fn get_cursor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<Option<RetentionCursor>> {
+                self.inner.get_cursor(thread_id).await
+            }
+
+            async fn advance_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+                new_floor: u64,
+                now: OffsetDateTime,
+            ) -> anyhow::Result<RetentionCursor> {
+                self.inner.advance_floor(thread_id, new_floor, now).await
+            }
+
+            async fn effective_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<u64> {
+                let call = self.reads.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    self.inner
+                        .advance_floor(thread_id, self.racing_floor, t0())
+                        .await?;
+                }
+                self.inner.effective_floor(thread_id).await
+            }
+        }
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let racing = RacingRetention {
+            inner: Arc::new(InMemoryRetentionStore::new()),
+            reads: AtomicU32::new(0),
+            racing_floor: 3,
+        };
+
+        let mut stream = stream_events(&thread_a(), None, &repo, &racing, &notifier).await?;
+
+        // Simulate broadcast-buffered sub-floor events committed
+        // before the floor advance was observed.
+        for i in 0..3i64 {
+            let e = repo
+                .commit_event(
+                    &thread_a(),
+                    AgentEvent::text(format!("m{i}"), "sub-floor"),
+                    t_plus(i),
+                )
+                .await?;
+            notifier.notify(&[e]);
+        }
+
+        // An above-floor event the client actually wants.
+        let wanted = repo
+            .commit_event(&thread_a(), AgentEvent::text("m3", "above-floor"), t_plus(3))
+            .await?;
+        notifier.notify(&[wanted]);
+
+        // Phase 0: RetentionGap signal.
+        match stream.next().await {
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => {
+                assert_eq!(requested_after, 0);
+                assert_eq!(retention_floor, 3);
+            }
+            other => panic!("expected RetentionGap, got {other:?}"),
+        }
+
+        // Next yielded event must be seq=3 (above floor); sub-floor
+        // events must have been dropped by the dedup guard.
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(
+                e.sequence, 3,
+                "sub-floor live event leaked through dedup guard",
+            ),
+            other => panic!("expected Event(seq=3), got {other:?}"),
         }
         Ok(())
     }

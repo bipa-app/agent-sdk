@@ -3062,8 +3062,27 @@ impl EventRepository for PostgresDurableStore {
         .await
         .with_context(|| format!("next event sequence for {thread_id}"))?;
 
-        let next = record.next_seq.unwrap_or(0);
-        u64::try_from(next).context("event next_sequence out of range")
+        let from_events = u64::try_from(record.next_seq.unwrap_or(0))
+            .context("event next_sequence out of range")?;
+
+        // Clamp to the retention floor: when the janitor has purged
+        // all events, MAX() is NULL and `from_events` would fall back
+        // to 0, letting new events reuse sequences already "claimed"
+        // by purged history and silently missing every subscriber.
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
@@ -3191,8 +3210,26 @@ impl PostgresDurableStore {
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
 
-        let next = record.next_seq.unwrap_or(0);
-        u64::try_from(next).context("event next_sequence (tx) out of range")
+        let from_events = u64::try_from(record.next_seq.unwrap_or(0))
+            .context("event next_sequence (tx) out of range")?;
+
+        // Derived from the retention floor so sequences never regress
+        // after the janitor purges events. See `next_sequence` for
+        // the full rationale.
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("read retention floor (tx) for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor (tx) out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     /// Insert committed events into an existing transaction.
@@ -5722,6 +5759,55 @@ mod tests {
         assert_eq!(reclaimed_rows.len(), 1);
         assert_eq!(reclaimed_rows[0].id, id);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_sequence_does_not_regress_after_full_retention_purge() -> Result<()> {
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-seq-no-regress");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        // Commit 3 events — sequences 0, 1, 2.
+        for i in 0..3 {
+            EventRepository::commit_event(
+                &store,
+                &thread_id,
+                AgentEvent::text(format!("m{i}"), "hello"),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Janitor purges every event by advancing the floor past the
+        // last assigned sequence — MAX(sequence) falls back to NULL
+        // on the empty table.
+        RetentionStore::advance_floor(&store, &thread_id, 3, t_plus(3)).await?;
+        assert_eq!(
+            RetentionStore::effective_floor(&store, &thread_id).await?,
+            3,
+        );
+
+        // A new event must land at sequence >= 3, not reuse 0.
+        let fresh = EventRepository::commit_event(
+            &store,
+            &thread_id,
+            AgentEvent::text("m3", "post-purge"),
+            t_plus(4),
+        )
+        .await?;
+        assert!(
+            fresh.sequence >= 3,
+            "sequence regressed after purge: {} (expected >= 3)",
+            fresh.sequence,
+        );
         Ok(())
     }
 
