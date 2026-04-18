@@ -427,7 +427,7 @@ mod tests {
         }
 
         let policy = RetentionPolicy {
-            event_ttl: Some(std::time::Duration::from_secs(3600)),
+            event_ttl: Some(std::time::Duration::from_hours(1)),
             checkpoint_max_per_thread: Some(2),
             batch_size: 100,
         };
@@ -475,7 +475,7 @@ mod tests {
             .await?;
 
         let policy = RetentionPolicy {
-            event_ttl: Some(std::time::Duration::from_secs(3600)),
+            event_ttl: Some(std::time::Duration::from_hours(1)),
             checkpoint_max_per_thread: Some(1),
             batch_size: 100,
         };
@@ -588,7 +588,7 @@ mod tests {
         }
 
         let policy = RetentionPolicy {
-            event_ttl: Some(std::time::Duration::from_secs(3600)),
+            event_ttl: Some(std::time::Duration::from_hours(1)),
             checkpoint_max_per_thread: Some(1),
             batch_size: 1,
         };
