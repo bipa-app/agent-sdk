@@ -24,7 +24,15 @@
 //! retention:
 //!   event_ttl_secs: null
 //!   checkpoint_max_per_thread: null
+//!   janitor_enabled: false
+//!   janitor_interval_secs: 60
+//!   janitor_batch_size: 100
 //! ```
+//!
+//! The built-in retention janitor is opt-in: setting `event_ttl_secs`
+//! or `checkpoint_max_per_thread` alone is not enough — the janitor
+//! only sweeps when `janitor_enabled: true`.  When enabled, the host
+//! spawns an extra background task (see the `host` module docs).
 //!
 //! PostgreSQL-backed durable-core config:
 //!

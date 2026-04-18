@@ -109,11 +109,14 @@ pub async fn run_janitor_cycle(
             .context("list threads needing retention")?;
 
         for thread_id in &threads {
-            report.threads_scanned += 1;
-            event_swept_threads.insert(thread_id.clone());
-            remaining_budget = remaining_budget.saturating_sub(1);
-
             // ── Compute safe floor ──────────────────────────────
+            //
+            // We do NOT charge budget or mark the thread as swept
+            // until after a useful advance completes below: threads
+            // that exit via an early `continue` (TOCTOU where events
+            // vanished, or outbox rows pinning the floor) must remain
+            // eligible for Pass 2's standalone checkpoint sweep and
+            // must not consume batch budget on no-op work.
             let outbox_bound = deps
                 .outbox_store
                 .min_unpublished_sequence(thread_id)
@@ -165,6 +168,11 @@ pub async fn run_janitor_cycle(
                     .with_context(|| format!("prune checkpoints for {thread_id}"))?;
                 report.checkpoints_pruned += pruned;
             }
+
+            // ── Charge budget and mark as swept (useful work done)
+            report.threads_scanned += 1;
+            event_swept_threads.insert(thread_id.clone());
+            remaining_budget = remaining_budget.saturating_sub(1);
         }
     }
 
@@ -605,6 +613,86 @@ mod tests {
             "shared budget violated: {} threads touched with batch_size=1",
             report.threads_scanned
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_blocked_pass1_thread_leaves_pass2_budget_intact() -> Result<()> {
+        use crate::journal::checkpoint::NewCheckpointParams;
+        use crate::journal::checkpoint_store::CheckpointStore;
+        use crate::journal::outbox::{NewOutboxRow, OutboxStore};
+        use crate::journal::outbox_message::OutboxMessageKind;
+        use crate::journal::task::AgentTaskId;
+        use agent_sdk_core::{TokenUsage, llm};
+
+        // Regression: a Pass 1 thread whose floor cannot advance (the
+        // outbox pins `safe_floor <= current_floor`) must NOT burn
+        // `batch_size` budget or mark itself as swept — otherwise a
+        // Pass 2 thread with excess checkpoints gets silently skipped.
+        let events = InMemoryEventRepository::new();
+        let retention = InMemoryRetentionStore::new();
+        let outbox = InMemoryOutboxStore::new();
+        let checkpoint_store = InMemoryCheckpointStore::new();
+
+        // thread_a: expired events + pending outbox row at seq 0
+        // (pins safe_floor to 0, which is <= current_floor 0).
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m0", "old"), t0())
+            .await?;
+        outbox
+            .insert_batch(vec![NewOutboxRow {
+                kind: OutboxMessageKind::ThreadEventsAvailable,
+                thread_id: thread_a(),
+                event_id: Some(uuid::Uuid::now_v7()),
+                sequence: Some(0),
+                payload_json: serde_json::json!({}),
+                max_attempts: 3,
+                now: t0(),
+            }])
+            .await?;
+
+        // thread_b: excess checkpoints (Pass 2 eligible only).
+        for i in 1..=3u32 {
+            checkpoint_store
+                .commit_checkpoint(NewCheckpointParams {
+                    thread_id: thread_b(),
+                    turn_number: i,
+                    task_id: AgentTaskId::from_string(format!("task-b-{i}")),
+                    messages: vec![llm::Message::user(format!("turn {i}"))],
+                    agent_state_snapshot: serde_json::json!({}),
+                    turn_usage: TokenUsage::default(),
+                    now: t0(),
+                })
+                .await?;
+        }
+
+        let policy = RetentionPolicy {
+            event_ttl: Some(std::time::Duration::from_hours(1)),
+            checkpoint_max_per_thread: Some(1),
+            batch_size: 2,
+        };
+
+        let report = run_janitor_cycle(
+            &policy,
+            &deps(&events, &retention, &outbox, &checkpoint_store),
+            t_plus(7200),
+        )
+        .await?;
+
+        assert_eq!(
+            report.floors_advanced, 0,
+            "thread_a's floor must stay pinned by the outbox row",
+        );
+        assert_eq!(
+            report.checkpoints_pruned, 2,
+            "Pass 2 must still prune thread_b's excess checkpoints",
+        );
+        assert_eq!(
+            report.threads_scanned, 1,
+            "only thread_b counts as scanned (thread_a did no useful work)",
+        );
+        let remaining = checkpoint_store.list_by_thread(&thread_b()).await?;
+        assert_eq!(remaining.len(), 1);
         Ok(())
     }
 

@@ -30,6 +30,7 @@
 //! |------|-------|----------|---------|
 //! | Lease sweep | 1 | [`WorkerConfig::sweep_interval`] | Release expired leases via recovery matrix |
 //! | Worker | `pool_size` | [`WorkerConfig::acquisition_interval`] | Poll for runnable tasks, acquire and hold lease |
+//! | Retention janitor | 0 or 1 | [`RetentionConfig::janitor_interval`] | Advance retention floors and prune excess checkpoints (spawned only when [`RetentionConfig::janitor_enabled`] is `true`) |
 //!
 //! All background tasks respect the host's [`CancellationToken`] and
 //! drain cleanly on shutdown.
@@ -42,6 +43,8 @@
 //!
 //! [`WorkerConfig::sweep_interval`]: super::config::WorkerConfig::sweep_interval
 //! [`WorkerConfig::acquisition_interval`]: super::config::WorkerConfig::acquisition_interval
+//! [`RetentionConfig::janitor_interval`]: super::config::RetentionConfig::janitor_interval
+//! [`RetentionConfig::janitor_enabled`]: super::config::RetentionConfig::janitor_enabled
 //! [`StoreRegistry`]: super::stores::StoreRegistry
 //! [`HealthSurface`]: super::health::HealthSurface
 
