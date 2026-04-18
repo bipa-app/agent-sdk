@@ -221,7 +221,7 @@ pub async fn stream_events(
     // events up to the watermark via `get_events` + filter, because
     // `get_events_in_range` uses a strictly-greater-than lower bound
     // and would skip sequence 0.
-    let replay_buffer = if watermark == 0 {
+    let mut replay_buffer: Vec<CommittedEvent> = if watermark == 0 {
         Vec::new()
     } else {
         let high_water = watermark - 1;
@@ -243,6 +243,29 @@ pub async fn stream_events(
             Some(_) => Vec::new(),
         }
     };
+
+    // Step 3.5: close the floor-advance race.
+    //
+    // Between steps 1.5 and 3, the janitor may have advanced the
+    // retention floor and atomically purged events we expected to
+    // see.  Re-read the floor and, if it has moved forward, emit a
+    // RetentionGap covering the newly-purged range and drop any
+    // events below the new floor from the replay buffer.  This
+    // preserves the "no gaps" guarantee documented above.
+    let floor_after_fetch = retention_store
+        .effective_floor(thread_id)
+        .await
+        .context("stream_events: re-read retention floor")?;
+
+    if floor_after_fetch > floor {
+        let requested = match (retention_gap, after_sequence) {
+            (Some((requested_after, _)), _) => requested_after,
+            (None, Some(after)) => after,
+            (None, None) => 0,
+        };
+        retention_gap = Some((requested, floor_after_fetch));
+        replay_buffer.retain(|e| e.sequence >= floor_after_fetch);
+    }
 
     // `last_yielded` seeds the dedup guard so live-tail events that
     // overlap with the replay window are skipped.
@@ -768,6 +791,100 @@ mod tests {
         match stream.next().await {
             Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 4),
             other => panic!("expected Event(seq=4), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floor_advance_between_floor_read_and_event_fetch_emits_gap() -> Result<()> {
+        use super::super::retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Retention store wrapper that simulates the janitor race: on
+        // the SECOND `effective_floor` call (the post-fetch re-read in
+        // step 3.5), the floor has already advanced to `racing_floor`.
+        // This exercises the race-recovery code path deterministically.
+        struct RacingRetention {
+            inner: Arc<InMemoryRetentionStore>,
+            reads: AtomicU32,
+            racing_floor: u64,
+        }
+
+        #[async_trait]
+        impl RetentionStore for RacingRetention {
+            async fn get_cursor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<Option<RetentionCursor>> {
+                self.inner.get_cursor(thread_id).await
+            }
+
+            async fn advance_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+                new_floor: u64,
+                now: OffsetDateTime,
+            ) -> anyhow::Result<RetentionCursor> {
+                self.inner.advance_floor(thread_id, new_floor, now).await
+            }
+
+            async fn effective_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<u64> {
+                let call = self.reads.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    self.inner
+                        .advance_floor(thread_id, self.racing_floor, t0())
+                        .await?;
+                }
+                self.inner.effective_floor(thread_id).await
+            }
+        }
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let racing = RacingRetention {
+            inner: Arc::new(InMemoryRetentionStore::new()),
+            reads: AtomicU32::new(0),
+            racing_floor: 3,
+        };
+
+        for i in 0..5i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Initial floor=0, janitor races and advances to 3 before the
+        // post-fetch re-read. Stream must surface a RetentionGap and
+        // drop events below the new floor from the replay buffer.
+        let mut stream = stream_events(&thread_a(), None, &repo, &racing, &notifier).await?;
+
+        match stream.next().await {
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => {
+                assert_eq!(requested_after, 0);
+                assert_eq!(retention_floor, 3);
+            }
+            other => panic!("expected RetentionGap, got {other:?}"),
+        }
+
+        // First event yielded must be at or above the new floor.
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert!(
+                e.sequence >= 3,
+                "event below new floor slipped through: seq={}",
+                e.sequence
+            ),
+            other => panic!("expected Event(seq>=3), got {other:?}"),
         }
         Ok(())
     }

@@ -33,7 +33,10 @@ pub struct RetentionPolicy {
     pub event_ttl: Option<std::time::Duration>,
     /// Maximum checkpoints per thread.  `None` = no limit.
     pub checkpoint_max_per_thread: Option<u32>,
-    /// Maximum threads processed per janitor cycle.
+    /// Maximum threads processed per janitor cycle.  The event-TTL
+    /// and checkpoint-limit passes draw from this same shared budget,
+    /// so the combined number of threads touched per cycle never
+    /// exceeds this value.
     pub batch_size: u32,
 }
 
@@ -82,6 +85,11 @@ pub async fn run_janitor_cycle(
 ) -> Result<JanitorCycleReport> {
     let mut report = JanitorCycleReport::default();
 
+    // Shared per-cycle thread budget: both passes draw from the same
+    // pool so the combined thread count never exceeds `batch_size`,
+    // matching the documented per-cycle contract.
+    let mut remaining_budget = policy.batch_size;
+
     // ── Pass 1: event-TTL sweep ─────────────────────────────────
     //
     // Threads with events older than the TTL get their retention
@@ -96,13 +104,14 @@ pub async fn run_janitor_cycle(
 
         let threads = deps
             .event_repo
-            .threads_with_events_before(cutoff, policy.batch_size)
+            .threads_with_events_before(cutoff, remaining_budget)
             .await
             .context("list threads needing retention")?;
 
         for thread_id in &threads {
             report.threads_scanned += 1;
             event_swept_threads.insert(thread_id.clone());
+            remaining_budget = remaining_budget.saturating_sub(1);
 
             // ── Compute safe floor ──────────────────────────────
             let outbox_bound = deps
@@ -164,11 +173,15 @@ pub async fn run_janitor_cycle(
     // Threads that were NOT already processed in pass 1 but have
     // more checkpoints than the configured limit.  This ensures
     // checkpoint_max_per_thread works independently of event_ttl.
-    if let Some(limit) = policy.checkpoint_max_per_thread {
+    // Uses the remaining portion of the shared `batch_size` budget
+    // so the total thread count across both passes never exceeds it.
+    if remaining_budget > 0
+        && let Some(limit) = policy.checkpoint_max_per_thread
+    {
         let keep = limit.max(1);
         let threads = deps
             .checkpoint_store
-            .threads_exceeding_checkpoint_count(keep, policy.batch_size)
+            .threads_exceeding_checkpoint_count(keep, remaining_budget)
             .await
             .context("list threads with excess checkpoints")?;
 
@@ -176,7 +189,11 @@ pub async fn run_janitor_cycle(
             if event_swept_threads.contains(thread_id) {
                 continue;
             }
+            if remaining_budget == 0 {
+                break;
+            }
             report.threads_scanned += 1;
+            remaining_budget = remaining_budget.saturating_sub(1);
             let pruned = deps
                 .checkpoint_store
                 .delete_checkpoints_beyond_limit(thread_id, keep)
@@ -529,6 +546,65 @@ mod tests {
 
         assert_eq!(retention.effective_floor(&thread_a()).await?, 1);
         assert_eq!(retention.effective_floor(&thread_b()).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_size_is_shared_budget_across_passes() -> Result<()> {
+        use crate::journal::checkpoint::NewCheckpointParams;
+        use crate::journal::checkpoint_store::CheckpointStore;
+        use crate::journal::task::AgentTaskId;
+        use agent_sdk_core::{TokenUsage, llm};
+
+        // Two disjoint populations:
+        //   - thread_a: has expired events (Pass 1 eligible).
+        //   - thread_b: has excess checkpoints only (Pass 2 eligible).
+        //
+        // With batch_size = 1, the documented contract says at most
+        // ONE thread may be touched per cycle. Previously batch_size
+        // was applied independently to each pass, so up to 2 threads
+        // could be touched.  This test guards against that regression.
+        let events = InMemoryEventRepository::new();
+        let retention = InMemoryRetentionStore::new();
+        let outbox = InMemoryOutboxStore::new();
+        let checkpoint_store = InMemoryCheckpointStore::new();
+
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m0", "old"), t0())
+            .await?;
+
+        for i in 1..=3u32 {
+            checkpoint_store
+                .commit_checkpoint(NewCheckpointParams {
+                    thread_id: thread_b(),
+                    turn_number: i,
+                    task_id: AgentTaskId::from_string(format!("task-b-{i}")),
+                    messages: vec![llm::Message::user(format!("turn {i}"))],
+                    agent_state_snapshot: serde_json::json!({}),
+                    turn_usage: TokenUsage::default(),
+                    now: t0(),
+                })
+                .await?;
+        }
+
+        let policy = RetentionPolicy {
+            event_ttl: Some(std::time::Duration::from_secs(3600)),
+            checkpoint_max_per_thread: Some(1),
+            batch_size: 1,
+        };
+
+        let report = run_janitor_cycle(
+            &policy,
+            &deps(&events, &retention, &outbox, &checkpoint_store),
+            t_plus(7200),
+        )
+        .await?;
+
+        assert_eq!(
+            report.threads_scanned, 1,
+            "shared budget violated: {} threads touched with batch_size=1",
+            report.threads_scanned
+        );
         Ok(())
     }
 

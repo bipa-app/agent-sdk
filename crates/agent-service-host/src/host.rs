@@ -200,6 +200,12 @@ impl ServiceHost {
                 config.retention.janitor_batch_size > 0,
                 "retention.janitor_batch_size must be > 0"
             );
+            if let Some(ttl) = config.retention.event_ttl_secs {
+                anyhow::ensure!(
+                    ttl > 0,
+                    "retention.event_ttl_secs must be > 0; omit (null) to keep events forever"
+                );
+            }
         }
         Ok(())
     }
