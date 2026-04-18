@@ -82,6 +82,7 @@ use crate::journal::event_stream::{StreamEvent, stream_events};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::recovery::{RecoveryAction, RecoveryRecord};
+use crate::journal::retention::InMemoryRetentionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore, SubagentInvocationSpawn};
 use crate::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, SuspensionPayload, TaskKind, TaskStatus,
@@ -737,13 +738,23 @@ async fn drain_thread_stream(
     notifier: &EventNotifier,
     expected_count: usize,
 ) -> Result<Vec<AgentEvent>> {
-    let mut stream = stream_events(thread_id, None, repo, notifier).await?;
+    let mut stream = stream_events(
+        thread_id,
+        None,
+        repo,
+        &InMemoryRetentionStore::new(),
+        notifier,
+    )
+    .await?;
     let mut collected = Vec::with_capacity(expected_count);
     for _ in 0..expected_count {
         match stream.next().await {
             Some(StreamEvent::Event(committed)) => collected.push(committed.event.clone()),
             Some(StreamEvent::Lagged { skipped }) => {
                 anyhow::bail!("unexpected Lagged during replay drain, skipped={skipped}")
+            }
+            Some(StreamEvent::RetentionGap { .. }) => {
+                panic!("unexpected retention gap")
             }
             None => {
                 anyhow::bail!(

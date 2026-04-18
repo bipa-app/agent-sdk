@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MAX(sequence) AS \"max_seq: i64\" FROM agent_sdk_committed_events WHERE thread_id = ?1 AND committed_at < ?2",
+  "describe": {
+    "columns": [
+      {
+        "name": "max_seq: i64",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c9b5d1c4faa92fe581d0ec9f1b6a3f26660d530fbd2fe3c07b51a9293a28bbfc"
+}

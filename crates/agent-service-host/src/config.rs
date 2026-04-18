@@ -24,7 +24,15 @@
 //! retention:
 //!   event_ttl_secs: null
 //!   checkpoint_max_per_thread: null
+//!   janitor_enabled: false
+//!   janitor_interval_secs: 60
+//!   janitor_batch_size: 100
 //! ```
+//!
+//! The built-in retention janitor is opt-in: setting `event_ttl_secs`
+//! or `checkpoint_max_per_thread` alone is not enough — the janitor
+//! only sweeps when `janitor_enabled: true`.  When enabled, the host
+//! spawns an extra background task (see the `host` module docs).
 //!
 //! PostgreSQL-backed durable-core config:
 //!
@@ -482,7 +490,7 @@ pub enum BrokerConfig {
 ///
 /// `None` values mean "keep forever" — the sweep tasks skip the
 /// corresponding cleanup.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetentionConfig {
     /// Time-to-live for committed events, in seconds.  `None` = keep
@@ -490,6 +498,32 @@ pub struct RetentionConfig {
     pub event_ttl_secs: Option<u64>,
     /// Maximum checkpoints per thread.  `None` = no limit.
     pub checkpoint_max_per_thread: Option<u32>,
+    /// Whether the retention janitor background loop runs.
+    pub janitor_enabled: bool,
+    /// Seconds between janitor sweep cycles.
+    pub janitor_interval_secs: u64,
+    /// Maximum threads processed per janitor cycle.
+    pub janitor_batch_size: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            event_ttl_secs: None,
+            checkpoint_max_per_thread: None,
+            janitor_enabled: false,
+            janitor_interval_secs: 60,
+            janitor_batch_size: 100,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Janitor sweep interval as a [`std::time::Duration`] (for tokio timers).
+    #[must_use]
+    pub const fn janitor_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.janitor_interval_secs)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

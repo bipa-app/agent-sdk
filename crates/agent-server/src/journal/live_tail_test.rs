@@ -15,6 +15,7 @@ use super::event_notifier::EventNotifier;
 use super::event_repository::{EventRepository, InMemoryEventRepository};
 use super::event_stream::{StreamEvent, stream_events};
 use super::live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub};
+use super::retention::InMemoryRetentionStore;
 use agent_sdk_core::ThreadId;
 use agent_sdk_core::events::AgentEvent;
 use anyhow::{Context, Result};
@@ -170,7 +171,14 @@ async fn reconnect_via_stream_events_recovers_cleanly() -> Result<()> {
     assert_eq!(last_delivered, Some(2));
 
     // Reconnect using stream_events.
-    let mut stream = stream_events(&thread_a(), last_delivered, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        last_delivered,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Should get events 3 and 4 from durable replay.
     match stream.next().await {

@@ -152,9 +152,14 @@ impl std::fmt::Display for OutboxStatus {
 ///
 /// `event_id` and `sequence` are populated for
 /// [`OutboxMessageKind::ThreadEventsAvailable`] rows, which reference
-/// the highest committed event in the triggering batch.  They are
-/// `None` for [`OutboxMessageKind::TaskWakeup`] rows, which reference
-/// only the task / thread carried in `payload_json`.
+/// the LOWEST committed event in the triggering batch.  Using the
+/// first (not last) event makes [`OutboxStore::min_unpublished_sequence`]
+/// a correct retention-floor safety bound for every event in the
+/// batch, including multi-event commits.  The advisory payload
+/// separately carries `last_sequence` so subscribers know how far to
+/// replay.  Both fields are `None` for
+/// [`OutboxMessageKind::TaskWakeup`] rows, which reference only the
+/// task / thread carried in `payload_json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     /// Unique outbox row identity.
@@ -163,12 +168,13 @@ pub struct OutboxRow {
     pub kind: OutboxMessageKind,
     /// Thread the message refers to.
     pub thread_id: ThreadId,
-    /// Highest committed event in the triggering batch (only set for
+    /// Lowest committed event in the triggering batch (only set for
     /// `ThreadEventsAvailable` rows).
     #[serde(default)]
     pub event_id: Option<uuid::Uuid>,
-    /// Highest committed sequence in the triggering batch (only set
-    /// for `ThreadEventsAvailable` rows).
+    /// Lowest committed sequence in the triggering batch (only set
+    /// for `ThreadEventsAvailable` rows).  Acts as the retention
+    /// safety bound over the entire batch range.
     #[serde(default)]
     pub sequence: Option<u64>,
     /// Relay lifecycle status.
@@ -206,10 +212,10 @@ pub struct OutboxRow {
 /// Parameters for inserting a new outbox row.
 ///
 /// For `ThreadEventsAvailable` rows, `event_id` and `sequence` MUST be
-/// `Some` and refer to the highest committed event in the triggering
-/// batch.  For `TaskWakeup` rows, both MUST be `None` — the
-/// transactional rule is enforced at the database layer via a CHECK
-/// constraint.
+/// `Some` and refer to the LOWEST committed event in the triggering
+/// batch (the safety bound for the retention janitor).  For
+/// `TaskWakeup` rows, both MUST be `None` — the transactional rule is
+/// enforced at the database layer via a CHECK constraint.
 pub struct NewOutboxRow {
     pub kind: OutboxMessageKind,
     pub thread_id: ThreadId,
@@ -313,6 +319,16 @@ pub trait OutboxStore: Send + Sync {
 
     /// Count pending (undelivered, non-expired) rows for a thread.
     async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64>;
+
+    /// Return the lowest `sequence` among non-terminal
+    /// (`Pending` / `Claimed`) outbox rows for a thread.
+    ///
+    /// Returns `None` when no unpublished rows exist or when all
+    /// non-terminal rows are `TaskWakeup` kind (which carry no
+    /// sequence).  The retention janitor uses this bound to ensure it
+    /// never advances the event retention floor past an unpublished
+    /// outbox row.
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -550,6 +566,22 @@ impl OutboxStore for InMemoryOutboxStore {
             .count();
         drop(inner);
         Ok(count as u64)
+    }
+
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+        let inner = self.inner.read().await;
+        let min_seq = inner
+            .rows
+            .values()
+            .filter(|r| {
+                r.thread_id == *thread_id
+                    && matches!(r.status, OutboxStatus::Pending | OutboxStatus::Claimed)
+                    && r.sequence.is_some()
+            })
+            .filter_map(|r| r.sequence)
+            .min();
+        drop(inner);
+        Ok(min_seq)
     }
 }
 

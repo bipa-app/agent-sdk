@@ -2957,6 +2957,55 @@ ORDER BY turn_number
         .with_context(|| format!("list checkpoints for {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
+
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let threshold_i64 = i64::from(threshold);
+        let limit_i64 = i64::from(limit);
+        let rows = sqlx::query!(
+            r"SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > $1 ORDER BY thread_id LIMIT $2",
+            threshold_i64,
+            limit_i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads_exceeding_checkpoint_count")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ThreadId::from_string(r.thread_id))
+            .collect())
+    }
+
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64> {
+        ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
+
+        let result = sqlx::query!(
+            r"
+DELETE FROM agent_sdk_turn_checkpoints
+WHERE thread_id = $1
+  AND id NOT IN (
+      SELECT id FROM agent_sdk_turn_checkpoints
+      WHERE thread_id = $1
+      ORDER BY turn_number DESC
+      LIMIT $2
+  )
+",
+            thread_key(thread_id),
+            i64::from(keep_latest_n),
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("delete checkpoints beyond limit for {thread_id}"))?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[async_trait]
@@ -3013,8 +3062,27 @@ impl EventRepository for PostgresDurableStore {
         .await
         .with_context(|| format!("next event sequence for {thread_id}"))?;
 
-        let next = record.next_seq.unwrap_or(0);
-        u64::try_from(next).context("event next_sequence out of range")
+        let from_events = u64::try_from(record.next_seq.unwrap_or(0))
+            .context("event next_sequence out of range")?;
+
+        // Clamp to the retention floor: when the janitor has purged
+        // all events, MAX() is NULL and `from_events` would fall back
+        // to 0, letting new events reuse sequences already "claimed"
+        // by purged history and silently missing every subscriber.
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("read retention floor for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
@@ -3063,6 +3131,79 @@ ORDER BY sequence
 
         records.into_iter().map(TryInto::try_into).collect()
     }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let records = sqlx::query!(
+            r"
+SELECT DISTINCT thread_id
+FROM agent_sdk_committed_events
+WHERE committed_at < $1
+ORDER BY thread_id
+LIMIT $2
+",
+            cutoff,
+            i64::from(limit),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("threads with events before cutoff")?;
+
+        Ok(records.into_iter().map(|r| ThreadId(r.thread_id)).collect())
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MAX(sequence) AS max_seq
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+  AND committed_at < $2
+",
+            thread_key(thread_id),
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("max sequence before cutoff for {thread_id}"))?;
+
+        record
+            .max_seq
+            .map(|v| u64_from_i64(v, "max_sequence_before"))
+            .transpose()
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MIN(sequence) AS min_seq
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+  AND committed_at >= $2
+",
+            thread_key(thread_id),
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min sequence at or after cutoff for {thread_id}"))?;
+
+        record
+            .min_seq
+            .map(|v| u64_from_i64(v, "min_sequence_at_or_after"))
+            .transpose()
+    }
 }
 
 impl PostgresDurableStore {
@@ -3095,8 +3236,26 @@ impl PostgresDurableStore {
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
 
-        let next = record.next_seq.unwrap_or(0);
-        u64::try_from(next).context("event next_sequence (tx) out of range")
+        let from_events = u64::try_from(record.next_seq.unwrap_or(0))
+            .context("event next_sequence (tx) out of range")?;
+
+        // Derived from the retention floor so sequences never regress
+        // after the janitor purges events. See `next_sequence` for
+        // the full rationale.
+        let floor_record = sqlx::query!(
+            r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = $1",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("read retention floor (tx) for {thread_id}"))?;
+        let floor = floor_record
+            .map(|r| u64::try_from(r.retention_floor))
+            .transpose()
+            .context("retention_floor (tx) out of range")?
+            .unwrap_or(0);
+
+        Ok(from_events.max(floor))
     }
 
     /// Insert committed events into an existing transaction.
@@ -3143,16 +3302,24 @@ VALUES ($1, $2, $3, $4, $5)
     /// committed event batch.
     ///
     /// Phase 8.1 contract: exactly one
-    /// `OutboxMessageKind::ThreadEventsAvailable` row per batch.  The
-    /// row references the highest committed event in the batch so the
-    /// FK to `agent_sdk_committed_events` stays sound, and carries an
-    /// advisory payload of `{thread_id, last_sequence}`.
+    /// `OutboxMessageKind::ThreadEventsAvailable` row per batch.
+    ///
+    /// The row's `sequence` / `event_id` columns reference the FIRST
+    /// event of the batch so `min_unpublished_sequence` acts as a
+    /// retention-floor safety bound over the entire batch range
+    /// (otherwise the janitor could delete earlier events of a
+    /// multi-event batch).  The FK to `agent_sdk_committed_events`
+    /// stays sound either way.  The advisory payload still carries
+    /// `last_sequence` so subscribers know how far to replay.
     async fn insert_thread_events_outbox_row_tx(
         tx: &mut Transaction<'_, Postgres>,
         committed: &[CommittedEvent],
         max_attempts: u32,
         now: OffsetDateTime,
     ) -> Result<OutboxRow> {
+        let first = committed
+            .first()
+            .context("event batch must contain at least one event")?;
         let last = committed
             .last()
             .context("event batch must contain at least one event")?;
@@ -3165,7 +3332,7 @@ VALUES ($1, $2, $3, $4, $5)
         let payload_json = payload_message
             .to_payload_json()
             .context("serialise thread_events_available advisory payload")?;
-        let last_sequence_i64 = i64_from_u64(last.sequence, "outbox sequence")?;
+        let first_sequence_i64 = i64_from_u64(first.sequence, "outbox sequence")?;
 
         sqlx::query!(
             r"
@@ -3176,8 +3343,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 ",
             id.as_str(),
             thread_key(&last.thread_id),
-            last.event_id.to_string(),
-            last_sequence_i64,
+            first.event_id.to_string(),
+            first_sequence_i64,
             payload_json,
             now,
             i64::from(max_attempts),
@@ -3186,8 +3353,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
         .await
         .with_context(|| {
             format!(
-                "insert thread_events_available outbox row for batch ending at seq {}",
-                last.sequence,
+                "insert thread_events_available outbox row for batch [{}..={}]",
+                first.sequence, last.sequence,
             )
         })?;
 
@@ -3195,8 +3362,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
             id,
             kind: OutboxMessageKind::ThreadEventsAvailable,
             thread_id: last.thread_id.clone(),
-            event_id: Some(last.event_id),
-            sequence: Some(last.sequence),
+            event_id: Some(first.event_id),
+            sequence: Some(first.sequence),
             status: OutboxStatus::Pending,
             payload_json,
             created_at: now,
@@ -3514,6 +3681,27 @@ ORDER BY sequence NULLS LAST, id
 
         let count = record.cnt.unwrap_or(0);
         u64::try_from(count).context("outbox pending count out of range")
+    }
+
+    async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MIN(sequence) AS min_seq
+FROM agent_sdk_outbox
+WHERE thread_id = $1
+  AND status IN ('pending', 'claimed')
+  AND sequence IS NOT NULL
+",
+            thread_key(thread_id),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min unpublished sequence for {thread_id}"))?;
+
+        record
+            .min_seq
+            .map(|v| u64_from_i64(v, "min_unpublished_sequence"))
+            .transpose()
     }
 }
 
@@ -5312,8 +5500,10 @@ mod tests {
             .context("Phase 8.1 contract: outbox_row must be present")?;
         assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
         assert_eq!(row.thread_id, thread_id);
-        assert_eq!(row.sequence, Some(2));
-        assert_eq!(row.event_id, Some(outcome.committed_events[2].event_id),);
+        // The row columns reference the FIRST event of the batch
+        // (retention safety bound); the payload carries the LAST.
+        assert_eq!(row.sequence, Some(0));
+        assert_eq!(row.event_id, Some(outcome.committed_events[0].event_id),);
 
         // Advisory payload must round-trip back to the typed message.
         let message = OutboxMessage::from_payload_json(row.kind, row.payload_json.clone())?;
@@ -5605,6 +5795,55 @@ mod tests {
         assert_eq!(reclaimed_rows.len(), 1);
         assert_eq!(reclaimed_rows[0].id, id);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_sequence_does_not_regress_after_full_retention_purge() -> Result<()> {
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::retention::RetentionStore;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let Some((store, _guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let thread_id = thread_id("t-pg-seq-no-regress");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+
+        // Commit 3 events — sequences 0, 1, 2.
+        for i in 0..3 {
+            EventRepository::commit_event(
+                &store,
+                &thread_id,
+                AgentEvent::text(format!("m{i}"), "hello"),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Janitor purges every event by advancing the floor past the
+        // last assigned sequence — MAX(sequence) falls back to NULL
+        // on the empty table.
+        RetentionStore::advance_floor(&store, &thread_id, 3, t_plus(3)).await?;
+        assert_eq!(
+            RetentionStore::effective_floor(&store, &thread_id).await?,
+            3,
+        );
+
+        // A new event must land at sequence >= 3, not reuse 0.
+        let fresh = EventRepository::commit_event(
+            &store,
+            &thread_id,
+            AgentEvent::text("m3", "post-purge"),
+            t_plus(4),
+        )
+        .await?;
+        assert!(
+            fresh.sequence >= 3,
+            "sequence regressed after purge: {} (expected >= 3)",
+            fresh.sequence,
+        );
         Ok(())
     }
 

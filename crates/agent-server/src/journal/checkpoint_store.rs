@@ -3,13 +3,17 @@
 //! The [`CheckpointStore`] trait is the sole write surface for
 //! completed-turn checkpoints. Its key design properties:
 //!
-//! 1. **Append-only** — checkpoints are inserted via
-//!    [`CheckpointStore::commit_checkpoint`] and are never modified or
-//!    deleted.
+//! 1. **Write-append by default** — checkpoints are inserted via
+//!    [`CheckpointStore::commit_checkpoint`]. Individual rows are
+//!    immutable once written (no `update()`), but the retention
+//!    janitor may prune excess older rows via
+//!    [`CheckpointStore::delete_checkpoints_beyond_limit`] while
+//!    always preserving the latest checkpoint for thread recovery.
 //! 2. **Thread-scoped uniqueness** — at most one checkpoint exists
 //!    per `(thread_id, turn_number)`. Duplicate inserts are rejected.
-//! 3. **Immutable after creation** — there is no `update()` or
-//!    `delete()` because checkpoints are durable snapshots.
+//! 3. **Immutable after creation** — existing rows are never updated;
+//!    deletion is only allowed through the bounded
+//!    `delete_checkpoints_beyond_limit` pruning path.
 //!
 //! [`InMemoryCheckpointStore`] is the reference implementation,
 //! following the same `Arc<RwLock<Inner>>` pattern as
@@ -24,6 +28,8 @@
 //! | [`CheckpointStore::get_by_turn`] | Reads a row by `(thread_id, turn_number)` | — |
 //! | [`CheckpointStore::get_latest_by_thread`] | Returns the highest-turn checkpoint for a thread | — |
 //! | [`CheckpointStore::list_by_thread`] | Lists all checkpoints for a thread | Ordered by `turn_number` |
+//! | [`CheckpointStore::threads_exceeding_checkpoint_count`] | Lists threads with more than N checkpoints | Janitor-only |
+//! | [`CheckpointStore::delete_checkpoints_beyond_limit`] | Prunes all but the newest N checkpoints for a thread | `keep_latest_n >= 1` |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,9 +44,10 @@ use super::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
 /// Storage trait for [`Checkpoint`] rows.
 ///
 /// The trait surface is deliberately narrow: `commit_checkpoint` is
-/// the only write path. There is no `update()` or `delete()` because
-/// checkpoints are immutable snapshots of committed conversation
-/// state.
+/// the only unconditional write path, and individual rows are
+/// immutable (no `update()`). The retention janitor may prune older
+/// rows via `delete_checkpoints_beyond_limit`, but must always
+/// preserve the latest checkpoint for thread recovery.
 ///
 /// Implementations must guarantee that the `(thread_id, turn_number)`
 /// uniqueness constraint is enforced, and that `list_by_thread`
@@ -104,6 +111,32 @@ pub trait CheckpointStore: Send + Sync {
     /// # Errors
     /// Returns an error if the underlying store cannot be queried.
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<Checkpoint>>;
+
+    /// Return distinct thread IDs that have more than `threshold`
+    /// checkpoints, limited to `limit` results.
+    ///
+    /// Used by the retention janitor to discover threads eligible for
+    /// checkpoint pruning without requiring an event-TTL scan.
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>>;
+
+    /// Delete all but the newest `keep_latest_n` checkpoints for a
+    /// thread, returning the count of deleted rows.
+    ///
+    /// `keep_latest_n` must be at least 1 — the latest checkpoint is
+    /// always preserved for thread recovery.
+    ///
+    /// # Errors
+    /// - Returns an error if `keep_latest_n < 1`.
+    /// - Store-level write errors.
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -217,6 +250,71 @@ impl CheckpointStore for InMemoryCheckpointStore {
         drop(inner);
         checkpoints.sort_by_key(|c| c.turn_number);
         Ok(checkpoints)
+    }
+
+    async fn threads_exceeding_checkpoint_count(
+        &self,
+        threshold: u32,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let inner = self.inner.read().await;
+        let mut threads: Vec<ThreadId> = inner
+            .thread_index
+            .iter()
+            .filter(|(_, ids)| ids.len() > threshold as usize)
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        // `ORDER BY thread_id LIMIT n` mirrors the durable backends so
+        // the janitor's per-cycle subset is deterministic across
+        // in-memory and SQL implementations.
+        threads.sort_by(|a, b| a.0.cmp(&b.0));
+        threads.truncate(limit as usize);
+        drop(inner);
+        Ok(threads)
+    }
+
+    async fn delete_checkpoints_beyond_limit(
+        &self,
+        thread_id: &ThreadId,
+        keep_latest_n: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
+
+        let mut inner = self.inner.write().await;
+        let Some(ids) = inner.thread_index.get(thread_id) else {
+            return Ok(0);
+        };
+
+        let mut by_turn: Vec<(u32, CheckpointId)> = ids
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .checkpoints
+                    .get(id)
+                    .map(|c| (c.turn_number, id.clone()))
+            })
+            .collect();
+        by_turn.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+        let to_delete: Vec<CheckpointId> = by_turn
+            .into_iter()
+            .skip(keep_latest_n as usize)
+            .map(|(_, id)| id)
+            .collect();
+
+        let deleted = to_delete.len() as u64;
+        for id in &to_delete {
+            if let Some(ckpt) = inner.checkpoints.remove(id) {
+                inner
+                    .turn_uniqueness
+                    .remove(&(thread_id.clone(), ckpt.turn_number));
+            }
+        }
+        if let Some(index) = inner.thread_index.get_mut(thread_id) {
+            index.retain(|id| !to_delete.contains(id));
+        }
+        drop(inner);
+        Ok(deleted)
     }
 }
 

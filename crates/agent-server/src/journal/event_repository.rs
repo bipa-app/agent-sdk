@@ -116,6 +116,43 @@ pub trait EventRepository: Send + Sync {
         after_sequence: u64,
         up_to_sequence: u64,
     ) -> Result<Vec<CommittedEvent>>;
+
+    /// Return distinct thread IDs that have at least one committed event
+    /// with `committed_at < cutoff`, limited to `limit` results.
+    ///
+    /// Used by the retention janitor to identify threads with events
+    /// eligible for TTL-based purge.
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>>;
+
+    /// Return the highest sequence number among events with
+    /// `committed_at < cutoff` for a given thread.
+    ///
+    /// Returns `None` if no events match.  The retention janitor uses
+    /// this as the time-based candidate retention floor.
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>>;
+
+    /// Return the lowest sequence number among events with
+    /// `committed_at >= cutoff` for a given thread.
+    ///
+    /// Returns `None` if no surviving events have a timestamp at or
+    /// after the cutoff.  The retention janitor uses this as an upper
+    /// cap on the candidate floor so that non-contiguous expiration —
+    /// e.g. clock skew or concurrent writers producing a later event
+    /// with an earlier `committed_at` — cannot drag the floor past a
+    /// live event.
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -248,6 +285,60 @@ impl EventRepository for InMemoryEventRepository {
             .unwrap_or_default();
         drop(inner);
         Ok(result)
+    }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let inner = self.inner.read().await;
+        let mut ids: Vec<String> = inner
+            .events
+            .iter()
+            .filter(|(_, evts)| evts.iter().any(|e| e.timestamp < cutoff))
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        // `ORDER BY thread_id LIMIT n` mirrors the durable backends so
+        // the janitor's per-cycle subset is deterministic across
+        // in-memory and SQL implementations.
+        ids.sort();
+        ids.truncate(limit as usize);
+        let threads: Vec<ThreadId> = ids.into_iter().map(ThreadId::from_string).collect();
+        drop(inner);
+        Ok(threads)
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let inner = self.inner.read().await;
+        let max_seq = inner.events.get(&thread_id.0).and_then(|evts| {
+            evts.iter()
+                .filter(|e| e.timestamp < cutoff)
+                .map(|e| e.sequence)
+                .max()
+        });
+        drop(inner);
+        Ok(max_seq)
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let inner = self.inner.read().await;
+        let min_seq = inner.events.get(&thread_id.0).and_then(|evts| {
+            evts.iter()
+                .filter(|e| e.timestamp >= cutoff)
+                .map(|e| e.sequence)
+                .min()
+        });
+        drop(inner);
+        Ok(min_seq)
     }
 }
 

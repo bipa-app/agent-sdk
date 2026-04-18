@@ -72,6 +72,30 @@ impl EventRepository for FailingEventRepository {
     ) -> Result<Vec<crate::journal::CommittedEvent>> {
         Ok(Vec::new())
     }
+
+    async fn threads_with_events_before(
+        &self,
+        _cutoff: OffsetDateTime,
+        _limit: u32,
+    ) -> Result<Vec<agent_sdk_core::ThreadId>> {
+        Ok(Vec::new())
+    }
+
+    async fn max_sequence_before(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 fn sample_policy() -> InheritedSubagentPolicy {

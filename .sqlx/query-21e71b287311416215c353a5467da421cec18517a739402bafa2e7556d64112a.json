@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT MIN(sequence) AS min_seq\nFROM agent_sdk_outbox\nWHERE thread_id = $1\n  AND status IN ('pending', 'claimed')\n  AND sequence IS NOT NULL\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "21e71b287311416215c353a5467da421cec18517a739402bafa2e7556d64112a"
+}

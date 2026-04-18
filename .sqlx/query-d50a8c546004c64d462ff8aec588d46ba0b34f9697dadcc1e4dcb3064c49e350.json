@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MIN(sequence) AS \"min_seq: i64\" FROM agent_sdk_committed_events WHERE thread_id = ?1 AND committed_at >= ?2",
+  "describe": {
+    "columns": [
+      {
+        "name": "min_seq: i64",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "d50a8c546004c64d462ff8aec588d46ba0b34f9697dadcc1e4dcb3064c49e350"
+}

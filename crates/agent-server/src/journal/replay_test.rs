@@ -14,6 +14,7 @@ use super::committed_event::CommittedEvent;
 use super::event_notifier::EventNotifier;
 use super::event_repository::{EventRepository, InMemoryEventRepository};
 use super::event_stream::{StreamEvent, stream_events};
+use super::retention::InMemoryRetentionStore;
 use agent_sdk_core::ThreadId;
 use agent_sdk_core::events::AgentEvent;
 use anyhow::Result;
@@ -103,7 +104,14 @@ async fn producer_during_replay_drain_yields_contiguous_sequence() -> Result<()>
     }
 
     // Open stream from the beginning.
-    let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Drain the first 5 from replay.
     let first_5 = drain_sequences(&mut stream, 5).await;
@@ -145,7 +153,14 @@ async fn batch_commit_straddles_watermark() -> Result<()> {
     }
 
     // Open stream (watermark captures seq 2 as high-water).
-    let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Now batch-commit 4 more events (sequences 3..6).
     commit_batch_and_notify(&repo, &notifier, &thread_a(), 4, 3).await?;
@@ -179,9 +194,23 @@ async fn multiple_reconnects_different_offsets() -> Result<()> {
     }
 
     // Client A reconnects after seq 2.
-    let mut stream_a = stream_events(&thread_a(), Some(2), &repo, &notifier).await?;
+    let mut stream_a = stream_events(
+        &thread_a(),
+        Some(2),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     // Client B reconnects after seq 5.
-    let mut stream_b = stream_events(&thread_a(), Some(5), &repo, &notifier).await?;
+    let mut stream_b = stream_events(
+        &thread_a(),
+        Some(5),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     let a_seqs = drain_sequences(&mut stream_a, 5).await;
     let b_seqs = drain_sequences(&mut stream_b, 2).await;
@@ -209,7 +238,14 @@ async fn unnotified_events_invisible_in_live_tail() -> Result<()> {
     commit_and_notify(&repo, &notifier, &thread_a(), "m1", 1).await?;
 
     // Open stream after seq 1 (fully caught up).
-    let mut stream = stream_events(&thread_a(), Some(1), &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        Some(1),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Commit event 2 WITHOUT notifying (simulates a bug or a
     // separate code path that forgot to notify).
@@ -228,7 +264,14 @@ async fn unnotified_events_invisible_in_live_tail() -> Result<()> {
     }
 
     // Reconnect to verify seq 2 is available through durable replay.
-    let mut reconnected = stream_events(&thread_a(), Some(1), &repo, &notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_a(),
+        Some(1),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let seqs = drain_sequences(&mut reconnected, 2).await;
     assert_eq!(seqs, vec![2, 3]);
 
@@ -245,7 +288,14 @@ async fn empty_thread_replay_goes_to_live() -> Result<()> {
     let repo = InMemoryEventRepository::new();
     let notifier = EventNotifier::new();
 
-    let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Commit the first event.
     commit_and_notify(&repo, &notifier, &thread_a(), "m0", 0).await?;
@@ -284,7 +334,14 @@ async fn mixed_single_and_batch_commits_contiguous() -> Result<()> {
     commit_batch_and_notify(&repo, &notifier, &thread_a(), 2, 5).await?;
 
     // Replay from start.
-    let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let seqs = drain_sequences(&mut stream, 7).await;
     assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6]);
 
@@ -310,7 +367,14 @@ async fn handoff_overlap_with_many_concurrent_writes() -> Result<()> {
     }
 
     // Open stream from after seq 3. Watermark will be at seq 4.
-    let mut stream = stream_events(&thread_a(), Some(3), &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        Some(3),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Concurrently commit 5 more events while replay hasn't drained.
     for i in 5..10i64 {
@@ -351,7 +415,14 @@ async fn after_sequence_beyond_committed_range() -> Result<()> {
     }
 
     // after_sequence = 10 (beyond anything committed).
-    let mut stream = stream_events(&thread_a(), Some(10), &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        Some(10),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Commit a new event.
     commit_and_notify(&repo, &notifier, &thread_a(), "m3", 3).await?;
@@ -393,7 +464,14 @@ async fn lagged_subscriber_can_reconnect() -> Result<()> {
         commit_and_notify(&repo, &notifier, &thread_a(), &format!("m{i}"), i).await?;
     }
 
-    let mut stream = stream_events(&thread_a(), None, &repo, &notifier).await?;
+    let mut stream = stream_events(
+        &thread_a(),
+        None,
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
 
     // Drain replay.
     let replay_seqs = drain_sequences(&mut stream, 2).await;
@@ -414,7 +492,14 @@ async fn lagged_subscriber_can_reconnect() -> Result<()> {
 
     // Reconnect from the last known good sequence (1) and verify
     // we get all events.
-    let mut reconnected = stream_events(&thread_a(), Some(1), &repo, &notifier).await?;
+    let mut reconnected = stream_events(
+        &thread_a(),
+        Some(1),
+        &repo,
+        &InMemoryRetentionStore::new(),
+        &notifier,
+    )
+    .await?;
     let seqs = drain_sequences(&mut reconnected, 18).await;
     assert_eq!(seqs, (2..20).collect::<Vec<u64>>());
 

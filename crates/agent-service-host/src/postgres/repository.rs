@@ -69,8 +69,9 @@ const TURN_CHECKPOINT_READS: &[&str] = &[
     "get_by_turn",
     "get_latest_by_thread",
     "list_by_thread",
+    "threads_exceeding_checkpoint_count",
 ];
-const TURN_CHECKPOINT_WRITES: &[&str] = &["commit_checkpoint"];
+const TURN_CHECKPOINT_WRITES: &[&str] = &["commit_checkpoint", "delete_checkpoints_beyond_limit"];
 
 const REPOSITORIES: &[RepositoryBoundary] = &[
     RepositoryBoundary {
@@ -139,11 +140,12 @@ const REPOSITORIES: &[RepositoryBoundary] = &[
         reads: TURN_CHECKPOINT_READS,
         writes: TURN_CHECKPOINT_WRITES,
         invariants: &[
-            "checkpoints are immutable after insert",
+            "individual checkpoints are immutable after insert — updates are forbidden",
             "exactly one row exists per `(thread_id, turn_number)`",
             "latest recovery reads by descending `turn_number`",
+            "the retention janitor is the only writer that deletes rows, via `delete_checkpoints_beyond_limit`, which preserves the latest `keep_latest_n >= 1` checkpoints per thread",
         ],
-        transaction_notes: "Append-only table. `commit_checkpoint` joins the same transaction as attempt close, thread aggregate update, and message head/batch updates.",
+        transaction_notes: "`commit_checkpoint` joins the same transaction as attempt close, thread aggregate update, and message head/batch updates. `delete_checkpoints_beyond_limit` runs as a single bounded DELETE outside any cross-table transaction; it preserves latest `keep_latest_n` by `turn_number DESC` so recovery is never starved of a restorable checkpoint.",
     },
 ];
 
@@ -175,10 +177,22 @@ pub const fn completed_turn_units_of_work() -> &'static [UnitOfWorkContract] {
 // Event journal, outbox, and retention repository boundaries
 // =====================================================================
 
-const EVENT_READS: &[&str] = &["get_events", "get_events_in_range", "next_sequence"];
+const EVENT_READS: &[&str] = &[
+    "get_events",
+    "get_events_in_range",
+    "next_sequence",
+    "threads_with_events_before",
+    "max_sequence_before",
+    "min_sequence_at_or_after",
+];
 const EVENT_WRITES: &[&str] = &["commit_event", "commit_event_batch"];
 
-const OUTBOX_READS: &[&str] = &["get", "list_by_thread", "count_pending"];
+const OUTBOX_READS: &[&str] = &[
+    "get",
+    "list_by_thread",
+    "count_pending",
+    "min_unpublished_sequence",
+];
 const OUTBOX_WRITES: &[&str] = &[
     "insert_batch",
     "claim_pending",
@@ -200,10 +214,11 @@ const EVENT_JOURNAL_REPOSITORIES: &[RepositoryBoundary] = &[
             "`(thread_id, sequence)` is unique and enforced by the database",
             "sequences are monotonically allocated per thread under write serialisation",
             "batch inserts assign contiguous sequence ranges atomically",
-            "the table is append-only: no UPDATE or DELETE by application code",
+            "committed rows are never UPDATEd by application code",
+            "the retention janitor is the only writer that deletes rows, via the `advance_retention_floor` unit of work, which purges `sequence < new_floor` atomically with the floor advance",
             "all committed event_ids are UUID v7 (time-ordered)",
         ],
-        transaction_notes: "Single-event commits are single-row inserts. Batch commits run in one SQL transaction to guarantee contiguous sequences. When used with the outbox, both committed-events and outbox rows share the same transaction boundary.",
+        transaction_notes: "Single-event commits are single-row inserts. Batch commits run in one SQL transaction to guarantee contiguous sequences. When used with the outbox, both committed-events and outbox rows share the same transaction boundary. Retention DELETEs run inside the `advance_retention_floor` transaction and never overlap with append paths.",
     },
     RepositoryBoundary {
         name: "outbox_repository",
@@ -243,7 +258,7 @@ const EVENT_JOURNAL_UNITS_OF_WORK: &[UnitOfWorkContract] = &[
     UnitOfWorkContract {
         name: "commit_events_with_outbox",
         tables: &["agent_sdk_committed_events", "agent_sdk_outbox"],
-        requirement: "Phase 8.1: insert committed events and exactly one coalesced `thread_events_available` outbox row in one SQL transaction. The single row references the highest committed event in the batch and carries an advisory `{thread_id, last_sequence}` payload. Either all rows commit or none do.",
+        requirement: "Phase 8.1: insert committed events and exactly one coalesced `thread_events_available` outbox row in one SQL transaction. The single row references the LOWEST committed event in the batch (retention safety bound) and carries an advisory `{thread_id, last_sequence}` payload. Either all rows commit or none do.",
     },
     UnitOfWorkContract {
         name: "advance_retention_floor",
