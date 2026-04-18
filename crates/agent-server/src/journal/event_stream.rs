@@ -290,9 +290,8 @@ pub async fn stream_events(
     let mut initial_last_yielded = effective_after.or(after_sequence);
     if floor_after_fetch > 0 {
         let floor_minus_one = floor_after_fetch - 1;
-        initial_last_yielded = Some(
-            initial_last_yielded.map_or(floor_minus_one, |last| last.max(floor_minus_one)),
-        );
+        initial_last_yielded =
+            Some(initial_last_yielded.map_or(floor_minus_one, |last| last.max(floor_minus_one)));
     }
 
     Ok(EventStream {
@@ -1028,7 +1027,11 @@ mod tests {
 
         // An above-floor event the client actually wants.
         let wanted = repo
-            .commit_event(&thread_a(), AgentEvent::text("m3", "above-floor"), t_plus(3))
+            .commit_event(
+                &thread_a(),
+                AgentEvent::text("m3", "above-floor"),
+                t_plus(3),
+            )
             .await?;
         notifier.notify(&[wanted]);
 

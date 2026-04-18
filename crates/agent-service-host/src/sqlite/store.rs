@@ -1097,8 +1097,8 @@ LIMIT 1
         .fetch_one(&mut **tx)
         .await
         .with_context(|| format!("next event sequence (tx) for {thread_id}"))?;
-        let from_events = u64::try_from(record.next_seq)
-            .context("event next_sequence (tx) out of range")?;
+        let from_events =
+            u64::try_from(record.next_seq).context("event next_sequence (tx) out of range")?;
 
         let floor_record = sqlx::query!(
             r"SELECT retention_floor FROM agent_sdk_retention_cursors WHERE thread_id = ?1",
@@ -2610,8 +2610,8 @@ impl EventRepository for SqliteDurableStore {
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("next event sequence for {thread_id}"))?;
-        let from_events = u64::try_from(record.next_seq)
-            .context("event next_sequence out of range")?;
+        let from_events =
+            u64::try_from(record.next_seq).context("event next_sequence out of range")?;
 
         // When the janitor has purged all events, MAX() is NULL and
         // `from_events` falls back to 0. The retention floor records
