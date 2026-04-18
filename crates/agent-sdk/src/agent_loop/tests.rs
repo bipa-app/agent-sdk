@@ -342,6 +342,133 @@ async fn test_tool_execution() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A read-only tool whose `execute` blocks on a shared [`tokio::sync::Barrier`]
+/// until `party_size` concurrent invocations have arrived. Used to prove the
+/// agent loop fans out `ToolTier::Observe` calls in parallel: a serial loop
+/// would deadlock the barrier (only one party ever arrives) and the test's
+/// surrounding `tokio::time::timeout` would fail.
+struct BarrierTool {
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BarrierToolName {
+    Barrier,
+}
+
+impl crate::tools::ToolName for BarrierToolName {}
+
+impl crate::tools::Tool<()> for BarrierTool {
+    type Name = BarrierToolName;
+
+    fn name(&self) -> BarrierToolName {
+        BarrierToolName::Barrier
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Barrier"
+    }
+
+    fn description(&self) -> &'static str {
+        "Waits on a shared barrier; used to prove parallel observe-tier execution."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        _input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        self.barrier.wait().await;
+        Ok(ToolResult::success("through".to_string()))
+    }
+}
+
+/// With serial tool execution (the pre-patch behavior) this test deadlocks on
+/// the first `barrier.wait()` and the outer timeout fires. With parallel
+/// observe-tier batching, all three calls arrive at the barrier concurrently
+/// and complete immediately.
+///
+/// We also assert that results appear in the same order the model emitted
+/// them, because parallel fan-out must not reshuffle the tool-result stream.
+#[tokio::test]
+async fn test_observe_tools_run_in_parallel() -> anyhow::Result<()> {
+    const PARTY: usize = 3;
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("call_a", "barrier", json!({})),
+            ("call_b", "barrier", json!({})),
+            ("call_c", "barrier", json!({})),
+        ]),
+        MockProvider::text_response("done"),
+    ]);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(BarrierTool {
+        barrier: Arc::new(tokio::sync::Barrier::new(PARTY)),
+    });
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (_, events) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_recorded(
+            &agent,
+            thread_id,
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "tool calls ran serially: the barrier deadlocked because only \
+             one of {PARTY} parties ever arrived. parallel observe-tier \
+             execution is not active."
+        )
+    })??;
+
+    // All three tool calls finished successfully. We do NOT assert event
+    // order: with parallel execution, `ToolCallEnd` events arrive in
+    // completion order, which is what a streaming UI wants. The model-facing
+    // `tool_results` vector is separately input-ordered by `join_all`'s
+    // ordering guarantee — see `execute_pending_tool_calls_for_turn`.
+    let mut tool_end_ids: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::ToolCallEnd { id, result, .. } => Some((id.clone(), result.success)),
+            _ => None,
+        })
+        .collect();
+    tool_end_ids.sort();
+
+    assert_eq!(
+        tool_end_ids,
+        vec![
+            ("call_a".to_string(), true),
+            ("call_b".to_string(), true),
+            ("call_c".to_string(), true),
+        ],
+        "expected all three barrier calls to complete successfully, got {tool_end_ids:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_max_turns_limit() -> anyhow::Result<()> {
     // Provider that always requests a tool
