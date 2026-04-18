@@ -243,7 +243,7 @@ const EVENT_JOURNAL_UNITS_OF_WORK: &[UnitOfWorkContract] = &[
     UnitOfWorkContract {
         name: "commit_events_with_outbox",
         tables: &["agent_sdk_committed_events", "agent_sdk_outbox"],
-        requirement: "Phase 8.1: insert committed events and exactly one coalesced `thread_events_available` outbox row in one SQL transaction. The single row references the highest committed event in the batch and carries an advisory `{thread_id, last_sequence}` payload. Either all rows commit or none do.",
+        requirement: "Phase 8.1: insert committed events and exactly one coalesced `thread_events_available` outbox row in one SQL transaction. The single row references the LOWEST committed event in the batch (retention safety bound) and carries an advisory `{thread_id, last_sequence}` payload. Either all rows commit or none do.",
     },
     UnitOfWorkContract {
         name: "advance_retention_floor",

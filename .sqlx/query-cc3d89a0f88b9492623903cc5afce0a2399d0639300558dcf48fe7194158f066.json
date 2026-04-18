@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT MIN(sequence) AS min_seq\nFROM agent_sdk_committed_events\nWHERE thread_id = $1\n  AND committed_at >= $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "cc3d89a0f88b9492623903cc5afce0a2399d0639300558dcf48fe7194158f066"
+}

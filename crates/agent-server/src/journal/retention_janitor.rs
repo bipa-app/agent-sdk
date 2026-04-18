@@ -133,7 +133,20 @@ pub async fn run_janitor_cycle(
                 continue;
             };
 
-            let candidate_floor = max_seq + 1;
+            // Cap the floor to the FIRST live (non-expired) sequence,
+            // if any.  This guarantees `advance_floor`, which deletes
+            // everything below the floor regardless of per-row
+            // `committed_at`, never destroys a live event — even when
+            // `committed_at` is non-monotonic (clock skew, concurrent
+            // writers, NTP step corrections produce a later sequence
+            // with an earlier timestamp).
+            let first_live_seq = deps
+                .event_repo
+                .min_sequence_at_or_after(thread_id, cutoff)
+                .await
+                .context("read min sequence at or after cutoff")?;
+
+            let candidate_floor = first_live_seq.map_or(max_seq + 1, |live| live.min(max_seq + 1));
 
             let safe_floor =
                 outbox_bound.map_or(candidate_floor, |min_unpub| candidate_floor.min(min_unpub));
@@ -612,6 +625,119 @@ mod tests {
             report.threads_scanned, 1,
             "shared budget violated: {} threads touched with batch_size=1",
             report.threads_scanned
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn janitor_protects_entire_multi_event_batch_via_outbox_bound() -> Result<()> {
+        use crate::journal::outbox::{NewOutboxRow, OutboxStore};
+        use crate::journal::outbox_message::OutboxMessageKind;
+
+        // Regression: when a worker commits events [3, 4, 5] in one
+        // batch and the resulting outbox row pins the safety bound,
+        // the janitor must not delete events 3 or 4 while the row is
+        // unpublished.  The outbox row is seeded with sequence=3 —
+        // the FIRST event of the batch — matching the contract
+        // implemented in `insert_thread_events_outbox_row_tx`.
+        let events = InMemoryEventRepository::new();
+        let retention = InMemoryRetentionStore::new();
+        let outbox = InMemoryOutboxStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
+
+        for i in 0..=2u64 {
+            let name = format!("m{i}");
+            events
+                .commit_event(&thread_a(), AgentEvent::text(&name, "prefix"), t0())
+                .await?;
+        }
+        // Batch [3, 4, 5] committed atomically (all same timestamp).
+        for i in 3..=5u64 {
+            let name = format!("m{i}");
+            events
+                .commit_event(&thread_a(), AgentEvent::text(&name, "batch"), t0())
+                .await?;
+        }
+
+        // Advance past the prefix first so the safety bound is what
+        // keeps the pending batch alive.
+        retention.advance_floor(&thread_a(), 3, t_plus(1)).await?;
+
+        outbox
+            .insert_batch(vec![NewOutboxRow {
+                kind: OutboxMessageKind::ThreadEventsAvailable,
+                thread_id: thread_a(),
+                event_id: Some(uuid::Uuid::now_v7()),
+                sequence: Some(3),
+                payload_json: serde_json::json!({}),
+                max_attempts: 3,
+                now: t0(),
+            }])
+            .await?;
+
+        let report = run_janitor_cycle(
+            &policy_with_ttl(3600),
+            &deps(&events, &retention, &outbox, &checkpoints),
+            t_plus(7200),
+        )
+        .await?;
+
+        assert_eq!(
+            retention.effective_floor(&thread_a()).await?,
+            3,
+            "floor must stay at 3; seqs 3..=5 are in the pending batch",
+        );
+        assert_eq!(report.events_purged, 0);
+        assert_eq!(report.floors_advanced, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floor_never_advances_past_live_event_with_earlier_timestamp() -> Result<()> {
+        // Regression: non-monotonic `committed_at` (clock skew,
+        // concurrent writers) must not trick the janitor into
+        // deleting a live event.  Setup: seq 0, 1 expired; seq 2
+        // live (within TTL); seq 3 has an *older* timestamp than
+        // seq 2 (expired).  `max_sequence_before` returns 3 →
+        // candidate_floor would be 4 and destroy seq 2 if we used
+        // only `max_sequence_before`.  The min-live-sequence cap
+        // pins candidate_floor to 2, keeping seq 2 alive.
+        let events = InMemoryEventRepository::new();
+        let retention = InMemoryRetentionStore::new();
+        let outbox = InMemoryOutboxStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
+
+        // TTL = 1h, now = t0() + 2h → cutoff = t0() + 1h.
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m0", "old0"), t0())
+            .await?;
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m1", "old1"), t0())
+            .await?;
+        // Live: timestamp at cutoff+10 min (well within TTL).
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m2", "live"), t_plus(4200))
+            .await?;
+        // Non-monotonic: seq 3 timestamp before seq 2's.
+        events
+            .commit_event(&thread_a(), AgentEvent::text("m3", "old3"), t0())
+            .await?;
+
+        let report = run_janitor_cycle(
+            &policy_with_ttl(3600),
+            &deps(&events, &retention, &outbox, &checkpoints),
+            t_plus(7200),
+        )
+        .await?;
+
+        assert_eq!(
+            retention.effective_floor(&thread_a()).await?,
+            2,
+            "floor must stop at the first live sequence (2), not seq 4",
+        );
+        assert_eq!(
+            report.events_purged, 2,
+            "only seq 0 and 1 may be purged; seq 2 is live",
         );
         Ok(())
     }

@@ -1161,12 +1161,21 @@ VALUES (?1, ?2, ?3, ?4, ?5)",
     /// Phase 8.1 contract — exactly one
     /// `OutboxMessageKind::ThreadEventsAvailable` row per batch with
     /// payload `{thread_id, last_sequence}`.
+    ///
+    /// The row's `sequence` / `event_id` columns store the FIRST
+    /// event of the batch so that `min_unpublished_sequence` acts as
+    /// a retention-floor safety bound for every event in the batch
+    /// (not just the last one).  The advisory payload still carries
+    /// `last_sequence` so subscribers know how far to replay.
     async fn insert_thread_events_outbox_row_tx(
         tx: &mut Transaction<'_, Sqlite>,
         committed: &[CommittedEvent],
         max_attempts: u32,
         now: OffsetDateTime,
     ) -> Result<OutboxRow> {
+        let first = committed
+            .first()
+            .context("event batch must contain at least one event")?;
         let last = committed
             .last()
             .context("event batch must contain at least one event")?;
@@ -1181,8 +1190,8 @@ VALUES (?1, ?2, ?3, ?4, ?5)",
             .context("serialise thread_events_available advisory payload")?;
         let id_str = id.as_str();
         let thread_id_key = thread_key(&last.thread_id);
-        let event_id_str = last.event_id.to_string();
-        let sequence_i64 = i64_from_u64(last.sequence, "outbox sequence")?;
+        let event_id_str = first.event_id.to_string();
+        let sequence_i64 = i64_from_u64(first.sequence, "outbox sequence")?;
         let max_attempts_i64 = i64::from(max_attempts);
         let kind_str = OutboxMessageKind::ThreadEventsAvailable.as_str();
 
@@ -1206,8 +1215,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         .await
         .with_context(|| {
             format!(
-                "insert thread_events_available outbox row for batch ending at seq {}",
-                last.sequence,
+                "insert thread_events_available outbox row for batch [{}..={}]",
+                first.sequence, last.sequence,
             )
         })?;
 
@@ -1215,8 +1224,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
             id,
             kind: OutboxMessageKind::ThreadEventsAvailable,
             thread_id: last.thread_id.clone(),
-            event_id: Some(last.event_id),
-            sequence: Some(last.sequence),
+            event_id: Some(first.event_id),
+            sequence: Some(first.sequence),
             status: OutboxStatus::Pending,
             payload_json,
             created_at: now,
@@ -2695,6 +2704,26 @@ impl EventRepository for SqliteDurableStore {
         .with_context(|| format!("max_sequence_before for {thread_id}"))?;
         match record.max_seq {
             Some(v) => Ok(Some(u64_from_i64(v, "max_sequence_before")?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let tid = thread_key(thread_id);
+        let record = sqlx::query!(
+            r#"SELECT MIN(sequence) AS "min_seq: i64" FROM agent_sdk_committed_events WHERE thread_id = ?1 AND committed_at >= ?2"#,
+            tid,
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min_sequence_at_or_after for {thread_id}"))?;
+        match record.min_seq {
+            Some(v) => Ok(Some(u64_from_i64(v, "min_sequence_at_or_after")?)),
             None => Ok(None),
         }
     }
@@ -4192,8 +4221,10 @@ mod tests {
             .context("Phase 8.1 contract: outbox_row must be present")?;
         assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
         assert_eq!(row.thread_id, thread_id);
-        assert_eq!(row.sequence, Some(2));
-        assert_eq!(row.event_id, Some(outcome.committed_events[2].event_id));
+        // The row columns reference the FIRST event of the batch
+        // (retention safety bound); the payload carries the LAST.
+        assert_eq!(row.sequence, Some(0));
+        assert_eq!(row.event_id, Some(outcome.committed_events[0].event_id));
 
         let message = OutboxMessage::from_payload_json(row.kind, row.payload_json.clone())?;
         assert_eq!(

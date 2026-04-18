@@ -152,9 +152,14 @@ impl std::fmt::Display for OutboxStatus {
 ///
 /// `event_id` and `sequence` are populated for
 /// [`OutboxMessageKind::ThreadEventsAvailable`] rows, which reference
-/// the highest committed event in the triggering batch.  They are
-/// `None` for [`OutboxMessageKind::TaskWakeup`] rows, which reference
-/// only the task / thread carried in `payload_json`.
+/// the LOWEST committed event in the triggering batch.  Using the
+/// first (not last) event makes [`OutboxStore::min_unpublished_sequence`]
+/// a correct retention-floor safety bound for every event in the
+/// batch, including multi-event commits.  The advisory payload
+/// separately carries `last_sequence` so subscribers know how far to
+/// replay.  Both fields are `None` for
+/// [`OutboxMessageKind::TaskWakeup`] rows, which reference only the
+/// task / thread carried in `payload_json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     /// Unique outbox row identity.
@@ -163,12 +168,13 @@ pub struct OutboxRow {
     pub kind: OutboxMessageKind,
     /// Thread the message refers to.
     pub thread_id: ThreadId,
-    /// Highest committed event in the triggering batch (only set for
+    /// Lowest committed event in the triggering batch (only set for
     /// `ThreadEventsAvailable` rows).
     #[serde(default)]
     pub event_id: Option<uuid::Uuid>,
-    /// Highest committed sequence in the triggering batch (only set
-    /// for `ThreadEventsAvailable` rows).
+    /// Lowest committed sequence in the triggering batch (only set
+    /// for `ThreadEventsAvailable` rows).  Acts as the retention
+    /// safety bound over the entire batch range.
     #[serde(default)]
     pub sequence: Option<u64>,
     /// Relay lifecycle status.
@@ -206,10 +212,10 @@ pub struct OutboxRow {
 /// Parameters for inserting a new outbox row.
 ///
 /// For `ThreadEventsAvailable` rows, `event_id` and `sequence` MUST be
-/// `Some` and refer to the highest committed event in the triggering
-/// batch.  For `TaskWakeup` rows, both MUST be `None` — the
-/// transactional rule is enforced at the database layer via a CHECK
-/// constraint.
+/// `Some` and refer to the LOWEST committed event in the triggering
+/// batch (the safety bound for the retention janitor).  For
+/// `TaskWakeup` rows, both MUST be `None` — the transactional rule is
+/// enforced at the database layer via a CHECK constraint.
 pub struct NewOutboxRow {
     pub kind: OutboxMessageKind,
     pub thread_id: ThreadId,

@@ -3178,6 +3178,31 @@ WHERE thread_id = $1
             .map(|v| u64_from_i64(v, "max_sequence_before"))
             .transpose()
     }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let record = sqlx::query!(
+            r"
+SELECT MIN(sequence) AS min_seq
+FROM agent_sdk_committed_events
+WHERE thread_id = $1
+  AND committed_at >= $2
+",
+            thread_key(thread_id),
+            cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("min sequence at or after cutoff for {thread_id}"))?;
+
+        record
+            .min_seq
+            .map(|v| u64_from_i64(v, "min_sequence_at_or_after"))
+            .transpose()
+    }
 }
 
 impl PostgresDurableStore {
@@ -3276,16 +3301,24 @@ VALUES ($1, $2, $3, $4, $5)
     /// committed event batch.
     ///
     /// Phase 8.1 contract: exactly one
-    /// `OutboxMessageKind::ThreadEventsAvailable` row per batch.  The
-    /// row references the highest committed event in the batch so the
-    /// FK to `agent_sdk_committed_events` stays sound, and carries an
-    /// advisory payload of `{thread_id, last_sequence}`.
+    /// `OutboxMessageKind::ThreadEventsAvailable` row per batch.
+    ///
+    /// The row's `sequence` / `event_id` columns reference the FIRST
+    /// event of the batch so `min_unpublished_sequence` acts as a
+    /// retention-floor safety bound over the entire batch range
+    /// (otherwise the janitor could delete earlier events of a
+    /// multi-event batch).  The FK to `agent_sdk_committed_events`
+    /// stays sound either way.  The advisory payload still carries
+    /// `last_sequence` so subscribers know how far to replay.
     async fn insert_thread_events_outbox_row_tx(
         tx: &mut Transaction<'_, Postgres>,
         committed: &[CommittedEvent],
         max_attempts: u32,
         now: OffsetDateTime,
     ) -> Result<OutboxRow> {
+        let first = committed
+            .first()
+            .context("event batch must contain at least one event")?;
         let last = committed
             .last()
             .context("event batch must contain at least one event")?;
@@ -3298,7 +3331,7 @@ VALUES ($1, $2, $3, $4, $5)
         let payload_json = payload_message
             .to_payload_json()
             .context("serialise thread_events_available advisory payload")?;
-        let last_sequence_i64 = i64_from_u64(last.sequence, "outbox sequence")?;
+        let first_sequence_i64 = i64_from_u64(first.sequence, "outbox sequence")?;
 
         sqlx::query!(
             r"
@@ -3309,8 +3342,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
 ",
             id.as_str(),
             thread_key(&last.thread_id),
-            last.event_id.to_string(),
-            last_sequence_i64,
+            first.event_id.to_string(),
+            first_sequence_i64,
             payload_json,
             now,
             i64::from(max_attempts),
@@ -3319,8 +3352,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
         .await
         .with_context(|| {
             format!(
-                "insert thread_events_available outbox row for batch ending at seq {}",
-                last.sequence,
+                "insert thread_events_available outbox row for batch [{}..={}]",
+                first.sequence, last.sequence,
             )
         })?;
 
@@ -3328,8 +3361,8 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
             id,
             kind: OutboxMessageKind::ThreadEventsAvailable,
             thread_id: last.thread_id.clone(),
-            event_id: Some(last.event_id),
-            sequence: Some(last.sequence),
+            event_id: Some(first.event_id),
+            sequence: Some(first.sequence),
             status: OutboxStatus::Pending,
             payload_json,
             created_at: now,
@@ -5466,8 +5499,10 @@ mod tests {
             .context("Phase 8.1 contract: outbox_row must be present")?;
         assert_eq!(row.kind, OutboxMessageKind::ThreadEventsAvailable);
         assert_eq!(row.thread_id, thread_id);
-        assert_eq!(row.sequence, Some(2));
-        assert_eq!(row.event_id, Some(outcome.committed_events[2].event_id),);
+        // The row columns reference the FIRST event of the batch
+        // (retention safety bound); the payload carries the LAST.
+        assert_eq!(row.sequence, Some(0));
+        assert_eq!(row.event_id, Some(outcome.committed_events[0].event_id),);
 
         // Advisory payload must round-trip back to the typed message.
         let message = OutboxMessage::from_payload_json(row.kind, row.payload_json.clone())?;

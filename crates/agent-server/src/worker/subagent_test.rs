@@ -88,6 +88,14 @@ impl EventRepository for FailingEventRepository {
     ) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        _thread_id: &agent_sdk_core::ThreadId,
+        _cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 fn sample_policy() -> InheritedSubagentPolicy {

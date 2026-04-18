@@ -138,6 +138,21 @@ pub trait EventRepository: Send + Sync {
         thread_id: &ThreadId,
         cutoff: OffsetDateTime,
     ) -> Result<Option<u64>>;
+
+    /// Return the lowest sequence number among events with
+    /// `committed_at >= cutoff` for a given thread.
+    ///
+    /// Returns `None` if no surviving events have a timestamp at or
+    /// after the cutoff.  The retention janitor uses this as an upper
+    /// cap on the candidate floor so that non-contiguous expiration —
+    /// e.g. clock skew or concurrent writers producing a later event
+    /// with an earlier `committed_at` — cannot drag the floor past a
+    /// live event.
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -303,6 +318,22 @@ impl EventRepository for InMemoryEventRepository {
         });
         drop(inner);
         Ok(max_seq)
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        let inner = self.inner.read().await;
+        let min_seq = inner.events.get(&thread_id.0).and_then(|evts| {
+            evts.iter()
+                .filter(|e| e.timestamp >= cutoff)
+                .map(|e| e.sequence)
+                .min()
+        });
+        drop(inner);
+        Ok(min_seq)
     }
 }
 
