@@ -2535,7 +2535,7 @@ impl CheckpointStore for SqliteDurableStore {
         let threshold_i64 = i64::from(threshold);
         let limit_i64 = i64::from(limit);
         let rows = sqlx::query_scalar!(
-            r"SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > ?1 LIMIT ?2",
+            r"SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > ?1 ORDER BY thread_id LIMIT ?2",
             threshold_i64,
             limit_i64,
         )
@@ -2678,7 +2678,7 @@ impl EventRepository for SqliteDurableStore {
     ) -> Result<Vec<ThreadId>> {
         let limit_i64 = i64::from(limit);
         let rows: Vec<String> = sqlx::query_scalar!(
-            r"SELECT DISTINCT thread_id FROM agent_sdk_committed_events WHERE committed_at < ?1 LIMIT ?2",
+            r"SELECT DISTINCT thread_id FROM agent_sdk_committed_events WHERE committed_at < ?1 ORDER BY thread_id LIMIT ?2",
             cutoff,
             limit_i64,
         )

@@ -258,13 +258,17 @@ impl CheckpointStore for InMemoryCheckpointStore {
         limit: u32,
     ) -> Result<Vec<ThreadId>> {
         let inner = self.inner.read().await;
-        let threads: Vec<ThreadId> = inner
+        let mut threads: Vec<ThreadId> = inner
             .thread_index
             .iter()
             .filter(|(_, ids)| ids.len() > threshold as usize)
             .map(|(tid, _)| tid.clone())
-            .take(limit as usize)
             .collect();
+        // `ORDER BY thread_id LIMIT n` mirrors the durable backends so
+        // the janitor's per-cycle subset is deterministic across
+        // in-memory and SQL implementations.
+        threads.sort_by(|a, b| a.0.cmp(&b.0));
+        threads.truncate(limit as usize);
         drop(inner);
         Ok(threads)
     }

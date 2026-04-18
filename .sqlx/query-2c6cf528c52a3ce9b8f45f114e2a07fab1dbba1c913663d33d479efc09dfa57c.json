@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > $1 LIMIT $2",
+  "query": "SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > $1 ORDER BY thread_id LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       false
     ]
   },
-  "hash": "644e35b740af4617b123f874bacdc224acb51036e3f43da6b99a80ca6568d047"
+  "hash": "2c6cf528c52a3ce9b8f45f114e2a07fab1dbba1c913663d33d479efc09dfa57c"
 }

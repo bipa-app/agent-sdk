@@ -293,13 +293,18 @@ impl EventRepository for InMemoryEventRepository {
         limit: u32,
     ) -> Result<Vec<ThreadId>> {
         let inner = self.inner.read().await;
-        let threads: Vec<ThreadId> = inner
+        let mut ids: Vec<String> = inner
             .events
             .iter()
             .filter(|(_, evts)| evts.iter().any(|e| e.timestamp < cutoff))
-            .map(|(tid, _)| ThreadId::from_string(tid.clone()))
-            .take(limit as usize)
+            .map(|(tid, _)| tid.clone())
             .collect();
+        // `ORDER BY thread_id LIMIT n` mirrors the durable backends so
+        // the janitor's per-cycle subset is deterministic across
+        // in-memory and SQL implementations.
+        ids.sort();
+        ids.truncate(limit as usize);
+        let threads: Vec<ThreadId> = ids.into_iter().map(ThreadId::from_string).collect();
         drop(inner);
         Ok(threads)
     }

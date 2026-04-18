@@ -268,12 +268,14 @@ pub async fn stream_events(
             (None, Some(after)) => after,
             (None, None) => 0,
         };
-        // Only surface a gap if the floor actually surpassed the
-        // client's position; otherwise the janitor only removed
-        // events the client already had.  The documented contract is
-        // `requested_after < retention_floor`, so we must not invert
-        // it when `requested >= floor_after_fetch`.
-        if floor_after_fetch > requested {
+        // A gap requires at least one purged sequence between
+        // `requested` and `floor_after_fetch` — i.e. `floor > requested + 1`.
+        // Mirror Step 1.5's `after + 1 < floor` guard so the two steps
+        // agree at the boundary `requested == floor_after_fetch - 1`:
+        // the client has already seen every purged event and can
+        // resume seamlessly at the new floor with no false-positive
+        // gap.
+        if floor_after_fetch > requested.saturating_add(1) {
             retention_gap = Some((requested, floor_after_fetch));
         }
         // `retain` is unconditional: any in-buffer event below the
@@ -939,6 +941,93 @@ mod tests {
         let mut stream = stream_events(&thread_a(), Some(4), &repo, &retention, &notifier).await?;
 
         // First yielded item must be Event(seq=5), not RetentionGap.
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 5),
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => panic!(
+                "spurious RetentionGap: requested_after={requested_after}, retention_floor={retention_floor}"
+            ),
+            other => panic!("expected Event(seq=5), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn racing_floor_to_exactly_after_plus_one_emits_no_gap() -> Result<()> {
+        // Step 3.5 boundary regression: if the client supplies
+        // `after_sequence = after`, the floor starts at 0 (so Step 1.5
+        // sees no gap), and the janitor races to advance the floor to
+        // EXACTLY `after + 1`, no gap should be emitted — the purged
+        // range `(after, after + 1)` is empty.  This mirrors Step 1.5's
+        // `after + 1 < floor` guard.
+        use super::super::retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct RacingRetention {
+            inner: Arc<InMemoryRetentionStore>,
+            reads: AtomicU32,
+            racing_floor: u64,
+        }
+
+        #[async_trait]
+        impl RetentionStore for RacingRetention {
+            async fn get_cursor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<Option<RetentionCursor>> {
+                self.inner.get_cursor(thread_id).await
+            }
+
+            async fn advance_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+                new_floor: u64,
+                now: OffsetDateTime,
+            ) -> anyhow::Result<RetentionCursor> {
+                self.inner.advance_floor(thread_id, new_floor, now).await
+            }
+
+            async fn effective_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<u64> {
+                let call = self.reads.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    self.inner
+                        .advance_floor(thread_id, self.racing_floor, t0())
+                        .await?;
+                }
+                self.inner.effective_floor(thread_id).await
+            }
+        }
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let racing = RacingRetention {
+            inner: Arc::new(InMemoryRetentionStore::new()),
+            reads: AtomicU32::new(0),
+            racing_floor: 5,
+        };
+
+        // Commit seqs 0..=9.
+        for i in 0..10i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Client: after_sequence = 4 (racing_floor - 1). Step 1.5 sees
+        // floor=0 → no gap. Janitor advances to floor=5 between reads.
+        // The purged range is (4, 5) → empty → NO gap.
+        let mut stream = stream_events(&thread_a(), Some(4), &repo, &racing, &notifier).await?;
+
         match stream.next().await {
             Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 5),
             Some(StreamEvent::RetentionGap {

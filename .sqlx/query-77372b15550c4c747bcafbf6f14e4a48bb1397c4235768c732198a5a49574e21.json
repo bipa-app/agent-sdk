@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT DISTINCT thread_id FROM agent_sdk_committed_events WHERE committed_at < ?1 LIMIT ?2",
+  "query": "SELECT thread_id FROM agent_sdk_turn_checkpoints GROUP BY thread_id HAVING COUNT(*) > ?1 ORDER BY thread_id LIMIT ?2",
   "describe": {
     "columns": [
       {
@@ -16,5 +16,5 @@
       false
     ]
   },
-  "hash": "af765fd49bdd4965109812e5c70ae7fbf3f9fe3fbfae890a31fd2534d7a1388b"
+  "hash": "77372b15550c4c747bcafbf6f14e4a48bb1397c4235768c732198a5a49574e21"
 }

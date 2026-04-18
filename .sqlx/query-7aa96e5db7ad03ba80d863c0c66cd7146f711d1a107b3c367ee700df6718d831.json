@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT DISTINCT thread_id\nFROM agent_sdk_committed_events\nWHERE committed_at < $1\nLIMIT $2\n",
+  "query": "\nSELECT DISTINCT thread_id\nFROM agent_sdk_committed_events\nWHERE committed_at < $1\nORDER BY thread_id\nLIMIT $2\n",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       false
     ]
   },
-  "hash": "754226771423e29b5d801ec6d173d49c6dee829fdafb7abfd36b6fe62db7ef60"
+  "hash": "7aa96e5db7ad03ba80d863c0c66cd7146f711d1a107b3c367ee700df6718d831"
 }
