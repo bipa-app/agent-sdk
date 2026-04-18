@@ -19,7 +19,7 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
-    ToolResult, ToolRuntime, TurnOptions,
+    ToolResult, ToolRuntime, ToolTier, TurnOptions,
 };
 use agent_sdk_core::audit::AuditProvenance;
 
@@ -954,55 +954,148 @@ where
         provenance,
     };
 
-    for pending in pending_tool_calls.clone() {
-        match execute_tool_call(&pending, &execution_ctx).await {
-            ToolExecutionOutcome::Completed { tool_id, result } => {
-                tool_results.push((tool_id, result));
-            }
-            ToolExecutionOutcome::RequiresConfirmation {
-                tool_id,
-                tool_name,
-                display_name,
-                input,
-                description,
-                listen_context,
-            } => {
-                let pending_idx = match pending_tool_index(&pending_tool_calls, &tool_id) {
-                    Ok(index) => index,
-                    Err(error) => return Err(InternalTurnResult::Error(error)),
-                };
-                if let Some(context) = listen_context {
-                    pending_tool_calls[pending_idx].listen_context = Some(context);
-                }
+    // Tool calls are walked in the order the model emitted them. Adjacent
+    // `ToolTier::Observe` calls are run concurrently via `join_all` because
+    // they are read-only by contract and safe to overlap. Anything else
+    // (currently only `ToolTier::Confirm`, plus the listen path that may
+    // suspend for confirmation) stays strictly serial: a confirmation gate
+    // is a sequencing decision and the next tool's input may depend on the
+    // previous tool's effect on the world.
+    //
+    // Result order is preserved to match the input order, so downstream
+    // consumers (tool-result message assembly, audit logs, replay) see no
+    // observable change beyond reduced wall time.
+    let mut idx = 0;
+    while idx < pending_tool_calls.len() {
+        let first_tier = pending_tool_calls[idx].tier;
 
-                let continuation = AgentContinuation {
-                    thread_id: thread_id.clone(),
+        if first_tier == ToolTier::Observe {
+            let end = observe_run_end(&pending_tool_calls, idx);
+            let batch = &pending_tool_calls[idx..end];
+
+            // Borrow the slice for the duration of `join_all` only — the
+            // borrow ends before we touch `pending_tool_calls` mutably below.
+            let outcomes = futures::future::join_all(
+                batch.iter().map(|p| execute_tool_call(p, &execution_ctx)),
+            )
+            .await;
+
+            for outcome in outcomes {
+                if let Some(early) = handle_tool_outcome(
+                    outcome,
+                    &mut pending_tool_calls,
+                    &mut tool_results,
+                    thread_id,
                     turn,
-                    total_usage: total_usage.clone(),
-                    turn_usage: turn_usage.clone(),
-                    pending_tool_calls: pending_tool_calls.clone(),
-                    awaiting_index: pending_idx,
-                    completed_results: tool_results,
-                    state: state.clone(),
-                    response_id: response_id.clone(),
+                    total_usage,
+                    turn_usage,
+                    state,
+                    response_id.as_deref(),
                     stop_reason,
-                    response_content: Vec::new(),
-                };
-
-                return Err(InternalTurnResult::AwaitingConfirmation {
-                    tool_call_id: tool_id,
-                    tool_name,
-                    display_name,
-                    input,
-                    description,
-                    continuation: Box::new(continuation),
-                });
+                ) {
+                    return Err(early);
+                }
             }
-            ToolExecutionOutcome::Error(error) => return Err(InternalTurnResult::Error(error)),
+            idx = end;
+        } else {
+            let outcome = execute_tool_call(&pending_tool_calls[idx], &execution_ctx).await;
+            if let Some(early) = handle_tool_outcome(
+                outcome,
+                &mut pending_tool_calls,
+                &mut tool_results,
+                thread_id,
+                turn,
+                total_usage,
+                turn_usage,
+                state,
+                response_id.as_deref(),
+                stop_reason,
+            ) {
+                return Err(early);
+            }
+            idx += 1;
         }
     }
 
     Ok(tool_results)
+}
+
+/// Find the end (exclusive) of the run of consecutive `ToolTier::Observe`
+/// calls that starts at `start`.
+fn observe_run_end(pending: &[PendingToolCallInfo], start: usize) -> usize {
+    let mut end = start;
+    while end < pending.len() && pending[end].tier == ToolTier::Observe {
+        end += 1;
+    }
+    end
+}
+
+/// Process a single tool execution outcome. On `Completed`, append to the
+/// results vector and return `None`. On `RequiresConfirmation`, snapshot the
+/// turn into a continuation and return the `InternalTurnResult` the caller
+/// should propagate. On `Error`, surface it.
+///
+/// Pulled out of the main loop so the parallel and serial paths share one
+/// implementation of the confirmation snapshot.
+#[allow(clippy::too_many_arguments)]
+fn handle_tool_outcome(
+    outcome: ToolExecutionOutcome,
+    pending_tool_calls: &mut [PendingToolCallInfo],
+    tool_results: &mut Vec<(String, ToolResult)>,
+    thread_id: &ThreadId,
+    turn: usize,
+    total_usage: &TokenUsage,
+    turn_usage: &TokenUsage,
+    state: &crate::types::AgentState,
+    response_id: Option<&str>,
+    stop_reason: Option<StopReason>,
+) -> Option<InternalTurnResult> {
+    match outcome {
+        ToolExecutionOutcome::Completed { tool_id, result } => {
+            tool_results.push((tool_id, result));
+            None
+        }
+        ToolExecutionOutcome::RequiresConfirmation {
+            tool_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            listen_context,
+        } => {
+            let pending_idx = match pending_tool_index(pending_tool_calls, &tool_id) {
+                Ok(index) => index,
+                Err(error) => return Some(InternalTurnResult::Error(error)),
+            };
+            if let Some(context) = listen_context {
+                pending_tool_calls[pending_idx].listen_context = Some(context);
+            }
+
+            let continuation = AgentContinuation {
+                thread_id: thread_id.clone(),
+                turn,
+                total_usage: total_usage.clone(),
+                turn_usage: turn_usage.clone(),
+                pending_tool_calls: pending_tool_calls.to_vec(),
+                awaiting_index: pending_idx,
+                completed_results: std::mem::take(tool_results),
+                state: state.clone(),
+                response_id: response_id.map(str::to_string),
+                stop_reason,
+                response_content: Vec::new(),
+            };
+
+            Some(InternalTurnResult::AwaitingConfirmation {
+                tool_call_id: tool_id,
+                tool_name,
+                display_name,
+                input,
+                description,
+                continuation: Box::new(continuation),
+            })
+        }
+        ToolExecutionOutcome::Error(error) => Some(InternalTurnResult::Error(error)),
+    }
 }
 
 pub(super) async fn append_tool_results_and_emit_turn_complete<H, M>(
