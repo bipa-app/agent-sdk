@@ -263,7 +263,16 @@ pub async fn stream_events(
             (None, Some(after)) => after,
             (None, None) => 0,
         };
-        retention_gap = Some((requested, floor_after_fetch));
+        // Only surface a gap if the floor actually surpassed the
+        // client's position; otherwise the janitor only removed
+        // events the client already had.  The documented contract is
+        // `requested_after < retention_floor`, so we must not invert
+        // it when `requested >= floor_after_fetch`.
+        if floor_after_fetch > requested {
+            retention_gap = Some((requested, floor_after_fetch));
+        }
+        // `retain` is unconditional: any in-buffer event below the
+        // new floor was purged by the janitor and must not be served.
         replay_buffer.retain(|e| e.sequence >= floor_after_fetch);
     }
 
@@ -885,6 +894,94 @@ mod tests {
                 e.sequence
             ),
             other => panic!("expected Event(seq>=3), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn floor_advance_at_or_below_requested_emits_no_gap() -> Result<()> {
+        // When the janitor advances the floor during the race window
+        // but stays at/below the client's `after_sequence`, the janitor
+        // only removed events the client already had — no RetentionGap
+        // should be emitted (contract: `requested_after < retention_floor`).
+        use super::super::retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct RacingRetention {
+            inner: Arc<InMemoryRetentionStore>,
+            reads: AtomicU32,
+            racing_floor: u64,
+        }
+
+        #[async_trait]
+        impl RetentionStore for RacingRetention {
+            async fn get_cursor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<Option<RetentionCursor>> {
+                self.inner.get_cursor(thread_id).await
+            }
+
+            async fn advance_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+                new_floor: u64,
+                now: OffsetDateTime,
+            ) -> anyhow::Result<RetentionCursor> {
+                self.inner.advance_floor(thread_id, new_floor, now).await
+            }
+
+            async fn effective_floor(
+                &self,
+                thread_id: &agent_sdk_core::ThreadId,
+            ) -> anyhow::Result<u64> {
+                let call = self.reads.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    self.inner
+                        .advance_floor(thread_id, self.racing_floor, t0())
+                        .await?;
+                }
+                self.inner.effective_floor(thread_id).await
+            }
+        }
+
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::new();
+        let racing = RacingRetention {
+            inner: Arc::new(InMemoryRetentionStore::new()),
+            reads: AtomicU32::new(0),
+            racing_floor: 5,
+        };
+
+        // Commit 10 events (sequences 0..9).
+        for i in 0..10i64 {
+            repo.commit_event(
+                &thread_a(),
+                AgentEvent::text(format!("m{i}"), format!("msg-{i}")),
+                t_plus(i),
+            )
+            .await?;
+        }
+
+        // Client asks `after_sequence = 8` — wants seq 9 as the next
+        // replay event. Janitor races and advances floor to 5, which
+        // is BELOW the client's position — client loses nothing, so no
+        // gap signal should be emitted.
+        let mut stream = stream_events(&thread_a(), Some(8), &repo, &racing, &notifier).await?;
+
+        // First yielded item must be the replay event at seq 9, NOT a
+        // RetentionGap (would have inverted `requested_after >= retention_floor`).
+        match stream.next().await {
+            Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 9),
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => panic!(
+                "unexpected RetentionGap: requested_after={requested_after}, retention_floor={retention_floor}"
+            ),
+            other => panic!("expected Event(seq=9), got {other:?}"),
         }
         Ok(())
     }

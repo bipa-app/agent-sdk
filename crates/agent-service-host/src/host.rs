@@ -206,6 +206,12 @@ impl ServiceHost {
                     "retention.event_ttl_secs must be > 0; omit (null) to keep events forever"
                 );
             }
+            if let Some(n) = config.retention.checkpoint_max_per_thread {
+                anyhow::ensure!(
+                    n > 0,
+                    "retention.checkpoint_max_per_thread must be > 0; omit (null) to keep all checkpoints"
+                );
+            }
         }
         Ok(())
     }
