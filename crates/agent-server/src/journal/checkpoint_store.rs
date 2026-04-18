@@ -283,7 +283,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
                     .map(|c| (c.turn_number, id.clone()))
             })
             .collect();
-        by_turn.sort_by(|a, b| b.0.cmp(&a.0));
+        by_turn.sort_by_key(|a| std::cmp::Reverse(a.0));
 
         let to_delete: Vec<CheckpointId> = by_turn
             .into_iter()
