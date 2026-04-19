@@ -36,6 +36,7 @@ pub const MODEL_HAIKU_45: &str = "claude-haiku-4-5-20251001";
 pub const MODEL_SONNET_45: &str = "claude-sonnet-4-5-20250929";
 pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
+pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 
 /// Claude Code tool name mappings for OAuth mode.
 ///
@@ -278,6 +279,17 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_OPUS_46.to_owned())
     }
 
+    /// Create a provider using Claude Opus 4.7.
+    ///
+    /// Note: Opus 4.7 requires adaptive thinking. Passing a
+    /// `ThinkingConfig` with `ThinkingMode::Enabled { budget_tokens }`
+    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
+    /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
+    #[must_use]
+    pub fn opus_47(api_key: String) -> Self {
+        Self::new(api_key, MODEL_OPUS_47.to_owned())
+    }
+
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
     pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
@@ -300,7 +312,10 @@ impl AnthropicProvider {
     }
 
     fn requires_adaptive_thinking(&self) -> bool {
-        matches!(self.model.as_str(), MODEL_SONNET_46 | MODEL_OPUS_46)
+        matches!(
+            self.model.as_str(),
+            MODEL_SONNET_46 | MODEL_OPUS_46 | MODEL_OPUS_47
+        )
     }
 }
 
@@ -842,6 +857,46 @@ mod tests {
             .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
             .unwrap_err();
         assert!(error.to_string().contains("ThinkingConfig::adaptive()"));
+    }
+
+    #[test]
+    fn test_opus_47_rejects_budgeted_thinking() {
+        // Opus 4.7 follows the same adaptive-only policy as 4.6. Without
+        // this guard the provider would serialise `thinking.type.enabled`
+        // and get a 400 back from the API — we want a clear SDK-level
+        // error instead.
+        let opus_47 = AnthropicProvider::opus_47("test-api-key".to_string());
+        let error = opus_47
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_opus_47_accepts_adaptive_thinking() {
+        let opus_47 = AnthropicProvider::opus_47("test-api-key".to_string());
+        assert!(
+            opus_47
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_ok()
+        );
+        assert!(
+            opus_47
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_core::llm::Effort::High
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_opus_47_factory_creates_opus_47_provider() {
+        let provider = AnthropicProvider::opus_47("test-api-key".to_string());
+        assert_eq!(provider.model(), MODEL_OPUS_47);
+        assert_eq!(provider.provider(), "anthropic");
     }
 
     #[test]

@@ -124,6 +124,18 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Anthropic
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-opus-4-7",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(15.0, 75.0).with_notes("Anthropic Opus 4.7 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Opus 4.7 requires adaptive thinking — `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-opus-4-6",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
