@@ -23,6 +23,8 @@ pub struct ApiGenerateContentRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<&'a [ApiToolConfig]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ApiFunctionCallingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<ApiGenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content: Option<&'a str>,
@@ -95,6 +97,43 @@ pub struct ApiFunctionDeclaration {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+/// Gemini `toolConfig.functionCallingConfig` wire format.
+///
+/// - `mode: "AUTO"` — model decides.
+/// - `mode: "ANY"` with `allowed_function_names` — force specific function(s).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiFunctionCallingConfig {
+    pub function_calling_config: ApiFunctionCallingMode,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiFunctionCallingMode {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
+}
+
+impl ApiFunctionCallingConfig {
+    pub fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+        match tc {
+            agent_sdk_core::llm::ToolChoice::Auto => Self {
+                function_calling_config: ApiFunctionCallingMode {
+                    mode: "AUTO".to_owned(),
+                    allowed_function_names: None,
+                },
+            },
+            agent_sdk_core::llm::ToolChoice::Tool(name) => Self {
+                function_calling_config: ApiFunctionCallingMode {
+                    mode: "ANY".to_owned(),
+                    allowed_function_names: Some(vec![name.clone()]),
+                },
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -626,6 +665,7 @@ mod tests {
             contents: &contents,
             system_instruction: None,
             tools: None,
+            tool_config: None,
             generation_config: None,
             cached_content: Some("cachedContents/example"),
         };

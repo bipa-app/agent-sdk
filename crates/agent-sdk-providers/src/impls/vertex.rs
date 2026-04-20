@@ -11,9 +11,9 @@
 use crate::attachments::validate_request_attachments;
 use crate::impls::anthropic::{MODEL_OPUS_46, MODEL_SONNET_46, data as anthropic_data};
 use crate::impls::gemini::data::{
-    ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
-    ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
-    map_finish_reason, map_thinking_config, stream_gemini_response,
+    ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
+    ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
+    convert_tools_to_config, map_finish_reason, map_thinking_config, stream_gemini_response,
 };
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta};
@@ -277,6 +277,10 @@ impl VertexProvider {
         }
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
+        let tool_config = request
+            .tool_choice
+            .as_ref()
+            .map(ApiFunctionCallingConfig::from_tool_choice);
         let system_instruction = if request.system.is_empty() {
             None
         } else {
@@ -295,6 +299,7 @@ impl VertexProvider {
             contents: &contents,
             system_instruction: system_instruction.as_ref(),
             tools: tools.as_ref().map(std::slice::from_ref),
+            tool_config,
             generation_config: Some(ApiGenerationConfig {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
@@ -414,6 +419,10 @@ impl VertexProvider {
             }
             let contents = build_api_contents(&request.messages);
             let tools = request.tools.map(convert_tools_to_config);
+            let tool_config = request
+                .tool_choice
+                .as_ref()
+                .map(ApiFunctionCallingConfig::from_tool_choice);
             let system_instruction = if request.system.is_empty() {
                 None
             } else {
@@ -432,6 +441,7 @@ impl VertexProvider {
                 contents: &contents,
                 system_instruction: system_instruction.as_ref(),
                 tools: tools.as_ref().map(std::slice::from_ref),
+                tool_config,
                 generation_config: Some(ApiGenerationConfig {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
@@ -504,6 +514,10 @@ impl VertexProvider {
             .and_then(|t| t.effort)
             .map(|effort| anthropic_data::ApiOutputConfig { effort });
         let system = Self::build_vertex_claude_system_prompt(&request.system);
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .map(anthropic_data::ApiToolChoice::from_tool_choice);
 
         let api_request = anthropic_data::ApiMessagesRequest {
             model: None, // model is in the URL for Vertex
@@ -511,6 +525,7 @@ impl VertexProvider {
             system,
             messages: &messages,
             tools: tools.as_deref(),
+            tool_choice,
             stream: false,
             thinking,
             output_config,
@@ -618,6 +633,10 @@ impl VertexProvider {
                 .and_then(|t| t.effort)
                 .map(|effort| anthropic_data::ApiOutputConfig { effort });
             let system = Self::build_vertex_claude_system_prompt(&request.system);
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .map(anthropic_data::ApiToolChoice::from_tool_choice);
 
             let api_request = anthropic_data::ApiMessagesRequest {
                 model: None, // model is in the URL for Vertex
@@ -625,6 +644,7 @@ impl VertexProvider {
                 system,
                 messages: &messages,
                 tools: tools.as_deref(),
+                tool_choice,
                 stream: true,
                 thinking,
                 output_config,

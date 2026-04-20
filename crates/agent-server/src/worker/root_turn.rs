@@ -501,6 +501,7 @@ async fn build_chat_request(
         session_id: None,
         cached_content: None,
         thinking,
+        tool_choice: None,
     })
 }
 
@@ -1390,6 +1391,7 @@ async fn build_resume_chat_request(
         session_id: None,
         cached_content: None,
         thinking,
+        tool_choice: None,
     })
 }
 

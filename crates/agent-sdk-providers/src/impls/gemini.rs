@@ -12,9 +12,9 @@ use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
-    ApiContent, ApiGenerateContentRequest, ApiGenerateContentResponse, ApiGenerationConfig,
-    ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks, convert_tools_to_config,
-    map_finish_reason, map_thinking_config,
+    ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
+    ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
+    convert_tools_to_config, map_finish_reason, map_thinking_config,
 };
 use reqwest::StatusCode;
 
@@ -156,6 +156,10 @@ impl LlmProvider for GeminiProvider {
         }
         let contents = build_api_contents(&request.messages);
         let tools = request.tools.map(convert_tools_to_config);
+        let tool_config = request
+            .tool_choice
+            .as_ref()
+            .map(ApiFunctionCallingConfig::from_tool_choice);
         let system_instruction = if request.system.is_empty() {
             None
         } else {
@@ -174,6 +178,7 @@ impl LlmProvider for GeminiProvider {
             contents: &contents,
             system_instruction: system_instruction.as_ref(),
             tools: tools.as_ref().map(std::slice::from_ref),
+            tool_config,
             generation_config: Some(ApiGenerationConfig {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
@@ -295,6 +300,10 @@ impl LlmProvider for GeminiProvider {
             }
             let contents = build_api_contents(&request.messages);
             let tools = request.tools.map(convert_tools_to_config);
+            let tool_config = request
+                .tool_choice
+                .as_ref()
+                .map(ApiFunctionCallingConfig::from_tool_choice);
             let system_instruction = if request.system.is_empty() {
                 None
             } else {
@@ -313,6 +322,7 @@ impl LlmProvider for GeminiProvider {
                 contents: &contents,
                 system_instruction: system_instruction.as_ref(),
                 tools: tools.as_ref().map(std::slice::from_ref),
+                tool_config,
                 generation_config: Some(ApiGenerationConfig {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
