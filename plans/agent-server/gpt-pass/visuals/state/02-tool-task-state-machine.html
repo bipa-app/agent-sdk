@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tool Task State Machine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "state",
+        pageId: "tool-task-state-machine",
+        rootPath: "../",
+        kicker: "State View",
+        title: "Tool Task State Machine",
+        summary:
+          "The durable lifecycle for one tool call. Child tasks own execution, confirmation, replay-safe restart, and final parent-batch aggregation.",
+        boardWidth: 1200,
+        boardHeight: 760,
+        legend: [
+          { label: "Child task lifecycle", tone: "safety" },
+          { label: "Worker-owned active execution", tone: "runtime" },
+          { label: "Durable prepared state", tone: "persistence" },
+          { label: "Terminal outcomes", tone: "persistence" },
+        ],
+        nodes: [
+          { id: "pending", title: "pending", copy: "Runnable child task with durable parent linkage and requested input.", tone: "safety", group: "child task", x: 60, y: 70, w: 240, h: 126, points: ["Acquirable by tool workers.", "No worker or lease.", "One child per tool call."] },
+          { id: "running", title: "running", copy: "Active tool execution or prepared-state creation under a tool worker.", tone: "runtime", group: "active", x: 380, y: 70, w: 240, h: 126, points: ["worker_id required.", "Lease and heartbeat required.", "Owns lifecycle audit."] },
+          { id: "prepared", title: "prepared_operation_state", copy: "Typed durable fields that capture operation identity, revision, and prepared snapshot.", tone: "persistence", group: "durable fields", x: 730, y: 70, w: 240, h: 126, points: ["Not a separate task status.", "Exists before awaiting_confirmation.", "Supports restart-safe resume checks."] },
+          { id: "confirm", title: "awaiting_confirmation", copy: "Paused child task waiting for explicit approval or rejection.", tone: "safety", group: "paused", x: 730, y: 380, w: 240, h: 126, points: ["No worker or lease.", "Prepared state already durable.", "Resume-time Block still possible."] },
+          { id: "completed", title: "completed", copy: "Terminal success, cached replay, or deterministic tool error result.", tone: "persistence", group: "terminal", x: 1030, y: 70, w: 140, h: 126, points: ["Parent batch can aggregate this result.", "ToolCallEnd aligns with completion."] },
+          { id: "failed", title: "failed", copy: "Terminal failure when the child cannot continue safely.", tone: "persistence", group: "terminal", x: 380, y: 380, w: 240, h: 126, points: ["Used for unsafe replay or exhausted retry.", "Parent batch maps this deterministically."] },
+          { id: "cancelled", title: "cancelled", copy: "Terminal cancellation from parent batch rules, rejection, or cascade cancel.", tone: "persistence", group: "terminal", x: 60, y: 380, w: 240, h: 126, points: ["Can originate from parent or sibling confirm failure.", "No further execution."] },
+        ],
+        edges: [
+          { id: "tool-pending-running", label: "acquire", tone: "runtime", copy: "A tool worker acquires the child task with a guarded pending -> running transition.", labelX: 276, labelY: 98, points: [{ x: 300, y: 146 }, { x: 380, y: 146 }] },
+          { id: "tool-running-completed", label: "observe done", tone: "persistence", copy: "Observe-tier work or cached replay closes directly to completed.", labelX: 792, labelY: 98, points: [{ x: 620, y: 146 }, { x: 1030, y: 146 }] },
+          { id: "tool-running-failed", label: "unsafe or exhausted", tone: "persistence", copy: "Unsafe replay conditions or exhausted retry budget move the child to failed.", labelX: 528, labelY: 251, points: [{ x: 500, y: 196 }, { x: 500, y: 380 }] },
+          { id: "tool-running-prepared", label: "persist intent + prepared state", tone: "persistence", copy: "Confirm/listen tools persist stable operation identity and prepared snapshot before pausing.", labelX: 660, labelY: 98, points: [{ x: 620, y: 146 }, { x: 730, y: 146 }] },
+          { id: "tool-prepared-confirm", label: "move to confirmation", tone: "safety", copy: "Once prepared state is durable, the child task pauses in awaiting_confirmation.", labelX: 864, labelY: 258, points: [{ x: 850, y: 196 }, { x: 850, y: 380 }] },
+          { id: "tool-confirm-running", label: "approved resume", tone: "runtime", copy: "A fresh worker resumes the child, re-checks policy, and only then can execute the final mutation.", labelX: 672, labelY: 410, points: [{ x: 730, y: 446 }, { x: 460, y: 446 }, { x: 460, y: 196 }] },
+          { id: "tool-confirm-cancelled", label: "rejected or invalidated", tone: "persistence", copy: "Rejection, expiry, or resume-time block prevents execution and cancels/fails the child deterministically.", labelX: 432, labelY: 448, points: [{ x: 730, y: 446 }, { x: 300, y: 446 }] },
+          { id: "tool-pending-cancelled", label: "cancel before start", tone: "persistence", copy: "Queued or pending child work can be cancelled by the parent batch immediately.", labelX: 180, labelY: 251, points: [{ x: 180, y: 196 }, { x: 180, y: 446 }] },
+        ],
+        scenarios: [
+          {
+            id: "observe",
+            title: "Observe-tier direct completion",
+            copy: "Observe tasks run and complete without waiting for approval.",
+            detail: {
+              title: "Observe-tier direct completion",
+              copy: "This is the simplest child lifecycle. The child worker acquires the task, records durable execution state, runs the tool, and closes to completed or failed.",
+              tags: ["observe"],
+              bullets: [
+                "No awaiting_confirmation state.",
+                "Replay-safe intent still persists first.",
+                "Parent resume waits for batch aggregation, not for inline joins.",
+              ],
+            },
+            highlightNodes: ["pending", "running", "completed", "failed"],
+            highlightEdges: ["tool-pending-running", "tool-running-completed", "tool-running-failed"],
+          },
+          {
+            id: "confirm",
+            title: "Prepared confirm execution",
+            copy: "Confirm-tier work pauses after durable preparation, then resumes on a fresh worker after approval.",
+            detail: {
+              title: "Prepared confirm execution",
+              copy: "This is the state-machine expression of the Phase 5 prepare/await/execute split.",
+              tags: ["confirm"],
+              bullets: [
+                "prepared_operation_state is durable data, not just transient memory.",
+                "awaiting_confirmation clears worker ownership.",
+                "Fresh-worker resume re-checks policy before execute().",
+              ],
+            },
+            highlightNodes: ["pending", "running", "prepared", "confirm", "completed"],
+            highlightEdges: ["tool-pending-running", "tool-running-prepared", "tool-prepared-confirm", "tool-confirm-running", "tool-running-completed"],
+          },
+          {
+            id: "blocked",
+            title: "Blocked or invalidated resume",
+            copy: "Prepared state exists, but the child never executes because resume-time policy blocks it or the operation is invalidated.",
+            detail: {
+              title: "Blocked or invalidated resume",
+              copy: "This is the most important safety rule in the confirm lifecycle: approval history does not bypass current policy.",
+              tags: ["blocked", "invalidated"],
+              bullets: [
+                "awaiting_confirmation can end in cancelled/failed without execute().",
+                "Audit must explain blocked, invalidated, or expired resume state.",
+                "The parent batch receives deterministic failure semantics.",
+              ],
+            },
+            highlightNodes: ["running", "prepared", "confirm", "cancelled"],
+            highlightEdges: ["tool-running-prepared", "tool-prepared-confirm", "tool-confirm-cancelled"],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

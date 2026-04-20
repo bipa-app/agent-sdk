@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Checkpoint Recovery Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "sequence",
+        pageId: "checkpoint-recovery-flow",
+        rootPath: "../",
+        kicker: "Sequence View",
+        title: "Checkpoint Recovery Flow",
+        summary:
+          "Recovery is checkpoint-first. The worker never reconstructs conversation truth from half-written message rows, stale in-memory state, or speculative event streams.",
+        lanes: [
+          { id: "attempt", title: "turn_attempts", copy: "Immutable audit rows for one executed attempt.", tone: "contracts", group: "audit" },
+          { id: "checkpoint", title: "turn_checkpoints", copy: "Thread-scoped completed-turn snapshots and recovery roots.", tone: "persistence", group: "recovery" },
+          { id: "thread", title: "threads/messages", copy: "Conversation projections that must align with the latest completed checkpoint.", tone: "journal", group: "projection" },
+          { id: "journal", title: "agent_tasks", copy: "Owns task status, retries, and stale-task recovery decisions.", tone: "journal", group: "authority" },
+          { id: "loader", title: "Recovery loader", copy: "Builds the next turn seed from durable committed state only.", tone: "runtime", group: "runtime" },
+        ],
+        legend: [
+          { label: "Immutable audit", tone: "contracts" },
+          { label: "Completed-turn recovery root", tone: "persistence" },
+          { label: "Durable conversation projections", tone: "journal" },
+          { label: "Task recovery authority", tone: "journal" },
+          { label: "Fresh worker bootstrap", tone: "runtime" },
+        ],
+        scenarios: [
+          {
+            id: "clean-resume",
+            title: "Resume after a clean completed-turn commit",
+            copy: "The happy path for recovery: the latest checkpoint and thread aggregate already agree.",
+            detail: {
+              title: "Resume after a clean completed-turn commit",
+              copy: "This is the baseline recovery model. Everything else is judged against whether it preserves the same clarity.",
+              tags: ["recovery", "clean commit"],
+              bullets: [
+                "Completed-turn commit writes attempt closure, message projection, thread aggregate, and checkpoint together.",
+                "The newest checkpoint defines the next turn seed.",
+                "Recovery ignores earlier failed attempts unless needed for audit.",
+              ],
+            },
+            steps: [
+              {
+                title: "The previous turn committed cleanly",
+                copy: "A completed-turn transaction already aligned the checkpoint and user-facing projections.",
+                cards: [
+                  {
+                    lane: "attempt",
+                    title: "Attempt closed successfully",
+                    copy: "The terminal attempt row records provider/model provenance and stop reason.",
+                    meta: "immutable audit",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "checkpoint",
+                    title: "Checkpoint inserted",
+                    copy: "One full-message checkpoint now exists for the completed turn number.",
+                    meta: "thread-scoped uniqueness",
+                    tone: "persistence",
+                  },
+                  {
+                    lane: "thread",
+                    title: "Thread projections advanced",
+                    copy: "Messages and thread aggregates match the same completed turn.",
+                    meta: "no projection drift",
+                    tone: "journal",
+                  },
+                ],
+              },
+              {
+                title: "A later worker needs to continue the thread",
+                copy: "The worker never replays from thread start if a completed checkpoint exists.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Acquire next root task",
+                    copy: "Journal chooses the next runnable root task for the same thread.",
+                    meta: "fresh task or next turn",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "loader",
+                    title: "Load latest completed checkpoint",
+                    copy: "Recovery starts from the highest committed checkpoint turn number for the thread.",
+                    meta: "checkpoint-first",
+                    tone: "runtime",
+                    points: [
+                      "No need to scan all prior events.",
+                      "No dependence on partial message-store writes.",
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "crash-before-commit",
+            title: "Crash before completed-turn commit",
+            copy: "The turn attempt may exist, but the authoritative checkpoint has not advanced.",
+            detail: {
+              title: "Crash before completed-turn commit",
+              copy: "This is the central crash window that Phase 3 was designed around. Recovery must not invent durable progress that never committed.",
+              tags: ["crash window", "no false progress"],
+              bullets: [
+                "A turn attempt can exist without a new checkpoint.",
+                "Thread projections must not advance ahead of the newest completed checkpoint.",
+                "Journal policy decides retry vs terminal failure after inspecting durable side-effect state.",
+              ],
+            },
+            steps: [
+              {
+                title: "A new attempt starts but has not committed",
+                copy: "The worker may have buffered message/state changes, but they are not durable projections yet.",
+                cards: [
+                  {
+                    lane: "attempt",
+                    title: "Attempt row is open or failed",
+                    copy: "Audit can show that a turn was in progress or failed, but that is not a conversation commit.",
+                    meta: "attempt without checkpoint",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "thread",
+                    title: "No projection change",
+                    copy: "Durable messages and thread counters must still reflect the previous completed turn.",
+                    meta: "guarded commit path only",
+                    tone: "journal",
+                  },
+                ],
+              },
+              {
+                title: "Recovery loads the previous checkpoint",
+                copy: "Because there is no newer completed checkpoint, recovery falls back to the last committed turn state.",
+                cards: [
+                  {
+                    lane: "checkpoint",
+                    title: "Latest checkpoint unchanged",
+                    copy: "The older completed-turn checkpoint is still the only safe recovery root.",
+                    meta: "previous turn wins",
+                    tone: "persistence",
+                  },
+                  {
+                    lane: "loader",
+                    title: "Rebuild from previous commit",
+                    copy: "The fresh worker ignores buffered uncommitted state and seeds from the last durable checkpoint.",
+                    meta: "no speculative replay",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Journal chooses retry or failure",
+                copy: "The task lifecycle, not the recovery loader, decides whether another attempt should happen.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Apply recovery matrix",
+                    copy: "If strict side-effect state exists without a completed checkpoint, the task may fail closed instead of retrying blindly.",
+                    meta: "phase 2 invariant",
+                    tone: "journal",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "crash-after-commit",
+            title: "Crash after completed-turn commit",
+            copy: "Once the commit transaction lands, recovery can proceed immediately from the new checkpoint.",
+            detail: {
+              title: "Crash after completed-turn commit",
+              copy: "This is the whole point of the completed-turn transaction: if the process dies after commit, the durable system is already self-consistent.",
+              tags: ["post-commit crash", "stable restart"],
+              bullets: [
+                "The worker can die immediately after commit without losing durable conversation truth.",
+                "Replay, recovery, and new turn execution all see the same new checkpoint.",
+                "No post-commit background repair is needed to make the thread coherent.",
+              ],
+            },
+            steps: [
+              {
+                title: "Commit lands before the crash",
+                copy: "All durable rows for the turn are already in their new committed state.",
+                cards: [
+                  {
+                    lane: "checkpoint",
+                    title: "New checkpoint visible",
+                    copy: "The completed-turn checkpoint exists and matches the new thread turn count.",
+                    meta: "committed truth",
+                    tone: "persistence",
+                  },
+                  {
+                    lane: "thread",
+                    title: "Projections already advanced",
+                    copy: "Message history and thread aggregates are already aligned with the checkpoint.",
+                    meta: "coherent restart",
+                    tone: "journal",
+                  },
+                ],
+              },
+              {
+                title: "Fresh worker restarts from the new checkpoint",
+                copy: "The system does not need any special replay path to recover the thread after process death.",
+                cards: [
+                  {
+                    lane: "loader",
+                    title: "Resume from new checkpoint",
+                    copy: "The next worker just loads the latest completed checkpoint and continues normally.",
+                    meta: "restart-safe",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "journal",
+                    title: "Continue next task transition",
+                    copy: "Any terminal/requeue follow-up can happen after restart because the durable turn result already exists.",
+                    meta: "state survives worker death",
+                    tone: "journal",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

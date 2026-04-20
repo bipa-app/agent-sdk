@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Root Task State Machine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "state",
+        pageId: "root-task-state-machine",
+        rootPath: "../",
+        kicker: "State View",
+        title: "Root Task State Machine",
+        summary:
+          "The authoritative lifecycle for root execution. This is where thread serializability, retry safety, tool-boundary suspension, and confirmation pauses become explicit instead of implicit behavior in workers.",
+        boardWidth: 1200,
+        boardHeight: 760,
+        legend: [
+          { label: "Journal states", tone: "journal" },
+          { label: "Runtime-owned active work", tone: "runtime" },
+          { label: "Blocked on child work", tone: "subagent" },
+          { label: "Paused on confirmation", tone: "safety" },
+          { label: "Terminal outcomes", tone: "persistence" },
+        ],
+        nodes: [
+          { id: "queued", title: "queued", copy: "Stored root work waiting behind the active root for the same thread.", tone: "journal", group: "admission", x: 40, y: 40, w: 210, h: 126, points: ["Root-only state.", "No worker or lease.", "Not directly acquirable."] },
+          { id: "pending", title: "pending", copy: "Runnable root work with no current worker lease.", tone: "journal", group: "runnable", x: 320, y: 40, w: 210, h: 126, points: ["One active root per thread.", "Acquisition uses CAS guards.", "next_turn_number lives here."] },
+          { id: "running", title: "running", copy: "A worker owns one root task and one turn attempt.", tone: "runtime", group: "active", x: 600, y: 40, w: 210, h: 126, points: ["worker_id required.", "Lease + heartbeat required.", "current_turn_attempt_id set."] },
+          { id: "waiting", title: "waiting_on_children", copy: "The parent turn is suspended while child tasks or subagents execute.", tone: "subagent", group: "blocked", x: 860, y: 40, w: 250, h: 126, points: ["No inline tool blocking.", "Resume only from durable child aggregation.", "Keeps parent batch linkage."] },
+          { id: "confirm", title: "awaiting_confirmation", copy: "Execution is paused on an explicit approval boundary with durable continuation state.", tone: "safety", group: "paused", x: 600, y: 360, w: 210, h: 126, points: ["No worker or lease.", "Continuation state required.", "Resume-time policy remains authoritative."] },
+          { id: "failed", title: "failed", copy: "Terminal failure after exhausted retry budget or fail-closed safety rules.", tone: "persistence", group: "terminal", x: 320, y: 360, w: 210, h: 126, points: ["error_blob recorded.", "No worker or lease."] },
+          { id: "cancelled", title: "cancelled", copy: "Terminal cancellation after durable cancel propagation completes.", tone: "persistence", group: "terminal", x: 40, y: 360, w: 210, h: 126, points: ["No worker or lease.", "Cascades through descendants."] },
+          { id: "completed", title: "completed", copy: "Terminal success or refusal after committed turn history is durable.", tone: "persistence", group: "terminal", x: 860, y: 360, w: 250, h: 126, points: ["result_blob recorded.", "Latest checkpoint already exists for committed turns."] },
+        ],
+        edges: [
+          { id: "queued-pending", label: "promote next root", tone: "journal", copy: "When the active root leaves the thread, the oldest queued root becomes runnable.", labelX: 288, labelY: 68, points: [{ x: 250, y: 118 }, { x: 320, y: 118 }] },
+          { id: "pending-running", label: "acquire", tone: "runtime", copy: "A worker acquires the runnable root with a guarded CAS transition.", labelX: 576, labelY: 68, points: [{ x: 530, y: 118 }, { x: 600, y: 118 }] },
+          { id: "running-waiting", label: "tool or subagent boundary", tone: "subagent", copy: "Tool work or delegated subagent work moves the parent into a blocked state owned by the journal.", labelX: 864, labelY: 68, points: [{ x: 810, y: 118 }, { x: 860, y: 118 }] },
+          { id: "waiting-pending", label: "resume from child results", tone: "journal", copy: "Once the child batch settles, the parent becomes runnable again for the next root turn.", labelX: 792, labelY: 228, points: [{ x: 985, y: 166 }, { x: 985, y: 280 }, { x: 425, y: 280 }, { x: 425, y: 166 }] },
+          { id: "running-confirm", label: "pause for confirmation", tone: "safety", copy: "A root can pause on awaiting_confirmation with durable continuation state.", labelX: 696, labelY: 258, points: [{ x: 705, y: 166 }, { x: 705, y: 360 }] },
+          { id: "confirm-pending", label: "resume approved work", tone: "journal", copy: "After approval, the journal makes the task runnable again and a fresh worker continues.", labelX: 480, labelY: 327, points: [{ x: 600, y: 430 }, { x: 425, y: 430 }, { x: 425, y: 166 }] },
+          { id: "running-pending", label: "retryable requeue", tone: "journal", copy: "Retryable running failures requeue the same active root instead of letting queued roots overtake it.", labelX: 480, labelY: 152, points: [{ x: 600, y: 146 }, { x: 560, y: 146 }, { x: 560, y: 166 }, { x: 425, y: 166 }] },
+          { id: "running-completed", label: "terminal turn commit", tone: "persistence", copy: "A committed terminal turn moves the root to completed after durable projections land.", labelX: 912, labelY: 228, points: [{ x: 810, y: 146 }, { x: 985, y: 146 }, { x: 985, y: 430 }] },
+          { id: "waiting-completed", label: "resume then finish", tone: "persistence", copy: "Child results can lead to a final root turn that commits terminal state.", labelX: 1032, labelY: 327, points: [{ x: 985, y: 166 }, { x: 985, y: 430 }] },
+          { id: "running-failed", label: "exhausted or fail closed", tone: "persistence", copy: "Non-retryable failures or fail-closed safety states end the root task.", labelX: 504, labelY: 228, points: [{ x: 600, y: 146 }, { x: 425, y: 146 }, { x: 425, y: 430 }] },
+          { id: "queued-cancelled", label: "cancel before run", tone: "persistence", copy: "Queued roots can be cancelled immediately without ever becoming active.", labelX: 144, labelY: 258, points: [{ x: 145, y: 166 }, { x: 145, y: 430 }] },
+          { id: "pending-cancelled", label: "cancel runnable root", tone: "persistence", copy: "Pending roots can also be cancelled immediately.", labelX: 288, labelY: 258, points: [{ x: 425, y: 166 }, { x: 425, y: 430 }, { x: 250, y: 430 }] },
+          { id: "confirm-cancelled", label: "cancel paused root", tone: "persistence", copy: "Confirmation-paused roots can be cancelled without resuming execution.", labelX: 480, labelY: 433, points: [{ x: 600, y: 486 }, { x: 250, y: 486 }] },
+        ],
+        scenarios: [
+          {
+            id: "normal-loop",
+            title: "Normal multi-turn loop",
+            copy: "The standard path through pending, running, optional waiting_on_children, and back to pending until the root completes.",
+            detail: {
+              title: "Normal multi-turn loop",
+              copy: "This focus mode isolates the root lifecycle that repeats every time the same thread needs another turn or child batch.",
+              tags: ["normal loop"],
+              bullets: [
+                "queued roots only exist for admission control.",
+                "running owns one active turn attempt.",
+                "waiting_on_children blocks the parent while child work finishes.",
+                "completed is only reached after a committed terminal turn.",
+              ],
+            },
+            highlightNodes: ["queued", "pending", "running", "waiting", "completed"],
+            highlightEdges: ["queued-pending", "pending-running", "running-waiting", "waiting-pending", "running-completed", "waiting-completed"],
+          },
+          {
+            id: "confirmation",
+            title: "Confirmation pause and resume",
+            copy: "A root pauses durably on awaiting_confirmation, then re-enters pending for a fresh worker to continue.",
+            detail: {
+              title: "Confirmation pause and resume",
+              copy: "The paused state is durable and unleased. That is what makes restart-safe confirmation possible.",
+              tags: ["confirmation"],
+              bullets: [
+                "awaiting_confirmation is not running work.",
+                "Continuation state must be durable before the worker leaves.",
+                "Resume-time policy still decides whether work can continue.",
+              ],
+            },
+            highlightNodes: ["pending", "running", "confirm", "cancelled"],
+            highlightEdges: ["pending-running", "running-confirm", "confirm-pending", "confirm-cancelled"],
+          },
+          {
+            id: "failure",
+            title: "Retry and terminal failure rules",
+            copy: "Retryable failures return to pending. Exhausted or unsafe failures move to failed.",
+            detail: {
+              title: "Retry and terminal failure rules",
+              copy: "This is the state-machine view of the Phase 2 recovery matrix and Phase 5 fail-closed rules.",
+              tags: ["failure", "retry"],
+              bullets: [
+                "Retry only happens through a guarded running -> pending transition.",
+                "queued roots do not overtake the active root during retry.",
+                "Terminal failed means the task cannot be resumed safely.",
+              ],
+            },
+            highlightNodes: ["pending", "running", "failed", "cancelled"],
+            highlightEdges: ["pending-running", "running-pending", "running-failed", "pending-cancelled", "queued-cancelled"],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

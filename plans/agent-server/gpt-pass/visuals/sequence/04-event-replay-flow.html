@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Event Replay Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "sequence",
+        pageId: "event-replay-flow",
+        rootPath: "../",
+        kicker: "Sequence View",
+        title: "Event Replay Flow",
+        summary:
+          "Committed envelopes are the only source of truth. Live tail is an optimization layered on top of the durable event journal, and lag recovery always returns to after_sequence replay.",
+        lanes: [
+          { id: "worker", title: "Worker", copy: "Root or tool worker producing replayable events.", tone: "runtime", group: "producer" },
+          { id: "commit", title: "Event committer", copy: "Allocates thread-scoped sequence numbers and stamps commit timestamps.", tone: "events", group: "commit" },
+          { id: "events", title: "events", copy: "Canonical append-only AgentEventEnvelope journal.", tone: "events", group: "journal" },
+          { id: "tail", title: "Local tail hub", copy: "Same-process live notifications over committed envelopes only.", tone: "ops", group: "live tail" },
+          { id: "subscriber", title: "Subscriber", copy: "Replay-first client or server-side watch session.", tone: "contracts", group: "reader" },
+        ],
+        legend: [
+          { label: "Runtime producer", tone: "runtime" },
+          { label: "Committed sequence authority", tone: "events" },
+          { label: "Local live tail", tone: "ops" },
+          { label: "Client-facing contract", tone: "contracts" },
+        ],
+        scenarios: [
+          {
+            id: "live-tail",
+            title: "Normal replay-to-live handoff",
+            copy: "The subscriber gets committed backlog first, then switches to committed live notifications with no race gap.",
+            detail: {
+              title: "Normal replay-to-live handoff",
+              copy: "This is the default watch experience. Live streaming is useful, but correctness still comes entirely from the committed log.",
+              tags: ["replay", "live tail"],
+              bullets: [
+                "Workers never publish live-only raw events.",
+                "after_sequence is exclusive and thread-scoped.",
+                "The handoff watermarks the log before switching to live notifications.",
+              ],
+            },
+            steps: [
+              {
+                title: "Worker emits a replayable event",
+                copy: "The event does not go straight to a channel or subscriber.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "Produce replayable AgentEvent",
+                    copy: "Thinking, text, tool progress, or lifecycle events all enter the same server event path.",
+                    meta: "one event path",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "commit",
+                    title: "Reserve sequence at commit time",
+                    copy: "The server assigns thread-scoped sequence and timestamp only when the durable write succeeds.",
+                    meta: "server-owned ordering",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Commit envelope before fanout",
+                copy: "Durable insert happens before hooks or local live notification observe the event.",
+                cards: [
+                  {
+                    lane: "events",
+                    title: "Append committed envelope",
+                    copy: "events(thread_id, sequence) stays canonical and append-only.",
+                    meta: "authoritative log",
+                    tone: "events",
+                  },
+                  {
+                    lane: "tail",
+                    title: "Notify tail hub",
+                    copy: "Local watch sessions receive only the already-committed envelope.",
+                    meta: "committed-only live tail",
+                    tone: "ops",
+                  },
+                ],
+              },
+              {
+                title: "Subscriber attaches safely",
+                copy: "Replay and live tail meet at a committed watermark, not at a race-prone current cursor guess.",
+                cards: [
+                  {
+                    lane: "subscriber",
+                    title: "Attach with after_sequence",
+                    copy: "The caller says which committed sequence they have already processed.",
+                    meta: "exclusive cursor",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "tail",
+                    title: "Capture watermark then replay",
+                    copy: "The server replays > after_sequence && <= watermark before switching the session to live notifications.",
+                    meta: "race-free handoff",
+                    tone: "ops",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "lagged-subscriber",
+            title: "Lagged subscriber disconnect",
+            copy: "Slow clients do not stall workers. They are disconnected cleanly and told to replay from the last durable sequence they consumed.",
+            detail: {
+              title: "Lagged subscriber disconnect",
+              copy: "Backpressure must be bounded. Workers cannot block on subscriber drain without compromising execution correctness and availability.",
+              tags: ["backpressure", "lag"],
+              bullets: [
+                "Each subscriber has a bounded live buffer.",
+                "Overflow triggers a short grace period, not unbounded blocking.",
+                "Recovery is always reconnect + after_sequence replay.",
+              ],
+            },
+            steps: [
+              {
+                title: "Committed events keep arriving",
+                copy: "The worker and event journal continue normally regardless of one slow subscriber.",
+                cards: [
+                  {
+                    lane: "events",
+                    title: "Canonical log keeps advancing",
+                    copy: "Durable sequence allocation is unaffected by slow consumers.",
+                    meta: "correctness unaffected",
+                    tone: "events",
+                  },
+                  {
+                    lane: "tail",
+                    title: "Subscriber buffer fills",
+                    copy: "The tail hub detects that one session is not draining fast enough.",
+                    meta: "bounded buffer",
+                    tone: "ops",
+                  },
+                ],
+              },
+              {
+                title: "Server stops enqueuing live notifications",
+                copy: "The lagged subscriber enters bounded wait, but workers never block.",
+                cards: [
+                  {
+                    lane: "tail",
+                    title: "Grace period starts",
+                    copy: "Existing buffered envelopes may drain briefly; no new ones are queued for that session.",
+                    meta: "bounded wait",
+                    tone: "ops",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Execution continues",
+                    copy: "The producer path remains decoupled from subscriber consumption.",
+                    meta: "no backpressure on workers",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Subscriber reconnects through replay",
+                copy: "The session closes with replay-required metadata and the client restarts from its last durable sequence.",
+                cards: [
+                  {
+                    lane: "subscriber",
+                    title: "Receive replay-required close",
+                    copy: "The client learns the last committed sequence it definitely received.",
+                    meta: "explicit recovery point",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "events",
+                    title: "Replay fills the gap",
+                    copy: "Reconnect with after_sequence returns the missing committed envelopes exactly once.",
+                    meta: "gap-free recovery",
+                    tone: "events",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "restart-replay",
+            title: "Replay after process restart",
+            copy: "The log survives worker death or server restart because replay never depended on live-only memory.",
+            detail: {
+              title: "Replay after process restart",
+              copy: "This is the test that distinguishes a real durable event system from a fancy channel fanout.",
+              tags: ["restart", "replay"],
+              bullets: [
+                "Same-process live tail can disappear on restart.",
+                "The committed events table remains the single replay source.",
+                "Cross-instance watch later reuses the same replay path.",
+              ],
+            },
+            steps: [
+              {
+                title: "Process or worker dies",
+                copy: "All in-memory tail sessions vanish, but the canonical events table remains.",
+                cards: [
+                  {
+                    lane: "tail",
+                    title: "Local tail disappears",
+                    copy: "Same-process live state is intentionally not part of correctness.",
+                    meta: "ephemeral layer",
+                    tone: "ops",
+                  },
+                  {
+                    lane: "events",
+                    title: "Committed log survives",
+                    copy: "Every replayable event already exists in the durable journal.",
+                    meta: "authoritative durability",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Subscriber reconnects to a fresh server instance",
+                copy: "The client does not need a special restart path beyond normal after_sequence replay.",
+                cards: [
+                  {
+                    lane: "subscriber",
+                    title: "Reconnect with after_sequence",
+                    copy: "The client sends the last durable sequence it processed before the outage.",
+                    meta: "same client contract",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "commit",
+                    title: "Resume sequence assignment later",
+                    copy: "New events keep using the thread cursor; old committed events keep their exact sequence numbers.",
+                    meta: "stable numbering",
+                    tone: "events",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

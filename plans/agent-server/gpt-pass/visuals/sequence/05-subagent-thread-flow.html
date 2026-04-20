@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Subagent Thread Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "sequence",
+        pageId: "subagent-thread-flow",
+        rootPath: "../",
+        kicker: "Sequence View",
+        title: "Subagent Thread Flow",
+        summary:
+          "Subagents are durable child threads, not inline side loops. The parent sees summary progress and a final structured result while the child thread owns its own checkpoints, tools, and replay history.",
+        lanes: [
+          { id: "parent", title: "Parent root task", copy: "The current root turn that requested delegated work.", tone: "runtime", group: "parent" },
+          { id: "invocation", title: "subagent task", copy: "Parent-visible invocation task that supervises the child thread.", tone: "subagent", group: "supervisor" },
+          { id: "childthread", title: "Child thread", copy: "A new conversation thread with its own root task chain.", tone: "journal", group: "thread" },
+          { id: "childworker", title: "Child worker", copy: "Standard root/tool workers reused inside the child thread.", tone: "runtime", group: "runtime" },
+          { id: "childevents", title: "Child replay", copy: "Full child event stream stays on the child thread.", tone: "events", group: "visibility" },
+          { id: "parentresult", title: "Parent result", copy: "Summary progress and final SubagentResult returned to the parent thread.", tone: "contracts", group: "surface" },
+        ],
+        legend: [
+          { label: "Parent runtime", tone: "runtime" },
+          { label: "Durable child-supervisor state", tone: "subagent" },
+          { label: "Child thread authority", tone: "journal" },
+          { label: "Child replay surface", tone: "events" },
+          { label: "Parent-facing result", tone: "contracts" },
+        ],
+        scenarios: [
+          {
+            id: "subagent-success",
+            title: "Successful delegated execution",
+            copy: "The subagent runs in its own thread, then resolves the parent invocation task with structured results and child references.",
+            detail: {
+              title: "Successful delegated execution",
+              copy: "The important design move is that the child thread reuses the same runtime model as any root thread instead of inventing a special in-memory subagent engine.",
+              tags: ["subagent", "success"],
+              bullets: [
+                "Spawn allocates a new child_thread_id and initial child root task.",
+                "The invocation task blocks on durable child state, not on hidden channels.",
+                "Parent result includes child refs for independent replay and inspection.",
+              ],
+            },
+            steps: [
+              {
+                title: "Parent turn requests a subagent",
+                copy: "The parent reaches a confirm-tier spawn action and the server resolves the effective child spec.",
+                cards: [
+                  {
+                    lane: "parent",
+                    title: "Request delegated work",
+                    copy: "The model requests a subagent with task, prompt, model hints, and capability profile.",
+                    meta: "confirm-tier spawn",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "invocation",
+                    title: "Resolve effective child spec",
+                    copy: "Server policy narrows the requested config through inherited limits and capability profiles.",
+                    meta: "cannot widen parent policy",
+                    tone: "subagent",
+                  },
+                ],
+              },
+              {
+                title: "Server allocates the child thread",
+                copy: "Spawn creates a durable child thread and a new child root task instead of an inline loop.",
+                cards: [
+                  {
+                    lane: "invocation",
+                    title: "Create invocation task",
+                    copy: "The subagent tool call becomes its own durable supervisor task.",
+                    meta: "parent-visible child task",
+                    tone: "subagent",
+                  },
+                  {
+                    lane: "childthread",
+                    title: "Allocate child thread and root task",
+                    copy: "Persist child_thread_id, child_root_task_id, and durable linkage back to the parent.",
+                    meta: "new thread tree",
+                    tone: "journal",
+                  },
+                ],
+              },
+              {
+                title: "Child thread executes normally",
+                copy: "The child thread reuses root-turn, tool-runtime, checkpoint, and replay behavior from earlier phases.",
+                cards: [
+                  {
+                    lane: "childworker",
+                    title: "Run child turns and tools",
+                    copy: "The child can take many turns, spawn tools, and checkpoint exactly like a normal thread.",
+                    meta: "no second engine",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "childevents",
+                    title: "Keep full child replay on child thread",
+                    copy: "The parent does not mirror the full child event stream into its own thread.",
+                    meta: "summary-only parent visibility",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Invocation task resolves parent result",
+                copy: "Once the child subtree is terminal, the supervisor task materializes the final parent-facing tool result.",
+                cards: [
+                  {
+                    lane: "invocation",
+                    title: "Aggregate child terminal state",
+                    copy: "The invocation task reads durable child results, usage, tool logs, and final response.",
+                    meta: "terminal child state only",
+                    tone: "subagent",
+                  },
+                  {
+                    lane: "parentresult",
+                    title: "Return SubagentResult",
+                    copy: "The parent gets final response, summary metrics, and child refs for deeper inspection.",
+                    meta: "child_thread_id included",
+                    tone: "contracts",
+                    points: [
+                      "child_thread_id",
+                      "child_root_task_id",
+                      "subagent_task_id",
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "subagent-failure",
+            title: "Child failure mapped to parent tool error",
+            copy: "A failed child thread does not directly blow up the parent task. It resolves into a deterministic failed tool result instead.",
+            detail: {
+              title: "Child failure mapped to parent tool error",
+              copy: "The parent runtime stays coherent because child failure is translated at the invocation-task boundary, not leaked as an uncontrolled runtime crash.",
+              tags: ["subagent", "failure mapping"],
+              bullets: [
+                "Child max-turn exhaustion and timeout are child terminal states.",
+                "The invocation task maps them into a deterministic parent tool error.",
+                "The parent can decide what to do next in the next root turn.",
+              ],
+            },
+            steps: [
+              {
+                title: "Child thread reaches a terminal failure state",
+                copy: "The failure belongs to the child thread and its durable task tree first.",
+                cards: [
+                  {
+                    lane: "childthread",
+                    title: "Child task tree fails",
+                    copy: "Timeout, max-turn exhaustion, or terminal child failure closes the child thread.",
+                    meta: "child-owned terminal state",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "childevents",
+                    title: "Child replay explains why",
+                    copy: "Operators can inspect the child thread directly through its own event stream and checkpoints.",
+                    meta: "separate replay surface",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Invocation task translates failure",
+                copy: "The parent-visible task resolves from durable child terminal state instead of rethrowing the child internals.",
+                cards: [
+                  {
+                    lane: "invocation",
+                    title: "Map child failure to tool result",
+                    copy: "The supervisor task produces an error SubagentResult with the failed child references.",
+                    meta: "deterministic translation",
+                    tone: "subagent",
+                  },
+                  {
+                    lane: "parentresult",
+                    title: "Parent receives stable error result",
+                    copy: "The parent turn sees a tool result it can reason about, not an invisible runtime crash.",
+                    meta: "parent remains coherent",
+                    tone: "contracts",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "subagent-cancel",
+            title: "Cascade cancellation through descendants",
+            copy: "Parent cancellation propagates through invocation task, child thread, child tools, and nested subagents.",
+            detail: {
+              title: "Cascade cancellation through descendants",
+              copy: "Cancellation must be tree-shaped and durable. Otherwise nested delegated work leaks after the parent task is already gone.",
+              tags: ["subagent", "cancellation"],
+              bullets: [
+                "Cancellation walks the whole descendant tree.",
+                "The child thread and its nested tasks do not outlive the parent by accident.",
+                "After restart, the journal can continue propagating cancellation from durable parent state.",
+              ],
+            },
+            steps: [
+              {
+                title: "Parent root is cancelled",
+                copy: "The journal records cancellation on the parent and begins descendant propagation.",
+                cards: [
+                  {
+                    lane: "parent",
+                    title: "Parent cancel requested",
+                    copy: "The parent root task becomes the origin of a durable cancellation cascade.",
+                    meta: "cancel_requested_at set",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "invocation",
+                    title: "Invocation task marked for cancellation",
+                    copy: "The subagent supervisor task becomes part of the same descendant cancellation tree.",
+                    meta: "same root ancestry",
+                    tone: "subagent",
+                  },
+                ],
+              },
+              {
+                title: "Child descendants are cancelled",
+                copy: "The cancellation tree reaches the child root task, child tool tasks, and any nested subagents.",
+                cards: [
+                  {
+                    lane: "childthread",
+                    title: "Cancel child root task",
+                    copy: "The child thread stops receiving new runnable work and closes through journal transitions.",
+                    meta: "durable cascade",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "childworker",
+                    title: "Stop running descendants",
+                    copy: "Active child tool workers or nested subagents observe the durable cancellation and terminate cleanly.",
+                    meta: "recursive cancellation",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Invocation task resolves cancellation to the parent",
+                copy: "The parent-facing result reflects cancellation once the descendant tree reaches terminal state.",
+                cards: [
+                  {
+                    lane: "parentresult",
+                    title: "Surface cancelled delegated work",
+                    copy: "The parent receives a deterministic cancelled/error result rather than leaving orphaned delegated execution behind.",
+                    meta: "no leaked descendants",
+                    tone: "contracts",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

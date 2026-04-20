@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Authority And Commit Map</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "state",
+        pageId: "authority-commit-map",
+        rootPath: "../",
+        kicker: "State View",
+        title: "Authority And Commit Map",
+        summary:
+          "A cleaner replacement for the dense all-in-one architecture board. The boxes fit on a fixed grid, and every line answers one question: who owns this decision, and where does it become durable?",
+        boardWidth: 1200,
+        boardHeight: 760,
+        legend: [
+          { label: "Contracts", tone: "contracts" },
+          { label: "Journal authority", tone: "journal" },
+          { label: "Runtime workers", tone: "runtime" },
+          { label: "Committed persistence", tone: "persistence" },
+          { label: "Replay and ops layers", tone: "events" },
+        ],
+        nodes: [
+          { id: "contracts", title: "SDK contracts", copy: "run_turn, continuation envelopes, event barrier, and audit surfaces.", tone: "contracts", group: "contract", x: 40, y: 60, w: 260, h: 132, points: ["Defines the server-safe SDK boundary.", "Outcome visibility follows event flush."] },
+          { id: "journal", title: "agent_tasks journal", copy: "Scheduling, leases, retries, waiting states, child trees, and recovery authority.", tone: "journal", group: "authority", x: 450, y: 60, w: 300, h: 132, points: ["The only scheduler of runnable work.", "Owns root and child task state."] },
+          { id: "persistence", title: "Turn persistence", copy: "threads, messages, turn_attempts, and completed-turn checkpoints.", tone: "persistence", group: "commit", x: 880, y: 60, w: 260, h: 132, points: ["Advances only on completed-turn commit.", "Checkpoint-first recovery root."] },
+          { id: "rootworker", title: "Root turn worker", copy: "Executes exactly one externally orchestrated turn, then returns to the journal.", tone: "runtime", group: "runtime", x: 110, y: 320, w: 280, h: 132, points: ["Never owns queue correctness.", "Never commits mid-turn durable history."] },
+          { id: "tooltasks", title: "Tool runtime tasks", copy: "Lightweight child tasks for tool execution, confirmation, and replay-safe restart.", tone: "safety", group: "child runtime", x: 450, y: 320, w: 300, h: 132, points: ["One task per tool call.", "Parent suspends cleanly while children run."] },
+          { id: "events", title: "Durable events", copy: "Committed envelope journal, replay, and bounded local live tail.", tone: "events", group: "replay", x: 880, y: 320, w: 260, h: 132, points: ["Replay is authoritative.", "Live tail is committed-only."] },
+          { id: "subagents", title: "Durable subagents", copy: "Child threads, inherited policy, summary progress, and cascade cancellation.", tone: "subagent", group: "delegation", x: 200, y: 580, w: 280, h: 132, points: ["Subagents reuse the same runtime model.", "Parent sees summary progress only."] },
+          { id: "ops", title: "Outbox and GA ops", copy: "Wakeup nudges, cross-instance fanout, retention floors, and degraded-mode health.", tone: "ops", group: "ops", x: 750, y: 580, w: 260, h: 132, points: ["Advisory transport only.", "Correctness does not depend on broker health."] },
+        ],
+        edges: [
+          { id: "contracts-journal", label: "authoritative boundary feeds authority", tone: "contracts", copy: "The SDK contract exists so the journal and workers can reason about exact turn outcomes and continuation state.", labelX: 372, labelY: 68, points: [{ x: 300, y: 126 }, { x: 450, y: 126 }] },
+          { id: "journal-persistence", label: "guarded commit path", tone: "journal", copy: "The journal hands committed outcomes into the persistence layer through explicit transaction boundaries.", labelX: 816, labelY: 68, points: [{ x: 750, y: 126 }, { x: 880, y: 126 }] },
+          { id: "journal-rootworker", label: "acquire runnable root", tone: "runtime", copy: "Workers never self-schedule. The journal decides which root is runnable and safe to lease.", labelX: 336, labelY: 213, points: [{ x: 600, y: 192 }, { x: 600, y: 264 }, { x: 390, y: 264 }, { x: 390, y: 320 }] },
+          { id: "rootworker-persistence", label: "completed-turn commit", tone: "persistence", copy: "The root worker only advances thread history through the Phase 3 completed-turn transaction.", labelX: 672, labelY: 266, points: [{ x: 390, y: 386 }, { x: 390, y: 260 }, { x: 1010, y: 260 }, { x: 1010, y: 192 }] },
+          { id: "rootworker-tooltasks", label: "tool boundary handoff", tone: "safety", copy: "The root suspends at tool boundaries and hands control to child tasks instead of executing inline.", labelX: 504, labelY: 403, points: [{ x: 390, y: 386 }, { x: 450, y: 386 }] },
+          { id: "tooltasks-journal", label: "child lifecycle authority", tone: "journal", copy: "Child tasks still live inside the same journal and recovery model as root tasks.", labelX: 600, labelY: 273, points: [{ x: 600, y: 320 }, { x: 600, y: 192 }] },
+          { id: "tooltasks-events", label: "tool lifecycle events", tone: "events", copy: "ToolCallStart, progress, requires confirmation, and ToolCallEnd all commit through the same event authority.", labelX: 840, labelY: 403, points: [{ x: 750, y: 386 }, { x: 880, y: 386 }] },
+          { id: "persistence-events", label: "commit-aligned lifecycle events", tone: "events", copy: "TurnComplete, Done, Refusal, Error, and ContextCompacted align with the durable state mutation they describe.", labelX: 1032, labelY: 213, points: [{ x: 1010, y: 192 }, { x: 1010, y: 320 }] },
+          { id: "journal-subagents", label: "descendant task trees", tone: "subagent", copy: "Subagents become child threads and invocation tasks linked through the same journal hierarchy.", labelX: 360, labelY: 501, points: [{ x: 600, y: 192 }, { x: 600, y: 530 }, { x: 340, y: 530 }, { x: 340, y: 580 }] },
+          { id: "events-ops", label: "watch notifications", tone: "ops", copy: "Outbox fanout only nudges watchers that a thread advanced; clients still replay from events.", labelX: 912, labelY: 547, points: [{ x: 1010, y: 452 }, { x: 1010, y: 580 }, { x: 880, y: 580 }] },
+        ],
+        scenarios: [
+          {
+            id: "core-turn",
+            title: "Core turn path",
+            copy: "The minimum durable server loop from contract to journal to completed-turn commit and committed events.",
+            detail: {
+              title: "Core turn path",
+              copy: "This is the backbone of the whole design. Everything else extends it but should not dilute its boundaries.",
+              tags: ["core"],
+              bullets: [
+                "SDK contracts define the safe boundary.",
+                "agent_tasks decides runnable work.",
+                "The root worker runs one turn.",
+                "Persistence and events advance only through explicit commit paths.",
+              ],
+            },
+            highlightNodes: ["contracts", "journal", "rootworker", "persistence", "events"],
+            highlightEdges: ["contracts-journal", "journal-rootworker", "rootworker-persistence", "persistence-events"],
+          },
+          {
+            id: "tool-child",
+            title: "Tool child-task extension",
+            copy: "The core turn path extends into child tasks without reintroducing inline blocking or hidden ownership.",
+            detail: {
+              title: "Tool child-task extension",
+              copy: "This view isolates the biggest architectural change: tools stop being synchronous root-loop operations and become proper durable tasks.",
+              tags: ["tool tasks"],
+              bullets: [
+                "Root worker suspends at the tool boundary.",
+                "Child tasks own execution, confirmation, and replay-safe restart.",
+                "The journal remains the scheduler for both root and child work.",
+              ],
+            },
+            highlightNodes: ["journal", "rootworker", "tooltasks", "events"],
+            highlightEdges: ["journal-rootworker", "rootworker-tooltasks", "tooltasks-journal", "tooltasks-events"],
+          },
+          {
+            id: "ops-layer",
+            title: "Delegation and ops layers",
+            copy: "Subagents and outbox/broker work remain secondary layers over the same durable core.",
+            detail: {
+              title: "Delegation and ops layers",
+              copy: "This is where the design resists feature creep. Subagents and broker fanout add capability, but they do not get to redefine authority or durability.",
+              tags: ["subagents", "ops"],
+              bullets: [
+                "Subagents are child threads, not a new execution engine.",
+                "Outbox and broker fanout are advisory transport only.",
+                "Replay and journal state stay authoritative even during degraded mode.",
+              ],
+            },
+            highlightNodes: ["journal", "subagents", "events", "ops"],
+            highlightEdges: ["journal-subagents", "events-ops"],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

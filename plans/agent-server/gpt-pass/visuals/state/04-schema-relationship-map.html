@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Schema Relationship Map</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "state",
+        pageId: "schema-relationship-map",
+        rootPath: "../",
+        kicker: "State View",
+        title: "Schema Relationship Map",
+        summary:
+          "The final durable model at the table level. This is the database view that anchors thread recovery, task authority, tool safety, and event replay.",
+        boardWidth: 1200,
+        boardHeight: 780,
+        legend: [
+          { label: "Conversation projections", tone: "persistence" },
+          { label: "Execution authority", tone: "journal" },
+          { label: "Tool durability", tone: "safety" },
+          { label: "Replay surfaces", tone: "events" },
+          { label: "Advisory transport", tone: "ops" },
+        ],
+        nodes: [
+          { id: "threads", title: "threads", copy: "Conversation aggregate and thread-scoped counters.", tone: "persistence", group: "projection", x: 40, y: 60, w: 210, h: 132, points: ["One row per user-facing thread.", "turn_count tracks committed turns only."] },
+          { id: "messages", title: "messages", copy: "Durable message projection ordered per thread.", tone: "persistence", group: "projection", x: 320, y: 60, w: 210, h: 132, points: ["Stores serialized llm::Message.", "Written only on completed-turn commit."] },
+          { id: "attempts", title: "turn_attempts", copy: "Immutable audit of one executed turn attempt.", tone: "contracts", group: "audit", x: 600, y: 60, w: 210, h: 132, points: ["Unique by thread/turn/attempt.", "Holds provider/model provenance."] },
+          { id: "checkpoints", title: "turn_checkpoints", copy: "Thread-scoped completed-turn recovery snapshots.", tone: "persistence", group: "recovery", x: 880, y: 60, w: 210, h: 132, points: ["One per thread per completed turn.", "Stores message snapshot plus agent state."] },
+          { id: "tasks", title: "agent_tasks", copy: "Root and child execution authority, leases, retries, and waiting states.", tone: "journal", group: "authority", x: 180, y: 320, w: 270, h: 132, points: ["Owns root and child task trees.", "One active root per thread."] },
+          { id: "tool_exec", title: "tool_executions", copy: "Stable operation identity and prepared-operation durability.", tone: "safety", group: "tool durability", x: 510, y: 320, w: 270, h: 132, points: ["Prevents blind re-execution.", "Stores prepared snapshots and revisions."] },
+          { id: "tool_log", title: "tool_call_log", copy: "Append-only audit of tool lifecycle outcomes and redaction decisions.", tone: "safety", group: "audit", x: 860, y: 320, w: 220, h: 132, points: ["Supports forensics and supportability.", "Explains blocked/replayed/cached paths."] },
+          { id: "events", title: "events", copy: "Committed AgentEventEnvelope journal for replay and live tail.", tone: "events", group: "replay", x: 40, y: 580, w: 210, h: 132, points: ["Append-only canonical event log.", "Unique (thread_id, sequence)."] },
+          { id: "msgs", title: "msgs", copy: "Transactional outbox rows for task wakeups and watch notifications.", tone: "ops", group: "advisory", x: 880, y: 580, w: 210, h: 132, points: ["Outbox only.", "Never authoritative execution state."] },
+        ],
+        edges: [
+          { id: "threads-messages", label: "owns history", tone: "persistence", copy: "threads own ordered message history, but writes happen only on completed-turn commit.", labelX: 216, labelY: 68, points: [{ x: 250, y: 126 }, { x: 320, y: 126 }] },
+          { id: "threads-checkpoints", label: "recover thread", tone: "persistence", copy: "Recovery anchors on the latest completed checkpoint for the thread, not on replaying from thread start.", labelX: 624, labelY: 68, points: [{ x: 145, y: 84 }, { x: 145, y: 48 }, { x: 985, y: 48 }, { x: 985, y: 84 }] },
+          { id: "attempts-checkpoints", label: "checkpoint source", tone: "persistence", copy: "Completed turn attempts are the audited source that produces checkpoints.", labelX: 840, labelY: 68, points: [{ x: 810, y: 126 }, { x: 880, y: 126 }] },
+          { id: "tasks-attempts", label: "current attempt", tone: "journal", copy: "agent_tasks points to the active turn attempt while work is running.", labelX: 432, labelY: 251, points: [{ x: 450, y: 386 }, { x: 600, y: 192 }] },
+          { id: "tasks-tool_exec", label: "tool task state", tone: "safety", copy: "Tool child tasks use tool_executions to persist stable operation identity and prepared state.", labelX: 492, labelY: 403, points: [{ x: 450, y: 386 }, { x: 510, y: 386 }] },
+          { id: "tool_exec-tool_log", label: "audit and result", tone: "safety", copy: "tool_call_log explains what happened to each durable tool operation.", labelX: 816, labelY: 403, points: [{ x: 780, y: 386 }, { x: 860, y: 386 }] },
+          { id: "attempts-events", label: "turn provenance", tone: "events", copy: "Replayable event rows carry turn provenance back to the attempt that produced them.", labelX: 396, labelY: 547, points: [{ x: 600, y: 192 }, { x: 145, y: 580 }] },
+          { id: "events-msgs", label: "watch notifications", tone: "ops", copy: "Outbox notifications only tell other instances that a thread advanced; they do not replace replay.", labelX: 600, labelY: 684, points: [{ x: 250, y: 646 }, { x: 880, y: 646 }] },
+          { id: "tasks-msgs", label: "task wakeups", tone: "ops", copy: "Wakeup outbox rows nudge worker acquisition loops but never authorize execution on their own.", labelX: 600, labelY: 547, points: [{ x: 450, y: 452 }, { x: 450, y: 646 }, { x: 880, y: 646 }] },
+        ],
+        scenarios: [
+          {
+            id: "recovery",
+            title: "Thread recovery path",
+            copy: "Focus on the tables that must agree for completed-turn recovery to be trustworthy.",
+            detail: {
+              title: "Thread recovery path",
+              copy: "This is the Phase 3 core. If these four tables drift, the entire thread model becomes ambiguous.",
+              tags: ["recovery"],
+              bullets: [
+                "threads and messages are projections.",
+                "turn_attempts are immutable audit.",
+                "turn_checkpoints are the recovery root.",
+                "Completed-turn commit keeps them aligned.",
+              ],
+            },
+            highlightNodes: ["threads", "messages", "attempts", "checkpoints"],
+            highlightEdges: ["threads-messages", "threads-checkpoints", "attempts-checkpoints"],
+          },
+          {
+            id: "tool-safety",
+            title: "Tool replay-safety path",
+            copy: "Focus on the tables that prevent unsafe re-execution of tool side effects.",
+            detail: {
+              title: "Tool replay-safety path",
+              copy: "This is the Phase 5 durability boundary: child task state plus execution identity plus lifecycle audit.",
+              tags: ["tools", "safety"],
+              bullets: [
+                "agent_tasks owns the child lifecycle.",
+                "tool_executions owns stable operation identity.",
+                "tool_call_log explains the full lifecycle.",
+              ],
+            },
+            highlightNodes: ["tasks", "tool_exec", "tool_log"],
+            highlightEdges: ["tasks-tool_exec", "tool_exec-tool_log"],
+          },
+          {
+            id: "replay-ops",
+            title: "Replay and advisory transport",
+            copy: "Focus on the difference between canonical event replay and outbox-only wakeup/fanout.",
+            detail: {
+              title: "Replay and advisory transport",
+              copy: "This is the Phase 6/8 seam. events is canonical. msgs is only an optimization layer over durable state.",
+              tags: ["events", "ops"],
+              bullets: [
+                "events is append-only and replay-authoritative.",
+                "msgs only carries advisory wakeup and watch notifications.",
+                "Cross-instance recovery always returns to replay.",
+              ],
+            },
+            highlightNodes: ["events", "msgs", "attempts", "tasks"],
+            highlightEdges: ["attempts-events", "events-msgs", "tasks-msgs"],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

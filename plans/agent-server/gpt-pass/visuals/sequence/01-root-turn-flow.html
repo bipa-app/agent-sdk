@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Root Turn Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "sequence",
+        pageId: "root-turn-flow",
+        rootPath: "../",
+        kicker: "Sequence View",
+        title: "Root Turn Flow",
+        summary:
+          "One externally orchestrated turn from journal acquisition to completed-turn commit. This page is the canonical starting point because every other runtime path builds on the same turn boundary and commit barrier.",
+        lanes: [
+          { id: "journal", title: "agent_tasks", copy: "Runnable root ownership, leases, retries, and resume state.", tone: "journal", group: "authority" },
+          { id: "worker", title: "Root worker", copy: "Acquires one root task and owns exactly one turn attempt.", tone: "runtime", group: "runtime" },
+          { id: "boundary", title: "run_turn", copy: "Direct async SDK boundary with event completion barrier.", tone: "contracts", group: "contract" },
+          { id: "persistence", title: "Turn persistence", copy: "turn_attempts, messages, checkpoints, and thread aggregates.", tone: "persistence", group: "commit" },
+          { id: "events", title: "Durable events", copy: "Committed envelopes, replay, and local live tail.", tone: "events", group: "events" },
+        ],
+        legend: [
+          { label: "Contract boundary", tone: "contracts" },
+          { label: "Journal authority", tone: "journal" },
+          { label: "Runtime execution", tone: "runtime" },
+          { label: "Committed persistence", tone: "persistence" },
+          { label: "Committed events", tone: "events" },
+        ],
+        scenarios: [
+          {
+            id: "text-success",
+            title: "Text-only success path",
+            copy: "The simplest durable path: no child work, no confirmation, one committed checkpoint.",
+            detail: {
+              title: "Text-only success path",
+              copy: "This is the minimum stable server loop. If this path is not exact, every more complex flow inherits ambiguity.",
+              tags: ["root turn", "happy path"],
+              bullets: [
+                "Journal authority selects one runnable root task.",
+                "Worker seeds staged stores from the latest completed checkpoint.",
+                "run_turn emits committed events as it goes and only resolves after the event barrier.",
+                "The worker closes the attempt and commits projections atomically.",
+              ],
+            },
+            steps: [
+              {
+                title: "Acquire one runnable root task",
+                copy: "The worker becomes the temporary owner of one root task and one turn attempt.",
+                detail: {
+                  title: "Acquire one runnable root task",
+                  copy: "No queue payload is authoritative here. The worker always re-checks durable task state before doing any work.",
+                  tags: ["lease", "ownership"],
+                  bullets: [
+                    "Only one active root exists per thread.",
+                    "CAS guards the transition from pending to running.",
+                    "The task carries the next turn number and current checkpoint provenance.",
+                  ],
+                },
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Lease the task",
+                    copy: "Move the root from pending to running and attach worker ownership.",
+                    meta: "pending -> running",
+                    tone: "journal",
+                    points: [
+                      "Guard on current status and worker id.",
+                      "Set heartbeat and lease expiry.",
+                    ],
+                  },
+                  {
+                    lane: "worker",
+                    title: "Open a turn attempt",
+                    copy: "Create one immutable turn_attempt row for this execution attempt.",
+                    meta: "attempt 1",
+                    tone: "runtime",
+                    points: [
+                      "The attempt owns provider/model provenance.",
+                      "Later retries create a new attempt number.",
+                    ],
+                  },
+                ],
+              },
+              {
+                title: "Seed staged execution state",
+                copy: "The worker reconstructs context from the latest completed checkpoint rather than from durable stores being mutated mid-turn.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "Build execution context",
+                    copy: "ExecutionContextFactory reconstructs tool context, policy inputs, and provider bindings.",
+                    meta: "deterministic runtime",
+                    tone: "runtime",
+                    points: [
+                      "No hidden in-memory event sequence state.",
+                      "No direct durable writes through message/state adapters.",
+                    ],
+                  },
+                  {
+                    lane: "persistence",
+                    title: "Load latest checkpoint",
+                    copy: "Seed buffered message/state adapters from thread-scoped completed-turn recovery state.",
+                    meta: "checkpoint seed",
+                    tone: "persistence",
+                    points: [
+                      "Latest completed checkpoint defines recovery truth.",
+                      "Thread aggregate and checkpoint turn number must match.",
+                    ],
+                  },
+                ],
+              },
+              {
+                title: "Execute one externally orchestrated turn",
+                copy: "The worker invokes run_turn directly and never hands core server correctness to run() wrappers.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "Invoke direct run_turn",
+                    copy: "Exactly one turn. The worker keeps control of cancellation, retries, and task state.",
+                    meta: "server core boundary",
+                    tone: "runtime",
+                    points: [
+                      "run() and run_persistent() remain convenience wrappers only.",
+                      "The worker never spawns hidden turn orchestration.",
+                    ],
+                  },
+                  {
+                    lane: "boundary",
+                    title: "Emit events through the barrier",
+                    copy: "Events commit through the authoritative sink while the turn is running.",
+                    meta: "outcome waits for flush",
+                    tone: "contracts",
+                    points: [
+                      "TurnOutcome is not visible before the turn event stream closes.",
+                      "The sink flush barrier replaces the old channel-drain guarantee.",
+                    ],
+                  },
+                  {
+                    lane: "events",
+                    title: "Commit live envelopes",
+                    copy: "Thinking, text, and lifecycle events are sequence-stable before local tail observes them.",
+                    meta: "committed first",
+                    tone: "events",
+                    points: [
+                      "Replay stays authoritative.",
+                      "Subscribers never receive pre-commit phantom events.",
+                    ],
+                  },
+                ],
+              },
+              {
+                title: "Close the turn attempt at the boundary",
+                copy: "Once run_turn resolves, the worker has a stable outcome plus the staged turn state needed for commit.",
+                cards: [
+                  {
+                    lane: "boundary",
+                    title: "Return TurnOutcome",
+                    copy: "The outcome arrives after all turn-scoped events for this boundary are committed and visible.",
+                    meta: "flush complete",
+                    tone: "contracts",
+                    points: [
+                      "Outcome visibility follows event visibility.",
+                      "Client lag is not on the execution critical path.",
+                    ],
+                  },
+                  {
+                    lane: "worker",
+                    title: "Interpret the outcome",
+                    copy: "The worker decides whether to commit, requeue, suspend, or fail closed through journal APIs.",
+                    meta: "journal-driven next step",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Commit completed-turn projections",
+                copy: "The completed-turn commit is one atomic transaction that advances durable conversation state.",
+                cards: [
+                  {
+                    lane: "persistence",
+                    title: "Close attempt + write checkpoint",
+                    copy: "Write messages, update thread aggregates, close the attempt, and insert one checkpoint together.",
+                    meta: "single transaction",
+                    tone: "persistence",
+                    points: [
+                      "No mid-turn durable history writes.",
+                      "Crash before commit leaves prior checkpoint authoritative.",
+                    ],
+                  },
+                  {
+                    lane: "events",
+                    title: "Commit terminal turn lifecycle event",
+                    copy: "TurnComplete and Done/Refusal align with the same durable mutation they describe.",
+                    meta: "same transaction class",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Return control to the journal",
+                copy: "After commit, the journal determines whether the task is completed or requeued for another turn.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Advance task state",
+                    copy: "Mark completed for terminal outcomes or requeue to pending for NeedsMoreTurns.",
+                    meta: "running -> completed|pending",
+                    tone: "journal",
+                    points: [
+                      "next_turn_number advances only after a committed turn.",
+                      "current_turn_attempt_id clears before the worker releases ownership.",
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "tool-handoff",
+            title: "Tool-boundary suspension",
+            copy: "The root turn commits only durable suspension state, then yields to child tool tasks.",
+            detail: {
+              title: "Tool-boundary suspension",
+              copy: "The root worker stops at the tool boundary. Inline blocking tool execution is intentionally gone from the authoritative path.",
+              tags: ["tool handoff", "phase 4/5 seam"],
+              bullets: [
+                "Root worker suspends cleanly when the model requests tool work.",
+                "Journal creates durable child tasks before control leaves the root turn.",
+                "The next root turn resumes from durable child outcomes, not from an in-memory join.",
+              ],
+            },
+            steps: [
+              {
+                title: "Acquire and seed the root turn",
+                copy: "The beginning is identical to the text-only path so the core turn contract stays small.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Acquire root task",
+                    copy: "Same guarded root-task acquisition and attempt creation as the base path.",
+                    meta: "shared start",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Seed from checkpoint",
+                    copy: "Same staged stores and deterministic execution context.",
+                    meta: "shared start",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Turn reaches a tool boundary",
+                copy: "run_turn returns the boundary outcome after committed turn events have flushed.",
+                cards: [
+                  {
+                    lane: "boundary",
+                    title: "Return NeedsToolWork",
+                    copy: "The outcome is a suspension boundary, not permission to execute tools inline.",
+                    meta: "root stops here",
+                    tone: "contracts",
+                    points: [
+                      "Tool calls become durable child tasks.",
+                      "The root worker keeps the same event barrier rule.",
+                    ],
+                  },
+                  {
+                    lane: "events",
+                    title: "Commit ToolCallStart envelope",
+                    copy: "Lifecycle events align with the journal mutation that creates child work.",
+                    meta: "same durable boundary",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Journal materializes child work",
+                copy: "The root task moves into a blocked state owned by the journal while child tasks take over execution.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Create tool child tasks",
+                    copy: "Persist tool_runtime tasks with operation identity, requested input, and parent linkage.",
+                    meta: "root -> waiting_on_children",
+                    tone: "journal",
+                    points: [
+                      "Parent retains root ownership and batch linkage.",
+                      "No child result exists only in channels.",
+                    ],
+                  },
+                  {
+                    lane: "persistence",
+                    title: "Persist suspension state",
+                    copy: "Record continuation state and any typed prepared-operation fields on the root task.",
+                    meta: "durable suspension",
+                    tone: "persistence",
+                  },
+                ],
+              },
+              {
+                title: "Root worker exits without committing a completed turn",
+                copy: "Conversation projections do not advance because the turn did not complete.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "Release root worker lease",
+                    copy: "The worker clears its turn-attempt ownership and hands control back to the journal.",
+                    meta: "stop cleanly",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "persistence",
+                    title: "No completed-turn checkpoint",
+                    copy: "The thread still recovers from the previous completed checkpoint until child outcomes drive the next turn.",
+                    meta: "no false progress",
+                    tone: "persistence",
+                  },
+                ],
+              },
+              {
+                title: "Later child outcomes resume the root",
+                copy: "The next root turn is a new acquisition driven by journal state, not an in-memory continuation of the same worker.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Aggregate child results",
+                    copy: "Once the batch settles, the journal can make the parent runnable again.",
+                    meta: "child batch complete",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Resume as a new root turn",
+                    copy: "The next turn seeds from the last completed checkpoint plus durable child results.",
+                    meta: "fresh worker path",
+                    tone: "runtime",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "turn-error",
+            title: "Error before completed-turn commit",
+            copy: "The worker closes the attempt but leaves durable conversation projections unchanged.",
+            detail: {
+              title: "Error before completed-turn commit",
+              copy: "This is the core crash/failure invariant: no committed checkpoint, no durable conversation advance.",
+              tags: ["failure", "fail closed"],
+              bullets: [
+                "Turn attempts can fail without creating completed-turn checkpoints.",
+                "The task requeues or fails through journal policy only after the attempt closes.",
+                "Recovery continues from the previous completed checkpoint.",
+              ],
+            },
+            steps: [
+              {
+                title: "Normal acquisition and execution begin",
+                copy: "The worker starts from the same durable setup as the success path.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Acquire task",
+                    copy: "Same guarded pending -> running transition.",
+                    meta: "shared start",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Run one turn attempt",
+                    copy: "The worker still owns one deterministic execution attempt.",
+                    meta: "shared start",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "run_turn resolves with an error outcome",
+                copy: "The event barrier still holds: turn-scoped events flush before the error outcome is visible.",
+                cards: [
+                  {
+                    lane: "boundary",
+                    title: "Return Error",
+                    copy: "The SDK boundary stops the turn without claiming a durable conversation commit happened.",
+                    meta: "outcome after flush",
+                    tone: "contracts",
+                  },
+                  {
+                    lane: "events",
+                    title: "Commit error envelope",
+                    copy: "Error lifecycle events describe the same terminal attempt transition the worker is about to persist.",
+                    meta: "durable error trace",
+                    tone: "events",
+                  },
+                ],
+              },
+              {
+                title: "Close the attempt without committing projections",
+                copy: "The attempt becomes failed or cancelled, but messages and checkpoints do not advance.",
+                cards: [
+                  {
+                    lane: "persistence",
+                    title: "Close attempt only",
+                    copy: "Record the failed attempt row and keep durable thread history at the previous checkpoint.",
+                    meta: "no checkpoint",
+                    tone: "persistence",
+                    points: [
+                      "No durable message rewrite.",
+                      "No threads.turn_count increment.",
+                    ],
+                  },
+                  {
+                    lane: "journal",
+                    title: "Choose retry or terminal failure",
+                    copy: "Retry budget and strict tool-state rules decide whether the task requeues or fails closed.",
+                    meta: "phase 2 recovery matrix",
+                    tone: "journal",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

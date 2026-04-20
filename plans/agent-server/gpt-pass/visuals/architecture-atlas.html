@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Server Architecture Atlas</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "hub",
+        pageId: "architecture-atlas-hub",
+        rootPath: "./",
+        kicker: "Agent Server Rewrite",
+        title: "Architecture Atlas",
+        summary:
+          "A smaller, understanding-first visual set for the stable agent server rewrite. Use sequence pages to learn how work moves through the system, then state pages to learn what owns each decision and where durability boundaries sit.",
+      };
+    </script>
+    <script src="./shared/atlas.js"></script>
+  </body>
+</html>

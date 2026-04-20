@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tool Runtime Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../shared/atlas.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.AGENT_ATLAS_PAGE = {
+        kind: "sequence",
+        pageId: "tool-runtime-flow",
+        rootPath: "../",
+        kicker: "Sequence View",
+        title: "Tool Runtime Flow",
+        summary:
+          "How tool calls become lightweight child tasks. The root worker suspends, child workers own tool execution, and the parent resumes only from durable batch outcomes.",
+        lanes: [
+          { id: "root", title: "Root task", copy: "The suspended parent turn that requested tool work.", tone: "runtime", group: "parent" },
+          { id: "journal", title: "agent_tasks", copy: "Creates, schedules, and resumes tool child work.", tone: "journal", group: "authority" },
+          { id: "tooltask", title: "Tool child task", copy: "One durable unit per tool call or subagent invocation.", tone: "safety", group: "child task" },
+          { id: "worker", title: "Tool worker", copy: "Executes qualified tool work or confirmation prepare/execute flows.", tone: "runtime", group: "runtime" },
+          { id: "ops", title: "tool_executions", copy: "Operation identity, prepared state, and replay control.", tone: "persistence", group: "durability" },
+          { id: "resume", title: "Parent resume", copy: "Journal aggregation that makes the root runnable again.", tone: "events", group: "resume" },
+        ],
+        legend: [
+          { label: "Journal and scheduling", tone: "journal" },
+          { label: "Runtime worker", tone: "runtime" },
+          { label: "Side-effect safety", tone: "safety" },
+          { label: "Durable execution state", tone: "persistence" },
+          { label: "Parent resume path", tone: "events" },
+        ],
+        scenarios: [
+          {
+            id: "observe-batch",
+            title: "Observe-only child batch",
+            copy: "Parallel observe tools run to completion, then the parent resumes with a full durable result set.",
+            detail: {
+              title: "Observe-only child batch",
+              copy: "This is the simplest child-task batch. It proves that tools are no longer inline root-turn mutations and that resume happens from durable aggregation only.",
+              tags: ["observe", "batch"],
+              bullets: [
+                "Each tool call becomes a child task with its own lifecycle.",
+                "The parent blocks in waiting_on_children instead of spinning in-process.",
+                "Observe failures become deterministic tool results rather than hidden exceptions.",
+              ],
+            },
+            steps: [
+              {
+                title: "Suspend the root at the tool boundary",
+                copy: "The root turn stops after persisting the child batch and its continuation state.",
+                cards: [
+                  {
+                    lane: "root",
+                    title: "Stop at boundary",
+                    copy: "The parent does not execute tools inline and does not keep a private channel join open.",
+                    meta: "clean suspension",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "journal",
+                    title: "Create child tasks",
+                    copy: "Persist one tool task per tool call and link them to the parent batch.",
+                    meta: "root -> waiting_on_children",
+                    tone: "journal",
+                    points: [
+                      "The parent batch has bounded parallelism.",
+                      "Resume can only happen after durable batch settlement.",
+                    ],
+                  },
+                ],
+              },
+              {
+                title: "Acquire child tool tasks",
+                copy: "Tool workers acquire runnable child tasks through the same guarded journal model as root tasks.",
+                cards: [
+                  {
+                    lane: "tooltask",
+                    title: "Pending child tasks",
+                    copy: "Every tool task has parent linkage, requested input, tier, and tool kind.",
+                    meta: "one task per call",
+                    tone: "safety",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Acquire one child task",
+                    copy: "Tool workers own retries, cancellation, and lifecycle audit for the tool call.",
+                    meta: "pending -> running",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Persist execution intent before side effects",
+                copy: "Strict durability stays in force for observe tasks even if they are cheap or synchronous.",
+                cards: [
+                  {
+                    lane: "ops",
+                    title: "Write stable operation identity",
+                    copy: "Persist execution intent or cached replay decision before any side-effecting work starts.",
+                    meta: "fail closed on write failure",
+                    tone: "persistence",
+                    points: [
+                      "No raw tool_call_id retry identity.",
+                      "InFlight state alone is never permission for blind re-execution.",
+                    ],
+                  },
+                  {
+                    lane: "worker",
+                    title: "Run the tool",
+                    copy: "Observe execution happens inside the child worker with deterministic result capture.",
+                    meta: "child-owned execution",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Complete the batch durably",
+                copy: "Each child closes independently, then the journal aggregates the entire batch before resuming the root.",
+                cards: [
+                  {
+                    lane: "tooltask",
+                    title: "Close child tasks",
+                    copy: "Success or deterministic error results are written as child-task outcomes.",
+                    meta: "running -> completed|failed",
+                    tone: "safety",
+                  },
+                  {
+                    lane: "resume",
+                    title: "Aggregate all child results",
+                    copy: "Only when the batch settles does the parent become runnable again.",
+                    meta: "batch barrier",
+                    tone: "events",
+                    points: [
+                      "No ad hoc in-memory join logic.",
+                      "Parent resumes from durable result payloads.",
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "confirm-flow",
+            title: "Confirm-tier prepared execution",
+            copy: "Confirmation is now a durable child-task lifecycle rather than an inline pause inside the root loop.",
+            detail: {
+              title: "Confirm-tier prepared execution",
+              copy: "The important boundary is between prepare and execute. The prepared snapshot is durable, and resume-time policy can still block execution later.",
+              tags: ["confirm", "prepared state"],
+              bullets: [
+                "listen()/prepare persists typed prepared-operation state.",
+                "The child task, not the root worker, owns awaiting_confirmation.",
+                "Confirmation approval is not final authority; resume-time policy still re-checks.",
+              ],
+            },
+            steps: [
+              {
+                title: "Prepare the confirm tool",
+                copy: "The child worker runs the safe prepare step and records durable prepared state.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "listen() or prepare()",
+                    copy: "Run the restart-safe preparation phase that does not yet execute the final side effect.",
+                    meta: "durable prepare",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "ops",
+                    title: "Persist prepared snapshot",
+                    copy: "Store operation_id, revision, prepared payload, and expiry before awaiting confirmation.",
+                    meta: "typed durable fields",
+                    tone: "persistence",
+                  },
+                ],
+              },
+              {
+                title: "Move the child task into awaiting_confirmation",
+                copy: "The journal clears worker ownership and records the child task as paused on external approval.",
+                cards: [
+                  {
+                    lane: "tooltask",
+                    title: "Awaiting confirmation",
+                    copy: "The child task becomes unleased and non-running while prepared state remains durable.",
+                    meta: "running -> awaiting_confirmation",
+                    tone: "safety",
+                  },
+                  {
+                    lane: "journal",
+                    title: "Block sibling launch rules",
+                    copy: "Only one confirm child can be active or awaiting confirmation in a parent batch.",
+                    meta: "batch safety",
+                    tone: "journal",
+                  },
+                ],
+              },
+              {
+                title: "Resume after approval",
+                copy: "A fresh worker re-acquires the child task and re-checks policy before executing the final operation.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Resume child task",
+                    copy: "The task transitions back to pending/running with durable prepared state still attached.",
+                    meta: "fresh worker",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "worker",
+                    title: "Re-evaluate policy",
+                    copy: "The worker checks effective input and prepared snapshot at execution time.",
+                    meta: "resume-time authority",
+                    tone: "runtime",
+                  },
+                ],
+              },
+              {
+                title: "Execute or fail closed",
+                copy: "If policy allows, execute; otherwise block deterministically without performing the external mutation.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "execute() only after re-check",
+                    copy: "The final side effect runs only after the fresh worker validates the prepared state against current policy.",
+                    meta: "authoritative execute",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "resume",
+                    title: "Resolve the parent batch",
+                    copy: "Confirm success resumes the parent; rejection or invalidation fails the batch deterministically.",
+                    meta: "parent outcome",
+                    tone: "events",
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            id: "resume-blocked",
+            title: "Resume blocked or invalidated",
+            copy: "The system refuses to execute a prepared external mutation when the later policy check no longer allows it.",
+            detail: {
+              title: "Resume blocked or invalidated",
+              copy: "This is where earlier designs went wrong. Prior approval is not enough. The authoritative decision happens at execution time on the resumed worker.",
+              tags: ["blocked", "fail closed"],
+              bullets: [
+                "Prepared state can expire or become invalidated.",
+                "Resume-time policy Block prevents execution.",
+                "The parent receives deterministic failure semantics instead of unsafe mutation.",
+              ],
+            },
+            steps: [
+              {
+                title: "Child task is already awaiting confirmation",
+                copy: "The prepared snapshot exists, but no execution has happened yet.",
+                cards: [
+                  {
+                    lane: "tooltask",
+                    title: "Paused child",
+                    copy: "Prepared state and operation identity are durable, but the task is still waiting for authoritative resume.",
+                    meta: "safe pause",
+                    tone: "safety",
+                  },
+                ],
+              },
+              {
+                title: "Fresh worker re-checks policy and state",
+                copy: "The resumed worker validates the operation under current policy, not historical approval alone.",
+                cards: [
+                  {
+                    lane: "worker",
+                    title: "Detect block or invalidation",
+                    copy: "Policy change, expiry, or revision mismatch prevents execute().",
+                    meta: "authoritative resume check",
+                    tone: "runtime",
+                  },
+                  {
+                    lane: "ops",
+                    title: "Mark invalidated or blocked",
+                    copy: "The execution record and audit trail explain why the operation did not proceed.",
+                    meta: "durable audit trail",
+                    tone: "persistence",
+                  },
+                ],
+              },
+              {
+                title: "Fail the batch deterministically",
+                copy: "The confirm child does not execute. Siblings cancel if required, and the parent receives a stable failure outcome.",
+                cards: [
+                  {
+                    lane: "journal",
+                    title: "Cancel remaining siblings",
+                    copy: "Mixed batches stop launching new work and cancel remaining child tasks as policy requires.",
+                    meta: "strict confirm semantics",
+                    tone: "journal",
+                  },
+                  {
+                    lane: "resume",
+                    title: "Surface failed parent result",
+                    copy: "The root resumes with a deterministic failure result, not a half-completed external mutation.",
+                    meta: "safe failure",
+                    tone: "events",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    </script>
+    <script src="../shared/atlas.js"></script>
+  </body>
+</html>

@@ -1,0 +1,2504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Server Architecture Canvas</title>
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --bg-hover: #30363d;
+  --border-primary: #30363d;
+  --border-secondary: #21262d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --blue: #58a6ff;
+  --blue-dim: #1f3a5f;
+  --green: #3fb950;
+  --green-dim: #1a3a2a;
+  --orange: #d29922;
+  --orange-dim: #3d2e00;
+  --purple: #bc8cff;
+  --purple-dim: #2d1f4e;
+  --red: #f85149;
+  --red-dim: #3d1418;
+  --cyan: #39d2c0;
+  --yellow: #e3b341;
+  --pink: #f778ba;
+  --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --radius: 6px;
+  --shadow: 0 2px 8px rgba(0,0,0,0.3);
+  --transition: 0.2s ease;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+  height: 100vh;
+}
+
+/* ---- Tab Navigation ---- */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-primary);
+  padding: 0 16px;
+  height: 44px;
+  align-items: stretch;
+  position: relative;
+  z-index: 100;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0 16px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+
+.tab-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+/* ---- Tab Content ---- */
+.tab-content {
+  display: none;
+  height: calc(100vh - 44px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 24px;
+}
+
+.tab-content.active { display: block; }
+
+/* ---- Legend ---- */
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  margin-bottom: 20px;
+  font-size: 12px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ---- Data Model Tables ---- */
+.dm-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  justify-content: center;
+  padding-bottom: 40px;
+}
+
+.dm-table {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  min-width: 280px;
+  max-width: 380px;
+  flex: 1 1 300px;
+  cursor: pointer;
+  transition: all var(--transition);
+  overflow: hidden;
+}
+
+.dm-table:hover { border-color: var(--text-muted); transform: translateY(-2px); box-shadow: var(--shadow); }
+.dm-table.expanded { max-width: 500px; flex-basis: 460px; }
+
+.dm-table-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.dm-table-header .badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+}
+
+.dm-table-body { padding: 0; }
+
+.dm-col {
+  display: flex;
+  align-items: baseline;
+  padding: 4px 14px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  border-bottom: 1px solid var(--border-secondary);
+  gap: 8px;
+  transition: background var(--transition);
+}
+
+.dm-col:last-child { border-bottom: none; }
+.dm-col:hover { background: var(--bg-tertiary); }
+
+.dm-col-name { color: var(--text-primary); min-width: 140px; flex-shrink: 0; }
+.dm-col-type { color: var(--text-secondary); font-size: 11px; flex: 1; }
+.dm-col-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  font-weight: 600;
+  flex-shrink: 0;
+  font-family: var(--font-sans);
+}
+
+.badge-pk { background: var(--blue-dim); color: var(--blue); }
+.badge-fk { background: var(--green-dim); color: var(--green); }
+.badge-uk { background: var(--orange-dim); color: var(--orange); }
+.badge-idx { background: var(--purple-dim); color: var(--purple); }
+.badge-null { background: var(--bg-tertiary); color: var(--text-muted); }
+
+.dm-constraints {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-primary);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+
+.dm-constraints div { margin-bottom: 4px; }
+.dm-constraints div:last-child { margin-bottom: 0; }
+
+.dm-hidden-cols { display: none; }
+.dm-table.expanded .dm-hidden-cols { display: flex; }
+
+.dm-expand-hint {
+  padding: 6px 14px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+  font-family: var(--font-sans);
+}
+
+.dm-table.expanded .dm-expand-hint { display: none; }
+
+/* domain colors */
+.domain-execution .dm-table-header { background: var(--blue-dim); }
+.domain-conversation .dm-table-header { background: var(--green-dim); }
+.domain-tool .dm-table-header { background: var(--purple-dim); }
+.domain-events .dm-table-header { background: var(--orange-dim); }
+.domain-outbox .dm-table-header { background: var(--red-dim); }
+
+/* FK Relationship overlay */
+.fk-relationships {
+  margin-bottom: 24px;
+  padding: 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+}
+
+.fk-relationships h3 { font-size: 13px; margin-bottom: 12px; color: var(--text-secondary); }
+
+.fk-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fk-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: 16px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: default;
+  transition: all var(--transition);
+}
+
+.fk-chip:hover { border-color: var(--blue); background: var(--blue-dim); }
+.fk-chip .arrow { color: var(--blue); font-weight: bold; }
+
+/* ---- Architecture Layers ---- */
+.arch-container { max-width: 1100px; margin: 0 auto; }
+
+.arch-layer {
+  position: relative;
+  padding: 20px 24px;
+  margin-bottom: 4px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all var(--transition);
+  border: 1px solid transparent;
+}
+
+.arch-layer:hover { border-color: var(--border-primary); }
+.arch-layer.expanded { border-color: var(--text-muted); }
+
+.arch-layer-num {
+  position: absolute;
+  left: -36px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+}
+
+.arch-layer-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.arch-layer-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.arch-layer-detail {
+  display: none;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-primary);
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.arch-layer.expanded .arch-layer-detail { display: block; }
+
+.arch-tables {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.arch-table-tag {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+}
+
+.arch-flow-arrow {
+  display: flex;
+  justify-content: center;
+  margin: -2px 0;
+  color: var(--text-muted);
+  font-size: 18px;
+  animation: flowPulse 2s ease-in-out infinite;
+}
+
+@keyframes flowPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* ---- State Machine ---- */
+.sm-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  padding: 20px 0 40px;
+}
+
+.sm-svg-wrap {
+  width: 100%;
+  max-width: 900px;
+  overflow: visible;
+}
+
+.sm-svg-wrap svg { width: 100%; height: auto; }
+
+.sm-state {
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sm-state:hover rect, .sm-state:hover ellipse {
+  stroke-width: 2.5;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+.sm-transition-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  fill: var(--text-secondary);
+}
+
+.sm-info-panel {
+  max-width: 700px;
+  width: 100%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  min-height: 100px;
+}
+
+.sm-info-panel h3 { font-size: 14px; margin-bottom: 8px; }
+.sm-info-panel p { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+
+.sm-worker-legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.sm-worker-tag {
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  border: 1px solid;
+}
+
+/* ---- Turn Lifecycle ---- */
+.tl-container {
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+.tl-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.tl-btn {
+  padding: 6px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all var(--transition);
+  font-family: var(--font-sans);
+}
+
+.tl-btn:hover { background: var(--bg-tertiary); border-color: var(--text-muted); }
+.tl-btn.active { background: var(--blue-dim); border-color: var(--blue); color: var(--blue); }
+.tl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.tl-step-counter {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  margin-left: auto;
+}
+
+.tl-steps { display: flex; flex-direction: column; gap: 8px; }
+
+.tl-step {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  opacity: 0.25;
+  transition: all 0.3s ease;
+}
+
+.tl-step.visible { opacity: 1; }
+.tl-step.current { border-color: var(--blue); box-shadow: 0 0 12px rgba(88,166,255,0.15); }
+
+.tl-step-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  flex-shrink: 0;
+}
+
+.tl-step.visible .tl-step-num { background: var(--blue-dim); color: var(--blue); border-color: var(--blue); }
+
+.tl-step-content { flex: 1; }
+.tl-step-title { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.tl-step-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+
+.tl-step-persist {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background: var(--green-dim);
+  color: var(--green);
+  flex-shrink: 0;
+}
+
+.tl-step-recovery {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: var(--red-dim);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--red);
+  display: none;
+}
+
+.tl-step.visible .tl-step-recovery { display: block; }
+
+/* ---- Tool Execution Scenarios ---- */
+.te-container { max-width: 1000px; margin: 0 auto; }
+
+.te-scenario-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.te-scenario-btn {
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+  font-family: var(--font-sans);
+}
+
+.te-scenario-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.te-scenario-btn.active { background: var(--purple-dim); border-color: var(--purple); color: var(--purple); }
+
+.te-step-nav {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.te-db-state {
+  margin-top: 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.te-db-header {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-primary);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.te-db-row {
+  padding: 6px 14px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-secondary);
+  display: flex;
+  gap: 12px;
+}
+
+.te-db-row:last-child { border-bottom: none; }
+
+.te-db-table-name { color: var(--purple); min-width: 120px; }
+.te-db-change { color: var(--green); }
+.te-db-value { color: var(--text-primary); }
+
+/* ---- Failure Scenarios ---- */
+.fs-container { max-width: 1000px; margin: 0 auto; }
+
+.fs-scenario-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.fs-scenario-btn {
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.fs-scenario-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.fs-scenario-btn.active { background: var(--red-dim); border-color: var(--red); color: var(--red); }
+
+.fs-panel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.fs-section { margin-bottom: 16px; }
+.fs-section:last-child { margin-bottom: 0; }
+
+.fs-section h4 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.fs-section-durable h4 { color: var(--green); }
+.fs-section-lost h4 { color: var(--red); }
+.fs-section-recovery h4 { color: var(--blue); }
+
+.fs-item {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  border-left: 2px solid var(--border-primary);
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+}
+
+.fs-section-durable .fs-item { border-left-color: var(--green); }
+.fs-section-lost .fs-item { border-left-color: var(--red); }
+.fs-section-recovery .fs-item { border-left-color: var(--blue); }
+
+.fs-timeline {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.fs-tl-step {
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-primary);
+  position: relative;
+  transition: all var(--transition);
+  cursor: pointer;
+}
+
+.fs-tl-step.crash { background: var(--red-dim); border-color: var(--red); color: var(--red); }
+.fs-tl-step.active { border-color: var(--blue); color: var(--blue); }
+
+/* ---- Annotations ---- */
+.annotation-layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 50;
+}
+
+.annotation-pin {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  background: var(--yellow);
+  color: var(--bg-primary);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  pointer-events: auto;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  z-index: 60;
+  transition: transform 0.15s ease;
+}
+
+.annotation-pin:hover { transform: translate(-50%, -50%) scale(1.2); }
+
+.annotation-sidebar {
+  position: fixed;
+  top: 44px;
+  right: 0;
+  width: 340px;
+  height: calc(100vh - 44px);
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-primary);
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+}
+
+.annotation-sidebar.open { transform: translateX(0); }
+
+.annotation-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.annotation-sidebar-header h3 { font-size: 14px; }
+
+.annotation-sidebar-actions { display: flex; gap: 8px; }
+
+.ann-btn {
+  padding: 4px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.ann-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+
+.annotation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.annotation-card {
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.annotation-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.annotation-card-num {
+  font-weight: 700;
+  color: var(--yellow);
+  font-size: 13px;
+}
+
+.annotation-card-tab {
+  font-size: 10px;
+  padding: 1px 6px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  color: var(--text-muted);
+}
+
+.annotation-card-loc {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.annotation-card-text { color: var(--text-primary); line-height: 1.5; }
+
+.annotation-card-del {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+}
+
+.annotation-card-del:hover { color: var(--red); }
+
+.annotation-toggle-btn {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--yellow);
+  color: var(--bg-primary);
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease;
+}
+
+.annotation-toggle-btn:hover { transform: scale(1.1); }
+
+.annotation-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: var(--red);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Annotation input dialog */
+.ann-dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 200;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+
+.ann-dialog-overlay.open { display: flex; }
+
+.ann-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 20px;
+  width: 400px;
+  max-width: 90vw;
+}
+
+.ann-dialog h3 { font-size: 15px; margin-bottom: 12px; }
+
+.ann-dialog label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.ann-dialog input, .ann-dialog textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.ann-dialog textarea { min-height: 80px; resize: vertical; }
+.ann-dialog input:focus, .ann-dialog textarea:focus { outline: none; border-color: var(--blue); }
+
+.ann-dialog-btns { display: flex; gap: 8px; justify-content: flex-end; }
+
+.ann-dialog-btns button {
+  padding: 6px 16px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  transition: all var(--transition);
+}
+
+.ann-dialog-btns button.primary { background: var(--blue-dim); border-color: var(--blue); color: var(--blue); }
+.ann-dialog-btns button:hover { filter: brightness(1.2); }
+
+/* ---- Toast ---- */
+.toast {
+  position: fixed;
+  bottom: 80px;
+  right: 20px;
+  background: var(--green-dim);
+  border: 1px solid var(--green);
+  color: var(--green);
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  z-index: 300;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: all 0.3s ease;
+  pointer-events: none;
+}
+
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* Annotation mode indicator */
+.ann-mode-indicator {
+  position: fixed;
+  top: 50px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--yellow);
+  color: var(--bg-primary);
+  padding: 6px 16px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  z-index: 150;
+  display: none;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+.ann-mode-indicator.show { display: block; }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* State machine SVG styles */
+.sm-state rect {
+  rx: 6;
+  ry: 6;
+  stroke-width: 1.5;
+}
+
+.sm-state text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+
+.sm-arrow {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.2;
+  marker-end: url(#arrowhead);
+}
+
+.sm-arrow-active {
+  stroke: var(--blue);
+  stroke-width: 2;
+  animation: arrowFlow 1s ease-in-out;
+}
+
+@keyframes arrowFlow {
+  0% { stroke-dasharray: 100; stroke-dashoffset: 100; }
+  100% { stroke-dasharray: 100; stroke-dashoffset: 0; }
+}
+
+/* util */
+.hidden { display: none !important; }
+.mono { font-family: var(--font-mono); }
+.text-blue { color: var(--blue); }
+.text-green { color: var(--green); }
+.text-orange { color: var(--orange); }
+.text-purple { color: var(--purple); }
+.text-red { color: var(--red); }
+.text-cyan { color: var(--cyan); }
+.mb-8 { margin-bottom: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.mb-24 { margin-bottom: 24px; }
+
+.section-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+</style>
+</head>
+<body>
+
+<!-- Tab Bar -->
+<nav class="tab-bar">
+  <button class="tab-btn active" data-tab="data-model">Data Model</button>
+  <button class="tab-btn" data-tab="arch-layers">Architecture Layers</button>
+  <button class="tab-btn" data-tab="state-machine">Task State Machine</button>
+  <button class="tab-btn" data-tab="turn-lifecycle">Turn Lifecycle</button>
+  <button class="tab-btn" data-tab="tool-exec">Tool Execution</button>
+  <button class="tab-btn" data-tab="failure">Failure Scenarios</button>
+  <button class="tab-btn" data-tab="annotations">Annotations</button>
+</nav>
+
+<!-- ========== TAB 1: DATA MODEL ========== -->
+<div id="data-model" class="tab-content active">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Execution (agent_tasks, turn_attempts, turn_checkpoints)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Conversation (threads, messages)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div> Tool (tool_executions, tool_call_log)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Events</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Outbox (msgs)</div>
+    <div class="legend-item"><span class="dm-col-badge badge-pk">PK</span> Primary Key</div>
+    <div class="legend-item"><span class="dm-col-badge badge-fk">FK</span> Foreign Key</div>
+    <div class="legend-item"><span class="dm-col-badge badge-uk">UQ</span> Unique</div>
+    <div class="legend-item"><span class="dm-col-badge badge-idx">IDX</span> Index</div>
+  </div>
+
+  <div class="fk-relationships">
+    <h3>Foreign Key Relationships</h3>
+    <div class="fk-list" id="fk-list"></div>
+  </div>
+
+  <div class="dm-grid" id="dm-grid"></div>
+</div>
+
+<!-- ========== TAB 2: ARCHITECTURE LAYERS ========== -->
+<div id="arch-layers" class="tab-content">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Execution / Control</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Persistence / Storage</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Events / Streaming</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div> Tool Runtime</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Messaging / Outbox</div>
+  </div>
+  <div class="arch-container" id="arch-container" style="padding-left: 48px;"></div>
+</div>
+
+<!-- ========== TAB 3: STATE MACHINE ========== -->
+<div id="state-machine" class="tab-content">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Active states</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Terminal success</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Terminal failure</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Waiting states</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--text-muted)"></div> Initial state</div>
+  </div>
+  <div class="sm-container">
+    <div class="sm-worker-legend" style="margin-bottom:8px;">
+      <div class="sm-worker-tag" style="border-color:var(--blue);color:var(--blue)">root_turn</div>
+      <div class="sm-worker-tag" style="border-color:var(--purple);color:var(--purple)">tool_runtime</div>
+      <div class="sm-worker-tag" style="border-color:var(--cyan);color:var(--cyan)">subagent</div>
+    </div>
+    <div class="sm-svg-wrap" id="sm-svg-wrap"></div>
+    <div class="sm-info-panel" id="sm-info-panel">
+      <h3>Click a state to learn more</h3>
+      <p>Each state in the agent_tasks state machine represents a distinct phase of task execution. Click any state node to see details about what happens in that state, which worker types can reach it, and what transitions are available.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ========== TAB 4: TURN LIFECYCLE ========== -->
+<div id="turn-lifecycle" class="tab-content">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Worker action</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Persisted data</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Crash recovery behavior</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Decision point</div>
+  </div>
+  <div class="tl-container">
+    <div class="tl-controls">
+      <button class="tl-btn active" data-path="text-only">Text-Only Path</button>
+      <button class="tl-btn" data-path="tool-use">Tool-Use Path</button>
+      <button class="tl-btn" id="tl-prev" disabled>Previous</button>
+      <button class="tl-btn" id="tl-next">Next</button>
+      <button class="tl-btn" id="tl-reset">Reset</button>
+      <span class="tl-step-counter" id="tl-counter">Step 0 / 0</span>
+    </div>
+    <div class="tl-steps" id="tl-steps"></div>
+  </div>
+</div>
+
+<!-- ========== TAB 5: TOOL EXECUTION ========== -->
+<div id="tool-exec" class="tab-content">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div> Tool execution action</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Database write</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Worker/task action</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Failure / cancellation</div>
+  </div>
+  <div class="te-container">
+    <div class="te-scenario-tabs" id="te-tabs"></div>
+    <div class="te-step-nav">
+      <button class="tl-btn" id="te-prev" disabled>Previous</button>
+      <button class="tl-btn" id="te-next">Next</button>
+      <button class="tl-btn" id="te-reset">Reset</button>
+      <span class="tl-step-counter" id="te-counter">Step 0 / 0</span>
+    </div>
+    <div class="tl-steps" id="te-steps"></div>
+    <div class="te-db-state" id="te-db-state" style="display:none">
+      <div class="te-db-header">Database State at This Step</div>
+      <div id="te-db-rows"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== TAB 6: FAILURE SCENARIOS ========== -->
+<div id="failure" class="tab-content">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Durable / safe state</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Lost / at risk</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> Recovery mechanism</div>
+  </div>
+  <div class="fs-container">
+    <div class="fs-scenario-tabs" id="fs-tabs"></div>
+    <div id="fs-content"></div>
+  </div>
+</div>
+
+<!-- ========== TAB 7: ANNOTATIONS ========== -->
+<div id="annotations" class="tab-content">
+  <div style="max-width:700px;margin:0 auto;text-align:center;padding-top:60px;">
+    <h2 style="margin-bottom:16px;">Annotation System</h2>
+    <p style="color:var(--text-secondary);margin-bottom:24px;line-height:1.6;">
+      Double-click anywhere on any tab to place an annotation pin. A dialog will prompt you for a location label and your comment.
+      All annotations are collected here and can be exported as Markdown.
+    </p>
+    <p style="color:var(--text-secondary);margin-bottom:24px;line-height:1.6;">
+      You can also click the yellow pin button in the bottom-right corner to toggle the annotation sidebar, which shows all annotations across all tabs.
+    </p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+      <button class="tl-btn" id="ann-export-main">Export as Markdown</button>
+      <button class="tl-btn" id="ann-clear-main">Clear All Annotations</button>
+    </div>
+    <div id="ann-main-list" style="margin-top:32px;text-align:left;"></div>
+  </div>
+</div>
+
+<!-- Annotation sidebar -->
+<div class="annotation-sidebar" id="ann-sidebar">
+  <div class="annotation-sidebar-header">
+    <h3>Annotations</h3>
+    <div class="annotation-sidebar-actions">
+      <button class="ann-btn" id="ann-export">Export MD</button>
+      <button class="ann-btn" id="ann-close-sidebar">Close</button>
+    </div>
+  </div>
+  <div class="annotation-list" id="ann-list"></div>
+</div>
+
+<!-- Annotation toggle button -->
+<button class="annotation-toggle-btn" id="ann-toggle" title="Toggle annotations sidebar">
+  <span style="font-size:16px;">&#128204;</span>
+  <span class="annotation-badge hidden" id="ann-badge">0</span>
+</button>
+
+<!-- Annotation input dialog -->
+<div class="ann-dialog-overlay" id="ann-dialog-overlay">
+  <div class="ann-dialog">
+    <h3>Add Annotation</h3>
+    <label for="ann-loc">Location / Component</label>
+    <input type="text" id="ann-loc" placeholder="e.g. agent_tasks table, Turn Worker layer...">
+    <label for="ann-text">Comment / Question</label>
+    <textarea id="ann-text" placeholder="Your annotation..."></textarea>
+    <div class="ann-dialog-btns">
+      <button id="ann-cancel">Cancel</button>
+      <button id="ann-save" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Annotation mode indicator -->
+<div class="ann-mode-indicator" id="ann-mode-ind">Double-click anywhere to add annotation</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ============================================================
+// UTILITY
+// ============================================================
+function $(sel, ctx) { return (ctx || document).querySelector(sel); }
+function $$(sel, ctx) { return [...(ctx || document).querySelectorAll(sel)]; }
+
+function showToast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ============================================================
+// TAB SYSTEM
+// ============================================================
+const tabBtns = $$('.tab-btn');
+const tabContents = $$('.tab-content');
+let activeTab = 'data-model';
+
+tabBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    activeTab = tab;
+    tabBtns.forEach(b => b.classList.toggle('active', b === btn));
+    tabContents.forEach(tc => tc.classList.toggle('active', tc.id === tab));
+  });
+});
+
+// ============================================================
+// TAB 1: DATA MODEL
+// ============================================================
+const tables = [
+  {
+    name: 'threads',
+    domain: 'conversation',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'status', type: 'TEXT', note: 'active | completed | archived' },
+      { name: 'title', type: 'TEXT' },
+      { name: 'metadata', type: 'BYTEA' },
+      { name: 'turn_count', type: 'INT' },
+      { name: 'input_tokens', type: 'BIGINT' },
+      { name: 'output_tokens', type: 'BIGINT' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+      { name: 'updated_at', type: 'TIMESTAMPTZ' },
+      { name: 'completed_at', type: 'TIMESTAMPTZ', badges: ['null'] },
+    ],
+    constraints: [],
+    primaryCols: 6,
+  },
+  {
+    name: 'messages',
+    domain: 'conversation',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'sequence_number', type: 'INT', badges: ['uk'] },
+      { name: 'role', type: 'TEXT' },
+      { name: 'content', type: 'BYTEA' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: ['UNIQUE(thread_id, sequence_number)'],
+    primaryCols: 6,
+  },
+  {
+    name: 'agent_tasks',
+    domain: 'execution',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'parent_task_id', type: 'UUID', badges: ['null'] },
+      { name: 'root_task_id', type: 'UUID' },
+      { name: 'depth', type: 'INT' },
+      { name: 'status', type: 'TEXT', note: 'queued | pending | running | waiting_on_children | awaiting_confirmation | completed | failed | cancelled' },
+      { name: 'task_kind', type: 'TEXT', note: 'root_turn | tool_runtime | subagent' },
+      { name: 'attempt', type: 'INT' },
+      { name: 'max_attempts', type: 'INT' },
+      { name: 'worker_id', type: 'TEXT', badges: ['null'] },
+      { name: 'lease_expires_at', type: 'TIMESTAMPTZ' },
+      { name: 'last_heartbeat_at', type: 'TIMESTAMPTZ' },
+      { name: 'cancel_requested_at', type: 'TIMESTAMPTZ', badges: ['null'] },
+      { name: 'next_turn_number', type: 'INT' },
+      { name: 'current_turn_attempt_id', type: 'UUID', badges: ['null'] },
+      { name: 'continuation_state', type: 'BYTEA', badges: ['null'] },
+      { name: 'prepared_operation_state', type: 'BYTEA', badges: ['null'] },
+      { name: 'context_blob', type: 'BYTEA' },
+      { name: 'result_blob', type: 'BYTEA', badges: ['null'] },
+      { name: 'error_blob', type: 'BYTEA', badges: ['null'] },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+      { name: 'updated_at', type: 'TIMESTAMPTZ' },
+      { name: 'completed_at', type: 'TIMESTAMPTZ', badges: ['null'] },
+    ],
+    constraints: [
+      'PARTIAL UNIQUE INDEX: one root task in pending|running|waiting_on_children|awaiting_confirmation per thread',
+    ],
+    primaryCols: 7,
+  },
+  {
+    name: 'turn_attempts',
+    domain: 'execution',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'task_id', type: 'UUID', badges: ['fk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'turn_number', type: 'INT' },
+      { name: 'attempt', type: 'INT' },
+      { name: 'status', type: 'TEXT' },
+      { name: 'requested_model', type: 'TEXT' },
+      { name: 'response_model', type: 'TEXT' },
+      { name: 'response_id', type: 'TEXT' },
+      { name: 'provider_name', type: 'TEXT' },
+      { name: 'outcome_kind', type: 'TEXT' },
+      { name: 'request_blob', type: 'BYTEA' },
+      { name: 'response_blob', type: 'BYTEA', badges: ['null'] },
+      { name: 'stop_reason', type: 'TEXT' },
+      { name: 'input_tokens', type: 'BIGINT' },
+      { name: 'output_tokens', type: 'BIGINT' },
+      { name: 'cached_input_tokens', type: 'BIGINT' },
+      { name: 'llm_duration_ms', type: 'BIGINT' },
+      { name: 'started_at', type: 'TIMESTAMPTZ' },
+      { name: 'completed_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: ['Append-only: never updated except to close from running to terminal'],
+    primaryCols: 6,
+  },
+  {
+    name: 'turn_checkpoints',
+    domain: 'execution',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'task_id', type: 'UUID', badges: ['fk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'turn_number', type: 'INT' },
+      { name: 'turn_attempt_id', type: 'UUID', badges: ['fk'] },
+      { name: 'messages_snapshot', type: 'BYTEA' },
+      { name: 'agent_state_snapshot', type: 'BYTEA' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: ['One per (thread_id, turn_number)'],
+    primaryCols: 5,
+  },
+  {
+    name: 'tool_executions',
+    domain: 'tool',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'task_id', type: 'UUID', badges: ['fk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'tool_call_id', type: 'TEXT' },
+      { name: 'stable_operation_key', type: 'TEXT', badges: ['null'] },
+      { name: 'prepared_operation_id', type: 'TEXT', badges: ['null'] },
+      { name: 'tool_name', type: 'TEXT' },
+      { name: 'display_name', type: 'TEXT' },
+      { name: 'input_blob', type: 'BYTEA' },
+      { name: 'status', type: 'TEXT' },
+      { name: 'result_blob', type: 'BYTEA', badges: ['null'] },
+      { name: 'started_at', type: 'TIMESTAMPTZ' },
+      { name: 'completed_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: [],
+    primaryCols: 6,
+  },
+  {
+    name: 'tool_call_log',
+    domain: 'tool',
+    columns: [
+      { name: 'id', type: 'BIGINT IDENTITY', badges: ['pk'] },
+      { name: 'task_id', type: 'UUID', badges: ['fk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'turn_attempt_id', type: 'UUID', badges: ['null'] },
+      { name: 'tool_call_id', type: 'TEXT' },
+      { name: 'tool_name', type: 'TEXT' },
+      { name: 'display_name', type: 'TEXT' },
+      { name: 'tier', type: 'TEXT' },
+      { name: 'tool_kind', type: 'TEXT' },
+      { name: 'outcome', type: 'TEXT' },
+      { name: 'input_blob', type: 'BYTEA' },
+      { name: 'result_blob', type: 'BYTEA', badges: ['null'] },
+      { name: 'metadata', type: 'JSONB' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: ['Append-only audit trail'],
+    primaryCols: 6,
+  },
+  {
+    name: 'events',
+    domain: 'events',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'thread_id', type: 'UUID', badges: ['fk'] },
+      { name: 'turn_attempt_id', type: 'UUID', badges: ['null'] },
+      { name: 'sequence', type: 'BIGINT', badges: ['uk'] },
+      { name: 'event_type', type: 'TEXT' },
+      { name: 'envelope_blob', type: 'BYTEA' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+    ],
+    constraints: ['UNIQUE(thread_id, sequence)'],
+    primaryCols: 5,
+  },
+  {
+    name: 'msgs',
+    domain: 'outbox',
+    columns: [
+      { name: 'id', type: 'UUID', badges: ['pk'] },
+      { name: 'kind', type: 'TEXT' },
+      { name: 'address', type: 'TEXT' },
+      { name: 'key', type: 'TEXT' },
+      { name: 'payload', type: 'JSONB' },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+      { name: 'published_at', type: 'TIMESTAMPTZ', badges: ['null'] },
+    ],
+    constraints: ['Outbox pattern: published_at NULL until AMQP publish confirmed'],
+    primaryCols: 5,
+  },
+];
+
+const fkRelationships = [
+  { from: 'messages', col: 'thread_id', to: 'threads', desc: 'Each message belongs to a thread' },
+  { from: 'agent_tasks', col: 'thread_id', to: 'threads', desc: 'Each task operates on a thread' },
+  { from: 'agent_tasks', col: 'parent_task_id', to: 'agent_tasks', desc: 'Child tasks reference parent (subagent hierarchy)' },
+  { from: 'turn_attempts', col: 'task_id', to: 'agent_tasks', desc: 'Turn attempts belong to an agent task' },
+  { from: 'turn_attempts', col: 'thread_id', to: 'threads', desc: 'Turn attempts reference the thread' },
+  { from: 'turn_checkpoints', col: 'task_id', to: 'agent_tasks', desc: 'Checkpoints belong to an agent task' },
+  { from: 'turn_checkpoints', col: 'thread_id', to: 'threads', desc: 'Checkpoints reference the thread' },
+  { from: 'turn_checkpoints', col: 'turn_attempt_id', to: 'turn_attempts', desc: 'Checkpoint references the successful turn attempt' },
+  { from: 'tool_executions', col: 'task_id', to: 'agent_tasks', desc: 'Tool executions belong to a child tool_runtime task' },
+  { from: 'tool_executions', col: 'thread_id', to: 'threads', desc: 'Tool executions reference the thread' },
+  { from: 'tool_call_log', col: 'task_id', to: 'agent_tasks', desc: 'Log entries reference the executing task' },
+  { from: 'tool_call_log', col: 'thread_id', to: 'threads', desc: 'Log entries reference the thread' },
+  { from: 'tool_call_log', col: 'turn_attempt_id', to: 'turn_attempts', desc: 'Log entries optionally reference a turn attempt' },
+  { from: 'events', col: 'thread_id', to: 'threads', desc: 'Events belong to a thread with monotonic sequence' },
+  { from: 'events', col: 'turn_attempt_id', to: 'turn_attempts', desc: 'Events optionally reference a turn attempt' },
+];
+
+function renderDataModel() {
+  const grid = $('#dm-grid');
+  grid.innerHTML = '';
+
+  tables.forEach(table => {
+    const el = document.createElement('div');
+    el.className = `dm-table domain-${table.domain}`;
+    el.dataset.table = table.name;
+
+    const domainLabel = { execution: 'Execution', conversation: 'Conversation', tool: 'Tool', events: 'Events', outbox: 'Outbox' };
+    const domainColor = { execution: 'var(--blue)', conversation: 'var(--green)', tool: 'var(--purple)', events: 'var(--orange)', outbox: 'var(--red)' };
+
+    let html = `<div class="dm-table-header">
+      <span>${table.name}</span>
+      <span class="badge" style="background:${domainColor[table.domain]}22;color:${domainColor[table.domain]}">${domainLabel[table.domain]}</span>
+    </div><div class="dm-table-body">`;
+
+    table.columns.forEach((col, i) => {
+      const isHidden = i >= table.primaryCols;
+      html += `<div class="dm-col ${isHidden ? 'dm-hidden-cols' : ''}">
+        <span class="dm-col-name">${col.name}</span>
+        <span class="dm-col-type">${col.type}${col.note ? ' -- ' + col.note : ''}</span>
+        ${(col.badges || []).map(b => {
+          const cls = b === 'pk' ? 'badge-pk' : b === 'fk' ? 'badge-fk' : b === 'uk' ? 'badge-uk' : b === 'idx' ? 'badge-idx' : 'badge-null';
+          const label = b === 'pk' ? 'PK' : b === 'fk' ? 'FK' : b === 'uk' ? 'UQ' : b === 'idx' ? 'IDX' : 'NULL';
+          return `<span class="dm-col-badge ${cls}">${label}</span>`;
+        }).join('')}
+      </div>`;
+    });
+
+    if (table.columns.length > table.primaryCols) {
+      html += `<div class="dm-expand-hint">+ ${table.columns.length - table.primaryCols} more columns (click to expand)</div>`;
+    }
+
+    html += '</div>';
+
+    if (table.constraints.length) {
+      html += '<div class="dm-constraints">';
+      table.constraints.forEach(c => { html += `<div>&#9432; ${c}</div>`; });
+      html += '</div>';
+    }
+
+    el.innerHTML = html;
+    el.addEventListener('click', () => el.classList.toggle('expanded'));
+    grid.appendChild(el);
+  });
+
+  // FK chips
+  const fkList = $('#fk-list');
+  fkList.innerHTML = '';
+  fkRelationships.forEach(fk => {
+    const chip = document.createElement('span');
+    chip.className = 'fk-chip';
+    chip.title = fk.desc;
+    chip.innerHTML = `${fk.from}.${fk.col} <span class="arrow">&rarr;</span> ${fk.to}`;
+    fkList.appendChild(chip);
+  });
+}
+
+renderDataModel();
+
+// ============================================================
+// TAB 2: ARCHITECTURE LAYERS
+// ============================================================
+const archLayers = [
+  {
+    num: 1, name: 'Transport Layer', sub: 'gRPC / HTTP (future, not in v1)',
+    color: 'var(--text-muted)',
+    tables: [],
+    detail: `<p>The transport layer will eventually provide gRPC and HTTP endpoints for external clients. In v1, the library is consumed directly as a Rust crate without a network boundary.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> Deferred to keep scope contained. The library API is designed so that adding gRPC later requires no changes to core logic.</p>`
+  },
+  {
+    num: 2, name: 'Event Pipeline', sub: 'Live streaming + durable replay with per-thread monotonic sequences',
+    color: 'var(--orange)',
+    tables: ['events'],
+    detail: `<p>Events are committed atomically with turn/tool transitions. Each thread maintains its own monotonic sequence counter, owned by the server (not the client).</p>
+    <p style="margin-top:8px;"><strong>Replay model:</strong> Clients read from the events table to catch up, then switch to a live stream. Stream-only events (like token deltas) are NOT persisted -- they are ephemeral.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> Server-owned sequence numbers prevent gaps. Atomic commit with state transitions ensures consistency.</p>`
+  },
+  {
+    num: 3, name: 'Turn Worker', sub: 'Acquires tasks, runs model turns via run_turn SDK call',
+    color: 'var(--blue)',
+    tables: ['agent_tasks', 'turn_attempts', 'turn_checkpoints'],
+    detail: `<p>The turn worker is the core execution loop. It acquires a runnable agent_task, creates a turn_attempt, rebuilds thread state from the latest checkpoint, computes the next AgentInput, and calls run_turn from the SDK.</p>
+    <p style="margin-top:8px;"><strong>Two outcomes:</strong> (1) No tool work: close turn_attempt, commit staged projections atomically, advance task. (2) Tool work: persist continuation state, create tool_runtime child tasks, move to waiting_on_children.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> Lease-based acquisition prevents double-execution. Heartbeats detect crashed workers. Checkpoints enable crash recovery without replaying all turns.</p>`
+  },
+  {
+    num: 4, name: 'Tool Runtime', sub: 'Child task workers for durable tool execution',
+    color: 'var(--purple)',
+    tables: ['tool_executions', 'tool_call_log'],
+    detail: `<p>Each tool call becomes a tool_runtime child task in agent_tasks. Tool workers acquire these tasks and execute them durably: the execution intent is persisted BEFORE the tool runs.</p>
+    <p style="margin-top:8px;"><strong>Three modes:</strong> (1) Sync tools: execute immediately, record result. (2) Async tools: execute with operation_id, poll for completion. (3) Listen/Confirm tools: listen() as prepare step, persist prepared state, move to awaiting_confirmation, then execute() after user confirmation.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> Durable execution intent means crashes can be recovered. The tool_call_log provides an append-only audit trail separate from execution state.</p>`
+  },
+  {
+    num: 5, name: 'Task Journal', sub: 'agent_tasks as the sole execution authority',
+    color: 'var(--blue)',
+    tables: ['agent_tasks'],
+    detail: `<p>The agent_tasks table is the single source of truth for execution state. Every state transition goes through this table. The partial unique index ensures at most one active root task per thread.</p>
+    <p style="margin-top:8px;"><strong>Hierarchy:</strong> Tasks form a tree -- root_turn at the top, tool_runtime and subagent children below. Parent cancellation cascades to all descendants.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> No in-memory coordination needed. Any worker can read the authoritative state from the database. Lease expiry handles crashed workers automatically.</p>`
+  },
+  {
+    num: 6, name: 'Persistence', sub: 'Threads, messages, checkpoints, turn attempts',
+    color: 'var(--green)',
+    tables: ['threads', 'messages', 'turn_checkpoints', 'turn_attempts'],
+    detail: `<p>The persistence layer stores conversation data (threads + messages) and execution history (turn_attempts + turn_checkpoints). Turn attempts are append-only and never updated except to mark completion.</p>
+    <p style="margin-top:8px;"><strong>Checkpoints:</strong> After each completed turn, a full message snapshot is saved. This allows crash recovery to rebuild from the latest checkpoint instead of replaying from scratch.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> BYTEA for message content allows flexible serialization. Sequence numbers on messages enable ordered reconstruction.</p>`
+  },
+  {
+    num: 7, name: 'AMQP Outbox', sub: 'Optional wakeup/fanout, never authoritative',
+    color: 'var(--red)',
+    tables: ['msgs'],
+    detail: `<p>The msgs table implements the transactional outbox pattern. Messages are written atomically with database state changes, then published to AMQP asynchronously.</p>
+    <p style="margin-top:8px;"><strong>Critical property:</strong> The outbox is NEVER authoritative. If AMQP messages are lost, the system recovers by polling the database. If messages are duplicated, idempotent consumers handle it.</p>
+    <p style="margin-top:8px;"><strong>Key decisions:</strong> published_at is NULL until publish is confirmed. A background poller retries unpublished messages. This decouples reliability from AMQP availability.</p>`
+  },
+];
+
+function renderArchLayers() {
+  const container = $('#arch-container');
+  container.innerHTML = '';
+
+  archLayers.forEach((layer, i) => {
+    if (i > 0) {
+      container.innerHTML += '<div class="arch-flow-arrow">&#9660;</div>';
+    }
+
+    const el = document.createElement('div');
+    el.className = 'arch-layer';
+    el.style.background = `${layer.color}11`;
+    el.style.borderLeft = `3px solid ${layer.color}`;
+
+    el.innerHTML = `
+      <div class="arch-layer-num" style="color:${layer.color};border-color:${layer.color}">${layer.num}</div>
+      <div class="arch-layer-title" style="color:${layer.color}">${layer.name}</div>
+      <div class="arch-layer-subtitle">${layer.sub}</div>
+      ${layer.tables.length ? `<div class="arch-tables">${layer.tables.map(t => `<span class="arch-table-tag">${t}</span>`).join('')}</div>` : ''}
+      <div class="arch-layer-detail">${layer.detail}</div>
+    `;
+
+    el.addEventListener('click', () => {
+      const wasExpanded = el.classList.contains('expanded');
+      $$('.arch-layer').forEach(l => l.classList.remove('expanded'));
+      if (!wasExpanded) el.classList.add('expanded');
+    });
+
+    container.appendChild(el);
+  });
+}
+
+renderArchLayers();
+
+// ============================================================
+// TAB 3: STATE MACHINE
+// ============================================================
+const smStates = [
+  { id: 'queued', x: 60, y: 60, w: 110, h: 40, color: 'var(--text-muted)', label: 'queued',
+    info: 'Initial state. Task has been created but not yet picked up by any worker. All task kinds (root_turn, tool_runtime, subagent) start here.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+  { id: 'pending', x: 280, y: 60, w: 110, h: 40, color: 'var(--blue)', label: 'pending',
+    info: 'Task has been claimed by a worker (worker_id set, lease acquired). The worker is preparing to execute: loading context, rebuilding state from checkpoints.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+  { id: 'running', x: 500, y: 60, w: 110, h: 40, color: 'var(--blue)', label: 'running',
+    info: 'Task is actively executing. For root_turn: running a model turn via run_turn. For tool_runtime: executing the tool. For subagent: running a sub-conversation. The worker sends heartbeats to maintain its lease.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+  { id: 'waiting', x: 490, y: 190, w: 195, h: 40, color: 'var(--orange)', label: 'waiting_on_children',
+    info: 'Task has dispatched child tasks (tool_runtime or subagent) and is waiting for all of them to complete. When all children finish, the task transitions back to running to process results. The "one active root per thread" constraint counts this state.',
+    workers: ['root_turn', 'subagent'] },
+  { id: 'confirming', x: 490, y: 300, w: 205, h: 40, color: 'var(--orange)', label: 'awaiting_confirmation',
+    info: 'Task requires user confirmation before proceeding. Used by listen/confirm tools where listen() has been called but execute() awaits human approval. The prepared_operation_state holds the operation context. The "one active root per thread" constraint counts this state.',
+    workers: ['tool_runtime'] },
+  { id: 'completed', x: 860, y: 60, w: 120, h: 40, color: 'var(--green)', label: 'completed',
+    info: 'Terminal success state. The task finished successfully. result_blob contains the output. completed_at is set. For root_turn: the turn produced a final response. For tool_runtime: the tool executed and returned a result.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+  { id: 'failed', x: 860, y: 190, w: 110, h: 40, color: 'var(--red)', label: 'failed',
+    info: 'Terminal failure state. The task exhausted its retry attempts (attempt >= max_attempts) or encountered an unrecoverable error. error_blob contains failure details.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+  { id: 'cancelled', x: 860, y: 300, w: 120, h: 40, color: 'var(--red)', label: 'cancelled',
+    info: 'Terminal cancellation state. The task was cancelled, either directly via cancel_requested_at or via parent cancellation cascading down the task tree. All descendant tasks are also cancelled.',
+    workers: ['root_turn', 'tool_runtime', 'subagent'] },
+];
+
+const smTransitions = [
+  { from: 'queued', to: 'pending', label: 'worker acquires', path: null },
+  { from: 'pending', to: 'running', label: 'context loaded', path: null },
+  { from: 'running', to: 'completed', label: 'success (no tools)', path: null },
+  { from: 'running', to: 'waiting', label: 'tools dispatched', path: [[555,100],[555,190]], labelOff: [10,0] },
+  { from: 'running', to: 'failed', label: 'max retries', path: [[610,80],[740,80],[740,150],[860,150],[860,190]], labelOff: [40,0] },
+  { from: 'running', to: 'cancelled', label: 'cancel requested', path: [[610,80],[760,80],[760,270],[860,270],[860,300]], labelOff: [50,0] },
+  { from: 'waiting', to: 'running', label: 'children done', path: [[490,210],[440,210],[440,80],[500,80]], labelOff: [-50,0] },
+  { from: 'waiting', to: 'failed', label: 'child failed', path: [[685,200],[860,200]], labelOff: [0,-8] },
+  { from: 'waiting', to: 'cancelled', label: 'cancel cascaded', path: [[685,225],[730,225],[730,310],[860,310]], labelOff: [0,-8] },
+  { from: 'confirming', to: 'running', label: 'confirmed', path: [[490,320],[420,320],[420,80],[500,80]], labelOff: [-44,0] },
+  { from: 'confirming', to: 'cancelled', label: 'timeout/reject', path: [[695,330],[860,330]], labelOff: [-20,-8] },
+  { from: 'running', to: 'confirming', label: 'needs confirm', path: [[555,100],[555,140],[470,140],[470,320],[490,320]], labelOff: [-55,0] },
+];
+
+function renderStateMachine() {
+  const wrap = $('#sm-svg-wrap');
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 1040 400');
+  svg.setAttribute('xmlns', svgNS);
+
+  // Defs - arrowhead
+  const defs = document.createElementNS(svgNS, 'defs');
+  const marker = document.createElementNS(svgNS, 'marker');
+  marker.setAttribute('id', 'arrowhead');
+  marker.setAttribute('markerWidth', '8');
+  marker.setAttribute('markerHeight', '6');
+  marker.setAttribute('refX', '8');
+  marker.setAttribute('refY', '3');
+  marker.setAttribute('orient', 'auto');
+  const poly = document.createElementNS(svgNS, 'polygon');
+  poly.setAttribute('points', '0 0, 8 3, 0 6');
+  poly.setAttribute('fill', 'var(--text-muted)');
+  marker.appendChild(poly);
+  defs.appendChild(marker);
+
+  const marker2 = marker.cloneNode(true);
+  marker2.setAttribute('id', 'arrowhead-blue');
+  marker2.querySelector('polygon').setAttribute('fill', 'var(--blue)');
+  defs.appendChild(marker2);
+
+  svg.appendChild(defs);
+
+  // Draw transitions
+  smTransitions.forEach(tr => {
+    const fromS = smStates.find(s => s.id === tr.from);
+    const toS = smStates.find(s => s.id === tr.to);
+
+    const path = document.createElementNS(svgNS, 'path');
+    let d;
+
+    if (tr.path) {
+      const pts = tr.path;
+      d = `M ${pts[0][0]} ${pts[0][1]}`;
+      for (let i = 1; i < pts.length; i++) {
+        d += ` L ${pts[i][0]} ${pts[i][1]}`;
+      }
+    } else {
+      const x1 = fromS.x + fromS.w;
+      const y1 = fromS.y + fromS.h / 2;
+      const x2 = toS.x;
+      const y2 = toS.y + toS.h / 2;
+      d = `M ${x1} ${y1} L ${x2} ${y2}`;
+    }
+
+    path.setAttribute('d', d);
+    path.setAttribute('class', 'sm-arrow');
+    path.dataset.transition = `${tr.from}-${tr.to}`;
+
+    // Label
+    let labelX, labelY;
+    const lOff = tr.labelOff || [0, 0];
+    if (tr.path) {
+      const mid = Math.floor(tr.path.length / 2);
+      labelX = tr.path[mid][0] + lOff[0];
+      labelY = tr.path[mid][1] - 8 + lOff[1];
+    } else {
+      labelX = (fromS.x + fromS.w + toS.x) / 2 + lOff[0];
+      labelY = ((fromS.y + fromS.h / 2) + (toS.y + toS.h / 2)) / 2 - 10 + lOff[1];
+    }
+
+    svg.appendChild(path);
+
+    const text = document.createElementNS(svgNS, 'text');
+    text.setAttribute('x', labelX);
+    text.setAttribute('y', labelY);
+    text.setAttribute('class', 'sm-transition-label');
+    text.setAttribute('text-anchor', 'middle');
+    text.textContent = tr.label;
+    svg.appendChild(text);
+  });
+
+  // Draw states
+  smStates.forEach(s => {
+    const g = document.createElementNS(svgNS, 'g');
+    g.setAttribute('class', 'sm-state');
+    g.dataset.state = s.id;
+
+    const rect = document.createElementNS(svgNS, 'rect');
+    rect.setAttribute('x', s.x);
+    rect.setAttribute('y', s.y);
+    rect.setAttribute('width', s.w);
+    rect.setAttribute('height', s.h);
+    rect.setAttribute('fill', `${s.color}22`);
+    rect.setAttribute('stroke', s.color);
+    rect.setAttribute('rx', '6');
+    g.appendChild(rect);
+
+    const text = document.createElementNS(svgNS, 'text');
+    text.setAttribute('x', s.x + s.w / 2);
+    text.setAttribute('y', s.y + s.h / 2);
+    text.setAttribute('fill', s.color);
+    text.setAttribute('font-size', s.label.length > 16 ? '9' : '11');
+    text.textContent = s.label;
+    g.appendChild(text);
+
+    g.addEventListener('click', () => {
+      const panel = $('#sm-info-panel');
+      const workerColors = { root_turn: 'var(--blue)', tool_runtime: 'var(--purple)', subagent: 'var(--cyan)' };
+      panel.innerHTML = `
+        <h3 style="color:${s.color}">${s.label}</h3>
+        <p>${s.info}</p>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+          <span style="font-size:11px;color:var(--text-muted);margin-right:4px;">Applicable to:</span>
+          ${s.workers.map(w => `<span class="sm-worker-tag" style="border-color:${workerColors[w]};color:${workerColors[w]}">${w}</span>`).join('')}
+        </div>
+      `;
+
+      // Highlight connected transitions
+      $$('.sm-arrow', svg).forEach(a => {
+        a.classList.remove('sm-arrow-active');
+        a.style.markerEnd = 'url(#arrowhead)';
+      });
+      $$('.sm-arrow', svg).forEach(a => {
+        const [from, to] = a.dataset.transition.split('-');
+        if (from === s.id || to === s.id) {
+          a.classList.add('sm-arrow-active');
+          a.style.markerEnd = 'url(#arrowhead-blue)';
+        }
+      });
+    });
+
+    svg.appendChild(g);
+  });
+
+  // "One active root per thread" constraint
+  const constraintG = document.createElementNS(svgNS, 'g');
+  const cRect = document.createElementNS(svgNS, 'rect');
+  cRect.setAttribute('x', 200);
+  cRect.setAttribute('y', 365);
+  cRect.setAttribute('width', 520);
+  cRect.setAttribute('height', 24);
+  cRect.setAttribute('fill', 'var(--orange-dim)');
+  cRect.setAttribute('stroke', 'var(--orange)');
+  cRect.setAttribute('stroke-dasharray', '4,2');
+  cRect.setAttribute('rx', '4');
+  constraintG.appendChild(cRect);
+
+  const cText = document.createElementNS(svgNS, 'text');
+  cText.setAttribute('x', 460);
+  cText.setAttribute('y', 381);
+  cText.setAttribute('fill', 'var(--orange)');
+  cText.setAttribute('font-size', '11');
+  cText.setAttribute('text-anchor', 'middle');
+  cText.setAttribute('font-family', 'var(--font-mono)');
+  cText.textContent = 'PARTIAL UNIQUE: one active root per thread (pending|running|waiting|confirming)';
+  constraintG.appendChild(cText);
+  svg.appendChild(constraintG);
+
+  wrap.innerHTML = '';
+  wrap.appendChild(svg);
+}
+
+renderStateMachine();
+
+// ============================================================
+// TAB 4: TURN LIFECYCLE
+// ============================================================
+const turnPaths = {
+  'text-only': [
+    { title: 'Acquire runnable task', desc: 'Turn worker queries agent_tasks for a task in queued status. Claims it by setting worker_id and lease_expires_at. Status transitions: queued -> pending.', persist: 'agent_tasks', recovery: 'If crash here: task lease expires, another worker can claim it. No side effects.' },
+    { title: 'Create turn_attempt', desc: 'A new turn_attempt row is inserted with status=running, the requested model, and the request blob. The task\'s current_turn_attempt_id is updated.', persist: 'turn_attempts', recovery: 'If crash here: orphaned turn_attempt in running status. On recovery, the turn_attempt is abandoned and a new one created.' },
+    { title: 'Rebuild thread state from checkpoint', desc: 'Load the latest turn_checkpoint for this thread. Deserialize messages_snapshot and agent_state_snapshot. If no checkpoint exists, start from the raw message history.', persist: 'none (read-only)', recovery: 'If crash here: same as step 2. Checkpoint is immutable and safe to re-read.' },
+    { title: 'Compute AgentInput', desc: 'Build the next AgentInput from the reconstructed state. This includes the full message history, system prompt, and any continuation state from a previous partial turn.', persist: 'none (in-memory)', recovery: 'If crash here: no durable state changed since step 2. Retry from step 1.' },
+    { title: 'Run model turn (run_turn)', desc: 'Call the SDK\'s run_turn function. This makes the LLM API call, streams the response, and returns the result. Status: pending -> running.', persist: 'agent_tasks (status)', recovery: 'If crash mid-stream: the LLM call is lost but no durable state was changed. On retry, a new turn_attempt is created and the model is called again.' },
+    { title: 'Model returns text-only response', desc: 'The model response contains only text content, no tool_use blocks. This is the simple path.', persist: 'none (decision point)', recovery: 'N/A' },
+    { title: 'Close turn_attempt', desc: 'Update turn_attempt: set response_blob, stop_reason, token counts, llm_duration_ms, outcome_kind, status=completed, completed_at.', persist: 'turn_attempts', recovery: 'If crash here: turn_attempt stays in running status. On recovery, it\'s abandoned and retried.' },
+    { title: 'Commit staged projections atomically', desc: 'In a single transaction: (1) Insert messages into messages table, (2) Create turn_checkpoint with full message snapshot, (3) Insert events with server-assigned sequence numbers, (4) Update thread (turn_count, token counts), (5) Optionally insert msgs (outbox) for AMQP.', persist: 'messages, turn_checkpoints, events, threads, msgs', recovery: 'Atomic transaction: either all persisted or none. If crash before commit: retry safely. If crash after commit: durable.' },
+    { title: 'Advance task to completed', desc: 'Set agent_tasks status=completed, result_blob with the response, completed_at. The turn is done.', persist: 'agent_tasks', recovery: 'If crash between step 8 and 9: data is committed but task not marked done. On recovery, worker detects committed state and advances task.' },
+  ],
+  'tool-use': [
+    { title: 'Acquire runnable task', desc: 'Turn worker queries agent_tasks for a task in queued status. Claims it by setting worker_id and lease_expires_at. Status: queued -> pending.', persist: 'agent_tasks', recovery: 'If crash here: task lease expires, another worker can claim it. No side effects.' },
+    { title: 'Create turn_attempt', desc: 'A new turn_attempt row is inserted with status=running, the requested model, and the request blob.', persist: 'turn_attempts', recovery: 'If crash here: orphaned turn_attempt. On recovery, abandoned and retried.' },
+    { title: 'Rebuild thread state from checkpoint', desc: 'Load latest turn_checkpoint. Deserialize messages and agent state. First turn starts from raw history.', persist: 'none (read-only)', recovery: 'Safe to retry -- checkpoints are immutable.' },
+    { title: 'Compute AgentInput and run model turn', desc: 'Build AgentInput, call run_turn. The model processes the conversation and decides to use tools.', persist: 'agent_tasks (status -> running)', recovery: 'If crash mid-stream: LLM call lost, no durable state changed. Retry from step 1.' },
+    { title: 'Model returns tool_use response', desc: 'The model response contains one or more tool_use content blocks. The worker must now dispatch these as child tasks.', persist: 'none (decision point)', recovery: 'N/A -- this is a branch point.' },
+    { title: 'Persist continuation state', desc: 'Save the current execution context (continuation_state on agent_tasks) so the parent can resume after children complete. This includes the assistant message with tool_use blocks.', persist: 'agent_tasks (continuation_state)', recovery: 'If crash before persist: no continuation saved, retry from model call. If crash after: continuation is durable.' },
+    { title: 'Create tool_runtime child tasks', desc: 'For each tool_use block, create a child agent_task with task_kind=tool_runtime, parent_task_id referencing the current task, status=queued. Each child gets its context_blob with tool name, input, and call ID.', persist: 'agent_tasks (children)', recovery: 'If crash mid-creation: some children created, some not. On recovery, idempotent creation fills the gaps.' },
+    { title: 'Move parent to waiting_on_children', desc: 'Update parent task: status=waiting_on_children. The parent is now dormant until all children complete.', persist: 'agent_tasks', recovery: 'If crash here: parent may still be running with children queued. Recovery detects children and moves to waiting.' },
+    { title: '[Tool workers execute children]', desc: 'Each tool_runtime child is picked up by a tool worker (see Tool Execution tab). They execute independently and in parallel.', persist: 'tool_executions, tool_call_log', recovery: 'Each child has its own recovery path (see Failure Scenarios).' },
+    { title: 'All children completed', desc: 'Last child to complete triggers parent wake-up. The parent aggregates all tool results from children\'s result_blobs.', persist: 'agent_tasks (children status)', recovery: 'If a child fails: parent may fail or retry depending on policy. Cancellation cascades.' },
+    { title: 'Resume parent: running again', desc: 'Parent task status: waiting_on_children -> running. Load continuation_state, inject tool results as tool_result messages, and loop back to run another model turn.', persist: 'agent_tasks (status)', recovery: 'If crash on resume: continuation_state is still durable. Retry aggregation and resume.' },
+    { title: 'Next model turn (loop back to step 4)', desc: 'The parent runs another model turn with the tool results included. This may produce text (end turn) or more tool calls (loop again).', persist: '(see step 4 onwards)', recovery: 'Same recovery as initial turn -- checkpoint from last completed turn.' },
+  ],
+};
+
+let tlPath = 'text-only';
+let tlStep = -1;
+
+function renderTurnLifecycle() {
+  const steps = turnPaths[tlPath];
+  const container = $('#tl-steps');
+  container.innerHTML = '';
+
+  steps.forEach((step, i) => {
+    const el = document.createElement('div');
+    el.className = 'tl-step';
+    el.dataset.index = i;
+
+    el.innerHTML = `
+      <div class="tl-step-num">${i + 1}</div>
+      <div class="tl-step-content">
+        <div class="tl-step-title">${step.title}</div>
+        <div class="tl-step-desc">${step.desc}</div>
+        ${step.recovery !== 'N/A' ? `<div class="tl-step-recovery">${step.recovery}</div>` : ''}
+      </div>
+      ${step.persist !== 'none (read-only)' && step.persist !== 'none (in-memory)' && step.persist !== 'none (decision point)' ? `<div class="tl-step-persist">${step.persist}</div>` : ''}
+    `;
+
+    container.appendChild(el);
+  });
+
+  tlStep = -1;
+  updateTLCounter();
+}
+
+function updateTLCounter() {
+  const steps = turnPaths[tlPath];
+  $('#tl-counter').textContent = `Step ${Math.max(0, tlStep + 1)} / ${steps.length}`;
+  $('#tl-prev').disabled = tlStep <= 0;
+  $('#tl-next').disabled = tlStep >= steps.length - 1;
+}
+
+function advanceTL(dir) {
+  const steps = turnPaths[tlPath];
+  tlStep = Math.max(-1, Math.min(steps.length - 1, tlStep + dir));
+
+  $$('.tl-step', $('#tl-steps')).forEach((el, i) => {
+    el.classList.toggle('visible', i <= tlStep);
+    el.classList.toggle('current', i === tlStep);
+  });
+
+  updateTLCounter();
+}
+
+$('#tl-next').addEventListener('click', () => advanceTL(1));
+$('#tl-prev').addEventListener('click', () => advanceTL(-1));
+$('#tl-reset').addEventListener('click', () => { tlStep = -1; renderTurnLifecycle(); });
+
+$$('.tl-controls .tl-btn[data-path]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('.tl-controls .tl-btn[data-path]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    tlPath = btn.dataset.path;
+    renderTurnLifecycle();
+  });
+});
+
+renderTurnLifecycle();
+
+// ============================================================
+// TAB 5: TOOL EXECUTION SCENARIOS
+// ============================================================
+const toolScenarios = {
+  sync: {
+    label: 'Sync Tool (Success)',
+    steps: [
+      { title: 'Tool worker acquires child task', desc: 'A tool_runtime child task is picked up from agent_tasks (status: queued -> pending -> running).', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w2, lease_expires_at=now()+30s' }
+      ]},
+      { title: 'Persist execution intent', desc: 'A tool_executions row is created BEFORE the tool runs. This is the durable record of intent.', db: [
+        { table: 'tool_executions', change: 'INSERT', value: 'id=te1, tool_name="bash", status=running, input_blob={cmd:"ls"}' }
+      ]},
+      { title: 'Execute tool synchronously', desc: 'The tool (e.g., bash) is executed. The worker waits for the result.', db: []},
+      { title: 'Record result', desc: 'Tool execution result is saved. The tool_executions row is updated with result_blob and status=completed.', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'status=completed, result_blob={output:"file1.rs\\nfile2.rs"}, completed_at=now()' }
+      ]},
+      { title: 'Log to audit trail', desc: 'An entry is appended to tool_call_log with full details for auditing.', db: [
+        { table: 'tool_call_log', change: 'INSERT', value: 'tool_name="bash", outcome="success", tier="sync"' }
+      ]},
+      { title: 'Complete child task', desc: 'The tool_runtime task is marked completed with the result. If this was the last child, the parent wakes up.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=completed, result_blob={...}, completed_at=now()' }
+      ]},
+    ],
+  },
+  async_op: {
+    label: 'Async Tool (operation_id)',
+    steps: [
+      { title: 'Tool worker acquires child task', desc: 'A tool_runtime child task for an async tool (e.g., long-running API call) is claimed.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w3' }
+      ]},
+      { title: 'Persist execution intent', desc: 'tool_executions row created with the async tool details.', db: [
+        { table: 'tool_executions', change: 'INSERT', value: 'tool_name="deploy", status=running, input_blob={env:"staging"}' }
+      ]},
+      { title: 'Execute tool -- receives operation_id', desc: 'The tool starts execution and returns an operation_id for tracking. The actual work continues asynchronously.', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'stable_operation_key="deploy-staging-abc123"' }
+      ]},
+      { title: 'Poll for completion', desc: 'The worker periodically polls the tool using the operation_id. This is resilient to worker crashes because the operation_id is persisted.', db: []},
+      { title: 'Tool completes', desc: 'Polling returns a completed result. The tool_executions row is updated.', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'status=completed, result_blob={url:"https://staging.example.com"}, completed_at=now()' }
+      ]},
+      { title: 'Log and complete task', desc: 'Audit log entry created, child task marked completed.', db: [
+        { table: 'tool_call_log', change: 'INSERT', value: 'tool_name="deploy", outcome="success", tier="async"' },
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=completed, result_blob={...}' }
+      ]},
+    ],
+  },
+  listen_confirm: {
+    label: 'Listen/Confirm Tool',
+    steps: [
+      { title: 'Tool worker acquires child task', desc: 'A tool_runtime child task for a listen/confirm tool (e.g., human approval) is claimed.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w4' }
+      ]},
+      { title: 'Persist execution intent', desc: 'tool_executions row created before any execution.', db: [
+        { table: 'tool_executions', change: 'INSERT', value: 'tool_name="approve_deploy", status=running' }
+      ]},
+      { title: 'Call listen() as prepare step', desc: 'The tool\'s listen() method is called. This sets up whatever is needed to receive confirmation (e.g., sends a Slack message with approve/reject buttons).', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'prepared_operation_id="slack-msg-xyz"' }
+      ]},
+      { title: 'Persist prepared state, move to awaiting_confirmation', desc: 'The prepared operation context is saved on the task. The task moves to awaiting_confirmation, releasing the worker.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=awaiting_confirmation, prepared_operation_state={slack_msg_id:"xyz"}' }
+      ]},
+      { title: 'User confirms (external event)', desc: 'An external system (e.g., Slack callback) signals confirmation. The task is moved back to queued for pickup.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=queued (re-enqueued for execution)' }
+      ]},
+      { title: 'Worker re-acquires, calls execute()', desc: 'A worker picks up the task again, loads prepared_operation_state, and calls execute() to complete the operation.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w5' }
+      ]},
+      { title: 'Record result and complete', desc: 'The tool returns its result. Execution and task are completed.', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'status=completed, result_blob={approved:true}' },
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=completed' }
+      ]},
+    ],
+  },
+  batch_fail: {
+    label: 'Mixed Batch + Confirm Failure',
+    steps: [
+      { title: 'Parent dispatches 3 tool children', desc: 'Model returned 3 tool_use blocks. Parent creates 3 child tasks: bash (sync), deploy (async), approve (listen/confirm).', db: [
+        { table: 'agent_tasks', change: 'INSERT x3', value: 'child_1: bash (queued), child_2: deploy (queued), child_3: approve (queued)' }
+      ]},
+      { title: 'Parent moves to waiting_on_children', desc: 'Parent task waits for all 3 children.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'parent status=waiting_on_children' }
+      ]},
+      { title: 'bash child completes successfully', desc: 'First child executes and completes.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'child_1 status=completed' }
+      ]},
+      { title: 'deploy child starts async execution', desc: 'Second child starts, gets operation_id, begins polling.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'child_2 status=running' },
+        { table: 'tool_executions', change: 'INSERT', value: 'deploy tool, operation_key="deploy-abc"' }
+      ]},
+      { title: 'approve child reaches awaiting_confirmation', desc: 'Third child calls listen(), persists prepared state, waits for confirmation.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'child_3 status=awaiting_confirmation' }
+      ]},
+      { title: 'User REJECTS the approval', desc: 'External rejection triggers the confirm tool to fail. This child task fails.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'child_3 status=failed, error_blob={reason:"user rejected"}' }
+      ]},
+      { title: 'Cancel surviving siblings', desc: 'Because a child failed, the parent cancels all other running/queued children. The deploy child (still polling) is cancelled.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'child_2 status=cancelled, cancel_requested_at=now()' }
+      ]},
+      { title: 'Parent task fails', desc: 'With a child failure, the parent transitions from waiting_on_children to failed.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'parent status=failed, error_blob={child_3:"user rejected"}' }
+      ]},
+    ],
+  },
+  crash_recovery: {
+    label: 'Crash During Execution',
+    steps: [
+      { title: 'Worker acquires and starts tool', desc: 'Worker picks up tool_runtime task, persists execution intent, begins executing.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w6, lease_expires_at=T+30s' },
+        { table: 'tool_executions', change: 'INSERT', value: 'status=running, tool_name="write"' }
+      ]},
+      { title: 'CRASH: Worker dies mid-execution', desc: 'The worker process crashes. The tool was writing a file but did not complete. No result was recorded.', db: []},
+      { title: 'Lease expires (T+30s)', desc: 'After 30 seconds with no heartbeat, the task\'s lease expires. The task becomes available for reacquisition.', db: [
+        { table: 'agent_tasks', change: '(detected)', value: 'lease_expires_at < now(), worker_id=w6 (stale)' }
+      ]},
+      { title: 'New worker claims the task', desc: 'A recovery worker detects the expired lease and claims the task. The attempt counter is incremented.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'worker_id=w7, attempt=2, lease_expires_at=T2+30s' }
+      ]},
+      { title: 'Check for existing execution intent', desc: 'The new worker finds the tool_executions row in running status. It knows the previous attempt started but did not finish. It checks the stable_operation_key for idempotency.', db: []},
+      { title: 'Re-execute or resume', desc: 'If the tool supports idempotent retry (has operation_key): resume from where it left off. If not: re-execute from scratch. The tool_executions row is reused or a new one created.', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'status=completed (after successful re-execution)' }
+      ]},
+      { title: 'Complete normally', desc: 'The task completes as if the crash never happened. The durable execution intent prevented data loss.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=completed' }
+      ]},
+    ],
+  },
+  policy_block: {
+    label: 'Policy-Blocked Tool',
+    steps: [
+      { title: 'Tool worker acquires child task', desc: 'A tool_runtime child task is claimed by a worker.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=running, worker_id=w8' }
+      ]},
+      { title: 'Resume-time policy check', desc: 'Before executing the tool, the worker evaluates the security policy. The policy checks the tool name, input parameters, and user permissions against the current configuration.', db: []},
+      { title: 'Policy DENIES execution', desc: 'The policy check fails. For example: the "bash" tool is not allowed in this thread\'s security context, or the command contains a forbidden pattern.', db: []},
+      { title: 'Record policy denial', desc: 'The tool execution is recorded as blocked. The tool_call_log gets an entry with outcome="policy_denied".', db: [
+        { table: 'tool_executions', change: 'UPDATE', value: 'status=completed, result_blob={error:"policy denied: bash not allowed"}' },
+        { table: 'tool_call_log', change: 'INSERT', value: 'outcome="policy_denied", tool_name="bash"' }
+      ]},
+      { title: 'Complete child with error result', desc: 'The child task completes (not fails) with an error result that the model can interpret and respond to.', db: [
+        { table: 'agent_tasks', change: 'UPDATE', value: 'status=completed, result_blob={error:"policy denied"}' }
+      ]},
+      { title: 'Parent resumes with denial message', desc: 'The parent task resumes and feeds the policy denial as a tool_result to the model. The model can then try a different approach.', db: []},
+    ],
+  },
+};
+
+let teScenario = 'sync';
+let teStep = -1;
+
+function renderTEScenarios() {
+  const tabs = $('#te-tabs');
+  tabs.innerHTML = '';
+  Object.entries(toolScenarios).forEach(([key, sc]) => {
+    const btn = document.createElement('button');
+    btn.className = `te-scenario-btn ${key === teScenario ? 'active' : ''}`;
+    btn.textContent = sc.label;
+    btn.addEventListener('click', () => {
+      teScenario = key;
+      teStep = -1;
+      renderTEScenarios();
+      renderTESteps();
+    });
+    tabs.appendChild(btn);
+  });
+}
+
+function renderTESteps() {
+  const sc = toolScenarios[teScenario];
+  const container = $('#te-steps');
+  container.innerHTML = '';
+
+  sc.steps.forEach((step, i) => {
+    const el = document.createElement('div');
+    el.className = 'tl-step';
+    el.dataset.index = i;
+    el.innerHTML = `
+      <div class="tl-step-num">${i + 1}</div>
+      <div class="tl-step-content">
+        <div class="tl-step-title">${step.title}</div>
+        <div class="tl-step-desc">${step.desc}</div>
+      </div>
+    `;
+    container.appendChild(el);
+  });
+
+  updateTEState();
+}
+
+function updateTEState() {
+  const sc = toolScenarios[teScenario];
+  $$('.tl-step', $('#te-steps')).forEach((el, i) => {
+    el.classList.toggle('visible', i <= teStep);
+    el.classList.toggle('current', i === teStep);
+  });
+
+  // DB state
+  const dbState = $('#te-db-state');
+  const dbRows = $('#te-db-rows');
+  if (teStep >= 0) {
+    dbState.style.display = '';
+    dbRows.innerHTML = '';
+    const step = sc.steps[teStep];
+    if (step.db.length === 0) {
+      dbRows.innerHTML = '<div class="te-db-row" style="color:var(--text-muted)">No database changes at this step</div>';
+    } else {
+      step.db.forEach(d => {
+        dbRows.innerHTML += `<div class="te-db-row">
+          <span class="te-db-table-name">${d.table}</span>
+          <span class="te-db-change">${d.change}</span>
+          <span class="te-db-value">${d.value}</span>
+        </div>`;
+      });
+    }
+  } else {
+    dbState.style.display = 'none';
+  }
+
+  $('#te-counter').textContent = `Step ${Math.max(0, teStep + 1)} / ${sc.steps.length}`;
+  $('#te-prev').disabled = teStep <= 0;
+  $('#te-next').disabled = teStep >= sc.steps.length - 1;
+}
+
+$('#te-next').addEventListener('click', () => { teStep++; updateTEState(); });
+$('#te-prev').addEventListener('click', () => { teStep--; updateTEState(); });
+$('#te-reset').addEventListener('click', () => { teStep = -1; updateTEState(); });
+
+renderTEScenarios();
+renderTESteps();
+
+// ============================================================
+// TAB 6: FAILURE SCENARIOS
+// ============================================================
+const failureScenarios = {
+  crash_mid_turn: {
+    label: 'Worker crash mid-turn (no tools)',
+    timeline: ['Acquire task', 'Create turn_attempt', 'Rebuild state', 'Call run_turn', '*** CRASH ***', 'Lease expires', 'Recovery worker claims'],
+    crashIndex: 4,
+    durable: [
+      'agent_tasks row with worker_id and lease_expires_at',
+      'turn_attempt row in running status (will be abandoned)',
+      'All previous turn_checkpoints (safe, immutable)',
+      'All committed messages from previous turns',
+    ],
+    lost: [
+      'In-flight LLM response (partial stream data)',
+      'Any in-memory computed AgentInput',
+      'The running turn_attempt (abandoned, new one created)',
+    ],
+    recovery: [
+      'Lease expires after timeout (e.g., 30 seconds)',
+      'Recovery worker detects expired lease, claims the task',
+      'Attempt counter incremented (checked against max_attempts)',
+      'New turn_attempt created; old one left in running status (orphaned but harmless)',
+      'State rebuilt from latest checkpoint -- no data loss from previous turns',
+      'Model called again with the same input (the failed stream is simply retried)',
+    ],
+  },
+  crash_after_dispatch: {
+    label: 'Worker crash after tool dispatch',
+    timeline: ['Acquire task', 'Run model turn', 'Persist continuation', 'Create children', 'Set waiting_on_children', '*** CRASH ***', 'Children execute', 'Recovery detects'],
+    crashIndex: 5,
+    durable: [
+      'agent_tasks.continuation_state with full execution context',
+      'All child agent_tasks rows (queued or running)',
+      'Parent task status=waiting_on_children',
+      'tool_executions intent rows for each child',
+    ],
+    lost: [
+      'Worker\'s in-memory state (irrelevant -- continuation_state has everything)',
+      'Worker\'s lease on parent task (expires naturally)',
+    ],
+    recovery: [
+      'Children continue executing independently (they have their own workers)',
+      'When all children complete, parent needs to wake up',
+      'Recovery mechanism: periodic scan for tasks in waiting_on_children where all children are terminal',
+      'Or: last completing child triggers parent re-enqueue via AMQP outbox',
+      'Parent resumes from continuation_state, aggregates child results normally',
+    ],
+  },
+  crash_during_tool: {
+    label: 'Worker crash during tool execution',
+    timeline: ['Acquire child task', 'Persist intent', 'Start tool execution', '*** CRASH ***', 'Lease expires', 'New worker claims', 'Check execution intent', 'Resume/retry'],
+    crashIndex: 3,
+    durable: [
+      'tool_executions row with status=running and input_blob',
+      'stable_operation_key (if the tool provided one)',
+      'agent_tasks child row with attempt count',
+    ],
+    lost: [
+      'Tool\'s partial execution results (if tool has no operation_id)',
+      'Worker\'s in-memory state',
+    ],
+    recovery: [
+      'After lease expiry, new worker claims the child task',
+      'Worker finds tool_executions row in running status',
+      'If stable_operation_key exists: attempt to resume/poll the existing operation',
+      'If no operation_key: re-execute the tool from scratch (must be safe to retry)',
+      'Idempotent tools: safe to retry. Non-idempotent tools: may need operation_key for safety',
+      'After completion, normal flow resumes (parent wakes up when all children done)',
+    ],
+  },
+  db_unavailable: {
+    label: 'Database temporarily unavailable',
+    timeline: ['Worker running', 'Heartbeat fails', 'DB down 60s', 'DB recovers', 'Lease expired', 'Re-acquisition'],
+    crashIndex: 2,
+    durable: [
+      'All previously committed state (database is durable on disk)',
+      'In-flight work continues in the worker\'s memory',
+    ],
+    lost: [
+      'Heartbeat updates (lease may expire)',
+      'Any pending writes during the outage',
+      'New task acquisitions during the outage',
+    ],
+    recovery: [
+      'Workers detect write failures and enter retry loops with exponential backoff',
+      'If the DB outage outlasts the lease: other workers may try to claim the same task',
+      'Fencing token (worker_id + attempt number) prevents split-brain execution',
+      'On DB recovery: workers retry pending writes',
+      'Any in-flight LLM calls are wasted if the worker lost its lease (harmless, just costs tokens)',
+      'System self-heals once DB is available -- no manual intervention needed',
+    ],
+  },
+  amqp_lost: {
+    label: 'AMQP queue lost/duplicated',
+    timeline: ['Commit with outbox', 'Publish to AMQP', 'AMQP ACK lost', 'Duplicate publish', 'Consumer receives x2'],
+    crashIndex: 2,
+    durable: [
+      'msgs (outbox) row with published_at=NULL',
+      'All database state (independent of AMQP)',
+      'The outbox is the source of truth, not AMQP',
+    ],
+    lost: [
+      'Nothing is lost -- AMQP is never authoritative',
+    ],
+    recovery: [
+      'Background poller scans msgs table for rows where published_at IS NULL',
+      'Poller retries publishing to AMQP with exponential backoff',
+      'If AMQP loses a message: poller will eventually retry',
+      'If AMQP delivers a duplicate: consumers must be idempotent',
+      'Consumers can deduplicate using the msgs.id (UUID)',
+      'Key design principle: AMQP is a performance optimization (wakeup), not a correctness requirement. The system can always fall back to polling the database.',
+    ],
+  },
+  confirm_timeout: {
+    label: 'Confirmation timeout/expiry',
+    timeline: ['Tool reaches awaiting_confirmation', 'Wait for user...', 'Timeout threshold', 'Task cancelled/failed'],
+    crashIndex: 2,
+    durable: [
+      'agent_tasks with status=awaiting_confirmation',
+      'prepared_operation_state with full context',
+      'tool_executions with prepared_operation_id',
+    ],
+    lost: [
+      'The prepared operation may expire externally (e.g., Slack message becomes stale)',
+    ],
+    recovery: [
+      'A background scanner checks for tasks in awaiting_confirmation past their timeout',
+      'Timed-out tasks are transitioned to cancelled (or failed, depending on policy)',
+      'The parent task (if any) is notified of the child\'s cancellation',
+      'Parent may choose to: (a) fail entirely, (b) retry with a new confirmation request, or (c) proceed without the confirmed tool',
+      'External prepared operations (e.g., Slack messages) may need cleanup via a cancellation hook',
+    ],
+  },
+  parent_cancel_cascade: {
+    label: 'Parent cancelled while children running',
+    timeline: ['Parent waiting_on_children', 'Cancel requested on parent', 'Cascade to child_1', 'Cascade to child_2', 'Cascade to child_3', 'All cancelled'],
+    crashIndex: 1,
+    durable: [
+      'parent agent_tasks with cancel_requested_at set',
+      'Each child agent_tasks with cancel_requested_at propagated',
+    ],
+    lost: [
+      'Any in-flight work by child workers (gracefully abandoned)',
+      'Partial results from children that were mid-execution',
+    ],
+    recovery: [
+      'cancel_requested_at is set on the parent task',
+      'Cancellation cascades recursively to ALL descendants in the task tree',
+      'Each child task: if queued/pending, immediately cancelled. If running, worker detects cancel on next heartbeat',
+      'Workers check cancel_requested_at during heartbeat -- if set, they abort and mark status=cancelled',
+      'For tasks in awaiting_confirmation: cancelled immediately (no external confirmation needed)',
+      'Subagent children (which have their own child threads) are also cancelled recursively',
+      'Once all descendants are in terminal state, parent is marked cancelled',
+      'The cancel operation is idempotent -- re-requesting cancel is a no-op',
+    ],
+  },
+};
+
+let fsScenario = 'crash_mid_turn';
+
+function renderFSScenarios() {
+  const tabs = $('#fs-tabs');
+  tabs.innerHTML = '';
+  Object.entries(failureScenarios).forEach(([key, sc]) => {
+    const btn = document.createElement('button');
+    btn.className = `fs-scenario-btn ${key === fsScenario ? 'active' : ''}`;
+    btn.textContent = sc.label;
+    btn.addEventListener('click', () => {
+      fsScenario = key;
+      renderFSScenarios();
+      renderFSContent();
+    });
+    tabs.appendChild(btn);
+  });
+}
+
+function renderFSContent() {
+  const sc = failureScenarios[fsScenario];
+  const container = $('#fs-content');
+
+  let html = '<div class="fs-timeline">';
+  sc.timeline.forEach((step, i) => {
+    html += `<div class="fs-tl-step ${i === sc.crashIndex ? 'crash' : ''} ${i < sc.crashIndex ? 'active' : ''}">${step}</div>`;
+    if (i < sc.timeline.length - 1) html += '<div style="display:flex;align-items:center;color:var(--text-muted);font-size:16px;padding:0 2px;">&rarr;</div>';
+  });
+  html += '</div>';
+
+  html += '<div class="fs-panel">';
+
+  html += '<div class="fs-section fs-section-durable"><h4>What is Durable (Safe)</h4>';
+  sc.durable.forEach(d => { html += `<div class="fs-item">${d}</div>`; });
+  html += '</div>';
+
+  html += '<div class="fs-section fs-section-lost"><h4>What is Lost / At Risk</h4>';
+  sc.lost.forEach(d => { html += `<div class="fs-item">${d}</div>`; });
+  html += '</div>';
+
+  html += '<div class="fs-section fs-section-recovery"><h4>Recovery Mechanism</h4>';
+  sc.recovery.forEach(d => { html += `<div class="fs-item">${d}</div>`; });
+  html += '</div>';
+
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+renderFSScenarios();
+renderFSContent();
+
+// ============================================================
+// TAB 7 / GLOBAL: ANNOTATION SYSTEM
+// ============================================================
+let annotations = [];
+let annotationMode = false;
+let pendingAnnotation = null;
+
+function getTabName(tabId) {
+  const names = {
+    'data-model': 'Data Model',
+    'arch-layers': 'Architecture Layers',
+    'state-machine': 'Task State Machine',
+    'turn-lifecycle': 'Turn Lifecycle',
+    'tool-exec': 'Tool Execution',
+    'failure': 'Failure Scenarios',
+    'annotations': 'Annotations',
+  };
+  return names[tabId] || tabId;
+}
+
+// Double-click to create annotation
+document.addEventListener('dblclick', (e) => {
+  if (e.target.closest('.ann-dialog-overlay') || e.target.closest('.annotation-sidebar') || e.target.closest('.tab-bar') || e.target.closest('.annotation-toggle-btn')) return;
+
+  pendingAnnotation = { x: e.clientX, y: e.clientY, tab: activeTab };
+  const overlay = $('#ann-dialog-overlay');
+  overlay.classList.add('open');
+  $('#ann-loc').value = '';
+  $('#ann-text').value = '';
+  $('#ann-loc').focus();
+});
+
+$('#ann-cancel').addEventListener('click', () => {
+  $('#ann-dialog-overlay').classList.remove('open');
+  pendingAnnotation = null;
+});
+
+$('#ann-save').addEventListener('click', () => {
+  const loc = $('#ann-loc').value.trim();
+  const text = $('#ann-text').value.trim();
+  if (!text) return;
+
+  const ann = {
+    id: Date.now(),
+    num: annotations.length + 1,
+    tab: pendingAnnotation.tab,
+    x: pendingAnnotation.x,
+    y: pendingAnnotation.y,
+    location: loc || '(unspecified)',
+    text: text,
+  };
+
+  annotations.push(ann);
+  renderAnnotations();
+  $('#ann-dialog-overlay').classList.remove('open');
+  pendingAnnotation = null;
+});
+
+// Also support Enter key in the dialog
+$('#ann-text').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    $('#ann-save').click();
+  }
+});
+
+function renderAnnotations() {
+  // Pins on current tab
+  $$('.annotation-pin').forEach(p => p.remove());
+  annotations.filter(a => a.tab === activeTab).forEach(a => {
+    const pin = document.createElement('div');
+    pin.className = 'annotation-pin';
+    pin.textContent = a.num;
+    pin.style.left = a.x + 'px';
+    pin.style.top = a.y + 'px';
+    pin.title = a.text;
+    pin.addEventListener('click', (e) => {
+      e.stopPropagation();
+      $('#ann-sidebar').classList.add('open');
+    });
+    document.body.appendChild(pin);
+  });
+
+  // Sidebar list
+  const list = $('#ann-list');
+  list.innerHTML = '';
+  annotations.forEach(a => {
+    const card = document.createElement('div');
+    card.className = 'annotation-card';
+    card.innerHTML = `
+      <div class="annotation-card-header">
+        <span class="annotation-card-num">#${a.num}</span>
+        <span class="annotation-card-tab">${getTabName(a.tab)}</span>
+        <button class="annotation-card-del" data-id="${a.id}">&times;</button>
+      </div>
+      <div class="annotation-card-loc">${a.location}</div>
+      <div class="annotation-card-text">${a.text}</div>
+    `;
+    card.querySelector('.annotation-card-del').addEventListener('click', () => {
+      annotations = annotations.filter(x => x.id !== a.id);
+      annotations.forEach((x, i) => x.num = i + 1);
+      renderAnnotations();
+    });
+    list.appendChild(card);
+  });
+
+  // Main tab list
+  const mainList = $('#ann-main-list');
+  if (mainList) {
+    mainList.innerHTML = '';
+    if (annotations.length === 0) {
+      mainList.innerHTML = '<p style="color:var(--text-muted);text-align:center;">No annotations yet. Double-click on any tab to add one.</p>';
+    } else {
+      annotations.forEach(a => {
+        const card = document.createElement('div');
+        card.className = 'annotation-card';
+        card.innerHTML = `
+          <div class="annotation-card-header">
+            <span class="annotation-card-num">#${a.num}</span>
+            <span class="annotation-card-tab">${getTabName(a.tab)}</span>
+            <button class="annotation-card-del" data-id="${a.id}">&times;</button>
+          </div>
+          <div class="annotation-card-loc">${a.location}</div>
+          <div class="annotation-card-text">${a.text}</div>
+        `;
+        card.querySelector('.annotation-card-del').addEventListener('click', () => {
+          annotations = annotations.filter(x => x.id !== a.id);
+          annotations.forEach((x, i) => x.num = i + 1);
+          renderAnnotations();
+        });
+        mainList.appendChild(card);
+      });
+    }
+  }
+
+  // Badge
+  const badge = $('#ann-badge');
+  if (annotations.length > 0) {
+    badge.classList.remove('hidden');
+    badge.textContent = annotations.length;
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+// Toggle sidebar
+$('#ann-toggle').addEventListener('click', () => {
+  $('#ann-sidebar').classList.toggle('open');
+});
+
+$('#ann-close-sidebar').addEventListener('click', () => {
+  $('#ann-sidebar').classList.remove('open');
+});
+
+// Export
+function exportAnnotations() {
+  if (annotations.length === 0) {
+    showToast('No annotations to export');
+    return;
+  }
+
+  let md = '# Architecture Review Annotations\n\n';
+  annotations.forEach(a => {
+    md += `## [${getTabName(a.tab)}] - Annotation #${a.num}\n`;
+    md += `**Location**: ${a.location}\n`;
+    md += `**Comment**: ${a.text}\n\n`;
+  });
+
+  navigator.clipboard.writeText(md).then(() => {
+    showToast('Annotations copied to clipboard as Markdown');
+  }).catch(() => {
+    // Fallback
+    const ta = document.createElement('textarea');
+    ta.value = md;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('Annotations copied to clipboard as Markdown');
+  });
+}
+
+$('#ann-export').addEventListener('click', exportAnnotations);
+$('#ann-export-main').addEventListener('click', exportAnnotations);
+
+$('#ann-clear-main').addEventListener('click', () => {
+  if (annotations.length === 0) return;
+  annotations = [];
+  renderAnnotations();
+  showToast('All annotations cleared');
+});
+
+// Re-render annotations when switching tabs
+tabBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    setTimeout(renderAnnotations, 50);
+  });
+});
+
+renderAnnotations();
+
+</script>
+</body>
+</html>
