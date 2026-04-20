@@ -24,6 +24,8 @@ pub struct ApiMessagesRequest<'a> {
     pub messages: &'a [ApiMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<&'a [ApiTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ApiToolChoice>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ApiThinkingConfig>,
@@ -31,6 +33,33 @@ pub struct ApiMessagesRequest<'a> {
     pub output_config: Option<ApiOutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<&'a str>,
+}
+
+/// Anthropic API `tool_choice` wire format.
+///
+/// - `{"type": "auto"}` — model decides.
+/// - `{"type": "tool", "name": "<name>"}` — model must call the named tool.
+#[derive(Serialize)]
+pub struct ApiToolChoice {
+    #[serde(rename = "type")]
+    pub choice_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ApiToolChoice {
+    pub fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+        match tc {
+            agent_sdk_core::llm::ToolChoice::Auto => Self {
+                choice_type: "auto".to_owned(),
+                name: None,
+            },
+            agent_sdk_core::llm::ToolChoice::Tool(name) => Self {
+                choice_type: "tool".to_owned(),
+                name: Some(name.clone()),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -942,6 +971,7 @@ mod tests {
             system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
             tools: None,
+            tool_choice: None,
             stream: true,
             thinking: None,
             output_config: None,
@@ -964,6 +994,7 @@ mod tests {
             system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
             tools: None,
+            tool_choice: None,
             stream: false,
             thinking: None,
             output_config: None,
@@ -998,6 +1029,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let messages = build_api_messages(&request);
@@ -1035,6 +1067,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let messages = build_api_messages(&request);
@@ -1065,6 +1098,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let messages = build_api_messages(&request);

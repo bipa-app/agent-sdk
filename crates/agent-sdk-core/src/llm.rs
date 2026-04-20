@@ -92,6 +92,15 @@ impl Default for ThinkingConfig {
 
 // ── Request / Response ────────────────────────────────────────────────
 
+/// Controls whether the model must use a tool.
+#[derive(Debug, Clone)]
+pub enum ToolChoice {
+    /// Let the model decide whether to use tools (default when `None`).
+    Auto,
+    /// Force the model to call a specific tool by name.
+    Tool(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,
@@ -108,6 +117,10 @@ pub struct ChatRequest {
     pub cached_content: Option<String>,
     /// Optional extended thinking configuration.
     pub thinking: Option<ThinkingConfig>,
+    /// Optional constraint on tool usage.
+    ///
+    /// When `None` the provider's default behaviour applies (typically `auto`).
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

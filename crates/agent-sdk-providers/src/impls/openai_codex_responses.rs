@@ -2449,6 +2449,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let input = build_api_input(&request);

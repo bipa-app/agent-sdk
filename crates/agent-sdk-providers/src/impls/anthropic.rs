@@ -15,8 +15,8 @@ use agent_sdk_core::llm::{
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
-    ApiMessagesRequest, ApiOutputConfig, ApiThinkingConfig, build_api_messages, build_api_tools,
-    is_message_stop_event, map_content_blocks, map_stop_reason, parse_sse_event,
+    ApiMessagesRequest, ApiOutputConfig, ApiThinkingConfig, ApiToolChoice, build_api_messages,
+    build_api_tools, is_message_stop_event, map_content_blocks, map_stop_reason, parse_sse_event,
     take_next_sse_event,
 };
 use futures::StreamExt;
@@ -354,6 +354,10 @@ impl LlmProvider for AnthropicProvider {
 
         let system = self.build_system_prompt_for_request(&request.system);
         let max_tokens = self.effective_max_tokens(&request);
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .map(ApiToolChoice::from_tool_choice);
 
         let api_request = ApiMessagesRequest {
             model: Some(&self.model),
@@ -361,6 +365,7 @@ impl LlmProvider for AnthropicProvider {
             system,
             messages: &messages,
             tools: tools.as_deref(),
+            tool_choice,
             stream: false,
             thinking,
             output_config,
@@ -518,6 +523,10 @@ impl LlmProvider for AnthropicProvider {
 
             let system = self.build_system_prompt_for_request(&request.system);
             let max_tokens = self.effective_max_tokens(&request);
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .map(ApiToolChoice::from_tool_choice);
 
             let api_request = ApiMessagesRequest {
                 model: Some(&self.model),
@@ -525,6 +534,7 @@ impl LlmProvider for AnthropicProvider {
                 system,
                 messages: &messages,
                 tools: tools.as_deref(),
+                tool_choice,
                 stream: true,
                 thinking,
                 output_config,

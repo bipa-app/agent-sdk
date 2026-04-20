@@ -454,6 +454,7 @@ where
         session_id: Some(thread_id.to_string()),
         cached_content: None,
         thinking,
+        tool_choice: None,
     })
 }
 

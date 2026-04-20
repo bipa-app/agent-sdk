@@ -316,6 +316,7 @@ impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let outcome = self

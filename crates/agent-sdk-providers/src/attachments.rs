@@ -237,6 +237,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         }
     }
 

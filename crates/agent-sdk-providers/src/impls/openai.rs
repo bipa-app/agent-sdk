@@ -345,15 +345,21 @@ impl LlmProvider for OpenAIProvider {
         let tools: Option<Vec<ApiTool>> = request
             .tools
             .map(|ts| ts.into_iter().map(convert_tool).collect());
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .map(ApiToolChoice::from_tool_choice);
 
-        let api_request = build_api_chat_request(
-            &self.model,
-            &messages,
-            request.max_tokens,
-            tools.as_deref(),
+        let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
+        let api_request = ApiChatRequest {
+            model: &self.model,
+            messages: &messages,
+            max_completion_tokens: Some(request.max_tokens),
+            max_tokens: include_max_tokens_alias.then_some(request.max_tokens),
+            tools: tools.as_deref(),
+            tool_choice,
             reasoning,
-            use_max_tokens_alias(&self.base_url),
-        );
+        };
 
         log::debug!(
             "OpenAI LLM request model={} max_tokens={}",
@@ -475,16 +481,26 @@ impl LlmProvider for OpenAIProvider {
             let tools: Option<Vec<ApiTool>> = request
                 .tools
                 .map(|ts| ts.into_iter().map(convert_tool).collect());
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .map(ApiToolChoice::from_tool_choice);
 
-            let api_request = build_api_chat_request_streaming(
-                &self.model,
-                &messages,
-                request.max_tokens,
-                tools.as_deref(),
+            let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
+            let include_stream_usage = use_stream_usage_options(&self.base_url);
+            let api_request = ApiChatRequestStreaming {
+                model: &self.model,
+                messages: &messages,
+                max_completion_tokens: Some(request.max_tokens),
+                max_tokens: include_max_tokens_alias.then_some(request.max_tokens),
+                tools: tools.as_deref(),
+                tool_choice,
                 reasoning,
-                use_max_tokens_alias(&self.base_url),
-                use_stream_usage_options(&self.base_url),
-            );
+                stream_options: include_stream_usage.then_some(ApiStreamOptions {
+                    include_usage: true,
+                }),
+                stream: true,
+            };
 
             log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
 
@@ -736,47 +752,6 @@ fn map_finish_reason(finish_reason: &str) -> StopReason {
     }
 }
 
-fn build_api_chat_request<'a>(
-    model: &'a str,
-    messages: &'a [ApiMessage],
-    max_tokens: u32,
-    tools: Option<&'a [ApiTool]>,
-    reasoning: Option<ApiReasoning>,
-    include_max_tokens_alias: bool,
-) -> ApiChatRequest<'a> {
-    ApiChatRequest {
-        model,
-        messages,
-        max_completion_tokens: Some(max_tokens),
-        max_tokens: include_max_tokens_alias.then_some(max_tokens),
-        tools,
-        reasoning,
-    }
-}
-
-fn build_api_chat_request_streaming<'a>(
-    model: &'a str,
-    messages: &'a [ApiMessage],
-    max_tokens: u32,
-    tools: Option<&'a [ApiTool]>,
-    reasoning: Option<ApiReasoning>,
-    include_max_tokens_alias: bool,
-    include_stream_usage: bool,
-) -> ApiChatRequestStreaming<'a> {
-    ApiChatRequestStreaming {
-        model,
-        messages,
-        max_completion_tokens: Some(max_tokens),
-        max_tokens: include_max_tokens_alias.then_some(max_tokens),
-        tools,
-        reasoning,
-        stream_options: include_stream_usage.then_some(ApiStreamOptions {
-            include_usage: true,
-        }),
-        stream: true,
-    }
-}
-
 fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
     thinking
         .and_then(resolve_reasoning_effort)
@@ -974,6 +949,8 @@ struct ApiChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ApiToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
 }
 
@@ -988,10 +965,44 @@ struct ApiChatRequestStreaming<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ApiTool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ApiToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ApiStreamOptions>,
     stream: bool,
+}
+
+/// `OpenAI` `tool_choice` wire format.
+///
+/// - `"auto"` — model decides.
+/// - `{"type": "function", "function": {"name": "<name>"}}` — force a specific function.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ApiToolChoice {
+    String(String),
+    Named {
+        #[serde(rename = "type")]
+        choice_type: String,
+        function: ApiToolChoiceFunction,
+    },
+}
+
+#[derive(Serialize)]
+struct ApiToolChoiceFunction {
+    name: String,
+}
+
+impl ApiToolChoice {
+    fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+        match tc {
+            agent_sdk_core::llm::ToolChoice::Auto => Self::String("auto".to_owned()),
+            agent_sdk_core::llm::ToolChoice::Tool(name) => Self::Named {
+                choice_type: "function".to_owned(),
+                function: ApiToolChoiceFunction { name: name.clone() },
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1672,6 +1683,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -1696,6 +1708,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -1975,6 +1988,7 @@ mod tests {
             session_id: Some("thread-1".to_string()),
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
 
         assert!(should_use_responses_api(
@@ -2044,6 +2058,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: None,
             tools: None,
+            tool_choice: None,
             reasoning: None,
         };
 
@@ -2067,6 +2082,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: Some(1024),
             tools: None,
+            tool_choice: None,
             reasoning: None,
         };
 
@@ -2090,6 +2106,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: None,
             tools: None,
+            tool_choice: None,
             reasoning: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
@@ -2120,6 +2137,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: Some(1024),
             tools: None,
+            tool_choice: None,
             reasoning: None,
             stream_options: None,
             stream: true,
@@ -2146,6 +2164,7 @@ mod tests {
             max_completion_tokens: Some(1024),
             max_tokens: None,
             tools: None,
+            tool_choice: None,
             reasoning: Some(ApiReasoning {
                 effort: ReasoningEffort::High,
             }),

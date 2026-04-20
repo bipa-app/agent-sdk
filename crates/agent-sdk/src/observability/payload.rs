@@ -152,6 +152,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
         assert!(convert_system_instructions(&request).is_none());
     }
@@ -167,6 +168,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
         let result = convert_system_instructions(&request).expect("should be Some");
         assert_eq!(result, json!([{"text": "You are helpful."}]));
@@ -372,6 +374,7 @@ mod tests {
             session_id: None,
             cached_content: None,
             thinking: None,
+            tool_choice: None,
         };
         let result = convert_input_messages(&request);
         let arr = result.as_array().expect("array");
