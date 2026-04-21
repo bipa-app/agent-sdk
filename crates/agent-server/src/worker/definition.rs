@@ -217,16 +217,20 @@ impl AgentDefinition {
     ///
     /// Returns the output of [`tools_fn`](Self::tools_fn) when set,
     /// otherwise a clone of [`tools`](Self::tools).
+    /// Resolve the effective tool list for a turn.
+    ///
+    /// If a [`tools_fn`](Self::tools_fn) is set AND the task has
+    /// `caller_metadata`, invoke the filter. Otherwise fall back to
+    /// the static [`tools`](Self::tools) vec — the filter has no
+    /// caller context to act on, so it would be meaningless.
     #[must_use]
-    pub fn resolve_tools(&self, caller_metadata: &serde_json::Value) -> Vec<Tool> {
-        self.tools_fn.as_ref().map_or_else(
-            || self.tools.clone(),
-            |f| {
-                f(&ToolFilterContext {
-                    caller_metadata: caller_metadata.clone(),
-                })
-            },
-        )
+    pub fn resolve_tools(&self, caller_metadata: Option<&serde_json::Value>) -> Vec<Tool> {
+        match (&self.tools_fn, caller_metadata) {
+            (Some(f), Some(metadata)) => f(&ToolFilterContext {
+                caller_metadata: metadata.clone(),
+            }),
+            _ => self.tools.clone(),
+        }
     }
 }
 
@@ -261,14 +265,26 @@ mod tests {
     #[test]
     fn resolve_tools_returns_static_when_no_tools_fn() {
         let def = definition_with_static_tools(vec![tool("ping"), tool("pong")]);
-        let resolved = def.resolve_tools(&serde_json::Value::Null);
+        let resolved = def.resolve_tools(None);
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "ping");
         assert_eq!(resolved[1].name, "pong");
     }
 
     #[test]
-    fn resolve_tools_delegates_to_tools_fn_when_set() {
+    fn resolve_tools_falls_back_to_static_when_metadata_absent() {
+        // tools_fn set but no caller_metadata → static tools win.
+        let def = AgentDefinition {
+            tools_fn: Some(Arc::new(|_| vec![tool("from_filter")])),
+            ..definition_with_static_tools(vec![tool("static")])
+        };
+        let resolved = def.resolve_tools(None);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "static");
+    }
+
+    #[test]
+    fn resolve_tools_delegates_to_tools_fn_when_metadata_present() {
         // Filter: expose `admin_only` when caller_metadata.role == "admin";
         // otherwise expose `public_only`.
         let tools_fn: ToolsFn = Arc::new(|ctx| {
@@ -289,17 +305,15 @@ mod tests {
             ..definition_with_static_tools(vec![tool("fallback")])
         };
 
-        let admin_tools = def.resolve_tools(&serde_json::json!({ "role": "admin" }));
+        let admin_meta = serde_json::json!({ "role": "admin" });
+        let admin_tools = def.resolve_tools(Some(&admin_meta));
         assert_eq!(admin_tools.len(), 1);
         assert_eq!(admin_tools[0].name, "admin_only");
 
-        let guest_tools = def.resolve_tools(&serde_json::json!({ "role": "guest" }));
+        let guest_meta = serde_json::json!({ "role": "guest" });
+        let guest_tools = def.resolve_tools(Some(&guest_meta));
         assert_eq!(guest_tools.len(), 1);
         assert_eq!(guest_tools[0].name, "public_only");
-
-        let null_tools = def.resolve_tools(&serde_json::Value::Null);
-        assert_eq!(null_tools.len(), 1);
-        assert_eq!(null_tools[0].name, "public_only");
     }
 
     #[test]
@@ -316,7 +330,7 @@ mod tests {
         assert_eq!(restored.tools.len(), 1);
         assert_eq!(restored.tools[0].name, "persistent");
         // restored.resolve_tools falls back to the static list.
-        let resolved = restored.resolve_tools(&serde_json::Value::Null);
+        let resolved = restored.resolve_tools(None);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "persistent");
     }

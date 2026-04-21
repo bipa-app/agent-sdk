@@ -277,7 +277,7 @@ pub async fn execute_root_turn(
         &inputs.staged_stores.messages,
         thread_id,
         user_prompt,
-        &inputs.bootstrap.task.caller_metadata,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
     )
     .await
     .context("build chat request")?;
@@ -465,7 +465,7 @@ async fn build_chat_request(
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_core::ThreadId,
     user_prompt: &str,
-    caller_metadata: &serde_json::Value,
+    caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     // Get existing message history from staged store.
     let mut messages = staged_messages
@@ -489,7 +489,8 @@ async fn build_chat_request(
     };
 
     // Resolve tool list: `tools_fn` takes precedence over `tools` when
-    // set, enabling per-turn filtering based on caller identity.
+    // set AND caller_metadata is present, enabling per-turn filtering
+    // based on caller identity.
     let resolved_tools = definition.resolve_tools(caller_metadata);
 
     Ok(ChatRequest {
@@ -1104,7 +1105,7 @@ pub async fn resume_root_turn(
         definition,
         &inputs.staged_stores.messages,
         thread_id,
-        &inputs.bootstrap.task.caller_metadata,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
     )
     .await
     .context("build resume chat request")?;
@@ -1370,7 +1371,7 @@ async fn build_resume_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_core::ThreadId,
-    caller_metadata: &serde_json::Value,
+    caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     let messages = staged_messages
         .get_history(thread_id)

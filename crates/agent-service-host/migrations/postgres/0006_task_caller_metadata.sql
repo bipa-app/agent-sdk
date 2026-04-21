@@ -6,8 +6,11 @@
 -- this value — it's an opaque JSON blob the application filter
 -- deserializes into its own domain type.
 --
--- Defaults to JSON null for backwards compatibility with rows inserted
--- before this column existed.
+-- Nullable on purpose: SQL NULL means "the submitter did not attach
+-- any metadata" (skip the filter, use static tools) and is
+-- semantically distinct from a stored JSON `null` literal (which
+-- would be an explicit, empty caller context). Existing rows from
+-- before this migration are NULL, which is the correct fallback.
 
 ALTER TABLE agent_sdk_tasks
-    ADD COLUMN caller_metadata_json JSONB NOT NULL DEFAULT 'null'::jsonb;
+    ADD COLUMN caller_metadata_json JSONB NULL;

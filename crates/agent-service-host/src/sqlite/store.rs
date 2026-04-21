@@ -3296,7 +3296,7 @@ struct TaskRecord {
     depth: i64,
     thread_id: String,
     submitted_input_json: serde_json::Value,
-    caller_metadata_json: serde_json::Value,
+    caller_metadata_json: Option<serde_json::Value>,
     worker_id: Option<String>,
     lease_id: Option<String>,
     lease_expires_at: Option<OffsetDateTime>,

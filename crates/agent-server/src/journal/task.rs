@@ -565,19 +565,23 @@ pub struct AgentTask {
     pub submitted_input: Vec<SubmittedInputItem>,
 
     // ── caller metadata ─────────────────────────────────────
-    /// Opaque per-turn caller metadata captured at submission time.
+    /// Opaque per-turn caller metadata captured at submission time,
+    /// absent when the submitter did not attach any.
     ///
-    /// Passed through to
+    /// When `Some`, passed through to
     /// [`AgentDefinition::tools_fn`](crate::worker::definition::AgentDefinition::tools_fn)
     /// via [`ToolFilterContext`](crate::worker::definition::ToolFilterContext)
     /// at turn start. Lets the application-level tool-filter see
     /// the caller's identity (user kind, role, entry point, ...)
     /// without the SDK having to interpret it.
     ///
-    /// Defaults to `Value::Null` for backwards compatibility. Tasks
-    /// created before this field existed round-trip cleanly.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub caller_metadata: serde_json::Value,
+    /// When `None`, the per-turn filter is bypassed and the agent's
+    /// static tool list is used. Distinguishing "absent" from "JSON
+    /// null" matters: absent means the submitter never attached
+    /// metadata; a JSON `null` `Value` would be an explicit, albeit
+    /// empty, context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_metadata: Option<serde_json::Value>,
 
     // ── lease ───────────────────────────────────────────────
     pub worker_id: Option<WorkerId>,
@@ -665,7 +669,7 @@ impl AgentTask {
             depth: 0,
             thread_id,
             submitted_input: Vec::new(),
-            caller_metadata: serde_json::Value::Null,
+            caller_metadata: None,
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,
@@ -714,7 +718,7 @@ impl AgentTask {
     ) -> Self {
         let mut task = Self::new_root_turn(thread_id, now, max_attempts);
         task.submitted_input = input;
-        task.caller_metadata = caller_metadata;
+        task.caller_metadata = Some(caller_metadata);
         task
     }
 
