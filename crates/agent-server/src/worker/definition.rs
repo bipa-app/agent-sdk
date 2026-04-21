@@ -219,12 +219,14 @@ impl AgentDefinition {
     /// otherwise a clone of [`tools`](Self::tools).
     #[must_use]
     pub fn resolve_tools(&self, caller_metadata: &serde_json::Value) -> Vec<Tool> {
-        match &self.tools_fn {
-            Some(f) => f(&ToolFilterContext {
-                caller_metadata: caller_metadata.clone(),
-            }),
-            None => self.tools.clone(),
-        }
+        self.tools_fn.as_ref().map_or_else(
+            || self.tools.clone(),
+            |f| {
+                f(&ToolFilterContext {
+                    caller_metadata: caller_metadata.clone(),
+                })
+            },
+        )
     }
 }
 
@@ -270,11 +272,12 @@ mod tests {
         // Filter: expose `admin_only` when caller_metadata.role == "admin";
         // otherwise expose `public_only`.
         let tools_fn: ToolsFn = Arc::new(|ctx| {
-            let role = match ctx.caller_metadata.get("role").and_then(|v| v.as_str()) {
-                Some(r) => r,
-                None => "none",
-            };
-            if role == "admin" {
+            let is_admin = ctx
+                .caller_metadata
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                == Some("admin");
+            if is_admin {
                 vec![tool("admin_only")]
             } else {
                 vec![tool("public_only")]

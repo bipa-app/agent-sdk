@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE status = $1\nORDER BY created_at, id\n",
+  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE root_id = $1\nORDER BY depth, created_at, id\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
@@ -45,71 +45,76 @@
       },
       {
         "ordinal": 8,
+        "name": "caller_metadata_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
         "name": "worker_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "lease_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "lease_expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "last_heartbeat_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "state_json",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "attempt",
         "type_info": "Int8"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "max_attempts",
         "type_info": "Int8"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "last_error",
         "type_info": "Text"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "pending_child_count",
         "type_info": "Int8"
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "spawn_index",
         "type_info": "Int8"
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "result_payload",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "completed_at",
         "type_info": "Timestamptz"
       }
@@ -124,6 +129,7 @@
       false,
       false,
       true,
+      false,
       false,
       false,
       false,
@@ -144,5 +150,5 @@
       true
     ]
   },
-  "hash": "77e601da7ab042a4397e9c86ce298f91b9b75b2c261850a1f128007c0e00b298"
+  "hash": "72b6e39b3cb80b5dd1f6848db1d82365549cca993c679d6b502561b1638b31fc"
 }

@@ -342,7 +342,7 @@ impl GrpcShared {
             event_repo: self.stores.event_repo.as_ref(),
         };
 
-        match resume_confirmed_tool(
+        match Box::pin(resume_confirmed_tool(
             bootstrap,
             &deps,
             self.runtime.confirmation_policy().as_ref(),
@@ -358,7 +358,7 @@ impl GrpcShared {
                 }
             },
             now,
-        )
+        ))
         .await
         {
             Ok(

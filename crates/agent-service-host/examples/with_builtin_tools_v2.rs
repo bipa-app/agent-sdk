@@ -171,6 +171,7 @@ fn make_bootstrap(
         depth: 0,
         thread_id: thread.clone(),
         submitted_input: Vec::new(),
+        caller_metadata: serde_json::Value::Null,
         worker_id: None,
         lease_id: None,
         lease_expires_at: None,

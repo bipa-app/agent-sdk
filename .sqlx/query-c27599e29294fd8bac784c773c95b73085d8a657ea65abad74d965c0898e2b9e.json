@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nUPDATE agent_sdk_tasks\nSET\n    kind = $2,\n    status = $3,\n    parent_id = $4,\n    root_id = $5,\n    depth = $6,\n    thread_id = $7,\n    submitted_input_json = $8,\n    worker_id = $9,\n    lease_id = $10,\n    lease_expires_at = $11,\n    last_heartbeat_at = $12,\n    state_json = $13,\n    attempt = $14,\n    max_attempts = $15,\n    last_error = $16,\n    pending_child_count = $17,\n    spawn_index = $18,\n    result_payload = $19,\n    created_at = $20,\n    updated_at = $21,\n    completed_at = $22,\n    caller_metadata_json = $23\nWHERE id = $1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c27599e29294fd8bac784c773c95b73085d8a657ea65abad74d965c0898e2b9e"
+}

@@ -173,7 +173,7 @@ impl SqliteDurableStore {
 
 const TASK_COLUMNS: &str = r"
     id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, worker_id, lease_id, lease_expires_at,
+    submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
     last_heartbeat_at, state_json, attempt, max_attempts, last_error,
     pending_child_count, spawn_index, result_payload,
     created_at, updated_at, completed_at";
@@ -639,6 +639,7 @@ INSERT INTO agent_sdk_turn_checkpoints (
         let depth = i64::from(task.depth);
         let thread_id_key = thread_key(&task.thread_id);
         let submitted_input_json = json_to_value(&task.submitted_input, "task submitted input")?;
+        let caller_metadata_json = task.caller_metadata.clone();
         let worker_id = task.worker_id.as_ref().map(WorkerId::as_str);
         let lease_id = task.lease_id.as_ref().map(LeaseId::as_str);
         let state_json = json_to_value(&task.state, "task state")?;
@@ -650,13 +651,13 @@ INSERT INTO agent_sdk_turn_checkpoints (
             r"
 INSERT INTO agent_sdk_tasks (
     id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, worker_id, lease_id, lease_expires_at,
+    submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
     last_heartbeat_at, state_json, attempt, max_attempts, last_error,
     pending_child_count, spawn_index, result_payload,
     created_at, updated_at, completed_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
 )
 ",
             id,
@@ -667,6 +668,7 @@ INSERT INTO agent_sdk_tasks (
             depth,
             thread_id_key,
             submitted_input_json,
+            caller_metadata_json,
             worker_id,
             lease_id,
             task.lease_expires_at,
@@ -697,6 +699,7 @@ INSERT INTO agent_sdk_tasks (
         let depth = i64::from(task.depth);
         let thread_id_key = thread_key(&task.thread_id);
         let submitted_input_json = json_to_value(&task.submitted_input, "task submitted input")?;
+        let caller_metadata_json = task.caller_metadata.clone();
         let worker_id = task.worker_id.as_ref().map(WorkerId::as_str);
         let lease_id = task.lease_id.as_ref().map(LeaseId::as_str);
         let state_json = json_to_value(&task.state, "task state")?;
@@ -713,7 +716,8 @@ UPDATE agent_sdk_tasks SET
     last_heartbeat_at = ?12, state_json = ?13, attempt = ?14,
     max_attempts = ?15, last_error = ?16, pending_child_count = ?17,
     spawn_index = ?18, result_payload = ?19,
-    created_at = ?20, updated_at = ?21, completed_at = ?22
+    created_at = ?20, updated_at = ?21, completed_at = ?22,
+    caller_metadata_json = ?23
 WHERE id = ?1
 ",
             id,
@@ -738,6 +742,7 @@ WHERE id = ?1
             task.created_at,
             task.updated_at,
             task.completed_at,
+            caller_metadata_json,
         )
         .execute(&mut **tx)
         .await
@@ -3291,6 +3296,7 @@ struct TaskRecord {
     depth: i64,
     thread_id: String,
     submitted_input_json: serde_json::Value,
+    caller_metadata_json: serde_json::Value,
     worker_id: Option<String>,
     lease_id: Option<String>,
     lease_expires_at: Option<OffsetDateTime>,
@@ -3319,6 +3325,7 @@ impl TryFrom<TaskRecord> for AgentTask {
             depth: u32_from_i64(r.depth, "task depth")?,
             thread_id: ThreadId::from_string(r.thread_id),
             submitted_input: json_from_value(r.submitted_input_json, "task submitted_input")?,
+            caller_metadata: r.caller_metadata_json,
             worker_id: r.worker_id.map(WorkerId::from_string),
             lease_id: r.lease_id.map(LeaseId::from_string),
             lease_expires_at: r.lease_expires_at,
