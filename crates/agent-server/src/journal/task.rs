@@ -564,6 +564,21 @@ pub struct AgentTask {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub submitted_input: Vec<SubmittedInputItem>,
 
+    // ── caller metadata ─────────────────────────────────────
+    /// Opaque per-turn caller metadata captured at submission time.
+    ///
+    /// Passed through to
+    /// [`AgentDefinition::tools_fn`](crate::worker::definition::AgentDefinition::tools_fn)
+    /// via [`ToolFilterContext`](crate::worker::definition::ToolFilterContext)
+    /// at turn start. Lets the application-level tool-filter see
+    /// the caller's identity (user kind, role, entry point, ...)
+    /// without the SDK having to interpret it.
+    ///
+    /// Defaults to `Value::Null` for backwards compatibility. Tasks
+    /// created before this field existed round-trip cleanly.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub caller_metadata: serde_json::Value,
+
     // ── lease ───────────────────────────────────────────────
     pub worker_id: Option<WorkerId>,
     pub lease_id: Option<LeaseId>,
@@ -650,6 +665,7 @@ impl AgentTask {
             depth: 0,
             thread_id,
             submitted_input: Vec::new(),
+            caller_metadata: serde_json::Value::Null,
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,
@@ -681,6 +697,27 @@ impl AgentTask {
         task
     }
 
+    /// Allocate a fresh [`TaskKind::RootTurn`] with durably captured
+    /// external input and caller metadata.
+    ///
+    /// The `caller_metadata` is passed through to
+    /// [`AgentDefinition::tools_fn`](crate::worker::definition::AgentDefinition::tools_fn)
+    /// at turn start, enabling per-turn tool filtering driven by
+    /// application-level caller identity.
+    #[must_use]
+    pub fn new_root_turn_with_input_and_caller(
+        thread_id: ThreadId,
+        input: Vec<SubmittedInputItem>,
+        caller_metadata: serde_json::Value,
+        now: OffsetDateTime,
+        max_attempts: u32,
+    ) -> Self {
+        let mut task = Self::new_root_turn(thread_id, now, max_attempts);
+        task.submitted_input = input;
+        task.caller_metadata = caller_metadata;
+        task
+    }
+
     /// Allocate a fresh child task under `parent`.
     ///
     /// The child inherits `parent.root_id` and `parent.thread_id`, sets
@@ -707,6 +744,7 @@ impl AgentTask {
             depth: parent.depth.saturating_add(1),
             thread_id: parent.thread_id.clone(),
             submitted_input: Vec::new(),
+            caller_metadata: parent.caller_metadata.clone(),
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,
@@ -757,6 +795,7 @@ impl AgentTask {
             depth: parent.depth.saturating_add(1),
             thread_id: parent.thread_id.clone(),
             submitted_input: Vec::new(),
+            caller_metadata: parent.caller_metadata.clone(),
             worker_id: None,
             lease_id: None,
             lease_expires_at: None,

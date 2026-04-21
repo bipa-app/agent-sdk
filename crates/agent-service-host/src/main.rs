@@ -44,6 +44,7 @@ fn main() -> Result<()> {
         max_tokens: 4096,
         tools: Vec::new(),
         thinking: ThinkingPolicy::default(),
+        tools_fn: None,
         policy: RuntimePolicy::server_default(),
     };
     let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(default_definition));

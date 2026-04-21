@@ -76,6 +76,7 @@ fn sample_definition() -> AgentDefinition {
         max_tokens: 4096,
         tools: sample_tools(),
         thinking: ThinkingPolicy::Disabled,
+        tools_fn: None,
         policy: RuntimePolicy::server_default(),
     }
 }
@@ -245,6 +246,7 @@ async fn registry_resolves_per_thread_override() -> anyhow::Result<()> {
         system_prompt: "Custom prompt.".into(),
         max_tokens: 8192,
         tools: Vec::new(),
+        tools_fn: None,
         thinking: ThinkingPolicy::Adaptive {
             effort: Some(Effort::Max),
         },

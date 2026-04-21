@@ -14,9 +14,38 @@
 //! does not implement `Serialize`/`Deserialize`, so the server defines
 //! its own enum to ensure round-trip durability.
 
+use std::sync::Arc;
+
 use agent_sdk_core::ToolRuntime;
 use agent_sdk_core::llm::{Effort, Tool};
 use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-turn tool filtering
+// ─────────────────────────────────────────────────────────────────────
+
+/// Context passed to [`AgentDefinition::tools_fn`] at the start of each
+/// turn.
+///
+/// Carries the caller metadata that was attached to the task at
+/// submission time (see [`crate::journal::task::AgentTask::caller_metadata`]).
+/// The SDK does not interpret this value — it's an opaque
+/// `serde_json::Value` that the application-level filter
+/// deserializes into its own domain type (role, user kind, entry
+/// point, etc.) to decide which tools this turn sees.
+#[derive(Clone, Debug)]
+pub struct ToolFilterContext {
+    /// Opaque per-turn caller metadata. Deserialize into your own
+    /// domain type inside `tools_fn`.
+    pub caller_metadata: serde_json::Value,
+}
+
+/// Dynamic-dispatch tool-filter closure type.
+///
+/// Stored on [`AgentDefinition::tools_fn`] when per-turn tool
+/// filtering is desired. Invoked from the worker's turn-composition
+/// path immediately before the LLM request is built.
+pub type ToolsFn = Arc<dyn Fn(&ToolFilterContext) -> Vec<Tool> + Send + Sync>;
 
 // ─────────────────────────────────────────────────────────────────────
 // Thinking policy
@@ -91,8 +120,11 @@ impl Default for RuntimePolicy {
 /// no SDK-local defaults participate in the resolution.
 ///
 /// The struct is `Serialize + Deserialize` so it can be persisted as
-/// part of audit rows or checkpoint metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// part of audit rows or checkpoint metadata. The optional
+/// [`tools_fn`](Self::tools_fn) is skipped by serde (closures are
+/// not serializable) — deserialized definitions use the static
+/// [`tools`](Self::tools) list.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
     // ── Provider / model ─────────────────────────────────────────
     /// LLM provider identifier (e.g. `"anthropic"`, `"openai"`).
@@ -105,12 +137,194 @@ pub struct AgentDefinition {
     pub system_prompt: String,
     /// Maximum tokens per LLM response.
     pub max_tokens: u32,
-    /// Tool definitions available to the agent.
+    /// Static tool definitions. Used when [`tools_fn`](Self::tools_fn)
+    /// is `None`, and as the fallback for deserialized definitions
+    /// (checkpoint replay / audit records) where the closure could
+    /// not be persisted.
     pub tools: Vec<Tool>,
+    /// Optional per-turn tool-filter closure.
+    ///
+    /// When `Some`, the worker invokes this function at turn start
+    /// with a [`ToolFilterContext`] derived from the task's
+    /// [`caller_metadata`](crate::journal::task::AgentTask::caller_metadata).
+    /// The returned `Vec<Tool>` is what the LLM sees — tools not in
+    /// the returned list are effectively invisible for that turn.
+    ///
+    /// When `None`, the static [`tools`](Self::tools) list is used.
+    ///
+    /// Serde-skipped because `Arc<dyn Fn>` cannot be serialized. On
+    /// deserialization (audit replay, checkpoint restore) this is
+    /// `None` and the static `tools` fallback applies — which is
+    /// correct for those code paths, since they do not compose a
+    /// fresh LLM request.
+    #[serde(skip)]
+    pub tools_fn: Option<ToolsFn>,
     /// Extended thinking configuration.
     pub thinking: ThinkingPolicy,
 
     // ── Execution policy ─────────────────────────────────────────
     /// Server-owned execution policy.
     pub policy: RuntimePolicy,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Manual trait impls
+// ─────────────────────────────────────────────────────────────────────
+//
+// `tools_fn: Option<Arc<dyn Fn>>` rules out deriving `Debug`,
+// `PartialEq`, and `Eq`. We implement them manually, treating
+// `tools_fn` as presence-only (closure identity is not part of the
+// definition's semantic identity — two definitions are equal iff
+// their data fields match).
+
+impl std::fmt::Debug for AgentDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentDefinition")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("system_prompt", &self.system_prompt)
+            .field("max_tokens", &self.max_tokens)
+            .field("tools", &self.tools)
+            .field(
+                "tools_fn",
+                &self.tools_fn.as_ref().map_or("None", |_| "Some(<closure>)"),
+            )
+            .field("thinking", &self.thinking)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl PartialEq for AgentDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        // `tools_fn` is intentionally excluded from equality — closure
+        // identity is not part of the definition's semantic identity.
+        self.provider == other.provider
+            && self.model == other.model
+            && self.system_prompt == other.system_prompt
+            && self.max_tokens == other.max_tokens
+            && self.tools == other.tools
+            && self.thinking == other.thinking
+            && self.policy == other.policy
+    }
+}
+
+impl Eq for AgentDefinition {}
+
+impl AgentDefinition {
+    /// Resolve the effective tool list for a turn, given the task's
+    /// caller metadata.
+    ///
+    /// Returns the output of [`tools_fn`](Self::tools_fn) when set,
+    /// otherwise a clone of [`tools`](Self::tools).
+    #[must_use]
+    pub fn resolve_tools(&self, caller_metadata: &serde_json::Value) -> Vec<Tool> {
+        match &self.tools_fn {
+            Some(f) => f(&ToolFilterContext {
+                caller_metadata: caller_metadata.clone(),
+            }),
+            None => self.tools.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_sdk_core::ToolTier;
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.into(),
+            description: format!("{name} tool"),
+            input_schema: serde_json::json!({ "type": "object" }),
+            display_name: name.into(),
+            tier: ToolTier::Observe,
+        }
+    }
+
+    fn definition_with_static_tools(tools: Vec<Tool>) -> AgentDefinition {
+        AgentDefinition {
+            provider: "anthropic".into(),
+            model: "test-model".into(),
+            system_prompt: "test".into(),
+            max_tokens: 1024,
+            tools,
+            tools_fn: None,
+            thinking: ThinkingPolicy::default(),
+            policy: RuntimePolicy::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_tools_returns_static_when_no_tools_fn() {
+        let def = definition_with_static_tools(vec![tool("ping"), tool("pong")]);
+        let resolved = def.resolve_tools(&serde_json::Value::Null);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "ping");
+        assert_eq!(resolved[1].name, "pong");
+    }
+
+    #[test]
+    fn resolve_tools_delegates_to_tools_fn_when_set() {
+        // Filter: expose `admin_only` when caller_metadata.role == "admin";
+        // otherwise expose `public_only`.
+        let tools_fn: ToolsFn = Arc::new(|ctx| {
+            let role = match ctx.caller_metadata.get("role").and_then(|v| v.as_str()) {
+                Some(r) => r,
+                None => "none",
+            };
+            if role == "admin" {
+                vec![tool("admin_only")]
+            } else {
+                vec![tool("public_only")]
+            }
+        });
+
+        let def = AgentDefinition {
+            tools_fn: Some(tools_fn),
+            ..definition_with_static_tools(vec![tool("fallback")])
+        };
+
+        let admin_tools = def.resolve_tools(&serde_json::json!({ "role": "admin" }));
+        assert_eq!(admin_tools.len(), 1);
+        assert_eq!(admin_tools[0].name, "admin_only");
+
+        let guest_tools = def.resolve_tools(&serde_json::json!({ "role": "guest" }));
+        assert_eq!(guest_tools.len(), 1);
+        assert_eq!(guest_tools[0].name, "public_only");
+
+        let null_tools = def.resolve_tools(&serde_json::Value::Null);
+        assert_eq!(null_tools.len(), 1);
+        assert_eq!(null_tools[0].name, "public_only");
+    }
+
+    #[test]
+    fn definition_serde_round_trips_without_tools_fn() {
+        // tools_fn is #[serde(skip)] — ensure the rest of the struct
+        // round-trips and the deserialized tools_fn is None.
+        let def = AgentDefinition {
+            tools_fn: Some(Arc::new(|_| vec![tool("ghost")])),
+            ..definition_with_static_tools(vec![tool("persistent")])
+        };
+        let json = serde_json::to_string(&def).expect("serialize");
+        let restored: AgentDefinition = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.tools_fn.is_none());
+        assert_eq!(restored.tools.len(), 1);
+        assert_eq!(restored.tools[0].name, "persistent");
+        // restored.resolve_tools falls back to the static list.
+        let resolved = restored.resolve_tools(&serde_json::Value::Null);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "persistent");
+    }
+
+    #[test]
+    fn partial_eq_ignores_tools_fn() {
+        let a = definition_with_static_tools(vec![tool("x")]);
+        let b = AgentDefinition {
+            tools_fn: Some(Arc::new(|_| Vec::new())),
+            ..definition_with_static_tools(vec![tool("x")])
+        };
+        assert_eq!(a, b);
+    }
 }

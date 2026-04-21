@@ -194,6 +194,7 @@ mod tests {
             max_tokens: 4096,
             tools: Vec::new(),
             thinking: ThinkingPolicy::default(),
+            tools_fn: None,
             policy: RuntimePolicy::server_default(),
         }
     }
@@ -551,6 +552,7 @@ mod tests {
             system_prompt: "test prompt".into(),
             max_tokens: 8192,
             tools: Vec::new(),
+            tools_fn: None,
             thinking: ThinkingPolicy::Enabled {
                 budget_tokens: 1000,
             },

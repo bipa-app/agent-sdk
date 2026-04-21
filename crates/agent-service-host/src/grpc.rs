@@ -1898,6 +1898,7 @@ mod tests {
             max_tokens: 512,
             tools,
             thinking: ThinkingPolicy::default(),
+            tools_fn: None,
             policy: RuntimePolicy::server_default(),
         }
     }
