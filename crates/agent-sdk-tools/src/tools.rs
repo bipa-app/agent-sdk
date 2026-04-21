@@ -1101,7 +1101,23 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.listen_tools.retain(|name, _| predicate(name));
     }
 
-    /// Convert all tools (sync + async) to LLM tool definitions.
+    /// Convert all tools (sync + async + listen) to LLM tool
+    /// definitions. The output is sorted by tool name so the order
+    /// is deterministic across builds and across calls.
+    ///
+    /// Determinism matters for **prompt caching**. Anthropic's
+    /// `cache_control: ephemeral` keys on the byte content of the
+    /// system + tool list. Anything that perturbs the order of the
+    /// tool list invalidates the cache. The three backing maps are
+    /// `HashMap`s, whose `values()` order is randomized (DoS-safe
+    /// `RandomState` by default), so two consecutive turns with the
+    /// same registered tool set were producing different orderings
+    /// and silently zeroing the cache hit rate.
+    ///
+    /// Sorting by name is the cheapest fix that holds across
+    /// insertion order, internal map type changes, and concurrent
+    /// builds. The tool count is small (tens, not thousands) so the
+    /// sort cost is negligible compared to a single LLM call.
     #[must_use]
     pub fn to_llm_tools(&self) -> Vec<llm::Tool> {
         let mut tools: Vec<_> = self
@@ -1132,6 +1148,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             tier: tool.tier(),
         }));
 
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
     }
 }
@@ -1219,6 +1236,49 @@ mod tests {
         let llm_tools = registry.to_llm_tools();
         assert_eq!(llm_tools.len(), 1);
         assert_eq!(llm_tools[0].name, "mock_tool");
+    }
+
+    #[test]
+    fn to_llm_tools_returns_alphabetical_order() {
+        let mut registry = ToolRegistry::new();
+        // Register in non-alphabetical order so the assertion would
+        // fail if we ever returned insertion order again.
+        registry.register(MockTool); // "mock_tool"
+        registry.register(AnotherTool); // "another_tool"
+
+        let names: Vec<String> = registry
+            .to_llm_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["another_tool", "mock_tool"]);
+    }
+
+    #[test]
+    fn to_llm_tools_is_deterministic_across_calls() {
+        // Regression: prompt caching depends on byte-stable tool list
+        // ordering. The `HashMap` behind the registry randomizes its
+        // `values()` order, so without an explicit sort two consecutive
+        // builds with the same registered set could ship different
+        // tool orderings to the LLM and silently invalidate the cache.
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(AnotherTool);
+
+        let first: Vec<String> = registry
+            .to_llm_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+
+        for _ in 0..32 {
+            let next: Vec<String> = registry
+                .to_llm_tools()
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            assert_eq!(next, first, "tool ordering must be stable across calls");
+        }
     }
 
     struct AnotherTool;
