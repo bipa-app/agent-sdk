@@ -277,6 +277,7 @@ pub async fn execute_root_turn(
         &inputs.staged_stores.messages,
         thread_id,
         user_prompt,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
     )
     .await
     .context("build chat request")?;
@@ -464,6 +465,7 @@ async fn build_chat_request(
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_core::ThreadId,
     user_prompt: &str,
+    caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     // Get existing message history from staged store.
     let mut messages = staged_messages
@@ -486,13 +488,18 @@ async fn build_chat_request(
         }
     };
 
+    // Resolve tool list: `tools_fn` takes precedence over `tools` when
+    // set AND caller_metadata is present, enabling per-turn filtering
+    // based on caller identity.
+    let resolved_tools = definition.resolve_tools(caller_metadata);
+
     Ok(ChatRequest {
         system: definition.system_prompt.clone(),
         messages,
-        tools: if definition.tools.is_empty() {
+        tools: if resolved_tools.is_empty() {
             None
         } else {
-            Some(definition.tools.clone())
+            Some(resolved_tools)
         },
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,
@@ -1094,10 +1101,14 @@ pub async fn resume_root_turn(
 
     // 3. Build the chat request from staged history — no extra user
     //    prompt to append because everything is already buffered.
-    let chat_request =
-        build_resume_chat_request(definition, &inputs.staged_stores.messages, thread_id)
-            .await
-            .context("build resume chat request")?;
+    let chat_request = build_resume_chat_request(
+        definition,
+        &inputs.staged_stores.messages,
+        thread_id,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    )
+    .await
+    .context("build resume chat request")?;
 
     // 4. Call the LLM.
     let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
@@ -1360,6 +1371,7 @@ async fn build_resume_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_core::ThreadId,
+    caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     let messages = staged_messages
         .get_history(thread_id)
@@ -1378,13 +1390,15 @@ async fn build_resume_chat_request(
         }
     };
 
+    let resolved_tools = definition.resolve_tools(caller_metadata);
+
     Ok(ChatRequest {
         system: definition.system_prompt.clone(),
         messages,
-        tools: if definition.tools.is_empty() {
+        tools: if resolved_tools.is_empty() {
             None
         } else {
-            Some(definition.tools.clone())
+            Some(resolved_tools)
         },
         max_tokens: definition.max_tokens,
         max_tokens_explicit: true,

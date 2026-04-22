@@ -82,11 +82,11 @@ mod tests {
     fn sqlite_executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 5,
-            "expected 5 executable migrations, got {:?}",
+            migrations.len() == 6,
+            "expected 6 executable migrations, got {:?}",
             migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
         );
-        for (idx, expected) in (1_i64..=5).enumerate() {
+        for (idx, expected) in (1_i64..=6).enumerate() {
             ensure!(
                 migrations[idx].version == expected,
                 "expected version {expected}, got {}",

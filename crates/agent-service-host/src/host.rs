@@ -788,8 +788,13 @@ async fn worker_loop(params: WorkerLoopParams) {
                     kind = ?task.kind,
                     "acquired task",
                 );
-                if let Err(err) =
-                    execute_acquired_task(task, &stores, Arc::clone(&runtime), &cancel).await
+                if let Err(err) = Box::pin(execute_acquired_task(
+                    task,
+                    &stores,
+                    Arc::clone(&runtime),
+                    &cancel,
+                ))
+                .await
                 {
                     warn!(%worker_id, error = %err, "task execution failed");
                 }
@@ -1142,6 +1147,7 @@ mod tests {
             max_tokens: 4096,
             tools: Vec::new(),
             thinking: ThinkingPolicy::default(),
+            tools_fn: None,
             policy: RuntimePolicy::server_default(),
         }
     }
