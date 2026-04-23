@@ -641,12 +641,13 @@ async fn capture_llm_payloads<P>(
 ) where
     P: LlmProvider,
 {
-    use crate::observability::{CaptureKind, PayloadBundle, payload, spans};
+    use crate::observability::{CaptureKind, PayloadBundle, spans};
     use opentelemetry::trace::Span;
 
-    let system_json = payload::convert_system_instructions(request);
-    let input_json = payload::convert_input_messages(request);
-    let output_json = payload::convert_output_messages(response);
+    let redactor = observability_store.redactor();
+    let system_json = redactor.convert_system_instructions(request);
+    let input_json = redactor.convert_input_messages(request);
+    let output_json = redactor.convert_output_messages(response);
     let bundle = PayloadBundle {
         capture_id: uuid::Uuid::new_v4().to_string(),
         capture_kind: CaptureKind::TurnChat,
