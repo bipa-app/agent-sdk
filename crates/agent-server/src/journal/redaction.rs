@@ -1,27 +1,54 @@
 //! Baseline redaction policy for tool audit records.
 //!
 //! Tool inputs and outputs may contain sensitive data (passwords, API
-//! keys, tokens, connection strings) that should not be stored in
-//! durable audit records without explicit redaction. This module
-//! provides:
+//! keys, tokens, connection strings, and — importantly for financial
+//! workloads — card PANs, CPFs, CNPJs, emails, phone numbers) that
+//! should not be stored in durable audit records without explicit
+//! redaction. This module provides:
 //!
 //! - [`RedactionPolicy`] — configurable redaction rules with three
 //!   levels: [`None`](RedactionLevel::None),
 //!   [`Baseline`](RedactionLevel::Baseline), and
 //!   [`Full`](RedactionLevel::Full).
 //! - [`redact_value`] — applies redaction rules to a JSON value,
-//!   replacing sensitive keys with a `[REDACTED]` marker.
-//! - [`redact_string`] — applies redaction rules to a plain string,
-//!   masking patterns that look like secrets.
+//!   replacing sensitive keys with a `[REDACTED]` marker and masking
+//!   entity PII in string leaves with `[REDACTED:<category>]`.
+//! - [`redact_string`] / [`redact_error`] — apply redaction rules to
+//!   plain strings.
 //!
 //! # Baseline policy
 //!
-//! The [`RedactionPolicy::baseline`] constructor returns a policy that
-//! redacts common sensitive patterns:
+//! The [`RedactionPolicy::baseline`] constructor returns a policy
+//! that composes two redaction layers:
 //!
-//! - JSON object keys matching sensitive patterns (`password`, `secret`,
-//!   `token`, `api_key`, `authorization`, `credential`, etc.)
-//! - String values that look like bearer tokens or API keys
+//! 1. **Structural** — JSON object keys matching sensitive names
+//!    (`password`, `secret`, `token`, `api_key`, `authorization`,
+//!    `credential`, `cpf`, `cnpj`, etc.) wholesale-redact their
+//!    value. String values that *start with* a sensitive prefix
+//!    (`Bearer `, `sk-`, `ghp_`, `AKIA…`) are likewise wholesale
+//!    redacted.
+//! 2. **Entity-level** — a [`PiiDetector`] scans every remaining
+//!    string leaf for emails, E.164 phones, credit card PANs (Luhn
+//!    validated), Brazilian CPFs and CNPJs (mod-11 validated), Pix
+//!    UUID keys, IPv4 addresses, JWTs, and embedded credential
+//!    tokens. Detected spans are replaced with
+//!    `[REDACTED:<category>]` while the surrounding context stays
+//!    intact. This catches PII that leaks into freeform text (e.g.
+//!    a PAN mentioned in a tool response) without wrecking
+//!    debuggability.
+//!
+//! The detector defaults to
+//! [`BaselineDetector`](agent_sdk_core::privacy::BaselineDetector).
+//! Callers can plug in a custom detector by assigning
+//! [`RedactionPolicy::detector`] directly.
+//!
+//! # Serialisation
+//!
+//! [`RedactionPolicy`] is `Serialize` + `Deserialize`. The detector
+//! is skipped on serialize and re-populated with the process-wide
+//! baseline on deserialize — policies persisted to disk retain
+//! their levels and pattern lists, and the runtime detector is
+//! rebound on load.
 //!
 //! # Usage
 //!
@@ -32,16 +59,42 @@
 //! let input = serde_json::json!({
 //!     "command": "echo hello",
 //!     "api_key": "sk-abc123",
+//!     "note": "CPF 111.444.777-35 on file"
 //! });
 //! let redacted = redact_value(&input, &policy);
-//! // redacted["api_key"] == "[REDACTED]"
-//! // redacted["command"] == "echo hello"
+//! // redacted["api_key"] == "[REDACTED]"       (sensitive key)
+//! // redacted["command"] == "echo hello"       (no PII)
+//! // redacted["note"] contains "[REDACTED:cpf]" (entity mask)
 //! ```
 
+use agent_sdk_core::privacy::{BaselineDetector, NoopDetector, PiiDetector, mask_spans};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, LazyLock};
 
-/// Redaction marker used to replace sensitive values.
+/// Redaction marker used for wholesale redaction (sensitive key
+/// match or full-string secret prefix). Entity-level masks use
+/// `[REDACTED:<category>]` — see [`agent_sdk_core::privacy`].
 pub const REDACTED_MARKER: &str = "[REDACTED]";
+
+/// Shared baseline detector. Compiled lazily on first use; cloning
+/// the `Arc` is a single atomic inc.
+static BASELINE_DETECTOR: LazyLock<Arc<dyn PiiDetector>> = LazyLock::new(|| {
+    BaselineDetector::new().map_or_else(
+        |_| Arc::new(NoopDetector) as Arc<dyn PiiDetector>,
+        |d| Arc::new(d) as Arc<dyn PiiDetector>,
+    )
+});
+
+/// Shared noop detector.
+static NOOP_DETECTOR: LazyLock<Arc<dyn PiiDetector>> =
+    LazyLock::new(|| Arc::new(NoopDetector) as Arc<dyn PiiDetector>);
+
+/// Default detector used when a policy is deserialised without an
+/// embedded detector (which is always, since the field is
+/// `#[serde(skip)]`).
+fn default_detector() -> Arc<dyn PiiDetector> {
+    BASELINE_DETECTOR.clone()
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Redaction level
@@ -66,9 +119,20 @@ pub enum RedactionLevel {
 /// Configurable redaction rules for tool audit records.
 ///
 /// Each field category (input, output, error) has its own
-/// [`RedactionLevel`], and the policy carries a list of key patterns
-/// that the [`Baseline`](RedactionLevel::Baseline) level uses to
-/// identify sensitive values.
+/// [`RedactionLevel`]. At [`Baseline`](RedactionLevel::Baseline) the
+/// policy composes two layers:
+///
+/// 1. Structural — [`sensitive_key_patterns`](Self::sensitive_key_patterns)
+///    triggers wholesale replacement of JSON object values by key
+///    name, and [`sensitive_value_prefixes`](Self::sensitive_value_prefixes)
+///    does the same for strings that *start with* a known prefix.
+/// 2. Entity-level — [`detector`](Self::detector) scans every
+///    remaining string leaf for emails, PANs, CPFs, CNPJs, etc. and
+///    masks the spans it finds in place.
+///
+/// The detector is a runtime object not persisted across
+/// serialisation; on deserialise it is rebound to the process-wide
+/// baseline ([`agent_sdk_core::privacy::BaselineDetector`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RedactionPolicy {
     /// Redaction level for tool input values.
@@ -83,14 +147,22 @@ pub struct RedactionPolicy {
     /// String patterns in values that trigger redaction at baseline
     /// level (e.g. `"Bearer "`, `"sk-"`). Case-sensitive prefix match.
     pub sensitive_value_prefixes: Vec<String>,
+    /// Entity-level PII detector applied at baseline. Defaults to
+    /// [`BaselineDetector`]; assign directly to plug in a custom
+    /// implementation.
+    #[serde(skip, default = "default_detector")]
+    pub detector: Arc<dyn PiiDetector>,
 }
 
 impl RedactionPolicy {
     /// Baseline redaction policy suitable for production audit logs.
     ///
-    /// Redacts JSON object keys that look like credentials and string
-    /// values that look like tokens, while preserving non-sensitive
-    /// structural data for debugging.
+    /// Redacts JSON object keys that look like credentials and
+    /// string values that look like tokens wholesale, and masks
+    /// entity-level PII (emails, PANs, CPFs, CNPJs, Pix UUIDs,
+    /// E.164 phones, IPs, JWTs) detected anywhere in remaining
+    /// string leaves. Preserves non-sensitive structural data for
+    /// debugging.
     #[must_use]
     pub fn baseline() -> Self {
         Self {
@@ -133,6 +205,7 @@ impl RedactionPolicy {
                 "github_pat_".into(),
                 "AKIA".into(),
             ],
+            detector: default_detector(),
         }
     }
 
@@ -141,13 +214,14 @@ impl RedactionPolicy {
     /// Suitable only for development and testing. Never use in
     /// production audit logs.
     #[must_use]
-    pub const fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             input_level: RedactionLevel::None,
             output_level: RedactionLevel::None,
             error_level: RedactionLevel::None,
             sensitive_key_patterns: Vec::new(),
             sensitive_value_prefixes: Vec::new(),
+            detector: NOOP_DETECTOR.clone(),
         }
     }
 
@@ -156,13 +230,14 @@ impl RedactionPolicy {
     /// Suitable for high-security environments where no tool data
     /// should be stored in audit logs.
     #[must_use]
-    pub const fn full() -> Self {
+    pub fn full() -> Self {
         Self {
             input_level: RedactionLevel::Full,
             output_level: RedactionLevel::Full,
             error_level: RedactionLevel::Full,
             sensitive_key_patterns: Vec::new(),
             sensitive_value_prefixes: Vec::new(),
+            detector: NOOP_DETECTOR.clone(),
         }
     }
 
@@ -212,43 +287,43 @@ pub fn redact_value(value: &serde_json::Value, policy: &RedactionPolicy) -> serd
 /// output level.
 ///
 /// - [`None`](RedactionLevel::None): returns the string unchanged.
-/// - [`Baseline`](RedactionLevel::Baseline): masks the string if it
-///   matches any sensitive value prefix.
+/// - [`Baseline`](RedactionLevel::Baseline): wholesale-masks if the
+///   string matches any sensitive value prefix; otherwise applies
+///   entity detection and masks individual PII spans
+///   (`[REDACTED:<category>]`) while preserving surrounding context.
 /// - [`Full`](RedactionLevel::Full): returns `"[REDACTED]"`.
 #[must_use]
 pub fn redact_string(value: &str, policy: &RedactionPolicy) -> String {
     match policy.output_level {
         RedactionLevel::None => value.to_owned(),
-        RedactionLevel::Baseline => {
-            if policy.is_sensitive_value(value) {
-                REDACTED_MARKER.to_owned()
-            } else {
-                value.to_owned()
-            }
-        }
+        RedactionLevel::Baseline => baseline_redact_str(value, policy),
         RedactionLevel::Full => REDACTED_MARKER.to_owned(),
     }
 }
 
 /// Apply redaction rules to an error string based on the given policy's
-/// error level.
-///
-/// - [`None`](RedactionLevel::None): returns the string unchanged.
-/// - [`Baseline`](RedactionLevel::Baseline): masks the string if it
-///   matches any sensitive value prefix.
-/// - [`Full`](RedactionLevel::Full): returns `"[REDACTED]"`.
+/// error level. Same semantics as [`redact_string`], but gated by
+/// [`RedactionPolicy::error_level`].
 #[must_use]
 pub fn redact_error(value: &str, policy: &RedactionPolicy) -> String {
     match policy.error_level {
         RedactionLevel::None => value.to_owned(),
-        RedactionLevel::Baseline => {
-            if policy.is_sensitive_value(value) {
-                REDACTED_MARKER.to_owned()
-            } else {
-                value.to_owned()
-            }
-        }
+        RedactionLevel::Baseline => baseline_redact_str(value, policy),
         RedactionLevel::Full => REDACTED_MARKER.to_owned(),
+    }
+}
+
+/// Shared baseline redaction for a plain string: prefix-match first
+/// (wholesale), then entity detection (span-level).
+fn baseline_redact_str(value: &str, policy: &RedactionPolicy) -> String {
+    if policy.is_sensitive_value(value) {
+        return REDACTED_MARKER.to_owned();
+    }
+    let spans = policy.detector.detect(value);
+    if spans.is_empty() {
+        value.to_owned()
+    } else {
+        mask_spans(value, &spans)
     }
 }
 
@@ -265,8 +340,10 @@ fn apply_redaction(
     }
 }
 
-/// Baseline redaction: recursively walk JSON and redact sensitive keys
-/// and values.
+/// Baseline redaction: recursively walk JSON and redact sensitive
+/// keys (wholesale), sensitive value prefixes (wholesale), and any
+/// entity-level PII detected within remaining string leaves
+/// (span-level).
 fn redact_baseline(value: &serde_json::Value, policy: &RedactionPolicy) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -285,9 +362,13 @@ fn redact_baseline(value: &serde_json::Value, policy: &RedactionPolicy) -> serde
         }
         serde_json::Value::String(s) => {
             if policy.is_sensitive_value(s) {
-                serde_json::json!(REDACTED_MARKER)
-            } else {
+                return serde_json::json!(REDACTED_MARKER);
+            }
+            let spans = policy.detector.detect(s);
+            if spans.is_empty() {
                 value.clone()
+            } else {
+                serde_json::Value::String(mask_spans(s, &spans))
             }
         }
         _ => value.clone(),
@@ -628,5 +709,157 @@ mod tests {
             REDACTED_MARKER,
         );
         assert_eq!(result["level1"]["level2"]["level3"]["value"], "safe");
+    }
+
+    // ── Entity-level detection via the plugged-in PiiDetector ──
+
+    #[test]
+    fn baseline_masks_email_in_non_sensitive_string_value() {
+        let policy = RedactionPolicy::baseline();
+        let input = serde_json::json!({
+            "note": "forward to ana.silva+bipa@bipa.exchange please"
+        });
+        let result = redact_value(&input, &policy);
+        let note = result["note"].as_str().expect("note is string");
+        assert!(note.contains("[REDACTED:email]"), "got: {note}");
+        assert!(!note.contains("ana.silva+bipa@bipa.exchange"));
+    }
+
+    #[test]
+    fn baseline_masks_cpf_in_freeform_text() {
+        let policy = RedactionPolicy::baseline();
+        let input = serde_json::json!({
+            "description": "confirmou pelo CPF 111.444.777-35 ontem"
+        });
+        let result = redact_value(&input, &policy);
+        let desc = result["description"].as_str().expect("desc is string");
+        assert!(desc.contains("[REDACTED:cpf]"), "got: {desc}");
+        assert!(!desc.contains("111.444.777-35"));
+    }
+
+    #[test]
+    fn baseline_masks_cnpj_in_freeform_text() {
+        let policy = RedactionPolicy::baseline();
+        let input = serde_json::json!({
+            "description": "pagar CNPJ 11.222.333/0001-81 até sexta"
+        });
+        let result = redact_value(&input, &policy);
+        let desc = result["description"].as_str().expect("desc is string");
+        assert!(desc.contains("[REDACTED:cnpj]"), "got: {desc}");
+    }
+
+    #[test]
+    fn baseline_masks_luhn_valid_pan_in_tool_output() {
+        let policy = RedactionPolicy::baseline();
+        let output = "charged card 4111 1111 1111 1111 successfully for 150 BRL";
+        let result = redact_string(output, &policy);
+        assert!(result.contains("[REDACTED:credit_card]"), "got: {result}");
+        assert!(!result.contains("4111 1111 1111 1111"));
+    }
+
+    #[test]
+    fn baseline_does_not_mask_luhn_invalid_digits() {
+        // 16 digits that aren't Luhn-valid — must not be flagged as a PAN.
+        let policy = RedactionPolicy::baseline();
+        let output = "order 1234 5678 9012 3456 processed";
+        let result = redact_string(output, &policy);
+        assert!(
+            !result.contains("[REDACTED:"),
+            "false positive on non-PAN digits: {result}"
+        );
+    }
+
+    #[test]
+    fn baseline_masks_embedded_secret_token() {
+        // The wholesale prefix check only fires when the WHOLE string
+        // starts with a prefix. Embedded secrets rely on the entity
+        // detector's SecretDetector component.
+        let policy = RedactionPolicy::baseline();
+        let output = "deploy failed: key=sk-abcdefghijklmnopqrstuv rejected";
+        let result = redact_string(output, &policy);
+        assert!(result.contains("[REDACTED:secret]"), "got: {result}");
+    }
+
+    #[test]
+    fn baseline_preserves_wholesale_prefix_behaviour() {
+        // A string that STARTS with a sensitive prefix still falls
+        // into the wholesale `[REDACTED]` path — entity detection
+        // does not override that stronger signal.
+        let policy = RedactionPolicy::baseline();
+        let result = redact_string("sk-abc123def456ghi789jkl", &policy);
+        assert_eq!(result, REDACTED_MARKER);
+    }
+
+    #[test]
+    fn baseline_masks_pii_in_nested_string_leaves() {
+        let policy = RedactionPolicy::baseline();
+        let input = serde_json::json!({
+            "audit_log": [
+                {
+                    "actor": "system",
+                    "details": "user CPF 111.444.777-35 contacted from 192.168.1.100"
+                }
+            ]
+        });
+        let result = redact_value(&input, &policy);
+        let details = result["audit_log"][0]["details"]
+            .as_str()
+            .expect("details string");
+        assert!(details.contains("[REDACTED:cpf]"), "got: {details}");
+        assert!(details.contains("[REDACTED:ip_address]"), "got: {details}");
+    }
+
+    #[test]
+    fn sensitive_key_match_wins_over_entity_detection() {
+        // Values under a sensitive key still get wholesale `[REDACTED]`
+        // — not a partial entity mask. Preserves the pre-upgrade
+        // contract.
+        let policy = RedactionPolicy::baseline();
+        let input = serde_json::json!({
+            "api_key": "sk-leaky",
+            "access_token": "Bearer eyJ..."
+        });
+        let result = redact_value(&input, &policy);
+        assert_eq!(result["api_key"], REDACTED_MARKER);
+        assert_eq!(result["access_token"], REDACTED_MARKER);
+    }
+
+    #[test]
+    fn none_policy_performs_no_entity_detection() {
+        let policy = RedactionPolicy::none();
+        let input = serde_json::json!({
+            "note": "CPF 111.444.777-35 email a@b.co"
+        });
+        let result = redact_value(&input, &policy);
+        assert_eq!(result, input, "none policy must not mutate input");
+    }
+
+    #[test]
+    fn deserialized_policy_retains_baseline_entity_detection() -> anyhow::Result<()> {
+        // The detector field is `#[serde(skip)]`. After a round-trip
+        // through JSON, the policy must still perform entity
+        // detection via the default BaselineDetector.
+        let policy = RedactionPolicy::baseline();
+        let json = serde_json::to_string(&policy)?;
+        let back: RedactionPolicy = serde_json::from_str(&json)?;
+        let result = redact_string("pix para CPF 111.444.777-35 agora", &back);
+        assert!(
+            result.contains("[REDACTED:cpf]"),
+            "deserialized policy stopped detecting CPF: {result}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn error_level_baseline_masks_entities_in_stack_trace() {
+        // Opt-in: callers can flip error_level to Baseline and the
+        // detector applies to error strings too.
+        let policy = RedactionPolicy {
+            error_level: RedactionLevel::Baseline,
+            ..RedactionPolicy::baseline()
+        };
+        let trace = "NotFound: user with CPF 111.444.777-35 missing in table users";
+        let result = redact_error(trace, &policy);
+        assert!(result.contains("[REDACTED:cpf]"), "got: {result}");
     }
 }

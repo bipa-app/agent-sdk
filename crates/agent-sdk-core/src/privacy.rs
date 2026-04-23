@@ -179,7 +179,11 @@ impl PiiSpan {
 /// Implementations must be deterministic and side-effect free.
 /// The order of returned spans is unspecified; callers that need
 /// ordered output should sort by `start`.
-pub trait PiiDetector: Send + Sync {
+///
+/// [`Debug`] is a supertrait so detectors embedded in larger config
+/// structs (e.g. an audit redaction policy) can derive `Debug`
+/// without custom impls.
+pub trait PiiDetector: Send + Sync + std::fmt::Debug {
     /// Find every PII span in `text`. Returned spans use UTF-8
     /// char-boundary-safe byte offsets.
     fn detect(&self, text: &str) -> Vec<PiiSpan>;
@@ -472,6 +476,7 @@ impl PiiDetector for EntityDetector {
 
 /// Aggregates multiple detectors, optionally deduplicating
 /// overlapping spans.
+#[derive(Debug)]
 pub struct CompositeDetector {
     detectors: Vec<Box<dyn PiiDetector>>,
     dedup: bool,
@@ -507,6 +512,7 @@ impl PiiDetector for CompositeDetector {
 
 /// Convenience composite of [`SecretDetector`] + [`EntityDetector`]
 /// using default settings. Suitable as the SDK default detector.
+#[derive(Debug)]
 pub struct BaselineDetector {
     inner: CompositeDetector,
 }
@@ -1003,6 +1009,7 @@ mod tests {
     fn composite_dedupes_overlapping_spans() {
         // Two detectors that both match the same bytes produce a
         // single output span after dedup.
+        #[derive(Debug)]
         struct Always(PiiCategory);
         impl PiiDetector for Always {
             fn detect(&self, text: &str) -> Vec<PiiSpan> {
@@ -1024,6 +1031,7 @@ mod tests {
 
     #[test]
     fn composite_without_dedup_preserves_overlaps() {
+        #[derive(Debug)]
         struct Always(PiiCategory);
         impl PiiDetector for Always {
             fn detect(&self, text: &str) -> Vec<PiiSpan> {

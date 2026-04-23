@@ -1326,8 +1326,11 @@ async fn audit_event_with_redacted_input() -> Result<()> {
 
     let persisted_input = events[0].input.as_ref().context("input should exist")?;
     assert_eq!(persisted_input["amount"], 100);
+    // Sensitive key: wholesale `[REDACTED]`.
     assert_eq!(persisted_input["api_key"], "[REDACTED]");
-    assert_eq!(persisted_input["recipient"], "user@example.com");
+    // Email under a non-sensitive key: entity-level mask via the
+    // baseline PiiDetector.
+    assert_eq!(persisted_input["recipient"], "[REDACTED:email]");
 
     Ok(())
 }
