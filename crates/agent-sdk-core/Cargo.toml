@@ -9,6 +9,7 @@ keywords = ["agent", "llm", "ai", "types"]
 categories = ["data-structures"]
 
 [dependencies]
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }

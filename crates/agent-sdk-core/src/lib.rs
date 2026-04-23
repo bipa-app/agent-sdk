@@ -14,6 +14,7 @@
 pub mod audit;
 pub mod events;
 pub mod llm;
+pub mod privacy;
 pub mod types;
 
 // ── Flat re-exports ──────────────────────────────────────────────────
