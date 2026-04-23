@@ -163,12 +163,19 @@ impl RedactionPolicy {
     /// E.164 phones, IPs, JWTs) detected anywhere in remaining
     /// string leaves. Preserves non-sensitive structural data for
     /// debugging.
+    ///
+    /// All three levels (`input_level`, `output_level`,
+    /// `error_level`) default to [`Baseline`](RedactionLevel::Baseline).
+    /// Error strings routinely embed user data in stack traces
+    /// (`NotFound: user cpf=…`), so masking them is the safer
+    /// default — callers that need raw errors can explicitly set
+    /// `error_level: RedactionLevel::None` on a baseline policy.
     #[must_use]
     pub fn baseline() -> Self {
         Self {
             input_level: RedactionLevel::Baseline,
             output_level: RedactionLevel::Baseline,
-            error_level: RedactionLevel::None,
+            error_level: RedactionLevel::Baseline,
             sensitive_key_patterns: vec![
                 "password".into(),
                 "passwd".into(),
@@ -406,7 +413,9 @@ mod tests {
         let policy = RedactionPolicy::baseline();
         assert_eq!(policy.input_level, RedactionLevel::Baseline);
         assert_eq!(policy.output_level, RedactionLevel::Baseline);
-        assert_eq!(policy.error_level, RedactionLevel::None);
+        // Errors default to Baseline too — stack traces often leak
+        // user PII and we'd rather mask by default than ship raw.
+        assert_eq!(policy.error_level, RedactionLevel::Baseline);
         assert!(!policy.sensitive_key_patterns.is_empty());
         assert!(!policy.sensitive_value_prefixes.is_empty());
     }
@@ -592,12 +601,38 @@ mod tests {
     // ── redact_error ────────────────────────────────────────────
 
     #[test]
-    fn redact_error_none_preserves() {
+    fn redact_error_baseline_preserves_non_pii() {
+        // Baseline error_level masks PII but leaves ordinary
+        // operational messages untouched.
         let policy = RedactionPolicy::baseline();
         assert_eq!(
             redact_error("connection timeout after 30s", &policy),
             "connection timeout after 30s"
         );
+    }
+
+    #[test]
+    fn redact_error_baseline_masks_pii_by_default() {
+        // New default (ERROR level = Baseline) — PII in error strings
+        // gets entity-masked without requiring an explicit opt-in.
+        let policy = RedactionPolicy::baseline();
+        let masked = redact_error(
+            "Failed to process order for user CPF 111.444.777-35",
+            &policy,
+        );
+        assert!(masked.contains("[REDACTED:cpf]"), "got: {masked}");
+        assert!(!masked.contains("111.444.777-35"));
+    }
+
+    #[test]
+    fn redact_error_explicit_none_passes_through() {
+        // Callers that need raw errors can opt out of the default.
+        let policy = RedactionPolicy {
+            error_level: RedactionLevel::None,
+            ..RedactionPolicy::baseline()
+        };
+        let raw = "Failed to process order for user CPF 111.444.777-35";
+        assert_eq!(redact_error(raw, &policy), raw);
     }
 
     #[test]
