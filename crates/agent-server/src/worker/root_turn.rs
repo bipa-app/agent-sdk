@@ -48,6 +48,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint_store::CheckpointStore;
@@ -108,34 +109,42 @@ pub struct RootTurnDeps<'a> {
 /// The same IDs are reused for the consolidated [`AgentEvent::Text`] /
 /// [`AgentEvent::Thinking`] events emitted at turn close, so streaming
 /// clients can correlate every delta with the final event by id.
+///
+/// IDs are [`Uuid`] values (`UUIDv7`) rather than `String` so the type
+/// system enforces the invariant that they are well-formed UUIDs and
+/// debug output stays compact.  `UUIDv7` is time-ordered, so journal
+/// readers that sort events by id observe the same chronological
+/// ordering as the event stream itself.
 #[derive(Debug, Default)]
 struct ContentIds {
-    text_ids: BTreeMap<usize, String>,
-    thinking_ids: BTreeMap<usize, String>,
+    text_ids: BTreeMap<usize, Uuid>,
+    thinking_ids: BTreeMap<usize, Uuid>,
 }
 
 impl ContentIds {
     /// Get-or-insert the message id for a text block, generating a
-    /// fresh UUID on first use.
-    fn text_id_for(&mut self, block_index: usize) -> &str {
-        self.text_ids
+    /// fresh `UUIDv7` on first use.
+    fn text_id_for(&mut self, block_index: usize) -> Uuid {
+        *self
+            .text_ids
             .entry(block_index)
-            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .or_insert_with(Uuid::now_v7)
     }
 
     /// Get-or-insert the message id for a thinking block.
-    fn thinking_id_for(&mut self, block_index: usize) -> &str {
-        self.thinking_ids
+    fn thinking_id_for(&mut self, block_index: usize) -> Uuid {
+        *self
+            .thinking_ids
             .entry(block_index)
-            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .or_insert_with(Uuid::now_v7)
     }
 
     /// First text id in block-index order, if any.
     ///
     /// Used to assign a stable id to the [`AgentEvent::Refusal`]
     /// emitted when the model refuses with text.
-    fn first_text_id(&self) -> Option<&str> {
-        self.text_ids.values().next().map(String::as_str)
+    fn first_text_id(&self) -> Option<Uuid> {
+        self.text_ids.values().next().copied()
     }
 }
 
@@ -730,11 +739,11 @@ async fn call_llm(
                     // never produce non-empty text.
                     continue;
                 }
-                let message_id = content_ids.text_id_for(*block_index).to_owned();
+                let message_id = content_ids.text_id_for(*block_index);
                 commit_streaming_delta(
                     deps,
                     thread_id,
-                    AgentEvent::text_delta(message_id, text_chunk.clone()),
+                    AgentEvent::text_delta(message_id.to_string(), text_chunk.clone()),
                     "text_delta",
                     delta_count,
                 )
@@ -747,11 +756,11 @@ async fn call_llm(
                 if thinking_chunk.is_empty() {
                     continue;
                 }
-                let thinking_id = content_ids.thinking_id_for(*block_index).to_owned();
+                let thinking_id = content_ids.thinking_id_for(*block_index);
                 commit_streaming_delta(
                     deps,
                     thread_id,
-                    AgentEvent::thinking_delta(thinking_id, thinking_chunk.clone()),
+                    AgentEvent::thinking_delta(thinking_id.to_string(), thinking_chunk.clone()),
                     "thinking_delta",
                     delta_count,
                 )
@@ -1016,10 +1025,10 @@ fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) 
         .filter_map(|block| match block {
             llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => thinking_iter
                 .next()
-                .map(|id| AgentEvent::thinking(id, thinking)),
-            llm::ContentBlock::Text { text } if !text.is_empty() => {
-                text_iter.next().map(|id| AgentEvent::text(id, text))
-            }
+                .map(|id| AgentEvent::thinking(id.to_string(), thinking)),
+            llm::ContentBlock::Text { text } if !text.is_empty() => text_iter
+                .next()
+                .map(|id| AgentEvent::text(id.to_string(), text)),
             _ => None,
         })
         .collect()
@@ -1043,13 +1052,11 @@ fn build_turn_complete_events(
     if response.stop_reason == Some(llm::StopReason::Refusal) {
         // The refusal text is the first text block, so reuse the id
         // that streaming assigned to that block.  If the model refused
-        // without producing any text, fall back to a fresh UUID so the
-        // event still has a stable id for downstream consumers.
-        let refusal_id = content_ids
-            .first_text_id()
-            .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+        // without producing any text, fall back to a fresh `UUIDv7` so
+        // the event still has a stable id for downstream consumers.
+        let refusal_id = content_ids.first_text_id().unwrap_or_else(Uuid::now_v7);
         events.push(AgentEvent::refusal(
-            refusal_id,
+            refusal_id.to_string(),
             response.first_text().map(str::to_owned),
         ));
     }
