@@ -831,11 +831,15 @@ async fn worker_loop(params: WorkerLoopParams) {
 ///
 /// We spawn a heartbeat ticker that calls
 /// [`AgentTaskStore::heartbeat_task`] at `heartbeat_interval` and
-/// extends `lease_expires_at` by `lease_duration`. The ticker stops as
-/// soon as the task execution future returns, or the cancellation
-/// token fires, so a slow shutdown still drains cleanly. A heartbeat
-/// failure is logged and the ticker exits — the task store's CAS will
-/// surface the lease loss to the execution path on its next call.
+/// extends `lease_expires_at` by `lease_duration`. The ticker uses a
+/// child of the worker's cancellation token so it inherits shutdown
+/// propagation from the parent while remaining independently
+/// cancellable when the task execution future returns — without that
+/// independent cancel we'd have no way to stop the ticker on natural
+/// task completion (cancelling the parent would also abort the worker
+/// loop). A heartbeat failure is logged and the ticker exits — the
+/// task store's CAS will surface the lease loss to the execution path
+/// on its next call.
 async fn run_task_with_heartbeat(
     task: AgentTask,
     worker_id: &WorkerId,
@@ -859,7 +863,7 @@ async fn run_task_with_heartbeat(
         return;
     };
 
-    let heartbeat_cancel = CancellationToken::new();
+    let heartbeat_cancel = cancel.child_token();
     let heartbeat_handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
         stores: stores.clone(),
         task_id: task_id.clone(),
