@@ -18,9 +18,12 @@ use super::confirmation::{
     ConfirmationResumeOutcome, PolicyVerdict, apply_confirmation_decision,
     pause_tool_for_confirmation, resume_confirmed_tool,
 };
+use std::sync::Arc;
+
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::execution_intent::{GuardedExecutionDeps, InMemoryExecutionIntentStore};
@@ -222,6 +225,7 @@ struct TestStores {
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
     events: InMemoryEventRepository,
+    event_notifier: Arc<EventNotifier>,
 }
 
 impl TestStores {
@@ -233,6 +237,7 @@ impl TestStores {
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events: InMemoryEventRepository::new(),
+            event_notifier: Arc::new(EventNotifier::new()),
         }
     }
 
@@ -244,6 +249,7 @@ impl TestStores {
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
             event_repo: &self.events,
+            event_notifier: &self.event_notifier,
         }
     }
 }

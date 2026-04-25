@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
+futures = { workspace = true }
 
 [features]
 # Exposes in-crate test doubles (e.g. `CapturingThreadEventsWatchHandler`)

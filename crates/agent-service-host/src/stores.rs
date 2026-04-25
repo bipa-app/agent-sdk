@@ -507,6 +507,7 @@ impl StoreRegistry {
             attempt_store: self.attempt_store.as_ref(),
             checkpoint_store: self.checkpoint_store.as_ref(),
             event_repo: self.event_repo.as_ref(),
+            event_notifier: self.event_notifier.as_ref(),
         }
     }
 

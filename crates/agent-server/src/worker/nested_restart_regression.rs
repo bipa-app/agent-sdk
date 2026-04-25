@@ -44,6 +44,7 @@
 //! (`SQLite`, `Postgres`) reuse the same `AgentTaskStore` contract
 //! and are covered by the conformance suite for the transitional
 //! primitives; the composite restart flow is the focus here.
+use std::sync::Arc;
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,6 +253,7 @@ struct TestStores {
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
     events: InMemoryEventRepository,
+    event_notifier: Arc<EventNotifier>,
 }
 
 impl TestStores {
@@ -263,6 +265,7 @@ impl TestStores {
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events: InMemoryEventRepository::new(),
+            event_notifier: Arc::new(EventNotifier::new()),
         }
     }
 
@@ -274,6 +277,7 @@ impl TestStores {
             attempt_store: &self.attempts,
             checkpoint_store: &self.checkpoints,
             event_repo: &self.events,
+            event_notifier: &self.event_notifier,
         }
     }
 
