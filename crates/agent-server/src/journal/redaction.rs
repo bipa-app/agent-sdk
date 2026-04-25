@@ -37,10 +37,9 @@
 //!    a PAN mentioned in a tool response) without wrecking
 //!    debuggability.
 //!
-//! The detector defaults to
-//! [`BaselineDetector`](agent_sdk_core::privacy::BaselineDetector).
-//! Callers can plug in a custom detector by assigning
-//! [`RedactionPolicy::detector`] directly.
+//! The detector defaults to [`BaselineDetector`]. Callers can plug
+//! in a custom detector by assigning [`RedactionPolicy::detector`]
+//! directly.
 //!
 //! # Serialisation
 //!
