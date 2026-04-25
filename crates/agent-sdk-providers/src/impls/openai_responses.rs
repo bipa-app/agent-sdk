@@ -6,7 +6,7 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
@@ -225,7 +225,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -233,7 +233,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -272,9 +272,15 @@ impl LlmProvider for OpenAIResponsesProvider {
 
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    StreamErrorKind::RateLimited
+                } else if status.is_server_error() {
+                    StreamErrorKind::ServerError
+                } else {
+                    StreamErrorKind::InvalidRequest
+                };
                 log::warn!("OpenAI Responses error status={status} body={body}");
-                yield Ok(StreamDelta::Error { message: body, recoverable });
+                yield Ok(StreamDelta::Error { message: body, kind });
                 return;
             }
 
@@ -407,15 +413,16 @@ impl LlmProvider for OpenAIResponsesProvider {
                             // ── Error ───────────────────────────────────
                             "error" | "response.failed" => {
                                 let is_server_error = data.contains("server_error");
-                                let recoverable = is_server_error;
-                                if recoverable {
+                                let kind = if is_server_error {
                                     log::warn!("Responses API server error (recoverable): {data}");
+                                    StreamErrorKind::ServerError
                                 } else {
                                     log::error!("Responses API error event: {data}");
-                                }
+                                    StreamErrorKind::InvalidRequest
+                                };
                                 yield Ok(StreamDelta::Error {
                                     message: data.to_owned(),
-                                    recoverable,
+                                    kind,
                                 });
                                 return;
                             }

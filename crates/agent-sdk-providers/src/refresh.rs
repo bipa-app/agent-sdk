@@ -180,7 +180,7 @@ where
 
                 while let Some(item) = stream.next().await {
                     match item {
-                        Ok(StreamDelta::Error { message, recoverable })
+                        Ok(StreamDelta::Error { message, kind })
                             if !saw_output
                                 && !refreshed
                                 && is_unauthorized_error(&message) =>
@@ -194,7 +194,7 @@ where
                                     log::warn!(
                                         "RefreshingProvider refresh after streaming 401 failed: {error:#}"
                                     );
-                                    yield Ok(StreamDelta::Error { message, recoverable });
+                                    yield Ok(StreamDelta::Error { message, kind });
                                     return;
                                 }
                             }
@@ -270,6 +270,8 @@ mod tests {
 
     use agent_sdk_core::llm::{ChatResponse, ContentBlock, StopReason, Usage};
     use anyhow::Context;
+
+    use crate::streaming::StreamErrorKind;
 
     #[derive(Clone)]
     enum MockStreamItem {
@@ -547,7 +549,7 @@ mod tests {
         let mock = MockProvider::new();
         mock.queue_stream(vec![MockStreamItem::Ok(StreamDelta::Error {
             message: "status=401 Unauthorized".into(),
-            recoverable: false,
+            kind: StreamErrorKind::InvalidRequest,
         })])?;
         mock.queue_stream(vec![
             MockStreamItem::Ok(StreamDelta::TextDelta {
@@ -589,7 +591,7 @@ mod tests {
             }),
             MockStreamItem::Ok(StreamDelta::Error {
                 message: "401 Unauthorized".into(),
-                recoverable: false,
+                kind: StreamErrorKind::InvalidRequest,
             }),
         ])?;
 
@@ -617,11 +619,11 @@ mod tests {
         let mock = MockProvider::new();
         mock.queue_stream(vec![MockStreamItem::Ok(StreamDelta::Error {
             message: "status=401 Unauthorized".into(),
-            recoverable: false,
+            kind: StreamErrorKind::InvalidRequest,
         })])?;
         mock.queue_stream(vec![MockStreamItem::Ok(StreamDelta::Error {
             message: "still 401 Unauthorized".into(),
-            recoverable: false,
+            kind: StreamErrorKind::InvalidRequest,
         })])?;
 
         let refresh_count = Arc::new(AtomicUsize::new(0));

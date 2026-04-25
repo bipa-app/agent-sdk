@@ -13,7 +13,7 @@ use futures::StreamExt;
 use crate::model_capabilities::{
     ModelCapabilities, default_max_output_tokens, get_model_capabilities,
 };
-use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta};
+use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -75,19 +75,19 @@ pub trait LlmProvider: Send + Sync {
                     ChatOutcome::RateLimited => {
                         yield Ok(StreamDelta::Error {
                             message: "Rate limited".to_string(),
-                            recoverable: true,
+                            kind: StreamErrorKind::RateLimited,
                         });
                     }
                     ChatOutcome::InvalidRequest(msg) => {
                         yield Ok(StreamDelta::Error {
                             message: msg,
-                            recoverable: false,
+                            kind: StreamErrorKind::InvalidRequest,
                         });
                     }
                     ChatOutcome::ServerError(msg) => {
                         yield Ok(StreamDelta::Error {
                             message: msg,
-                            recoverable: true,
+                            kind: StreamErrorKind::ServerError,
                         });
                     }
                 },
@@ -190,17 +190,13 @@ pub trait LlmProvider: Send + Sync {
 /// Returns an error if the stream yields an error result.
 pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<ChatOutcome> {
     let mut accumulator = StreamAccumulator::new();
-    let mut last_error: Option<(String, bool)> = None;
+    let mut last_error: Option<(String, StreamErrorKind)> = None;
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(delta) => {
-                if let StreamDelta::Error {
-                    message,
-                    recoverable,
-                } = &delta
-                {
-                    last_error = Some((message.clone(), *recoverable));
+                if let StreamDelta::Error { message, kind } = &delta {
+                    last_error = Some((message.clone(), *kind));
                 }
                 accumulator.apply(&delta);
             }
@@ -208,16 +204,16 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
         }
     }
 
-    // If we encountered an error during streaming, return it
-    if let Some((message, recoverable)) = last_error {
-        if !recoverable {
-            return Ok(ChatOutcome::InvalidRequest(message));
-        }
-        // Check if it was a rate limit
-        if message.contains("Rate limited") || message.contains("rate limit") {
-            return Ok(ChatOutcome::RateLimited);
-        }
-        return Ok(ChatOutcome::ServerError(message));
+    // If we encountered an error during streaming, map kind directly
+    // to the corresponding `ChatOutcome` variant.  No string-matching
+    // heuristic is needed because the kind already records the
+    // category at the construction site.
+    if let Some((message, kind)) = last_error {
+        return Ok(match kind {
+            StreamErrorKind::RateLimited => ChatOutcome::RateLimited,
+            StreamErrorKind::ServerError => ChatOutcome::ServerError(message),
+            StreamErrorKind::InvalidRequest => ChatOutcome::InvalidRequest(message),
+        });
     }
 
     // Extract usage and stop_reason before consuming the accumulator

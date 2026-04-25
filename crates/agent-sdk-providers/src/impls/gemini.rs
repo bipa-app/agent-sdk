@@ -7,7 +7,7 @@ pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -286,7 +286,7 @@ impl LlmProvider for GeminiProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -294,7 +294,7 @@ impl LlmProvider for GeminiProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -357,12 +357,17 @@ impl LlmProvider for GeminiProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                let recoverable =
-                    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    StreamErrorKind::RateLimited
+                } else if status.is_server_error() {
+                    StreamErrorKind::ServerError
+                } else {
+                    StreamErrorKind::InvalidRequest
+                };
                 log::warn!("Gemini error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable,
+                    kind,
                 });
                 return;
             }

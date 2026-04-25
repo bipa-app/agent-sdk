@@ -9,7 +9,7 @@
 
 use crate::attachments::{request_has_attachments, validate_request_attachments};
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
@@ -464,7 +464,7 @@ impl LlmProvider for OpenAIProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -472,7 +472,7 @@ impl LlmProvider for OpenAIProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -521,15 +521,15 @@ impl LlmProvider for OpenAIProvider {
 
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                let (recoverable, level) = if status == StatusCode::TOO_MANY_REQUESTS {
-                    (true, "rate_limit")
+                let (kind, level) = if status == StatusCode::TOO_MANY_REQUESTS {
+                    (StreamErrorKind::RateLimited, "rate_limit")
                 } else if status.is_server_error() {
-                    (true, "server_error")
+                    (StreamErrorKind::ServerError, "server_error")
                 } else {
-                    (false, "client_error")
+                    (StreamErrorKind::InvalidRequest, "client_error")
                 };
                 log::warn!("OpenAI error status={status} body={body} kind={level}");
-                yield Ok(StreamDelta::Error { message: body, recoverable });
+                yield Ok(StreamDelta::Error { message: body, kind });
                 return;
             }
 

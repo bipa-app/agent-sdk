@@ -36,20 +36,25 @@
 
 use agent_sdk_core::audit::AuditProvenance;
 use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{self, ChatOutcome, ChatRequest};
+use agent_sdk_core::llm::{self, ChatRequest};
 use agent_sdk_core::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage,
     ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
+use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
+use futures::StreamExt;
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 use crate::journal::committed_event::CommittedEvent;
+use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
 use crate::journal::message_store::MessageProjectionStore;
@@ -80,6 +85,86 @@ pub struct RootTurnDeps<'a> {
     pub attempt_store: &'a dyn TurnAttemptStore,
     pub checkpoint_store: &'a dyn CheckpointStore,
     pub event_repo: &'a dyn EventRepository,
+    /// Same-process live-tail broadcaster.  Required so per-delta
+    /// `TextDelta` / `ThinkingDelta` events committed during streaming
+    /// reach `StreamThreadEvents` subscribers — the durable
+    /// [`EventRepository::commit_event`] path doesn't go through the
+    /// outbox + relay, so the worker has to notify directly.
+    pub event_notifier: &'a EventNotifier,
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Streaming content IDs
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-block message IDs assigned during streaming.
+///
+/// Both maps are keyed by the LLM's `block_index` so multi-block
+/// responses (e.g. two text blocks separated by a tool-use block) get
+/// distinct IDs per block.  Each ID is generated lazily on the first
+/// non-empty `TextDelta` / `ThinkingDelta` for its block, so blocks
+/// that never produce any content (or only empty deltas) never
+/// allocate an ID.
+///
+/// The same IDs are reused for the consolidated [`AgentEvent::Text`] /
+/// [`AgentEvent::Thinking`] events emitted at turn close, so streaming
+/// clients can correlate every delta with the final event by id.
+///
+/// IDs are [`Uuid`] values (`UUIDv7`) rather than `String` so the type
+/// system enforces the invariant that they are well-formed UUIDs and
+/// debug output stays compact.  `UUIDv7` is time-ordered, so journal
+/// readers that sort events by id observe the same chronological
+/// ordering as the event stream itself.
+#[derive(Debug, Default)]
+struct ContentIds {
+    text_ids: BTreeMap<usize, Uuid>,
+    thinking_ids: BTreeMap<usize, Uuid>,
+}
+
+impl ContentIds {
+    /// Get-or-insert the message id for a text block, generating a
+    /// fresh `UUIDv7` on first use.
+    fn text_id_for(&mut self, block_index: usize) -> Uuid {
+        *self
+            .text_ids
+            .entry(block_index)
+            .or_insert_with(Uuid::now_v7)
+    }
+
+    /// Get-or-insert the message id for a thinking block.
+    fn thinking_id_for(&mut self, block_index: usize) -> Uuid {
+        *self
+            .thinking_ids
+            .entry(block_index)
+            .or_insert_with(Uuid::now_v7)
+    }
+
+    /// First text id in block-index order, if any.
+    ///
+    /// Used to assign a stable id to the [`AgentEvent::Refusal`]
+    /// emitted when the model refuses with text.
+    fn first_text_id(&self) -> Option<Uuid> {
+        self.text_ids.values().next().copied()
+    }
+}
+
+/// Outcome of [`call_llm`]: the synthesized [`llm::ChatResponse`] plus
+/// the per-block IDs assigned during streaming.
+struct StreamedTurn {
+    response: llm::ChatResponse,
+    content_ids: ContentIds,
+}
+
+/// Bundle of context needed to commit / suspend a root turn after
+/// streaming completes.
+///
+/// Groups the per-block IDs (so the consolidated content events match
+/// the streamed deltas by id) with the `Start` [`CommittedEvent`]
+/// produced at turn open (so the outcome's `committed_events` includes
+/// every event written for the turn).
+struct TurnCloseContext {
+    content_ids: ContentIds,
+    start_committed: CommittedEvent,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -270,8 +355,34 @@ pub async fn execute_root_turn(
         .await
         .context("open turn attempt")?;
 
-    // 2. Build, send LLM request, and resolve the outcome — closing
-    //    the attempt on any non-success path.
+    // 2. Commit the `Start` event NOW, before streaming begins, so
+    //    later TextDelta / ThinkingDelta events have a parent in the
+    //    journal.  This trades the previous "Start committed atomically
+    //    with the rest of the turn" guarantee for live streaming: if
+    //    the LLM call fails (rate limit, transport error, cancel) the
+    //    Start is left orphaned and replay clients see
+    //    `Start … Error` (Error from `fail_root_turn`) or
+    //    `Start … <task Cancelled>`.  Both shapes are interpretable as
+    //    an abandoned turn; the next attempt for this task will commit
+    //    a fresh Start with the next sequence number.
+    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
+    let start_committed = deps
+        .event_repo
+        .commit_event(
+            thread_id,
+            AgentEvent::start(thread_id.clone(), turn_number),
+            now,
+        )
+        .await
+        .context("commit start event")?;
+    deps.event_notifier
+        .notify(std::slice::from_ref(&start_committed));
+
+    // 3. Build, send LLM request, and resolve the outcome — closing
+    //    the attempt on any non-success path.  `call_llm` allocates
+    //    per-block message/thinking IDs lazily as deltas arrive and
+    //    returns them so the consolidated content events emitted at
+    //    turn close reuse the same IDs.
     let chat_request = build_chat_request(
         definition,
         &inputs.staged_stores.messages,
@@ -282,27 +393,56 @@ pub async fn execute_root_turn(
     .await
     .context("build chat request")?;
 
-    let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
+    let StreamedTurn {
+        response,
+        content_ids,
+    } = call_llm(provider, chat_request, &attempt, deps, thread_id, now).await?;
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
     let commit_now = OffsetDateTime::now_utc();
+    let close_ctx = TurnCloseContext {
+        content_ids,
+        start_committed,
+    };
 
-    // 3. Branch: tool calls → suspend; text-only → commit.
+    // 4. Branch: tool calls → suspend; text-only → commit.
     //
-    // The Start event is committed inside each branch, AFTER its
-    // idempotency guard fires, so a stale-lease worker that
-    // re-acquired the task cannot produce a duplicate Start.
+    // Start was committed in step 2 (before streaming).  The branches
+    // commit only the consolidated content events, `TurnComplete`, and
+    // `Done` — atomically, with the message-projection write.
     if response.has_tool_use() {
-        return suspend_at_tool_boundary(inputs, user_prompt, response, attempt, deps, commit_now)
-            .await;
+        return suspend_at_tool_boundary(
+            inputs,
+            user_prompt,
+            response,
+            attempt,
+            deps,
+            commit_now,
+            close_ctx,
+        )
+        .await;
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
-    commit_text_only_turn(inputs, user_prompt, response, attempt, deps, commit_now).await
+    commit_text_only_turn(
+        inputs,
+        user_prompt,
+        response,
+        attempt,
+        deps,
+        commit_now,
+        close_ctx,
+    )
+    .await
 }
 
 /// Complete and commit a text-only turn (no tool calls).
+///
+/// The IDs in `close_ctx.content_ids` are reused for the consolidated
+/// `Text` / `Thinking` events committed alongside `TurnComplete` /
+/// `Done`, matching the ids used for the per-delta events streamed
+/// from `call_llm`.
 async fn commit_text_only_turn(
     inputs: RootWorkerInputs,
     user_prompt: &str,
@@ -310,6 +450,7 @@ async fn commit_text_only_turn(
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
+    close_ctx: TurnCloseContext,
 ) -> Result<RootTurnOutcome> {
     let thread_id = &inputs.bootstrap.thread_id;
     let task_id = &inputs.bootstrap.task_id;
@@ -325,32 +466,16 @@ async fn commit_text_only_turn(
     .await
     .context("buffer staged messages")?;
 
-    // Idempotency guard.
-    let expected_turn = inputs.recovery_view.next_turn_number;
-    let current_thread = deps
-        .thread_store
-        .get(thread_id)
-        .await
-        .context("re-read thread for idempotency check")?
-        .context("thread disappeared during turn execution")?;
-
-    if current_thread.committed_turns >= expected_turn {
-        bail!(
-            "turn {expected_turn} was already committed on thread {} \
-             (committed_turns={}); skipping duplicate commit",
-            thread_id,
-            current_thread.committed_turns,
-        );
-    }
+    ensure_turn_not_already_committed(
+        deps.thread_store,
+        thread_id,
+        inputs.recovery_view.next_turn_number,
+    )
+    .await?;
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
     let close_params = build_close_params(&response, &attempt);
-    let turn_usage = TokenUsage {
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
-        cached_input_tokens: response.usage.cached_input_tokens,
-        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-    };
+    let turn_usage = response_token_usage(&response);
 
     let drained_messages = inputs
         .staged_stores
@@ -366,21 +491,20 @@ async fn commit_text_only_turn(
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize agent state")?;
 
-    // Build lifecycle events with Start prepended. Start is included
-    // in the events vec passed to commit_completed_turn so it is
-    // committed atomically as step 5 — after all CAS-guarded state
-    // projections succeed. This prevents a stale-lease worker from
-    // producing orphaned Start events.
+    // Start was committed by `execute_root_turn` before streaming so
+    // the per-delta TextDelta / ThinkingDelta events have a parent in
+    // the journal.  This vec only carries the consolidated content
+    // events plus the `TurnComplete` / `Done` lifecycle edges.
     let duration = (now - attempt.opened_at).unsigned_abs();
-    let mut lifecycle_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
-    lifecycle_events.extend(build_turn_complete_events(
+    let lifecycle_events = build_turn_complete_events(
         &response,
         thread_id,
         turn_number,
         &turn_usage,
         &drained_state.total_usage,
         duration,
-    ));
+        &close_ctx.content_ids,
+    );
 
     let commit = commit_completed_turn(
         CompletedTurnCommit {
@@ -403,7 +527,11 @@ async fn commit_text_only_turn(
     .await
     .context("commit completed turn")?;
 
-    let committed_events = commit.committed_events.clone();
+    // Prepend the `Start` event committed before streaming so the
+    // outcome's `committed_events` represents every event committed
+    // for this turn (matching the pre-streaming contract).
+    let mut committed_events = vec![close_ctx.start_committed];
+    committed_events.extend(commit.committed_events.iter().cloned());
 
     let (completed_task, _parent) = deps
         .task_store
@@ -422,6 +550,45 @@ async fn commit_text_only_turn(
         response_text,
         committed_events,
     })
+}
+
+/// Idempotency guard: bail if a prior worker already committed the
+/// expected turn on this thread.
+///
+/// Called from both the fresh-turn and resumed-turn commit paths so a
+/// stale-lease worker that re-acquired the task cannot double-commit
+/// after another worker already advanced the thread.
+async fn ensure_turn_not_already_committed(
+    thread_store: &dyn ThreadStore,
+    thread_id: &agent_sdk_core::ThreadId,
+    expected_turn: u32,
+) -> Result<()> {
+    let current_thread = thread_store
+        .get(thread_id)
+        .await
+        .context("re-read thread for idempotency check")?
+        .context("thread disappeared during turn execution")?;
+
+    ensure!(
+        current_thread.committed_turns < expected_turn,
+        "turn {expected_turn} was already committed on thread {} \
+         (committed_turns={}); skipping duplicate commit",
+        thread_id,
+        current_thread.committed_turns,
+    );
+
+    Ok(())
+}
+
+/// Project [`llm::Usage`] from a chat response into the SDK's
+/// [`TokenUsage`] type used by the journal and audit records.
+const fn response_token_usage(response: &llm::ChatResponse) -> TokenUsage {
+    TokenUsage {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+        cached_input_tokens: response.usage.cached_input_tokens,
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -512,44 +679,179 @@ async fn build_chat_request(
     })
 }
 
-/// Call the LLM and resolve the outcome, closing the turn attempt on
-/// any non-success path before returning an error.
+/// Call the LLM via `chat_stream`, committing `TextDelta` /
+/// `ThinkingDelta` events to the journal as they arrive so live
+/// observers (TUI, desktop) see streaming output character-by-character
+/// instead of one consolidated [`AgentEvent::Text`] event at the end of
+/// the turn.
 ///
-/// On success the response is returned as-is — it may contain tool-use
-/// blocks. The caller is responsible for branching on text-only vs
-/// tool-call paths.
+/// Closes the turn attempt on any non-success path before returning an
+/// error.  On success returns a [`StreamedTurn`] containing the
+/// synthesized [`llm::ChatResponse`] (rebuilt from the
+/// [`StreamAccumulator`]) and the [`ContentIds`] map of per-block
+/// message/thinking IDs.  The IDs are generated lazily on the first
+/// non-empty delta for each `block_index` so the same id is reused for
+/// both the streamed delta events and the consolidated `Text` /
+/// `Thinking` events emitted at turn close.
+///
+/// Each delta event is committed with a freshly captured
+/// `OffsetDateTime::now_utc()` rather than the turn-open `now`, so the
+/// journal records true wall-clock arrival times for each delta.
 async fn call_llm(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
-    attempt_store: &dyn TurnAttemptStore,
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
     now: OffsetDateTime,
-) -> Result<llm::ChatResponse> {
-    let outcome = provider.chat(request).await.context("LLM provider call")?;
+) -> Result<StreamedTurn> {
+    let mut stream = std::pin::pin!(provider.chat_stream(request));
+    let mut accumulator = StreamAccumulator::new();
+    let mut content_ids = ContentIds::default();
+    let mut delta_count: u64 = 0;
 
-    let response = match outcome {
-        ChatOutcome::Success(r) => r,
-        ChatOutcome::RateLimited => {
-            close_attempt_with(attempt, TurnAttemptOutcome::RateLimited, attempt_store, now).await;
-            bail!("LLM rate limited");
+    while let Some(result) = stream.next().await {
+        let delta = match result {
+            Ok(delta) => delta,
+            Err(error) => {
+                close_attempt_with(
+                    attempt,
+                    TurnAttemptOutcome::ServerError,
+                    deps.attempt_store,
+                    now,
+                )
+                .await;
+                bail!("LLM stream iteration error: {error:#}");
+            }
+        };
+
+        delta_count = delta_count.saturating_add(1);
+        accumulator.apply(&delta);
+
+        match &delta {
+            StreamDelta::TextDelta {
+                delta: text_chunk,
+                block_index,
+            } => {
+                if text_chunk.is_empty() {
+                    // Empty deltas carry no content; skipping them
+                    // also avoids allocating an id for blocks that
+                    // never produce non-empty text.
+                    continue;
+                }
+                let message_id = content_ids.text_id_for(*block_index);
+                commit_streaming_delta(
+                    deps,
+                    thread_id,
+                    AgentEvent::text_delta(message_id.to_string(), text_chunk.clone()),
+                    "text_delta",
+                    delta_count,
+                )
+                .await;
+            }
+            StreamDelta::ThinkingDelta {
+                delta: thinking_chunk,
+                block_index,
+            } => {
+                if thinking_chunk.is_empty() {
+                    continue;
+                }
+                let thinking_id = content_ids.thinking_id_for(*block_index);
+                commit_streaming_delta(
+                    deps,
+                    thread_id,
+                    AgentEvent::thinking_delta(thinking_id.to_string(), thinking_chunk.clone()),
+                    "thinking_delta",
+                    delta_count,
+                )
+                .await;
+            }
+            StreamDelta::Error { message, kind } => {
+                // Map the kind directly onto the audit outcome so a
+                // genuine 5xx is recorded as `ServerError` (not
+                // `RateLimited`) and a validation rejection is
+                // recorded as `InvalidRequest` (not `ServerError`).
+                let outcome = match kind {
+                    StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
+                    StreamErrorKind::ServerError => TurnAttemptOutcome::ServerError,
+                    StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
+                };
+                close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
+                bail!("LLM stream error (kind={kind:?}): {message}");
+            }
+            // Done / Usage / ToolUseStart / ToolInputDelta /
+            // SignatureDelta / RedactedThinking are handled by the
+            // accumulator and don't need to be re-emitted as events.
+            StreamDelta::Done { .. }
+            | StreamDelta::Usage(_)
+            | StreamDelta::ToolUseStart { .. }
+            | StreamDelta::ToolInputDelta { .. }
+            | StreamDelta::SignatureDelta { .. }
+            | StreamDelta::RedactedThinking { .. } => {}
         }
-        ChatOutcome::InvalidRequest(msg) => {
-            close_attempt_with(
-                attempt,
-                TurnAttemptOutcome::InvalidRequest,
-                attempt_store,
-                now,
-            )
-            .await;
-            bail!("LLM invalid request: {msg}");
-        }
-        ChatOutcome::ServerError(msg) => {
-            close_attempt_with(attempt, TurnAttemptOutcome::ServerError, attempt_store, now).await;
-            bail!("LLM server error: {msg}");
-        }
+    }
+
+    let usage = accumulator.usage().cloned().unwrap_or(llm::Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    });
+    let stop_reason = accumulator.stop_reason().copied();
+    let content_blocks = accumulator.into_content_blocks();
+
+    // The synthesized response is assembled from streaming state and
+    // never reaches a provider's response-id space.  The downstream
+    // commit/suspension paths route every event through `content_ids`
+    // and never read `response.id`, so leaving it empty avoids
+    // allocating a UUID that nothing consumes.
+    let response = llm::ChatResponse {
+        id: String::new(),
+        content: content_blocks,
+        model: provider.model().to_string(),
+        stop_reason,
+        usage,
     };
 
-    Ok(response)
+    Ok(StreamedTurn {
+        response,
+        content_ids,
+    })
+}
+
+/// Commit a single streaming delta event with a freshly captured
+/// timestamp and best-effort live-tail notification.
+///
+/// Delta commit failures are intentionally non-fatal: the consolidated
+/// `Text` / `Thinking` event committed at turn close still captures
+/// the full content for replay clients, so a transient journal error
+/// during streaming should not abort the turn.
+async fn commit_streaming_delta(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    event: AgentEvent,
+    event_label: &str,
+    delta_count: u64,
+) {
+    // Use a fresh timestamp per delta so the journal records true
+    // wall-clock arrival times, not the stale turn-open `now` shared
+    // by every delta in a long streaming response.
+    let delta_now = OffsetDateTime::now_utc();
+    match deps
+        .event_repo
+        .commit_event(thread_id, event, delta_now)
+        .await
+    {
+        Ok(committed) => {
+            deps.event_notifier.notify(std::slice::from_ref(&committed));
+        }
+        Err(error) => {
+            log::warn!(
+                "failed to commit {event_label} event for thread {thread_id} \
+                 (delta_count={delta_count}): {error:#}",
+            );
+        }
+    }
 }
 
 /// Best-effort close of a turn attempt with a failure outcome.
@@ -671,13 +973,35 @@ fn build_full_assistant_message(response: &llm::ChatResponse) -> llm::Message {
     }
 }
 
+/// Sanitize a [`llm::ChatResponse`]'s `id` field for durable storage.
+///
+/// The streaming path leaves `response.id` empty because the
+/// provider's response id is not yet plumbed through the
+/// [`StreamDelta`] protocol.  Persisting `Some("")` would violate the
+/// documented contract on
+/// [`AgentContinuation::response_id`](agent_sdk_core::AgentContinuation::response_id)
+/// — `None` is the sentinel for "provider did not return an id" — so
+/// every caller that wants to durably record the response id must
+/// route through this helper.
+fn sanitized_response_id(response: &llm::ChatResponse) -> Option<String> {
+    Some(response.id.clone()).filter(|s| !s.is_empty())
+}
+
 fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> CloseAttemptParams {
+    let response_id = sanitized_response_id(response);
+
+    // The audit blob mirrors the typed `response_id` column so the two
+    // never disagree.  When the provider didn't return an id, the
+    // blob simply omits the `id` field rather than recording an empty
+    // string that contradicts `response_id IS NULL`.
+    let response_blob = response_id.as_ref().map_or_else(
+        || serde_json::json!({ "model": response.model }),
+        |id| serde_json::json!({ "id": id, "model": response.model }),
+    );
+
     CloseAttemptParams {
-        response_blob: serde_json::json!({
-            "id": response.id,
-            "model": response.model,
-        }),
-        response_id: Some(response.id.clone()),
+        response_blob,
+        response_id,
         response_model: Some(response.model.clone()),
         stop_reason: response.stop_reason,
         outcome: TurnAttemptOutcome::Success,
@@ -693,17 +1017,34 @@ fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> C
 /// the root turn produced — thinking blocks (model reasoning) and
 /// text blocks (final response). Tool-use blocks are excluded because
 /// they are covered by `ToolCallStart` events on the suspension path.
-fn build_content_events(response: &llm::ChatResponse) -> Vec<AgentEvent> {
+///
+/// Each consolidated event reuses the per-block id allocated during
+/// streaming so a client can match each delta with the final event by
+/// id (see [`call_llm`](super::call_llm)).
+///
+/// # Invariant
+///
+/// `response.content` is sorted by `block_index` (see
+/// [`StreamAccumulator::into_content_blocks`]).  `content_ids.text_ids`
+/// and `content_ids.thinking_ids` are [`BTreeMap`]s keyed by
+/// `block_index`, so iterating their values yields the same
+/// block-index ordering.  This lets us match each non-empty
+/// `Text` / `Thinking` block to its id positionally without needing
+/// the `block_index` attached to each [`llm::ContentBlock`].
+fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) -> Vec<AgentEvent> {
+    let mut text_iter = content_ids.text_ids.values();
+    let mut thinking_iter = content_ids.thinking_ids.values();
+
     response
         .content
         .iter()
         .filter_map(|block| match block {
-            llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                Some(AgentEvent::thinking(&response.id, thinking))
-            }
-            llm::ContentBlock::Text { text } if !text.is_empty() => {
-                Some(AgentEvent::text(&response.id, text))
-            }
+            llm::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => thinking_iter
+                .next()
+                .map(|id| AgentEvent::thinking(id.to_string(), thinking)),
+            llm::ContentBlock::Text { text } if !text.is_empty() => text_iter
+                .next()
+                .map(|id| AgentEvent::text(id.to_string(), text)),
             _ => None,
         })
         .collect()
@@ -721,11 +1062,17 @@ fn build_turn_complete_events(
     turn_usage: &TokenUsage,
     total_usage: &TokenUsage,
     duration: std::time::Duration,
+    content_ids: &ContentIds,
 ) -> Vec<AgentEvent> {
-    let mut events = build_content_events(response);
+    let mut events = build_content_events(response, content_ids);
     if response.stop_reason == Some(llm::StopReason::Refusal) {
+        // The refusal text is the first text block, so reuse the id
+        // that streaming assigned to that block.  If the model refused
+        // without producing any text, fall back to a fresh `UUIDv7` so
+        // the event still has a stable id for downstream consumers.
+        let refusal_id = content_ids.first_text_id().unwrap_or_else(Uuid::now_v7);
         events.push(AgentEvent::refusal(
-            response.id.clone(),
+            refusal_id.to_string(),
             response.first_text().map(str::to_owned),
         ));
     }
@@ -767,9 +1114,9 @@ async fn suspend_at_tool_boundary(
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
+    close_ctx: TurnCloseContext,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
-    let thread_id = &inputs.bootstrap.thread_id;
 
     // Idempotency guard: re-read the task from the durable store to
     // detect if a prior worker already completed this suspension (e.g.
@@ -797,8 +1144,6 @@ async fn suspend_at_tool_boundary(
              skipping duplicate suspension",
         );
     }
-
-    let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
     //    AlreadyClosed is non-fatal: a prior recovery sweep
@@ -844,7 +1189,7 @@ async fn suspend_at_tool_boundary(
 
     // Build content events (Thinking) from the tool-call response so
     // replay observers see the model's reasoning before tool dispatch.
-    let content_events = build_content_events(&response);
+    let content_events = build_content_events(&response, &close_ctx.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events: Vec<AgentEvent> = continuation
@@ -879,19 +1224,26 @@ async fn suspend_at_tool_boundary(
         .await
         .context("spawn tool children")?;
 
-    // Commit Start + content events (Thinking) + ToolCallStart events
-    // in a single batch AFTER spawn_tool_children. Since
-    // spawn_tool_children is CAS-guarded (only the lease-holder can
-    // succeed), only the winning worker writes events — preventing
-    // orphaned Start events from stale-lease workers.
-    let mut suspension_events = vec![AgentEvent::start(thread_id.clone(), turn_number)];
-    suspension_events.extend(content_events);
+    // `Start` was committed by `execute_root_turn` before streaming so
+    // the per-delta TextDelta / ThinkingDelta events have a parent in
+    // the journal.  This batch carries only the consolidated content
+    // events (Thinking) plus the ToolCallStart events emitted AFTER
+    // spawn_tool_children.  Since spawn_tool_children is CAS-guarded
+    // (only the lease-holder can succeed), only the winning worker
+    // writes these events.
+    let mut suspension_events = content_events;
     suspension_events.extend(tool_call_events);
-    let committed_events = deps
+    let suspension_committed = deps
         .event_repo
         .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
         .await
         .context("commit suspension events")?;
+
+    // Prepend the `Start` committed before streaming so the outcome's
+    // `committed_events` represents every event committed for this
+    // turn (matching the pre-streaming contract).
+    let mut committed_events = vec![close_ctx.start_committed];
+    committed_events.extend(suspension_committed);
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
@@ -977,7 +1329,7 @@ async fn build_continuation(
         awaiting_index: 0,
         completed_results: Vec::new(),
         state: updated_state,
-        response_id: Some(response.id.clone()),
+        response_id: sanitized_response_id(response),
         stop_reason: response.stop_reason,
         response_content: response.content.clone(),
     };
@@ -1110,8 +1462,17 @@ pub async fn resume_root_turn(
     .await
     .context("build resume chat request")?;
 
-    // 4. Call the LLM.
-    let response = call_llm(provider, chat_request, &attempt, deps.attempt_store, now).await?;
+    // 4. Stream the LLM call.  The resumed turn doesn't get a fresh
+    //    `Start` event — the original turn's Start is already in the
+    //    journal and replay treats the resume as a continuation of
+    //    that turn.  `call_llm` allocates per-block message/thinking
+    //    IDs lazily during streaming so the per-delta TextDelta /
+    //    ThinkingDelta events match the consolidated `Text` /
+    //    `Thinking` events committed at turn close.
+    let StreamedTurn {
+        response,
+        content_ids,
+    } = call_llm(provider, chat_request, &attempt, deps, thread_id, now).await?;
     let commit_now = OffsetDateTime::now_utc();
 
     let prior = ResumeContext {
@@ -1122,10 +1483,28 @@ pub async fn resume_root_turn(
 
     // 5. Branch: tool calls → re-suspend; text-only → commit.
     if response.has_tool_use() {
-        return suspend_resumed_turn(inputs, &prior, response, attempt, deps, commit_now).await;
+        return suspend_resumed_turn(
+            inputs,
+            &prior,
+            response,
+            attempt,
+            deps,
+            commit_now,
+            &content_ids,
+        )
+        .await;
     }
 
-    commit_resumed_turn(inputs, &continuation, &response, &attempt, deps, commit_now).await
+    commit_resumed_turn(
+        inputs,
+        &continuation,
+        &response,
+        &attempt,
+        deps,
+        commit_now,
+        &content_ids,
+    )
+    .await
 }
 
 /// Buffer the final assistant message and update the staged agent state
@@ -1183,65 +1562,33 @@ async fn buffer_resumed_assistant(
     Ok(())
 }
 
-/// Commit a resumed turn whose LLM response is text-only.
-///
-/// Buffers the final assistant message, updates agent state, runs
-/// the idempotency guard, drains staged stores, commits, and
-/// advances the task to `Completed`.
-async fn commit_resumed_turn(
-    inputs: RootWorkerInputs,
-    continuation: &AgentContinuation,
-    response: &llm::ChatResponse,
-    attempt: &TurnAttempt,
-    deps: &RootTurnDeps<'_>,
-    now: OffsetDateTime,
-) -> Result<RootTurnOutcome> {
-    let thread_id = &inputs.bootstrap.thread_id;
-    let task_id = &inputs.bootstrap.task_id;
-
-    let response_text = response.first_text().unwrap_or("").to_owned();
-
-    buffer_resumed_assistant(&inputs, continuation, response).await?;
-
-    // Idempotency guard (same as text-only path).
-    let expected_turn = inputs.recovery_view.next_turn_number;
-    let current_thread = deps
-        .thread_store
-        .get(thread_id)
-        .await
-        .context("re-read thread for resume idempotency check")?
-        .context("thread disappeared during resume")?;
-
-    if current_thread.committed_turns >= expected_turn {
-        bail!(
-            "turn {expected_turn} was already committed on thread {} \
-             (committed_turns={}); skipping duplicate resume commit",
-            thread_id,
-            current_thread.committed_turns,
-        );
-    }
-
-    // Drain staged stores and commit.
-    let close_params = build_close_params(response, attempt);
-    let turn_usage = TokenUsage {
-        input_tokens: continuation
-            .turn_usage
+/// Combine the prior continuation's per-turn usage with the new
+/// response's usage so the resume commit records cumulative token
+/// usage for the full turn (suspension + resume LLM calls).
+const fn merged_turn_usage(prior: &TokenUsage, response: &llm::ChatResponse) -> TokenUsage {
+    TokenUsage {
+        input_tokens: prior
             .input_tokens
             .saturating_add(response.usage.input_tokens),
-        output_tokens: continuation
-            .turn_usage
+        output_tokens: prior
             .output_tokens
             .saturating_add(response.usage.output_tokens),
-        cached_input_tokens: continuation
-            .turn_usage
+        cached_input_tokens: prior
             .cached_input_tokens
             .saturating_add(response.usage.cached_input_tokens),
-        cache_creation_input_tokens: continuation
-            .turn_usage
+        cache_creation_input_tokens: prior
             .cache_creation_input_tokens
             .saturating_add(response.usage.cache_creation_input_tokens),
-    };
+    }
+}
 
+/// Drain the staged message and state stores after a resumed turn so
+/// the commit path has the messages to persist and the snapshot to
+/// checkpoint.  Returns the drained messages, the snapshot value, and
+/// the cumulative `total_usage` from the staged state.
+fn drain_resumed_turn_state(
+    inputs: &RootWorkerInputs,
+) -> Result<(Vec<llm::Message>, serde_json::Value, TokenUsage)> {
     let drained_messages = inputs
         .staged_stores
         .messages
@@ -1255,6 +1602,46 @@ async fn commit_resumed_turn(
         .context("staged state was None after resume")?;
     let agent_state_snapshot =
         serde_json::to_value(&drained_state).context("serialize resumed agent state")?;
+    Ok((
+        drained_messages,
+        agent_state_snapshot,
+        drained_state.total_usage,
+    ))
+}
+
+/// Commit a resumed turn whose LLM response is text-only.
+///
+/// Buffers the final assistant message, updates agent state, runs
+/// the idempotency guard, drains staged stores, commits, and
+/// advances the task to `Completed`.
+async fn commit_resumed_turn(
+    inputs: RootWorkerInputs,
+    continuation: &AgentContinuation,
+    response: &llm::ChatResponse,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+    content_ids: &ContentIds,
+) -> Result<RootTurnOutcome> {
+    let thread_id = &inputs.bootstrap.thread_id;
+    let task_id = &inputs.bootstrap.task_id;
+
+    let response_text = response.first_text().unwrap_or("").to_owned();
+
+    buffer_resumed_assistant(&inputs, continuation, response).await?;
+
+    ensure_turn_not_already_committed(
+        deps.thread_store,
+        thread_id,
+        inputs.recovery_view.next_turn_number,
+    )
+    .await
+    .context("resume idempotency check")?;
+
+    let close_params = build_close_params(response, attempt);
+    let turn_usage = merged_turn_usage(&continuation.turn_usage, response);
+
+    let (drained_messages, agent_state_snapshot, total_usage) = drain_resumed_turn_state(&inputs)?;
 
     let turn_number = usize::try_from(inputs.recovery_view.next_turn_number).unwrap_or(0);
     let duration = (now - attempt.opened_at).unsigned_abs();
@@ -1263,8 +1650,9 @@ async fn commit_resumed_turn(
         thread_id,
         turn_number,
         &turn_usage,
-        &drained_state.total_usage,
+        &total_usage,
         duration,
+        content_ids,
     );
 
     let commit = commit_completed_turn(
@@ -1421,6 +1809,7 @@ async fn suspend_resumed_turn(
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
+    content_ids: &ContentIds,
 ) -> Result<RootTurnOutcome> {
     let task_id = &inputs.bootstrap.task_id;
 
@@ -1472,7 +1861,7 @@ async fn suspend_resumed_turn(
         .collect();
 
     // Build content events (Thinking) from the resume response.
-    let content_events = build_content_events(&response);
+    let content_events = build_content_events(&response, content_ids);
 
     // Build ToolCallStart events before continuation is moved.
     let tool_call_events: Vec<AgentEvent> = new_continuation
@@ -1595,7 +1984,7 @@ fn build_resume_continuation(
         awaiting_index: 0,
         completed_results: Vec::new(),
         state: updated_state,
-        response_id: Some(response.id.clone()),
+        response_id: sanitized_response_id(response),
         stop_reason: response.stop_reason,
         response_content: response.content.clone(),
     };
