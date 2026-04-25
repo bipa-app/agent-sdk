@@ -1,7 +1,14 @@
 //! Core observability types and the `ObservabilityStore` trait.
 
+use super::payload::PayloadRedactor;
 use crate::types::ThreadId;
 use async_trait::async_trait;
+use std::sync::LazyLock;
+
+/// Process-wide noop redactor used by the default
+/// `ObservabilityStore::redactor` implementation — avoids allocating
+/// a fresh `Arc<NoopDetector>` on every call.
+static NOOP_REDACTOR: LazyLock<PayloadRedactor> = LazyLock::new(PayloadRedactor::noop);
 
 /// Identifies the kind of LLM payload capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,4 +101,103 @@ pub trait ObservabilityStore: Send + Sync {
     ///
     /// Errors are logged and swallowed — they never fail the agent run.
     async fn capture(&self, bundle: &PayloadBundle) -> anyhow::Result<CaptureResult>;
+
+    /// PII redactor applied to every payload converted for this store.
+    ///
+    /// The agent loop calls this once per LLM round-trip and uses
+    /// the returned redactor to mask PII in the system prompt, input
+    /// messages, and output messages before building the
+    /// [`PayloadBundle`]. The same masked JSON is then recorded on
+    /// the `OTel` span, so a single redaction pass covers both
+    /// external persistence and local tracing.
+    ///
+    /// The default returns a shared noop redactor — existing stores
+    /// keep their current byte-for-byte output. Stores that need
+    /// PII-aware redaction (recommended for financial / regulated
+    /// workloads) should override this with a
+    /// [`PayloadRedactor`] wrapping a detector such as
+    /// [`agent_sdk_core::privacy::BaselineDetector`].
+    fn redactor(&self) -> &PayloadRedactor {
+        &NOOP_REDACTOR
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::Message;
+    use agent_sdk_core::ChatRequest;
+    use agent_sdk_core::privacy::BaselineDetector;
+    use std::sync::Arc;
+
+    struct NoopStore;
+
+    #[async_trait]
+    impl ObservabilityStore for NoopStore {
+        async fn capture(&self, _bundle: &PayloadBundle) -> anyhow::Result<CaptureResult> {
+            Ok(CaptureResult {
+                system_instructions: CaptureDecision::Omit,
+                input_messages: CaptureDecision::Omit,
+                output_messages: CaptureDecision::Omit,
+            })
+        }
+    }
+
+    struct PrivacyStore {
+        redactor: PayloadRedactor,
+    }
+
+    #[async_trait]
+    impl ObservabilityStore for PrivacyStore {
+        async fn capture(&self, _bundle: &PayloadBundle) -> anyhow::Result<CaptureResult> {
+            Ok(CaptureResult {
+                system_instructions: CaptureDecision::Omit,
+                input_messages: CaptureDecision::Omit,
+                output_messages: CaptureDecision::Omit,
+            })
+        }
+
+        fn redactor(&self) -> &PayloadRedactor {
+            &self.redactor
+        }
+    }
+
+    fn sample_request() -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages: vec![Message::user("CPF 111.444.777-35 please")],
+            tools: None,
+            max_tokens: 1024,
+            max_tokens_explicit: false,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+        }
+    }
+
+    #[test]
+    fn default_redactor_is_noop() {
+        let store = NoopStore;
+        let result = store.redactor().convert_input_messages(&sample_request());
+        let text = result[0]["content"][0]["text"].as_str().expect("text");
+        // Default impl: no redaction — CPF flows through unchanged.
+        assert_eq!(text, "CPF 111.444.777-35 please");
+    }
+
+    #[test]
+    fn overridden_redactor_masks_pii() {
+        let store = PrivacyStore {
+            redactor: PayloadRedactor::new(Arc::new(
+                BaselineDetector::new().expect("baseline compiles"),
+            )),
+        };
+        let result = store.redactor().convert_input_messages(&sample_request());
+        let text = result[0]["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.contains("[REDACTED:cpf]"),
+            "expected CPF mask via trait, got {text}"
+        );
+        assert!(!text.contains("111.444.777-35"));
+    }
 }

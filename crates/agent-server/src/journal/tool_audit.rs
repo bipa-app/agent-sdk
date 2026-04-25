@@ -37,9 +37,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::execution_intent::ToolEffectClass;
-use super::redaction::{
-    RedactionLevel, RedactionPolicy, redact_error, redact_string, redact_value,
-};
+use super::redaction::{RedactionPolicy, redact_error, redact_string, redact_value};
 use super::task::AgentTaskId;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -528,10 +526,7 @@ pub fn redact_event(event: &ToolAuditEvent, policy: &RedactionPolicy) -> ToolAud
 
 #[must_use]
 fn durable_store_redaction_policy() -> RedactionPolicy {
-    RedactionPolicy {
-        error_level: RedactionLevel::Baseline,
-        ..RedactionPolicy::baseline()
-    }
+    RedactionPolicy::baseline()
 }
 
 /// Decorator that applies a [`RedactionPolicy`] to every event on its
@@ -928,13 +923,15 @@ mod tests {
         assert_eq!(input["normal"], "hello");
 
         assert_eq!(redacted.output.as_deref(), Some(REDACTED_MARKER_VALUE));
-        // Baseline error_level is None, so the top-level error field and the
-        // error string inside the Failed variant both pass through unchanged.
-        assert_eq!(redacted.error.as_deref(), Some("Bearer eyJ-token"));
+        // Baseline error_level is now also Baseline — the top-level
+        // error field and the error inside the Failed variant both
+        // get wholesale-redacted because they start with sensitive
+        // prefixes ("Bearer ", "sk-").
+        assert_eq!(redacted.error.as_deref(), Some(REDACTED_MARKER_VALUE));
 
         match redacted.kind {
             ToolAuditEventKind::Failed { error } => {
-                assert_eq!(error, "sk-failure-token");
+                assert_eq!(error, REDACTED_MARKER_VALUE);
             }
             other => panic!("expected Failed variant, got {other:?}"),
         }
