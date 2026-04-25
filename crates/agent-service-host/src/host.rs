@@ -837,9 +837,21 @@ async fn worker_loop(params: WorkerLoopParams) {
 /// cancellable when the task execution future returns — without that
 /// independent cancel we'd have no way to stop the ticker on natural
 /// task completion (cancelling the parent would also abort the worker
-/// loop). A heartbeat failure is logged and the ticker exits — the
-/// task store's CAS will surface the lease loss to the execution path
-/// on its next call.
+/// loop).
+///
+/// Error policy: any failure from `heartbeat_task` exits the ticker —
+/// no retry. Two distinct causes are conflated here:
+/// * **Lease rejection** (worker / lease / status CAS mismatch). The
+///   row no longer belongs to this worker; whoever owns it now will
+///   carry it forward, and re-trying from this ticker would only
+///   muddy the logs.
+/// * **Transient store error** (e.g. a momentary DB hiccup). The task
+///   keeps running but its lease is no longer being extended, so the
+///   sweep may requeue it. We bail rather than retry because the
+///   task's own next store call will surface the same fault, and the
+///   default config (`lease_duration_secs = 30`,
+///   `heartbeat_interval_secs = 10`) gives the lease ~3 heartbeats of
+///   headroom — a single missed beat is benign.
 async fn run_task_with_heartbeat(
     task: AgentTask,
     worker_id: &WorkerId,
@@ -940,7 +952,7 @@ async fn heartbeat_loop(params: HeartbeatLoopParams) {
                     task_id = %task_id,
                     thread_id = %thread_id,
                     error = %err,
-                    "heartbeat failed; lease may have been requeued or stolen",
+                    "heartbeat failed; ticker exiting (lease rejection or transient store error — see run_task_with_heartbeat docs)",
                 );
                 return;
             }

@@ -7133,45 +7133,9 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: a `ReadyToResume` row whose worker keeps losing its
-    /// lease must reach a terminal state in a bounded number of cycles.
-    ///
-    /// Bug shape (pre-fix):
-    /// 1. A root turn ran, suspended on tool children, and resumed back
-    ///    to `Pending + ReadyToResume` after the children finished.
-    /// 2. The resume worker's LLM call ran longer than the lease
-    ///    (`lease_duration_secs = 30` by default in the host); no
-    ///    heartbeat existed, so the lease expired mid-flight.
-    /// 3. The expiry sweep saw `ExpiredLease + Running + ReadyToResume`
-    ///    and the recovery matrix carved this case out of the budget
-    ///    check — it always returned `Requeue`. `release_lease` did not
-    ///    bump `attempt` for `ReadyToResume`.
-    /// 4. The next worker re-acquired the row, ran the same resume,
-    ///    hit the same lease expiry, requeued again. Forever. The user
-    ///    saw the "resume root task from durable child results" warning
-    ///    fire every ~30 seconds with no termination.
-    ///
-    /// Fix shape:
-    /// - `release_lease` bumps `attempt` (capped at `max_attempts`)
-    ///   when the row is in `TaskState::ReadyToResume`, so the budget
-    ///   counter actually moves on each crashed resume cycle.
-    /// - `classify_recovery` no longer carves `ReadyToResume` out of
-    ///   the `ExpiredLease` budget check, so the row fails closed once
-    ///   `is_budget_exhausted()` returns true.
-    ///
-    /// This test simulates the cycle with `max_attempts = 3`:
-    /// - The original `Running` consumes one slot.
-    /// - Crashed resume #1 → `release_lease` bumps to 2 → requeue.
-    /// - Crashed resume #2 → bump to 3 → requeue.
-    /// - Crashed resume #3 → matrix sees budget exhausted → fail
-    ///   closed with `LeaseExpiredBudgetExhausted`.
-    ///
-    /// Without the fix the row would still be `Running` (or oscillating
-    /// between `Running` and `Pending`) at the end of the test instead
-    /// of `Failed`.
     /// Drive a fresh root through child-spawn → resume so the row
-    /// reaches `Pending + ReadyToResume + attempt=1`. Returned along
-    /// with the parent id for the regression test below to drive the
+    /// reaches `Pending + ReadyToResume + attempt=1`. Returns the
+    /// parent id for the regression test below to drive the
     /// crashed-resume cycle against.
     async fn submit_resumable_root(
         store: &InMemoryAgentTaskStore,
@@ -7235,6 +7199,13 @@ mod tests {
     /// Acquire a `ReadyToResume` row, then drive the lease past `now`
     /// and let the sweep classify it. Returns the recovery action so
     /// the caller can assert on `Requeue` vs `FailClosed`.
+    ///
+    /// The lease is set to `acquired_at + 1` — a deliberately tiny 1s
+    /// window so the test runs on a compressed time scale. The
+    /// production `lease_duration_secs` (default 30s) is irrelevant
+    /// here; what we exercise is the *shape* of expired-lease →
+    /// recovery, not the duration. `sweep_at` must be past
+    /// `acquired_at + 1` so the lease is observably expired.
     async fn crash_resume_cycle(
         store: &InMemoryAgentTaskStore,
         parent_id: &AgentTaskId,
@@ -7261,6 +7232,42 @@ mod tests {
         Ok(swept[0].action)
     }
 
+    /// Regression: a `ReadyToResume` row whose worker keeps losing its
+    /// lease must reach a terminal state in a bounded number of cycles.
+    ///
+    /// Bug shape (pre-fix):
+    /// 1. A root turn ran, suspended on tool children, and resumed back
+    ///    to `Pending + ReadyToResume` after the children finished.
+    /// 2. The resume worker's LLM call ran longer than the lease
+    ///    (`lease_duration_secs = 30` by default in the host); no
+    ///    heartbeat existed, so the lease expired mid-flight.
+    /// 3. The expiry sweep saw `ExpiredLease + Running + ReadyToResume`
+    ///    and the recovery matrix carved this case out of the budget
+    ///    check — it always returned `Requeue`. `release_lease` did not
+    ///    bump `attempt` for `ReadyToResume`.
+    /// 4. The next worker re-acquired the row, ran the same resume,
+    ///    hit the same lease expiry, requeued again. Forever. The user
+    ///    saw the "resume root task from durable child results" warning
+    ///    fire every ~30 seconds with no termination.
+    ///
+    /// Fix shape:
+    /// - `release_lease` bumps `attempt` (capped at `max_attempts`)
+    ///   when the row is in `TaskState::ReadyToResume`, so the budget
+    ///   counter actually moves on each crashed resume cycle.
+    /// - `classify_recovery` no longer carves `ReadyToResume` out of
+    ///   the `ExpiredLease` budget check, so the row fails closed once
+    ///   `is_budget_exhausted()` returns true.
+    ///
+    /// This test simulates the cycle with `max_attempts = 3`:
+    /// - The original `Running` consumes one slot.
+    /// - Crashed resume #1 → `release_lease` bumps to 2 → requeue.
+    /// - Crashed resume #2 → bump to 3 → requeue.
+    /// - Crashed resume #3 → matrix sees budget exhausted → fail
+    ///   closed with `LeaseExpiredBudgetExhausted`.
+    ///
+    /// Without the fix the row would still be `Running` (or oscillating
+    /// between `Running` and `Pending`) at the end of the test instead
+    /// of `Failed`.
     #[tokio::test(flavor = "multi_thread")]
     async fn ready_to_resume_with_repeated_lease_expiries_fails_closed() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
