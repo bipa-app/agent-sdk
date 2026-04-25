@@ -58,7 +58,9 @@ use agent_sdk_core::ToolTier;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
-use agent_server::journal::task::{AgentTask, LeaseId, SubmittedInputItem, TaskKind, WorkerId};
+use agent_server::journal::task::{
+    AgentTask, LeaseId, SubmittedInputItem, TaskKind, TaskStatus, WorkerId,
+};
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
     AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
@@ -375,6 +377,7 @@ impl ServiceHost {
                 stores: self.stores.clone(),
                 runtime: Arc::clone(&self.runtime),
                 lease_duration: self.config.worker.lease_duration(),
+                heartbeat_interval: self.config.worker.heartbeat_interval(),
                 poll_interval: self.config.worker.acquisition_interval(),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
@@ -715,6 +718,7 @@ struct WorkerLoopParams {
     stores: StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     lease_duration: time::Duration,
+    heartbeat_interval: std::time::Duration,
     poll_interval: std::time::Duration,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
@@ -741,6 +745,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         stores,
         runtime,
         lease_duration,
+        heartbeat_interval,
         poll_interval,
         wakeup_signal,
         cancel,
@@ -788,16 +793,16 @@ async fn worker_loop(params: WorkerLoopParams) {
                     kind = ?task.kind,
                     "acquired task",
                 );
-                if let Err(err) = Box::pin(execute_acquired_task(
+                run_task_with_heartbeat(
                     task,
+                    &worker_id,
                     &stores,
                     Arc::clone(&runtime),
                     &cancel,
-                ))
-                .await
-                {
-                    warn!(%worker_id, error = %err, "task execution failed");
-                }
+                    lease_duration,
+                    heartbeat_interval,
+                )
+                .await;
             }
             Ok(None) => {
                 // No runnable tasks — idle wait for the next tick
@@ -807,6 +812,133 @@ async fn worker_loop(params: WorkerLoopParams) {
             }
             Err(e) => {
                 warn!(%worker_id, error = %e, "task acquisition failed");
+            }
+        }
+    }
+}
+
+/// Run a task to completion while extending its lease in the
+/// background.
+///
+/// The lease the worker acquired is bounded by
+/// [`super::config::WorkerConfig::lease_duration`] (default 30s). LLM
+/// calls and tool executions routinely run longer than that, and
+/// without a heartbeat the lease-expiry sweep would requeue a
+/// still-live task to `Pending`. A second worker would then re-acquire
+/// it while the first is mid-flight, producing a stampede that is the
+/// usual precondition for the "resume root task from durable child
+/// results" fail-loop in production.
+///
+/// We spawn a heartbeat ticker that calls
+/// [`AgentTaskStore::heartbeat_task`] at `heartbeat_interval` and
+/// extends `lease_expires_at` by `lease_duration`. The ticker stops as
+/// soon as the task execution future returns, or the cancellation
+/// token fires, so a slow shutdown still drains cleanly. A heartbeat
+/// failure is logged and the ticker exits — the task store's CAS will
+/// surface the lease loss to the execution path on its next call.
+async fn run_task_with_heartbeat(
+    task: AgentTask,
+    worker_id: &WorkerId,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    cancel: &CancellationToken,
+    lease_duration: time::Duration,
+    heartbeat_interval: std::time::Duration,
+) {
+    let task_id = task.id.clone();
+    let thread_id = task.thread_id.clone();
+    let Some(lease_id) = task.lease_id.clone() else {
+        warn!(
+            %worker_id,
+            task_id = %task_id,
+            "acquired task missing lease id; skipping heartbeat",
+        );
+        if let Err(err) = Box::pin(execute_acquired_task(task, stores, runtime, cancel)).await {
+            warn!(%worker_id, error = %err, "task execution failed");
+        }
+        return;
+    };
+
+    let heartbeat_cancel = CancellationToken::new();
+    let heartbeat_handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
+        stores: stores.clone(),
+        task_id: task_id.clone(),
+        thread_id: thread_id.clone(),
+        worker_id: worker_id.clone(),
+        lease_id,
+        lease_duration,
+        heartbeat_interval,
+        cancel: heartbeat_cancel.clone(),
+    }));
+
+    let exec_result = Box::pin(execute_acquired_task(task, stores, runtime, cancel)).await;
+
+    heartbeat_cancel.cancel();
+    if let Err(join_err) = heartbeat_handle.await {
+        warn!(
+            %worker_id,
+            task_id = %task_id,
+            error = %join_err,
+            "heartbeat loop join failed",
+        );
+    }
+
+    if let Err(err) = exec_result {
+        warn!(%worker_id, error = %err, "task execution failed");
+    }
+}
+
+struct HeartbeatLoopParams {
+    stores: StoreRegistry,
+    task_id: agent_server::journal::task::AgentTaskId,
+    thread_id: agent_sdk_core::ThreadId,
+    worker_id: WorkerId,
+    lease_id: LeaseId,
+    lease_duration: time::Duration,
+    heartbeat_interval: std::time::Duration,
+    cancel: CancellationToken,
+}
+
+async fn heartbeat_loop(params: HeartbeatLoopParams) {
+    let HeartbeatLoopParams {
+        stores,
+        task_id,
+        thread_id,
+        worker_id,
+        lease_id,
+        lease_duration,
+        heartbeat_interval,
+        cancel,
+    } = params;
+    let mut ticker = tokio::time::interval(heartbeat_interval);
+    // Skip the immediate first tick — the lease was just set by
+    // acquire_next_runnable, so the first heartbeat should fire after
+    // one full interval.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        let new_expires_at = now + lease_duration;
+        match stores
+            .task_store
+            .heartbeat_task(&task_id, &worker_id, &lease_id, new_expires_at, now)
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    %worker_id,
+                    task_id = %task_id,
+                    thread_id = %thread_id,
+                    error = %err,
+                    "heartbeat failed; lease may have been requeued or stolen",
+                );
+                return;
             }
         }
     }
@@ -1037,6 +1169,36 @@ async fn fail_root_task(
     now: time::OffsetDateTime,
 ) -> Result<()> {
     let (worker_id, lease_id) = running_lease(task)?;
+
+    // Re-read the row before transitioning. If the lease has moved on
+    // — sweep requeued the row, another worker re-acquired, or the
+    // sweep already failed it closed — `fail_task` will reject the CAS
+    // and propagate as `mark root task failed`. That cascading error
+    // produces the noisy "task execution failed" loop seen in
+    // production. Skip the transition cleanly when we no longer own
+    // the row; whichever path took it over is responsible for the
+    // task's terminal state.
+    let current = stores
+        .task_store
+        .get(&task.id)
+        .await
+        .context("re-read task before fail")?;
+    let still_owned = current.as_ref().is_some_and(|t| {
+        t.status == TaskStatus::Running
+            && t.worker_id.as_ref() == Some(&worker_id)
+            && t.lease_id.as_ref() == Some(&lease_id)
+    });
+    if !still_owned {
+        let observed_status = current.as_ref().map(|t| t.status);
+        warn!(
+            task_id = %task.id,
+            thread_id = %task.thread_id,
+            ?observed_status,
+            "skip fail_root_task: lease no longer owned by this worker (sweep or re-acquire took over)",
+        );
+        return Ok(());
+    }
+
     fail_root_turn(
         &task.id,
         &worker_id,
@@ -1487,6 +1649,119 @@ mod tests {
         // Cancel immediately — all 8 workers must drain cleanly.
         token.cancel();
         host.run().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loop_extends_lease_until_cancelled() -> Result<()> {
+        use agent_sdk_core::ThreadId;
+        use agent_server::journal::task::AgentTask;
+
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        // Submit and acquire a root turn so we have a Running row to
+        // heartbeat against. The lease is set short on purpose — we
+        // want the heartbeat to push the expiry forward each tick.
+        let thread = ThreadId::from_string("t-heartbeat-extend");
+        let task = AgentTask::new_root_turn(thread.clone(), time::OffsetDateTime::now_utc(), 3);
+        let task_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        let now = time::OffsetDateTime::now_utc();
+        let worker = WorkerId::from_string("w-heartbeat");
+        let lease = LeaseId::new();
+        let initial_expiry = now + time::Duration::seconds(5);
+        stores
+            .task_store
+            .try_acquire_task(&task_id, worker.clone(), lease.clone(), initial_expiry, now)
+            .await?;
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
+            stores: stores.clone(),
+            task_id: task_id.clone(),
+            thread_id: thread,
+            worker_id: worker,
+            lease_id: lease,
+            lease_duration: time::Duration::seconds(30),
+            heartbeat_interval: std::time::Duration::from_secs(1),
+            cancel: cancel.clone(),
+        }));
+
+        // Auto-advance the synthetic clock past two heartbeat ticks.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let observed = stores
+            .task_store
+            .get(&task_id)
+            .await?
+            .context("task exists")?;
+        let observed_expiry = observed.lease_expires_at.context("task is leased")?;
+        assert!(
+            observed_expiry > initial_expiry,
+            "heartbeat should have pushed lease_expires_at forward (initial={initial_expiry}, observed={observed_expiry})",
+        );
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loop_exits_when_lease_is_lost() -> Result<()> {
+        use agent_sdk_core::ThreadId;
+        use agent_server::journal::task::AgentTask;
+
+        let config = ServiceConfig::default();
+        let host = ServiceHost::new(config, sample_registry(), sample_runtime()?)?;
+        let stores = host.stores().clone();
+
+        // Acquire with a real lease, then update the row to a different
+        // lease behind our back. The heartbeat CAS will reject and the
+        // loop must terminate on its own without us cancelling it.
+        let thread = ThreadId::from_string("t-heartbeat-lost");
+        let task = AgentTask::new_root_turn(thread.clone(), time::OffsetDateTime::now_utc(), 3);
+        let task_id = task.id.clone();
+        stores.task_store.submit_root_turn(task).await?;
+
+        let now = time::OffsetDateTime::now_utc();
+        let worker = WorkerId::from_string("w-orig");
+        let real_lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &task_id,
+                worker.clone(),
+                real_lease,
+                now + time::Duration::seconds(10),
+                now,
+            )
+            .await?;
+
+        // Spawn the heartbeat with a stale lease — its first CAS will fail.
+        let stale_lease = LeaseId::new();
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
+            stores: stores.clone(),
+            task_id,
+            thread_id: thread,
+            worker_id: worker,
+            lease_id: stale_lease,
+            lease_duration: time::Duration::seconds(30),
+            heartbeat_interval: std::time::Duration::from_millis(100),
+            cancel: cancel.clone(),
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The loop should have exited by itself; we never call cancel.
+        assert!(
+            handle.is_finished(),
+            "heartbeat must exit on lease mismatch"
+        );
+        handle.await?;
         Ok(())
     }
 
