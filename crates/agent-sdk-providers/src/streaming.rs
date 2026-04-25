@@ -82,9 +82,42 @@ pub enum StreamDelta {
     Error {
         /// Error message
         message: String,
-        /// Whether the error is recoverable (e.g., rate limit)
-        recoverable: bool,
+        /// Categorization of the error so downstream consumers can map
+        /// it back to the correct [`agent_sdk_core::llm::ChatOutcome`]
+        /// variant or audit-record `TurnAttemptOutcome` without losing
+        /// the rate-limit / server-error / invalid-request distinction.
+        kind: StreamErrorKind,
     },
+}
+
+/// Classification of a [`StreamDelta::Error`] event.
+///
+/// Mirrors [`ChatOutcome`](agent_sdk_core::llm::ChatOutcome)'s error
+/// variants so providers that emit errors via streaming preserve the
+/// same precision that non-streaming `chat()` callers see — every
+/// supported provider can map its underlying error (HTTP status,
+/// validation failure, mid-stream disconnect) directly onto one of
+/// these categories at the construction site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorKind {
+    /// Provider returned HTTP 429 / explicit rate-limit signal.
+    RateLimited,
+    /// Provider returned HTTP 5xx, the connection dropped mid-stream,
+    /// or the provider reported a transient runtime failure.
+    ServerError,
+    /// Caller-side error: validation failure before dispatch, HTTP
+    /// 4xx other than 429, or a non-retriable provider rejection.
+    InvalidRequest,
+}
+
+impl StreamErrorKind {
+    /// `true` when the error is potentially transient and the caller
+    /// may retry.  Rate-limit and server errors are recoverable;
+    /// invalid-request is not.
+    #[must_use]
+    pub const fn is_recoverable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::ServerError)
+    }
 }
 
 /// Type alias for a boxed stream of stream deltas.

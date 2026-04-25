@@ -203,14 +203,11 @@ where
                             return Err(StreamError::Fatal(error.message));
                         }
                     }
-                    StreamDelta::Error {
-                        message,
-                        recoverable,
-                    } => {
+                    StreamDelta::Error { message, kind } => {
                         log::warn!(
-                            "Stream error received delta_count={delta_count} message={message} recoverable={recoverable}"
+                            "Stream error received delta_count={delta_count} message={message} kind={kind:?}"
                         );
-                        return if *recoverable {
+                        return if kind.is_recoverable() {
                             Err(StreamError::Recoverable(message.clone()))
                         } else {
                             Err(StreamError::Fatal(message.clone()))

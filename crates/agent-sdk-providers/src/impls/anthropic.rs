@@ -8,7 +8,7 @@ pub(crate) mod data;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
@@ -484,7 +484,7 @@ impl LlmProvider for AnthropicProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -508,7 +508,7 @@ impl LlmProvider for AnthropicProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -573,7 +573,7 @@ impl LlmProvider for AnthropicProvider {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 yield Ok(StreamDelta::Error {
                     message: "Rate limited".to_string(),
-                    recoverable: true,
+                    kind: StreamErrorKind::RateLimited,
                 });
                 return;
             }
@@ -583,7 +583,7 @@ impl LlmProvider for AnthropicProvider {
                 log::error!("Anthropic server error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable: true,
+                    kind: StreamErrorKind::ServerError,
                 });
                 return;
             }
@@ -593,7 +593,7 @@ impl LlmProvider for AnthropicProvider {
                 log::warn!("Anthropic client error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -737,14 +737,14 @@ impl LlmProvider for AnthropicProvider {
             // Mark stream as properly completed
             drop_guard.completed = true;
 
-            // If stream ended without message_stop, emit a recoverable error
+            // If stream ended without message_stop, emit a server-error (transient) signal
             if !received_message_stop {
                 log::warn!(
                     "SSE stream ended without message_stop event - stream may have been interrupted chunk_count={chunk_count} total_bytes={total_bytes}"
                 );
                 yield Ok(StreamDelta::Error {
                     message: "Stream ended unexpectedly without completion".to_string(),
-                    recoverable: true,
+                    kind: StreamErrorKind::ServerError,
                 });
             }
         })

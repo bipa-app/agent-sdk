@@ -16,7 +16,7 @@ use crate::impls::gemini::data::{
     convert_tools_to_config, map_finish_reason, map_thinking_config, stream_gemini_response,
 };
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig, ThinkingMode, Usage,
 };
@@ -405,7 +405,7 @@ impl VertexProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -413,7 +413,7 @@ impl VertexProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -473,12 +473,17 @@ impl VertexProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                let recoverable =
-                    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    StreamErrorKind::RateLimited
+                } else if status.is_server_error() {
+                    StreamErrorKind::ServerError
+                } else {
+                    StreamErrorKind::InvalidRequest
+                };
                 log::warn!("Vertex AI error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable,
+                    kind,
                 });
                 return;
             }
@@ -611,7 +616,7 @@ impl VertexProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -619,7 +624,7 @@ impl VertexProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -687,7 +692,7 @@ impl VertexProvider {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 yield Ok(StreamDelta::Error {
                     message: "Rate limited".to_string(),
-                    recoverable: true,
+                    kind: StreamErrorKind::RateLimited,
                 });
                 return;
             }
@@ -697,7 +702,7 @@ impl VertexProvider {
                 log::error!("Vertex AI (Claude) server error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable: true,
+                    kind: StreamErrorKind::ServerError,
                 });
                 return;
             }
@@ -707,7 +712,7 @@ impl VertexProvider {
                 log::warn!("Vertex AI (Claude) client error status={status} body={body}");
                 yield Ok(StreamDelta::Error {
                     message: body,
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -788,7 +793,7 @@ impl VertexProvider {
                 );
                 yield Ok(StreamDelta::Error {
                     message: "Stream ended unexpectedly without completion".to_string(),
-                    recoverable: true,
+                    kind: StreamErrorKind::ServerError,
                 });
             }
         })

@@ -42,7 +42,7 @@ use agent_sdk_core::{
     ToolResult, ToolTier,
 };
 use agent_sdk_providers::LlmProvider;
-use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta};
+use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
@@ -766,17 +766,18 @@ async fn call_llm(
                 )
                 .await;
             }
-            StreamDelta::Error {
-                message,
-                recoverable,
-            } => {
-                let outcome = if *recoverable {
-                    TurnAttemptOutcome::RateLimited
-                } else {
-                    TurnAttemptOutcome::ServerError
+            StreamDelta::Error { message, kind } => {
+                // Map the kind directly onto the audit outcome so a
+                // genuine 5xx is recorded as `ServerError` (not
+                // `RateLimited`) and a validation rejection is
+                // recorded as `InvalidRequest` (not `ServerError`).
+                let outcome = match kind {
+                    StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
+                    StreamErrorKind::ServerError => TurnAttemptOutcome::ServerError,
+                    StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
                 };
                 close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
-                bail!("LLM stream error (recoverable={recoverable}): {message}");
+                bail!("LLM stream error (kind={kind:?}): {message}");
             }
             // Done / Usage / ToolUseStart / ToolInputDelta /
             // SignatureDelta / RedactedThinking are handled by the
@@ -972,19 +973,34 @@ fn build_full_assistant_message(response: &llm::ChatResponse) -> llm::Message {
     }
 }
 
+/// Sanitize a [`llm::ChatResponse`]'s `id` field for durable storage.
+///
+/// The streaming path leaves `response.id` empty because the
+/// provider's response id is not yet plumbed through the
+/// [`StreamDelta`] protocol.  Persisting `Some("")` would violate the
+/// documented contract on
+/// [`AgentContinuation::response_id`](agent_sdk_core::AgentContinuation::response_id)
+/// — `None` is the sentinel for "provider did not return an id" — so
+/// every caller that wants to durably record the response id must
+/// route through this helper.
+fn sanitized_response_id(response: &llm::ChatResponse) -> Option<String> {
+    Some(response.id.clone()).filter(|s| !s.is_empty())
+}
+
 fn build_close_params(response: &llm::ChatResponse, _attempt: &TurnAttempt) -> CloseAttemptParams {
-    // The streaming path leaves `response.id` empty because the
-    // provider's response id is not yet plumbed through the
-    // [`StreamDelta`] protocol.  Map the empty string to `None` so the
-    // audit record honestly reflects "no provider id available"
-    // instead of storing a meaningless empty value.
-    let response_id = Some(response.id.clone()).filter(|s| !s.is_empty());
+    let response_id = sanitized_response_id(response);
+
+    // The audit blob mirrors the typed `response_id` column so the two
+    // never disagree.  When the provider didn't return an id, the
+    // blob simply omits the `id` field rather than recording an empty
+    // string that contradicts `response_id IS NULL`.
+    let response_blob = response_id.as_ref().map_or_else(
+        || serde_json::json!({ "model": response.model }),
+        |id| serde_json::json!({ "id": id, "model": response.model }),
+    );
 
     CloseAttemptParams {
-        response_blob: serde_json::json!({
-            "id": response.id,
-            "model": response.model,
-        }),
+        response_blob,
         response_id,
         response_model: Some(response.model.clone()),
         stop_reason: response.stop_reason,
@@ -1313,7 +1329,7 @@ async fn build_continuation(
         awaiting_index: 0,
         completed_results: Vec::new(),
         state: updated_state,
-        response_id: Some(response.id.clone()),
+        response_id: sanitized_response_id(response),
         stop_reason: response.stop_reason,
         response_content: response.content.clone(),
     };
@@ -1968,7 +1984,7 @@ fn build_resume_continuation(
         awaiting_index: 0,
         completed_results: Vec::new(),
         state: updated_state,
-        response_id: Some(response.id.clone()),
+        response_id: sanitized_response_id(response),
         stop_reason: response.stop_reason,
         response_content: response.content.clone(),
     };

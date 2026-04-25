@@ -6,7 +6,7 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
@@ -411,7 +411,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -419,7 +419,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
-                    recoverable: false,
+                    kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
@@ -499,7 +499,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         message: format!(
                                             "failed to encode websocket warmup request: {error}"
                                         ),
-                                        recoverable: false,
+                                        kind: StreamErrorKind::InvalidRequest,
                                     });
                                     return;
                                 }
@@ -740,7 +740,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     message: format!(
                                         "failed to encode websocket request: {error}"
                                     ),
-                                    recoverable: false,
+                                    kind: StreamErrorKind::InvalidRequest,
                                 });
                                 return;
                             }
@@ -784,7 +784,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     yield Ok(StreamDelta::Error {
                                         message: "websocket closed before response.completed"
                                             .to_string(),
-                                        recoverable: true,
+                                        kind: StreamErrorKind::ServerError,
                                     });
                                     return;
                                 }
@@ -802,7 +802,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         reset_websocket_connection(&mut websocket_session);
                                         yield Ok(StreamDelta::Error {
                                             message: format!("websocket error: {error}"),
-                                            recoverable: true,
+                                            kind: StreamErrorKind::ServerError,
                                         });
                                         return;
                                     }
@@ -819,14 +819,18 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     if let Some((status, message)) =
                                         parse_wrapped_websocket_error_event(&text)
                                     {
-                                        let recoverable =
-                                            status == StatusCode::TOO_MANY_REQUESTS
-                                                || status.is_server_error();
+                                        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                                            StreamErrorKind::RateLimited
+                                        } else if status.is_server_error() {
+                                            StreamErrorKind::ServerError
+                                        } else {
+                                            StreamErrorKind::InvalidRequest
+                                        };
                                         if emitted_output {
                                             reset_websocket_connection(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message,
-                                                recoverable,
+                                                kind,
                                             });
                                             return;
                                         }
@@ -920,7 +924,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     });
                                                 yield Ok(StreamDelta::Error {
                                                     message,
-                                                    recoverable: false,
+                                                    kind: StreamErrorKind::ServerError,
                                                 });
                                                 return;
                                             }
@@ -933,14 +937,18 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         if let Some((status, message)) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
-                                            let recoverable =
-                                                status == StatusCode::TOO_MANY_REQUESTS
-                                                    || status.is_server_error();
+                                            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                                                StreamErrorKind::RateLimited
+                                            } else if status.is_server_error() {
+                                                StreamErrorKind::ServerError
+                                            } else {
+                                                StreamErrorKind::InvalidRequest
+                                            };
                                             if emitted_output {
                                                 reset_websocket_connection(&mut websocket_session);
                                                 yield Ok(StreamDelta::Error {
                                                     message,
-                                                    recoverable,
+                                                    kind,
                                                 });
                                                 return;
                                             }
@@ -1047,7 +1055,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         });
                                                     yield Ok(StreamDelta::Error {
                                                         message,
-                                                        recoverable: false,
+                                                        kind: StreamErrorKind::ServerError,
                                                     });
                                                     return;
                                                 }
@@ -1066,7 +1074,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             reset_websocket_connection(&mut websocket_session);
                                             yield Ok(StreamDelta::Error {
                                                 message: format!("websocket pong failed: {error}"),
-                                                recoverable: true,
+                                                kind: StreamErrorKind::ServerError,
                                             });
                                             return;
                                         }
@@ -1084,7 +1092,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         yield Ok(StreamDelta::Error {
                                             message: "websocket closed before response.completed"
                                                 .to_string(),
-                                            recoverable: true,
+                                            kind: StreamErrorKind::ServerError,
                                         });
                                         return;
                                     }
@@ -1111,7 +1119,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
-                        recoverable: false,
+                        kind: StreamErrorKind::InvalidRequest,
                     });
                     return;
                 }
@@ -1131,9 +1139,15 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                let recoverable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    StreamErrorKind::RateLimited
+                } else if status.is_server_error() {
+                    StreamErrorKind::ServerError
+                } else {
+                    StreamErrorKind::InvalidRequest
+                };
                 log::warn!("OpenAI Codex error status={status} body={body}");
-                yield Ok(StreamDelta::Error { message: body, recoverable });
+                yield Ok(StreamDelta::Error { message: body, kind });
                 return;
             }
 
@@ -1225,7 +1239,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     .unwrap_or_else(|| "Codex response failed".to_string());
                                 yield Ok(StreamDelta::Error {
                                     message,
-                                    recoverable: false,
+                                    kind: StreamErrorKind::ServerError,
                                 });
                                 return;
                             }
