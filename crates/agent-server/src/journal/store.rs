@@ -7133,6 +7133,288 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: a `ReadyToResume` row whose worker keeps losing its
+    /// lease must reach a terminal state in a bounded number of cycles.
+    ///
+    /// Bug shape (pre-fix):
+    /// 1. A root turn ran, suspended on tool children, and resumed back
+    ///    to `Pending + ReadyToResume` after the children finished.
+    /// 2. The resume worker's LLM call ran longer than the lease
+    ///    (`lease_duration_secs = 30` by default in the host); no
+    ///    heartbeat existed, so the lease expired mid-flight.
+    /// 3. The expiry sweep saw `ExpiredLease + Running + ReadyToResume`
+    ///    and the recovery matrix carved this case out of the budget
+    ///    check — it always returned `Requeue`. `release_lease` did not
+    ///    bump `attempt` for `ReadyToResume`.
+    /// 4. The next worker re-acquired the row, ran the same resume,
+    ///    hit the same lease expiry, requeued again. Forever. The user
+    ///    saw the "resume root task from durable child results" warning
+    ///    fire every ~30 seconds with no termination.
+    ///
+    /// Fix shape:
+    /// - `release_lease` bumps `attempt` (capped at `max_attempts`)
+    ///   when the row is in `TaskState::ReadyToResume`, so the budget
+    ///   counter actually moves on each crashed resume cycle.
+    /// - `classify_recovery` no longer carves `ReadyToResume` out of
+    ///   the `ExpiredLease` budget check, so the row fails closed once
+    ///   `is_budget_exhausted()` returns true.
+    ///
+    /// This test simulates the cycle with `max_attempts = 3`:
+    /// - The original `Running` consumes one slot.
+    /// - Crashed resume #1 → `release_lease` bumps to 2 → requeue.
+    /// - Crashed resume #2 → bump to 3 → requeue.
+    /// - Crashed resume #3 → matrix sees budget exhausted → fail
+    ///   closed with `LeaseExpiredBudgetExhausted`.
+    ///
+    /// Without the fix the row would still be `Running` (or oscillating
+    /// between `Running` and `Pending`) at the end of the test instead
+    /// of `Failed`.
+    /// Drive a fresh root through child-spawn → resume so the row
+    /// reaches `Pending + ReadyToResume + attempt=1`. Returned along
+    /// with the parent id for the regression test below to drive the
+    /// crashed-resume cycle against.
+    async fn submit_resumable_root(
+        store: &InMemoryAgentTaskStore,
+        thread_name: &str,
+        budget: u32,
+    ) -> Result<AgentTaskId> {
+        let root = AgentTask::new_root_turn(thread(thread_name), t_plus(0), budget);
+        let parent_id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-parent");
+        let lease = LeaseId::from_string("l-parent");
+        store
+            .try_acquire_task(
+                &parent_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await
+            .context("acquire parent")?
+            .context("parent claimed")?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &parent_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2)],
+                SuspensionPayload {
+                    continuation: sample_continuation(thread_name),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .context("spawn child")?;
+        let child = &children[0];
+        store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::from_string("w-child"),
+                LeaseId::from_string("l-child"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await
+            .context("acquire child")?
+            .context("child claimed")?;
+        store
+            .complete_task(
+                &child.id,
+                &WorkerId::from_string("w-child"),
+                &LeaseId::from_string("l-child"),
+                t_plus(4),
+            )
+            .await
+            .context("complete child")?;
+        Ok(parent_id)
+    }
+
+    /// Acquire a `ReadyToResume` row, then drive the lease past `now`
+    /// and let the sweep classify it. Returns the recovery action so
+    /// the caller can assert on `Requeue` vs `FailClosed`.
+    async fn crash_resume_cycle(
+        store: &InMemoryAgentTaskStore,
+        parent_id: &AgentTaskId,
+        cycle_label: &str,
+        acquired_at: i64,
+        sweep_at: i64,
+    ) -> Result<crate::journal::recovery::RecoveryAction> {
+        store
+            .try_acquire_task(
+                parent_id,
+                WorkerId::from_string(format!("w-{cycle_label}")),
+                LeaseId::from_string(format!("l-{cycle_label}")),
+                t_plus(acquired_at + 1),
+                t_plus(acquired_at),
+            )
+            .await
+            .context("acquire resume")?
+            .context("resume claimed")?;
+        let swept = store
+            .release_expired_leases(t_plus(sweep_at))
+            .await
+            .context("sweep")?;
+        assert_eq!(swept.len(), 1, "exactly one row should sweep per cycle");
+        Ok(swept[0].action)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_to_resume_with_repeated_lease_expiries_fails_closed() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let parent_id = submit_resumable_root(&store, "t-resume-loop", 3).await?;
+
+        // Sanity check the starting state: Pending+ReadyToResume on
+        // attempt 1, with two slots left in the budget.
+        let resumable = store.get(&parent_id).await?.context("parent exists")?;
+        assert_eq!(resumable.status, TaskStatus::Pending);
+        assert!(matches!(resumable.state, TaskState::ReadyToResume { .. }));
+        assert_eq!(resumable.attempt, 1);
+        assert_eq!(resumable.max_attempts, 3);
+
+        // Cycle 1: resume worker crashes, sweep requeues, attempt → 2.
+        let action = crash_resume_cycle(&store, &parent_id, "r1", 5, 15).await?;
+        assert!(
+            action.is_requeue(),
+            "cycle 1 should requeue, got {action:?}"
+        );
+        let after = store.get(&parent_id).await?.context("exists")?;
+        assert_eq!(after.attempt, 2, "release_lease must bump to 2");
+
+        // Cycle 2: same shape, attempt → 3 (budget now exhausted).
+        let action = crash_resume_cycle(&store, &parent_id, "r2", 16, 25).await?;
+        assert!(
+            action.is_requeue(),
+            "cycle 2 should requeue, got {action:?}"
+        );
+        let after = store.get(&parent_id).await?.context("exists")?;
+        assert_eq!(after.attempt, 3);
+        assert!(after.is_budget_exhausted());
+
+        // Cycle 3: budget already exhausted → matrix fails closed
+        // instead of requeuing forever (the bug we're fixing).
+        let action = crash_resume_cycle(&store, &parent_id, "r3", 26, 35).await?;
+        assert!(
+            action.is_fail_closed(),
+            "cycle 3 must fail closed (budget exhausted), got {action:?}",
+        );
+
+        let final_row = store.get(&parent_id).await?.context("exists")?;
+        assert_eq!(final_row.status, TaskStatus::Failed);
+        let last_error = final_row.last_error.as_deref().unwrap_or_default();
+        assert!(
+            last_error.starts_with("lease_expired_budget_exhausted"),
+            "expected budget-exhaustion error, got: {last_error}",
+        );
+        Ok(())
+    }
+
+    /// Companion to `ready_to_resume_with_repeated_lease_expiries_fails_closed`.
+    /// Pins down the pre-fix behavior so a future regression that
+    /// re-introduces either side of the bug shows up in CI.
+    ///
+    /// Two assertions describe the fix:
+    ///
+    /// 1. `release_lease` must bump `attempt` on a `ReadyToResume` row.
+    ///    Without that bump the recovery matrix's budget check would
+    ///    never fire, no matter how many times the row crashed.
+    /// 2. `classify_recovery(ExpiredLease, Running, ReadyToResume)`
+    ///    with an exhausted budget must return `FailClosed` rather
+    ///    than the old "always Requeue" carve-out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_to_resume_recovery_matrix_no_longer_carves_out_budget() -> Result<()> {
+        use crate::journal::recovery::{
+            FailureReason, RecoveryAction, RecoveryContext, classify_recovery,
+        };
+
+        // Set up a single-attempt root that has consumed its slot on
+        // the original Running and is now in `Pending+ReadyToResume`.
+        let store = InMemoryAgentTaskStore::new();
+        let root = AgentTask::new_root_turn(thread("t-resume-budget"), t_plus(0), 1);
+        let id = root.id.clone();
+        store.submit_root_turn(root).await.context("submit")?;
+        let worker = WorkerId::from_string("w-budget");
+        let lease = LeaseId::from_string("l-budget");
+        store
+            .try_acquire_task(&id, worker.clone(), lease.clone(), t_plus(60), t_plus(1))
+            .await
+            .context("acquire")?
+            .context("claimed")?;
+        let (_, children) = store
+            .spawn_tool_children(
+                &id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2)],
+                SuspensionPayload {
+                    continuation: sample_continuation("t-resume-budget"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .context("spawn")?;
+        let child = &children[0];
+        store
+            .try_acquire_task(
+                &child.id,
+                WorkerId::from_string("w-c"),
+                LeaseId::from_string("l-c"),
+                t_plus(60),
+                t_plus(3),
+            )
+            .await
+            .context("acquire child")?
+            .context("claimed")?;
+        store
+            .complete_task(
+                &child.id,
+                &WorkerId::from_string("w-c"),
+                &LeaseId::from_string("l-c"),
+                t_plus(4),
+            )
+            .await
+            .context("complete")?;
+
+        let resumable = store.get(&id).await?.context("exists")?;
+        assert_eq!(resumable.attempt, 1);
+        assert_eq!(resumable.max_attempts, 1);
+        assert!(resumable.is_budget_exhausted());
+        assert!(matches!(resumable.state, TaskState::ReadyToResume { .. }));
+
+        // Re-acquire so we have a `Running+ReadyToResume` row to
+        // classify under the `ExpiredLease` context, just like the
+        // sweep would.
+        let running = store
+            .try_acquire_task(
+                &id,
+                WorkerId::from_string("w-resume"),
+                LeaseId::from_string("l-resume"),
+                t_plus(120),
+                t_plus(5),
+            )
+            .await
+            .context("re-acquire")?
+            .context("claimed")?;
+        assert_eq!(running.status, TaskStatus::Running);
+        assert!(matches!(running.state, TaskState::ReadyToResume { .. }));
+        assert!(running.is_budget_exhausted());
+
+        // Pre-fix: this returned `RecoveryAction::Requeue` regardless
+        // of the budget. That carve-out is exactly what produced the
+        // "resume root task from durable child results" infinite loop
+        // in production.
+        assert_eq!(
+            classify_recovery(&running, RecoveryContext::ExpiredLease),
+            RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted),
+            "ReadyToResume + budget exhausted must fail closed under ExpiredLease",
+        );
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn complete_task_stays_waiting_until_last() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();

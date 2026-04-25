@@ -1157,6 +1157,16 @@ impl AgentTask {
     /// heartbeat. Note that this does NOT decrement `attempt` — the failed
     /// attempt still counts against the retry budget.
     ///
+    /// When the task is in [`TaskState::ReadyToResume`], `attempt` is
+    /// incremented (capped at `max_attempts`) to bound retries on the
+    /// resume path. Without this bump, a poisoned resume that keeps
+    /// crashing would loop forever because `mark_running` deliberately
+    /// does not consume budget on `ReadyToResume`. The cap matters for
+    /// the legitimate first resume: if the original attempt already
+    /// burned the only budget slot, the recovery matrix sees the
+    /// already-exhausted row and fails it closed instead of reaching
+    /// `mark_running`.
+    ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
     /// [`TaskStatus::Running`].
@@ -1166,6 +1176,9 @@ impl AgentTask {
                 from: self.status,
                 to: TaskStatus::Pending,
             });
+        }
+        if matches!(self.state, TaskState::ReadyToResume { .. }) {
+            self.attempt = self.attempt.saturating_add(1).min(self.max_attempts);
         }
         self.status = TaskStatus::Pending;
         self.worker_id = None;

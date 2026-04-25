@@ -46,7 +46,6 @@
 //! | Acquisition      | `Pending`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget ok                              | ok        | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Acquisition      | `Pending`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `RetryBudgetExhausted`    |
-//! | `ExpiredLease`   | `Running`, `ReadyToResume`                        | any       | n/a         | [`RecoveryAction::Requeue`]                              |
 //! | `ExpiredLease`   | `Running`, budget ok                              | ok        | n/a         | [`RecoveryAction::Requeue`]                              |
 //! | `ExpiredLease`   | `Running`, budget exhausted                       | exhausted | n/a         | [`RecoveryAction::FailClosed`] `LeaseExpiredBudgetExhausted` |
 //! | Any              | `tool_runtime` `AwaitingConfirmation` w/ prep op  | any       | Some        | [`RecoveryAction::FailClosed`] `UnsafePreparedOperationRecovery` |
@@ -54,6 +53,13 @@
 //! | Any              | `WaitingOnChildren`                               | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Any              | `Queued`                                          | any       | n/a         | [`RecoveryAction::NoAction`]                             |
 //! | Any              | `Completed` / `Failed` / `Cancelled`              | any       | n/a         | [`RecoveryAction::NoAction`]                             |
+//!
+//! `ReadyToResume` rows pick up the budget check on the expiry path
+//! because [`super::task::AgentTask::release_lease`] bumps `attempt`
+//! when the row's state is `ReadyToResume`. The first legitimate
+//! resume — driven by `recompute_pending_children` rather than the
+//! sweep — does not pass through `release_lease`, so it is not
+//! penalised by this bump.
 //!
 //! The table is locked by the
 //! `classify_recovery_matrix_is_exhaustive` test in this module so
@@ -310,13 +316,15 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // from `Running` transitions. Anything else is a bookkeeping bug
         // and the store surfaces it as an error, not a recovery decision.
         //
-        // A `ReadyToResume` task whose worker crashed is still a valid
-        // continuation — requeue it so another worker can resume the
-        // turn regardless of the attempt counter.
+        // `ReadyToResume` rows are subject to the same budget check as
+        // any other Running row. `release_lease` bumps `attempt` when
+        // the row carries a `ReadyToResume` state, so a poisoned resume
+        // (LLM error, idempotency violation, or a worker crash that
+        // does not break the row's invariants) eventually exhausts the
+        // budget and gets a deterministic fail-closed transition
+        // instead of bouncing through requeue → re-acquire forever.
         (RecoveryContext::ExpiredLease, TaskStatus::Running) => {
-            if matches!(task.state, TaskState::ReadyToResume { .. }) {
-                RecoveryAction::Requeue
-            } else if task.is_budget_exhausted() {
+            if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted)
             } else {
                 RecoveryAction::Requeue
@@ -720,7 +728,7 @@ mod tests {
         Ok(())
     }
 
-    // ── Regression: ReadyToResume bypasses budget exhaustion ──────
+    // ── ReadyToResume retry budget ────────────────────────────────
 
     /// Drive a fresh root through child-spawn → resume with the given
     /// budget so the row reaches `Pending + ReadyToResume + attempt=1`.
@@ -747,28 +755,53 @@ mod tests {
     }
 
     #[test]
-    fn ready_to_resume_with_exhausted_budget_classifies_as_no_action() -> Result<()> {
-        // A ReadyToResume task with max_attempts=1 has attempt==1 after
-        // its initial run. The recovery matrix must treat it as a
-        // continuation (NoAction), not a retry with exhausted budget.
-        let task = ready_to_resume_root(1)?;
+    fn ready_to_resume_first_resume_passes_acquisition_with_budget_left() -> Result<()> {
+        // The legitimate first resume reaches Pending+ReadyToResume via
+        // `recompute_pending_children`, which does not bump `attempt`.
+        // With max_attempts >= 2 there is still budget for the resume,
+        // so acquisition must proceed.
+        let task = ready_to_resume_root(3)?;
         assert_eq!(task.attempt, 1);
-        assert_eq!(task.max_attempts, 1);
-        assert!(task.is_budget_exhausted());
+        assert_eq!(task.max_attempts, 3);
+        assert!(!task.is_budget_exhausted());
         assert!(matches!(task.state, TaskState::ReadyToResume { .. }));
 
         assert_eq!(
             classify_recovery(&task, RecoveryContext::AcquisitionAttempt),
             RecoveryAction::NoAction,
-            "ReadyToResume must bypass budget exhaustion at acquisition"
+            "first resume must be acquired when budget remains"
         );
         Ok(())
     }
 
     #[test]
-    fn ready_to_resume_running_with_exhausted_budget_requeues_on_expired_lease() -> Result<()> {
-        // A ReadyToResume task that has been re-acquired and then its
-        // worker crashes must be requeued, not failed closed.
+    fn ready_to_resume_running_with_budget_left_requeues_on_expired_lease() -> Result<()> {
+        // A ReadyToResume task whose worker crashes mid-resume should be
+        // requeued so another worker can finish the resume.
+        let pending = ready_to_resume_root(3)?;
+        let running = pending.mark_running(
+            WorkerId::from_string("w-crash"),
+            LeaseId::from_string("l-crash"),
+            t_plus(120),
+            t_plus(4),
+        )?;
+        assert_eq!(running.attempt, 1);
+        assert!(!running.is_budget_exhausted());
+        assert!(matches!(running.state, TaskState::ReadyToResume { .. }));
+
+        assert_eq!(
+            classify_recovery(&running, RecoveryContext::ExpiredLease),
+            RecoveryAction::Requeue,
+            "ReadyToResume requeues while budget remains"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_to_resume_running_with_exhausted_budget_fails_closed_on_expired_lease() -> Result<()> {
+        // After enough crashed resumes, `release_lease` has bumped
+        // `attempt` up to `max_attempts`. The next expiry must fail the
+        // row closed instead of requeuing it forever.
         let pending = ready_to_resume_root(1)?;
         let running = pending.mark_running(
             WorkerId::from_string("w-crash"),
@@ -782,8 +815,54 @@ mod tests {
 
         assert_eq!(
             classify_recovery(&running, RecoveryContext::ExpiredLease),
-            RecoveryAction::Requeue,
-            "ReadyToResume must requeue even when budget is exhausted"
+            RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted),
+            "ReadyToResume must fail closed once the budget is exhausted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_lease_on_ready_to_resume_bumps_attempt() -> Result<()> {
+        // The retry-bound machinery: each `release_lease` for a
+        // `ReadyToResume` row consumes one slot of the retry budget
+        // (capped at `max_attempts`). Without this bump the row's
+        // `attempt` would never grow and the matrix's budget check
+        // would never fire on the resume path.
+        let pending = ready_to_resume_root(3)?;
+        assert_eq!(pending.attempt, 1);
+
+        let running = pending.mark_running(
+            WorkerId::from_string("w-1"),
+            LeaseId::from_string("l-1"),
+            t_plus(120),
+            t_plus(4),
+        )?;
+        assert_eq!(running.attempt, 1, "mark_running must not consume budget");
+
+        let released = running.release_lease(t_plus(5))?;
+        assert_eq!(released.attempt, 2, "release_lease must consume one slot");
+        assert!(matches!(released.state, TaskState::ReadyToResume { .. }));
+
+        // Cap at max_attempts: a second crash should bump to 3 and stop.
+        let rerun = released.mark_running(
+            WorkerId::from_string("w-2"),
+            LeaseId::from_string("l-2"),
+            t_plus(180),
+            t_plus(6),
+        )?;
+        let released_again = rerun.release_lease(t_plus(7))?;
+        assert_eq!(released_again.attempt, 3);
+
+        let last = released_again.mark_running(
+            WorkerId::from_string("w-3"),
+            LeaseId::from_string("l-3"),
+            t_plus(240),
+            t_plus(8),
+        )?;
+        let released_capped = last.release_lease(t_plus(9))?;
+        assert_eq!(
+            released_capped.attempt, 3,
+            "attempt is capped at max_attempts to keep the row valid"
         );
         Ok(())
     }
