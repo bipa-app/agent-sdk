@@ -791,11 +791,33 @@ async fn call_llm(
         }
     }
 
-    let usage = accumulator.usage().cloned().unwrap_or(llm::Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_input_tokens: 0,
-        cache_creation_input_tokens: 0,
+    // Pre-PR `provider.chat()` returned a non-`Option` `Usage` whose
+    // `input_tokens`/`output_tokens` are required serde fields, so a
+    // missing-usage response surfaced as a hard parse error.  After the
+    // streaming refactor, providers that never emit `StreamDelta::Usage`
+    // (e.g. the `openai` impl when pointed at `moonshot.ai` / `api.z.ai`
+    // / `minimax.io`, where `use_stream_usage_options` returns `false`)
+    // would silently default to `Usage{0,0,0,0}` and feed that into
+    // billing, quota, and audit columns indistinguishably from a
+    // genuinely free turn.
+    //
+    // The fallback is preserved (the same default exists in
+    // `provider::collect_stream` and `agent_loop::llm`, so this isn't
+    // unique to this site), but a `log::warn!` makes the gap loud and
+    // searchable in operational logs so cost-tracking dashboards can
+    // detect the under-counting.
+    let usage = accumulator.usage().cloned().unwrap_or_else(|| {
+        log::warn!(
+            "provider {} streamed turn for thread {thread_id} without a Usage delta; \
+             recording Usage{{0,0,0,0}} — token counts under-count on this turn",
+            provider.provider(),
+        );
+        llm::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
     });
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();
