@@ -52,6 +52,14 @@ enum MessageRole {
 message TokenUsage {
   uint64 input_tokens = 1;
   uint64 output_tokens = 2;
+  // Cache token counts surfaced by the LLM provider (Anthropic
+  // `cache_read_input_tokens` and `cache_creation_input_tokens`).
+  // Mirror `agent_sdk::TokenUsage` so the runtime can faithfully
+  // forward the data; clients price these against
+  // `model.cost.cacheRead` / `.cacheWrite`. Zero on providers that
+  // don't expose cache stats.
+  uint64 cached_input_tokens = 3;
+  uint64 cache_creation_input_tokens = 4;
 }
 
 // Binary payload surfaced to clients.
