@@ -1370,6 +1370,8 @@ fn map_token_usage(usage: &TokenUsage) -> pb::TokenUsage {
     pb::TokenUsage {
         input_tokens: u64::from(usage.input_tokens),
         output_tokens: u64::from(usage.output_tokens),
+        cached_input_tokens: u64::from(usage.cached_input_tokens),
+        cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
     }
 }
 
