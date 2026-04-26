@@ -96,6 +96,35 @@ pub enum AgentEvent {
     /// An error occurred during execution
     Error { message: String, recoverable: bool },
 
+    /// Auto-retry was initiated for a transient LLM error (rate
+    /// limit, server error, etc.). The `delay_ms` field gives the
+    /// runtime's chosen backoff before re-attempting; consumers
+    /// can render a "Retrying X/N in Ys…" indicator and clear it
+    /// on the matching `AutoRetryEnd`.
+    AutoRetryStart {
+        /// 1-based retry attempt number (first retry = 1).
+        attempt: u32,
+        /// Maximum retry attempts configured for this run.
+        max_attempts: u32,
+        /// Backoff before the next attempt in milliseconds.
+        delay_ms: u64,
+        /// Human-readable reason the retry was triggered.
+        error_message: String,
+    },
+
+    /// Auto-retry settled. `success = true` means a subsequent
+    /// attempt succeeded; `success = false` means the retry budget
+    /// was exhausted and `final_error` carries the last error.
+    AutoRetryEnd {
+        /// Total attempts performed (matches the last
+        /// `AutoRetryStart`'s `attempt`).
+        attempt: u32,
+        /// Whether a follow-up attempt eventually succeeded.
+        success: bool,
+        /// Last error when the retry budget ran out.
+        final_error: Option<String>,
+    },
+
     /// The model refused the request (safety/policy).
     Refusal {
         message_id: String,
