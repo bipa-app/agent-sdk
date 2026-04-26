@@ -135,6 +135,33 @@ message SubagentProgressEvent {
   optional string subagent_task_id = 15;
 }
 
+// Auto-retry was initiated for a transient LLM error (rate limit,
+// 5xx server error). Consumers can render a "Retrying X/N in
+// Yms…" indicator and clear it on the matching `auto_retry_end`.
+message AutoRetryStartEvent {
+  // 1-based retry attempt (first retry = 1).
+  uint32 attempt = 1;
+  // Maximum retry attempts configured for this run.
+  uint32 max_attempts = 2;
+  // Backoff before the next attempt in milliseconds.
+  uint64 delay_ms = 3;
+  // Human-readable reason the retry was triggered.
+  string error_message = 4;
+}
+
+// Auto-retry settled. `success = true` means a follow-up attempt
+// succeeded; `success = false` means the retry budget was
+// exhausted and `final_error` carries the last error.
+message AutoRetryEndEvent {
+  // Total attempts performed (matches the last `auto_retry_start`'s
+  // `attempt`).
+  uint32 attempt = 1;
+  // Whether a follow-up attempt eventually succeeded.
+  bool success = 2;
+  // Last error when the retry budget ran out. Empty when success.
+  optional string final_error = 3;
+}
+
 // A single committed event in per-thread sequence order.
 message EventEnvelope {
   string event_id = 1;
@@ -158,6 +185,8 @@ message EventEnvelope {
     RefusalEvent refusal = 22;
     ContextCompactedEvent context_compacted = 23;
     SubagentProgressEvent subagent_progress = 24;
+    AutoRetryStartEvent auto_retry_start = 25;
+    AutoRetryEndEvent auto_retry_end = 26;
   }
 }
 

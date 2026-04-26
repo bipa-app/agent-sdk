@@ -39,12 +39,24 @@ where
         };
 
         match outcome {
-            ChatOutcome::Success(response) => return (Ok(response), attempt),
+            ChatOutcome::Success(response) => {
+                if attempt > 0 {
+                    send_auto_retry_end_event(event_ctx, attempt, true, None).await;
+                }
+                return (Ok(response), attempt);
+            }
             ChatOutcome::RateLimited => {
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Rate limited by LLM provider after {max_retries} retries");
                     let error_msg = format!("Rate limited after {max_retries} retries");
+                    send_auto_retry_end_event(
+                        event_ctx,
+                        attempt - 1,
+                        false,
+                        Some(error_msg.clone()),
+                    )
+                    .await;
                     if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
                         return (Err(error), attempt);
                     }
@@ -57,6 +69,14 @@ where
                     delay.as_millis()
                 );
 
+                send_auto_retry_start_event(
+                    event_ctx,
+                    attempt,
+                    max_retries,
+                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "Rate limited by LLM provider",
+                )
+                .await;
                 sleep(delay).await;
             }
             ChatOutcome::InvalidRequest(msg) => {
@@ -71,6 +91,13 @@ where
                 if attempt > max_retries {
                     error!("LLM server error after {max_retries} retries: {msg}");
                     let error_msg = format!("Server error after {max_retries} retries: {msg}");
+                    send_auto_retry_end_event(
+                        event_ctx,
+                        attempt - 1,
+                        false,
+                        Some(error_msg.clone()),
+                    )
+                    .await;
                     if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
                         return (Err(error), attempt);
                     }
@@ -82,6 +109,14 @@ where
                     delay.as_millis()
                 );
 
+                send_auto_retry_start_event(
+                    event_ctx,
+                    attempt,
+                    max_retries,
+                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    &msg,
+                )
+                .await;
                 sleep(delay).await;
             }
         }
@@ -113,12 +148,19 @@ where
         let result = process_stream(provider, &request, event_ctx, stream_ids).await;
 
         match result {
-            Ok(response) => return (Ok(response), attempt),
+            Ok(response) => {
+                if attempt > 0 {
+                    send_auto_retry_end_event(event_ctx, attempt, true, None).await;
+                }
+                return (Ok(response), attempt);
+            }
             Err(StreamError::Recoverable(msg)) => {
                 attempt += 1;
                 if attempt > max_retries {
                     error!("Streaming error after {max_retries} retries: {msg}");
                     let err_msg = format!("Streaming error after {max_retries} retries: {msg}");
+                    send_auto_retry_end_event(event_ctx, attempt - 1, false, Some(err_msg.clone()))
+                        .await;
                     if let Err(error) = send_llm_error_event(event_ctx, &err_msg).await {
                         return (Err(error), attempt);
                     }
@@ -130,6 +172,14 @@ where
                     delay.as_millis()
                 );
 
+                send_auto_retry_start_event(
+                    event_ctx,
+                    attempt,
+                    max_retries,
+                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    &msg,
+                )
+                .await;
                 sleep(delay).await;
             }
             Err(StreamError::Fatal(msg)) => {
@@ -272,4 +322,59 @@ where
         AgentEvent::error(error_msg, true),
     )
     .await
+}
+
+/// Emit `AutoRetryStart` so consumers can render a "Retrying X/N
+/// in Yms…" indicator. Errors are swallowed — losing telemetry on
+/// the retry events shouldn't break the retry loop itself.
+async fn send_auto_retry_start_event<H>(
+    event_ctx: &LlmEventContext<'_, H>,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error_message: &str,
+) where
+    H: AgentHooks,
+{
+    let _ = send_event(
+        event_ctx.event_store,
+        event_ctx.thread_id,
+        event_ctx.turn,
+        event_ctx.hooks,
+        event_ctx.authority,
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message: error_message.to_string(),
+        },
+    )
+    .await;
+}
+
+/// Emit `AutoRetryEnd` when a retry sequence settles — `success =
+/// true` means a follow-up attempt eventually returned data;
+/// `success = false` means the budget was exhausted and
+/// `final_error` carries the last error.
+async fn send_auto_retry_end_event<H>(
+    event_ctx: &LlmEventContext<'_, H>,
+    attempt: u32,
+    success: bool,
+    final_error: Option<String>,
+) where
+    H: AgentHooks,
+{
+    let _ = send_event(
+        event_ctx.event_store,
+        event_ctx.thread_id,
+        event_ctx.turn,
+        event_ctx.hooks,
+        event_ctx.authority,
+        AgentEvent::AutoRetryEnd {
+            attempt,
+            success,
+            final_error,
+        },
+    )
+    .await;
 }

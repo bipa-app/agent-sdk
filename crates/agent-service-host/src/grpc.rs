@@ -1777,6 +1777,30 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 total_tokens: *total_tokens,
             },
         )),
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => Ok(pb::event_envelope::Event::AutoRetryStart(
+            pb::AutoRetryStartEvent {
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                delay_ms: *delay_ms,
+                error_message: error_message.clone(),
+            },
+        )),
+        AgentEvent::AutoRetryEnd {
+            attempt,
+            success,
+            final_error,
+        } => Ok(pb::event_envelope::Event::AutoRetryEnd(
+            pb::AutoRetryEndEvent {
+                attempt: *attempt,
+                success: *success,
+                final_error: final_error.clone(),
+            },
+        )),
         _ => Err(Status::internal("unsupported event variant").into()),
     }
 }
