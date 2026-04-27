@@ -214,6 +214,58 @@ fn sample_bootstrap_with_tools(task: AgentTask) -> WorkerBootstrapContext {
     }
 }
 
+fn tool_result_message(
+    child_results: &[(String, agent_sdk_core::ToolResult)],
+) -> agent_sdk_core::llm::Message {
+    let blocks = child_results
+        .iter()
+        .map(|(tool_use_id, result)| ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: result.output.clone(),
+            is_error: if result.success { None } else { Some(true) },
+        })
+        .collect();
+    agent_sdk_core::llm::Message::user_with_content(blocks)
+}
+
+fn assert_tool_results_follow_tool_use(
+    messages: &[agent_sdk_core::llm::Message],
+    tool_use_id: &str,
+) {
+    let tool_use_index = messages.iter().position(|message| {
+        matches!(
+            &message.content,
+            agent_sdk_core::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { id, .. } if id == tool_use_id
+                ))
+        )
+    });
+
+    let Some(index) = tool_use_index else {
+        panic!("expected tool_use {tool_use_id} in recovered messages");
+    };
+
+    let Some(next_message) = messages.get(index + 1) else {
+        panic!("expected tool_result message immediately after tool_use {tool_use_id}");
+    };
+
+    let has_matching_result = matches!(
+        &next_message.content,
+        agent_sdk_core::llm::Content::Blocks(blocks)
+            if blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id: result_id, .. }
+                    if result_id == tool_use_id
+            ))
+    );
+    assert!(
+        has_matching_result,
+        "expected tool_result for {tool_use_id} immediately after tool_use",
+    );
+}
+
 struct TestStores {
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
@@ -1821,6 +1873,9 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
     )
     .await?;
 
+    let mut expected_recovered_messages = suspended_messages.clone();
+    expected_recovered_messages.push(tool_result_message(&child_results));
+
     // Resume LLM call errors out — same shape as the production
     // "Stream ended unexpectedly" cascade that motivated this fix.
     let err = resume_root_turn(
@@ -1859,7 +1914,10 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
 
     // Critical assertion: the projection's draft slot survives the
     // task's fail() — `fail_root_turn` only clears the *task* row,
-    // never the message projection.
+    // never the message projection. The draft must include the
+    // completed child results, otherwise the next root turn would
+    // replay an orphaned assistant tool_use without the immediately
+    // following tool_result required by Anthropic.
     let projection_after_fail = stores
         .messages
         .get(&thread_a())
@@ -1870,9 +1928,13 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
         "draft must survive task failure",
     );
     assert!(
-        msgs_match(&projection_after_fail.draft_messages, &suspended_messages),
-        "draft must equal the most recent suspended_messages snapshot",
+        msgs_match(
+            &projection_after_fail.draft_messages,
+            &expected_recovered_messages,
+        ),
+        "draft must include completed child results after the suspended tool_use",
     );
+    assert_tool_results_follow_tool_use(&projection_after_fail.draft_messages, "call_1");
 
     // The recovery view used by the next root turn folds the draft
     // into `messages` so the resumed conversation continues from
@@ -1886,10 +1948,14 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
     )
     .await?;
     assert!(
-        msgs_match(&view.messages, &suspended_messages),
+        msgs_match(&view.messages, &expected_recovered_messages),
         "recovery view must surface the in-flight draft as the next turn's history",
     );
-    assert!(msgs_match(&view.draft_messages, &suspended_messages));
+    assert!(msgs_match(
+        &view.draft_messages,
+        &expected_recovered_messages
+    ));
+    assert_tool_results_follow_tool_use(&view.messages, "call_1");
     assert_eq!(view.next_turn_number, 1, "no turn was committed");
     assert!(view.latest_checkpoint.is_none());
 
