@@ -13,13 +13,14 @@ use std::sync::Arc;
 
 use crate::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 use crate::journal::event_notifier::EventNotifier;
-use crate::journal::event_repository::InMemoryEventRepository;
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, WorkerId};
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+use crate::journal::turn_attempt::TurnAttempt;
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
@@ -1507,12 +1508,17 @@ async fn failed_root_turn_closes_open_attempt() -> Result<()> {
     )
     .await?;
 
-    // The attempt opened by execute_root_turn should be closed.
+    // Every attempt opened during execute_root_turn (including the
+    // retries call_llm_with_retry minted on transient ServerErrors)
+    // must be closed by the time fail_root_turn returns.  The exact
+    // attempt count tracks `STREAM_MAX_RETRIES + 1`; we only assert
+    // the invariant — closed-ness — so the test stays robust to
+    // future tuning of the retry budget.
     let attempts = stores.attempts.list_by_task(&task_id).await?;
-    assert_eq!(attempts.len(), 1);
+    assert!(!attempts.is_empty(), "expected at least one attempt");
     assert!(
-        attempts[0].is_closed(),
-        "attempt should be closed after fail_root_turn"
+        attempts.iter().all(TurnAttempt::is_closed),
+        "all attempts should be closed after fail_root_turn",
     );
 
     Ok(())
@@ -2876,6 +2882,264 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
             .context("thread")?
             .committed_turns,
         1
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// LLM stream retry on transient failures
+// ─────────────────────────────────────────────────────────────────────
+//
+// Covers the worker-side retry-with-backoff added to `call_llm_with_retry`.
+// The agent-sdk's in-process `call_llm_streaming` already retries
+// transient LLM errors (rate-limit, server error, mid-stream drop), but
+// before this slice the daemon's worker path bailed on the first
+// `StreamDelta::Error`.  A single Anthropic SSE blip ("Stream ended
+// unexpectedly without completion") would fail the whole `RootTurn`
+// task and burn the journal's task-level `max_attempts` budget on the
+// same error — surfacing as the production fail-loop:
+//   `resume root task from durable child results: LLM stream error
+//    (kind=ServerError): Stream ended unexpectedly without completion`
+//
+// These tests pin the new behaviour: recoverable kinds retry up to
+// `STREAM_MAX_RETRIES` and emit `AutoRetryStart` / `AutoRetryEnd`
+// envelope events; fatal kinds (`InvalidRequest`) skip the retry loop.
+
+/// Provider whose first `n_failures` calls return `ServerError`,
+/// then `Success` on subsequent calls.  Lets a single test exercise
+/// the recover-after-N path without touching real network.
+struct FlakyProvider {
+    n_failures: usize,
+    success_text: String,
+    call_count: AtomicUsize,
+}
+
+impl FlakyProvider {
+    fn new(n_failures: usize, success_text: &str) -> Self {
+        Self {
+            n_failures,
+            success_text: success_text.to_owned(),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FlakyProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if n < self.n_failures {
+            return Ok(ChatOutcome::ServerError(format!(
+                "synthetic transient error #{n}"
+            )));
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: format!("msg_flaky_{n}"),
+            content: vec![ContentBlock::Text {
+                text: self.success_text.clone(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Provider that always returns `InvalidRequest` — exercises the
+/// fatal (no-retry) branch of `call_llm_with_retry`.
+struct InvalidRequestProvider;
+
+#[async_trait]
+impl LlmProvider for InvalidRequestProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        Ok(ChatOutcome::InvalidRequest("schema rejected".into()))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Pull every event from the in-memory event repository and tag it
+/// with its event-type discriminator string.  The test stores commit
+/// auto-retry envelopes through `event_repo.commit_event`, so we can
+/// inspect them with this helper without coupling to the proto layer.
+async fn collected_event_kinds(events: &InMemoryEventRepository) -> Vec<String> {
+    use agent_sdk_core::events::AgentEvent;
+    let committed = events.get_events(&thread_a()).await.expect("read events");
+    committed
+        .into_iter()
+        .map(|c| match c.event {
+            AgentEvent::Start { .. } => "start",
+            AgentEvent::TextDelta { .. } => "text_delta",
+            AgentEvent::Text { .. } => "text",
+            AgentEvent::ThinkingDelta { .. } => "thinking_delta",
+            AgentEvent::Thinking { .. } => "thinking",
+            AgentEvent::ToolCallStart { .. } => "tool_call_start",
+            AgentEvent::ToolCallEnd { .. } => "tool_call_end",
+            AgentEvent::TurnComplete { .. } => "turn_complete",
+            AgentEvent::Done { .. } => "done",
+            AgentEvent::Error { .. } => "error",
+            AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
+            AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+            _ => "other",
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_server_error_retries_and_succeeds() -> Result<()> {
+    // One transient failure → one retry → success.  The turn must
+    // complete normally and the journal must carry one
+    // `auto_retry_start` followed by an `auto_retry_end` with
+    // `success: true`.
+    let stores = TestStores::new();
+    let provider = FlakyProvider::new(1, "Hello after retry!");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after retry, got Suspended");
+    };
+    assert_eq!(response_text, "Hello after retry!");
+
+    // Provider was invoked twice: one failure, one success.
+    assert_eq!(provider.calls(), 2);
+
+    // Two turn attempts in the audit trail — one closed with
+    // `ServerError`, one closed with `Completed`.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 2, "expected 2 attempts (1 retry)");
+    assert!(attempts.iter().all(TurnAttempt::is_closed));
+
+    // The retry envelope landed in the event log.
+    let kinds = collected_event_kinds(&stores.events).await;
+    assert!(
+        kinds.iter().any(|k| k == "auto_retry_start"),
+        "expected an auto_retry_start event in {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "auto_retry_end"),
+        "expected an auto_retry_end event in {kinds:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_server_error_exhausts_budget_and_fails() -> Result<()> {
+    // Provider always errors.  The turn must fail with the budget-
+    // exhausted message and emit an `auto_retry_end { success:
+    // false }`.  No content events should be committed.
+    let stores = TestStores::new();
+    // Request more failures than the budget can absorb so the
+    // wrapper exhausts retries.
+    let provider = FlakyProvider::new(usize::MAX, "(unreachable)");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let err = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1))
+        .await
+        .expect_err("expected budget-exhausted failure");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("after") && msg.contains("retries"),
+        "expected budget-exhausted message, got: {msg}",
+    );
+
+    // Total attempts == 1 (initial) + STREAM_MAX_RETRIES retries.
+    // The constant lives in the impl, so we only assert the lower
+    // bound of "more than 1 attempt was made".
+    assert!(
+        provider.calls() > 1,
+        "expected multiple retry attempts, got {}",
+        provider.calls(),
+    );
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), provider.calls());
+    assert!(attempts.iter().all(TurnAttempt::is_closed));
+
+    let kinds = collected_event_kinds(&stores.events).await;
+    assert!(
+        kinds.iter().filter(|k| k == &"auto_retry_start").count() >= 1,
+        "expected at least one auto_retry_start in {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "auto_retry_end"),
+        "expected an auto_retry_end event in {kinds:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_invalid_request_does_not_retry() -> Result<()> {
+    // `InvalidRequest` is caller-side; no amount of retry will help.
+    // The wrapper must skip the retry loop and bail on the first
+    // attempt, leaving exactly one closed audit row.
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs =
+        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+
+    let err = execute_root_turn(
+        inputs,
+        "ping",
+        &InvalidRequestProvider,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await
+    .expect_err("expected invalid-request failure");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("invalidrequest")
+            || msg.to_lowercase().contains("invalid request")
+            || msg.contains("schema rejected"),
+        "expected invalid-request error, got: {msg}",
+    );
+
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1, "no retries for InvalidRequest");
+
+    let kinds = collected_event_kinds(&stores.events).await;
+    assert!(
+        kinds.iter().all(|k| k != "auto_retry_start"),
+        "no retry should have been attempted, found: {kinds:?}",
     );
 
     Ok(())

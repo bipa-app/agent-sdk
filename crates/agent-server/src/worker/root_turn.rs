@@ -47,6 +47,7 @@ use agent_sdk_tools::stores::{MessageStore, StateStore};
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -148,11 +149,27 @@ impl ContentIds {
     }
 }
 
-/// Outcome of [`call_llm`]: the synthesized [`llm::ChatResponse`] plus
-/// the per-block IDs assigned during streaming.
+/// Outcome of a single [`call_llm_once`] call: the synthesized
+/// [`llm::ChatResponse`] plus the per-block IDs assigned during
+/// streaming.  Owned by the retry loop — callers see the
+/// [`StreamedTurn`] the wrapper assembles.
+struct OnceOutcome {
+    response: llm::ChatResponse,
+    content_ids: ContentIds,
+}
+
+/// Outcome of [`call_llm_with_retry`]: the synthesized
+/// [`llm::ChatResponse`], the per-block IDs assigned during streaming,
+/// and the [`TurnAttempt`] that produced them.
+///
+/// The attempt is owned by this struct because [`call_llm_with_retry`]
+/// may have minted fresh attempts during the retry loop — callers need
+/// the *successful* attempt for the audit close in the
+/// commit/suspension paths, not the one they passed in.
 struct StreamedTurn {
     response: llm::ChatResponse,
     content_ids: ContentIds,
+    attempt: TurnAttempt,
 }
 
 /// Bundle of context needed to commit / suspend a root turn after
@@ -396,7 +413,19 @@ pub async fn execute_root_turn(
     let StreamedTurn {
         response,
         content_ids,
-    } = call_llm(provider, chat_request, &attempt, deps, thread_id, now).await?;
+        attempt,
+    } = call_llm_with_retry(LlmRetryParams {
+        inputs: &inputs,
+        definition,
+        attempt_user_prompt: user_prompt,
+        provider,
+        chat_request,
+        initial_attempt: attempt,
+        deps,
+        thread_id,
+        now,
+    })
+    .await?;
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
@@ -679,6 +708,306 @@ async fn build_chat_request(
     })
 }
 
+/// Maximum retries for a transient LLM stream error.  After this many
+/// recoverable failures (rate-limit / server / dropped connection) the
+/// turn is failed permanently and the user sees the last error.
+///
+/// This budget is per-turn — a fresh user submission starts at zero —
+/// and applies on top of the journal's task-level `max_attempts`
+/// (which governs lease re-acquisition).  Empirically `Stream ended
+/// unexpectedly without completion` from the Anthropic SSE provider
+/// almost always succeeds on the first retry; budgeting three
+/// attempts (~14 s worst-case at the default backoff) covers a longer
+/// transient blip without dragging out a genuinely poisoned turn.
+const STREAM_MAX_RETRIES: u32 = 3;
+
+/// Base backoff for the exponential retry schedule (`base * 2^(n-1)`
+/// with jitter, capped at [`STREAM_MAX_DELAY_MS`]).
+const STREAM_BASE_DELAY_MS: u64 = 500;
+
+/// Upper bound on the retry backoff.  The cap matches the
+/// daemon-reconnect ceiling in the bipi/desktop loops so a transient
+/// blip and a daemon respawn share the same wall-clock vocabulary.
+const STREAM_MAX_DELAY_MS: u64 = 8_000;
+
+/// Classified outcome of [`call_llm_once`].  The retry wrapper
+/// distinguishes recoverable transient failures from fatal ones so
+/// only the former enter the backoff loop.
+enum StreamAttemptError {
+    /// Provider returned `RateLimited` or `ServerError`, or the
+    /// underlying byte stream surfaced a transport error.  The turn
+    /// attempt was already closed with the matching outcome.
+    Recoverable {
+        kind: StreamErrorKind,
+        message: String,
+    },
+    /// Provider returned `InvalidRequest` (caller-side error) — no
+    /// retry will help.  The turn attempt was already closed with
+    /// `InvalidRequest`.
+    Fatal { message: String },
+}
+
+/// Bundle of context [`call_llm_with_retry`] needs to drive the
+/// streaming-LLM retry loop.
+///
+/// Holding these fields together keeps the retry wrapper's signature
+/// readable and lets every call site (the fresh-turn path in
+/// [`execute_root_turn`] and the resume path in
+/// [`resume_root_turn`]) build the params with the same vocabulary —
+/// only `attempt_user_prompt` differs.  The lifetime parameter ties
+/// every borrow to a single scope so the wrapper can't outlive the
+/// store handles or the input bundle.
+pub(crate) struct LlmRetryParams<'a> {
+    /// Worker inputs needed to re-open a [`TurnAttempt`] after a
+    /// recoverable failure (the audit row references this task and
+    /// the next-attempt-number derives from `attempt_store.list_by_task`).
+    pub(crate) inputs: &'a RootWorkerInputs,
+    /// Definition the freshly opened attempt records as provenance.
+    /// Re-resolving via the registry on every retry would be safer
+    /// against live-edit changes but is overkill for transient
+    /// LLM-stream blips.
+    pub(crate) definition: &'a AgentDefinition,
+    /// String written into the per-attempt `request_blob.user_prompt`
+    /// audit field.  Fresh turns pass the user prompt; resumes pass
+    /// the placeholder `"<resume>"` because there is no fresh user
+    /// input — the durable child results carry the continuation
+    /// payload.
+    pub(crate) attempt_user_prompt: &'a str,
+    /// LLM provider — borrowed because it can't be cloned cheaply.
+    pub(crate) provider: &'a dyn LlmProvider,
+    /// Chat request built once at the top of the turn and reused on
+    /// every retry.  Cloning per attempt is cheap because the
+    /// expensive parts (system prompt + staged history) are shared
+    /// `String` / `Vec<Message>` payloads.
+    pub(crate) chat_request: ChatRequest,
+    /// Initial [`TurnAttempt`] opened by the caller before streaming
+    /// begins.  Subsequent attempts are minted by the wrapper.
+    pub(crate) initial_attempt: TurnAttempt,
+    /// Store handles for committing delta events, closing failed
+    /// attempts, and emitting `AutoRetryStart` / `AutoRetryEnd`.
+    pub(crate) deps: &'a RootTurnDeps<'a>,
+    /// Thread under which every event commit and audit close is
+    /// attributed.
+    pub(crate) thread_id: &'a agent_sdk_core::ThreadId,
+    /// Wall-clock timestamp the first attempt records on its closed
+    /// attempt row when the streaming attempt fails.  Subsequent
+    /// attempts capture a fresh `now` per retry.
+    pub(crate) now: OffsetDateTime,
+}
+
+/// Drive the LLM stream with retry-on-transient.
+///
+/// One call into `call_llm_once` runs a single streaming attempt.  On
+/// success the result is returned; on a recoverable failure
+/// ([`StreamAttemptError::Recoverable`]) the wrapper:
+///
+///   1. emits an [`AgentEvent::AutoRetryStart`] so live observers can
+///      render a "Retrying X/N in Yms…" indicator,
+///   2. sleeps for the exponential-backoff delay,
+///   3. opens a fresh [`TurnAttempt`] (the previous one was already
+///      closed inside `call_llm_once`), and
+///   4. tries again.
+///
+/// When the budget is exhausted, an [`AgentEvent::AutoRetryEnd`] with
+/// `success: false` is emitted before bailing.  When a retry
+/// eventually succeeds, the matching `AutoRetryEnd { success: true }`
+/// fires.  These mirror the agent-sdk's in-process retry loop in
+/// `agent_loop::llm::call_llm_streaming` so both paths share a
+/// vocabulary.
+///
+/// ## Why retry inside the worker
+///
+/// Without this, a single transient `Stream ended unexpectedly
+/// without completion` from the Anthropic SSE provider — extremely
+/// common on long resumes after a subagent — fails the entire
+/// `RootTurn` task.  The journal's task-level `max_attempts` then
+/// burns through its budget on the same error and the user sees a
+/// `resume root task from durable child results: LLM stream error
+/// (kind=ServerError)` cascade with no recovery.
+///
+/// Retries committed delta events from the failed attempt remain in
+/// the journal — they share the per-attempt `ContentIds`, so a
+/// successful retry generates fresh ids and the renderer can
+/// distinguish "previous attempt's partial deltas" from "current
+/// attempt's full content" via the surrounding
+/// `AutoRetryStart`/`AutoRetryEnd` envelope.
+async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn> {
+    let LlmRetryParams {
+        inputs,
+        definition,
+        attempt_user_prompt,
+        provider,
+        chat_request,
+        initial_attempt,
+        deps,
+        thread_id,
+        now,
+    } = params;
+
+    let mut attempt = initial_attempt;
+    let mut retries: u32 = 0;
+
+    loop {
+        let attempt_now = if retries == 0 {
+            now
+        } else {
+            OffsetDateTime::now_utc()
+        };
+        match call_llm_once(
+            provider,
+            chat_request.clone(),
+            &attempt,
+            deps,
+            thread_id,
+            attempt_now,
+        )
+        .await
+        {
+            Ok(OnceOutcome {
+                response,
+                content_ids,
+            }) => {
+                if retries > 0 {
+                    emit_auto_retry_end(deps, thread_id, retries, true, None).await;
+                }
+                return Ok(StreamedTurn {
+                    response,
+                    content_ids,
+                    attempt,
+                });
+            }
+            Err(StreamAttemptError::Recoverable { kind, message }) => {
+                retries = retries.saturating_add(1);
+                if retries > STREAM_MAX_RETRIES {
+                    let final_msg = format!(
+                        "LLM stream error after {STREAM_MAX_RETRIES} retries (kind={kind:?}): {message}"
+                    );
+                    emit_auto_retry_end(
+                        deps,
+                        thread_id,
+                        retries.saturating_sub(1),
+                        false,
+                        Some(final_msg.clone()),
+                    )
+                    .await;
+                    bail!("{final_msg}");
+                }
+                let delay = stream_backoff_delay(retries);
+                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                log::warn!(
+                    "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
+                     for thread {thread_id}; retrying in {delay_ms} ms — {message}"
+                );
+                emit_auto_retry_start(
+                    deps,
+                    thread_id,
+                    retries,
+                    STREAM_MAX_RETRIES,
+                    delay_ms,
+                    &message,
+                )
+                .await;
+                tokio::time::sleep(delay).await;
+                attempt = open_attempt(
+                    inputs,
+                    definition,
+                    attempt_user_prompt,
+                    deps.attempt_store,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .context("open retry turn attempt")?;
+            }
+            Err(StreamAttemptError::Fatal { message }) => {
+                bail!("{message}");
+            }
+        }
+    }
+}
+
+/// Exponential backoff with bounded jitter.  Mirrors
+/// `agent_sdk::agent_loop::helpers::calculate_backoff_delay` but
+/// is duplicated here to avoid leaking a `pub(crate)` boundary across
+/// crates for a tiny pure helper.
+fn stream_backoff_delay(attempt: u32) -> Duration {
+    // Exponential: base, base*2, base*4, ...
+    let base = STREAM_BASE_DELAY_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(20));
+    // Add jitter (0..min(base, 1000)ms) to spread out colliding
+    // retries from independent turns hitting the same upstream blip.
+    let max_jitter = STREAM_BASE_DELAY_MS.min(1000);
+    let jitter = if max_jitter > 0 {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        RandomState::new().build_hasher().finish() % max_jitter
+    } else {
+        0
+    };
+    let delay_ms = base.saturating_add(jitter).min(STREAM_MAX_DELAY_MS);
+    Duration::from_millis(delay_ms)
+}
+
+/// Best-effort emit of an `AutoRetryStart` event so renderers can
+/// render a "Retrying X/N in Yms…" pill.  Errors are swallowed —
+/// losing telemetry on the retry events shouldn't block the retry
+/// loop itself.
+async fn emit_auto_retry_start(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error_message: &str,
+) {
+    let event = AgentEvent::AutoRetryStart {
+        attempt,
+        max_attempts,
+        delay_ms,
+        error_message: error_message.to_string(),
+    };
+    match deps
+        .event_repo
+        .commit_event(thread_id, event, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(committed) => {
+            deps.event_notifier.notify(std::slice::from_ref(&committed));
+        }
+        Err(error) => {
+            log::warn!("failed to commit auto_retry_start event for thread {thread_id}: {error:#}");
+        }
+    }
+}
+
+/// Best-effort emit of an `AutoRetryEnd` event.  `success = true`
+/// means a follow-up attempt eventually returned data; `success =
+/// false` means the budget was exhausted and `final_error` carries
+/// the last error.
+async fn emit_auto_retry_end(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    attempt: u32,
+    success: bool,
+    final_error: Option<String>,
+) {
+    let event = AgentEvent::AutoRetryEnd {
+        attempt,
+        success,
+        final_error,
+    };
+    match deps
+        .event_repo
+        .commit_event(thread_id, event, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(committed) => {
+            deps.event_notifier.notify(std::slice::from_ref(&committed));
+        }
+        Err(error) => {
+            log::warn!("failed to commit auto_retry_end event for thread {thread_id}: {error:#}");
+        }
+    }
+}
+
 /// Call the LLM via `chat_stream`, committing `TextDelta` /
 /// `ThinkingDelta` events to the journal as they arrive so live
 /// observers (TUI, desktop) see streaming output character-by-character
@@ -697,14 +1026,19 @@ async fn build_chat_request(
 /// Each delta event is committed with a freshly captured
 /// `OffsetDateTime::now_utc()` rather than the turn-open `now`, so the
 /// journal records true wall-clock arrival times for each delta.
-async fn call_llm(
+///
+/// Returns [`StreamAttemptError::Recoverable`] for transient failures
+/// (the retry wrapper [`call_llm_with_retry`] handles backoff +
+/// re-attempt) and [`StreamAttemptError::Fatal`] for caller-side
+/// errors that no retry can fix.
+async fn call_llm_once(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_core::ThreadId,
     now: OffsetDateTime,
-) -> Result<StreamedTurn> {
+) -> Result<OnceOutcome, StreamAttemptError> {
     let mut stream = std::pin::pin!(provider.chat_stream(request));
     let mut accumulator = StreamAccumulator::new();
     let mut content_ids = ContentIds::default();
@@ -714,6 +1048,11 @@ async fn call_llm(
         let delta = match result {
             Ok(delta) => delta,
             Err(error) => {
+                // Transport-level stream errors (HTTP read failures,
+                // dropped TCP, etc.) are treated as recoverable —
+                // they're the most common shape of "Anthropic SSE
+                // stream died mid-flight" and almost always succeed
+                // on retry.
                 close_attempt_with(
                     attempt,
                     TurnAttemptOutcome::ServerError,
@@ -721,7 +1060,10 @@ async fn call_llm(
                     now,
                 )
                 .await;
-                bail!("LLM stream iteration error: {error:#}");
+                return Err(StreamAttemptError::Recoverable {
+                    kind: StreamErrorKind::ServerError,
+                    message: format!("LLM stream iteration error: {error:#}"),
+                });
             }
         };
 
@@ -777,7 +1119,14 @@ async fn call_llm(
                     StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
                 };
                 close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
-                bail!("LLM stream error (kind={kind:?}): {message}");
+                let message = message.clone();
+                let kind = *kind;
+                if kind.is_recoverable() {
+                    return Err(StreamAttemptError::Recoverable { kind, message });
+                }
+                return Err(StreamAttemptError::Fatal {
+                    message: format!("LLM stream error (kind={kind:?}): {message}"),
+                });
             }
             // Done / Usage / ToolUseStart / ToolInputDelta /
             // SignatureDelta / RedactedThinking are handled by the
@@ -791,21 +1140,42 @@ async fn call_llm(
         }
     }
 
-    // Pre-PR `provider.chat()` returned a non-`Option` `Usage` whose
-    // `input_tokens`/`output_tokens` are required serde fields, so a
-    // missing-usage response surfaced as a hard parse error.  After the
-    // streaming refactor, providers that never emit `StreamDelta::Usage`
-    // (e.g. the `openai` impl when pointed at `moonshot.ai` / `api.z.ai`
-    // / `minimax.io`, where `use_stream_usage_options` returns `false`)
-    // would silently default to `Usage{0,0,0,0}` and feed that into
-    // billing, quota, and audit columns indistinguishably from a
-    // genuinely free turn.
-    //
-    // The fallback is preserved (the same default exists in
-    // `provider::collect_stream` and `agent_loop::llm`, so this isn't
-    // unique to this site), but a `log::warn!` makes the gap loud and
-    // searchable in operational logs so cost-tracking dashboards can
-    // detect the under-counting.
+    let response = synthesize_response(accumulator, provider, thread_id);
+    Ok(OnceOutcome {
+        response,
+        content_ids,
+    })
+}
+
+/// Build the synthetic [`llm::ChatResponse`] from a closed
+/// [`StreamAccumulator`].
+///
+/// Pre-PR `provider.chat()` returned a non-`Option` `Usage` whose
+/// `input_tokens`/`output_tokens` are required serde fields, so a
+/// missing-usage response surfaced as a hard parse error.  After the
+/// streaming refactor, providers that never emit `StreamDelta::Usage`
+/// (e.g. the `openai` impl when pointed at `moonshot.ai` / `api.z.ai`
+/// / `minimax.io`, where `use_stream_usage_options` returns `false`)
+/// would silently default to `Usage{0,0,0,0}` and feed that into
+/// billing, quota, and audit columns indistinguishably from a
+/// genuinely free turn.
+///
+/// The fallback is preserved (the same default exists in
+/// `provider::collect_stream` and `agent_loop::llm`, so this isn't
+/// unique to this site), but a `log::warn!` makes the gap loud and
+/// searchable in operational logs so cost-tracking dashboards can
+/// detect the under-counting.
+///
+/// The synthesized response is assembled from streaming state and
+/// never reaches a provider's response-id space.  The downstream
+/// commit/suspension paths route every event through `content_ids`
+/// and never read `response.id`, so leaving it empty avoids
+/// allocating a UUID that nothing consumes.
+fn synthesize_response(
+    accumulator: StreamAccumulator,
+    provider: &dyn LlmProvider,
+    thread_id: &agent_sdk_core::ThreadId,
+) -> llm::ChatResponse {
     let usage = accumulator.usage().cloned().unwrap_or_else(|| {
         log::warn!(
             "provider {} streamed turn for thread {thread_id} without a Usage delta; \
@@ -822,23 +1192,13 @@ async fn call_llm(
     let stop_reason = accumulator.stop_reason().copied();
     let content_blocks = accumulator.into_content_blocks();
 
-    // The synthesized response is assembled from streaming state and
-    // never reaches a provider's response-id space.  The downstream
-    // commit/suspension paths route every event through `content_ids`
-    // and never read `response.id`, so leaving it empty avoids
-    // allocating a UUID that nothing consumes.
-    let response = llm::ChatResponse {
+    llm::ChatResponse {
         id: String::new(),
         content: content_blocks,
         model: provider.model().to_string(),
         stop_reason,
         usage,
-    };
-
-    Ok(StreamedTurn {
-        response,
-        content_ids,
-    })
+    }
 }
 
 /// Commit a single streaming delta event with a freshly captured
@@ -1494,7 +1854,19 @@ pub async fn resume_root_turn(
     let StreamedTurn {
         response,
         content_ids,
-    } = call_llm(provider, chat_request, &attempt, deps, thread_id, now).await?;
+        attempt,
+    } = call_llm_with_retry(LlmRetryParams {
+        inputs: &inputs,
+        definition,
+        attempt_user_prompt: "<resume>",
+        provider,
+        chat_request,
+        initial_attempt: attempt,
+        deps,
+        thread_id,
+        now,
+    })
+    .await?;
     let commit_now = OffsetDateTime::now_utc();
 
     let prior = ResumeContext {
