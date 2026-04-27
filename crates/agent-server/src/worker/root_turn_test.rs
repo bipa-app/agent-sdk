@@ -29,6 +29,7 @@ use agent_sdk_core::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
 use agent_sdk_providers::LlmProvider;
+use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1872,6 +1873,15 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
         t_plus(20),
     )
     .await?;
+    let staged_before_resume = inputs
+        .staged_stores
+        .messages
+        .get_history(&thread_a())
+        .await?;
+    assert!(
+        staged_before_resume.is_empty(),
+        "ReadyToResume inputs must not seed the previous draft; resume_root_turn appends suspended messages plus tool results",
+    );
 
     let mut expected_recovered_messages = suspended_messages.clone();
     expected_recovered_messages.push(tool_result_message(&child_results));

@@ -289,6 +289,34 @@ impl StagedStores {
     /// Returns an error if the `agent_state_snapshot` cannot be
     /// deserialized into [`AgentState`].
     pub fn from_recovery_view(view: &ThreadRecoveryView) -> Result<Self> {
+        Self::from_recovery_view_with_messages(view, view.messages.clone())
+    }
+
+    /// Construct staged stores from a recovery view, but seed messages
+    /// only from the latest committed checkpoint.
+    ///
+    /// This is used when resuming an already-suspended root task. The
+    /// task state supplies `suspended_messages` and completed child
+    /// results explicitly; including recovery draft messages in the
+    /// seed would duplicate the assistant `tool_use` before the
+    /// matching `tool_result` is appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `agent_state_snapshot` cannot be
+    /// deserialized into [`AgentState`].
+    pub fn from_recovery_view_committed_only(view: &ThreadRecoveryView) -> Result<Self> {
+        let messages = view
+            .latest_checkpoint
+            .as_ref()
+            .map_or_else(Vec::new, |checkpoint| checkpoint.messages.clone());
+        Self::from_recovery_view_with_messages(view, messages)
+    }
+
+    fn from_recovery_view_with_messages(
+        view: &ThreadRecoveryView,
+        messages: Vec<llm::Message>,
+    ) -> Result<Self> {
         let thread_id = view.thread.thread_id.clone();
 
         // Seed agent state from the checkpoint snapshot or create a
@@ -307,7 +335,7 @@ impl StagedStores {
         };
 
         Ok(Self {
-            messages: StagedMessageStore::new(thread_id.clone(), view.messages.clone()),
+            messages: StagedMessageStore::new(thread_id.clone(), messages),
             state: StagedStateStore::new(thread_id, Some(seed_state)),
         })
     }
@@ -533,6 +561,64 @@ mod tests {
         let state = state.context("should be Some")?;
         assert_eq!(state.turn_count, 3);
         assert_eq!(state.total_usage.input_tokens, 500);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_only_view_excludes_draft_messages() -> Result<()> {
+        let seed_state = AgentState {
+            thread_id: thread_a(),
+            turn_count: 1,
+            total_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            metadata: std::collections::HashMap::default(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let snapshot = serde_json::to_value(&seed_state)?;
+        let committed = vec![llm::Message::user("committed")];
+        let draft = vec![
+            llm::Message::user("draft user"),
+            llm::Message::assistant_with_tool_use(
+                None,
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "pwd"}),
+            ),
+        ];
+        let checkpoint = super::super::checkpoint::Checkpoint::new(
+            super::super::checkpoint::NewCheckpointParams {
+                thread_id: thread_a(),
+                turn_number: 1,
+                task_id: super::super::task::AgentTaskId::from_string("task_committed"),
+                messages: committed.clone(),
+                agent_state_snapshot: snapshot.clone(),
+                turn_usage: TokenUsage::default(),
+                now: time::OffsetDateTime::now_utc(),
+            },
+        )?;
+
+        let mut view_messages = committed.clone();
+        view_messages.extend(draft.clone());
+        let view = ThreadRecoveryView {
+            thread: super::super::thread::Thread::new(thread_a(), time::OffsetDateTime::now_utc()),
+            messages: view_messages,
+            agent_state_snapshot: snapshot,
+            latest_checkpoint: Some(checkpoint),
+            draft_messages: draft,
+            next_turn_number: 2,
+        };
+
+        let staged = StagedStores::from_recovery_view_committed_only(&view)?;
+        let messages = staged.messages.get_history(&thread_a()).await?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            serde_json::to_value(messages)?,
+            serde_json::to_value(committed)?
+        );
 
         Ok(())
     }
