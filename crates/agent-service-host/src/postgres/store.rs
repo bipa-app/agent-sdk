@@ -282,15 +282,19 @@ ON CONFLICT (thread_id) DO UPDATE SET
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
+        // Bootstrap with `draft_messages_json = NULL` — a fresh
+        // thread has no in-flight turn. The full upsert path below
+        // populates the column once a suspension boundary fires.
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_message_heads (
     thread_id,
     history_json,
+    draft_messages_json,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, $3, $4, $5)
+) VALUES ($1, $2, NULL, $3, $4, $5)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             thread_key(thread_id),
@@ -309,6 +313,7 @@ ON CONFLICT (thread_id) DO NOTHING
 SELECT
     thread_id,
     history_json,
+    draft_messages_json,
     version,
     created_at,
     updated_at
@@ -334,6 +339,7 @@ FOR UPDATE
 SELECT
     thread_id,
     history_json,
+    draft_messages_json,
     version,
     created_at,
     updated_at
@@ -352,23 +358,38 @@ WHERE thread_id = $1
         tx: &mut Transaction<'_, Postgres>,
         projection: &MessageProjection,
     ) -> Result<()> {
+        // Persist `draft_messages` as NULL when empty so the column
+        // distinguishes "no in-flight turn" from "explicit empty
+        // draft" — matches the intent the migration documents and
+        // mirrors the SQLite path.
+        let draft_messages_json = if projection.draft_messages.is_empty() {
+            None
+        } else {
+            Some(json_to_value(
+                &projection.draft_messages,
+                "message head draft messages",
+            )?)
+        };
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_message_heads (
     thread_id,
     history_json,
+    draft_messages_json,
     version,
     created_at,
     updated_at
-) VALUES ($1, $2, $3, $4, $5)
+) VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = EXCLUDED.history_json,
+    draft_messages_json = EXCLUDED.draft_messages_json,
     version = EXCLUDED.version,
     created_at = EXCLUDED.created_at,
     updated_at = EXCLUDED.updated_at
 ",
             thread_key(&projection.thread_id),
             json_to_value(&projection.messages, "message head history")?,
+            draft_messages_json,
             i64_from_u64(projection.version, "message head version")?,
             projection.created_at,
             projection.updated_at,
@@ -1405,9 +1426,20 @@ FOR UPDATE
 
         let projection_before =
             Self::lock_message_head_tx(&mut tx, &params.thread_id, params.now).await?;
+        // Append the committed turn's messages AND clear any
+        // in-flight draft in the same transaction. The
+        // worker-level suspension paths populated the draft slot
+        // at every tool-boundary suspension; once the turn fully
+        // commits, the draft is subsumed by the committed history
+        // and must be wiped before the next turn starts. Doing the
+        // clear here (rather than as a follow-up call) closes the
+        // crash window where a recovery between commit and clear
+        // would surface duplicated messages through the next-turn
+        // view.
         let updated_projection = projection_before
             .append_committed(params.messages.clone(), params.now)
-            .context("append committed messages inside postgres completed-turn transaction")?;
+            .context("append committed messages inside postgres completed-turn transaction")?
+            .clear_draft(params.now);
 
         Self::insert_message_commit_tx(
             &mut tx,
@@ -2797,6 +2829,39 @@ impl MessageProjectionStore for PostgresDurableStore {
         tx.commit().await.context("commit replace_history")?;
         Ok(updated)
     }
+
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
+        let updated = projection.set_draft(messages, now);
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit set_draft")?;
+        Ok(updated)
+    }
+
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<MessageProjection>> {
+        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+            // No projection row exists yet — nothing to clear.
+            // Mirror the SQLite path: the commit helper short-
+            // circuits on first-turn happy paths.
+            return Ok(None);
+        };
+        let updated = projection.clear_draft(now);
+        let mut tx = self.begin().await?;
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit clear_draft")?;
+        Ok(Some(updated))
+    }
 }
 
 #[async_trait]
@@ -4177,6 +4242,10 @@ impl TryFrom<ThreadRecord> for Thread {
 struct MessageHeadRecord {
     thread_id: String,
     history_json: serde_json::Value,
+    /// In-flight draft snapshot, NULL when no turn is suspended.
+    /// Populated by the worker at every tool-boundary suspension and
+    /// cleared atomically by the completed-turn transaction.
+    draft_messages_json: Option<serde_json::Value>,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -4186,9 +4255,14 @@ impl TryFrom<MessageHeadRecord> for MessageProjection {
     type Error = anyhow::Error;
 
     fn try_from(record: MessageHeadRecord) -> Result<Self> {
+        let draft_messages = match record.draft_messages_json {
+            Some(value) => json_from_value(value, "message head draft messages")?,
+            None => Vec::new(),
+        };
         Ok(Self {
             thread_id: ThreadId::from_string(record.thread_id),
             messages: json_from_value(record.history_json, "message head history")?,
+            draft_messages,
             version: u64_from_i64(record.version, "message head version")?,
             created_at: record.created_at,
             updated_at: record.updated_at,

@@ -994,6 +994,7 @@ async fn execute_root_task(
             bootstrap,
             stores.thread_store.as_ref(),
             stores.checkpoint_store.as_ref(),
+            stores.message_store.as_ref(),
             now,
         )
         .await

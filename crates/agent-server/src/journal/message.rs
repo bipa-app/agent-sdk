@@ -1,20 +1,43 @@
 //! Durable message projection schema and invariants.
 //!
 //! The `message_projection` is the single place where the committed
-//! per-thread conversation history lives. The projection is updated
-//! **only** at turn-completion time — there are no durable mid-turn
-//! writes — so a crash can never leave the projection ahead of the
-//! latest completed checkpoint.
+//! per-thread conversation history lives. The committed history is
+//! updated **only** at turn-completion time, so a crash can never leave
+//! the committed projection ahead of the latest completed checkpoint.
+//!
+//! # Draft history
+//!
+//! Alongside the committed history, the projection carries an optional
+//! `draft_messages` list — the in-flight conversation accumulated since
+//! the last committed turn. Drafts exist so a turn that fails
+//! mid-stream (e.g. a transient LLM transport error after several
+//! suspension/resume cycles) can still surface its accumulated work to
+//! the next turn instead of vanishing entirely.
+//!
+//! Draft semantics:
+//! - Written at every tool-boundary suspension via
+//!   [`MessageProjection::set_draft`]: the suspension path snapshots
+//!   its full `suspended_messages` list into the draft slot.
+//! - Cleared on every successful turn commit via
+//!   [`MessageProjection::clear_draft`]: the committed history now
+//!   subsumes the draft, so the slot must be empty for the next
+//!   turn.
+//! - Survives task failure: `fail_root_turn` clears the failed task's
+//!   transient `TaskState` payload, but the projection's draft is
+//!   preserved on a separate row, so [`super::thread_recover`] can fold
+//!   the in-flight messages into the recovery view.
 //!
 //! # Mutation paths
 //!
 //! | Transition | What it does | Guard |
 //! |------------|--------------|-------|
-//! | [`MessageProjection::append_committed`] | Extends history, bumps version | Non-empty input |
-//! | [`MessageProjection::replace_history`] | Atomic swap, bumps version | — |
+//! | [`MessageProjection::append_committed`] | Extends committed history, bumps version | Non-empty input |
+//! | [`MessageProjection::replace_history`] | Atomic swap of committed history, bumps version | — |
+//! | [`MessageProjection::set_draft`] | Replace the in-flight draft, bumps version | — |
+//! | [`MessageProjection::clear_draft`] | Drop the in-flight draft, bumps version | — |
 //!
-//! Both transitions consume `self` and return a new
-//! `MessageProjection`, following the same pure-transition pattern as
+//! All transitions consume `self` and return a new `MessageProjection`,
+//! following the same pure-transition pattern as
 //! [`super::thread::Thread::apply_committed_turn`].
 //!
 //! # Version field
@@ -27,7 +50,8 @@
 //!
 //! Messages are stored in insertion order as `Vec<llm::Message>`.
 //! The outer projection row serializes with `snake_case` keys to
-//! match every other journal type.
+//! match every other journal type. `draft_messages` defaults to an
+//! empty list so older serialized rows still deserialize cleanly.
 
 use agent_sdk_core::{ThreadId, llm};
 use serde::{Deserialize, Serialize};
@@ -61,6 +85,17 @@ pub struct MessageProjection {
     pub thread_id: ThreadId,
     /// Ordered committed message history.
     pub messages: Vec<llm::Message>,
+    /// In-flight conversation accumulated since the last committed
+    /// turn.
+    ///
+    /// Populated by [`Self::set_draft`] at every tool-boundary
+    /// suspension and cleared by [`Self::clear_draft`] at turn
+    /// commit. Empty when no turn is in flight.
+    ///
+    /// `#[serde(default)]` keeps older serialized rows compatible —
+    /// they decode with an empty draft slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draft_messages: Vec<llm::Message>,
     /// Monotonically increasing version, bumped on every mutation.
     pub version: u64,
     /// When this projection row was first created.
@@ -78,6 +113,7 @@ impl MessageProjection {
         Self {
             thread_id,
             messages: Vec::new(),
+            draft_messages: Vec::new(),
             version: 0,
             created_at: now,
             updated_at: now,
@@ -122,10 +158,49 @@ impl MessageProjection {
         self
     }
 
+    /// Replace the in-flight draft messages.
+    ///
+    /// Called at every tool-boundary suspension with the full
+    /// `suspended_messages` list captured at that point. The draft
+    /// is overwritten (not appended) because each suspension carries
+    /// the complete in-flight history through that boundary.
+    ///
+    /// An empty `messages` argument is allowed and produces the same
+    /// observable state as [`Self::clear_draft`], but
+    /// [`Self::clear_draft`] is the canonical entry point for the
+    /// turn-commit path.
+    #[must_use]
+    pub fn set_draft(mut self, messages: Vec<llm::Message>, now: OffsetDateTime) -> Self {
+        self.draft_messages = messages;
+        self.version += 1;
+        self.updated_at = now;
+        self
+    }
+
+    /// Drop the in-flight draft messages.
+    ///
+    /// Called after a successful turn commit so the next turn starts
+    /// with no stale draft. No-op when the draft is already empty
+    /// (still bumps the version so writers can observe the
+    /// transition).
+    #[must_use]
+    pub fn clear_draft(mut self, now: OffsetDateTime) -> Self {
+        self.draft_messages = Vec::new();
+        self.version += 1;
+        self.updated_at = now;
+        self
+    }
+
     /// Number of messages in the committed history.
     #[must_use]
     pub const fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    /// `true` when an in-flight draft is currently held.
+    #[must_use]
+    pub const fn has_draft(&self) -> bool {
+        !self.draft_messages.is_empty()
     }
 }
 
@@ -311,6 +386,137 @@ mod tests {
         let p = p.replace_history(vec![], t_plus(2));
         assert_eq!(p.thread_id, thread_id());
         assert_eq!(p.created_at, t0());
+    }
+
+    // ── set_draft / clear_draft ───────────────────────────────────
+
+    #[test]
+    fn new_projection_has_no_draft() {
+        let p = MessageProjection::new(thread_id(), t0());
+        assert!(!p.has_draft());
+        assert!(p.draft_messages.is_empty());
+    }
+
+    #[test]
+    fn set_draft_stores_in_flight_messages_without_touching_committed() {
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p
+            .append_committed(vec![llm::Message::user("committed")], t_plus(1))
+            .unwrap();
+        assert_eq!(p.message_count(), 1);
+        assert_eq!(p.version, 1);
+
+        let p = p.set_draft(
+            vec![
+                llm::Message::user("turn 2 prompt"),
+                llm::Message::assistant("calling tool"),
+            ],
+            t_plus(2),
+        );
+        // Committed history is untouched.
+        assert_eq!(p.message_count(), 1);
+        // Draft now carries the in-flight messages.
+        assert!(p.has_draft());
+        assert_eq!(p.draft_messages.len(), 2);
+        assert_eq!(p.version, 2);
+        assert_eq!(p.updated_at, t_plus(2));
+    }
+
+    #[test]
+    fn set_draft_overwrites_prior_draft() {
+        // Each suspension passes the full accumulated suspended_messages,
+        // so set_draft must replace the slot rather than append.
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p.set_draft(vec![llm::Message::user("first suspension")], t_plus(1));
+        let p = p.set_draft(
+            vec![
+                llm::Message::user("first suspension"),
+                llm::Message::assistant("second tool boundary"),
+            ],
+            t_plus(2),
+        );
+        assert_eq!(p.draft_messages.len(), 2);
+        assert_eq!(p.version, 2);
+    }
+
+    #[test]
+    fn clear_draft_drops_in_flight_messages() {
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p.set_draft(vec![llm::Message::user("in flight")], t_plus(1));
+        assert!(p.has_draft());
+        let p = p.clear_draft(t_plus(2));
+        assert!(!p.has_draft());
+        assert_eq!(p.version, 2);
+        assert_eq!(p.updated_at, t_plus(2));
+    }
+
+    #[test]
+    fn clear_draft_on_empty_slot_still_bumps_version() {
+        // The store path may call clear_draft unconditionally on every
+        // commit — calling it with an already-empty slot must remain
+        // observable so optimistic-concurrency writers don't miss the
+        // transition.
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p.clear_draft(t_plus(1));
+        assert!(!p.has_draft());
+        assert_eq!(p.version, 1);
+    }
+
+    #[test]
+    fn draft_survives_commit_history_extensions_until_cleared() {
+        // Sanity: append_committed and replace_history operate on the
+        // committed slot only. The draft must persist verbatim until
+        // an explicit clear_draft / set_draft.
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p.set_draft(vec![llm::Message::user("draft")], t_plus(1));
+
+        let p = p
+            .append_committed(vec![llm::Message::user("committed-1")], t_plus(2))
+            .unwrap();
+        assert!(p.has_draft());
+        assert_eq!(p.draft_messages.len(), 1);
+
+        let p = p.replace_history(vec![llm::Message::user("[summary]")], t_plus(3));
+        assert!(p.has_draft());
+        assert_eq!(p.draft_messages.len(), 1);
+    }
+
+    #[test]
+    fn draft_round_trips_through_json() -> anyhow::Result<()> {
+        let p = MessageProjection::new(thread_id(), t0());
+        let p = p.set_draft(
+            vec![
+                llm::Message::user("draft prompt"),
+                llm::Message::assistant("draft asst"),
+            ],
+            t_plus(1),
+        );
+        let json = serde_json::to_string(&p)?;
+        let recovered: MessageProjection = serde_json::from_str(&json)?;
+        assert!(recovered.has_draft());
+        assert_eq!(recovered.draft_messages.len(), 2);
+        assert_eq!(recovered.version, p.version);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_json_without_draft_field_decodes_empty() -> anyhow::Result<()> {
+        // Older daemons serialized rows before draft_messages existed.
+        // The field is `#[serde(default)]` so legacy payloads must
+        // still round-trip with an empty draft slot.
+        let legacy = serde_json::json!({
+            "thread_id": "t-msg-test",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ],
+            "version": 1,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+        });
+        let recovered: MessageProjection = serde_json::from_value(legacy)?;
+        assert!(!recovered.has_draft());
+        assert_eq!(recovered.messages.len(), 1);
+        Ok(())
     }
 
     // ── wire format ───────────────────────────────────────────────

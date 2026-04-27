@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, version, created_at, updated_at)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)\nON CONFLICT (thread_id) DO UPDATE SET\n    history_json = excluded.history_json,\n    draft_messages_json = excluded.draft_messages_json,\n    version = excluded.version,\n    updated_at = excluded.updated_at\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "0df816599d7467edef8a714b38232aa432f07232a24504d623f67abba3a55f48"
+}

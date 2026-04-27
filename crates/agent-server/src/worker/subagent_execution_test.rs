@@ -445,6 +445,7 @@ async fn suspend_child_root_on_tool_call(
         bootstrap(child_running.clone(), child_definition_with_tools())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         t_plus(3),
     )
     .await?;
@@ -557,6 +558,7 @@ async fn resume_child_root_to_completion(
         bootstrap(child_resumable.clone(), child_definition_with_tools())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         t_plus(7),
     )
     .await?;
@@ -882,6 +884,7 @@ async fn resume_parent_after_subagent(
         bootstrap(parent_running.clone(), sample_definition())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         t_plus(11),
     )
     .await?;

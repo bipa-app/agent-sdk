@@ -101,7 +101,10 @@ impl RootWorkerInputs {
 /// This is the primary entry point for Phase 4.2 context reconstruction.
 /// It:
 ///
-/// 1. Recovers the thread state via Phase 3.5's [`recover_thread`].
+/// 1. Recovers the thread state via Phase 3.5's [`recover_thread`],
+///    folding in any in-flight draft messages from the message
+///    projection so a turn that previously failed mid-stream picks
+///    up its accumulated work.
 /// 2. Validates the task is bound to the same thread.
 /// 3. Seeds staged stores from the recovery view.
 /// 4. Returns [`RootWorkerInputs`] ready for turn execution.
@@ -116,12 +119,20 @@ pub async fn build_root_worker_inputs(
     bootstrap: WorkerBootstrapContext,
     thread_store: &dyn ThreadStore,
     checkpoint_store: &dyn CheckpointStore,
+    message_store: &dyn super::message_store::MessageProjectionStore,
     now: OffsetDateTime,
 ) -> Result<RootWorkerInputs> {
-    // 1. Recover thread state from the latest checkpoint.
-    let recovery_view = recover_thread(&bootstrap.thread_id, thread_store, checkpoint_store, now)
-        .await
-        .context("build_root_worker_inputs: recover thread")?;
+    // 1. Recover thread state from the latest checkpoint plus any
+    //    in-flight draft.
+    let recovery_view = recover_thread(
+        &bootstrap.thread_id,
+        thread_store,
+        checkpoint_store,
+        message_store,
+        now,
+    )
+    .await
+    .context("build_root_worker_inputs: recover thread")?;
 
     // 2. Validate task is bound to the bootstrap thread.
     ensure_thread_match(&bootstrap.thread_id, &bootstrap.task.thread_id)?;
@@ -302,9 +313,10 @@ mod tests {
         let task = root_task(&thread_a());
         let bootstrap = sample_bootstrap(task);
 
-        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
-            .await
-            .context("build")?;
+        let inputs =
+            build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, &s.messages, t0())
+                .await
+                .context("build")?;
 
         // Recovery view is for a fresh thread.
         assert_eq!(inputs.recovery_view.next_turn_number, 1);
@@ -373,9 +385,15 @@ mod tests {
         // Build inputs for a new task on the same thread.
         let task = root_task(&thread_a());
         let bootstrap = sample_bootstrap(task);
-        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t_plus(3))
-            .await
-            .context("build")?;
+        let inputs = build_root_worker_inputs(
+            bootstrap,
+            &s.threads,
+            &s.checkpoints,
+            &s.messages,
+            t_plus(3),
+        )
+        .await
+        .context("build")?;
 
         // Recovery view has the committed state.
         assert_eq!(inputs.recovery_view.next_turn_number, 3);
@@ -429,9 +447,15 @@ mod tests {
 
         let task = root_task(&thread_a());
         let bootstrap = sample_bootstrap(task);
-        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t_plus(2))
-            .await
-            .context("build")?;
+        let inputs = build_root_worker_inputs(
+            bootstrap,
+            &s.threads,
+            &s.checkpoints,
+            &s.messages,
+            t_plus(2),
+        )
+        .await
+        .context("build")?;
 
         // Mutate staged stores.
         inputs
@@ -470,9 +494,10 @@ mod tests {
         let s = Stores::new();
         let task = root_task(&thread_a());
         let bootstrap = sample_bootstrap(task);
-        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
-            .await
-            .context("build")?;
+        let inputs =
+            build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, &s.messages, t0())
+                .await
+                .context("build")?;
 
         // Simulate turn work.
         inputs
@@ -527,10 +552,11 @@ mod tests {
             task,
         };
 
-        let err = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
-            .await
-            .err()
-            .expect("should reject mismatched thread_id");
+        let err =
+            build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, &s.messages, t0())
+                .await
+                .err()
+                .expect("should reject mismatched thread_id");
         assert!(
             err.to_string().contains("does not match"),
             "expected mismatch error, got: {err}",
@@ -572,9 +598,10 @@ mod tests {
             task,
         };
 
-        let inputs = build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, t0())
-            .await
-            .context("build")?;
+        let inputs =
+            build_root_worker_inputs(bootstrap, &s.threads, &s.checkpoints, &s.messages, t0())
+                .await
+                .context("build")?;
 
         assert_eq!(inputs.definition().model, "gpt-5");
         assert_eq!(inputs.definition().system_prompt, "test prompt");

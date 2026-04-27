@@ -278,7 +278,14 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_replay()).await?;
     let ctx = bootstrap(task, definition_with_thinking());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = ThinkingTextProvider {
         thinking: "Let me think about this...".into(),
@@ -323,11 +330,19 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
 /// between `ToolCallStart` and `ToolCallEnd`.
 #[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn tool_progress_events_are_durable() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_replay()).await?;
     let ctx = bootstrap(task, definition_with_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // Suspend to create a child tool task.
     let provider = ThinkingToolCallProvider {
@@ -495,8 +510,14 @@ async fn execute_child_and_resume(
             .clone()
             .context("parent has no lease_id")?,
     };
-    let resume_inputs =
-        build_root_worker_inputs(resume_ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let resume_inputs = build_root_worker_inputs(
+        resume_ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
     resume_from_children(resume_inputs, &parent_acq, provider, &stores.deps(), t0()).await?;
     Ok(())
 }
@@ -509,7 +530,14 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_replay()).await?;
     let ctx = bootstrap(task, definition_with_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = ThinkingToolCallProvider {
         thinking: "I should run this command".into(),
@@ -610,7 +638,14 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
         ..sample_definition()
     };
     let ctx = bootstrap(task, def.clone());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // Provider that returns two tool calls on first call, text on resume.
     let provider = ThinkingToolCallProvider {
@@ -698,7 +733,14 @@ async fn empty_collector_adds_no_events() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_replay()).await?;
     let ctx = bootstrap(task, definition_with_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = ThinkingToolCallProvider {
         thinking: String::new(),

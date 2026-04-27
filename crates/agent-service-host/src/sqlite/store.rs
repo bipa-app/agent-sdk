@@ -299,7 +299,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
     ) -> Result<MessageProjection> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -320,10 +320,14 @@ WHERE thread_id = ?1
             let thread_id_key = thread_key(thread_id);
             let history_json = json_to_value(&fresh.messages, "message head bootstrap history")?;
             let version = i64_from_u64(fresh.version, "message head bootstrap version")?;
+            // Bootstrap the row with `draft_messages_json = NULL` —
+            // a fresh thread has no in-flight turn. The full upsert
+            // path (`upsert_message_head_tx`) carries the actual
+            // draft once a suspension boundary fires.
             sqlx::query(
                 r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, version, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, version, created_at, updated_at)
+VALUES (?1, ?2, NULL, ?3, ?4, ?5)
 ON CONFLICT (thread_id) DO NOTHING
 ",
             )
@@ -345,7 +349,7 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<Option<MessageProjection>> {
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
-SELECT thread_id, history_json, version, created_at, updated_at
+SELECT thread_id, history_json, draft_messages_json, version, created_at, updated_at
 FROM agent_sdk_message_heads
 WHERE thread_id = ?1
 ",
@@ -363,18 +367,31 @@ WHERE thread_id = ?1
     ) -> Result<()> {
         let thread_id_key = thread_key(&projection.thread_id);
         let history_json = json_to_value(&projection.messages, "message head history")?;
+        // Persist `draft_messages` as NULL when empty so the column
+        // distinguishes "no in-flight turn" from "explicit empty
+        // draft" — matches the intent the migration documents.
+        let draft_messages_json = if projection.draft_messages.is_empty() {
+            None
+        } else {
+            Some(json_to_value(
+                &projection.draft_messages,
+                "message head draft messages",
+            )?)
+        };
         let version = i64_from_u64(projection.version, "message head version")?;
         sqlx::query!(
             r"
-INSERT INTO agent_sdk_message_heads (thread_id, history_json, version, created_at, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5)
+INSERT INTO agent_sdk_message_heads (thread_id, history_json, draft_messages_json, version, created_at, updated_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ON CONFLICT (thread_id) DO UPDATE SET
     history_json = excluded.history_json,
+    draft_messages_json = excluded.draft_messages_json,
     version = excluded.version,
     updated_at = excluded.updated_at
 ",
             thread_id_key,
             history_json,
+            draft_messages_json,
             version,
             projection.created_at,
             projection.updated_at,
@@ -1270,9 +1287,16 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
 
         let projection_before =
             Self::get_message_head_tx(&mut tx, &params.thread_id, params.now).await?;
+        // Append the committed turn's messages AND clear any
+        // in-flight draft in the same transaction. Without the
+        // draft clear, a crash window between this transaction and
+        // an out-of-band `clear_draft` call would let the next
+        // recovery view see committed turn N's messages duplicated
+        // through the still-populated draft slot.
         let updated_projection = projection_before
             .append_committed(params.messages.clone(), params.now)
-            .context("append committed messages inside sqlite completed-turn transaction")?;
+            .context("append committed messages inside sqlite completed-turn transaction")?
+            .clear_draft(params.now);
 
         Self::insert_message_commit_tx(
             &mut tx,
@@ -2404,6 +2428,39 @@ impl MessageProjectionStore for SqliteDurableStore {
         tx.commit().await.context("commit replace_history")?;
         Ok(updated)
     }
+
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut tx = self.begin().await?;
+        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
+        let updated = projection.set_draft(messages, now);
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit set_draft")?;
+        Ok(updated)
+    }
+
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<MessageProjection>> {
+        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+            // No projection row exists yet — nothing to clear. The
+            // commit path treats this as a no-op so first-turn
+            // happy-paths don't bootstrap rows just to clear them.
+            return Ok(None);
+        };
+        let updated = projection.clear_draft(now);
+        let mut tx = self.begin().await?;
+        Self::upsert_message_head_tx(&mut tx, &updated).await?;
+        tx.commit().await.context("commit clear_draft")?;
+        Ok(Some(updated))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3387,6 +3444,10 @@ impl TryFrom<ThreadRecord> for Thread {
 struct MessageHeadRecord {
     thread_id: String,
     history_json: serde_json::Value,
+    /// In-flight draft snapshot, NULL when no turn is suspended.
+    /// Populated by the worker at every tool-boundary suspension and
+    /// cleared atomically by `commit_completed_turn_atomic_inner`.
+    draft_messages_json: Option<serde_json::Value>,
     version: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -3395,9 +3456,14 @@ struct MessageHeadRecord {
 impl TryFrom<MessageHeadRecord> for MessageProjection {
     type Error = anyhow::Error;
     fn try_from(r: MessageHeadRecord) -> Result<Self> {
+        let draft_messages = match r.draft_messages_json {
+            Some(value) => json_from_value(value, "message head draft messages")?,
+            None => Vec::new(),
+        };
         Ok(Self {
             thread_id: ThreadId::from_string(r.thread_id),
             messages: json_from_value(r.history_json, "message head history")?,
+            draft_messages,
             version: u64_from_i64(r.version, "message head version")?,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -4596,6 +4662,127 @@ mod tests {
             OutboxStore::reclaim_expired_claims(&store, t_plus(6), time::Duration::seconds(30))
                 .await?;
         assert_eq!(reclaimed, 0);
+
+        Ok(())
+    }
+
+    /// `SQLite` end-to-end of the lost-history fix:
+    ///
+    /// `set_draft` round-trips through the new `draft_messages_json`
+    /// column, persists across reconnects (the migration applies
+    /// cleanly to a fresh DB), and the atomic completed-turn
+    /// transaction wipes the slot atomically with the message
+    /// commit so a recovery between the two never sees committed +
+    /// draft duplicated.
+    #[tokio::test]
+    async fn draft_messages_persist_until_atomic_commit_clears_them() -> Result<()> {
+        use agent_sdk_core::llm;
+        use agent_sdk_core::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::commit::CompletedTurnCommit;
+        use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
+        use agent_server::journal::message_store::MessageProjectionStore;
+        use agent_server::journal::task::AgentTask;
+        use agent_server::journal::turn_attempt::{
+            CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
+        };
+        use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-draft");
+
+        // 1. Suspension snapshot — the worker writes the
+        //    accumulated `suspended_messages` to the projection draft
+        //    after every tool boundary.
+        let suspended = vec![
+            llm::Message::user("user prompt"),
+            llm::Message::assistant("calling tool"),
+        ];
+        let projection_after_suspend =
+            MessageProjectionStore::set_draft(&store, &thread_id, suspended.clone(), t_plus(1))
+                .await?;
+        assert!(projection_after_suspend.has_draft());
+        assert_eq!(projection_after_suspend.draft_messages.len(), 2);
+
+        // 2. Reload from disk to prove the new column round-trips.
+        let reloaded = MessageProjectionStore::get(&store, &thread_id)
+            .await?
+            .context("projection persisted")?;
+        assert!(reloaded.has_draft());
+        assert_eq!(reloaded.draft_messages.len(), 2);
+
+        // 3. Submit a real root task — `agent_sdk_message_commits`
+        //    has a FK to `agent_sdk_tasks` so the commit transaction
+        //    needs an existing task row to reference.
+        let task = AgentTask::new_root_turn(thread_id.clone(), t_plus(2), 3);
+        let task_id = task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, task).await?;
+
+        // 4. Open an attempt for the upcoming commit. The
+        //    completed-turn transaction validates the attempt id, so
+        //    we need a real one.
+        let attempt = TurnAttemptStore::open_attempt(
+            &store,
+            OpenAttemptParams {
+                task_id: task_id.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                request_blob: serde_json::json!({"messages": []}),
+                now: t_plus(2),
+            },
+        )
+        .await?;
+
+        // 5. Atomically commit the turn. The transaction must clear
+        //    the draft as the same write that appends committed
+        //    history, so a crash-and-reload between the two would be
+        //    impossible.
+        let final_messages = vec![
+            llm::Message::user("user prompt"),
+            llm::Message::assistant("final reply"),
+        ];
+        let commit = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
+            &store,
+            CompletedTurnCommit {
+                thread_id: thread_id.clone(),
+                task_id,
+                turn_attempt_id: attempt.id.clone(),
+                close_attempt_params: CloseAttemptParams {
+                    response_blob: serde_json::json!({"id": "msg_01"}),
+                    response_id: Some("msg_01".into()),
+                    response_model: Some("claude-sonnet-4-5-20250929".into()),
+                    stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+                    outcome: TurnAttemptOutcome::Success,
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cached_input_tokens: 0,
+                },
+                messages: final_messages,
+                turn_usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
+                now: t_plus(3),
+            },
+        )
+        .await?;
+        assert_eq!(commit.checkpoint.turn_number, 1);
+
+        // 6. Final state: committed history present, draft cleared.
+        let projection_after_commit = MessageProjectionStore::get(&store, &thread_id)
+            .await?
+            .context("projection persisted")?;
+        assert!(
+            !projection_after_commit.has_draft(),
+            "atomic commit must wipe the draft as part of the same transaction",
+        );
+        assert_eq!(
+            projection_after_commit.message_count(),
+            2,
+            "committed history reflects the turn's final messages",
+        );
 
         Ok(())
     }

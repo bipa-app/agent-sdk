@@ -532,6 +532,7 @@ async fn suspend_child_root_on_tool_call(
         bootstrap(child_running.clone(), child_definition_with_tools())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         at_acquire,
     )
     .await?;
@@ -634,6 +635,7 @@ async fn drive_child_to_completion(
         bootstrap(child_resume.clone(), child_definition_with_tools())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         clock,
     )
     .await?;
@@ -693,6 +695,7 @@ async fn resume_parent_root(
         bootstrap(parent_running.clone(), sample_definition())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         at,
     )
     .await?;
@@ -862,6 +865,7 @@ async fn resume_child_root_to_completion(
         bootstrap(child_resume.clone(), child_definition_with_tools())?,
         &stores.threads,
         &stores.checkpoints,
+        &stores.messages,
         acquire_at,
     )
     .await?;

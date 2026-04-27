@@ -9,29 +9,41 @@
 //!    `committed_turns` and `total_usage`).
 //! 3. Appends messages to the message projection.
 //! 4. Creates a checkpoint for `(thread_id, turn_number)`.
+//! 5. Clears any in-flight draft on the message projection — the
+//!    suspension paths populate this slot at every tool boundary so
+//!    a mid-turn failure can still surface the conversation through
+//!    [`super::thread_recover`]. A successful commit subsumes the
+//!    draft, so it must be wiped before the next turn starts.
 //!
 //! If any step fails the function returns `Err` and no subsequent
 //! steps execute. For the in-memory stores each individual call is
 //! internally atomic (single write-lock scope). Durable backends can
 //! expose an atomic transaction hook through
 //! [`super::thread_store::ThreadStore::atomic_completed_turn_committer`]
-//! so this helper routes steps 1-4 through one database transaction.
+//! so this helper routes steps 1-5 through one database transaction.
+//! Atomic backends are responsible for clearing the draft as part of
+//! their transaction — the helper does not call `clear_draft` after
+//! the atomic hook returns, because doing so outside the transaction
+//! would open a tiny crash window where committed history and draft
+//! could both contain the same messages.
 //!
 //! # Guarantees
 //!
 //! - A completed turn creates **exactly one** checkpoint for
 //!   `(thread_id, turn_number)`.
-//! - Thread aggregate, message projection, closed turn attempt, and
-//!   checkpoint commit together.
+//! - Thread aggregate, message projection, closed turn attempt,
+//!   checkpoint, and draft cleanup commit together.
 //! - Failed or cancelled turns that never call this function do not
-//!   create checkpoints.
+//!   create checkpoints, but the draft persisted at the most recent
+//!   suspension boundary survives so the next turn can recover the
+//!   in-flight conversation.
 //!
 //! # What this module does **not** own
 //!
 //! - Recovery loaders — see [`super::thread_recover`].
 //! - Task state transitions — the caller is responsible for calling
 //!   [`super::store::AgentTaskStore::complete_task`] separately.
-//! - Event persistence — lifecycle events are committed as step 5
+//! - Event persistence — lifecycle events are committed as step 6
 //!   after all state projections (Phase 6.2).
 
 use agent_sdk_core::events::AgentEvent;
@@ -189,7 +201,7 @@ pub async fn commit_completed_turn(
     //
     let checkpoint = checkpoint_store
         .commit_checkpoint(NewCheckpointParams {
-            thread_id: params.thread_id,
+            thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
             messages: updated_projection.messages,
@@ -200,7 +212,26 @@ pub async fn commit_completed_turn(
         .await
         .context("commit: create checkpoint")?;
 
-    // 5. Commit lifecycle events. Skipped when no events are provided
+    // 5. Clear the in-flight draft so the next turn starts with a
+    //    clean slot. The committed history and checkpoint we just
+    //    wrote already contain everything the suspension path
+    //    snapshotted into the draft. Calling `clear_draft` is safe
+    //    when the slot is already empty — the store returns `None`
+    //    on first-turn threads with no projection row yet, which
+    //    means there was nothing to clear in the first place.
+    //
+    //    The non-atomic path (in-memory stores) accepts a tiny race
+    //    window: a concurrent reader between step 4 and step 5 could
+    //    observe the committed history together with a stale draft.
+    //    Durable backends close this gap by clearing the draft inside
+    //    their atomic completed-turn transaction; see the module
+    //    docs.
+    message_store
+        .clear_draft(&params.thread_id, params.now)
+        .await
+        .context("commit: clear in-flight draft")?;
+
+    // 6. Commit lifecycle events. Skipped when no events are provided
     //    (e.g. callers that don't produce lifecycle events yet).
     let committed_events = if events.is_empty() {
         Vec::new()
@@ -682,6 +713,108 @@ mod tests {
         // Only 1 checkpoint exists (from the first commit).
         let list = s.checkpoints.list_by_thread(&thread_a()).await?;
         assert_eq!(list.len(), 1);
+        Ok(())
+    }
+
+    // ── Draft cleanup ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn commit_clears_in_flight_draft() -> Result<()> {
+        // Simulate a turn that suspended at one or more tool boundaries
+        // (populating the message-projection draft) and then completed
+        // text-only. The commit must wipe the draft so the next turn
+        // doesn't see the in-flight messages duplicated against the
+        // committed history.
+        let s = Stores::new();
+        let task_id = AgentTaskId::from_string("task_draft_clear");
+        let attempt_id = s.open_attempt(&task_id, 1).await;
+
+        // Pre-populate a draft as the suspension paths would.
+        s.messages
+            .set_draft(
+                &thread_a(),
+                vec![
+                    llm::Message::user("user prompt"),
+                    llm::Message::assistant("calling tool"),
+                ],
+                t_plus(2),
+            )
+            .await
+            .context("seed draft")?;
+        let projection = s
+            .messages
+            .get(&thread_a())
+            .await?
+            .context("projection bootstrapped")?;
+        assert!(projection.has_draft(), "draft must be present pre-commit");
+
+        commit_completed_turn(
+            CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id,
+                turn_attempt_id: attempt_id,
+                close_attempt_params: sample_close_params(),
+                messages: sample_messages(),
+                turn_usage: usage(100, 50),
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
+                now: t_plus(5),
+            },
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("commit")?;
+
+        let projection_after = s
+            .messages
+            .get(&thread_a())
+            .await?
+            .context("projection still present after commit")?;
+        assert!(
+            !projection_after.has_draft(),
+            "commit must clear the in-flight draft so the next turn starts clean"
+        );
+        // Committed history still has the turn's messages.
+        assert_eq!(projection_after.message_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_succeeds_when_no_draft_was_set() -> Result<()> {
+        // First-turn happy path: nothing ever called set_draft, the
+        // projection row may not even exist yet. The commit's
+        // clear_draft call must not error out — the store returns
+        // `None` and the commit proceeds.
+        let s = Stores::new();
+        let task_id = AgentTaskId::from_string("task_no_draft");
+        let attempt_id = s.open_attempt(&task_id, 1).await;
+
+        let outcome = commit_completed_turn(
+            CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id,
+                turn_attempt_id: attempt_id,
+                close_attempt_params: sample_close_params(),
+                messages: sample_messages(),
+                turn_usage: usage(100, 50),
+                agent_state_snapshot: serde_json::json!({}),
+                events: Vec::new(),
+                now: t_plus(1),
+            },
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("commit without prior draft")?;
+
+        assert_eq!(outcome.checkpoint.turn_number, 1);
         Ok(())
     }
 

@@ -290,9 +290,15 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap(task);
-    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
-        .await
-        .context("build inputs")?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
 
     let provider = MockTextProvider::new("hello");
     let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t0()).await?;
@@ -342,9 +348,15 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap(task);
-    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
-        .await
-        .context("build inputs")?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
 
     let provider = MockTextProvider::with_refusal("I cannot do that");
     let outcome =
@@ -393,9 +405,15 @@ async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
-        .await
-        .context("build inputs")?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
 
     let provider = MockToolCallProvider::new(vec![
         (
@@ -450,9 +468,15 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
-        .await
-        .context("build inputs")?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
 
     // Suspend to create child tasks.
     let provider = MockToolCallProvider::new(vec![(
@@ -525,9 +549,15 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs = build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0())
-        .await
-        .context("build inputs")?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
 
     let provider = MockToolCallProvider::new(vec![(
         "tc_fail".into(),
@@ -679,9 +709,14 @@ async fn execute_child_and_resume(
         worker_id: WorkerId::from_string("worker_resume"),
         lease_id: parent_acq.lease_id.clone().unwrap(),
     };
-    let resume_inputs =
-        build_root_worker_inputs(resume_bootstrap, &stores.threads, &stores.checkpoints, t0())
-            .await?;
+    let resume_inputs = build_root_worker_inputs(
+        resume_bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     resume_from_children(resume_inputs, &parent_acq, provider, &stores.deps(), t0()).await?;
     Ok(())
@@ -693,8 +728,14 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // Step 1: suspend (emits ToolCallStart).
     let provider = MockToolCallProvider::new(vec![(
@@ -758,8 +799,14 @@ async fn committed_events_returned_in_outcome_types() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = MockTextProvider::new("result");
     let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t0()).await?;
