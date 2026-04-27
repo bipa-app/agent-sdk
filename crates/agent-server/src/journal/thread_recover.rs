@@ -12,16 +12,28 @@
 //! 3. If the thread has committed turns, loads the latest completed
 //!    checkpoint and validates that its `turn_number` matches
 //!    `thread.committed_turns`.
-//! 4. Returns a [`ThreadRecoveryView`] containing the committed
-//!    message history, agent-state snapshot, and next turn number
-//!    — everything a caller needs to resume the conversation.
+//! 4. Loads any in-flight draft from the message projection so a
+//!    turn that suspended at a tool boundary and then failed
+//!    mid-stream surfaces its accumulated conversation through the
+//!    next-turn view instead of vanishing.
+//! 5. Returns a [`ThreadRecoveryView`] containing the committed
+//!    message history followed by any in-flight draft messages,
+//!    agent-state snapshot, and next turn number — everything a
+//!    caller needs to resume the conversation.
 //!
 //! # Design properties
 //!
-//! - **Checkpoint-only recovery** — the view is built exclusively
-//!   from the latest completed checkpoint. Failed or in-progress
-//!   attempts that never called [`super::commit::commit_completed_turn`]
-//!   do not pollute the recovered state.
+//! - **Checkpoint-anchored recovery** — the committed-history portion
+//!   of the view is built exclusively from the latest completed
+//!   checkpoint. Failed or in-progress attempts that never called
+//!   [`super::commit::commit_completed_turn`] do not advance the
+//!   committed state.
+//! - **Draft awareness** — when a turn fails after one or more
+//!   suspension boundaries, the draft slot on the message projection
+//!   carries the in-flight `suspended_messages`. The recovery view
+//!   appends them to the committed history so the next turn picks up
+//!   the work the failed turn already did. The draft is cleared on
+//!   the next successful commit.
 //! - **Sequential root-task continuity** — checkpoints record which
 //!   task produced them, but the recovery view is task-agnostic. A
 //!   new root task on the same thread picks up from the last
@@ -38,6 +50,12 @@
 //!   [`super::recovery`].
 //! - Context compaction — a future concern; recovery serves the raw
 //!   checkpoint history.
+//! - Dangling tool-use repair — when the draft ends in an assistant
+//!   `tool_use` block whose results never landed (the failure
+//!   happened during the resume LLM call), the upstream caller is
+//!   responsible for synthesising failed tool-result blocks before
+//!   submitting the history to a model. The journal preserves the
+//!   raw draft as captured at the last suspension.
 
 use agent_sdk_core::{ThreadId, llm};
 use anyhow::{Context, Result, bail};
@@ -45,6 +63,7 @@ use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
 use super::checkpoint_store::CheckpointStore;
+use super::message_store::MessageProjectionStore;
 use super::thread::Thread;
 use super::thread_store::ThreadStore;
 
@@ -52,7 +71,8 @@ use super::thread_store::ThreadStore;
 // Recovery view
 // ─────────────────────────────────────────────────────────────────────
 
-/// The next-turn view rebuilt from the latest completed checkpoint.
+/// The next-turn view rebuilt from the latest completed checkpoint
+/// plus any in-flight draft.
 ///
 /// This is the single output type that a caller (future agent loop,
 /// transport layer, etc.) needs to resume a conversation on a thread.
@@ -64,15 +84,26 @@ use super::thread_store::ThreadStore;
 /// | Aggregate | `thread` |
 /// | Snapshot | `messages`, `agent_state_snapshot` |
 /// | Cursor | `next_turn_number` |
-/// | Source | `latest_checkpoint` |
+/// | Source | `latest_checkpoint`, `draft_messages` |
 #[derive(Clone, Debug)]
 pub struct ThreadRecoveryView {
     /// The thread aggregate at recovery time.
     pub thread: Thread,
 
-    /// Committed message history from the latest checkpoint.
+    /// Full message history available to the next turn.
     ///
-    /// Empty for a fresh thread (no committed turns).
+    /// Layout: `[committed history from latest checkpoint] + [draft
+    /// messages captured at the most recent suspension]`. Either
+    /// half can be empty:
+    ///
+    /// - A fresh thread (no committed turns, no in-flight turn) has
+    ///   an empty list.
+    /// - A thread with only committed turns has just the checkpoint
+    ///   history.
+    /// - A thread that failed mid-turn has the committed history
+    ///   followed by the draft snapshot from the last suspension —
+    ///   exactly what the failed turn was working with up to its
+    ///   last tool boundary.
     pub messages: Vec<llm::Message>,
 
     /// Opaque agent-state blob from the latest checkpoint.
@@ -83,6 +114,16 @@ pub struct ThreadRecoveryView {
     /// The checkpoint the view was built from, or `None` if the
     /// thread has no committed turns.
     pub latest_checkpoint: Option<Checkpoint>,
+
+    /// In-flight draft messages folded into [`Self::messages`], or
+    /// an empty vec when no draft is present.
+    ///
+    /// Exposed separately so callers that need to distinguish "the
+    /// committed conversation" from "what an interrupted turn left
+    /// behind" can do so without diffing against the checkpoint —
+    /// for example, to render a "previous attempt was interrupted
+    /// — continuing" notice.
+    pub draft_messages: Vec<llm::Message>,
 
     /// The turn number the next attempt should target.
     ///
@@ -95,15 +136,18 @@ pub struct ThreadRecoveryView {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Recover the next-turn view for `thread_id` from the latest
-/// completed checkpoint.
+/// completed checkpoint and any in-flight draft.
 ///
 /// This is the primary entry point for Phase 3.5 thread recovery.
 ///
 /// # Fresh threads
 ///
-/// If the thread has zero committed turns the function returns a view
-/// with empty messages, a null agent-state snapshot, and
-/// `next_turn_number = 1`.
+/// If the thread has zero committed turns AND no draft, the function
+/// returns a view with empty messages, a null agent-state snapshot,
+/// and `next_turn_number = 1`. A draft on a fresh thread (rare but
+/// possible: the very first turn suspended at a tool boundary and
+/// then failed before any commit) still surfaces in `messages` so
+/// the next turn picks up the in-flight conversation.
 ///
 /// # Consistency guard
 ///
@@ -122,6 +166,7 @@ pub async fn recover_thread(
     thread_id: &ThreadId,
     thread_store: &dyn ThreadStore,
     checkpoint_store: &dyn CheckpointStore,
+    message_store: &dyn MessageProjectionStore,
     now: OffsetDateTime,
 ) -> Result<ThreadRecoveryView> {
     // 1. Load or bootstrap the thread aggregate.
@@ -135,18 +180,34 @@ pub async fn recover_thread(
         bail!("recover: thread {thread_id} is already completed, no new turns can be committed");
     }
 
-    // 3. Fresh thread — no checkpoints to load.
+    // 3. Load the in-flight draft, if any. The projection row may
+    //    not exist yet (very first turn never wrote anything), in
+    //    which case the draft is empty.
+    let draft_messages = match message_store
+        .get(thread_id)
+        .await
+        .context("recover: load message projection")?
+    {
+        Some(projection) => projection.draft_messages,
+        None => Vec::new(),
+    };
+
+    // 4. Fresh thread — no checkpoints to load. The draft may still
+    //    be populated if the very first turn suspended and then
+    //    failed before any commit, so it's included in `messages`
+    //    even on the no-checkpoint path.
     if thread.committed_turns == 0 {
         return Ok(ThreadRecoveryView {
             thread,
-            messages: Vec::new(),
+            messages: draft_messages.clone(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            draft_messages,
             next_turn_number: 1,
         });
     }
 
-    // 4. Load the latest completed checkpoint.
+    // 5. Load the latest completed checkpoint.
     let checkpoint = checkpoint_store
         .get_latest_by_thread(thread_id)
         .await
@@ -160,7 +221,7 @@ pub async fn recover_thread(
         );
     };
 
-    // 5. Consistency guard: checkpoint turn_number must match the
+    // 6. Consistency guard: checkpoint turn_number must match the
     //    thread's committed_turns.
     if checkpoint.turn_number != thread.committed_turns {
         bail!(
@@ -171,12 +232,17 @@ pub async fn recover_thread(
         );
     }
 
+    // 7. Build the merged message list: committed checkpoint history
+    //    followed by the in-flight draft (if any).
     let next_turn = thread.committed_turns + 1;
+    let mut messages = checkpoint.messages.clone();
+    messages.extend(draft_messages.iter().cloned());
     Ok(ThreadRecoveryView {
         thread,
-        messages: checkpoint.messages.clone(),
+        messages,
         agent_state_snapshot: checkpoint.agent_state_snapshot.clone(),
         latest_checkpoint: Some(checkpoint),
+        draft_messages,
         next_turn_number: next_turn,
     })
 }
@@ -317,7 +383,7 @@ mod tests {
     async fn recover_fresh_thread_returns_empty_view() -> Result<()> {
         let s = Stores::new();
 
-        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover")?;
 
@@ -348,7 +414,7 @@ mod tests {
         .await
         .context("commit")?;
 
-        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover")?;
 
@@ -405,7 +471,7 @@ mod tests {
         .await
         .context("turn 3")?;
 
-        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover")?;
 
@@ -454,7 +520,7 @@ mod tests {
         .context("A turn 2")?;
 
         // Task B (a new root task on the same thread) recovers.
-        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover for B")?;
 
@@ -479,7 +545,7 @@ mod tests {
         .await
         .context("B turn 3")?;
 
-        let view2 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view2 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover after B")?;
 
@@ -519,7 +585,7 @@ mod tests {
         let _failed_attempt_id = s.open_attempt(&task_fail, 1).await?;
 
         // Recovery should still see only the good turn.
-        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let view = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .context("recover")?;
 
@@ -573,8 +639,10 @@ mod tests {
         )
         .await?;
 
-        let view_a = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0()).await?;
-        let view_b = recover_thread(&thread_b(), &s.threads, &s.checkpoints, t0()).await?;
+        let view_a =
+            recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0()).await?;
+        let view_b =
+            recover_thread(&thread_b(), &s.threads, &s.checkpoints, &s.messages, t0()).await?;
 
         assert_eq!(view_a.thread.committed_turns, 2);
         assert_eq!(view_a.next_turn_number, 3);
@@ -608,7 +676,7 @@ mod tests {
             .await
             .context("mark completed")?;
 
-        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .unwrap_err();
         assert!(
@@ -631,7 +699,7 @@ mod tests {
             .await
             .context("advance")?;
 
-        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .unwrap_err();
         assert!(
@@ -677,7 +745,7 @@ mod tests {
 
         // Thread says 3 committed turns, but latest checkpoint is
         // at turn 2.
-        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0())
+        let err = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
             .await
             .unwrap_err();
         assert!(
@@ -705,8 +773,8 @@ mod tests {
         .await
         .context("commit")?;
 
-        let v1 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0()).await?;
-        let v2 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, t0()).await?;
+        let v1 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0()).await?;
+        let v2 = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0()).await?;
 
         assert_eq!(v1.thread.committed_turns, v2.thread.committed_turns);
         assert_eq!(v1.next_turn_number, v2.next_turn_number);

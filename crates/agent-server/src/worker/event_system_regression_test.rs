@@ -332,7 +332,14 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx = bootstrap(task, definition_with_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = MockToolCallProvider {
         tool_calls: vec![(
@@ -403,8 +410,14 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
             .clone()
             .context("parent has no lease_id")?,
     };
-    let resume_inputs =
-        build_root_worker_inputs(resume_ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let resume_inputs = build_root_worker_inputs(
+        resume_ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
     resume_from_children(resume_inputs, &parent_acq, &provider, &stores.deps(), t0()).await?;
 
     // Verify: all events are contiguous and belong to the same thread.
@@ -561,7 +574,14 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
     // repository and notify will push them to the live tail.
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx = bootstrap(task, sample_definition());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
     let provider = MockTextProvider {
         response_text: "answer".into(),
     };
@@ -775,8 +795,14 @@ async fn events_after_failure_continue_contiguous_sequence() -> Result<()> {
         worker_id: WorkerId::from_string("w2"),
         lease_id: LeaseId::from_string("l2"),
     };
-    let inputs2 =
-        build_root_worker_inputs(ctx2, &stores.threads, &stores.checkpoints, t_plus(1)).await?;
+    let inputs2 = build_root_worker_inputs(
+        ctx2,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(1),
+    )
+    .await?;
     let provider = MockTextProvider {
         response_text: "recovered".into(),
     };
@@ -858,7 +884,14 @@ async fn concurrent_child_progress_events_ordered() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx = bootstrap(task, definition_with_two_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = MockToolCallProvider {
         tool_calls: vec![
@@ -960,8 +993,14 @@ async fn execute_child_and_resume_parent(
             .clone()
             .context("no lease_id on parent")?,
     };
-    let resume_inputs =
-        build_root_worker_inputs(resume_ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let resume_inputs = build_root_worker_inputs(
+        resume_ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
     resume_from_children(resume_inputs, &parent_acq, provider, &stores.deps(), t0()).await
 }
 
@@ -974,7 +1013,14 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
     let stores = TestStores::new();
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx = bootstrap(task, definition_with_tools());
-    let inputs = build_root_worker_inputs(ctx, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        ctx,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider = MockToolCallProvider {
         tool_calls: vec![(
@@ -1070,8 +1116,14 @@ async fn cross_thread_isolation() -> Result<()> {
         worker_id: WorkerId::from_string("w_a"),
         lease_id: LeaseId::from_string("l_a"),
     };
-    let inputs_a =
-        build_root_worker_inputs(ctx_a, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs_a = build_root_worker_inputs(
+        ctx_a,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // Thread B: text-only turn.
     let root_second = AgentTask::new_root_turn(thread_reg_b(), t0(), 3);
@@ -1096,8 +1148,14 @@ async fn cross_thread_isolation() -> Result<()> {
         worker_id: WorkerId::from_string("w_b"),
         lease_id: LeaseId::from_string("l_b"),
     };
-    let inputs_b =
-        build_root_worker_inputs(ctx_b, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs_b = build_root_worker_inputs(
+        ctx_b,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let provider_a = MockTextProvider {
         response_text: "answer A".into(),
@@ -1145,8 +1203,14 @@ async fn multi_turn_contiguous_sequencing() -> Result<()> {
     // Turn 1.
     let task1 = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx1 = bootstrap(task1, sample_definition());
-    let inputs1 =
-        build_root_worker_inputs(ctx1, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs1 = build_root_worker_inputs(
+        ctx1,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
     let p1 = MockTextProvider {
         response_text: "turn 1 answer".into(),
     };
@@ -1178,8 +1242,14 @@ async fn multi_turn_contiguous_sequencing() -> Result<()> {
         worker_id: WorkerId::from_string("w2"),
         lease_id: LeaseId::from_string("l2"),
     };
-    let inputs2 =
-        build_root_worker_inputs(ctx2, &stores.threads, &stores.checkpoints, t_plus(10)).await?;
+    let inputs2 = build_root_worker_inputs(
+        ctx2,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
     let p2 = MockTextProvider {
         response_text: "turn 2 answer".into(),
     };

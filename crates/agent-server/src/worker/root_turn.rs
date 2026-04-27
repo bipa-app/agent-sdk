@@ -1489,6 +1489,7 @@ fn build_turn_complete_events(
 /// No checkpoint or message-projection write occurs on this path.
 ///
 /// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+#[allow(clippy::too_many_lines)]
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
     user_prompt: &str,
@@ -1590,6 +1591,11 @@ async fn suspend_at_tool_boundary(
         .collect();
 
     // 5. Atomically spawn children and park the parent.
+    //
+    //    Clone `suspended_messages` before move into `SuspensionPayload`
+    //    so the post-spawn `set_draft` call below can persist the same
+    //    snapshot to the message projection's draft slot.
+    let draft_snapshot = suspended_messages.clone();
     let (parent_task, child_tasks) = deps
         .task_store
         .spawn_tool_children(
@@ -1605,6 +1611,29 @@ async fn suspend_at_tool_boundary(
         )
         .await
         .context("spawn tool children")?;
+
+    // 6. Snapshot the in-flight conversation to the projection's
+    //    draft slot now that the suspension is durable on the parent
+    //    task.  If the resumed turn later fails (LLM transport
+    //    error, lease-expiry timeout, etc.) `fail_root_turn` clears
+    //    the task's transient `TaskState` payload — but the draft on
+    //    the message projection survives so `recover_thread` can
+    //    fold the in-flight messages into the next-turn view.
+    //
+    //    Best-effort: a draft write failure must not roll back a
+    //    successful spawn. The recovery path simply degrades to the
+    //    pre-fix behaviour of seeing only committed history.
+    if let Err(error) = deps
+        .message_store
+        .set_draft(&inputs.bootstrap.thread_id, draft_snapshot, now)
+        .await
+    {
+        log::warn!(
+            "failed to snapshot suspended_messages to message projection draft for thread {} task {}: {error:#}",
+            inputs.bootstrap.thread_id,
+            task_id,
+        );
+    }
 
     // `Start` was committed by `execute_root_turn` before streaming so
     // the per-delta TextDelta / ThinkingDelta events have a parent in
@@ -2273,6 +2302,10 @@ async fn suspend_resumed_turn(
         })
         .collect();
 
+    // Clone the new accumulated `suspended_messages` so we can mirror
+    // them into the projection's draft slot once the spawn succeeds.
+    // See `suspend_at_tool_boundary` for the recovery contract.
+    let draft_snapshot = new_suspended.clone();
     let (parent_task, child_tasks) = deps
         .task_store
         .spawn_tool_children(
@@ -2288,6 +2321,22 @@ async fn suspend_resumed_turn(
         )
         .await
         .context("re-spawn tool children on resume")?;
+
+    // Refresh the projection draft so a subsequent failure on the
+    // *next* resume LLM call still surfaces the full in-flight
+    // history through `recover_thread`. Best-effort, same rationale
+    // as `suspend_at_tool_boundary`.
+    if let Err(error) = deps
+        .message_store
+        .set_draft(&inputs.bootstrap.thread_id, draft_snapshot, now)
+        .await
+    {
+        log::warn!(
+            "failed to refresh resumed suspended_messages draft for thread {} task {}: {error:#}",
+            inputs.bootstrap.thread_id,
+            task_id,
+        );
+    }
 
     // Commit content events (Thinking) followed by ToolCallStart events.
     let mut suspension_events = content_events;

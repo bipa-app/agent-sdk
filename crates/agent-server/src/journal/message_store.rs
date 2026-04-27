@@ -1,16 +1,25 @@
 //! Durable-friendly storage trait for [`MessageProjection`] rows.
 //!
 //! The [`MessageProjectionStore`] trait is the sole write surface for
-//! committed message history. Its key design properties:
+//! the per-thread message projection. Its key design properties:
 //!
 //! 1. **No raw `update()`** — all mutations flow through named entry
-//!    points (`commit_messages`, `replace_history`) so callers cannot
-//!    bypass the projection's transition guards.
-//! 2. **No mid-turn writes** — the store is called only at turn
-//!    completion, keeping the durable projection consistent with the
-//!    latest completed checkpoint.
-//! 3. **`replace_history` is atomic** — the swap happens under the
-//!    write lock so readers never see a partially replaced history.
+//!    points (`commit_messages`, `replace_history`, `set_draft`,
+//!    `clear_draft`) so callers cannot bypass the projection's
+//!    transition guards.
+//! 2. **Committed history is turn-bounded** — `commit_messages` and
+//!    `replace_history` are called only at turn completion, keeping
+//!    the committed projection consistent with the latest completed
+//!    checkpoint.
+//! 3. **Drafts capture in-flight conversation** — `set_draft` /
+//!    `clear_draft` operate on a separate slot reserved for
+//!    suspended-but-not-yet-committed history. A failed turn leaves
+//!    the slot populated so [`super::thread_recover`] can fold the
+//!    in-flight messages into the recovery view; a successful commit
+//!    clears the slot.
+//! 4. **All mutations are atomic** — every entry point performs its
+//!    swap under the write lock so readers never observe a partial
+//!    state.
 //!
 //! [`InMemoryMessageProjectionStore`] is the reference implementation,
 //! following the same `Arc<RwLock<Inner>>` pattern as
@@ -20,11 +29,13 @@
 //!
 //! | Entry point | What it mutates | Guard |
 //! |-------------|----------------|-------|
-//! | [`MessageProjectionStore::commit_messages`] | Appends messages, bumps version | Non-empty batch |
-//! | [`MessageProjectionStore::replace_history`] | Swaps entire history, bumps version | — |
-//! | [`MessageProjectionStore::get_or_create`] | Creates row with empty history | Idempotent |
+//! | [`MessageProjectionStore::commit_messages`] | Appends committed messages, bumps version | Non-empty batch |
+//! | [`MessageProjectionStore::replace_history`] | Swaps entire committed history, bumps version | — |
+//! | [`MessageProjectionStore::set_draft`] | Replaces the in-flight draft, bumps version | — |
+//! | [`MessageProjectionStore::clear_draft`] | Drops the in-flight draft, bumps version | — |
+//! | [`MessageProjectionStore::get_or_create`] | Creates row with empty history and empty draft | Idempotent |
 //!
-//! No other entry point modifies the committed message history.
+//! No other entry point modifies the projection's stored state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,6 +126,52 @@ pub trait MessageProjectionStore: Send + Sync {
         messages: Vec<llm::Message>,
         now: OffsetDateTime,
     ) -> Result<MessageProjection>;
+
+    /// Replace the in-flight draft messages for `thread_id`.
+    ///
+    /// Called by the worker at every tool-boundary suspension with
+    /// the full `suspended_messages` list captured at that point.
+    /// The draft is overwritten (not appended) because each
+    /// suspension carries the complete in-flight history through
+    /// that boundary.
+    ///
+    /// Behavior:
+    /// 1. Loads or bootstraps the projection row for `thread_id`.
+    /// 2. Applies [`MessageProjection::set_draft`] with the given
+    ///    messages.
+    /// 3. Persists the updated row atomically.
+    ///
+    /// Returns the projection as persisted.
+    ///
+    /// # Errors
+    /// Store-level write errors.
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection>;
+
+    /// Drop the in-flight draft for `thread_id`.
+    ///
+    /// Called as the final step of a successful turn commit so the
+    /// next turn starts with a clean draft slot. Idempotent: calling
+    /// this on a thread that has no draft is a no-op for observers,
+    /// but still bumps the version and `updated_at` so the
+    /// projection's monotonic timeline remains intact.
+    ///
+    /// Returns the projection as persisted, or [`None`] when the
+    /// projection row does not exist yet (e.g. the very first commit
+    /// short-circuits a clear because there was nothing to clear in
+    /// the first place).
+    ///
+    /// # Errors
+    /// Store-level write errors.
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<MessageProjection>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -211,6 +268,41 @@ impl MessageProjectionStore for InMemoryMessageProjectionStore {
         *projection = updated.clone();
         drop(inner);
         Ok(updated)
+    }
+
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        let mut inner = self.inner.write().await;
+        let projection = inner
+            .by_thread
+            .entry(thread_id.clone())
+            .or_insert_with(|| MessageProjection::new(thread_id.clone(), now));
+        let updated = projection.clone().set_draft(messages, now);
+        *projection = updated.clone();
+        drop(inner);
+        Ok(updated)
+    }
+
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<MessageProjection>> {
+        let mut inner = self.inner.write().await;
+        let Some(projection) = inner.by_thread.get(thread_id).cloned() else {
+            // No projection row exists yet — there's nothing to clear.
+            // Returning `None` lets the commit path skip an unnecessary
+            // bootstrap when the very first turn never wrote a draft.
+            return Ok(None);
+        };
+        let updated = projection.clear_draft(now);
+        inner.by_thread.insert(thread_id.clone(), updated.clone());
+        drop(inner);
+        Ok(Some(updated))
     }
 }
 
@@ -467,6 +559,116 @@ mod tests {
         let b = store.get(&thread_b()).await.unwrap().unwrap();
         assert_eq!(a.message_count(), 0);
         assert_eq!(b.message_count(), 1); // untouched
+    }
+
+    // ── set_draft / clear_draft ───────────────────────────────────
+
+    #[tokio::test]
+    async fn set_draft_creates_projection_when_absent() {
+        let store = InMemoryMessageProjectionStore::new();
+        let p = store
+            .set_draft(&thread_a(), vec![llm::Message::user("draft")], t0())
+            .await
+            .unwrap();
+        // Bootstrapping the row + applying set_draft both bump the
+        // version, so the first persisted version observed by callers
+        // is `1` rather than `0`.
+        assert_eq!(p.version, 1);
+        assert!(p.has_draft());
+        assert_eq!(p.draft_messages.len(), 1);
+        assert_eq!(p.message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_draft_overwrites_prior_draft() {
+        let store = InMemoryMessageProjectionStore::new();
+        store
+            .set_draft(&thread_a(), vec![llm::Message::user("first")], t0())
+            .await
+            .unwrap();
+        let p = store
+            .set_draft(
+                &thread_a(),
+                vec![
+                    llm::Message::user("first"),
+                    llm::Message::assistant("second"),
+                ],
+                t_plus(1),
+            )
+            .await
+            .unwrap();
+        // Two suspensions overwrote the draft slot — committed history
+        // remains empty and the slot now carries the latest two-message
+        // snapshot.
+        assert_eq!(p.draft_messages.len(), 2);
+        assert_eq!(p.message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_draft_does_not_modify_committed_history() {
+        let store = InMemoryMessageProjectionStore::new();
+        store
+            .commit_messages(&thread_a(), vec![llm::Message::user("turn 1")], t0())
+            .await
+            .unwrap();
+        let p = store
+            .set_draft(
+                &thread_a(),
+                vec![llm::Message::user("turn 2 in flight")],
+                t_plus(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.message_count(), 1, "committed history untouched");
+        assert!(p.has_draft());
+        assert_eq!(p.draft_messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_draft_returns_none_when_projection_absent() {
+        let store = InMemoryMessageProjectionStore::new();
+        let result = store.clear_draft(&thread_a(), t0()).await.unwrap();
+        // No row to clear — the commit path can skip a needless
+        // bootstrap on the first-turn happy path.
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_draft_drops_in_flight_messages() {
+        let store = InMemoryMessageProjectionStore::new();
+        store
+            .set_draft(&thread_a(), vec![llm::Message::user("draft")], t0())
+            .await
+            .unwrap();
+        let p = store
+            .clear_draft(&thread_a(), t_plus(1))
+            .await
+            .unwrap()
+            .expect("clear returns the projection row");
+        assert!(!p.has_draft());
+    }
+
+    #[tokio::test]
+    async fn draft_isolates_threads() {
+        let store = InMemoryMessageProjectionStore::new();
+        store
+            .set_draft(&thread_a(), vec![llm::Message::user("a-draft")], t0())
+            .await
+            .unwrap();
+        store
+            .set_draft(&thread_b(), vec![llm::Message::user("b-draft")], t0())
+            .await
+            .unwrap();
+        store.clear_draft(&thread_a(), t_plus(1)).await.unwrap();
+
+        let a = store.get(&thread_a()).await.unwrap().unwrap();
+        let b = store.get(&thread_b()).await.unwrap().unwrap();
+        assert!(!a.has_draft());
+        assert!(
+            b.has_draft(),
+            "thread b's draft must survive thread a's clear"
+        );
+        assert_eq!(b.draft_messages.len(), 1);
     }
 
     // ── version monotonicity ──────────────────────────────────────

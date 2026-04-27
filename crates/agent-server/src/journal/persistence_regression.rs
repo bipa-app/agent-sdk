@@ -143,7 +143,14 @@ mod tests {
         }
 
         async fn recover(&self, thread_id: &ThreadId) -> Result<ThreadRecoveryView> {
-            recover_thread(thread_id, &self.threads, &self.checkpoints, t0()).await
+            recover_thread(
+                thread_id,
+                &self.threads,
+                &self.checkpoints,
+                &self.messages,
+                t0(),
+            )
+            .await
         }
     }
 

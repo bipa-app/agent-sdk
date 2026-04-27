@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    thread_id,\n    history_json,\n    version,\n    created_at,\n    updated_at\nFROM agent_sdk_message_heads\nWHERE thread_id = $1\n",
+  "query": "\nSELECT\n    thread_id,\n    history_json,\n    draft_messages_json,\n    version,\n    created_at,\n    updated_at\nFROM agent_sdk_message_heads\nWHERE thread_id = $1\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
@@ -15,16 +15,21 @@
       },
       {
         "ordinal": 2,
+        "name": "draft_messages_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
         "name": "version",
         "type_info": "Int8"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -37,10 +42,11 @@
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "e854425cccddbc5c406b2681de0c0b5855d2e85cfccc22c0b6a410d71f709963"
+  "hash": "ffe7b11309ac12eb9527f62a1b7287bce50ebf8ac1c40f4efb48b4873670ebd9"
 }

@@ -229,8 +229,14 @@ async fn suspend_root_with_tools(
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_root(&stores.tasks).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;

@@ -479,6 +479,7 @@ mod tests {
             messages: Vec::new(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            draft_messages: Vec::new(),
             next_turn_number: 1,
         };
 
@@ -517,6 +518,7 @@ mod tests {
             messages: sample_messages(),
             agent_state_snapshot: snapshot,
             latest_checkpoint: None,
+            draft_messages: Vec::new(),
             next_turn_number: 4,
         };
 
@@ -542,6 +544,7 @@ mod tests {
             messages: sample_messages(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            draft_messages: Vec::new(),
             next_turn_number: 1,
         };
 

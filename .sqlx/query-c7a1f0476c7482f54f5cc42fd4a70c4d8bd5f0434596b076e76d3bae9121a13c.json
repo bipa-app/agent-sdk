@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_message_heads (\n    thread_id,\n    history_json,\n    draft_messages_json,\n    version,\n    created_at,\n    updated_at\n) VALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (thread_id) DO UPDATE SET\n    history_json = EXCLUDED.history_json,\n    draft_messages_json = EXCLUDED.draft_messages_json,\n    version = EXCLUDED.version,\n    created_at = EXCLUDED.created_at,\n    updated_at = EXCLUDED.updated_at\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Int8",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c7a1f0476c7482f54f5cc42fd4a70c4d8bd5f0434596b076e76d3bae9121a13c"
+}

@@ -290,8 +290,14 @@ async fn text_only_turn_end_to_end() -> Result<()> {
 
     // 2. Bootstrap and build inputs.
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // 3. Execute the turn.
     let outcome = execute_root_turn(inputs, "Hi there!", &provider, &stores.deps(), t_plus(5))
@@ -346,8 +352,14 @@ async fn no_durable_writes_before_commit() -> Result<()> {
 
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // After build_root_worker_inputs, thread exists (get_or_create)
     // but message projection and checkpoints are empty — no turn data
@@ -389,8 +401,14 @@ async fn checkpoint_contains_correct_agent_state() -> Result<()> {
 
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(1)).await?;
 
@@ -420,8 +438,14 @@ async fn turn_attempt_is_opened_and_closed() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(1)).await?;
 
@@ -469,8 +493,14 @@ async fn llm_error_propagates() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let err = execute_root_turn(inputs, "test", &ErrorProvider, &stores.deps(), t_plus(1))
         .await
@@ -515,8 +545,14 @@ async fn tool_suspension_end_to_end() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "List files", &provider, &stores.deps(), t_plus(5)).await?;
@@ -607,8 +643,14 @@ async fn tool_suspension_multiple_tool_calls() -> Result<()> {
 
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Do stuff", &provider, &stores.deps(), t_plus(5)).await?;
@@ -656,8 +698,14 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
 
@@ -733,8 +781,14 @@ async fn tool_suspension_children_are_runnable() -> Result<()> {
 
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
 
@@ -785,8 +839,14 @@ async fn suspend_and_complete_children(
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -897,9 +957,14 @@ async fn resume_text_only_end_to_end() -> Result<()> {
 
     // Build resume inputs.
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume with text-only response.
     let resume_provider = MockTextProvider::new("Here are your files: file1.txt, file2.txt");
@@ -1000,9 +1065,14 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     let resume_provider = MockTextProvider::new("completed");
     resume_root_turn(
@@ -1078,9 +1148,14 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume with a response that contains MORE tool calls.
     let resume_provider = MockToolCallProvider::single(
@@ -1186,9 +1261,14 @@ async fn resume_with_failed_tool_result() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     let resume_provider = MockTextProvider::new("The command failed with permission denied.");
     let outcome = resume_root_turn(
@@ -1268,9 +1348,14 @@ async fn resume_multiple_tool_results() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     let resume_provider =
         MockTextProvider::new("You are in /home/user, file contains: contents of /x");
@@ -1312,8 +1397,14 @@ async fn suspension_captures_messages_for_resume() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     execute_root_turn(inputs, "List files", &provider, &stores.deps(), t_plus(5)).await?;
 
@@ -1440,8 +1531,14 @@ async fn failed_root_turn_does_not_advance_projections() -> Result<()> {
     let worker_id = WorkerId::from_string("worker_test");
     let lease_id = LeaseId::from_string("lease_test");
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // execute_root_turn fails (LLM server error).
     let err = execute_root_turn(inputs, "test", &ErrorProvider, &stores.deps(), t_plus(1))
@@ -1490,8 +1587,14 @@ async fn failed_root_turn_closes_open_attempt() -> Result<()> {
     let worker_id = WorkerId::from_string("worker_test");
     let lease_id = LeaseId::from_string("lease_test");
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let err = execute_root_turn(inputs, "test", &ErrorProvider, &stores.deps(), t_plus(1))
         .await
@@ -1567,9 +1670,14 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume fails (LLM error).
     let err = resume_root_turn(
@@ -1622,6 +1730,172 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
     Ok(())
 }
 
+/// Regression for the lost-history bug:
+///
+/// A long-running root turn that suspends at a tool boundary, has its
+/// children complete, and then fails on the resume LLM call must
+/// preserve the in-flight `suspended_messages` snapshot on the
+/// message projection's draft slot. `recover_thread` must surface
+/// those messages so the next root turn picks up the work the failed
+/// turn already did instead of starting from an empty history.
+///
+/// Without the draft persistence wired by `suspend_at_tool_boundary`
+/// + `suspend_resumed_turn` and the recovery path in `recover_thread`,
+/// the failed task's `TaskState` clear (see
+/// `failed_resumed_turn_does_not_leak_continuation`) would take the
+/// only durable copy of the conversation with it and the next turn
+/// would see `messages == []`.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<()> {
+    use crate::journal::thread_recover::recover_thread;
+
+    let stores = TestStores::new();
+
+    // Suspend with a single tool call and run the child to completion.
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_core::ToolResult {
+            success: true,
+            output: "ok".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        },
+    )];
+    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    )
+    .await?;
+
+    // Sanity: the suspension path must have written the draft snapshot.
+    let projection_after_suspend = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection bootstrapped on suspend")?;
+    assert!(
+        projection_after_suspend.has_draft(),
+        "draft must be populated after the first suspension",
+    );
+    assert_eq!(
+        projection_after_suspend.draft_messages.len(),
+        suspended_messages.len(),
+        "draft must mirror the suspension's suspended_messages list",
+    );
+    assert_eq!(
+        projection_after_suspend.message_count(),
+        0,
+        "committed history stays empty until the turn commits",
+    );
+
+    // Re-acquire the parent for resume.
+    let parent_id = parent.id.clone();
+    let worker_id = WorkerId::from_string("worker_test");
+    let lease_id = LeaseId::from_string("lease_test");
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            worker_id.clone(),
+            lease_id.clone(),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
+
+    // Resume LLM call errors out — same shape as the production
+    // "Stream ended unexpectedly" cascade that motivated this fix.
+    let err = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages.clone(),
+        child_results,
+        &ErrorProvider,
+        &stores.deps(),
+        t_plus(25),
+    )
+    .await
+    .unwrap_err();
+
+    // Fail the task — clears `TaskState` per the existing contract.
+    let failed = fail_root_turn(
+        &parent_id,
+        &worker_id,
+        &lease_id,
+        &thread_a(),
+        &err,
+        &stores.deps(),
+        t_plus(26),
+    )
+    .await?;
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert!(failed.state.is_none());
+
+    // Helper: structural compare for `llm::Message` (no PartialEq).
+    let msgs_match =
+        |a: &[agent_sdk_core::llm::Message], b: &[agent_sdk_core::llm::Message]| -> bool {
+            let aj = serde_json::to_value(a).expect("serialize a");
+            let bj = serde_json::to_value(b).expect("serialize b");
+            aj == bj
+        };
+
+    // Critical assertion: the projection's draft slot survives the
+    // task's fail() — `fail_root_turn` only clears the *task* row,
+    // never the message projection.
+    let projection_after_fail = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection still present after fail")?;
+    assert!(
+        projection_after_fail.has_draft(),
+        "draft must survive task failure",
+    );
+    assert!(
+        msgs_match(&projection_after_fail.draft_messages, &suspended_messages),
+        "draft must equal the most recent suspended_messages snapshot",
+    );
+
+    // The recovery view used by the next root turn folds the draft
+    // into `messages` so the resumed conversation continues from
+    // where the failed turn got to.
+    let view = recover_thread(
+        &thread_a(),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    assert!(
+        msgs_match(&view.messages, &suspended_messages),
+        "recovery view must surface the in-flight draft as the next turn's history",
+    );
+    assert!(msgs_match(&view.draft_messages, &suspended_messages));
+    assert_eq!(view.next_turn_number, 1, "no turn was committed");
+    assert!(view.latest_checkpoint.is_none());
+
+    Ok(())
+}
+
 // ── Cancellation path ───────────────────────────────────────────
 
 #[tokio::test]
@@ -1632,8 +1906,14 @@ async fn cancelled_root_turn_does_not_advance_projections() -> Result<()> {
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
     // Just build inputs to trigger thread get_or_create, then cancel.
-    let _inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let _inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     // Cancel the running root task.
     let cancelled_ids = cancel_root_turn(&task_id, &stores.deps(), t_plus(1)).await?;
@@ -1681,8 +1961,14 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t_plus(5)).await?;
 
@@ -1750,8 +2036,14 @@ async fn regression_text_only_completion() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t_plus(1)).await?;
 
@@ -1824,9 +2116,14 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     let resume_provider = MockTextProvider::new("Output: hello world");
     let outcome = resume_root_turn(
@@ -1905,9 +2202,14 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume with more tool calls → re-suspend.
     let resume_provider =
@@ -1980,9 +2282,14 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume with error provider.
     let err = resume_root_turn(
@@ -2037,8 +2344,14 @@ async fn suspend_and_complete_children_durably(
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2107,8 +2420,14 @@ async fn suspend_and_fail_children(
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2282,8 +2601,14 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
     ]);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2340,8 +2665,14 @@ async fn aggregate_rejects_non_terminal_children() -> Result<()> {
         MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "ls"}));
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2412,9 +2743,14 @@ async fn resume_from_children_end_to_end() -> Result<()> {
 
     // Build resume inputs.
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Use resume_from_children — the Phase 5.4 entry point.
     let resume_provider = MockTextProvider::new("Here are your files: file1.txt, file2.txt");
@@ -2524,8 +2860,14 @@ async fn resume_from_children_with_mixed_batch() -> Result<()> {
     ]);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2562,9 +2904,14 @@ async fn resume_from_children_with_mixed_batch() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume via the Phase 5.4 entry point.
     let resume_provider =
@@ -2636,9 +2983,14 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
         .context("re-acquire")?;
 
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_plus(20))
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
 
     // Resume with a response that has MORE tool calls.
     let resume_provider = MockToolCallProvider::single(
@@ -2722,8 +3074,14 @@ async fn cancelled_child_produces_deterministic_error_result() -> Result<()> {
         MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "slow"}));
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let bootstrap = sample_bootstrap_with_tools(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome =
         execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
@@ -2783,9 +3141,14 @@ async fn reacquire_and_resume(
         .await?
         .context("re-acquire parent")?;
     let bootstrap = sample_bootstrap_with_tools(acquired);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t_acquire)
-            .await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_acquire,
+    )
+    .await?;
     resume_from_children(inputs, parent, provider, &stores.deps(), t_resume).await
 }
 
@@ -3022,8 +3385,14 @@ async fn stream_server_error_retries_and_succeeds() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let outcome = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
     let RootTurnOutcome::Completed { response_text, .. } = outcome else {
@@ -3067,8 +3436,14 @@ async fn stream_server_error_exhausts_budget_and_fails() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let err = execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1))
         .await
@@ -3113,8 +3488,14 @@ async fn stream_invalid_request_does_not_retry() -> Result<()> {
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
     let task_id = task.id.clone();
     let bootstrap = sample_bootstrap(task);
-    let inputs =
-        build_root_worker_inputs(bootstrap, &stores.threads, &stores.checkpoints, t0()).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
 
     let err = execute_root_turn(
         inputs,
