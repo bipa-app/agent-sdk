@@ -1862,6 +1862,12 @@ pub async fn resume_root_turn(
     .await
     .context("buffer resume messages")?;
 
+    let resumed_draft = build_resumed_draft_messages(&suspended_messages, &child_results);
+    deps.message_store
+        .set_draft(thread_id, resumed_draft, now)
+        .await
+        .context("refresh draft with completed child results before resume LLM call")?;
+
     // 3. Build the chat request from staged history — no extra user
     //    prompt to append because everything is already buffered.
     let chat_request = build_resume_chat_request(
@@ -2175,6 +2181,16 @@ fn build_tool_results_message(child_results: &[(String, ToolResult)]) -> llm::Me
     llm::Message::user_with_content(blocks)
 }
 
+fn build_resumed_draft_messages(
+    suspended_messages: &[llm::Message],
+    child_results: &[(String, ToolResult)],
+) -> Vec<llm::Message> {
+    let mut messages = Vec::with_capacity(suspended_messages.len() + 1);
+    messages.extend_from_slice(suspended_messages);
+    messages.push(build_tool_results_message(child_results));
+    messages
+}
+
 /// Build a chat request for the resume path. Unlike the fresh-turn
 /// `build_chat_request`, this uses the staged history as-is (no
 /// additional user prompt to append).
@@ -2266,11 +2282,8 @@ async fn suspend_resumed_turn(
     // Build suspended messages that capture the FULL conversation
     // through this point: original user prompt + original assistant +
     // tool results + new assistant response.
-    let mut new_suspended = Vec::with_capacity(prior.suspended_messages.len() + 2);
-    // Original user prompt + original assistant response (tool calls).
-    new_suspended.extend_from_slice(prior.suspended_messages);
-    // Tool results from child tasks.
-    new_suspended.push(build_tool_results_message(prior.child_results));
+    let mut new_suspended =
+        build_resumed_draft_messages(prior.suspended_messages, prior.child_results);
     // New assistant response (with new tool-use blocks).
     new_suspended.push(build_full_assistant_message(&response));
 
