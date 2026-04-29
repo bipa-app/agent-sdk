@@ -55,19 +55,27 @@
 //!
 //! [`OutboxStore::reclaim_expired_claims`]: agent_server::journal::outbox::OutboxStore::reclaim_expired_claims
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use agent_sdk_core::ThreadId;
 use agent_server::journal::broker::BrokerAdapter;
-use agent_server::journal::outbox::OutboxStore;
-use agent_server::journal::relay::{BrokerPublisher, OutboxRelayWorker, RelayWorker, RetryBackoff};
+use agent_server::journal::outbox::{OutboxRow, OutboxStore};
+use agent_server::journal::relay::{
+    BrokerPublisher, OutboxRelayWorker, Publisher, RelayWorker, RetryBackoff,
+};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::health::{HealthSurface, LatencyLayerHealth};
+use crate::metrics::{BacklogThreshold, MetricsRecorder, NoopMetricsRecorder};
 
 // ─────────────────────────────────────────────────────────────────────
 // Config
@@ -113,6 +121,45 @@ fn default_worker_id() -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Thread-tracking publisher
+// ─────────────────────────────────────────────────────────────────────
+
+/// Publisher wrapper that records every thread it observes.
+///
+/// The relay scheduler uses the captured set to ask the
+/// [`OutboxStore`] for per-thread pending counts when computing the
+/// backlog signal — without modifying the [`Publisher`] trait.
+///
+/// The set grows monotonically across ticks.  In typical deploys the
+/// thread-id cardinality is bounded by active threads on the box, so
+/// the memory cost is modest; tests assert the wiring works end to
+/// end.  An explicit eviction strategy can be added later if a deploy
+/// finds the working set unbounded.
+struct TrackingPublisher {
+    inner: Arc<dyn Publisher>,
+    observed: Arc<AsyncMutex<HashSet<ThreadId>>>,
+}
+
+impl TrackingPublisher {
+    fn new(inner: Arc<dyn Publisher>) -> (Arc<Self>, Arc<AsyncMutex<HashSet<ThreadId>>>) {
+        let observed = Arc::new(AsyncMutex::new(HashSet::new()));
+        let publisher = Arc::new(Self {
+            inner,
+            observed: Arc::clone(&observed),
+        });
+        (publisher, observed)
+    }
+}
+
+#[async_trait]
+impl Publisher for TrackingPublisher {
+    async fn publish_row(&self, row: &OutboxRow) -> Result<()> {
+        self.observed.lock().await.insert(row.thread_id.clone());
+        self.inner.publish_row(row).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Scheduler
 // ─────────────────────────────────────────────────────────────────────
 
@@ -123,6 +170,13 @@ pub struct RelayScheduler {
     worker: Arc<dyn RelayWorker>,
     config: RelaySchedulerConfig,
     health: Option<Arc<HealthSurface>>,
+    metrics: Arc<dyn MetricsRecorder>,
+    backlog_threshold: Option<BacklogThreshold>,
+    /// Threads the scheduler has observed during recent publishes.
+    /// Populated only when `new()` constructs the worker — callers
+    /// using `with_worker` opt out of automatic backlog observation
+    /// because the scheduler cannot intercept their `Publisher` calls.
+    observed_threads: Option<Arc<AsyncMutex<HashSet<ThreadId>>>>,
 }
 
 impl RelayScheduler {
@@ -137,10 +191,11 @@ impl RelayScheduler {
         broker: Arc<dyn BrokerAdapter>,
         config: RelaySchedulerConfig,
     ) -> Self {
-        let publisher = Arc::new(BrokerPublisher::new(broker));
+        let inner_publisher: Arc<dyn Publisher> = Arc::new(BrokerPublisher::new(broker));
+        let (tracking, observed) = TrackingPublisher::new(inner_publisher);
         let worker: Arc<dyn RelayWorker> = Arc::new(OutboxRelayWorker::new(
             Arc::clone(&store),
-            publisher,
+            tracking,
             config.batch_size,
             config.retry_backoff,
         ));
@@ -149,6 +204,9 @@ impl RelayScheduler {
             worker,
             config,
             health: None,
+            metrics: Arc::new(NoopMetricsRecorder),
+            backlog_threshold: None,
+            observed_threads: Some(observed),
         }
     }
 
@@ -165,6 +223,9 @@ impl RelayScheduler {
             worker,
             config,
             health: None,
+            metrics: Arc::new(NoopMetricsRecorder),
+            backlog_threshold: None,
+            observed_threads: None,
         }
     }
 
@@ -173,6 +234,24 @@ impl RelayScheduler {
     #[must_use]
     pub fn with_health(mut self, health: Arc<HealthSurface>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    /// Attach a metrics recorder so every tick / reclaim / backlog
+    /// observation is reported to operators.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Attach a backlog-protection threshold.  When set, the
+    /// scheduler observes the unpublished outbox count after each
+    /// tick and flips the latency layer to `Degraded` when the soft
+    /// band is exceeded.
+    #[must_use]
+    pub const fn with_backlog_threshold(mut self, threshold: BacklogThreshold) -> Self {
+        self.backlog_threshold = Some(threshold);
         self
     }
 
@@ -189,6 +268,7 @@ impl RelayScheduler {
             .reclaim_expired_claims(now, self.config.claim_lease)
             .await
             .context("startup reclaim of outbox claims")?;
+        self.metrics.record_relay_reclaim(reclaimed);
         if reclaimed > 0 {
             info!(
                 reclaimed,
@@ -222,11 +302,15 @@ impl RelayScheduler {
                 return Ok(outcome);
             }
 
+            let tick_started = Instant::now();
             let tick = self
                 .worker
                 .tick(&self.config.worker_id, now_fn())
                 .await
                 .context("relay backfill tick")?;
+            let duration_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.metrics.record_relay_tick(&tick, duration_ms);
+
             outcome.ticks += 1;
             outcome.delivered += tick.delivered;
             outcome.failed += tick.failed;
@@ -237,6 +321,7 @@ impl RelayScheduler {
                 failed = tick.failed,
                 expired = tick.expired,
                 claimed = tick.claimed,
+                duration_ms,
                 "relay backfill tick",
             );
             if tick.failed > 0 || tick.expired > 0 {
@@ -251,7 +336,8 @@ impl RelayScheduler {
                     expired = outcome.expired,
                     "relay backfill drained",
                 );
-                if outcome.failed > 0 || outcome.expired > 0 {
+                let backlog_breached = self.observe_backlog().await;
+                if outcome.failed > 0 || outcome.expired > 0 || backlog_breached {
                     self.mark_degraded();
                 } else {
                     self.mark_healthy();
@@ -301,9 +387,11 @@ impl RelayScheduler {
                                 reclaimed = count,
                                 "reclaimed stale outbox claims — other worker likely crashed",
                             );
+                            self.metrics.record_relay_reclaim(count);
                             reclaim_degraded = false;
                         }
-                        Ok(_) => {
+                        Ok(count) => {
+                            self.metrics.record_relay_reclaim(count);
                             reclaim_degraded = false;
                         }
                         Err(err) => {
@@ -313,10 +401,13 @@ impl RelayScheduler {
                         }
                     }
                 }
-                result = self.worker.tick(&self.config.worker_id, now_fn()) => {
+                result = self.tick_with_metrics(now_fn()) => {
                     match result {
                         Ok(tick) if tick.claimed == 0 => {
-                            if !reclaim_degraded {
+                            let backlog_breached = self.observe_backlog().await;
+                            if backlog_breached {
+                                self.mark_degraded();
+                            } else if !reclaim_degraded {
                                 self.mark_healthy();
                             }
                             tokio::select! {
@@ -404,6 +495,78 @@ impl RelayScheduler {
                      core readiness unaffected",
                 );
             }
+        }
+    }
+
+    /// Run a single worker tick, time it, and report the result to the
+    /// metrics recorder.  Used by the steady-state loop where
+    /// `tokio::select!` cannot wrap a borrow inside an `async {}` block
+    /// without holding the borrow across the await.
+    async fn tick_with_metrics(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::relay::RelayTick> {
+        let started = Instant::now();
+        let tick = self.worker.tick(&self.config.worker_id, now).await?;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.metrics.record_relay_tick(&tick, duration_ms);
+        Ok(tick)
+    }
+
+    /// Sample the unpublished outbox count for threads the scheduler
+    /// has observed in recent ticks and report the observation to the
+    /// metrics recorder.  Returns `true` when the soft band is
+    /// breached (caller flips latency layer to `Degraded`).
+    ///
+    /// The sample iterates the [`TrackingPublisher`]'s observed-thread
+    /// set and queries [`OutboxStore::count_pending`] per entry — the
+    /// existing per-thread API.  This is bounded by the active-thread
+    /// cardinality on the box.  Schedulers built via `with_worker`
+    /// have no tracking publisher and therefore record a zero
+    /// observation (the `with_worker` path is reserved for tests).
+    async fn observe_backlog(&self) -> bool {
+        let Some(observed) = &self.observed_threads else {
+            return false;
+        };
+        let threads: Vec<ThreadId> = {
+            let lock = observed.lock().await;
+            lock.iter().cloned().collect()
+        };
+        let mut total: u64 = 0;
+        for thread in &threads {
+            match self.store.count_pending(thread).await {
+                Ok(count) => total = total.saturating_add(count),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        thread_id = %thread,
+                        "count_pending failed during backlog observation",
+                    );
+                }
+            }
+        }
+        let soft = self.backlog_threshold.map(|t| t.soft);
+        self.metrics.record_relay_backlog(total, soft);
+        match self.backlog_threshold {
+            Some(threshold) if threshold.breaches_soft(total) => {
+                if threshold.breaches_hard(total) {
+                    warn!(
+                        pending = total,
+                        soft = threshold.soft,
+                        hard = threshold.hard,
+                        "outbox backlog exceeded HARD threshold — page on-call",
+                    );
+                } else {
+                    warn!(
+                        pending = total,
+                        soft = threshold.soft,
+                        hard = threshold.hard,
+                        "outbox backlog exceeded soft threshold — latency layer degraded",
+                    );
+                }
+                true
+            }
+            _ => false,
         }
     }
 }
