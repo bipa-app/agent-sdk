@@ -73,6 +73,7 @@ use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
 use super::config::{BrokerConfig, ServiceConfig};
 use super::health::{HealthSurface, LatencyLayerHealth};
 use super::http_health::HttpHealthHandle;
+use super::metrics::{LoggingMetricsRecorder, MetricsRecorder};
 use super::relay::{RelayScheduler, RelaySchedulerConfig};
 use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
@@ -105,6 +106,7 @@ pub struct ServiceHost {
     stores: StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
     health: Arc<HealthSurface>,
+    metrics: Arc<dyn MetricsRecorder>,
     shutdown: CancellationToken,
 }
 
@@ -131,6 +133,7 @@ impl ServiceHost {
             stores,
             runtime,
             health: HealthSurface::shared(),
+            metrics: Arc::new(LoggingMetricsRecorder),
             shutdown: CancellationToken::new(),
         })
     }
@@ -152,6 +155,7 @@ impl ServiceHost {
             stores,
             runtime,
             health: HealthSurface::shared(),
+            metrics: Arc::new(LoggingMetricsRecorder),
             shutdown: CancellationToken::new(),
         })
     }
@@ -239,6 +243,22 @@ impl ServiceHost {
         &self.health
     }
 
+    /// Access the shared metrics recorder (for tests and embedders).
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<dyn MetricsRecorder> {
+        &self.metrics
+    }
+
+    /// Replace the default [`LoggingMetricsRecorder`] with a caller
+    /// provided implementation — typically an
+    /// [`InMemoryMetricsRecorder`](crate::metrics::InMemoryMetricsRecorder)
+    /// for tests or a Prometheus/OTel-backed recorder for production.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Access the host runtime wiring.
     #[must_use]
     pub const fn runtime(&self) -> &Arc<ExecutionRuntime> {
@@ -295,6 +315,7 @@ impl ServiceHost {
             self.stores.clone(),
             self.config.worker.sweep_interval(),
             Arc::clone(&self.health),
+            Arc::clone(&self.metrics),
             self.shutdown.clone(),
         ));
         let worker_handles = self.spawn_worker_pool(&wakeup_signal);
@@ -434,12 +455,16 @@ impl ServiceHost {
             let broker = build_broker_adapter(&self.config.relay.broker)
                 .context("building relay broker adapter")?;
             let scheduler_config = build_relay_scheduler_config(&self.config.relay);
-            let scheduler = RelayScheduler::new(
+            let mut scheduler = RelayScheduler::new(
                 Arc::clone(&self.stores.outbox_store),
                 broker,
                 scheduler_config,
             )
-            .with_health(Arc::clone(&self.health));
+            .with_health(Arc::clone(&self.health))
+            .with_metrics(Arc::clone(&self.metrics));
+            if let Some(threshold) = self.config.relay.backlog_threshold {
+                scheduler = scheduler.with_backlog_threshold(threshold);
+            }
             // Inherit the host's shutdown token so SIGINT/SIGTERM drains
             // the relay along with the rest of the service.
             Ok(Some(scheduler.spawn(self.shutdown.clone())))
@@ -473,6 +498,7 @@ impl ServiceHost {
             self.stores.clone(),
             policy,
             self.config.retention.janitor_interval(),
+            Arc::clone(&self.metrics),
             self.shutdown.clone(),
         )))
     }
@@ -625,6 +651,7 @@ async fn lease_sweep_loop(
     stores: StoreRegistry,
     interval: std::time::Duration,
     health: Arc<HealthSurface>,
+    metrics: Arc<dyn MetricsRecorder>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -644,8 +671,11 @@ async fn lease_sweep_loop(
                 match stores.task_store.release_expired_leases(now).await {
                     Ok(records) if !records.is_empty() => {
                         info!(count = records.len(), "released expired leases");
+                        metrics.record_lease_sweep(records.len());
                     }
-                    Ok(_) => { /* nothing expired — quiet */ }
+                    Ok(_) => {
+                        metrics.record_lease_sweep(0);
+                    }
                     Err(e) => {
                         warn!(error = %e, "lease sweep failed");
                     }
@@ -663,6 +693,7 @@ async fn retention_janitor_loop(
     stores: StoreRegistry,
     policy: agent_server::journal::RetentionPolicy,
     interval: std::time::Duration,
+    metrics: Arc<dyn MetricsRecorder>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -683,18 +714,18 @@ async fn retention_janitor_loop(
                     checkpoint_store: stores.checkpoint_store.as_ref(),
                 };
                 match agent_server::journal::run_janitor_cycle(&policy, &deps, now).await {
-                    Ok(report)
-                        if report.events_purged > 0 || report.checkpoints_pruned > 0 =>
-                    {
-                        info!(
-                            threads = report.threads_scanned,
-                            events_purged = report.events_purged,
-                            checkpoints_pruned = report.checkpoints_pruned,
-                            floors_advanced = report.floors_advanced,
-                            "retention janitor cycle",
-                        );
+                    Ok(report) => {
+                        if report.events_purged > 0 || report.checkpoints_pruned > 0 {
+                            info!(
+                                threads = report.threads_scanned,
+                                events_purged = report.events_purged,
+                                checkpoints_pruned = report.checkpoints_pruned,
+                                floors_advanced = report.floors_advanced,
+                                "retention janitor cycle",
+                            );
+                        }
+                        metrics.record_janitor_cycle(&report);
                     }
-                    Ok(_) => { /* nothing to clean — quiet */ }
                     Err(e) => {
                         warn!(error = %e, "retention janitor cycle failed");
                     }
@@ -2128,6 +2159,7 @@ mod tests {
                 claim_lease_secs: 30,
                 reclaim_interval_secs: 30,
                 retry_backoff_secs: 0,
+                backlog_threshold: None,
                 broker: BrokerConfig::InMemory,
             },
             ..ServiceConfig::default()
@@ -2220,6 +2252,7 @@ mod tests {
                 claim_lease_secs: 30,
                 reclaim_interval_secs: 60,
                 retry_backoff_secs: 0,
+                backlog_threshold: None,
                 broker: BrokerConfig::InMemory,
             },
             ..ServiceConfig::default()
@@ -2330,6 +2363,7 @@ mod tests {
                 claim_lease_secs: 30,
                 reclaim_interval_secs: 300,
                 retry_backoff_secs: 0,
+                backlog_threshold: None,
                 broker: crate::config::BrokerConfig::InMemory,
             },
             ..ServiceConfig::default()
@@ -2454,6 +2488,7 @@ mod tests {
                 claim_lease_secs: 30,
                 reclaim_interval_secs: 300,
                 retry_backoff_secs: 0,
+                backlog_threshold: None,
                 broker: crate::config::BrokerConfig::InMemory,
             },
             ..ServiceConfig::default()

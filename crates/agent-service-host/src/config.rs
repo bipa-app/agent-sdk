@@ -426,6 +426,13 @@ pub struct RelayConfig {
     pub reclaim_interval_secs: u64,
     /// Seconds to wait before retrying a failed publish.
     pub retry_backoff_secs: u64,
+    /// Soft / hard backlog alerting bands.  When set, the relay
+    /// scheduler observes the unpublished outbox count after each
+    /// tick and flips the latency layer to `Degraded` if the soft
+    /// band is exceeded.  `None` keeps the historical "best-effort"
+    /// behaviour with no in-process protection — operators alert
+    /// purely from external metrics.
+    pub backlog_threshold: Option<crate::metrics::BacklogThreshold>,
     /// Which broker adapter to compose into the relay.
     pub broker: BrokerConfig,
 }
@@ -440,6 +447,7 @@ impl Default for RelayConfig {
             claim_lease_secs: 60,
             reclaim_interval_secs: 30,
             retry_backoff_secs: 30,
+            backlog_threshold: None,
             broker: BrokerConfig::default(),
         }
     }
@@ -790,6 +798,10 @@ storage:
         assert_eq!(config.poll_interval_secs, 2);
         assert_eq!(config.reclaim_interval_secs, 30);
         assert_eq!(config.claim_lease_secs, 60);
+        assert!(
+            config.backlog_threshold.is_none(),
+            "backlog protection is opt-in",
+        );
     }
 
     #[test]
@@ -818,7 +830,34 @@ relay:
         assert_eq!(config.relay.batch_size, 32);
         assert_eq!(config.relay.poll_interval_secs, 5);
         assert_eq!(config.relay.claim_lease_secs, 45);
+        assert!(config.relay.backlog_threshold.is_none());
         assert!(matches!(config.relay.broker, BrokerConfig::InMemory));
+        Ok(())
+    }
+
+    #[test]
+    fn relay_yaml_backlog_threshold_round_trips() -> Result<()> {
+        let yaml = r"
+relay:
+  enabled: true
+  backlog_threshold:
+    soft: 250
+    hard: 5000
+  broker: in_memory
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        let threshold = config.relay.backlog_threshold.context("threshold parsed")?;
+        assert_eq!(threshold.soft, 250);
+        assert_eq!(threshold.hard, 5_000);
+
+        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
+        let recovered = re_config
+            .relay
+            .backlog_threshold
+            .context("threshold survives round trip")?;
+        assert_eq!(recovered.soft, 250);
+        assert_eq!(recovered.hard, 5_000);
         Ok(())
     }
 

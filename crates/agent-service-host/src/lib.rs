@@ -71,6 +71,7 @@ pub mod grpc;
 pub mod health;
 pub mod host;
 pub mod http_health;
+pub mod metrics;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod proto;
@@ -85,3 +86,5 @@ pub mod watch;
 
 #[cfg(test)]
 mod conformance;
+#[cfg(test)]
+mod ga_regression;
