@@ -8,18 +8,17 @@
 //!
 //! # Relationship to audit redaction
 //!
-//! The agent-server journal ships a key-name based
-//! [`RedactionPolicy`](../../../agent_server/journal/redaction/struct.RedactionPolicy.html)
-//! that matches JSON fields like `password` or `api_key` and masks
-//! their values. This module is complementary: it operates on
-//! *freeform text* and uses regex + check-digit validation to
-//! recognise entities that don't sit in a named field — a card
-//! number dropped into a prompt, a CPF mentioned inside a tool
-//! response, a bearer token leaking into an error message.
+//! This module also ships a key-name based [`RedactionPolicy`]
+//! (in [`redaction`]) that matches JSON fields like `password` or
+//! `api_key` and masks their values. The two layers are complementary:
+//! the policy handles structural redaction by key, and a
+//! [`PiiDetector`] scans any remaining string values for freeform
+//! entities (a card number dropped into a prompt, a CPF mentioned
+//! inside a tool response, a bearer token leaking into an error
+//! message).
 //!
-//! Integrations typically compose the two: the policy handles
-//! structural redaction by key, and a [`PiiDetector`] scans any
-//! remaining string values.
+//! Integrations typically compose the two via
+//! [`redact_for_observability`].
 //!
 //! # Categories
 //!
@@ -70,6 +69,13 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+pub mod redaction;
+
+pub use redaction::{
+    REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
+    redact_string, redact_value,
+};
 
 // ─────────────────────────────────────────────────────────────────────
 // Category and span

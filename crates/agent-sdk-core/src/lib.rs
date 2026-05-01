@@ -27,6 +27,10 @@ pub use llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, ContentSource, Effort, Message,
     Role, StopReason, ThinkingConfig, ThinkingMode, Tool, Usage,
 };
+pub use privacy::{
+    REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
+    redact_string, redact_value,
+};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
