@@ -51,9 +51,10 @@
 //! # Default impl
 //!
 //! [`RedactionPolicy`] implements `Default` by returning
-//! [`Self::baseline()`] — never an empty policy. Code that wants a
-//! genuinely empty policy must opt in via [`RedactionPolicy::none`]
-//! and acknowledge the production-safety implications.
+//! [`RedactionPolicy::baseline()`] — never an empty policy. Code
+//! that wants a genuinely empty policy must opt in via
+//! [`RedactionPolicy::none`] and acknowledge the production-safety
+//! implications.
 //!
 //! # Serialisation
 //!
