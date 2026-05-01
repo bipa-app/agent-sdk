@@ -385,6 +385,10 @@ pub use tokio_util::sync::CancellationToken;
 pub use agent_sdk_core::audit::{
     AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
 };
+pub use agent_sdk_core::privacy::{
+    REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
+    redact_string, redact_value,
+};
 pub use authority::{EventAuthority, LocalEventAuthority};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
