@@ -91,6 +91,7 @@ pub mod definition;
 pub mod registry;
 pub mod root_turn;
 pub mod subagent;
+pub mod subagent_spawn_selector;
 pub mod tool_task;
 
 #[cfg(test)]
@@ -128,11 +129,16 @@ pub use root_turn::{
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
-    SpawnedSubagentInvocation, SubagentCapabilityProfile, SubagentCapabilityRequest,
-    SubagentInvocationDeps, SubagentMcpRequest, SubagentResult, SubagentResultDeps,
-    SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy, SubagentSpawnRequest,
-    SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome, execute_subagent_task,
-    resolve_subagent_bootstrap, resolve_subagent_spec, spawn_subagent_invocation,
+    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentResult,
+    SubagentResultDeps, SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy,
+    SubagentSpawnRequest, SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome,
+    execute_subagent_task, resolve_subagent_bootstrap, resolve_subagent_spec,
+    spawn_subagent_batch_invocations, spawn_subagent_invocation,
+};
+pub use subagent_spawn_selector::{
+    BatchRouting, NoopSubagentSpawnSelector, SubagentSpawnDecision, SubagentSpawnSelector,
+    classify_batch,
 };
 pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,

@@ -2432,6 +2432,90 @@ FOR UPDATE SKIP LOCKED
         Ok((new_parent, invocation, child_root))
     }
 
+    async fn spawn_subagent_batch(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawns: Vec<SubagentInvocationSpawn>,
+        payload: SuspensionPayload,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+        if spawns.is_empty() {
+            return Err(anyhow!("spawn rejected: spawns must be non-empty"));
+        }
+        let mut tx = self.begin().await?;
+
+        let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
+
+        // Cross-entry uniqueness — same rule as the SQLite + InMemory impls.
+        let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+            std::collections::HashSet::with_capacity(spawns.len());
+        for spawn in &spawns {
+            if !seen_thread_ids.insert(&spawn.child_thread_id) {
+                return Err(anyhow!(
+                    "spawn rejected: duplicate child_thread_id {} in batch",
+                    spawn.child_thread_id
+                ));
+            }
+        }
+
+        let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
+        let mut child_ids: Vec<AgentTaskId> = Vec::with_capacity(spawns.len());
+        for spawn in spawns {
+            let SubagentInvocationSpawn {
+                child_thread_id,
+                spec,
+                child_root_input,
+                payload: _per_entry_payload,
+                spawn_index,
+            } = spawn;
+            ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
+
+            let child_root = AgentTask::new_root_turn_with_input(
+                child_thread_id.clone(),
+                child_root_input,
+                now,
+                AgentTask::DEFAULT_MAX_ATTEMPTS,
+            );
+            ensure_spawn_task_id_available_tx(&mut tx, &child_root.id, "child root").await?;
+
+            let invocation = AgentTask::new_subagent_invocation(
+                &old_parent,
+                SubagentInvocationState {
+                    spec,
+                    child_thread_id,
+                    child_root_task_id: child_root.id.clone(),
+                },
+                spawn_index,
+                now,
+                AgentTask::DEFAULT_MAX_ATTEMPTS,
+            )
+            .context("spawn rejected: new_subagent_invocation failed")?;
+            ensure_spawn_task_id_available_tx(&mut tx, &invocation.id, "invocation").await?;
+
+            child_ids.push(invocation.id.clone());
+            prepared.push((invocation, child_root));
+        }
+
+        let child_count =
+            u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(&mut tx, &new_parent).await?;
+        for (invocation, child_root) in &prepared {
+            Self::insert_task_tx(&mut tx, invocation).await?;
+            Self::insert_task_tx(&mut tx, child_root).await?;
+        }
+        tx.commit().await.context("commit spawn_subagent_batch")?;
+        Ok((new_parent, prepared))
+    }
+
     async fn complete_task(
         &self,
         child_id: &AgentTaskId,

@@ -1016,7 +1016,7 @@ async fn execute_root_task(
         .await
         .context("reading root-task event watermark")?;
 
-    let outcome = async {
+    let outcome = Box::pin(async {
         let bootstrap =
             resolve_bootstrap_context(task.clone(), stores.definition_registry.as_ref())
                 .await
@@ -1037,28 +1037,26 @@ async fn execute_root_task(
             .context("resolve runtime provider")?;
 
         if matches!(task.state, TaskState::ReadyToResume { .. }) {
-            resume_from_children(
-                inputs,
-                &task,
-                provider.as_ref(),
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("resume root task from durable child results")
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector(selector.as_ref());
+            resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
+                .await
+                .context("resume root task from durable child results")
         } else {
             let user_prompt = root_task_prompt(&task)?;
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector(selector.as_ref());
             agent_server::worker::execute_root_turn(
                 inputs,
                 &user_prompt,
                 provider.as_ref(),
-                &stores.root_turn_deps(),
+                &deps,
                 now,
             )
             .await
             .context("execute fresh root task")
         }
-    }
+    })
     .await;
 
     match outcome {

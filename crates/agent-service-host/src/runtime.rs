@@ -12,7 +12,8 @@ use std::sync::{Arc, RwLock};
 use agent_sdk_core::{PendingToolCallInfo, ToolResult};
 use agent_sdk_providers::LlmProvider;
 use agent_server::worker::{
-    AgentDefinition, ConfirmationPolicy, PolicyVerdict, ToolEventCollector, ToolTaskBootstrap,
+    AgentDefinition, ConfirmationPolicy, NoopSubagentSpawnSelector, PolicyVerdict,
+    SubagentSpawnSelector, ToolEventCollector, ToolTaskBootstrap,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -45,6 +46,12 @@ pub struct ExecutionRuntime {
     provider_resolver: Arc<dyn ProviderResolver>,
     tool_executor: Arc<dyn ToolCallExecutor>,
     confirmation_policy: Arc<dyn ConfirmationPolicy>,
+    /// Optional per-call routing selector consulted at the tool
+    /// boundary. Defaults to [`NoopSubagentSpawnSelector`] when
+    /// constructed via [`Self::new`], which keeps the legacy
+    /// behaviour (every tool call routes through
+    /// `spawn_tool_children`).
+    subagent_spawn_selector: Arc<dyn SubagentSpawnSelector>,
 }
 
 impl ExecutionRuntime {
@@ -58,7 +65,21 @@ impl ExecutionRuntime {
             provider_resolver,
             tool_executor,
             confirmation_policy,
+            subagent_spawn_selector: Arc::new(NoopSubagentSpawnSelector),
         }
+    }
+
+    /// Replace the active subagent-spawn selector. Hosts that wire a
+    /// real selector (e.g. bip's `BipSubagentSpawnSelector`) call
+    /// this once at construction and keep the noop default until
+    /// then.
+    #[must_use]
+    pub fn with_subagent_spawn_selector(
+        mut self,
+        selector: Arc<dyn SubagentSpawnSelector>,
+    ) -> Self {
+        self.subagent_spawn_selector = selector;
+        self
     }
 
     #[must_use]
@@ -74,6 +95,11 @@ impl ExecutionRuntime {
     #[must_use]
     pub fn confirmation_policy(&self) -> &Arc<dyn ConfirmationPolicy> {
         &self.confirmation_policy
+    }
+
+    #[must_use]
+    pub fn subagent_spawn_selector(&self) -> &Arc<dyn SubagentSpawnSelector> {
+        &self.subagent_spawn_selector
     }
 }
 

@@ -756,6 +756,55 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)>;
 
+    /// Atomically persist N durable subagent invocations under one
+    /// parent transition.
+    ///
+    /// This is the fan-out flavour of
+    /// [`AgentTaskStore::spawn_subagent_invocation`]. A successful
+    /// call:
+    ///
+    /// 1. CAS-checks the running parent against `(worker, lease)`.
+    /// 2. Allocates one parent-visible `subagent` invocation task per
+    ///    entry in `spawns`.
+    /// 3. Allocates one fresh child-thread `root_turn` task per
+    ///    entry, on the per-entry `child_thread_id`.
+    /// 4. Persists durable linkage on each invocation task's
+    ///    [`crate::journal::task_state::SubagentInvocationState`]
+    ///    payload.
+    /// 5. Transitions the parent to [`TaskStatus::WaitingOnChildren`]
+    ///    with `pending_child_count = spawns.len()` and the full
+    ///    invocation-task-id list as its child-wait targets.
+    ///
+    /// One shared [`SuspensionPayload`] is used for all entries — the
+    /// continuation envelope is the same parent suspension regardless
+    /// of how many children fan out from it.
+    ///
+    /// Callers must materialize each child thread row before invoking
+    /// this method so durable backends can satisfy task → thread
+    /// foreign keys while inserting the per-entry child root tasks.
+    /// They must also ensure no two entries share the same
+    /// `child_thread_id` (the implementation rejects duplicates).
+    ///
+    /// Returns `(parent, [(invocation_i, child_root_i); spawns.len()])`
+    /// with the rows as persisted, in the same order as `spawns`.
+    ///
+    /// # Errors
+    /// Same CAS and non-leaf envelope as
+    /// [`AgentTaskStore::spawn_subagent_invocation`], plus:
+    /// - `spawn rejected: spawns must be non-empty` — empty input.
+    /// - `spawn rejected: duplicate child_thread_id ...` — two
+    ///   entries collide on the same child thread.
+    /// - schema errors from [`AgentTask::new_subagent_invocation`].
+    async fn spawn_subagent_batch(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawns: Vec<SubagentInvocationSpawn>,
+        payload: SuspensionPayload,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)>;
+
     /// Transition a running child to [`TaskStatus::Completed`] and,
     /// under the same write lock, recompute the parent's
     /// `pending_child_count` from the live-children index so the
@@ -1009,6 +1058,12 @@ pub trait AgentTaskStore: Send + Sync {
 // ─────────────────────────────────────────────────────────────────────
 // In-memory reference implementation
 // ─────────────────────────────────────────────────────────────────────
+
+/// Output shape of [`Inner::build_batch_invocation_pairs`]: the
+/// per-entry `(invocation, child_root)` pairs plus the ordered
+/// `child_ids` vector the caller hands to
+/// [`AgentTask::wait_on_children`] when transitioning the parent.
+type BatchInvocationRows = (Vec<(AgentTask, AgentTask)>, Vec<AgentTaskId>);
 
 #[derive(Default)]
 struct Inner {
@@ -1487,6 +1542,155 @@ impl Inner {
         self.by_id
             .insert(new_invocation.id.clone(), new_invocation.clone());
         Ok(Some(new_invocation))
+    }
+
+    // ─── Spawn-batch helpers (Phase 7.2 fan-out) ─────────────────────
+
+    /// CAS-validate that `parent_id` is currently a `Running`, non-leaf
+    /// task held by `(worker, lease)`. Returns the parent row on
+    /// success — callers that intend to mutate the parent must hold
+    /// the inner write lock and reuse this snapshot.
+    ///
+    /// Centralizes the "spawn rejected: …" prelude shared by
+    /// [`AgentTaskStore::spawn_tool_children`],
+    /// [`AgentTaskStore::spawn_subagent_invocation`], and
+    /// [`AgentTaskStore::spawn_subagent_batch`] so the validation
+    /// surface stays in one place. Error messages are stable for
+    /// the `spawn_*_rejects_wrong_worker_or_lease` tests.
+    fn validate_running_owned_non_leaf_parent(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+    ) -> Result<AgentTask> {
+        let old_parent = self
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
+        Ok(old_parent)
+    }
+
+    /// Reject a fan-out batch when:
+    /// - any two entries point at the same `child_thread_id`, or
+    /// - any entry's `child_thread_id` already has tasks indexed under it.
+    ///
+    /// Both checks must pass before the impl materializes any
+    /// invocation/child rows so a partial materialization can never
+    /// orphan child thread state.
+    fn validate_batch_thread_uniqueness(&self, spawns: &[SubagentInvocationSpawn]) -> Result<()> {
+        let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+            std::collections::HashSet::with_capacity(spawns.len());
+        for spawn in spawns {
+            if !seen_thread_ids.insert(&spawn.child_thread_id) {
+                return Err(anyhow!(
+                    "spawn rejected: duplicate child_thread_id {} in batch",
+                    spawn.child_thread_id
+                ));
+            }
+        }
+
+        for spawn in spawns {
+            if self.by_thread.contains_key(&spawn.child_thread_id)
+                || self
+                    .active_root_by_thread
+                    .contains_key(&spawn.child_thread_id)
+            {
+                return Err(anyhow!(
+                    "spawn rejected: child thread id {} already has tasks",
+                    spawn.child_thread_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize the per-entry `(invocation, child_root)` pair for
+    /// every spawn in the batch.
+    ///
+    /// Mutates **nothing** in `self`: returns the prepared rows plus
+    /// the ordered child id list so the caller can transition the
+    /// parent atomically. A schema error on entry K therefore leaves
+    /// the store untouched.
+    fn build_batch_invocation_pairs(
+        &self,
+        old_parent: &AgentTask,
+        spawns: Vec<SubagentInvocationSpawn>,
+        now: OffsetDateTime,
+    ) -> Result<BatchInvocationRows> {
+        let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
+        let mut child_ids: Vec<AgentTaskId> = Vec::with_capacity(spawns.len());
+        for spawn in spawns {
+            let SubagentInvocationSpawn {
+                child_thread_id,
+                spec,
+                child_root_input,
+                spawn_index,
+                payload: _per_entry_payload,
+            } = spawn;
+            let child_root = AgentTask::new_root_turn_with_input(
+                child_thread_id.clone(),
+                child_root_input,
+                now,
+                RuntimePolicy::server_default().max_attempts,
+            );
+            if self.by_id.contains_key(&child_root.id) {
+                let id = &child_root.id;
+                return Err(anyhow!(
+                    "spawn rejected: child root task id {id} already exists"
+                ));
+            }
+
+            let invocation = AgentTask::new_subagent_invocation(
+                old_parent,
+                SubagentInvocationState {
+                    spec,
+                    child_thread_id,
+                    child_root_task_id: child_root.id.clone(),
+                },
+                spawn_index,
+                now,
+                AgentTask::DEFAULT_MAX_ATTEMPTS,
+            )
+            .context("spawn rejected: new_subagent_invocation failed")?;
+            if self.by_id.contains_key(&invocation.id) {
+                let id = &invocation.id;
+                return Err(anyhow!(
+                    "spawn rejected: invocation task id {id} already exists"
+                ));
+            }
+            child_ids.push(invocation.id.clone());
+            prepared.push((invocation, child_root));
+        }
+        Ok((prepared, child_ids))
     }
 }
 
@@ -2367,6 +2571,55 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
         drop(inner);
         Ok((new_parent, invocation, child_root))
+    }
+
+    async fn spawn_subagent_batch(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        spawns: Vec<SubagentInvocationSpawn>,
+        payload: SuspensionPayload,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>)> {
+        if spawns.is_empty() {
+            return Err(anyhow!("spawn rejected: spawns must be non-empty"));
+        }
+        let mut inner = self.inner.write().await;
+
+        let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
+        inner.validate_batch_thread_uniqueness(&spawns)?;
+
+        // Materialize the (invocation, child_root) pair per entry —
+        // mutate nothing in `inner` until every row is built so a
+        // schema error on entry K leaves the store untouched.
+        let (prepared, child_ids) = inner.build_batch_invocation_pairs(&old_parent, spawns, now)?;
+
+        let child_count =
+            u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;
+        let new_parent = old_parent
+            .clone()
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+
+        // All validation passed — apply mutations.
+        inner.rebalance_after_row_change(&old_parent, &new_parent);
+        inner
+            .by_id
+            .insert(new_parent.id.clone(), new_parent.clone());
+        for (invocation, child_root) in &prepared {
+            inner.add_to_indexes(invocation);
+            inner
+                .by_id
+                .insert(invocation.id.clone(), invocation.clone());
+            inner.add_to_indexes(child_root);
+            inner
+                .by_id
+                .insert(child_root.id.clone(), child_root.clone());
+        }
+
+        drop(inner);
+        Ok((new_parent, prepared))
     }
 
     async fn complete_task(
@@ -6719,8 +6972,262 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_batch_creates_n_invocations_under_one_parent() -> Result<()> {
+        // Fan-out: a single CAS on the parent transitions it into
+        // WaitingOnChildren with `pending_child_count = N`, allocates
+        // N invocation tasks, and N child-thread root tasks. The
+        // parent's `child_ids` list contains every invocation id in
+        // the same order as the input `spawns`.
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-subagent-batch").await?;
+        let parent_id = parent.id.clone();
+        let child_thread_ids = [
+            thread("t-subagent-batch-child-a"),
+            thread("t-subagent-batch-child-b"),
+            thread("t-subagent-batch-child-c"),
+        ];
+
+        let spawns: Vec<SubagentInvocationSpawn> = child_thread_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, child_thread_id)| SubagentInvocationSpawn {
+                child_thread_id: child_thread_id.clone(),
+                spec: sample_subagent_spec(),
+                child_root_input: sample_subagent_input(),
+                spawn_index: u32::try_from(idx).expect("test idx fits in u32"),
+                payload: SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch"),
+                    suspended_messages: Vec::new(),
+                },
+            })
+            .collect();
+
+        let (parked_parent, prepared) = store
+            .spawn_subagent_batch(
+                &parent_id,
+                &worker,
+                &lease,
+                spawns,
+                SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .context("spawn_subagent_batch")?;
+
+        // Parent transitioned once with the cumulative count.
+        assert_eq!(parked_parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked_parent.pending_child_count, 3);
+        assert!(parked_parent.worker_id.is_none());
+        match &parked_parent.state {
+            crate::journal::task_state::TaskState::WaitingOnChildren { child_ids, .. } => {
+                assert_eq!(child_ids.len(), 3);
+                for ((idx, (invocation, _child_root)), child_id) in
+                    prepared.iter().enumerate().zip(child_ids.iter())
+                {
+                    assert_eq!(
+                        &invocation.id, child_id,
+                        "child_ids[{idx}] should match invocation order"
+                    );
+                }
+            }
+            other => panic!("expected WaitingOnChildren state, got {other:?}"),
+        }
+
+        // Per-entry assertions.
+        assert_eq!(prepared.len(), 3);
+        for (idx, (invocation, child_root)) in prepared.iter().enumerate() {
+            assert_eq!(invocation.kind, TaskKind::Subagent);
+            assert_eq!(invocation.status, TaskStatus::WaitingOnChildren);
+            assert_eq!(invocation.parent_id.as_ref(), Some(&parent_id));
+            assert_eq!(
+                invocation.spawn_index,
+                Some(u32::try_from(idx).expect("test idx fits in u32"))
+            );
+            assert_eq!(invocation.thread_id, parent.thread_id);
+            assert_eq!(invocation.depth, parent.depth + 1);
+
+            let linkage = invocation
+                .state
+                .subagent_invocation()
+                .context("subagent linkage missing")?;
+            assert_eq!(linkage.child_root_task_id, child_root.id);
+            assert_eq!(linkage.child_thread_id, child_thread_ids[idx]);
+
+            assert_eq!(child_root.kind, TaskKind::RootTurn);
+            assert_eq!(child_root.status, TaskStatus::Pending);
+            assert_eq!(child_root.thread_id, child_thread_ids[idx]);
+            assert!(child_root.parent_id.is_none());
+        }
+
+        // Index assertions: parent's child set sees all N invocations.
+        let parent_children = store
+            .list_children(&parent_id)
+            .await
+            .context("list parent children")?;
+        assert_eq!(parent_children.len(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_batch_rejects_empty_input() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) =
+            running_root_for_spawn(&store, "t-subagent-batch-empty").await?;
+        let parent_id = parent.id.clone();
+
+        let err = store
+            .spawn_subagent_batch(
+                &parent_id,
+                &worker,
+                &lease,
+                Vec::new(),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-empty"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .err()
+            .context("empty batch should fail")?;
+        assert!(
+            format!("{err:#}").contains("spawns must be non-empty"),
+            "unexpected: {err:#}"
+        );
+
+        // Parent state untouched after the rejected call.
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_batch_rejects_duplicate_child_thread_ids() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) =
+            running_root_for_spawn(&store, "t-subagent-batch-dup").await?;
+        let parent_id = parent.id.clone();
+        let dup_thread = thread("t-subagent-batch-dup-child");
+
+        let spawns = vec![
+            SubagentInvocationSpawn {
+                child_thread_id: dup_thread.clone(),
+                spec: sample_subagent_spec(),
+                child_root_input: sample_subagent_input(),
+                spawn_index: 0,
+                payload: SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-dup"),
+                    suspended_messages: Vec::new(),
+                },
+            },
+            SubagentInvocationSpawn {
+                child_thread_id: dup_thread.clone(),
+                spec: sample_subagent_spec(),
+                child_root_input: sample_subagent_input(),
+                spawn_index: 1,
+                payload: SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-dup"),
+                    suspended_messages: Vec::new(),
+                },
+            },
+        ];
+
+        let err = store
+            .spawn_subagent_batch(
+                &parent_id,
+                &worker,
+                &lease,
+                spawns,
+                SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-dup"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .err()
+            .context("duplicate thread id should fail")?;
+        assert!(
+            format!("{err:#}").contains("duplicate child_thread_id"),
+            "unexpected: {err:#}"
+        );
+
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_subagent_batch_rejects_wrong_worker_or_lease() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, _worker, lease) =
+            running_root_for_spawn(&store, "t-subagent-batch-cas").await?;
+        let parent_id = parent.id.clone();
+        let child_thread_id = thread("t-subagent-batch-cas-child");
+        let make_spawns = || {
+            vec![SubagentInvocationSpawn {
+                child_thread_id: child_thread_id.clone(),
+                spec: sample_subagent_spec(),
+                child_root_input: sample_subagent_input(),
+                spawn_index: 0,
+                payload: SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-cas"),
+                    suspended_messages: Vec::new(),
+                },
+            }]
+        };
+
+        let err = store
+            .spawn_subagent_batch(
+                &parent_id,
+                &WorkerId::from_string("w-imposter"),
+                &lease,
+                make_spawns(),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-subagent-batch-cas"),
+                    suspended_messages: Vec::new(),
+                },
+                t_plus(2),
+            )
+            .await
+            .err()
+            .context("wrong worker should fail")?;
+        assert!(
+            format!("{err:#}").contains("worker mismatch"),
+            "unexpected: {err:#}"
+        );
+
+        let persisted = store
+            .get(&parent_id)
+            .await
+            .context("get parent")?
+            .context("parent exists")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent_id).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn child_root_terminal_transition_wakes_linked_subagent_invocation() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
+
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-subagent-terminal").await?;
         let parent_id = parent.id.clone();
         let child_thread_id = thread("t-subagent-terminal-child");

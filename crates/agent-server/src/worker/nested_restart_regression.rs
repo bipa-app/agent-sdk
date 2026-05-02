@@ -278,6 +278,7 @@ impl TestStores {
             checkpoint_store: &self.checkpoints,
             event_repo: &self.events,
             event_notifier: &self.event_notifier,
+            subagent_spawn_selector: None,
         }
     }
 
@@ -963,13 +964,13 @@ async fn restart_mid_child_resume_completes_nested_tree_deterministically() -> R
 
     // A fresh worker resumes the child root, then the invocation
     // materialization and parent resume all complete.
-    resume_child_root_to_completion(
+    Box::pin(resume_child_root_to_completion(
         &stores,
         &spawned.child_root_task.id,
         "resume-after-restart",
         clock_after_restart,
         clock_after_restart + Duration::seconds(1),
-    )
+    ))
     .await?;
     let subagent_outcome = run_invocation_to_completion(
         &stores,
@@ -981,12 +982,12 @@ async fn restart_mid_child_resume_completes_nested_tree_deterministically() -> R
     .await?;
     assert_invocation_success(&subagent_outcome, "child final response");
 
-    let completed_parent = resume_parent_root(
+    let completed_parent = Box::pin(resume_parent_root(
         &stores,
         &parent.task.id,
         "after-restart",
         clock_after_restart + Duration::seconds(4),
-    )
+    ))
     .await?;
     assert_eq!(completed_parent.status, TaskStatus::Completed);
     assert_eq!(completed_parent.id, parent.task.id);
@@ -1124,13 +1125,13 @@ async fn restart_lease_sweep_requeues_running_child_tool_and_tree_completes() ->
         "recovered output",
     )
     .await?;
-    resume_child_root_to_completion(
+    Box::pin(resume_child_root_to_completion(
         &stores,
         &spawned.child_root_task.id,
         "child-resume-recovered",
         clock_after_restart + Duration::seconds(2),
         clock_after_restart + Duration::seconds(3),
-    )
+    ))
     .await?;
     let subagent_outcome = run_invocation_to_completion(
         &stores,
@@ -1142,12 +1143,12 @@ async fn restart_lease_sweep_requeues_running_child_tool_and_tree_completes() ->
     .await?;
     assert!(subagent_outcome.tool_result.success);
 
-    let completed_parent = resume_parent_root(
+    let completed_parent = Box::pin(resume_parent_root(
         &stores,
         &parent.task.id,
         "recovered",
         clock_after_restart + Duration::seconds(6),
-    )
+    ))
     .await?;
     assert_eq!(completed_parent.status, TaskStatus::Completed);
 
@@ -1213,11 +1214,25 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
 
     let tool_tasks =
         suspend_child_root_on_tool_call(&stores, &spawned, "replay", t_plus(3), t_plus(4)).await?;
-    let subagent_outcome =
-        drive_child_to_completion(&stores, &spawned, &tool_tasks, "replay", t_plus(5)).await?;
+    // Box::pin: M5.4's deeper helper-call stack pushed this test's
+    // future past clippy's `large_futures` threshold. Test-only
+    // hot path — boxing is free.
+    let subagent_outcome = Box::pin(drive_child_to_completion(
+        &stores,
+        &spawned,
+        &tool_tasks,
+        "replay",
+        t_plus(5),
+    ))
+    .await?;
     assert!(subagent_outcome.tool_result.success);
-    let completed_parent =
-        resume_parent_root(&stores, &parent.task.id, "replay", t_plus(20)).await?;
+    let completed_parent = Box::pin(resume_parent_root(
+        &stores,
+        &parent.task.id,
+        "replay",
+        t_plus(20),
+    ))
+    .await?;
     assert_eq!(completed_parent.status, TaskStatus::Completed);
 
     // Simulate a restart and build a fresh notifier. The durable
@@ -1226,6 +1241,47 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
     let reconnect_notifier = EventNotifier::new();
 
     let parent_repo_events = stores.events.get_events(&parent_thread).await?;
+    let child_repo_events = stores
+        .events
+        .get_events(&spawned.child_thread.thread_id)
+        .await?;
+
+    assert_parent_thread_replay_is_summary_only(
+        &parent_thread,
+        &stores.events,
+        &reconnect_notifier,
+        &parent_repo_events,
+    )
+    .await?;
+    assert_child_thread_replay_is_rich(
+        &spawned.child_thread.thread_id,
+        &stores.events,
+        &reconnect_notifier,
+        &child_repo_events,
+    )
+    .await?;
+
+    // Cross-thread isolation: no event in the parent repo belongs
+    // to the child thread, and vice versa.
+    for committed in &parent_repo_events {
+        assert_eq!(committed.thread_id, parent_thread);
+    }
+    for committed in &child_repo_events {
+        assert_eq!(committed.thread_id, spawned.child_thread.thread_id);
+    }
+
+    Ok(())
+}
+
+/// Drain the parent thread's replay stream and assert it carries only
+/// the per-spawn / per-completion `SubagentProgress` summaries plus
+/// lifecycle events — never any of the child's tool-call events.
+async fn assert_parent_thread_replay_is_summary_only(
+    parent_thread: &ThreadId,
+    events: &InMemoryEventRepository,
+    reconnect_notifier: &EventNotifier,
+    parent_repo_events: &[crate::journal::CommittedEvent],
+) -> Result<()> {
     let parent_event_count = parent_repo_events.len();
     assert!(
         parent_event_count >= 2,
@@ -1233,9 +1289,9 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
     );
 
     let parent_events = drain_thread_stream(
-        &parent_thread,
-        &stores.events,
-        &reconnect_notifier,
+        parent_thread,
+        events,
+        reconnect_notifier,
         parent_event_count,
     )
     .await?;
@@ -1260,24 +1316,26 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
             _ => {}
         }
     }
+    Ok(())
+}
 
-    // Child thread replay — rich timeline, zero SubagentProgress.
-    let child_repo_events = stores
-        .events
-        .get_events(&spawned.child_thread.thread_id)
-        .await?;
+/// Drain the child thread's replay stream and assert it carries the
+/// full rich timeline (`ToolCallStart` / `ToolCallEnd` / `Done`) and
+/// **no** `SubagentProgress` events — those live exclusively on the
+/// parent.
+async fn assert_child_thread_replay_is_rich(
+    child_thread: &ThreadId,
+    events: &InMemoryEventRepository,
+    reconnect_notifier: &EventNotifier,
+    child_repo_events: &[crate::journal::CommittedEvent],
+) -> Result<()> {
     let child_event_count = child_repo_events.len();
     assert!(
         child_event_count > 0,
         "child thread must have committed at least Start/Done lifecycle events",
     );
-    let child_events = drain_thread_stream(
-        &spawned.child_thread.thread_id,
-        &stores.events,
-        &reconnect_notifier,
-        child_event_count,
-    )
-    .await?;
+    let child_events =
+        drain_thread_stream(child_thread, events, reconnect_notifier, child_event_count).await?;
     assert_eq!(child_events.len(), child_event_count);
     for event in &child_events {
         assert!(
@@ -1303,16 +1361,6 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
             .any(|event| matches!(event, AgentEvent::Done { .. })),
         "child thread replay must include a Done event for the completed turn",
     );
-
-    // Cross-thread isolation: no event in the parent repo belongs
-    // to the child thread, and vice versa.
-    for committed in &parent_repo_events {
-        assert_eq!(committed.thread_id, parent_thread);
-    }
-    for committed in &child_repo_events {
-        assert_eq!(committed.thread_id, spawned.child_thread.thread_id);
-    }
-
     Ok(())
 }
 
