@@ -116,6 +116,19 @@ where
 {
     hooks.on_event(&event).await;
 
+    // Mirror the event onto `langfuse.trace.output` when a
+    // `RootTraceState` is attached to the current OTel context. The
+    // helper is a no-op when no state is attached (the default
+    // `agent.run` / `agent.run_turn` paths) — it only fires for the
+    // `_with_options` callers that asked the SDK to populate
+    // Langfuse trace metadata.
+    #[cfg(feature = "otel")]
+    crate::observability::trace_io::observe_current(&event);
+    #[cfg(feature = "otel")]
+    if let AgentEvent::Error { message, .. } = &event {
+        crate::observability::trace_io::observe_current_error(message);
+    }
+
     let envelope = authority.wrap(event);
     event_store
         .append(thread_id, turn, envelope)
@@ -133,6 +146,12 @@ pub(super) async fn wrap_and_send(
     event: AgentEvent,
     authority: &Arc<dyn EventAuthority>,
 ) -> Result<(), AgentError> {
+    // Same trace-output mirror as `send_event`. We tap the event
+    // before consuming it to wrap the envelope so the accumulator
+    // sees the same payload that lands in the store.
+    #[cfg(feature = "otel")]
+    crate::observability::trace_io::observe_current(&event);
+
     let envelope = authority.wrap(event);
     event_store
         .append(thread_id, turn, envelope)

@@ -54,7 +54,7 @@ use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId};
+use crate::types::{AgentConfig, AgentInput, AgentRunState, RunOptions, ThreadId};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -329,6 +329,38 @@ where
         state_rx
     }
 
+    /// Like [`run`](Self::run), but with caller-supplied trace metadata.
+    ///
+    /// Equivalent to `run` except that the supplied [`RunOptions`]
+    /// configure session/user IDs (propagated as `session.id` /
+    /// `user.id` baggage), `langfuse.trace.{name,tags,metadata.*,
+    /// input,output}`, `langfuse.{release,environment}`, and the
+    /// trace-text truncation ceiling.
+    ///
+    /// Use this instead of `run` whenever the consumer needs the
+    /// SDK to populate Langfuse trace metadata; `run` itself
+    /// continues to delegate here with `RunOptions::default()`.
+    pub fn run_with_options(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+        run_options: RunOptions,
+    ) -> oneshot::Receiver<AgentRunState>
+    where
+        Ctx: Clone,
+    {
+        let (state_rx, _handle) = self.run_abortable_with_options(
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            run_options,
+        );
+        state_rx
+    }
+
     /// Like [`run`](Self::run), but also returns the [`tokio::task::JoinHandle`] for the
     /// spawned task.
     ///
@@ -349,6 +381,39 @@ where
     where
         Ctx: Clone,
     {
+        self.run_abortable_with_options(
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            RunOptions::default(),
+        )
+    }
+
+    /// Like [`run_abortable`](Self::run_abortable), but with
+    /// caller-supplied trace metadata. See [`run_with_options`](Self::run_with_options).
+    pub fn run_abortable_with_options(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+        run_options: RunOptions,
+    ) -> (
+        oneshot::Receiver<AgentRunState>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        Ctx: Clone,
+    {
+        // `run_options` only feeds OTel root-span metadata. On
+        // non-otel builds the value is genuinely not needed —
+        // explicitly drop it so the unused-variable / needless-pass
+        // lints stay quiet without us reaching for an
+        // `#[allow(...)]`.
+        #[cfg(not(feature = "otel"))]
+        drop(run_options);
+
         let (state_tx, state_rx) = oneshot::channel();
         let authority = self.resolve_authority();
 
@@ -387,6 +452,8 @@ where
                 audit_sink,
                 cancel_token,
                 input_rx: None,
+                #[cfg(feature = "otel")]
+                run_options,
                 #[cfg(feature = "otel")]
                 observability_store,
             })
@@ -427,6 +494,34 @@ where
     where
         Ctx: Clone,
     {
+        self.run_persistent_with_options(
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            RunOptions::default(),
+        )
+    }
+
+    /// Like [`run_persistent`](Self::run_persistent), but with
+    /// caller-supplied trace metadata. See
+    /// [`run_with_options`](Self::run_with_options).
+    pub fn run_persistent_with_options(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+        run_options: RunOptions,
+    ) -> AgentHandle
+    where
+        Ctx: Clone,
+    {
+        // See `run_abortable_with_options` for why we explicitly
+        // drop `run_options` on non-otel builds.
+        #[cfg(not(feature = "otel"))]
+        drop(run_options);
+
         let (state_tx, state_rx) = oneshot::channel();
         let (input_tx, input_rx) = mpsc::channel(32);
         let authority = self.resolve_authority();
@@ -467,6 +562,8 @@ where
                 audit_sink,
                 cancel_token,
                 input_rx: Some(input_rx),
+                #[cfg(feature = "otel")]
+                run_options,
                 #[cfg(feature = "otel")]
                 observability_store,
             })
@@ -586,6 +683,42 @@ where
     where
         Ctx: Clone,
     {
+        self.run_turn_with_options(
+            thread_id,
+            input,
+            tool_context,
+            cancel_token,
+            options,
+            RunOptions::default(),
+        )
+        .await
+    }
+
+    /// Like [`run_turn`](Self::run_turn), but with caller-supplied
+    /// trace metadata.
+    ///
+    /// See [`run_with_options`](Self::run_with_options) for the full
+    /// [`RunOptions`] contract. The `turn_options` parameter retains
+    /// its existing semantics (tool runtime / strict durability);
+    /// `run_options` is layered on top to populate Langfuse trace
+    /// metadata on the root `invoke_agent` span.
+    pub async fn run_turn_with_options(
+        &self,
+        thread_id: ThreadId,
+        input: AgentInput,
+        tool_context: ToolContext<Ctx>,
+        cancel_token: CancellationToken,
+        turn_options: TurnOptions,
+        run_options: RunOptions,
+    ) -> crate::types::TurnOutcome
+    where
+        Ctx: Clone,
+    {
+        // See `run_abortable_with_options` for why we explicitly
+        // drop `run_options` on non-otel builds.
+        #[cfg(not(feature = "otel"))]
+        drop(run_options);
+
         let authority = self.resolve_authority();
 
         run_single_turn(TurnParameters {
@@ -605,7 +738,9 @@ where
             execution_store: self.execution_store.clone(),
             audit_sink: Arc::clone(&self.audit_sink),
             cancel_token,
-            turn_options: options,
+            turn_options,
+            #[cfg(feature = "otel")]
+            run_options,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store.clone(),
         })

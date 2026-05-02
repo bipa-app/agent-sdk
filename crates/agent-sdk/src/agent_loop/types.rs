@@ -4,6 +4,8 @@ use crate::hooks::ToolAuditSink;
 use crate::llm::StopReason;
 use crate::stores::{EventStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
+#[cfg(feature = "otel")]
+use crate::types::RunOptions;
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
     PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
@@ -244,6 +246,15 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) cancel_token: CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
+    /// Trace metadata applied to the root span (and threaded through
+    /// every event emission as `langfuse.trace.output`).
+    ///
+    /// Always present on the otel build path; defaults to
+    /// [`RunOptions::default`] when the caller used the historical
+    /// `run` / `run_persistent` entry points. Stripped from non-otel
+    /// builds because nothing consumes it there.
+    #[cfg(feature = "otel")]
+    pub(super) run_options: RunOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -373,6 +384,12 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) cancel_token: CancellationToken,
     pub(super) turn_options: TurnOptions,
+    /// Trace metadata applied to the root span. See
+    /// [`RunLoopParameters::run_options`] for the full contract.
+    /// Only consumed on the otel build path — see the gating note
+    /// on [`RunLoopParameters::run_options`].
+    #[cfg(feature = "otel")]
+    pub(super) run_options: RunOptions,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }

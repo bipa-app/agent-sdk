@@ -16,8 +16,8 @@
 use agent_sdk::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
 use agent_sdk::observability::{CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle};
 use agent_sdk::{
-    AgentInput, CancellationToken, EventStore, InMemoryEventStore, LlmProvider, ThreadId,
-    ToolContext, builder,
+    AgentInput, CancellationToken, EventStore, InMemoryEventStore, LlmProvider, RunOptions,
+    ThreadId, ToolContext, builder,
 };
 use agent_sdk_otel::{OtelConfig, install_global_provider};
 use anyhow::{Context, Result};
@@ -88,11 +88,35 @@ async fn main() -> Result<()> {
         .build();
 
     let thread_id = ThreadId::new();
-    let final_state = agent.run(
+
+    // A5: pass per-run trace metadata through `RunOptions` so the
+    // SDK populates `langfuse.trace.{name,session.id,user.id,
+    // metadata.*}` and the running `langfuse.trace.{input,output}`
+    // accumulator without any consumer-side glue. Leave any field
+    // at its default (e.g. `RunOptions::default()`) when you don't
+    // need that piece of metadata.
+    let mut trace_metadata = serde_json::Map::new();
+    trace_metadata.insert(
+        "client.platform".to_string(),
+        serde_json::Value::String("example".to_string()),
+    );
+    let run_options = RunOptions {
+        session_id: Some(thread_id.to_string()),
+        user_id: Some("demo-user".to_string()),
+        trace_name: Some("agent-sdk.otel-example".to_string()),
+        trace_tags: vec!["example".to_string(), "demo".to_string()],
+        trace_metadata,
+        release: Some(env!("CARGO_PKG_VERSION").to_string()),
+        environment: Some("local".to_string()),
+        trace_text_max_chars: None,
+    };
+
+    let final_state = agent.run_with_options(
         thread_id.clone(),
         AgentInput::Text("Say hello in one sentence.".to_string()),
         ToolContext::new(()),
         CancellationToken::new(),
+        run_options,
     );
     let state = final_state.await.context("agent state channel closed")?;
     let event_count = event_store.get_events(&thread_id).await?.len();

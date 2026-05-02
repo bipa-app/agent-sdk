@@ -1643,19 +1643,32 @@ where
     S: StateStore,
 {
     #[cfg(feature = "otel")]
-    let mut root_span = crate::observability::instrument::start_root_span(
-        params.provider.as_ref(),
-        &params.tools,
-        &params.config,
-        &params.thread_id,
-        &params.input,
-        "loop",
+    let mut started = crate::observability::instrument::start_root_span(
+        &crate::observability::instrument::StartRootSpanParams {
+            provider: params.provider.as_ref(),
+            tools: &params.tools,
+            config: &params.config,
+            thread_id: &params.thread_id,
+            input: &params.input,
+            run_mode: "loop",
+            run_options: &params.run_options,
+        },
+    );
+    #[cfg(feature = "otel")]
+    let trace_state = crate::observability::instrument::build_root_trace_state(
+        started.is_recording,
+        &params.run_options,
     );
     #[cfg(feature = "otel")]
     let root_context = {
-        use opentelemetry::trace::Span;
-
-        crate::observability::context::current_with_span_context(root_span.span_context().clone())
+        let cx = crate::observability::instrument::build_root_context(
+            started.span_context.clone(),
+            &params.run_options,
+        );
+        match trace_state.clone() {
+            Some(state) => state.attach_to(&cx),
+            None => cx,
+        }
     };
 
     #[cfg(feature = "otel")]
@@ -1690,8 +1703,11 @@ where
                 (0, &EMPTY)
             }
         };
+        if let Some(state) = trace_state {
+            state.flush(&mut started.span);
+        }
         end_root_span(
-            &mut root_span,
+            &mut started.span,
             turns,
             total_usage,
             run_state_outcome(&result),
@@ -1720,6 +1736,8 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         audit_sink,
         cancel_token,
         mut input_rx,
+        #[cfg(feature = "otel")]
+            run_options: _,
         #[cfg(feature = "otel")]
         observability_store,
     }: RunLoopParameters<Ctx, P, H, M, S>,
@@ -1836,19 +1854,32 @@ where
     S: StateStore,
 {
     #[cfg(feature = "otel")]
-    let mut root_span = crate::observability::instrument::start_root_span(
-        params.provider.as_ref(),
-        &params.tools,
-        &params.config,
-        &params.thread_id,
-        &params.input,
-        "single_turn",
+    let mut started = crate::observability::instrument::start_root_span(
+        &crate::observability::instrument::StartRootSpanParams {
+            provider: params.provider.as_ref(),
+            tools: &params.tools,
+            config: &params.config,
+            thread_id: &params.thread_id,
+            input: &params.input,
+            run_mode: "single_turn",
+            run_options: &params.run_options,
+        },
+    );
+    #[cfg(feature = "otel")]
+    let trace_state = crate::observability::instrument::build_root_trace_state(
+        started.is_recording,
+        &params.run_options,
     );
     #[cfg(feature = "otel")]
     let root_context = {
-        use opentelemetry::trace::Span;
-
-        crate::observability::context::current_with_span_context(root_span.span_context().clone())
+        let cx = crate::observability::instrument::build_root_context(
+            started.span_context.clone(),
+            &params.run_options,
+        );
+        match trace_state.clone() {
+            Some(state) => state.attach_to(&cx),
+            None => cx,
+        }
     };
 
     #[cfg(feature = "otel")]
@@ -1895,8 +1926,11 @@ where
                 (0, &EMPTY)
             }
         };
+        if let Some(state) = trace_state {
+            state.flush(&mut started.span);
+        }
         end_root_span(
-            &mut root_span,
+            &mut started.span,
             turns,
             total_usage,
             turn_outcome_str(&outcome),
@@ -1925,6 +1959,8 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         audit_sink,
         cancel_token,
         turn_options,
+        #[cfg(feature = "otel")]
+            run_options: _,
         #[cfg(feature = "otel")]
         observability_store,
     }: TurnParameters<Ctx, P, H, M, S>,

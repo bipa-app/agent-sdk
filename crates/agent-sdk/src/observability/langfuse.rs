@@ -186,6 +186,16 @@ pub fn set_trace_output(span: &mut BoxedSpan, value: impl Into<String>) {
     set_string_attribute(span, LANGFUSE_TRACE_OUTPUT, value);
 }
 
+/// Set `langfuse.release` on the span.
+pub fn set_release(span: &mut BoxedSpan, value: impl Into<String>) {
+    set_string_attribute(span, LANGFUSE_RELEASE, value);
+}
+
+/// Set `langfuse.environment` on the span.
+pub fn set_environment(span: &mut BoxedSpan, value: impl Into<String>) {
+    set_string_attribute(span, LANGFUSE_ENVIRONMENT, value);
+}
+
 /// Set a `langfuse.trace.metadata.<key>` entry on the span.
 ///
 /// `key` must be the unprefixed metadata key. The helper concatenates
