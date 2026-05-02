@@ -1017,6 +1017,84 @@ pub struct TurnOptions {
     pub strict_durability: bool,
 }
 
+// ── RunOptions ───────────────────────────────────────────────────────
+
+/// Per-run trace metadata applied to every span emitted by the agent
+/// loop.
+///
+/// Passed to [`run_with_options`](#method.run_with_options) /
+/// [`run_turn_with_options`](#method.run_turn_with_options) /
+/// [`run_persistent_with_options`](#method.run_persistent_with_options)
+/// so a consumer can configure session / user / Langfuse trace
+/// metadata once and have it land on every emitted span — without
+/// writing manual span code or pre-installing baggage on the `OTel`
+/// context.
+///
+/// The SDK applies the contents of `RunOptions` at the root
+/// `invoke_agent` span:
+///
+/// * `session_id` / `user_id` — copied to W3C baggage so Langfuse
+///   `session.id` / `user.id` filters fire on every child span (the
+///   baggage propagation path lives in `agent_sdk::observability::baggage`).
+/// * `trace_name` — set as `langfuse.trace.name`.
+/// * `trace_tags` — set as `langfuse.trace.tags`.
+/// * `trace_metadata` — each entry stamped under `langfuse.trace.metadata.<key>`.
+/// * `release` — set as `langfuse.release`.
+/// * `environment` — set as `langfuse.environment`.
+/// * `trace_text_max_chars` — overrides the default ceiling
+///   (`agent_sdk::observability::langfuse::DEFAULT_TRACE_TEXT_MAX_CHARS`)
+///   for `langfuse.trace.input` / `langfuse.trace.output`.
+///
+/// The SDK also computes `langfuse.trace.input` from the supplied
+/// [`AgentInput`] (after PII redaction) and
+/// streams `langfuse.trace.output` as the agent emits text, tool, and
+/// error events.
+///
+/// `RunOptions` is `Clone + Debug + Default`; it carries only display
+/// strings and opaque metadata values (no secrets) so the standard
+/// `Debug` derive is safe to expose in error contexts.
+///
+/// # Example
+///
+/// ```no_run
+/// use agent_sdk_core::types::RunOptions;
+/// use serde_json::json;
+///
+/// let opts = RunOptions {
+///     session_id: Some("thread-42".to_string()),
+///     user_id: Some("user-7".to_string()),
+///     trace_name: Some("bipa.assistant.android".to_string()),
+///     trace_tags: vec!["mobile.android".to_string()],
+///     trace_metadata: json!({"version": "1.2.3"})
+///         .as_object()
+///         .cloned()
+///         .unwrap_or_default(),
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct RunOptions {
+    /// Langfuse `session.id` / W3C `session.id` baggage entry.
+    pub session_id: Option<String>,
+    /// Langfuse `user.id` / W3C `user.id` baggage entry.
+    pub user_id: Option<String>,
+    /// Display name of the trace in the Langfuse UI.
+    pub trace_name: Option<String>,
+    /// Free-form labels attached to the trace.
+    pub trace_tags: Vec<String>,
+    /// Trace-level metadata stamped as `langfuse.trace.metadata.<key>`.
+    pub trace_metadata: serde_json::Map<String, serde_json::Value>,
+    /// Release identifier for the trace's build.
+    pub release: Option<String>,
+    /// Langfuse environment slug (`prod`, `staging`, …).
+    pub environment: Option<String>,
+    /// Override the default character ceiling for trace-level free-text
+    /// attributes. `None` falls back to
+    /// `agent_sdk::observability::langfuse::DEFAULT_TRACE_TEXT_MAX_CHARS`.
+    pub trace_text_max_chars: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

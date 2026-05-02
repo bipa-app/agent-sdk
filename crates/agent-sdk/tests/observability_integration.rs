@@ -1406,3 +1406,377 @@ async fn baggage_helpers_attach_and_preserve_existing_entries() -> Result<()> {
 
     Ok(())
 }
+
+// ── RunOptions / Langfuse trace metadata (A5) ────────────────────────
+
+use agent_sdk::RunOptions;
+
+fn run_options_with_session(session: &str) -> RunOptions {
+    RunOptions {
+        session_id: Some(session.to_string()),
+        ..RunOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn run_options_stamp_langfuse_trace_metadata_on_root_span() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hello!")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "release_channel".to_string(),
+        Value::String("beta".to_string()),
+    );
+    metadata.insert("user_count".to_string(), json!(42));
+
+    let opts = RunOptions {
+        session_id: Some("session-A5".to_string()),
+        user_id: Some("user-A5".to_string()),
+        trace_name: Some("a5.test.run".to_string()),
+        trace_tags: vec!["mobile.android".to_string(), "experiment.b".to_string()],
+        trace_metadata: metadata,
+        release: Some("1.2.3".to_string()),
+        environment: Some("staging".to_string()),
+        trace_text_max_chars: None,
+    };
+
+    let final_state = agent.run_with_options(
+        thread_id.clone(),
+        AgentInput::Text("Hi from A5".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    // Trace name is stamped verbatim.
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_TRACE_NAME).as_deref(),
+        Some("a5.test.run"),
+    );
+
+    // Tags become a comma-joined string (the OTel SDK stringifies the
+    // string-array attribute consistently for `assert_eq!`).
+    assert!(
+        get_attr(root, langfuse::LANGFUSE_TRACE_TAGS)
+            .is_some_and(|v| v.contains("mobile.android") && v.contains("experiment.b")),
+        "trace tags missing or malformed: {:?}",
+        get_attr(root, langfuse::LANGFUSE_TRACE_TAGS),
+    );
+
+    // Each metadata entry lands under `langfuse.trace.metadata.<key>`.
+    assert_eq!(
+        get_attr(
+            root,
+            &format!(
+                "{}{}",
+                langfuse::LANGFUSE_TRACE_METADATA_PREFIX,
+                "release_channel"
+            ),
+        )
+        .as_deref(),
+        Some("beta"),
+    );
+    assert_eq!(
+        get_attr(
+            root,
+            &format!(
+                "{}{}",
+                langfuse::LANGFUSE_TRACE_METADATA_PREFIX,
+                "user_count"
+            ),
+        )
+        .as_deref(),
+        Some("42"),
+    );
+
+    // `release` and `environment` map to the canonical Langfuse attrs.
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_RELEASE).as_deref(),
+        Some("1.2.3"),
+    );
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_ENVIRONMENT).as_deref(),
+        Some("staging"),
+    );
+
+    // Session/user become baggage entries that the existing
+    // `copy_baggage_to_active_span` helper mirrors onto the span.
+    assert_eq!(
+        get_attr(root, obs_baggage::BAGGAGE_SESSION_ID).as_deref(),
+        Some("session-A5"),
+    );
+    assert_eq!(
+        get_attr(root, obs_baggage::BAGGAGE_LANGFUSE_SESSION_ID).as_deref(),
+        Some("session-A5"),
+    );
+    assert_eq!(
+        get_attr(root, obs_baggage::BAGGAGE_USER_ID).as_deref(),
+        Some("user-A5"),
+    );
+    assert_eq!(
+        get_attr(root, obs_baggage::BAGGAGE_LANGFUSE_USER_ID).as_deref(),
+        Some("user-A5"),
+    );
+
+    // Trace input mirrors the `AgentInput` summary.
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_TRACE_INPUT).as_deref(),
+        Some("Hi from A5"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_options_default_omits_caller_supplied_trace_metadata() -> Result<()> {
+    // Backwards compatibility: `agent.run(...)` (no options) must
+    // continue to emit the same span surface as before A5 — the
+    // caller-supplied Langfuse fields (`trace.name`, `trace.tags`,
+    // `release`, `environment`, and the metadata prefix) MUST stay
+    // absent.
+    //
+    // `langfuse.trace.input` and `langfuse.trace.output` are
+    // populated unconditionally because the SDK now lifts that
+    // computation away from consumers — that's covered by the
+    // dedicated `_accumulate_trace_output_from_events` test.
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    assert_attr_absent(root, langfuse::LANGFUSE_TRACE_NAME);
+    assert_attr_absent(root, langfuse::LANGFUSE_TRACE_TAGS);
+    assert_attr_absent(root, langfuse::LANGFUSE_RELEASE);
+    assert_attr_absent(root, langfuse::LANGFUSE_ENVIRONMENT);
+    assert_attr_absent(
+        root,
+        &format!("{}{}", langfuse::LANGFUSE_TRACE_METADATA_PREFIX, "anything"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_options_accumulate_trace_output_from_events() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![
+        TestProvider::tool_use_response("call_1", "echo", json!({"text": "hello"})),
+        TestProvider::text_response("All done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let final_state = agent.run_with_options(
+        thread_id.clone(),
+        AgentInput::Text("Echo and finish".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        run_options_with_session("trace-output-session"),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    let trace_output = get_attr(root, langfuse::LANGFUSE_TRACE_OUTPUT)
+        .context("missing langfuse.trace.output on root span")?;
+
+    // The accumulator labels every chunk it ingests. We expect at
+    // minimum: the assistant text, the tool call summary, and the
+    // tool result body.
+    assert!(
+        trace_output.contains("[Assistant]"),
+        "expected [Assistant] label, got: {trace_output}",
+    );
+    assert!(
+        trace_output.contains("All done"),
+        "expected assistant text, got: {trace_output}",
+    );
+    assert!(
+        trace_output.contains("[Tool Call]"),
+        "expected [Tool Call] label, got: {trace_output}",
+    );
+    assert!(
+        trace_output.contains("echo"),
+        "expected tool name in trace output, got: {trace_output}",
+    );
+    assert!(
+        trace_output.contains("[Tool Result]"),
+        "expected [Tool Result] label, got: {trace_output}",
+    );
+    assert!(
+        trace_output.contains("hello"),
+        "expected tool result body, got: {trace_output}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_with_options_stamps_metadata_in_single_turn_mode() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("flag".to_string(), Value::String("enabled".to_string()));
+    let opts = RunOptions {
+        session_id: Some("turn-session".to_string()),
+        user_id: None,
+        trace_name: Some("single-turn".to_string()),
+        trace_tags: Vec::new(),
+        trace_metadata: metadata,
+        release: None,
+        environment: None,
+        trace_text_max_chars: None,
+    };
+
+    let _ = agent
+        .run_turn_with_options(
+            thread_id.clone(),
+            AgentInput::Text("One-shot".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+            opts,
+        )
+        .await;
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    assert_eq!(
+        get_attr(root, attrs::SDK_RUN_MODE).as_deref(),
+        Some("single_turn"),
+    );
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_TRACE_NAME).as_deref(),
+        Some("single-turn"),
+    );
+    assert_eq!(
+        get_attr(
+            root,
+            &format!("{}{}", langfuse::LANGFUSE_TRACE_METADATA_PREFIX, "flag"),
+        )
+        .as_deref(),
+        Some("enabled"),
+    );
+    assert_eq!(
+        get_attr(root, langfuse::LANGFUSE_TRACE_INPUT).as_deref(),
+        Some("One-shot"),
+    );
+    assert_eq!(
+        get_attr(root, obs_baggage::BAGGAGE_SESSION_ID).as_deref(),
+        Some("turn-session"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_options_truncate_trace_text_at_caller_supplied_max() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let long: String = "x".repeat(200);
+    let provider = TestProvider::new(vec![TestProvider::text_response(&long)]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    // Cap trace text at a small budget so we can observe the
+    // truncation marker on the accumulated `langfuse.trace.output`.
+    let opts = RunOptions {
+        session_id: None,
+        user_id: None,
+        trace_name: None,
+        trace_tags: Vec::new(),
+        trace_metadata: serde_json::Map::new(),
+        release: None,
+        environment: None,
+        trace_text_max_chars: Some(32),
+    };
+
+    let final_state = agent.run_with_options(
+        thread_id.clone(),
+        AgentInput::Text("Long output".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+
+    let trace_output = get_attr(root, langfuse::LANGFUSE_TRACE_OUTPUT)
+        .context("missing langfuse.trace.output on root span")?;
+    assert!(
+        trace_output.chars().count() <= 32,
+        "trace output exceeded budget ({} chars): {trace_output}",
+        trace_output.chars().count(),
+    );
+    assert!(
+        trace_output.ends_with('…'),
+        "expected ellipsis truncation marker, got: {trace_output}",
+    );
+
+    Ok(())
+}

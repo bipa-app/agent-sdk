@@ -394,9 +394,9 @@ pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
-    ListenExecutionContext, PendingToolCallInfo, RetryConfig, ThreadId, TokenUsage, ToolExecution,
-    ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
-    TurnSummary,
+    ListenExecutionContext, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId, TokenUsage,
+    ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
+    TurnOutcome, TurnSummary,
 };
 
 // agent-sdk-tools (via thin modules)

@@ -12,6 +12,7 @@ pub mod langfuse;
 pub mod payload;
 pub mod provider_name;
 pub mod spans;
+pub(crate) mod trace_io;
 pub mod types;
 
 pub use types::{CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle};
