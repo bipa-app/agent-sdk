@@ -1068,6 +1068,7 @@ pub struct SubagentInvocationDeps<'a> {
 }
 
 /// Durable records created for one subagent spawn.
+#[derive(Debug)]
 pub struct SpawnedSubagentInvocation {
     pub parent_task: AgentTask,
     pub invocation_task: AgentTask,
@@ -1347,6 +1348,194 @@ pub async fn spawn_subagent_invocation(
         child_thread,
         child_root_task,
         committed_events,
+    })
+}
+
+/// Records returned by [`spawn_subagent_batch_invocations`].
+///
+/// One [`SpawnedSubagentInvocation`] per entry in the input `spawns`,
+/// in the same order. The first entry's `parent_task` is the
+/// authoritative post-spawn parent row; subsequent entries carry a
+/// clone for convenience so callers can iterate uniformly.
+#[derive(Debug)]
+pub struct SpawnedSubagentBatch {
+    /// Parent task post-transition (`WaitingOnChildren`, with
+    /// `pending_child_count == invocations.len()`).
+    pub parent_task: AgentTask,
+    /// One persisted invocation + child thread per entry, in input order.
+    pub invocations: Vec<SpawnedSubagentInvocation>,
+}
+
+/// Persist N durable subagent invocations atomically under one parent
+/// transition.
+///
+/// This is the fan-out flavour of [`spawn_subagent_invocation`]. The
+/// validation, child-thread materialization, and parent-progress
+/// emission semantics match the single-shot path, repeated per
+/// entry. The single store-side CAS guarantees the parent moves to
+/// `WaitingOnChildren { pending_child_count: N }` exactly once — no
+/// partial fan-out is observable from concurrent readers.
+///
+/// `spawns` must be non-empty; every entry's `spawn_index` must point
+/// at the matching `pending_tool_calls` slot in the shared
+/// continuation envelope (taken from `spawns[0].payload`); every
+/// `child_thread_id` must be unique across the batch.
+///
+/// # Errors
+///
+/// Returns an error if the input is empty, if any entry references an
+/// out-of-bounds `spawn_index`, if any of the targeted tool calls is
+/// not Confirm-tier, if child-thread materialization fails for any
+/// entry, if the store-side `spawn_subagent_batch` rejects the call
+/// (CAS, leaf-parent, duplicate child thread, duplicate invocation
+/// id), or if the durable linkage returned by the store is inconsistent.
+#[allow(clippy::too_many_lines)] // linear validate-then-apply pipeline
+pub async fn spawn_subagent_batch_invocations(
+    parent_id: &AgentTaskId,
+    worker: &WorkerId,
+    lease: &LeaseId,
+    mut spawns: Vec<SubagentInvocationSpawn>,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedSubagentBatch> {
+    ensure!(!spawns.is_empty(), "subagent batch must be non-empty");
+
+    // Validate every entry against the shared continuation envelope
+    // before we start materializing child threads. Two reasons:
+    //
+    // 1. The entries in `spawns` all share one parent suspension, so
+    //    `payload.continuation.payload.pending_tool_calls` is the same
+    //    list for everyone — one bad spawn_index should reject the
+    //    whole batch up front, not after we've created N-1 child
+    //    threads.
+    // 2. We pre-compute one shared payload from `spawns[0].payload` so
+    //    the store-side primitive only needs one envelope.
+    let pending_tool_count = spawns[0]
+        .payload
+        .continuation
+        .payload
+        .pending_tool_calls
+        .len();
+    let mut pending_tools_by_entry: Vec<agent_sdk_core::PendingToolCallInfo> =
+        Vec::with_capacity(spawns.len());
+    for spawn in &spawns {
+        let spawn_index_usize =
+            usize::try_from(spawn.spawn_index).context("subagent spawn_index exceeds usize")?;
+        ensure!(
+            spawn_index_usize < pending_tool_count,
+            "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
+        );
+        let pending_tool =
+            spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
+        ensure_confirm_tier_subagent_tool(&pending_tool)?;
+        pending_tools_by_entry.push(pending_tool);
+    }
+
+    // Per-entry: derive the default child input if blank, and
+    // materialize the child thread row before the store sees it.
+    let mut child_threads = Vec::with_capacity(spawns.len());
+    for spawn in &mut spawns {
+        if spawn.child_root_input.is_empty() {
+            spawn.child_root_input = build_child_root_input(&spawn.spec);
+        }
+        let child_thread = deps
+            .thread_store
+            .get_or_create(&spawn.child_thread_id, now)
+            .await
+            .context("materialize child thread projection")?;
+        child_threads.push(child_thread);
+    }
+
+    // The store primitive expects one shared SuspensionPayload and
+    // ignores the per-entry payloads — but the trait stores the
+    // shared one explicitly for clarity. Take the first entry's
+    // payload (every entry must agree on it; they originated from
+    // the same parent suspension).
+    let shared_payload = spawns[0].payload.clone();
+
+    let (parent_task, prepared) = deps
+        .task_store
+        .spawn_subagent_batch(parent_id, worker, lease, spawns, shared_payload, now)
+        .await
+        .context("persist subagent batch invocation tasks")?;
+
+    ensure!(
+        prepared.len() == child_threads.len(),
+        "spawn_subagent_batch returned {} invocations for {} child threads",
+        prepared.len(),
+        child_threads.len(),
+    );
+    ensure!(
+        prepared.len() == pending_tools_by_entry.len(),
+        "spawn_subagent_batch returned {} invocations for {} pending tools",
+        prepared.len(),
+        pending_tools_by_entry.len(),
+    );
+
+    let mut invocations = Vec::with_capacity(prepared.len());
+    for ((invocation_task, child_root_task), (child_thread, pending_tool)) in prepared
+        .into_iter()
+        .zip(child_threads.into_iter().zip(pending_tools_by_entry))
+    {
+        let linkage = invocation_task
+            .state
+            .subagent_invocation()
+            .context("subagent invocation task missing durable linkage")?;
+        ensure!(
+            linkage.child_root_task_id == child_root_task.id,
+            "subagent invocation linkage points at child root {} but store returned {}",
+            linkage.child_root_task_id,
+            child_root_task.id,
+        );
+        ensure!(
+            linkage.child_thread_id == child_root_task.thread_id,
+            "subagent invocation linkage points at child thread {} but child root uses {}",
+            linkage.child_thread_id,
+            child_root_task.thread_id,
+        );
+        ensure!(
+            child_thread.thread_id == child_root_task.thread_id,
+            "materialized child thread {} but child root uses {}",
+            child_thread.thread_id,
+            child_root_task.thread_id,
+        );
+
+        let subagent_name = canonical_subagent_name(&pending_tool.name);
+        let started_event = build_parent_progress_event(&SubagentProgressSnapshot {
+            subagent_id: &pending_tool.id,
+            subagent_name,
+            spec: &linkage.spec,
+            child_thread_id: &child_thread.thread_id,
+            child_root_task_id: &child_root_task.id,
+            subagent_task_id: &invocation_task.id,
+            completed: false,
+            success: false,
+            current_turn: 0,
+            tool_count: 0,
+            total_tokens: 0,
+        });
+        let committed_events = commit_parent_subagent_progress_if_possible(
+            deps.event_repo,
+            &parent_task.thread_id,
+            started_event,
+            now,
+            "batch_spawn",
+            &pending_tool.id,
+        )
+        .await;
+
+        invocations.push(SpawnedSubagentInvocation {
+            parent_task: parent_task.clone(),
+            invocation_task,
+            child_thread,
+            child_root_task,
+            committed_events,
+        });
+    }
+
+    Ok(SpawnedSubagentBatch {
+        parent_task,
+        invocations,
     })
 }
 

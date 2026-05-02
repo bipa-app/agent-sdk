@@ -1626,6 +1626,16 @@ async fn suspend_at_tool_boundary(
                     .await?;
             (spawned.parent_task, vec![spawned.invocation_task])
         }
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
+            let batch =
+                spawn_multi_subagent_invocations(&inputs, deps, plans, payload, now).await?;
+            let invocation_tasks = batch
+                .invocations
+                .into_iter()
+                .map(|inv| inv.invocation_task)
+                .collect();
+            (batch.parent_task, invocation_tasks)
+        }
         super::subagent_spawn_selector::BatchRouting::AllTools
         | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
             .task_store
@@ -1779,6 +1789,60 @@ async fn spawn_single_subagent_invocation(
     )
     .await
     .context("spawn subagent invocation")
+}
+
+/// Materialize a `MultiSubagent` routing verdict into N durable
+/// subagent invocations under one parent transition.
+///
+/// Mirrors [`spawn_single_subagent_invocation`] for the fan-out
+/// case. The shared [`SuspensionPayload`] flows once into every
+/// per-entry `SubagentInvocationSpawn`; the worker helper
+/// [`super::subagent::spawn_subagent_batch_invocations`] then issues
+/// a single store call against
+/// [`AgentTaskStore::spawn_subagent_batch`](crate::journal::store::AgentTaskStore::spawn_subagent_batch).
+async fn spawn_multi_subagent_invocations(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    plans: Vec<(
+        usize,
+        Box<super::subagent_spawn_selector::SubagentSpawnPlan>,
+    )>,
+    payload: SuspensionPayload,
+    now: OffsetDateTime,
+) -> Result<super::subagent::SpawnedSubagentBatch> {
+    let mut spawns = Vec::with_capacity(plans.len());
+    for (spawn_index, plan) in plans {
+        let spawn_index_u32 =
+            u32::try_from(spawn_index).context("subagent spawn_index exceeds u32")?;
+        spawns.push(crate::journal::store::SubagentInvocationSpawn {
+            child_thread_id: plan.child_thread_id.clone(),
+            spec: plan.spec.clone(),
+            child_root_input: plan.child_root_input.clone(),
+            spawn_index: spawn_index_u32,
+            // `spawn_subagent_batch_invocations` reads only the first
+            // entry's `payload.continuation` for index validation;
+            // the store-side primitive uses the explicit shared
+            // `payload` argument for the parent's suspension. Cloning
+            // keeps each `SubagentInvocationSpawn` self-contained so
+            // selector callers can construct them in any order.
+            payload: payload.clone(),
+        });
+    }
+    let invocation_deps = super::subagent::SubagentInvocationDeps {
+        task_store: deps.task_store,
+        thread_store: deps.thread_store,
+        event_repo: deps.event_repo,
+    };
+    super::subagent::spawn_subagent_batch_invocations(
+        &inputs.bootstrap.task_id,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        spawns,
+        &invocation_deps,
+        now,
+    )
+    .await
+    .context("spawn subagent batch invocations")
 }
 
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
@@ -2359,6 +2423,7 @@ async fn build_resume_chat_request(
 /// tool results + new assistant response) into the new suspension's
 /// `suspended_messages` so a subsequent resume can reconstruct the
 /// complete history.
+#[allow(clippy::too_many_lines)] // M5.4 fan-out arm pushed past 100 lines
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
     prior: &ResumeContext<'_>,
@@ -2453,6 +2518,16 @@ async fn suspend_resumed_turn(
                 spawn_single_subagent_invocation(&inputs, deps, &plan, payload, spawn_index, now)
                     .await?;
             (spawned.parent_task, vec![spawned.invocation_task])
+        }
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
+            let batch =
+                spawn_multi_subagent_invocations(&inputs, deps, plans, payload, now).await?;
+            let invocation_tasks = batch
+                .invocations
+                .into_iter()
+                .map(|inv| inv.invocation_task)
+                .collect();
+            (batch.parent_task, invocation_tasks)
         }
         super::subagent_spawn_selector::BatchRouting::AllTools
         | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps

@@ -18,9 +18,10 @@ use time::{Duration, OffsetDateTime};
 use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
-    SpawnedSubagentInvocation, SubagentCapabilityProfile, SubagentCapabilityRequest,
-    SubagentInvocationDeps, SubagentMcpRequest, SubagentSandboxPolicy, SubagentSpawnPolicy,
-    SubagentSpawnRequest, resolve_subagent_spec, spawn_subagent_invocation,
+    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentSandboxPolicy,
+    SubagentSpawnPolicy, SubagentSpawnRequest, resolve_subagent_spec,
+    spawn_subagent_batch_invocations, spawn_subagent_invocation,
 };
 
 fn set(values: &[&str]) -> BTreeSet<String> {
@@ -908,6 +909,208 @@ async fn assert_spawned_invocation_contract(
     assert_eq!(
         persisted_child_thread.thread_id,
         created.child_thread.thread_id
+    );
+
+    Ok(())
+}
+
+/// Build a `SuspensionPayload` with N pending tool calls (each a
+/// distinct `subagent_*` tool, all Confirm-tier). Used to drive the
+/// fan-out spawn helper, which validates each entry's `spawn_index`
+/// against the shared envelope.
+fn parent_suspension_payload_with_tools(
+    parent_thread_id: &agent_sdk_core::ThreadId,
+    tasks: &[&str],
+) -> SuspensionPayload {
+    let pending_tool_calls = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| agent_sdk_core::PendingToolCallInfo {
+            id: format!("call_subagent_{idx}"),
+            name: format!("subagent_researcher_{idx}"),
+            display_name: format!("Subagent: Researcher {idx}"),
+            tier: ToolTier::Confirm,
+            input: serde_json::json!({ "task": task }),
+            effective_input: serde_json::json!({ "task": task }),
+            listen_context: None,
+        })
+        .collect();
+    SuspensionPayload {
+        continuation: agent_sdk_core::ContinuationEnvelope::wrap(
+            agent_sdk_core::AgentContinuation {
+                thread_id: parent_thread_id.clone(),
+                turn: 1,
+                total_usage: agent_sdk_core::TokenUsage::default(),
+                turn_usage: agent_sdk_core::TokenUsage::default(),
+                pending_tool_calls,
+                awaiting_index: 0,
+                completed_results: Vec::new(),
+                state: agent_sdk_core::AgentState::new(parent_thread_id.clone()),
+                response_id: None,
+                stop_reason: None,
+                response_content: Vec::new(),
+            },
+        ),
+        suspended_messages: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
+    // Fan-out: a single CAS on the parent transitions it into
+    // WaitingOnChildren with `pending_child_count = 3`, allocates
+    // 3 invocation tasks + 3 child-thread root tasks, and emits
+    // 3 SubagentProgress events on the parent thread.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = vec!["explore A", "explore B", "explore C"];
+    let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
+
+    let spawns: Vec<SubagentInvocationSpawn> = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| SubagentInvocationSpawn {
+            child_thread_id: agent_sdk_core::ThreadId::new(),
+            spec: sample_spec(task),
+            child_root_input: child_root_input(task),
+            spawn_index: u32::try_from(idx).expect("test idx fits in u32"),
+            payload: payload.clone(),
+        })
+        .collect();
+
+    let batch: SpawnedSubagentBatch = spawn_subagent_batch_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        spawns,
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    assert_eq!(batch.parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(batch.parent_task.pending_child_count, 3);
+    assert_eq!(batch.invocations.len(), 3);
+
+    for (idx, invocation) in batch.invocations.iter().enumerate() {
+        assert_eq!(invocation.invocation_task.kind, TaskKind::Subagent);
+        assert_eq!(
+            invocation.invocation_task.status,
+            TaskStatus::WaitingOnChildren
+        );
+        assert_eq!(
+            invocation.invocation_task.spawn_index,
+            Some(u32::try_from(idx).expect("test idx fits in u32"))
+        );
+        assert_eq!(
+            invocation.invocation_task.parent_id.as_ref(),
+            Some(&parent.id)
+        );
+        assert_eq!(invocation.child_root_task.kind, TaskKind::RootTurn);
+        assert_eq!(invocation.child_root_task.status, TaskStatus::Pending);
+        assert_eq!(
+            invocation.child_root_task.thread_id,
+            invocation.child_thread.thread_id
+        );
+    }
+
+    // Each invocation produced one SubagentProgress event on the
+    // parent thread (3 total).
+    let parent_events = event_repo.get_events(&parent.thread_id).await?;
+    assert_eq!(parent_events.len(), 3);
+    for event in &parent_events {
+        match &event.event {
+            AgentEvent::SubagentProgress {
+                completed, success, ..
+            } => {
+                assert!(!completed);
+                assert!(!success);
+            }
+            other => anyhow::bail!("expected SubagentProgress, got {other:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_batch_rejects_empty_input() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+
+    let err = spawn_subagent_batch_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        Vec::new(),
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .expect_err("empty batch should fail");
+    assert!(
+        format!("{err:#}").contains("subagent batch must be non-empty"),
+        "unexpected: {err:#}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let tasks = vec!["A", "B"]; // 2 pending tool calls
+    let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
+
+    let spawns = vec![
+        SubagentInvocationSpawn {
+            child_thread_id: agent_sdk_core::ThreadId::new(),
+            spec: sample_spec("A"),
+            child_root_input: child_root_input("A"),
+            spawn_index: 0,
+            payload: payload.clone(),
+        },
+        SubagentInvocationSpawn {
+            child_thread_id: agent_sdk_core::ThreadId::new(),
+            spec: sample_spec("ghost"),
+            child_root_input: child_root_input("ghost"),
+            spawn_index: 5, // out of bounds — only 2 pending tool calls
+            payload: payload.clone(),
+        },
+    ];
+
+    let err = spawn_subagent_batch_invocations(
+        &parent.id,
+        &worker,
+        &lease,
+        spawns,
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await
+    .expect_err("out-of-bounds spawn_index should fail");
+    assert!(
+        format!("{err:#}").contains("out of bounds"),
+        "unexpected: {err:#}"
     );
 
     Ok(())
