@@ -365,12 +365,14 @@ where
 
 #[cfg(feature = "otel")]
 fn start_compaction_span(trigger: &'static str) -> opentelemetry::global::BoxedSpan {
-    use crate::observability::{attrs, spans};
+    use crate::observability::{attrs, baggage, spans};
 
-    spans::start_internal_span(
+    let mut span = spans::start_internal_span(
         "agent.context_compaction",
         vec![attrs::kv(attrs::SDK_COMPACTION_TRIGGER, trigger)],
-    )
+    );
+    baggage::copy_baggage_to_active_span(&mut span);
+    span
 }
 
 #[cfg(feature = "otel")]
@@ -561,7 +563,7 @@ where
 
     #[cfg(feature = "otel")]
     let mut llm_span = {
-        use crate::observability::{attrs, spans};
+        use crate::observability::{attrs, baggage, spans};
         use opentelemetry::KeyValue;
 
         let span_name = format!("chat {}", provider.model());
@@ -579,7 +581,9 @@ where
                 i64::from(max_tokens),
             ));
         }
-        spans::start_client_span(span_name, init_attrs)
+        let mut span = spans::start_client_span(span_name, init_attrs);
+        baggage::copy_baggage_to_active_span(&mut span);
+        span
     };
 
     #[cfg(feature = "otel")]
@@ -1515,7 +1519,7 @@ fn record_turn_span(
     usage_before_turn: &TokenUsage,
     result: &InternalTurnResult,
 ) {
-    use crate::observability::{attrs, spans};
+    use crate::observability::{attrs, baggage, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
@@ -1527,6 +1531,7 @@ fn record_turn_span(
             i64::try_from(turn_number).unwrap_or(0),
         )],
     );
+    baggage::copy_baggage_to_active_span(&mut turn_span);
 
     turn_span.set_attribute(attrs::kv_i64(
         attrs::SDK_TURN_INPUT_TOKENS,

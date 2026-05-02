@@ -5,6 +5,7 @@
 //! for the agent SDK's core orchestration boundaries.
 
 pub mod attrs;
+pub mod baggage;
 pub mod context;
 pub mod instrument;
 pub mod payload;
