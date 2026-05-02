@@ -89,8 +89,9 @@ pub enum SubagentSpawnDecision {
     /// The plan is boxed because [`SubagentSpawnPlan`] embeds an
     /// [`EffectiveSubagentSpec`] (~700 bytes) and clippy's
     /// `large_enum_variant` lint flags an inline carrier as wasteful
-    /// for the much-more-common [`SpawnAsTool`] path. Boxing keeps
-    /// the enum cheap to pass around without changing semantics.
+    /// for the much-more-common [`SubagentSpawnDecision::SpawnAsTool`]
+    /// path. Boxing keeps the enum cheap to pass around without
+    /// changing semantics.
     ///
     /// Mixed batches (`SpawnAsSubagent` alongside `SpawnAsTool`)
     /// degrade to [`BatchRouting::UnsupportedMixedBatch`] — the
@@ -173,7 +174,7 @@ pub trait SubagentSpawnSelector: Send + Sync {
 /// wants to opt out of durable subagent routing entirely. Every
 /// pre-existing call site of [`RootTurnDeps`](super::root_turn::RootTurnDeps)
 /// behaves as if a [`NoopSubagentSpawnSelector`] were attached, so
-/// switching to [`Some(&NoopSubagentSpawnSelector)`] is a true no-op.
+/// switching to `Some(&NoopSubagentSpawnSelector)` is a true no-op.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct NoopSubagentSpawnSelector;
 

@@ -95,9 +95,9 @@ pub struct RootTurnDeps<'a> {
     /// Optional per-call routing selector consulted at the tool
     /// boundary.  When `Some`, batches that resolve to a single
     /// subagent decision route through
-    /// [`spawn_subagent_invocation`] instead of the regular
-    /// `spawn_tool_children` path; everything else flows through
-    /// `spawn_tool_children` exactly as before.
+    /// [`spawn_subagent_invocation`](super::subagent::spawn_subagent_invocation)
+    /// instead of the regular `spawn_tool_children` path; everything
+    /// else flows through `spawn_tool_children` exactly as before.
     ///
     /// Defaults to `None` so every existing call site preserves
     /// pre-PR behaviour without wiring changes.  Hosts that want
