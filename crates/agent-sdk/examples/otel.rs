@@ -1,9 +1,17 @@
-//! OpenTelemetry configuration example.
+//! `OpenTelemetry` configuration example.
+//!
+//! Demonstrates the production-style bootstrap: a single
+//! `agent_sdk_otel::install_global_provider` call wires up tracer + meter
+//! providers and a W3C `TraceContext` + Baggage propagator, and the returned
+//! `OtelGuard` flushes pending exports on shutdown.
 //!
 //! Run with:
 //! ```bash
 //! cargo run --example otel --features otel
 //! ```
+//!
+//! Set `OTEL_EXPORTER_OTLP_ENDPOINT` to point at an `OTel` collector
+//! (e.g. `http://localhost:4317`); leave it unset to run in no-op mode.
 
 use agent_sdk::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
 use agent_sdk::observability::{CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle};
@@ -11,10 +19,9 @@ use agent_sdk::{
     AgentInput, CancellationToken, EventStore, InMemoryEventStore, LlmProvider, ThreadId,
     ToolContext, builder,
 };
+use agent_sdk_otel::{OtelConfig, install_global_provider};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use opentelemetry::global;
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use std::sync::Arc;
 
 struct DemoProvider;
@@ -62,11 +69,16 @@ impl ObservabilityStore for InlinePayloadStore {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let exporter = InMemorySpanExporter::default();
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    global::set_tracer_provider(tracer_provider.clone());
+    // Read OTel config from the environment. Override `service.name`
+    // unless the operator has supplied `OTEL_SERVICE_NAME` themselves.
+    let mut cfg = OtelConfig::from_env()?;
+    if std::env::var_os("OTEL_SERVICE_NAME").is_none() {
+        cfg.service_name = "agent-sdk-otel-example".to_string();
+    }
+    if cfg.service_version.is_none() {
+        cfg.service_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    }
+    let guard = install_global_provider(&cfg)?;
 
     let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
@@ -84,19 +96,14 @@ async fn main() -> Result<()> {
     );
     let state = final_state.await.context("agent state channel closed")?;
     let event_count = event_store.get_events(&thread_id).await?.len();
-    tracer_provider
-        .force_flush()
-        .context("failed to flush tracer provider")?;
-    let spans = exporter
-        .get_finished_spans()
-        .context("failed to read finished spans")?;
 
     println!("Final state: {state:?}");
     println!("Persisted {event_count} events");
-    println!("Exported {} spans:", spans.len());
-    for span in spans {
-        println!("- {}", span.name);
-    }
+    println!(
+        "OTel pipeline shutting down — set OTEL_EXPORTER_OTLP_ENDPOINT \
+         to push spans/metrics to a collector; leave it unset for no-op mode."
+    );
 
+    guard.shutdown()?;
     Ok(())
 }

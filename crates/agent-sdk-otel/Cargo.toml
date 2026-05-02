@@ -1,0 +1,25 @@
+[package]
+name = "agent-sdk-otel"
+version = "0.8.0"
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+description = "OpenTelemetry bootstrap helpers for the Agent SDK (OTLP exporter wiring + propagators)"
+keywords = ["agent", "llm", "opentelemetry", "otlp", "observability"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tonic = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
