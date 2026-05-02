@@ -47,6 +47,7 @@ where
     }
     let mut span = spans::start_internal_span("invoke_agent", span_attrs);
     super::baggage::copy_baggage_to_active_span(&mut span);
+    super::langfuse::tag_observation(&mut span, super::langfuse::ObservationType::Agent);
     span
 }
 

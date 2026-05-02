@@ -365,13 +365,14 @@ where
 
 #[cfg(feature = "otel")]
 fn start_compaction_span(trigger: &'static str) -> opentelemetry::global::BoxedSpan {
-    use crate::observability::{attrs, baggage, spans};
+    use crate::observability::{attrs, baggage, langfuse, spans};
 
     let mut span = spans::start_internal_span(
         "agent.context_compaction",
         vec![attrs::kv(attrs::SDK_COMPACTION_TRIGGER, trigger)],
     );
     baggage::copy_baggage_to_active_span(&mut span);
+    langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
     span
 }
 
@@ -563,7 +564,7 @@ where
 
     #[cfg(feature = "otel")]
     let mut llm_span = {
-        use crate::observability::{attrs, baggage, spans};
+        use crate::observability::{attrs, baggage, langfuse, spans};
         use opentelemetry::KeyValue;
 
         let span_name = format!("chat {}", provider.model());
@@ -583,6 +584,7 @@ where
         }
         let mut span = spans::start_client_span(span_name, init_attrs);
         baggage::copy_baggage_to_active_span(&mut span);
+        langfuse::tag_observation(&mut span, langfuse::ObservationType::Generation);
         span
     };
 
