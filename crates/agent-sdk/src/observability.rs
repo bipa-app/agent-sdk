@@ -8,6 +8,7 @@ pub mod attrs;
 pub mod baggage;
 pub mod context;
 pub mod instrument;
+pub mod langfuse;
 pub mod payload;
 pub mod provider_name;
 pub mod spans;

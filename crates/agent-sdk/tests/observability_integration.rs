@@ -6,7 +6,7 @@ use agent_sdk::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, StopReason, Usage,
 };
 use agent_sdk::observability::{
-    CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle, attrs,
+    CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle, attrs, langfuse,
 };
 use agent_sdk::{
     AgentInput, AgentState, AllowAllHooks, CancellationToken, DynamicToolName, InMemoryEventStore,
@@ -283,6 +283,10 @@ fn get_attr(span: &SpanData, key: &str) -> Option<String> {
         .map(|kv| format!("{}", kv.value))
 }
 
+fn get_observation_type(span: &SpanData) -> Option<String> {
+    get_attr(span, langfuse::LANGFUSE_OBSERVATION_TYPE)
+}
+
 fn parse_json_attr(span: &SpanData, key: &str) -> Result<Value> {
     let raw = get_attr(span, key).with_context(|| format!("missing {key} attribute"))?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {key}: {raw}"))
@@ -452,6 +456,11 @@ async fn context_compaction_span_is_child_of_root_span() -> Result<()> {
     assert_eq!(
         get_attr(compaction, attrs::SDK_OUTCOME).as_deref(),
         Some("success")
+    );
+    assert_eq!(
+        get_observation_type(compaction).as_deref(),
+        Some("chain"),
+        "agent.context_compaction must be tagged ObservationType::Chain"
     );
 
     Ok(())
@@ -1056,6 +1065,29 @@ async fn all_span_types_present_for_tool_call_flow() -> Result<()> {
     assert!(
         span_names.contains(&"execute_tool"),
         "missing execute_tool: {span_names:?}"
+    );
+
+    // Langfuse observation-type tagging (A4): every span the SDK emits
+    // must carry the documented `langfuse.observation.type` so a
+    // vanilla consumer pointing OTel at Langfuse gets the right icons
+    // (Agent / Generation / Tool) without writing any glue.
+    let invoke = find_span_in_trace(&trace_spans, "invoke_agent")?;
+    let chat = find_span_in_trace(&trace_spans, "chat test-model")?;
+    let tool = find_span_in_trace(&trace_spans, "execute_tool")?;
+    assert_eq!(
+        get_observation_type(invoke).as_deref(),
+        Some("agent"),
+        "invoke_agent must be tagged ObservationType::Agent"
+    );
+    assert_eq!(
+        get_observation_type(chat).as_deref(),
+        Some("generation"),
+        "chat span must be tagged ObservationType::Generation"
+    );
+    assert_eq!(
+        get_observation_type(tool).as_deref(),
+        Some("tool"),
+        "execute_tool span must be tagged ObservationType::Tool"
     );
 
     Ok(())

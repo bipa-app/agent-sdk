@@ -84,7 +84,12 @@ impl<T: McpTransport> McpClient<T> {
     /// Returns an error if the server rejects initialization.
     pub async fn initialize(&mut self) -> Result<&InitializeResult> {
         #[cfg(feature = "otel")]
-        let mut span = start_mcp_span("mcp.initialize", &self.server_name);
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.initialize", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
 
         let result = self.initialize_inner().await;
 
@@ -146,7 +151,12 @@ impl<T: McpTransport> McpClient<T> {
     /// Returns an error if the request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDefinition>> {
         #[cfg(feature = "otel")]
-        let mut span = start_mcp_span("mcp.tools/list", &self.server_name);
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.tools/list", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
 
         let result = self.list_tools_inner().await;
 
@@ -194,14 +204,17 @@ impl<T: McpTransport> McpClient<T> {
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpToolCallResult> {
         #[cfg(feature = "otel")]
         let mut span = {
+            use crate::observability::langfuse;
             use opentelemetry::KeyValue;
-            start_mcp_span_with_attrs(
+            let mut span = start_mcp_span_with_attrs(
                 "mcp.tools/call",
                 vec![
                     KeyValue::new("mcp.server.name", self.server_name.clone()),
                     KeyValue::new("gen_ai.tool.name", name.to_string()),
                 ],
-            )
+            );
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Tool);
+            span
         };
 
         let result = self.call_tool_inner(name, arguments).await;

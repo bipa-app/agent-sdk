@@ -110,7 +110,7 @@ where
     Ctx: Send + Sync + 'static,
     H: AgentHooks,
 {
-    use crate::observability::{attrs, baggage, spans};
+    use crate::observability::{attrs, baggage, langfuse, spans};
     use opentelemetry::KeyValue;
 
     let mut span_attrs = vec![
@@ -148,6 +148,7 @@ where
 
     let mut span = spans::start_internal_span("execute_tool", span_attrs);
     baggage::copy_baggage_to_active_span(&mut span);
+    langfuse::tag_observation(&mut span, langfuse::ObservationType::Tool);
     span
 }
 
