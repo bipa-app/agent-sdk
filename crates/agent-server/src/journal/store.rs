@@ -1059,6 +1059,12 @@ pub trait AgentTaskStore: Send + Sync {
 // In-memory reference implementation
 // ─────────────────────────────────────────────────────────────────────
 
+/// Output shape of [`Inner::build_batch_invocation_pairs`]: the
+/// per-entry `(invocation, child_root)` pairs plus the ordered
+/// `child_ids` vector the caller hands to
+/// [`AgentTask::wait_on_children`] when transitioning the parent.
+type BatchInvocationRows = (Vec<(AgentTask, AgentTask)>, Vec<AgentTaskId>);
+
 #[derive(Default)]
 struct Inner {
     /// Primary key index.
@@ -1537,16 +1543,158 @@ impl Inner {
             .insert(new_invocation.id.clone(), new_invocation.clone());
         Ok(Some(new_invocation))
     }
+
+    // ─── Spawn-batch helpers (Phase 7.2 fan-out) ─────────────────────
+
+    /// CAS-validate that `parent_id` is currently a `Running`, non-leaf
+    /// task held by `(worker, lease)`. Returns the parent row on
+    /// success — callers that intend to mutate the parent must hold
+    /// the inner write lock and reuse this snapshot.
+    ///
+    /// Centralizes the "spawn rejected: …" prelude shared by
+    /// [`AgentTaskStore::spawn_tool_children`],
+    /// [`AgentTaskStore::spawn_subagent_invocation`], and
+    /// [`AgentTaskStore::spawn_subagent_batch`] so the validation
+    /// surface stays in one place. Error messages are stable for
+    /// the `spawn_*_rejects_wrong_worker_or_lease` tests.
+    fn validate_running_owned_non_leaf_parent(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+    ) -> Result<AgentTask> {
+        let old_parent = self
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        if old_parent.status != TaskStatus::Running {
+            let status = old_parent.status;
+            return Err(anyhow!(
+                "spawn rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old_parent.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old_parent.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "spawn rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if old_parent.kind.is_leaf() {
+            let parent_kind = old_parent.kind;
+            return Err(anyhow!(
+                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
+            ));
+        }
+        Ok(old_parent)
+    }
+
+    /// Reject a fan-out batch when:
+    /// - any two entries point at the same `child_thread_id`, or
+    /// - any entry's `child_thread_id` already has tasks indexed under it.
+    ///
+    /// Both checks must pass before the impl materializes any
+    /// invocation/child rows so a partial materialization can never
+    /// orphan child thread state.
+    fn validate_batch_thread_uniqueness(&self, spawns: &[SubagentInvocationSpawn]) -> Result<()> {
+        let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
+            std::collections::HashSet::with_capacity(spawns.len());
+        for spawn in spawns {
+            if !seen_thread_ids.insert(&spawn.child_thread_id) {
+                return Err(anyhow!(
+                    "spawn rejected: duplicate child_thread_id {} in batch",
+                    spawn.child_thread_id
+                ));
+            }
+        }
+
+        for spawn in spawns {
+            if self.by_thread.contains_key(&spawn.child_thread_id)
+                || self
+                    .active_root_by_thread
+                    .contains_key(&spawn.child_thread_id)
+            {
+                return Err(anyhow!(
+                    "spawn rejected: child thread id {} already has tasks",
+                    spawn.child_thread_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize the per-entry `(invocation, child_root)` pair for
+    /// every spawn in the batch.
+    ///
+    /// Mutates **nothing** in `self`: returns the prepared rows plus
+    /// the ordered child id list so the caller can transition the
+    /// parent atomically. A schema error on entry K therefore leaves
+    /// the store untouched.
+    fn build_batch_invocation_pairs(
+        &self,
+        old_parent: &AgentTask,
+        spawns: Vec<SubagentInvocationSpawn>,
+        now: OffsetDateTime,
+    ) -> Result<BatchInvocationRows> {
+        let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
+        let mut child_ids: Vec<AgentTaskId> = Vec::with_capacity(spawns.len());
+        for spawn in spawns {
+            let SubagentInvocationSpawn {
+                child_thread_id,
+                spec,
+                child_root_input,
+                spawn_index,
+                payload: _per_entry_payload,
+            } = spawn;
+            let child_root = AgentTask::new_root_turn_with_input(
+                child_thread_id.clone(),
+                child_root_input,
+                now,
+                RuntimePolicy::server_default().max_attempts,
+            );
+            if self.by_id.contains_key(&child_root.id) {
+                let id = &child_root.id;
+                return Err(anyhow!(
+                    "spawn rejected: child root task id {id} already exists"
+                ));
+            }
+
+            let invocation = AgentTask::new_subagent_invocation(
+                old_parent,
+                SubagentInvocationState {
+                    spec,
+                    child_thread_id,
+                    child_root_task_id: child_root.id.clone(),
+                },
+                spawn_index,
+                now,
+                AgentTask::DEFAULT_MAX_ATTEMPTS,
+            )
+            .context("spawn rejected: new_subagent_invocation failed")?;
+            if self.by_id.contains_key(&invocation.id) {
+                let id = &invocation.id;
+                return Err(anyhow!(
+                    "spawn rejected: invocation task id {id} already exists"
+                ));
+            }
+            child_ids.push(invocation.id.clone());
+            prepared.push((invocation, child_root));
+        }
+        Ok((prepared, child_ids))
+    }
 }
 
 #[async_trait]
-// `clippy::too_many_lines` flags the `#[async_trait]`-expanded method
-// boundary inside this impl, attributing the count to the macro line.
-// `spawn_subagent_batch` legitimately needs the inline length to keep
-// the per-entry validation, the cross-entry uniqueness check, and the
-// atomic apply step in one read-flow without indirection that would
-// only obscure the CAS contract.
-#[allow(clippy::too_many_lines)]
 impl AgentTaskStore for InMemoryAgentTaskStore {
     async fn insert(&self, task: AgentTask) -> Result<()> {
         task.validate()
@@ -2439,116 +2587,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
         let mut inner = self.inner.write().await;
 
-        let old_parent = inner
-            .by_id
-            .get(parent_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        if old_parent.status != TaskStatus::Running {
-            let status = old_parent.status;
-            return Err(anyhow!(
-                "spawn rejected: task {parent_id} is not running (status {status:?})"
-            ));
-        }
-        match &old_parent.worker_id {
-            Some(current) if current == worker => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: worker mismatch on task {parent_id}"
-                ));
-            }
-        }
-        match &old_parent.lease_id {
-            Some(current) if current == lease => {}
-            _ => {
-                return Err(anyhow!(
-                    "spawn rejected: lease mismatch on task {parent_id}"
-                ));
-            }
-        }
-        if old_parent.kind.is_leaf() {
-            let parent_kind = old_parent.kind;
-            return Err(anyhow!(
-                "spawn rejected: parent {parent_id} is a leaf kind ({parent_kind:?}) and cannot spawn children"
-            ));
-        }
-
-        // Cross-entry validation: every child_thread_id must be unique
-        // across the batch — otherwise multiple invocations would try
-        // to materialize the same child thread.
-        let mut seen_thread_ids: std::collections::HashSet<&ThreadId> =
-            std::collections::HashSet::with_capacity(spawns.len());
-        for spawn in &spawns {
-            if !seen_thread_ids.insert(&spawn.child_thread_id) {
-                return Err(anyhow!(
-                    "spawn rejected: duplicate child_thread_id {} in batch",
-                    spawn.child_thread_id
-                ));
-            }
-        }
-
-        // Per-entry conflict checks against existing state, mirroring
-        // the single-shot `spawn_subagent_invocation` validation.
-        for spawn in &spawns {
-            if inner.by_thread.contains_key(&spawn.child_thread_id)
-                || inner
-                    .active_root_by_thread
-                    .contains_key(&spawn.child_thread_id)
-            {
-                return Err(anyhow!(
-                    "spawn rejected: child thread id {} already has tasks",
-                    spawn.child_thread_id
-                ));
-            }
-        }
+        let old_parent = inner.validate_running_owned_non_leaf_parent(parent_id, worker, lease)?;
+        inner.validate_batch_thread_uniqueness(&spawns)?;
 
         // Materialize the (invocation, child_root) pair per entry —
         // mutate nothing in `inner` until every row is built so a
         // schema error on entry K leaves the store untouched.
-        let mut prepared: Vec<(AgentTask, AgentTask)> = Vec::with_capacity(spawns.len());
-        let mut child_ids: Vec<AgentTaskId> = Vec::with_capacity(spawns.len());
-        for spawn in spawns {
-            let SubagentInvocationSpawn {
-                child_thread_id,
-                spec,
-                child_root_input,
-                spawn_index,
-                payload: _per_entry_payload,
-            } = spawn;
-            let child_root = AgentTask::new_root_turn_with_input(
-                child_thread_id.clone(),
-                child_root_input,
-                now,
-                RuntimePolicy::server_default().max_attempts,
-            );
-            if inner.by_id.contains_key(&child_root.id) {
-                let id = &child_root.id;
-                return Err(anyhow!(
-                    "spawn rejected: child root task id {id} already exists"
-                ));
-            }
-
-            let invocation = AgentTask::new_subagent_invocation(
-                &old_parent,
-                SubagentInvocationState {
-                    spec,
-                    child_thread_id,
-                    child_root_task_id: child_root.id.clone(),
-                },
-                spawn_index,
-                now,
-                AgentTask::DEFAULT_MAX_ATTEMPTS,
-            )
-            .context("spawn rejected: new_subagent_invocation failed")?;
-            if inner.by_id.contains_key(&invocation.id) {
-                let id = &invocation.id;
-                return Err(anyhow!(
-                    "spawn rejected: invocation task id {id} already exists"
-                ));
-            }
-            child_ids.push(invocation.id.clone());
-            prepared.push((invocation, child_root));
-        }
+        let (prepared, child_ids) = inner.build_batch_invocation_pairs(&old_parent, spawns, now)?;
 
         let child_count =
             u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;

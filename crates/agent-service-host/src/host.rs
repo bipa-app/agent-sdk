@@ -998,13 +998,7 @@ async fn execute_acquired_task(
     cancel: &CancellationToken,
 ) -> Result<()> {
     match task.kind {
-        // Box::pin because the M5.4 SubagentSpawnSelector wiring
-        // (crates/agent-server/src/worker/subagent_spawn_selector.rs)
-        // pushed this future past clippy's `large_futures` threshold
-        // (16 KiB). One heap alloc per acquired RootTurn task —
-        // negligible against the existing per-task overhead
-        // (tokio::spawn, lease structures, AgentTask payload, ...).
-        TaskKind::RootTurn => Box::pin(execute_root_task(task, stores, runtime)).await,
+        TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
         TaskKind::Subagent => execute_subagent_task_entry(task, stores).await,
     }
@@ -1022,7 +1016,7 @@ async fn execute_root_task(
         .await
         .context("reading root-task event watermark")?;
 
-    let outcome = async {
+    let outcome = Box::pin(async {
         let bootstrap =
             resolve_bootstrap_context(task.clone(), stores.definition_registry.as_ref())
                 .await
@@ -1062,7 +1056,7 @@ async fn execute_root_task(
             .await
             .context("execute fresh root task")
         }
-    }
+    })
     .await;
 
     match outcome {

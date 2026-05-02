@@ -983,7 +983,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
             duration_ms: Some(50),
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -991,7 +991,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire the parent for the resume path.
@@ -1094,7 +1094,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1102,7 +1102,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
             serde_json::json!({"command": "echo done"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire and resume.
@@ -1176,7 +1176,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1184,7 +1184,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire for resume.
@@ -1290,7 +1290,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
             duration_ms: Some(10),
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1298,7 +1298,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
             serde_json::json!({"command": "rm -rf /"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire and resume.
@@ -1370,7 +1370,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
             },
         ),
     ];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![
             (
@@ -1385,7 +1385,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
             ),
         ],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire and resume.
@@ -1508,7 +1508,7 @@ async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, _continuation, _messages) = suspend_and_complete_children(
+    let (parent, _continuation, _messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1516,7 +1516,7 @@ async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
             serde_json::json!({"command": "echo ok"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Parent is Pending with ReadyToResume.
@@ -1696,7 +1696,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1704,7 +1704,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire for resume.
@@ -1817,7 +1817,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -1825,7 +1825,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Sanity: the suspension path must have written the draft snapshot.
@@ -2163,7 +2163,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
             duration_ms: Some(25),
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -2171,7 +2171,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
             serde_json::json!({"command": "echo hello world"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Verify intermediate state.
@@ -2254,7 +2254,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -2262,7 +2262,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire for resume.
@@ -2334,7 +2334,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let (parent, continuation, suspended_messages) = suspend_and_complete_children(
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
         &stores,
         vec![(
             "call_1".into(),
@@ -2342,7 +2342,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire.
@@ -2582,7 +2582,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
             },
         ),
     ];
-    let parent = suspend_and_complete_children_durably(
+    let parent = Box::pin(suspend_and_complete_children_durably(
         &stores,
         vec![
             (
@@ -2597,7 +2597,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
             ),
         ],
         &child_results,
-    )
+    ))
     .await?;
 
     // Extract continuation from ReadyToResume state.
@@ -2623,7 +2623,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
 async fn aggregate_all_failed_children() -> Result<()> {
     let stores = TestStores::new();
 
-    let parent = suspend_and_fail_children(
+    let parent = Box::pin(suspend_and_fail_children(
         &stores,
         vec![
             (
@@ -2638,7 +2638,7 @@ async fn aggregate_all_failed_children() -> Result<()> {
             ),
         ],
         &["permission denied", "command not found"],
-    )
+    ))
     .await?;
 
     let continuation = match &parent.state {
@@ -2792,7 +2792,7 @@ async fn resume_from_children_end_to_end() -> Result<()> {
             duration_ms: Some(50),
         },
     )];
-    let parent = suspend_and_complete_children_durably(
+    let parent = Box::pin(suspend_and_complete_children_durably(
         &stores,
         vec![(
             "call_1".into(),
@@ -2800,7 +2800,7 @@ async fn resume_from_children_end_to_end() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire the parent.
@@ -3034,7 +3034,7 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
             duration_ms: None,
         },
     )];
-    let parent = suspend_and_complete_children_durably(
+    let parent = Box::pin(suspend_and_complete_children_durably(
         &stores,
         vec![(
             "call_1".into(),
@@ -3042,7 +3042,7 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
             serde_json::json!({"command": "ls"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Re-acquire.
@@ -3115,7 +3115,7 @@ async fn result_payload_round_trips_through_json() -> Result<()> {
     };
     let child_results = vec![("call_1".to_owned(), original_result.clone())];
 
-    let parent = suspend_and_complete_children_durably(
+    let parent = Box::pin(suspend_and_complete_children_durably(
         &stores,
         vec![(
             "call_1".into(),
@@ -3123,7 +3123,7 @@ async fn result_payload_round_trips_through_json() -> Result<()> {
             serde_json::json!({"command": "test"}),
         )],
         &child_results,
-    )
+    ))
     .await?;
 
     // Read the child from the store and verify its result_payload.
@@ -3253,7 +3253,7 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
         ("call_a".into(), ok_result("a")),
         ("call_b".into(), ok_result("b")),
     ];
-    let parent = suspend_and_complete_children_durably(
+    let parent = Box::pin(suspend_and_complete_children_durably(
         &stores,
         vec![
             (
@@ -3268,7 +3268,7 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
             ),
         ],
         &r1_results,
-    )
+    ))
     .await?;
     assert_eq!(stores.tasks.list_children(&parent.id).await?.len(), 2);
     assert_eq!(parent.state.child_ids().len(), 2);

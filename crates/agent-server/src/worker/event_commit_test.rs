@@ -751,7 +751,7 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     };
 
     // Steps 2-3: execute child tool + resume parent.
-    execute_child_and_resume(&stores, &child_tasks, &provider).await?;
+    Box::pin(execute_child_and_resume(&stores, &child_tasks, &provider)).await?;
 
     // Verify all events have strictly monotonic sequences.
     // Expected: Start → ToolCallStart → ToolCallEnd → Text → TurnComplete → Done

@@ -1050,8 +1050,13 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
     );
 
     // Execute child and resume parent.
-    let resume_outcome =
-        execute_child_and_resume_parent(&stores, &child_tasks, &provider, &thread_reg()).await?;
+    let resume_outcome = Box::pin(execute_child_and_resume_parent(
+        &stores,
+        &child_tasks,
+        &provider,
+        &thread_reg(),
+    ))
+    .await?;
     let resume_events = match resume_outcome {
         RootTurnOutcome::Completed {
             committed_events, ..

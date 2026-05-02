@@ -559,7 +559,7 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
     };
 
     // 2–3. Execute child tool + resume parent.
-    execute_child_and_resume(&stores, &child_tasks, &provider).await?;
+    Box::pin(execute_child_and_resume(&stores, &child_tasks, &provider)).await?;
 
     // 4. Verify full replay order from the repository.
     let events = stores.events.get_events(&thread_replay()).await?;

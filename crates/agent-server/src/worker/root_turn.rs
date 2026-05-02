@@ -1502,7 +1502,6 @@ fn build_turn_complete_events(
 /// No checkpoint or message-projection write occurs on this path.
 ///
 /// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
-#[allow(clippy::too_many_lines)]
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
     user_prompt: &str,
@@ -1542,25 +1541,14 @@ async fn suspend_at_tool_boundary(
     }
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
-    //    AlreadyClosed is non-fatal: a prior recovery sweep
-    //    (best_effort_close_open_attempts) may have closed the attempt
-    //    after our lease expired but before we reached this point. The
-    //    work is done — just continue with the suspension.
-    let close_params = build_close_params(&response, &attempt);
-    match deps
-        .attempt_store
-        .close_attempt(&attempt.id, close_params, now)
-        .await
-    {
-        Ok(_) => {}
-        Err(e)
-            if e.downcast_ref::<TurnAttemptSchemaError>()
-                == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
-        {
-            // Recovery sweep already closed this attempt — safe to proceed.
-        }
-        Err(e) => return Err(e.context("close attempt on tool suspension")),
-    }
+    close_attempt_or_propagate_already_closed(
+        &attempt,
+        &response,
+        deps,
+        "close attempt on tool suspension",
+        now,
+    )
+    .await?;
 
     // 2. Build the continuation envelope from current state + response.
     let continuation = build_continuation(&inputs, &response)
@@ -1575,38 +1563,21 @@ async fn suspend_at_tool_boundary(
         build_full_assistant_message(&response),
     ];
 
-    // 4. One child task per tool call.
-    // 3. One child task per tool call, inheriting the configured retry budget.
-    let tool_call_count = response.tool_uses().count();
-    let child_max_attempts = inputs.bootstrap.definition.policy.max_attempts;
-    let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
-        .map(|_| ChildSpawnSpec::new(child_max_attempts))
-        .collect();
+    // 4. One child task per tool call, inheriting the configured retry budget.
+    let specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the tool-call response so
     // replay observers see the model's reasoning before tool dispatch.
     let content_events = build_content_events(&response, &close_ctx.content_ids);
 
     // Build ToolCallStart events before continuation is moved.
-    let tool_call_events: Vec<AgentEvent> = continuation
-        .payload
-        .pending_tool_calls
-        .iter()
-        .map(|tc| {
-            AgentEvent::tool_call_start(
-                &tc.id,
-                &tc.name,
-                &tc.display_name,
-                tc.input.clone(),
-                tc.tier,
-            )
-        })
-        .collect();
+    let tool_call_events = build_tool_call_start_events(&continuation);
 
     // 4.b Consult the per-call subagent-spawn selector (if wired).
-    //     A `SingleSubagent` verdict re-routes section 5 onto
-    //     `spawn_subagent_invocation`; everything else falls through
-    //     to the regular `spawn_tool_children` path.
+    //     A `SingleSubagent` / `MultiSubagent` verdict re-routes
+    //     section 5 onto `spawn_subagent_invocation` /
+    //     `spawn_subagent_batch_invocations`; everything else falls
+    //     through to the regular `spawn_tool_children` path.
     let routing = classify_batch_for_inputs(&inputs, deps, &continuation).await?;
 
     // 5. Atomically spawn children and park the parent.
@@ -1619,60 +1590,29 @@ async fn suspend_at_tool_boundary(
         continuation,
         suspended_messages,
     };
-    let (parent_task, child_tasks) = match routing {
-        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
-            let spawned =
-                spawn_single_subagent_invocation(&inputs, deps, &plan, payload, spawn_index, now)
-                    .await?;
-            (spawned.parent_task, vec![spawned.invocation_task])
-        }
-        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
-            let batch =
-                spawn_multi_subagent_invocations(&inputs, deps, plans, payload, now).await?;
-            let invocation_tasks = batch
-                .invocations
-                .into_iter()
-                .map(|inv| inv.invocation_task)
-                .collect();
-            (batch.parent_task, invocation_tasks)
-        }
-        super::subagent_spawn_selector::BatchRouting::AllTools
-        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
-            .task_store
-            .spawn_tool_children(
-                task_id,
-                &inputs.bootstrap.worker_id,
-                &inputs.bootstrap.lease_id,
-                specs,
-                payload,
-                now,
-            )
-            .await
-            .context("spawn tool children")?,
-    };
+    let (parent_task, child_tasks) = apply_batch_routing(
+        &inputs,
+        deps,
+        routing,
+        payload,
+        specs,
+        "spawn tool children",
+        now,
+    )
+    .await?;
 
     // 6. Snapshot the in-flight conversation to the projection's
     //    draft slot now that the suspension is durable on the parent
-    //    task.  If the resumed turn later fails (LLM transport
-    //    error, lease-expiry timeout, etc.) `fail_root_turn` clears
-    //    the task's transient `TaskState` payload — but the draft on
-    //    the message projection survives so `recover_thread` can
-    //    fold the in-flight messages into the next-turn view.
-    //
-    //    Best-effort: a draft write failure must not roll back a
-    //    successful spawn. The recovery path simply degrades to the
-    //    pre-fix behaviour of seeing only committed history.
-    if let Err(error) = deps
-        .message_store
-        .set_draft(&inputs.bootstrap.thread_id, draft_snapshot, now)
-        .await
-    {
-        log::warn!(
-            "failed to snapshot suspended_messages to message projection draft for thread {} task {}: {error:#}",
-            inputs.bootstrap.thread_id,
-            task_id,
-        );
-    }
+    //    task.
+    snapshot_suspension_draft(
+        deps,
+        &inputs.bootstrap.thread_id,
+        task_id,
+        draft_snapshot,
+        now,
+        "snapshot suspended_messages to message projection draft",
+    )
+    .await;
 
     // `Start` was committed by `execute_root_turn` before streaming so
     // the per-delta TextDelta / ThinkingDelta events have a parent in
@@ -1843,6 +1783,168 @@ async fn spawn_multi_subagent_invocations(
     )
     .await
     .context("spawn subagent batch invocations")
+}
+
+/// Drive the routing match arm common to both `suspend_at_tool_boundary`
+/// (initial suspend) and `suspend_resumed_turn` (post-resume re-suspend).
+///
+/// Maps a [`super::subagent_spawn_selector::BatchRouting`] verdict to
+/// the correct store path:
+///
+/// * [`BatchRouting::SingleSubagent`](super::subagent_spawn_selector::BatchRouting::SingleSubagent)
+///   → [`spawn_single_subagent_invocation`]
+/// * [`BatchRouting::MultiSubagent`](super::subagent_spawn_selector::BatchRouting::MultiSubagent)
+///   → [`spawn_multi_subagent_invocations`]
+/// * [`BatchRouting::AllTools`](super::subagent_spawn_selector::BatchRouting::AllTools)
+///   and [`BatchRouting::UnsupportedMixedBatch`](super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch)
+///   → [`AgentTaskStore::spawn_tool_children`](crate::journal::store::AgentTaskStore::spawn_tool_children)
+///
+/// Returns the parked parent task plus the materialized child tasks
+/// (one entry for the single/multi subagent paths, N entries for
+/// `spawn_tool_children`).
+///
+/// `tool_children_context` distinguishes the original "spawn tool
+/// children" call site from the "re-spawn tool children on resume"
+/// site — only used in error context strings so backtraces still
+/// point at the right call.
+async fn apply_batch_routing(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    routing: super::subagent_spawn_selector::BatchRouting,
+    payload: SuspensionPayload,
+    specs: Vec<ChildSpawnSpec>,
+    tool_children_context: &'static str,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let task_id = &inputs.bootstrap.task_id;
+    match routing {
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
+            let spawned =
+                spawn_single_subagent_invocation(inputs, deps, &plan, payload, spawn_index, now)
+                    .await?;
+            Ok((spawned.parent_task, vec![spawned.invocation_task]))
+        }
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
+            let batch = spawn_multi_subagent_invocations(inputs, deps, plans, payload, now).await?;
+            let invocation_tasks = batch
+                .invocations
+                .into_iter()
+                .map(|inv| inv.invocation_task)
+                .collect();
+            Ok((batch.parent_task, invocation_tasks))
+        }
+        super::subagent_spawn_selector::BatchRouting::AllTools
+        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
+            .task_store
+            .spawn_tool_children(
+                task_id,
+                &inputs.bootstrap.worker_id,
+                &inputs.bootstrap.lease_id,
+                specs,
+                payload,
+                now,
+            )
+            .await
+            .context(tool_children_context),
+    }
+}
+
+/// Close the parent's turn attempt, treating
+/// [`TurnAttemptSchemaError::AlreadyClosed`] as a non-error (a prior
+/// recovery sweep may have closed it after the lease expired and
+/// before this worker reached the suspension point).
+///
+/// `error_context` is appended to any non-`AlreadyClosed` error so
+/// callers preserve their original "close attempt on …" context
+/// without duplicating the match arm.
+async fn close_attempt_or_propagate_already_closed(
+    attempt: &TurnAttempt,
+    response: &llm::ChatResponse,
+    deps: &RootTurnDeps<'_>,
+    error_context: &'static str,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let params = build_close_params(response, attempt);
+    match deps
+        .attempt_store
+        .close_attempt(&attempt.id, params, now)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.downcast_ref::<TurnAttemptSchemaError>()
+                == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
+        {
+            // Recovery sweep already closed this attempt — safe to proceed.
+            Ok(())
+        }
+        Err(e) => Err(e.context(error_context)),
+    }
+}
+
+/// Build the per-tool-call `ChildSpawnSpec` vector for one suspension.
+///
+/// One spec per pending tool call, all inheriting the configured retry
+/// budget. `ChildSpawnSpec::default()` would silently use
+/// `DEFAULT_MAX_ATTEMPTS=1` instead of the policy's budget, so do not
+/// substitute it.
+fn child_spawn_specs_for_response(
+    response: &llm::ChatResponse,
+    inputs: &RootWorkerInputs,
+) -> Vec<ChildSpawnSpec> {
+    let tool_call_count = response.tool_uses().count();
+    let child_max_attempts = inputs.bootstrap.definition.policy.max_attempts;
+    (0..tool_call_count)
+        .map(|_| ChildSpawnSpec::new(child_max_attempts))
+        .collect()
+}
+
+/// Materialize the [`AgentEvent::ToolCallStart`] vector from a
+/// continuation's `pending_tool_calls`.
+///
+/// Same projection in both `suspend_at_tool_boundary` and
+/// `suspend_resumed_turn` — extracted so the two suspend paths stay
+/// in lockstep when the start-event shape changes.
+fn build_tool_call_start_events(
+    continuation: &agent_sdk_core::ContinuationEnvelope,
+) -> Vec<AgentEvent> {
+    continuation
+        .payload
+        .pending_tool_calls
+        .iter()
+        .map(|tc| {
+            AgentEvent::tool_call_start(
+                &tc.id,
+                &tc.name,
+                &tc.display_name,
+                tc.input.clone(),
+                tc.tier,
+            )
+        })
+        .collect()
+}
+
+/// Snapshot the post-spawn `suspended_messages` to the projection's
+/// draft slot.
+///
+/// Best-effort: a draft write failure must not roll back a successful
+/// spawn. The recovery path simply degrades to the pre-fix behaviour
+/// of seeing only committed history. Errors are logged and dropped.
+async fn snapshot_suspension_draft(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    task_id: &AgentTaskId,
+    draft_snapshot: Vec<llm::Message>,
+    now: OffsetDateTime,
+    label: &'static str,
+) {
+    if let Err(error) = deps
+        .message_store
+        .set_draft(thread_id, draft_snapshot, now)
+        .await
+    {
+        log::warn!("failed to {label} for thread {thread_id} task {task_id}: {error:#}");
+    }
 }
 
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
@@ -2423,7 +2525,6 @@ async fn build_resume_chat_request(
 /// tool results + new assistant response) into the new suspension's
 /// `suspended_messages` so a subsequent resume can reconstruct the
 /// complete history.
-#[allow(clippy::too_many_lines)] // M5.4 fan-out arm pushed past 100 lines
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
     prior: &ResumeContext<'_>,
@@ -2436,26 +2537,14 @@ async fn suspend_resumed_turn(
     let task_id = &inputs.bootstrap.task_id;
 
     // Close the turn attempt — the LLM call succeeded.
-    //
-    // AlreadyClosed is non-fatal: a prior recovery sweep
-    // (best_effort_close_open_attempts) may have closed the attempt
-    // after our lease expired but before we reached this point. The
-    // work is done — just continue with the suspension.
-    let close_params = build_close_params(&response, &attempt);
-    match deps
-        .attempt_store
-        .close_attempt(&attempt.id, close_params, now)
-        .await
-    {
-        Ok(_) => {}
-        Err(e)
-            if e.downcast_ref::<TurnAttemptSchemaError>()
-                == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
-        {
-            // Recovery sweep already closed this attempt — safe to proceed.
-        }
-        Err(e) => return Err(e.context("close attempt on resumed tool suspension")),
-    }
+    close_attempt_or_propagate_already_closed(
+        &attempt,
+        &response,
+        deps,
+        "close attempt on resumed tool suspension",
+        now,
+    )
+    .await?;
 
     // Build a new continuation that accumulates usage from the prior
     // continuation plus the new response.
@@ -2470,38 +2559,17 @@ async fn suspend_resumed_turn(
     // New assistant response (with new tool-use blocks).
     new_suspended.push(build_full_assistant_message(&response));
 
-    // One child task per new tool call, inheriting the configured retry budget
-    // (same as suspend_at_tool_boundary — ChildSpawnSpec::default() would use
-    // DEFAULT_MAX_ATTEMPTS=1, not the policy's budget).
-    let tool_call_count = response.tool_uses().count();
-    let child_max_attempts = inputs.bootstrap.definition.policy.max_attempts;
-    let specs: Vec<ChildSpawnSpec> = (0..tool_call_count)
-        .map(|_| ChildSpawnSpec::new(child_max_attempts))
-        .collect();
+    // One child task per new tool call, inheriting the configured retry budget.
+    let specs = child_spawn_specs_for_response(&response, &inputs);
 
     // Build content events (Thinking) from the resume response.
     let content_events = build_content_events(&response, content_ids);
 
     // Build ToolCallStart events before continuation is moved.
-    let tool_call_events: Vec<AgentEvent> = new_continuation
-        .payload
-        .pending_tool_calls
-        .iter()
-        .map(|tc| {
-            AgentEvent::tool_call_start(
-                &tc.id,
-                &tc.name,
-                &tc.display_name,
-                tc.input.clone(),
-                tc.tier,
-            )
-        })
-        .collect();
+    let tool_call_events = build_tool_call_start_events(&new_continuation);
 
     // Consult the per-call subagent-spawn selector — same contract
-    // as `suspend_at_tool_boundary`. A `SingleSubagent` verdict
-    // re-routes the spawn onto `spawn_subagent_invocation`;
-    // everything else falls through to `spawn_tool_children`.
+    // as `suspend_at_tool_boundary`.
     let routing = classify_batch_for_inputs(&inputs, deps, &new_continuation).await?;
 
     // Clone the new accumulated `suspended_messages` so we can mirror
@@ -2512,53 +2580,30 @@ async fn suspend_resumed_turn(
         continuation: new_continuation,
         suspended_messages: new_suspended,
     };
-    let (parent_task, child_tasks) = match routing {
-        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
-            let spawned =
-                spawn_single_subagent_invocation(&inputs, deps, &plan, payload, spawn_index, now)
-                    .await?;
-            (spawned.parent_task, vec![spawned.invocation_task])
-        }
-        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => {
-            let batch =
-                spawn_multi_subagent_invocations(&inputs, deps, plans, payload, now).await?;
-            let invocation_tasks = batch
-                .invocations
-                .into_iter()
-                .map(|inv| inv.invocation_task)
-                .collect();
-            (batch.parent_task, invocation_tasks)
-        }
-        super::subagent_spawn_selector::BatchRouting::AllTools
-        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
-            .task_store
-            .spawn_tool_children(
-                task_id,
-                &inputs.bootstrap.worker_id,
-                &inputs.bootstrap.lease_id,
-                specs,
-                payload,
-                now,
-            )
-            .await
-            .context("re-spawn tool children on resume")?,
-    };
+    let (parent_task, child_tasks) = apply_batch_routing(
+        &inputs,
+        deps,
+        routing,
+        payload,
+        specs,
+        "re-spawn tool children on resume",
+        now,
+    )
+    .await?;
 
     // Refresh the projection draft so a subsequent failure on the
     // *next* resume LLM call still surfaces the full in-flight
     // history through `recover_thread`. Best-effort, same rationale
     // as `suspend_at_tool_boundary`.
-    if let Err(error) = deps
-        .message_store
-        .set_draft(&inputs.bootstrap.thread_id, draft_snapshot, now)
-        .await
-    {
-        log::warn!(
-            "failed to refresh resumed suspended_messages draft for thread {} task {}: {error:#}",
-            inputs.bootstrap.thread_id,
-            task_id,
-        );
-    }
+    snapshot_suspension_draft(
+        deps,
+        &inputs.bootstrap.thread_id,
+        task_id,
+        draft_snapshot,
+        now,
+        "refresh resumed suspended_messages draft",
+    )
+    .await;
 
     // Commit content events (Thinking) followed by ToolCallStart events.
     let mut suspension_events = content_events;

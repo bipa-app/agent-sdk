@@ -832,8 +832,13 @@ async fn completion_tolerates_parent_progress_commit_failures() -> Result<()> {
     )
     .await?;
 
-    let persisted_child_root = run_child_until_ready_to_resume(&stores, &spawned).await?;
-    resume_child_root_to_completion(&stores, &spawned, &persisted_child_root).await?;
+    let persisted_child_root = Box::pin(run_child_until_ready_to_resume(&stores, &spawned)).await?;
+    Box::pin(resume_child_root_to_completion(
+        &stores,
+        &spawned,
+        &persisted_child_root,
+    ))
+    .await?;
 
     let invocation_running = stores
         .tasks
@@ -936,8 +941,13 @@ async fn child_thread_reuses_root_turn_and_tool_runtime_before_materializing_par
     )
     .await?;
 
-    let persisted_child_root = run_child_until_ready_to_resume(&stores, &spawned).await?;
-    resume_child_root_to_completion(&stores, &spawned, &persisted_child_root).await?;
+    let persisted_child_root = Box::pin(run_child_until_ready_to_resume(&stores, &spawned)).await?;
+    Box::pin(resume_child_root_to_completion(
+        &stores,
+        &spawned,
+        &persisted_child_root,
+    ))
+    .await?;
     let subagent_outcome = materialize_subagent_result(&stores, &spawned).await?;
     let child_events = stores
         .events
@@ -970,7 +980,7 @@ async fn child_thread_reuses_root_turn_and_tool_runtime_before_materializing_par
         parent_ready.state,
         crate::journal::task_state::TaskState::ReadyToResume { .. }
     ));
-    let completed_parent = resume_parent_after_subagent(&stores, &parent).await?;
+    let completed_parent = Box::pin(resume_parent_after_subagent(&stores, &parent)).await?;
     assert_eq!(completed_parent.id, parent.id);
 
     Ok(())
