@@ -811,7 +811,7 @@ where
     M: MessageStore + 'static,
     S: StateStore + 'static,
 {
-    use crate::observability::{attrs, provider_name, spans};
+    use crate::observability::{attrs, baggage, provider_name, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
@@ -831,6 +831,7 @@ where
             KeyValue::new(attrs::SDK_RUN_MODE, "loop"),
         ],
     );
+    baggage::copy_baggage_to_active_span(&mut span);
     let outcome = if result.success { "done" } else { "error" };
     span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
     span.set_attribute(attrs::kv_i64(

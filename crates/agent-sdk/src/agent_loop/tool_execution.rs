@@ -110,7 +110,7 @@ where
     Ctx: Send + Sync + 'static,
     H: AgentHooks,
 {
-    use crate::observability::{attrs, spans};
+    use crate::observability::{attrs, baggage, spans};
     use opentelemetry::KeyValue;
 
     let mut span_attrs = vec![
@@ -146,7 +146,9 @@ where
         span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "listen"));
     }
 
-    spans::start_internal_span("execute_tool", span_attrs)
+    let mut span = spans::start_internal_span("execute_tool", span_attrs);
+    baggage::copy_baggage_to_active_span(&mut span);
+    span
 }
 
 #[cfg(feature = "otel")]

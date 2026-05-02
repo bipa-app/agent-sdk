@@ -1060,3 +1060,317 @@ async fn all_span_types_present_for_tool_call_flow() -> Result<()> {
 
     Ok(())
 }
+
+// ── Baggage propagation (A3) ─────────────────────────────────────────
+
+use agent_sdk::observability::baggage as obs_baggage;
+use opentelemetry::Context as OtelContext;
+use opentelemetry::baggage::BaggageExt;
+
+const ALL_BAGGAGE: &[(&str, &str)] = &[
+    (obs_baggage::BAGGAGE_USER_ID, "user-42"),
+    (obs_baggage::BAGGAGE_SESSION_ID, "session-7"),
+    (obs_baggage::BAGGAGE_LANGFUSE_USER_ID, "lf-user-42"),
+    (obs_baggage::BAGGAGE_LANGFUSE_SESSION_ID, "lf-session-7"),
+    (obs_baggage::BAGGAGE_DEPLOYMENT_ENVIRONMENT, "test"),
+];
+
+fn baggage_context(entries: &[(&'static str, &'static str)]) -> OtelContext {
+    let kvs: Vec<opentelemetry::KeyValue> = entries
+        .iter()
+        .map(|(k, v)| opentelemetry::KeyValue::new(*k, *v))
+        .collect();
+    OtelContext::current_with_baggage(kvs)
+}
+
+/// Run a future under the supplied otel context. Local `use` of
+/// `FutureExt` keeps the rest of the file's `with_context` calls
+/// (which target `anyhow::Context`) unambiguous.
+async fn run_with_baggage<F, T>(cx: OtelContext, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use opentelemetry::trace::FutureExt;
+    fut.with_context(cx).await
+}
+
+fn assert_attr_eq(span: &SpanData, key: &str, expected: &str) {
+    assert_eq!(
+        get_attr(span, key).as_deref(),
+        Some(expected),
+        "expected {key}={expected} on span {:?}",
+        span.name
+    );
+}
+
+fn assert_attr_absent(span: &SpanData, key: &str) {
+    assert!(
+        get_attr(span, key).is_none(),
+        "expected {key} to be absent on span {:?}, got {:?}",
+        span.name,
+        get_attr(span, key)
+    );
+}
+
+#[tokio::test]
+async fn baggage_attributes_copied_to_every_span() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![
+        TestProvider::tool_use_response("call_1", "echo", json!({"text": "hi"})),
+        TestProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let event_store = new_event_store();
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(event_store)
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+    let cx = baggage_context(ALL_BAGGAGE);
+
+    run_with_baggage(cx, async {
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        anyhow::Ok(())
+    })
+    .await?;
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+
+    let names_to_check = [
+        "invoke_agent",
+        "agent.turn",
+        "chat test-model",
+        "execute_tool",
+    ];
+    for name in names_to_check {
+        let span = find_span_in_trace(&trace_spans, name)?;
+        for (key, value) in ALL_BAGGAGE {
+            assert_attr_eq(span, key, value);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baggage_session_id_mirrored_to_gen_ai_conversation_id() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let session_value = "lf-session-mirror";
+    let cx = baggage_context(&[(obs_baggage::BAGGAGE_SESSION_ID, session_value)]);
+
+    run_with_baggage(cx, async {
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        anyhow::Ok(())
+    })
+    .await?;
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+    let turn = find_span_in_trace(&trace_spans, "agent.turn")?;
+
+    for span in [llm, turn] {
+        assert_attr_eq(span, obs_baggage::BAGGAGE_SESSION_ID, session_value);
+        assert_attr_eq(span, attrs::GEN_AI_CONVERSATION_ID, session_value);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baggage_partial_only_user_id() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let cx = baggage_context(&[(obs_baggage::BAGGAGE_USER_ID, "only-user")]);
+
+    run_with_baggage(cx, async {
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        anyhow::Ok(())
+    })
+    .await?;
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+
+    for name in ["invoke_agent", "agent.turn", "chat test-model"] {
+        let span = find_span_in_trace(&trace_spans, name)?;
+        assert_attr_eq(span, obs_baggage::BAGGAGE_USER_ID, "only-user");
+        assert_attr_absent(span, obs_baggage::BAGGAGE_SESSION_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_LANGFUSE_USER_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_LANGFUSE_SESSION_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_DEPLOYMENT_ENVIRONMENT);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baggage_absent_no_attributes() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+
+    for name in ["invoke_agent", "agent.turn", "chat test-model"] {
+        let span = find_span_in_trace(&trace_spans, name)?;
+        assert_attr_absent(span, obs_baggage::BAGGAGE_USER_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_SESSION_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_LANGFUSE_USER_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_LANGFUSE_SESSION_ID);
+        assert_attr_absent(span, obs_baggage::BAGGAGE_DEPLOYMENT_ENVIRONMENT);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baggage_survives_tokio_spawn() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    // The agent spawns a tokio task internally for `run()`. The baggage we
+    // attach in this test task must survive that spawn (the SDK wraps the
+    // spawned future with `FutureExt::with_context(parent_cx)`). If that
+    // contract regresses, the user.id attribute will go missing on every
+    // span that was emitted from the spawned task.
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let cx = baggage_context(&[(obs_baggage::BAGGAGE_USER_ID, "spawn-user")]);
+
+    // The spawned task does the actual work — wait for it inside the
+    // contextualised future so the baggage is in scope until the agent
+    // has emitted every span.
+    run_with_baggage(cx, async {
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        anyhow::Ok(())
+    })
+    .await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+
+    // Spans below the root were emitted from inside the spawned task.
+    let turn = find_span_in_trace(&trace_spans, "agent.turn")?;
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert_attr_eq(root, obs_baggage::BAGGAGE_USER_ID, "spawn-user");
+    assert_attr_eq(turn, obs_baggage::BAGGAGE_USER_ID, "spawn-user");
+    assert_attr_eq(llm, obs_baggage::BAGGAGE_USER_ID, "spawn-user");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baggage_helpers_attach_and_preserve_existing_entries() -> Result<()> {
+    // The `with_user_id` / `with_session_id` helpers must not clobber
+    // unrelated baggage entries already on the context.
+    let cx = OtelContext::current_with_baggage([opentelemetry::KeyValue::new("trace.tag", "v1")]);
+    let cx = obs_baggage::with_user_id(&cx, "alice");
+    let cx = obs_baggage::with_session_id(&cx, "session-1");
+
+    assert_eq!(
+        cx.baggage().get("trace.tag").map(ToString::to_string),
+        Some("v1".to_string())
+    );
+    assert_eq!(
+        cx.baggage()
+            .get(obs_baggage::BAGGAGE_USER_ID)
+            .map(ToString::to_string),
+        Some("alice".to_string())
+    );
+    assert_eq!(
+        cx.baggage()
+            .get(obs_baggage::BAGGAGE_SESSION_ID)
+            .map(ToString::to_string),
+        Some("session-1".to_string())
+    );
+
+    Ok(())
+}

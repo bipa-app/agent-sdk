@@ -282,8 +282,10 @@ fn start_mcp_span_with_attrs(
     name: impl Into<std::borrow::Cow<'static, str>>,
     attrs: Vec<opentelemetry::KeyValue>,
 ) -> opentelemetry::global::BoxedSpan {
-    use crate::observability::spans;
-    spans::start_client_span(name, attrs)
+    use crate::observability::{baggage, spans};
+    let mut span = spans::start_client_span(name, attrs);
+    baggage::copy_baggage_to_active_span(&mut span);
+    span
 }
 
 #[cfg(feature = "otel")]

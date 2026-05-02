@@ -45,7 +45,9 @@ where
             i64::try_from(max_turns).unwrap_or(0),
         ));
     }
-    spans::start_internal_span("invoke_agent", span_attrs)
+    let mut span = spans::start_internal_span("invoke_agent", span_attrs);
+    super::baggage::copy_baggage_to_active_span(&mut span);
+    span
 }
 
 /// Finalize the root span with outcome attributes and end it.
