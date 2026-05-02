@@ -998,7 +998,13 @@ async fn execute_acquired_task(
     cancel: &CancellationToken,
 ) -> Result<()> {
     match task.kind {
-        TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
+        // Box::pin because the M5.4 SubagentSpawnSelector wiring
+        // (crates/agent-server/src/worker/subagent_spawn_selector.rs)
+        // pushed this future past clippy's `large_futures` threshold
+        // (16 KiB). One heap alloc per acquired RootTurn task —
+        // negligible against the existing per-task overhead
+        // (tokio::spawn, lease structures, AgentTask payload, ...).
+        TaskKind::RootTurn => Box::pin(execute_root_task(task, stores, runtime)).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
         TaskKind::Subagent => execute_subagent_task_entry(task, stores).await,
     }
@@ -1037,22 +1043,20 @@ async fn execute_root_task(
             .context("resolve runtime provider")?;
 
         if matches!(task.state, TaskState::ReadyToResume { .. }) {
-            resume_from_children(
-                inputs,
-                &task,
-                provider.as_ref(),
-                &stores.root_turn_deps(),
-                now,
-            )
-            .await
-            .context("resume root task from durable child results")
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector(selector.as_ref());
+            resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
+                .await
+                .context("resume root task from durable child results")
         } else {
             let user_prompt = root_task_prompt(&task)?;
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector(selector.as_ref());
             agent_server::worker::execute_root_turn(
                 inputs,
                 &user_prompt,
                 provider.as_ref(),
-                &stores.root_turn_deps(),
+                &deps,
                 now,
             )
             .await

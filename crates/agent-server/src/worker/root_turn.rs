@@ -92,6 +92,19 @@ pub struct RootTurnDeps<'a> {
     /// [`EventRepository::commit_event`] path doesn't go through the
     /// outbox + relay, so the worker has to notify directly.
     pub event_notifier: &'a EventNotifier,
+    /// Optional per-call routing selector consulted at the tool
+    /// boundary.  When `Some`, batches that resolve to a single
+    /// subagent decision route through
+    /// [`spawn_subagent_invocation`] instead of the regular
+    /// `spawn_tool_children` path; everything else flows through
+    /// `spawn_tool_children` exactly as before.
+    ///
+    /// Defaults to `None` so every existing call site preserves
+    /// pre-PR behaviour without wiring changes.  Hosts that want
+    /// durable subagent routing pass a real selector — see
+    /// [`crate::worker::subagent_spawn_selector`].
+    pub subagent_spawn_selector:
+        Option<&'a (dyn super::subagent_spawn_selector::SubagentSpawnSelector + 'a)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1590,27 +1603,43 @@ async fn suspend_at_tool_boundary(
         })
         .collect();
 
+    // 4.b Consult the per-call subagent-spawn selector (if wired).
+    //     A `SingleSubagent` verdict re-routes section 5 onto
+    //     `spawn_subagent_invocation`; everything else falls through
+    //     to the regular `spawn_tool_children` path.
+    let routing = classify_batch_for_inputs(&inputs, deps, &continuation).await?;
+
     // 5. Atomically spawn children and park the parent.
     //
     //    Clone `suspended_messages` before move into `SuspensionPayload`
     //    so the post-spawn `set_draft` call below can persist the same
     //    snapshot to the message projection's draft slot.
     let draft_snapshot = suspended_messages.clone();
-    let (parent_task, child_tasks) = deps
-        .task_store
-        .spawn_tool_children(
-            task_id,
-            &inputs.bootstrap.worker_id,
-            &inputs.bootstrap.lease_id,
-            specs,
-            SuspensionPayload {
-                continuation,
-                suspended_messages,
-            },
-            now,
-        )
-        .await
-        .context("spawn tool children")?;
+    let payload = SuspensionPayload {
+        continuation,
+        suspended_messages,
+    };
+    let (parent_task, child_tasks) = match routing {
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
+            let spawned =
+                spawn_single_subagent_invocation(&inputs, deps, &plan, payload, spawn_index, now)
+                    .await?;
+            (spawned.parent_task, vec![spawned.invocation_task])
+        }
+        super::subagent_spawn_selector::BatchRouting::AllTools
+        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
+            .task_store
+            .spawn_tool_children(
+                task_id,
+                &inputs.bootstrap.worker_id,
+                &inputs.bootstrap.lease_id,
+                specs,
+                payload,
+                now,
+            )
+            .await
+            .context("spawn tool children")?,
+    };
 
     // 6. Snapshot the in-flight conversation to the projection's
     //    draft slot now that the suspension is durable on the parent
@@ -1661,6 +1690,95 @@ async fn suspend_at_tool_boundary(
         child_tasks,
         committed_events,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Subagent spawn routing helpers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Consult the configured [`SubagentSpawnSelector`] (if any) and
+/// classify the resulting per-call decisions into a single
+/// [`BatchRouting`] verdict.
+///
+/// Returns [`BatchRouting::AllTools`] when no selector is wired, when
+/// the selector returns the wrong number of decisions, or when the
+/// selector itself errors — in every "something looked off" case we
+/// fall through to the legacy `spawn_tool_children` path so a broken
+/// selector cannot break a turn entirely.
+async fn classify_batch_for_inputs(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    continuation: &ContinuationEnvelope,
+) -> Result<super::subagent_spawn_selector::BatchRouting> {
+    let Some(selector) = deps.subagent_spawn_selector else {
+        return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
+    };
+    let pending = &continuation.payload.pending_tool_calls;
+    let decisions = match selector.decide(&inputs.bootstrap.thread_id, pending).await {
+        Ok(decisions) => decisions,
+        Err(error) => {
+            log::warn!(
+                "subagent spawn selector failed on thread {}: {error:#} — falling back to spawn_tool_children",
+                inputs.bootstrap.thread_id,
+            );
+            return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
+        }
+    };
+    if decisions.len() != pending.len() {
+        log::warn!(
+            "subagent spawn selector returned {} decisions for {} tool calls on thread {}; falling back to spawn_tool_children",
+            decisions.len(),
+            pending.len(),
+            inputs.bootstrap.thread_id,
+        );
+        return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
+    }
+    Ok(super::subagent_spawn_selector::classify_batch(decisions))
+}
+
+/// Materialize a `SingleSubagent` routing verdict into a durable
+/// [`spawn_subagent_invocation`](super::subagent::spawn_subagent_invocation)
+/// call, returning the durable records that the caller maps back
+/// into [`RootTurnOutcome::Suspended`].
+///
+/// The invocation task surfaces in `child_tasks` of the outcome —
+/// the host's task acquisition loop will pick it up under
+/// [`TaskKind::Subagent`](crate::journal::task::TaskKind::Subagent)
+/// and dispatch it through `execute_subagent_task_entry`. The child
+/// thread's first root-turn task is also persisted by
+/// `spawn_subagent_invocation` and rides the regular root-task
+/// runnable queue from there.
+async fn spawn_single_subagent_invocation(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    plan: &super::subagent_spawn_selector::SubagentSpawnPlan,
+    payload: SuspensionPayload,
+    spawn_index: usize,
+    now: OffsetDateTime,
+) -> Result<super::subagent::SpawnedSubagentInvocation> {
+    let spawn_index_u32 = u32::try_from(spawn_index).context("subagent spawn_index exceeds u32")?;
+    let spawn = crate::journal::store::SubagentInvocationSpawn {
+        child_thread_id: plan.child_thread_id.clone(),
+        spec: plan.spec.clone(),
+        child_root_input: plan.child_root_input.clone(),
+        spawn_index: spawn_index_u32,
+        payload,
+    };
+    let invocation_deps = super::subagent::SubagentInvocationDeps {
+        task_store: deps.task_store,
+        thread_store: deps.thread_store,
+        event_repo: deps.event_repo,
+    };
+    super::subagent::spawn_subagent_invocation(
+        &inputs.bootstrap.task_id,
+        &inputs.bootstrap.worker_id,
+        &inputs.bootstrap.lease_id,
+        spawn,
+        &invocation_deps,
+        now,
+    )
+    .await
+    .context("spawn subagent invocation")
 }
 
 /// Build a [`ContinuationEnvelope`] capturing the state at the tool
@@ -2315,25 +2433,41 @@ async fn suspend_resumed_turn(
         })
         .collect();
 
+    // Consult the per-call subagent-spawn selector — same contract
+    // as `suspend_at_tool_boundary`. A `SingleSubagent` verdict
+    // re-routes the spawn onto `spawn_subagent_invocation`;
+    // everything else falls through to `spawn_tool_children`.
+    let routing = classify_batch_for_inputs(&inputs, deps, &new_continuation).await?;
+
     // Clone the new accumulated `suspended_messages` so we can mirror
     // them into the projection's draft slot once the spawn succeeds.
     // See `suspend_at_tool_boundary` for the recovery contract.
     let draft_snapshot = new_suspended.clone();
-    let (parent_task, child_tasks) = deps
-        .task_store
-        .spawn_tool_children(
-            task_id,
-            &inputs.bootstrap.worker_id,
-            &inputs.bootstrap.lease_id,
-            specs,
-            SuspensionPayload {
-                continuation: new_continuation,
-                suspended_messages: new_suspended,
-            },
-            now,
-        )
-        .await
-        .context("re-spawn tool children on resume")?;
+    let payload = SuspensionPayload {
+        continuation: new_continuation,
+        suspended_messages: new_suspended,
+    };
+    let (parent_task, child_tasks) = match routing {
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => {
+            let spawned =
+                spawn_single_subagent_invocation(&inputs, deps, &plan, payload, spawn_index, now)
+                    .await?;
+            (spawned.parent_task, vec![spawned.invocation_task])
+        }
+        super::subagent_spawn_selector::BatchRouting::AllTools
+        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
+            .task_store
+            .spawn_tool_children(
+                task_id,
+                &inputs.bootstrap.worker_id,
+                &inputs.bootstrap.lease_id,
+                specs,
+                payload,
+                now,
+            )
+            .await
+            .context("re-spawn tool children on resume")?,
+    };
 
     // Refresh the projection draft so a subsequent failure on the
     // *next* resume LLM call still surfaces the full in-flight

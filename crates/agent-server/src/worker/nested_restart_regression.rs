@@ -278,6 +278,7 @@ impl TestStores {
             checkpoint_store: &self.checkpoints,
             event_repo: &self.events,
             event_notifier: &self.event_notifier,
+            subagent_spawn_selector: None,
         }
     }
 
@@ -1213,8 +1214,17 @@ async fn replay_after_restart_is_summary_only_on_parent_and_rich_on_child() -> R
 
     let tool_tasks =
         suspend_child_root_on_tool_call(&stores, &spawned, "replay", t_plus(3), t_plus(4)).await?;
-    let subagent_outcome =
-        drive_child_to_completion(&stores, &spawned, &tool_tasks, "replay", t_plus(5)).await?;
+    // Box::pin: M5.4's deeper helper-call stack pushed this test's
+    // future past clippy's `large_futures` threshold. Test-only
+    // hot path — boxing is free.
+    let subagent_outcome = Box::pin(drive_child_to_completion(
+        &stores,
+        &spawned,
+        &tool_tasks,
+        "replay",
+        t_plus(5),
+    ))
+    .await?;
     assert!(subagent_outcome.tool_result.success);
     let completed_parent =
         resume_parent_root(&stores, &parent.task.id, "replay", t_plus(20)).await?;

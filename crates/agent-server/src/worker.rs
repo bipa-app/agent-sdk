@@ -91,6 +91,7 @@ pub mod definition;
 pub mod registry;
 pub mod root_turn;
 pub mod subagent;
+pub mod subagent_spawn_selector;
 pub mod tool_task;
 
 #[cfg(test)]
@@ -133,6 +134,10 @@ pub use subagent::{
     SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy, SubagentSpawnRequest,
     SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome, execute_subagent_task,
     resolve_subagent_bootstrap, resolve_subagent_spec, spawn_subagent_invocation,
+};
+pub use subagent_spawn_selector::{
+    BatchRouting, NoopSubagentSpawnSelector, SubagentSpawnDecision, SubagentSpawnSelector,
+    classify_batch,
 };
 pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,

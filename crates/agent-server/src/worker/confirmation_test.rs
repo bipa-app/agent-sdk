@@ -250,6 +250,7 @@ impl TestStores {
             checkpoint_store: &self.checkpoints,
             event_repo: &self.events,
             event_notifier: &self.event_notifier,
+            subagent_spawn_selector: None,
         }
     }
 }

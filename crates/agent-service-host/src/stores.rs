@@ -498,6 +498,12 @@ impl StoreRegistry {
     ///
     /// This is a convenience method that constructs the borrow-based
     /// deps struct the root-turn execution path expects.
+    ///
+    /// Returns deps with `subagent_spawn_selector = None`, i.e.
+    /// every tool call routes through the regular
+    /// `spawn_tool_children` path. Hosts that want durable subagent
+    /// routing should call
+    /// [`Self::root_turn_deps_with_selector`] instead.
     #[must_use]
     pub fn root_turn_deps(&self) -> agent_server::RootTurnDeps<'_> {
         agent_server::RootTurnDeps {
@@ -508,7 +514,23 @@ impl StoreRegistry {
             checkpoint_store: self.checkpoint_store.as_ref(),
             event_repo: self.event_repo.as_ref(),
             event_notifier: self.event_notifier.as_ref(),
+            subagent_spawn_selector: None,
         }
+    }
+
+    /// Like [`Self::root_turn_deps`] but threads a
+    /// [`agent_server::SubagentSpawnSelector`] into the deps so the
+    /// worker can route subagent tool calls through
+    /// `spawn_subagent_invocation` instead of the regular
+    /// tool-runtime path.
+    #[must_use]
+    pub fn root_turn_deps_with_selector<'a>(
+        &'a self,
+        selector: &'a dyn agent_server::SubagentSpawnSelector,
+    ) -> agent_server::RootTurnDeps<'a> {
+        let mut deps = self.root_turn_deps();
+        deps.subagent_spawn_selector = Some(selector);
+        deps
     }
 
     /// Build [`agent_server::SubagentResultDeps`] for invocation-task
