@@ -1260,6 +1260,18 @@ WHERE parent_id = $1
             } else {
                 Some(old_parent)
             }
+        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+            // Phase 7.6 / ENG-8048 M5.4 follow-up: a child-thread
+            // root turn has no `parent_id` but is logically linked
+            // to a parent-thread `Subagent` invocation task via
+            // `state.subagent_invocation.child_root_task_id`. Mirror
+            // the in-memory store's `resume_linked_subagent_invocation`
+            // call here — without it the durable daemon leaves the
+            // invocation stuck in `WaitingOnChildren` after the child
+            // thread completes, `execute_subagent_task` never runs,
+            // and the parent thread's `SubagentProgress { completed:
+            // true }` event never fires.
+            Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?
         } else {
             None
         };
