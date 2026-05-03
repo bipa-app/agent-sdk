@@ -1780,3 +1780,375 @@ async fn run_options_truncate_trace_text_at_caller_supplied_max() -> Result<()> 
 
     Ok(())
 }
+
+// ── Span events (A6) ─────────────────────────────────────────────────
+
+use agent_sdk::llm::{StreamBox, StreamDelta, StreamErrorKind};
+use agent_sdk::{AgentConfig, AgentRunState};
+use async_stream::stream;
+use std::time::Duration;
+
+/// LLM provider that emits a scripted streaming sequence.
+///
+/// Each chunk in `script` is yielded after a tiny sleep so the
+/// test exercises the live streaming path (first-chunk → completed
+/// or first-chunk → dropped) rather than the synthetic fallback that
+/// `LlmProvider::chat_stream` synthesises from `chat()`.
+struct ScriptedStreamProvider {
+    script: RwLock<Vec<StreamDelta>>,
+}
+
+impl ScriptedStreamProvider {
+    const fn new(script: Vec<StreamDelta>) -> Self {
+        Self {
+            script: RwLock::new(script),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedStreamProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        Err(anyhow!(
+            "ScriptedStreamProvider.chat() should not be called"
+        ))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let script = self
+            .script
+            .write()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        Box::pin(stream! {
+            for delta in script {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                yield Ok(delta);
+            }
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "test-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "anthropic"
+    }
+}
+
+fn streaming_config() -> AgentConfig {
+    AgentConfig {
+        streaming: true,
+        ..AgentConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn llm_span_emits_stream_lifecycle_events() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = ScriptedStreamProvider::new(vec![
+        StreamDelta::TextDelta {
+            delta: "hi".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::TextDelta {
+            delta: " there".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+        },
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(streaming_config())
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert!(
+        span_has_event(llm, "llm.stream.first_chunk"),
+        "expected llm.stream.first_chunk on chat span, got events: {:?}",
+        llm.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        span_has_event(llm, "llm.stream.completed"),
+        "expected llm.stream.completed on chat span, got events: {:?}",
+        llm.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn llm_span_emits_dropped_event_when_stream_aborts() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    // No retries so the fatal stream error short-circuits cleanly.
+    let mut config = streaming_config();
+    config.retry = agent_sdk::RetryConfig::no_retry();
+
+    let provider = ScriptedStreamProvider::new(vec![
+        StreamDelta::TextDelta {
+            delta: "partial".to_string(),
+            block_index: 0,
+        },
+        StreamDelta::Error {
+            message: "boom".to_string(),
+            kind: StreamErrorKind::InvalidRequest,
+        },
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state.await.context("agent state channel closed")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+    assert!(matches!(state, AgentRunState::Error(_)));
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert!(
+        span_has_event(llm, "llm.stream.dropped"),
+        "expected llm.stream.dropped on chat span, got events: {:?}",
+        llm.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    let dropped = llm
+        .events
+        .iter()
+        .find(|e| e.name.as_ref() == "llm.stream.dropped")
+        .context("dropped event")?;
+    let attrs: std::collections::HashMap<String, String> = dropped
+        .attributes
+        .iter()
+        .map(|kv| (kv.key.to_string(), format!("{}", kv.value)))
+        .collect();
+    assert_eq!(
+        attrs
+            .get(attrs::SDK_LLM_STREAM_DROP_REASON)
+            .map(String::as_str),
+        Some("fatal_error"),
+    );
+    assert_eq!(
+        attrs.get(attrs::ERROR_TYPE).map(String::as_str),
+        Some("invalid_request"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_span_emits_max_turns_reached_event() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    // max_turns=1 + a tool-use response forces the next iteration to
+    // hit `begin_turn`'s `ctx.turn > max_turns` branch on turn 2.
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let provider = TestProvider::new(vec![
+        TestProvider::tool_use_response("call_1", "echo", json!({"text": "hi"})),
+        // Padding entries — never reached because max_turns aborts first.
+        TestProvider::text_response("Done"),
+    ]);
+
+    let config = AgentConfig {
+        max_turns: Some(1),
+        ..AgentConfig::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .config(config)
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Trigger max turns".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state.await.context("agent state channel closed")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+    assert!(matches!(state, AgentRunState::Error(_)));
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    assert!(
+        span_has_event(root, "agent.max_turns_reached"),
+        "expected agent.max_turns_reached on root span, got events: {:?}",
+        root.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_span_emits_context_window_exceeded_event() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![ChatOutcome::Success(ChatResponse {
+        id: "resp_ctx".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "too big".to_string(),
+        }],
+        model: "test-model".to_string(),
+        stop_reason: Some(StopReason::ModelContextWindowExceeded),
+        usage: Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    })]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state.await.context("agent state channel closed")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+    assert!(matches!(state, AgentRunState::Error(_)));
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    assert!(
+        span_has_event(root, "agent.context_window_exceeded"),
+        "expected agent.context_window_exceeded on root span, got events: {:?}",
+        root.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+// Hook that always asks for confirmation — used by the
+// `tool_span_emits_confirmation_required_event` test.
+use agent_sdk::{AgentHooks, ToolDecision, ToolInvocation};
+
+#[derive(Default)]
+struct ConfirmAllHooks;
+
+#[async_trait]
+impl AgentHooks for ConfirmAllHooks {
+    async fn pre_tool_use(&self, _invocation: &ToolInvocation) -> ToolDecision {
+        ToolDecision::RequiresConfirmation("Confirm please".to_string())
+    }
+}
+
+#[tokio::test]
+async fn tool_span_emits_confirmation_required_event() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![
+        TestProvider::tool_use_response("call_1", "echo", json!({"text": "hi"})),
+        TestProvider::text_response("Done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(ConfirmAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Echo".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let state = final_state.await.context("agent state channel closed")?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+    assert!(matches!(state, AgentRunState::AwaitingConfirmation { .. }));
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let tool = find_span_in_trace(&trace_spans, "execute_tool")?;
+    assert!(
+        span_has_event(tool, "tool.confirmation_required"),
+        "expected tool.confirmation_required on tool span, got events: {:?}",
+        tool.events
+            .iter()
+            .map(|e| e.name.as_ref())
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}

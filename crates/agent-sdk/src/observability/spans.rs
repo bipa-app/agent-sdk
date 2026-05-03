@@ -51,6 +51,18 @@ pub fn set_span_error(span: &mut BoxedSpan, error_type: &str, message: &str) {
     span.set_status(Status::error(message.to_string()));
 }
 
+/// Add a structured span event with attributes.
+///
+/// Skips silently when the span is not recording (sampling drop or
+/// no-op tracer). Mirrors the guards used by every other helper in
+/// this module so callers don't have to check `is_recording` first.
+pub fn add_event(span: &mut BoxedSpan, name: impl Into<Cow<'static, str>>, attrs: Vec<KeyValue>) {
+    if !span.is_recording() {
+        return;
+    }
+    span.add_event(name, attrs);
+}
+
 /// Record payload content on an LLM span based on store decisions.
 pub fn record_payload_on_span(
     span: &mut BoxedSpan,

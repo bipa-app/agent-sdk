@@ -1183,7 +1183,23 @@ where
                 _ => Some(done_run_state(ctx)),
             }
         }
-        () = cancel_token.cancelled() => Some(cancelled_run_state(ctx)),
+        () = cancel_token.cancelled() => {
+            #[cfg(feature = "otel")]
+            crate::observability::instrument::record_root_event(
+                "agent.cancelled",
+                vec![
+                    crate::observability::attrs::kv(
+                        crate::observability::attrs::SDK_CANCEL_REASON,
+                        "cancel_token",
+                    ),
+                    crate::observability::attrs::kv_i64(
+                        crate::observability::attrs::SDK_TURN_NUMBER,
+                        i64::try_from(ctx.turn).unwrap_or(0),
+                    ),
+                ],
+            );
+            Some(cancelled_run_state(ctx))
+        }
     }
 }
 
@@ -1364,6 +1380,20 @@ where
     loop {
         if cancel_token.is_cancelled() {
             log::info!("Agent run cancelled before turn {}", ctx.turn);
+            #[cfg(feature = "otel")]
+            crate::observability::instrument::record_root_event(
+                "agent.cancelled",
+                vec![
+                    crate::observability::attrs::kv(
+                        crate::observability::attrs::SDK_CANCEL_REASON,
+                        "cancel_token",
+                    ),
+                    crate::observability::attrs::kv_i64(
+                        crate::observability::attrs::SDK_TURN_NUMBER,
+                        i64::try_from(ctx.turn).unwrap_or(0),
+                    ),
+                ],
+            );
             return Some(cancelled_run_state(ctx));
         }
 
@@ -1643,7 +1673,7 @@ where
     S: StateStore,
 {
     #[cfg(feature = "otel")]
-    let mut started = crate::observability::instrument::start_root_span(
+    let started = crate::observability::instrument::start_root_span(
         &crate::observability::instrument::StartRootSpanParams {
             provider: params.provider.as_ref(),
             tools: &params.tools,
@@ -1665,6 +1695,8 @@ where
             started.span_context.clone(),
             &params.run_options,
         );
+        let cx =
+            crate::observability::instrument::attach_root_event_sink(&cx, started.sink.clone());
         match trace_state.clone() {
             Some(state) => state.attach_to(&cx),
             None => cx,
@@ -1682,7 +1714,9 @@ where
 
     #[cfg(feature = "otel")]
     {
-        use crate::observability::instrument::{end_root_span, run_state_outcome};
+        use crate::observability::instrument::{
+            end_root_span, flush_root_trace_state, run_state_outcome,
+        };
 
         let (turns, total_usage) = match &result {
             AgentRunState::Done {
@@ -1704,14 +1738,9 @@ where
             }
         };
         if let Some(state) = trace_state {
-            state.flush(&mut started.span);
+            flush_root_trace_state(&started.sink, state.as_ref());
         }
-        end_root_span(
-            &mut started.span,
-            turns,
-            total_usage,
-            run_state_outcome(&result),
-        );
+        end_root_span(started.sink, turns, total_usage, run_state_outcome(&result));
     }
 
     result
@@ -1854,7 +1883,7 @@ where
     S: StateStore,
 {
     #[cfg(feature = "otel")]
-    let mut started = crate::observability::instrument::start_root_span(
+    let started = crate::observability::instrument::start_root_span(
         &crate::observability::instrument::StartRootSpanParams {
             provider: params.provider.as_ref(),
             tools: &params.tools,
@@ -1876,6 +1905,8 @@ where
             started.span_context.clone(),
             &params.run_options,
         );
+        let cx =
+            crate::observability::instrument::attach_root_event_sink(&cx, started.sink.clone());
         match trace_state.clone() {
             Some(state) => state.attach_to(&cx),
             None => cx,
@@ -1895,7 +1926,9 @@ where
 
     #[cfg(feature = "otel")]
     {
-        use crate::observability::instrument::{end_root_span, turn_outcome_str};
+        use crate::observability::instrument::{
+            end_root_span, flush_root_trace_state, turn_outcome_str,
+        };
 
         let (turns, total_usage) = match &outcome {
             TurnOutcome::Done {
@@ -1927,14 +1960,9 @@ where
             }
         };
         if let Some(state) = trace_state {
-            state.flush(&mut started.span);
+            flush_root_trace_state(&started.sink, state.as_ref());
         }
-        end_root_span(
-            &mut started.span,
-            turns,
-            total_usage,
-            turn_outcome_str(&outcome),
-        );
+        end_root_span(started.sink, turns, total_usage, turn_outcome_str(&outcome));
     }
 
     outcome
@@ -1980,6 +2008,14 @@ where
     // Check for cancellation before starting any work
     if cancel_token.is_cancelled() {
         log::info!("Agent turn cancelled before execution started");
+        #[cfg(feature = "otel")]
+        crate::observability::instrument::record_root_event(
+            "agent.cancelled",
+            vec![crate::observability::attrs::kv(
+                crate::observability::attrs::SDK_CANCEL_REASON,
+                "cancel_token",
+            )],
+        );
         return cancelled_turn_outcome(&thread_id, 0, &provenance, &turn_options);
     }
 

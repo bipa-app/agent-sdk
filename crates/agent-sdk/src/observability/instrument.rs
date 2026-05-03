@@ -41,7 +41,7 @@ where
 /// needs to decide whether to build a [`trace_io::RootTraceState`]
 /// for streamed events without re-introspecting the span every time.
 pub(crate) struct StartedRootSpan {
-    pub(crate) span: BoxedSpan,
+    pub(crate) sink: RootSpanEventSink,
     pub(crate) span_context: opentelemetry::trace::SpanContext,
     pub(crate) is_recording: bool,
 }
@@ -102,7 +102,7 @@ where
     let is_recording = span.is_recording();
     let span_context = span.span_context().clone();
     StartedRootSpan {
-        span,
+        sink: RootSpanEventSink::new(span),
         span_context,
         is_recording,
     }
@@ -163,6 +163,86 @@ pub(crate) fn build_root_context(
 ) -> Context {
     let cx = run_options_baggage(&Context::current(), run_options);
     cx.with_remote_span_context(span_context)
+}
+
+/// Layer a [`RootSpanEventSink`] onto the supplied context.
+///
+/// Inner code paths (turn / tool execution / agent loop) call
+/// [`record_root_event`] to add events to the root `invoke_agent`
+/// span without holding a reference to the boxed span. The sink is
+/// retrieved from `Context::current()` and dispatches to the locked
+/// span.
+#[must_use]
+pub(crate) fn attach_root_event_sink(cx: &Context, sink: RootSpanEventSink) -> Context {
+    cx.with_value(sink)
+}
+
+/// Add an event to the root `invoke_agent` span on the **current**
+/// `OTel` context, if a sink has been attached via
+/// [`attach_root_event_sink`].
+///
+/// No-op when no sink is in scope. Used by call sites deep in the
+/// agent loop (cancellation paths, max-turn enforcement,
+/// context-window-exceeded handling) so they don't have to thread
+/// the boxed span through every parameter struct.
+pub(crate) fn record_root_event(name: &'static str, attrs: Vec<KeyValue>) {
+    if let Some(sink) = Context::current().get::<RootSpanEventSink>() {
+        sink.add_event(name, attrs);
+    }
+}
+
+/// Send-able handle to the root span used to attach events from
+/// other tasks under the same context.
+///
+/// Wraps the boxed span behind an `Arc<Mutex<_>>` so the sink can be
+/// stored in an `OTel` context (which requires `Clone + Send + Sync`)
+/// without copying the span.
+#[derive(Clone)]
+pub(crate) struct RootSpanEventSink(
+    std::sync::Arc<std::sync::Mutex<opentelemetry::global::BoxedSpan>>,
+);
+
+impl RootSpanEventSink {
+    /// Build a sink that drains into `span`.
+    pub(crate) fn new(span: opentelemetry::global::BoxedSpan) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(span)))
+    }
+
+    /// Reclaim ownership of the wrapped span at the end of the run.
+    ///
+    /// Returns `None` when there are still outstanding clones of the
+    /// `Arc`, meaning some child task captured the sink and outlived
+    /// the run. Callers fall back to emitting events on the orphaned
+    /// span via [`add_event`](Self::add_event); see `end_root_span`.
+    pub(crate) fn into_inner(self) -> Option<opentelemetry::global::BoxedSpan> {
+        let Self(arc) = self;
+        std::sync::Arc::try_unwrap(arc)
+            .ok()
+            .and_then(|mu| mu.into_inner().ok())
+    }
+
+    fn add_event(&self, name: &'static str, attrs: Vec<KeyValue>) {
+        let Ok(mut span) = self.0.lock() else {
+            log::warn!("root span sink mutex poisoned; dropping event {name}");
+            return;
+        };
+        if !span.is_recording() {
+            return;
+        }
+        span.add_event(name, attrs);
+    }
+
+    /// Run `op` against the wrapped span while holding the inner
+    /// mutex. Used by [`flush_root_trace_state`] so the
+    /// `RootTraceState` can stamp its accumulated narrative on the
+    /// span without taking ownership of the sink.
+    pub(crate) fn with_span_mut<R>(
+        &self,
+        op: impl FnOnce(&mut opentelemetry::global::BoxedSpan) -> R,
+    ) -> Option<R> {
+        let mut span = self.0.lock().ok()?;
+        Some(op(&mut span))
+    }
 }
 
 /// Mirror the session / user / environment IDs from [`RunOptions`]
@@ -265,11 +345,18 @@ pub(crate) fn build_root_trace_state(
 /// final `langfuse.trace.output` is a single attribute on the
 /// exported span.
 pub(crate) fn end_root_span(
-    span: &mut BoxedSpan,
+    sink: RootSpanEventSink,
     total_turns: usize,
     total_usage: &TokenUsage,
     outcome: &'static str,
 ) {
+    let Some(mut span) = sink.into_inner() else {
+        log::warn!(
+            "root span sink still has outstanding clones at end_root_span; \
+             dropping outcome attributes",
+        );
+        return;
+    };
     span.set_attribute(KeyValue::new(
         attrs::SDK_TOTAL_TURNS,
         i64::try_from(total_turns).unwrap_or(0),
@@ -292,9 +379,15 @@ pub(crate) fn end_root_span(
     ));
     span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
     if outcome == "error" {
-        spans::set_span_error(span, "agent_error", "agent invocation failed");
+        spans::set_span_error(&mut span, "agent_error", "agent invocation failed");
     }
     span.end();
+}
+
+/// Flush any pending [`trace_io::RootTraceState`] onto the live root
+/// span before [`end_root_span`] consumes the sink.
+pub(crate) fn flush_root_trace_state(sink: &RootSpanEventSink, state: &trace_io::RootTraceState) {
+    sink.with_span_mut(|span| state.flush(span));
 }
 
 /// Map an `AgentRunState` to an outcome string.
