@@ -93,7 +93,13 @@ where
     #[cfg(feature = "otel")]
     let mut tool_span = start_tool_span(pending, ctx);
 
-    let outcome = execute_tool_call_inner(pending, ctx).await;
+    let outcome = execute_tool_call_inner(
+        pending,
+        ctx,
+        #[cfg(feature = "otel")]
+        &mut tool_span,
+    )
+    .await;
 
     #[cfg(feature = "otel")]
     finish_tool_span(&mut tool_span, &outcome);
@@ -154,7 +160,7 @@ where
 
 #[cfg(feature = "otel")]
 fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolExecutionOutcome) {
-    use crate::observability::attrs;
+    use crate::observability::{attrs, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
@@ -181,12 +187,17 @@ fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolE
                 ));
             }
         }
-        ToolExecutionOutcome::RequiresConfirmation { .. } => {
+        ToolExecutionOutcome::RequiresConfirmation { tool_name, .. } => {
             span.set_attribute(attrs::kv_bool(attrs::SDK_TOOL_CONFIRMATION_REQUIRED, true));
             span.set_attribute(KeyValue::new(
                 attrs::SDK_TOOL_OUTCOME,
                 "awaiting_confirmation",
             ));
+            spans::add_event(
+                span,
+                "tool.confirmation_required",
+                vec![KeyValue::new(attrs::GEN_AI_TOOL_NAME, tool_name.clone())],
+            );
         }
         ToolExecutionOutcome::Error(error) => {
             span.set_attribute(KeyValue::new(attrs::ERROR_TYPE, "event_store"));
@@ -201,6 +212,7 @@ fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolE
 async fn execute_tool_call_inner<Ctx, H>(
     pending: &PendingToolCallInfo,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    #[cfg(feature = "otel")] tool_span: &mut opentelemetry::global::BoxedSpan,
 ) -> ToolExecutionOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -219,6 +231,15 @@ where
             },
         )
         .await;
+        #[cfg(feature = "otel")]
+        crate::observability::spans::add_event(
+            tool_span,
+            "tool.cached_result_returned",
+            vec![opentelemetry::KeyValue::new(
+                crate::observability::attrs::GEN_AI_TOOL_CALL_ID,
+                pending.id.clone(),
+            )],
+        );
         return ToolExecutionOutcome::Completed {
             tool_id: pending.id.clone(),
             result: cached_result,
@@ -230,7 +251,14 @@ where
     }
 
     if let Some(async_tool) = ctx.tools.get_async(&pending.name) {
-        return execute_async_tool_call(pending, async_tool, ctx).await;
+        return execute_async_tool_call(
+            pending,
+            async_tool,
+            ctx,
+            #[cfg(feature = "otel")]
+            tool_span,
+        )
+        .await;
     }
 
     let Some(tool) = ctx.tools.get(&pending.name) else {
@@ -795,6 +823,7 @@ async fn complete_async_tool_call<Ctx, H>(
     pending: &PendingToolCallInfo,
     async_tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    #[cfg(feature = "otel")] tool_span: &mut opentelemetry::global::BoxedSpan,
 ) -> ToolExecutionOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -803,15 +832,17 @@ where
     let tier = async_tool.tier();
     let result =
         match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-            execute_async_tool(
+            execute_async_tool(AsyncToolExecutionParams {
                 pending,
-                async_tool,
-                ctx.tool_context,
-                ctx.event_store,
-                ctx.thread_id,
-                ctx.turn,
-                ctx.authority,
-            )
+                tool: async_tool,
+                tool_context: ctx.tool_context,
+                event_store: ctx.event_store,
+                thread_id: ctx.thread_id,
+                turn: ctx.turn,
+                authority: ctx.authority,
+                #[cfg(feature = "otel")]
+                tool_span: Some(tool_span),
+            })
             .await
         })
         .await
@@ -946,6 +977,7 @@ pub(super) async fn execute_async_tool_call<Ctx, H>(
     pending: &PendingToolCallInfo,
     async_tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+    #[cfg(feature = "otel")] tool_span: &mut opentelemetry::global::BoxedSpan,
 ) -> ToolExecutionOutcome
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -973,7 +1005,16 @@ where
         .pre_tool_use(&build_invocation(pending, tier))
         .await
     {
-        ToolDecision::Allow => complete_async_tool_call(pending, async_tool, ctx).await,
+        ToolDecision::Allow => {
+            complete_async_tool_call(
+                pending,
+                async_tool,
+                ctx,
+                #[cfg(feature = "otel")]
+                tool_span,
+            )
+            .await
+        }
         ToolDecision::Block(reason) => block_tool_call(pending, ctx, tier, reason).await,
         ToolDecision::RequiresConfirmation(description) => {
             require_tool_confirmation(pending, ctx, tier, description).await
@@ -1020,23 +1061,47 @@ where
     }
 }
 
+/// Parameters for [`execute_async_tool`].
+///
+/// Bundled into a struct so the function stays under the
+/// `too_many_arguments` clippy threshold.
+pub(super) struct AsyncToolExecutionParams<'a, Ctx> {
+    pub(super) pending: &'a PendingToolCallInfo,
+    pub(super) tool: &'a Arc<dyn ErasedAsyncTool<Ctx>>,
+    pub(super) tool_context: &'a ToolContext<Ctx>,
+    pub(super) event_store: &'a Arc<dyn EventStore>,
+    pub(super) thread_id: &'a ThreadId,
+    pub(super) turn: usize,
+    pub(super) authority: &'a Arc<dyn EventAuthority>,
+    /// Optional tool span; the resume-after-confirmation path passes
+    /// `None` because that path does not yet open a tool span.
+    #[cfg(feature = "otel")]
+    pub(super) tool_span: Option<&'a mut opentelemetry::global::BoxedSpan>,
+}
+
 /// Execute an async tool call and stream progress until completion.
 ///
 /// This function handles the two-phase execution of async tools:
 /// 1. Execute the tool (returns immediately with Success/Failed/`InProgress`)
 /// 2. If `InProgress`, stream status updates until completion
 pub(super) async fn execute_async_tool<Ctx>(
-    pending: &PendingToolCallInfo,
-    tool: &Arc<dyn ErasedAsyncTool<Ctx>>,
-    tool_context: &ToolContext<Ctx>,
-    event_store: &Arc<dyn EventStore>,
-    thread_id: &ThreadId,
-    turn: usize,
-    authority: &Arc<dyn EventAuthority>,
+    params: AsyncToolExecutionParams<'_, Ctx>,
 ) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone,
 {
+    let AsyncToolExecutionParams {
+        pending,
+        tool,
+        tool_context,
+        event_store,
+        thread_id,
+        turn,
+        authority,
+        #[cfg(feature = "otel")]
+        tool_span,
+    } = params;
+
     let tool_start = Instant::now();
 
     // Step 1: Execute (lightweight, returns quickly)
@@ -1060,64 +1125,149 @@ where
             operation_id,
             message,
         } => {
-            // Emit initial progress
-            wrap_and_send(
+            stream_async_tool_progress(StreamAsyncToolProgressParams {
+                pending,
+                tool,
+                tool_context,
                 event_store,
                 thread_id,
                 turn,
-                AgentEvent::tool_progress(
-                    &pending.id,
-                    &pending.name,
-                    &pending.display_name,
-                    "started",
-                    &message,
-                    None,
-                ),
                 authority,
-            )
-            .await?;
+                operation_id,
+                initial_message: message,
+                tool_start,
+                #[cfg(feature = "otel")]
+                tool_span,
+            })
+            .await
+        }
+    }
+}
 
-            // Stream status updates
-            let mut stream = tool.check_status_stream(tool_context, &operation_id);
+/// Parameters for [`stream_async_tool_progress`].
+///
+/// Inlined struct because the function is private and takes a mix of
+/// borrows / owned operation metadata.
+struct StreamAsyncToolProgressParams<'a, Ctx> {
+    pending: &'a PendingToolCallInfo,
+    tool: &'a Arc<dyn ErasedAsyncTool<Ctx>>,
+    tool_context: &'a ToolContext<Ctx>,
+    event_store: &'a Arc<dyn EventStore>,
+    thread_id: &'a ThreadId,
+    turn: usize,
+    authority: &'a Arc<dyn EventAuthority>,
+    operation_id: String,
+    initial_message: String,
+    tool_start: Instant,
+    #[cfg(feature = "otel")]
+    tool_span: Option<&'a mut opentelemetry::global::BoxedSpan>,
+}
 
-            while let Some(status) = stream.next().await {
-                match status {
-                    ErasedToolStatus::Progress {
+async fn stream_async_tool_progress<Ctx>(
+    params: StreamAsyncToolProgressParams<'_, Ctx>,
+) -> Result<ToolResult, AgentError>
+where
+    Ctx: Send + Sync + Clone,
+{
+    let StreamAsyncToolProgressParams {
+        pending,
+        tool,
+        tool_context,
+        event_store,
+        thread_id,
+        turn,
+        authority,
+        operation_id,
+        initial_message,
+        tool_start,
+        #[cfg(feature = "otel")]
+        mut tool_span,
+    } = params;
+
+    #[cfg(feature = "otel")]
+    if let Some(span) = tool_span.as_deref_mut() {
+        crate::observability::spans::add_event(
+            span,
+            "tool.async.started",
+            vec![opentelemetry::KeyValue::new(
+                crate::observability::attrs::GEN_AI_TOOL_NAME,
+                pending.name.clone(),
+            )],
+        );
+    }
+
+    wrap_and_send(
+        event_store,
+        thread_id,
+        turn,
+        AgentEvent::tool_progress(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            "started",
+            &initial_message,
+            None,
+        ),
+        authority,
+    )
+    .await?;
+
+    let mut stream = tool.check_status_stream(tool_context, &operation_id);
+    #[cfg(feature = "otel")]
+    let mut poll_index: u64 = 0;
+
+    while let Some(status) = stream.next().await {
+        match status {
+            ErasedToolStatus::Progress {
+                stage,
+                message,
+                data,
+            } => {
+                #[cfg(feature = "otel")]
+                if let Some(span) = tool_span.as_deref_mut() {
+                    poll_index += 1;
+                    crate::observability::spans::add_event(
+                        span,
+                        "tool.async.poll",
+                        vec![
+                            opentelemetry::KeyValue::new(
+                                crate::observability::attrs::SDK_TOOL_PROGRESS_STAGE,
+                                stage.clone(),
+                            ),
+                            crate::observability::attrs::kv_i64(
+                                crate::observability::attrs::SDK_TOOL_POLL_INDEX,
+                                i64::try_from(poll_index).unwrap_or(i64::MAX),
+                            ),
+                        ],
+                    );
+                }
+                wrap_and_send(
+                    event_store,
+                    thread_id,
+                    turn,
+                    AgentEvent::tool_progress(
+                        &pending.id,
+                        &pending.name,
+                        &pending.display_name,
                         stage,
                         message,
                         data,
-                    } => {
-                        wrap_and_send(
-                            event_store,
-                            thread_id,
-                            turn,
-                            AgentEvent::tool_progress(
-                                &pending.id,
-                                &pending.name,
-                                &pending.display_name,
-                                stage,
-                                message,
-                                data,
-                            ),
-                            authority,
-                        )
-                        .await?;
-                    }
-                    ErasedToolStatus::Completed(mut result)
-                    | ErasedToolStatus::Failed(mut result) => {
-                        result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        return Ok(result);
-                    }
-                }
+                    ),
+                    authority,
+                )
+                .await?;
             }
-
-            // Stream ended without completion (shouldn't happen)
-            Ok(
-                ToolResult::error("Async tool stream ended without completion")
-                    .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-            )
+            ErasedToolStatus::Completed(mut result) | ErasedToolStatus::Failed(mut result) => {
+                result.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                return Ok(result);
+            }
         }
     }
+
+    Ok(
+        ToolResult::error("Async tool stream ended without completion")
+            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+    )
 }
 
 /// Execute the confirmed tool call from a resume operation.
@@ -1315,15 +1465,17 @@ where
             awaiting_tool,
             ctx.thread_id,
             async {
-                execute_async_tool(
-                    awaiting_tool,
-                    async_tool,
-                    ctx.tool_context,
-                    ctx.event_store,
-                    ctx.thread_id,
-                    ctx.turn,
-                    ctx.authority,
-                )
+                execute_async_tool(AsyncToolExecutionParams {
+                    pending: awaiting_tool,
+                    tool: async_tool,
+                    tool_context: ctx.tool_context,
+                    event_store: ctx.event_store,
+                    thread_id: ctx.thread_id,
+                    turn: ctx.turn,
+                    authority: ctx.authority,
+                    #[cfg(feature = "otel")]
+                    tool_span: None,
+                })
                 .await
             },
         )

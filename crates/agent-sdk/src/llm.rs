@@ -28,4 +28,6 @@ pub mod types {
 pub use agent_sdk_core::llm::*;
 pub use agent_sdk_providers::provider::{LlmProvider, collect_stream};
 pub use agent_sdk_providers::router::{ModelRouter, ModelTier, TaskComplexity};
-pub use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta};
+pub use agent_sdk_providers::streaming::{
+    StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind,
+};

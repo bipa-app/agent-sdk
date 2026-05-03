@@ -42,6 +42,11 @@ pub const SDK_TOOLS_COUNT: &str = "agent_sdk.tools.count";
 pub const SDK_TOTAL_TURNS: &str = "agent_sdk.total_turns";
 pub const SDK_OUTCOME: &str = "agent_sdk.outcome";
 
+// ── Lifecycle Event Payload Attributes ───────────────────────────────
+
+/// Reason why a run was cancelled (`cancel_token` / `error`).
+pub const SDK_CANCEL_REASON: &str = "agent_sdk.cancel.reason";
+
 pub const SDK_TURN_NUMBER: &str = "agent_sdk.turn.number";
 pub const SDK_TURN_RESUMED: &str = "agent_sdk.turn.resumed";
 pub const SDK_TURN_HAD_TOOL_CALLS: &str = "agent_sdk.turn.had_tool_calls";
@@ -57,12 +62,35 @@ pub const SDK_LLM_HAD_TOOL_CALLS: &str = "agent_sdk.llm.had_tool_calls";
 pub const SDK_LLM_TEXT_OUTPUT_PRESENT: &str = "agent_sdk.llm.text_output_present";
 pub const SDK_LLM_THINKING_PRESENT: &str = "agent_sdk.llm.thinking_present";
 
+// ── LLM Stream / Retry Event Payload Attributes ──────────────────────
+
+/// Number of streaming deltas observed for an LLM call.
+pub const SDK_LLM_STREAM_DELTA_COUNT: &str = "agent_sdk.llm.stream.delta_count";
+/// Wall-clock duration (ms) from stream start to event emission.
+pub const SDK_LLM_STREAM_DURATION_MS: &str = "agent_sdk.llm.stream.duration_ms";
+/// Reason a streaming attempt was abandoned (`recoverable_error` /
+/// `fatal_error` / `event_channel_send_failed`).
+pub const SDK_LLM_STREAM_DROP_REASON: &str = "agent_sdk.llm.stream.drop_reason";
+/// 1-based retry attempt number.
+pub const SDK_LLM_RETRY_ATTEMPT: &str = "agent_sdk.llm.retry.attempt";
+/// Configured retry budget for the run.
+pub const SDK_LLM_RETRY_MAX_ATTEMPTS: &str = "agent_sdk.llm.retry.max_attempts";
+/// Backoff delay before the retry (ms).
+pub const SDK_LLM_RETRY_DELAY_MS: &str = "agent_sdk.llm.retry.delay_ms";
+
 pub const SDK_TOOL_DISPLAY_NAME: &str = "agent_sdk.tool.display_name";
 pub const SDK_TOOL_TIER: &str = "agent_sdk.tool.tier";
 pub const SDK_TOOL_KIND: &str = "agent_sdk.tool.kind";
 pub const SDK_TOOL_CONFIRMATION_REQUIRED: &str = "agent_sdk.tool.confirmation_required";
 pub const SDK_TOOL_OUTCOME: &str = "agent_sdk.tool.outcome";
 pub const SDK_TOOL_DURATION_MS: &str = "agent_sdk.tool.duration_ms";
+
+// ── Tool Event Payload Attributes ────────────────────────────────────
+
+/// Stage label reported by an async-tool progress update.
+pub const SDK_TOOL_PROGRESS_STAGE: &str = "agent_sdk.tool.progress.stage";
+/// Polling sequence number for an async-tool progress update.
+pub const SDK_TOOL_POLL_INDEX: &str = "agent_sdk.tool.poll_index";
 
 pub const SDK_COMPACTION_ORIGINAL_COUNT: &str = "agent_sdk.compaction.original_count";
 pub const SDK_COMPACTION_NEW_COUNT: &str = "agent_sdk.compaction.new_count";

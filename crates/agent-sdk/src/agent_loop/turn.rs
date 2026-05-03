@@ -60,6 +60,20 @@ where
         && ctx.turn > max_turns
     {
         warn!("Max turns reached (turn={}, max={max_turns})", ctx.turn);
+        #[cfg(feature = "otel")]
+        crate::observability::instrument::record_root_event(
+            "agent.max_turns_reached",
+            vec![
+                crate::observability::attrs::kv_i64(
+                    crate::observability::attrs::SDK_TURN_NUMBER,
+                    i64::try_from(ctx.turn).unwrap_or(0),
+                ),
+                crate::observability::attrs::kv_i64(
+                    crate::observability::attrs::SDK_CONFIG_MAX_TURNS,
+                    i64::try_from(max_turns).unwrap_or(0),
+                ),
+            ],
+        );
         let message = format!("Maximum turns ({max_turns}) reached");
         send_event(
             event_store,
@@ -189,6 +203,8 @@ where
             .await;
         }
 
+        #[cfg(feature = "otel")]
+        record_compaction_skipped(&messages);
         return Ok(messages);
     }
 
@@ -213,6 +229,9 @@ where
             })
             .await;
         }
+
+        #[cfg(feature = "otel")]
+        record_compaction_skipped(&messages);
     }
 
     Ok(messages)
@@ -420,9 +439,47 @@ fn finish_compaction_span_error(
     use crate::observability::{attrs, spans};
     use opentelemetry::trace::Span;
 
+    if error_type == "context_compaction_history_replace_failed" {
+        spans::add_event(
+            span,
+            "compaction.history_replace_failed",
+            vec![opentelemetry::KeyValue::new(
+                attrs::ERROR_TYPE,
+                error_type.to_string(),
+            )],
+        );
+    }
     span.set_attribute(attrs::kv(attrs::SDK_OUTCOME, "error"));
     spans::set_span_error(span, error_type, message);
     span.end();
+}
+
+/// Emit a `compaction.skipped_below_threshold` event on the active
+/// span.
+///
+/// Only fires when compaction was *configured* but `needs_compaction`
+/// returned false — i.e. the SDK was capable of compacting but chose
+/// not to. The event lands on whichever span is current
+/// (`invoke_agent` for a fresh turn) so a Tempo viewer sees the
+/// compaction-decision history without a dedicated child span.
+#[cfg(feature = "otel")]
+fn record_compaction_skipped(messages: &[Message]) {
+    use crate::observability::attrs;
+    use opentelemetry::Context;
+    use opentelemetry::trace::TraceContextExt;
+
+    let cx = Context::current();
+    let span = cx.span();
+    if !span.span_context().is_valid() {
+        return;
+    }
+    span.add_event(
+        "compaction.skipped_below_threshold",
+        vec![attrs::kv_i64(
+            attrs::SDK_COMPACTION_ORIGINAL_COUNT,
+            i64::try_from(messages.len()).unwrap_or(0),
+        )],
+    );
 }
 
 pub(super) fn build_turn_request<Ctx, P>(
@@ -590,6 +647,9 @@ where
 
     #[cfg(feature = "otel")]
     let request_for_capture = observability_store.map(|_| request.clone());
+    #[cfg(feature = "otel")]
+    let provider_name_for_observer =
+        crate::observability::provider_name::normalize(provider.provider());
 
     let (result, retry_count) = if config.streaming {
         call_llm_streaming(
@@ -601,10 +661,26 @@ where
                 message_id,
                 thinking_id,
             },
+            #[cfg(feature = "otel")]
+            Some(super::llm::LlmSpanObserver {
+                span: &mut llm_span,
+                provider_name: provider_name_for_observer,
+            }),
         )
         .await
     } else {
-        call_llm_with_retry(provider, request, config, &event_ctx).await
+        call_llm_with_retry(
+            provider,
+            request,
+            config,
+            &event_ctx,
+            #[cfg(feature = "otel")]
+            Some(super::llm::LlmSpanObserver {
+                span: &mut llm_span,
+                provider_name: provider_name_for_observer,
+            }),
+        )
+        .await
     };
 
     #[cfg(feature = "otel")]
@@ -697,11 +773,15 @@ fn finish_llm_span(
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
-    for attempt in 1..=retry_count {
-        span.add_event(
-            "llm.retry",
-            vec![KeyValue::new("retry.attempt", i64::from(attempt))],
-        );
+    // Per-retry `llm.retry` events are emitted on the live span by
+    // `call_llm_with_retry` / `call_llm_streaming` so they carry
+    // accurate provider / error context. The retry count is still
+    // surfaced as an attribute here for filterability.
+    if retry_count > 0 {
+        span.set_attribute(attrs::kv_i64(
+            attrs::SDK_LLM_RETRY_ATTEMPT,
+            i64::from(retry_count),
+        ));
     }
 
     match result {
@@ -1332,37 +1412,15 @@ where
             }
         }
         Some(StopReason::ModelContextWindowExceeded) => {
-            warn!("Model context window exceeded (turn={})", ctx.turn);
-            ctx.compaction_retries += 1;
-            if ctx.compaction_retries > super::types::MAX_COMPACTION_RETRIES {
-                return InternalTurnResult::Error(AgentError::new(
-                    format!(
-                        "Context window exceeded after {} compaction retries — giving up",
-                        super::types::MAX_COMPACTION_RETRIES
-                    ),
-                    false,
-                ));
-            }
-            if let Some(compact_config) = compaction_config {
-                if let Err(error) = compact_after_context_overflow(
-                    provider,
-                    compact_config,
-                    compactor,
-                    message_store,
-                    &ctx.thread_id,
-                )
-                .await
-                {
-                    return InternalTurnResult::Error(error);
-                }
-                ctx.turn = ctx.turn.saturating_sub(1);
-                return InternalTurnResult::Continue { turn_usage };
-            }
-
-            InternalTurnResult::Error(AgentError::new(
-                "Model context window exceeded and no compaction configured".to_string(),
-                false,
-            ))
+            handle_context_window_exceeded(
+                ctx,
+                turn_usage,
+                provider,
+                message_store,
+                compaction_config,
+                compactor,
+            )
+            .await
         }
         Some(StopReason::StopSequence) => {
             info!("Stop sequence hit (turn={})", ctx.turn);
@@ -1386,6 +1444,59 @@ where
             }
         }
     }
+}
+
+async fn handle_context_window_exceeded<P, M>(
+    ctx: &mut TurnContext,
+    turn_usage: TokenUsage,
+    provider: &Arc<P>,
+    message_store: &Arc<M>,
+    compaction_config: Option<&CompactionConfig>,
+    compactor: Option<&Arc<dyn ContextCompactor>>,
+) -> InternalTurnResult
+where
+    P: LlmProvider,
+    M: MessageStore,
+{
+    warn!("Model context window exceeded (turn={})", ctx.turn);
+    #[cfg(feature = "otel")]
+    crate::observability::instrument::record_root_event(
+        "agent.context_window_exceeded",
+        vec![crate::observability::attrs::kv_i64(
+            crate::observability::attrs::SDK_TURN_NUMBER,
+            i64::try_from(ctx.turn).unwrap_or(0),
+        )],
+    );
+    ctx.compaction_retries += 1;
+    if ctx.compaction_retries > super::types::MAX_COMPACTION_RETRIES {
+        return InternalTurnResult::Error(AgentError::new(
+            format!(
+                "Context window exceeded after {} compaction retries — giving up",
+                super::types::MAX_COMPACTION_RETRIES
+            ),
+            false,
+        ));
+    }
+    if let Some(compact_config) = compaction_config {
+        if let Err(error) = compact_after_context_overflow(
+            provider,
+            compact_config,
+            compactor,
+            message_store,
+            &ctx.thread_id,
+        )
+        .await
+        {
+            return InternalTurnResult::Error(error);
+        }
+        ctx.turn = ctx.turn.saturating_sub(1);
+        return InternalTurnResult::Continue { turn_usage };
+    }
+
+    InternalTurnResult::Error(AgentError::new(
+        "Model context window exceeded and no compaction configured".to_string(),
+        false,
+    ))
 }
 
 /// Checks if an error message indicates the prompt exceeds the model's context
