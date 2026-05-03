@@ -1003,6 +1003,21 @@ LIMIT 1
             } else {
                 Some(old_parent)
             }
+        } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+            // Phase 7.6 / ENG-8048 M5.4 follow-up: a child-thread
+            // root turn has no `parent_id` but is logically linked
+            // to a parent-thread `Subagent` invocation task via
+            // `state.subagent_invocation.child_root_task_id`. The
+            // in-memory `InMemoryAgentTaskStore` resumes that
+            // invocation here (see `journal::store.rs` —
+            // `resume_linked_subagent_invocation`); without the
+            // mirror call here the SQLite-backed daemon leaves the
+            // invocation stuck in `WaitingOnChildren` after the
+            // child thread completes, which means
+            // `execute_subagent_task` never runs and the parent
+            // thread's `SubagentProgress { completed: true }` event
+            // never fires. UI surfaces stay in `Running` forever.
+            Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?
         } else {
             None
         };
