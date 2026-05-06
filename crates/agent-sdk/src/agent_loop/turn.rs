@@ -401,7 +401,7 @@ fn record_compaction_result(
     result: &StoredCompactionResult,
     trigger: &'static str,
 ) {
-    use crate::observability::{attrs, metrics};
+    use crate::observability::{attrs, metrics, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
@@ -426,12 +426,44 @@ fn record_compaction_result(
     metrics_handle
         .context_compaction
         .add(1, &[KeyValue::new(attrs::SDK_COMPACTION_TRIGGER, trigger)]);
-    let tokens_saved = result.original_tokens.saturating_sub(result.new_tokens);
-    let tokens_saved_u64 = u64::try_from(tokens_saved).unwrap_or(u64::MAX);
-    metrics_handle.context_compaction_tokens_saved.record(
-        tokens_saved_u64,
-        &[KeyValue::new(attrs::SDK_COMPACTION_TRIGGER, trigger)],
-    );
+
+    // `tokens_saved` only makes sense when the compactor actually
+    // shrunk the token count. If it grew (or stayed flat with no
+    // change), recording a zero-value sample would still skew the
+    // histogram and hide a real regression. Per the B3 acceptance
+    // criteria we skip the record and surface the anomaly via a
+    // dedicated span event so we notice the compactor misbehaving.
+    if result.new_tokens > result.original_tokens {
+        spans::add_event(
+            span,
+            "compaction.expanded_unexpectedly",
+            vec![
+                attrs::kv_i64(
+                    attrs::SDK_COMPACTION_ORIGINAL_TOKENS,
+                    i64::try_from(result.original_tokens).unwrap_or(0),
+                ),
+                attrs::kv_i64(
+                    attrs::SDK_COMPACTION_NEW_TOKENS,
+                    i64::try_from(result.new_tokens).unwrap_or(0),
+                ),
+            ],
+        );
+        return;
+    }
+
+    let tokens_saved = result.original_tokens - result.new_tokens;
+    match u64::try_from(tokens_saved) {
+        Ok(tokens_saved_u64) => metrics_handle.context_compaction_tokens_saved.record(
+            tokens_saved_u64,
+            &[KeyValue::new(attrs::SDK_COMPACTION_TRIGGER, trigger)],
+        ),
+        Err(err) => {
+            log::debug!(
+                "skipping agent_sdk.context.compaction.tokens_saved record; \
+                 tokens_saved={tokens_saved} did not fit in u64: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "otel")]
