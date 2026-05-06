@@ -223,6 +223,8 @@ mod tests {
                 provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
                 request_blob: serde_json::json!({"messages": []}),
                 now: t_plus(52),
+                otel_trace_id: None,
+                otel_span_id: None,
             })
             .await?;
 

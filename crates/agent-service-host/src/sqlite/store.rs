@@ -441,7 +441,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms
+       cached_input_tokens, opened_at, closed_at, duration_ms,
+       otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
 ",
@@ -462,7 +463,8 @@ WHERE id = ?1
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms
+       cached_input_tokens, opened_at, closed_at, duration_ms,
+       otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = ?1
 ",
@@ -492,14 +494,17 @@ WHERE id = ?1
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
             .transpose()?;
+        let otel_trace_id = attempt.otel_trace_id.as_deref();
+        let otel_span_id = attempt.otel_span_id.as_deref();
         sqlx::query!(
             r"
 INSERT INTO agent_sdk_turn_attempts (
     id, task_id, attempt_number, provider, requested_model,
     request_blob, response_blob, response_id, response_model,
     stop_reason, outcome, input_tokens, output_tokens,
-    cached_input_tokens, opened_at, closed_at, duration_ms
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+    cached_input_tokens, opened_at, closed_at, duration_ms,
+    otel_trace_id, otel_span_id
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
 ",
             id,
             task_id,
@@ -518,6 +523,8 @@ INSERT INTO agent_sdk_turn_attempts (
             attempt.opened_at,
             attempt.closed_at,
             duration_ms,
+            otel_trace_id,
+            otel_span_id,
         )
         .execute(&mut **tx)
         .await
@@ -541,12 +548,15 @@ INSERT INTO agent_sdk_turn_attempts (
             .duration_ms
             .map(|v| i64::try_from(v).context("duration_ms exceeds i64::MAX"))
             .transpose()?;
+        let otel_trace_id = attempt.otel_trace_id.as_deref();
+        let otel_span_id = attempt.otel_span_id.as_deref();
         let result = sqlx::query!(
             r"
 UPDATE agent_sdk_turn_attempts SET
     response_blob = ?2, response_id = ?3, response_model = ?4,
     stop_reason = ?5, outcome = ?6, input_tokens = ?7, output_tokens = ?8,
-    cached_input_tokens = ?9, closed_at = ?10, duration_ms = ?11
+    cached_input_tokens = ?9, closed_at = ?10, duration_ms = ?11,
+    otel_trace_id = ?12, otel_span_id = ?13
 WHERE id = ?1
 ",
             id,
@@ -560,6 +570,8 @@ WHERE id = ?1
             cached_input_tokens,
             attempt.closed_at,
             duration_ms,
+            otel_trace_id,
+            otel_span_id,
         )
         .execute(&mut **tx)
         .await
@@ -2638,7 +2650,8 @@ impl TurnAttemptStore for SqliteDurableStore {
 SELECT id, task_id, attempt_number, provider, requested_model,
        request_blob, response_blob, response_id, response_model,
        stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, opened_at, closed_at, duration_ms
+       cached_input_tokens, opened_at, closed_at, duration_ms,
+       otel_trace_id, otel_span_id
 FROM agent_sdk_turn_attempts WHERE task_id = ?1 ORDER BY attempt_number
 ",
         )
@@ -3625,6 +3638,8 @@ struct TurnAttemptRecord {
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
     duration_ms: Option<i64>,
+    otel_trace_id: Option<String>,
+    otel_span_id: Option<String>,
 }
 
 impl TryFrom<TurnAttemptRecord> for TurnAttempt {
@@ -3666,6 +3681,8 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
                 .duration_ms
                 .map(|v| u64_from_i64(v, "turn attempt duration_ms"))
                 .transpose()?,
+            otel_trace_id: r.otel_trace_id,
+            otel_span_id: r.otel_span_id,
         };
         attempt
             .validate()
@@ -4863,6 +4880,8 @@ mod tests {
                 provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
                 request_blob: serde_json::json!({"messages": []}),
                 now: t_plus(2),
+                otel_trace_id: None,
+                otel_span_id: None,
             },
         )
         .await?;

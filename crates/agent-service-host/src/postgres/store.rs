@@ -459,7 +459,9 @@ SELECT
     cached_input_tokens,
     opened_at,
     closed_at,
-    duration_ms
+    duration_ms,
+    otel_trace_id,
+    otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = $1
 FOR UPDATE
@@ -493,7 +495,9 @@ SELECT
     cached_input_tokens,
     opened_at,
     closed_at,
-    duration_ms
+    duration_ms,
+    otel_trace_id,
+    otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = $1
 ",
@@ -528,10 +532,12 @@ INSERT INTO agent_sdk_turn_attempts (
     cached_input_tokens,
     opened_at,
     closed_at,
-    duration_ms
+    duration_ms,
+    otel_trace_id,
+    otel_span_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-    $10, $11, $12, $13, $14, $15, $16, $17
+    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
 )
 ",
             attempt.id.as_str(),
@@ -551,6 +557,8 @@ INSERT INTO agent_sdk_turn_attempts (
             attempt.opened_at,
             attempt.closed_at,
             optional_u64_to_i64(attempt.duration_ms, "attempt duration_ms")?,
+            attempt.otel_trace_id.clone(),
+            attempt.otel_span_id.clone(),
         )
         .execute(&mut **tx)
         .await
@@ -581,7 +589,9 @@ SET
     cached_input_tokens = $14,
     opened_at = $15,
     closed_at = $16,
-    duration_ms = $17
+    duration_ms = $17,
+    otel_trace_id = $18,
+    otel_span_id = $19
 WHERE id = $1
 ",
             attempt.id.as_str(),
@@ -601,6 +611,8 @@ WHERE id = $1
             attempt.opened_at,
             attempt.closed_at,
             optional_u64_to_i64(attempt.duration_ms, "attempt duration_ms")?,
+            attempt.otel_trace_id.clone(),
+            attempt.otel_span_id.clone(),
         )
         .execute(&mut **tx)
         .await
@@ -3011,7 +3023,9 @@ SELECT
     cached_input_tokens,
     opened_at,
     closed_at,
-    duration_ms
+    duration_ms,
+    otel_trace_id,
+    otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE task_id = $1
 ORDER BY attempt_number
@@ -4385,6 +4399,8 @@ struct TurnAttemptRecord {
     opened_at: OffsetDateTime,
     closed_at: Option<OffsetDateTime>,
     duration_ms: Option<i64>,
+    otel_trace_id: Option<String>,
+    otel_span_id: Option<String>,
 }
 
 impl TryFrom<TurnAttemptRecord> for TurnAttempt {
@@ -4427,6 +4443,8 @@ impl TryFrom<TurnAttemptRecord> for TurnAttempt {
                 .duration_ms
                 .map(|value| u64_from_i64(value, "turn attempt duration_ms"))
                 .transpose()?,
+            otel_trace_id: record.otel_trace_id,
+            otel_span_id: record.otel_span_id,
         };
         attempt
             .validate()
@@ -4739,6 +4757,8 @@ mod tests {
             provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
             request_blob: serde_json::json!({"messages": []}),
             now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
         }
     }
 

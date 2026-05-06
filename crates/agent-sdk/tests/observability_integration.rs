@@ -2535,3 +2535,239 @@ mod metrics {
         Ok(())
     }
 }
+
+// ── Span links (A7) ─────────────────────────────────────────────────
+
+use agent_sdk::EventStore;
+use agent_sdk::observability::spans;
+use agent_sdk::subagent::{SubagentConfig, SubagentTool};
+use opentelemetry::trace::{Span, SpanId as OtelSpanId, TraceContextExt, TraceId as OtelTraceId};
+
+/// `Clone`-able LLM provider used by the subagent link test.
+///
+/// The subagent tool requires `LlmProvider: Clone` because it
+/// instantiates a fresh `AgentLoop` per invocation; the main
+/// `TestProvider` in this file deliberately is not `Clone` so it can
+/// drain its scripted responses across calls. This wrapper hosts a
+/// minimal scripted provider for the link test alone.
+#[derive(Clone)]
+struct CloneableTestProvider {
+    responses: Arc<Mutex<Vec<ChatOutcome>>>,
+}
+
+impl CloneableTestProvider {
+    fn new(responses: Vec<ChatOutcome>) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(responses)),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CloneableTestProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        let mut responses = self.responses.lock().await;
+        if responses.is_empty() {
+            Ok(ChatOutcome::Success(ChatResponse {
+                id: "resp_default".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "default".to_string(),
+                }],
+                model: "test-model".to_string(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }))
+        } else {
+            Ok(responses.remove(0))
+        }
+    }
+
+    fn model(&self) -> &'static str {
+        "test-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "anthropic"
+    }
+}
+
+#[tokio::test]
+async fn link_to_replay_origin_attaches_attributes() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    // Reference values used by the OTel docs in
+    // https://www.w3.org/TR/trace-context/#examples-of-http-traceparent-headers.
+    let original_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let original_span = "00f067aa0ba902b7";
+
+    let mut span = spans::start_internal_span("agent.replay_test", vec![]);
+    spans::link_to_replay_origin(&mut span, original_trace, original_span, 2);
+    span.end();
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let target = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "agent.replay_test")
+        .context("missing agent.replay_test span")?;
+    assert_eq!(
+        target.links.links.len(),
+        1,
+        "expected exactly one replay link",
+    );
+    let link = target
+        .links
+        .links
+        .first()
+        .context("missing first replay link")?;
+    let expected_trace_id =
+        OtelTraceId::from_hex(original_trace).context("parse original trace id hex")?;
+    let expected_span_id =
+        OtelSpanId::from_hex(original_span).context("parse original span id hex")?;
+    assert_eq!(link.span_context.trace_id(), expected_trace_id);
+    assert_eq!(link.span_context.span_id(), expected_span_id);
+
+    let attrs: std::collections::HashMap<String, String> = link
+        .attributes
+        .iter()
+        .map(|kv| (kv.key.to_string(), format!("{}", kv.value)))
+        .collect();
+    assert_eq!(
+        attrs
+            .get(attrs::AGENT_REPLAY_ORIGINAL_TRACE_ID)
+            .map(String::as_str),
+        Some(original_trace),
+    );
+    assert_eq!(
+        attrs
+            .get(attrs::AGENT_REPLAY_ORIGINAL_SPAN_ID)
+            .map(String::as_str),
+        Some(original_span),
+    );
+    assert_eq!(
+        attrs
+            .get(attrs::AGENT_REPLAY_ATTEMPT_INDEX)
+            .map(String::as_str),
+        Some("2"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_to_replay_origin_drops_malformed_ids() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    let mut span = spans::start_internal_span("agent.replay_malformed", vec![]);
+    // "ZZZZ" is not valid hex. The helper must silently drop the link
+    // rather than panic.
+    spans::link_to_replay_origin(&mut span, "ZZZZ", "ZZZZ", 1);
+    span.end();
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let target = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "agent.replay_malformed")
+        .context("missing agent.replay_malformed span")?;
+    assert!(
+        target.links.links.is_empty(),
+        "expected no links on malformed input, got {} links",
+        target.links.links.len(),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn subagent_invoke_agent_links_to_parent_turn() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (tp, exporter) = setup_tracer();
+
+    // 1. Build a parent span manually; the subagent emit captures
+    //    `Context::current().span().span_context()` so we just need a
+    //    real span to be active when the subagent's emit hook runs.
+    let parent = spans::start_internal_span("invoke_agent_parent_test", vec![]);
+    let parent_trace_id = parent.span_context().trace_id();
+    let parent_span_id = parent.span_context().span_id();
+    let cx = OtelContext::current_with_span(parent);
+
+    // 2. Run the subagent under the parent context. The subagent
+    //    internally calls `Context::current().span().span_context()`
+    //    to capture the parent.
+    let provider = Arc::new(CloneableTestProvider::new(vec![ChatOutcome::Success(
+        ChatResponse {
+            id: "resp_subagent".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Subagent done".to_string(),
+            }],
+            model: "test-model".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 10,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        },
+    )]));
+    let tools = Arc::new(ToolRegistry::<()>::new());
+    let event_store_factory = || -> Arc<dyn EventStore> { Arc::new(InMemoryEventStore::new()) };
+    let subagent = SubagentTool::new(
+        SubagentConfig::new("worker"),
+        provider,
+        tools,
+        event_store_factory,
+    );
+
+    let parent_ctx_for_run = ToolContext::new(());
+    let attached = cx.attach();
+    let result = <SubagentTool<CloneableTestProvider> as Tool<()>>::execute(
+        &subagent,
+        &parent_ctx_for_run,
+        json!({ "task": "Inspect the repo" }),
+    )
+    .await?;
+    drop(attached);
+    assert!(result.success, "subagent should succeed");
+
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    // 3. Find the synthetic subagent invoke_agent span.
+    let spans = get_spans(&exporter)?;
+    let subagent_span = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "invoke_agent"
+                && get_attr(span, attrs::GEN_AI_AGENT_NAME).as_deref() == Some("worker")
+        })
+        .with_context(|| "missing subagent invoke_agent span".to_string())?;
+
+    assert_eq!(
+        subagent_span.links.links.len(),
+        1,
+        "expected exactly one parent-turn link on subagent span",
+    );
+    let link = subagent_span
+        .links
+        .links
+        .first()
+        .with_context(|| "missing parent-turn link".to_string())?;
+    assert_eq!(link.span_context.trace_id(), parent_trace_id);
+    assert_eq!(link.span_context.span_id(), parent_span_id);
+    // `link_to_parent_turn` doesn't carry attributes — the relationship
+    // is implicit in the linked SpanContext.
+    assert!(link.attributes.is_empty());
+
+    Ok(())
+}
