@@ -127,11 +127,11 @@ crates/
 * **Common package metadata** (`edition`, `license`, `repository`) is shared
   through `[workspace.package]` and inherited with `field.workspace = true`.
 
-## sdk/v2 Rewrite Workflow
+## Branch Workflow
 
-All rewrite work targets the **`sdk/v2`** branch.
+All work targets the **`main`** branch.
 
-* Base branch for every rewrite PR: **`sdk/v2`**
+* Base branch for every PR: **`main`**
 * New crates go under `crates/`
 * The workspace root `Cargo.toml` is a virtual manifest — no `[package]` section
 

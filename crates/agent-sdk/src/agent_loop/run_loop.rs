@@ -954,6 +954,7 @@ fn build_turn_context(
     total_usage: TokenUsage,
     state: AgentState,
     start_time: Instant,
+    #[cfg(feature = "otel")] input_kind: &'static str,
 ) -> TurnContext {
     TurnContext {
         thread_id: thread_id.clone(),
@@ -966,6 +967,8 @@ fn build_turn_context(
         response_id: None,
         stop_reason: None,
         tool_call_count: 0,
+        #[cfg(feature = "otel")]
+        input_kind,
     }
 }
 
@@ -1782,6 +1785,8 @@ where
     let provenance =
         agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
+    #[cfg(feature = "otel")]
+    let input_kind = crate::observability::attrs::input_kind_str(&input);
     let init_state = match initialize_run_loop_state(
         input,
         &thread_id,
@@ -1833,7 +1838,15 @@ where
         }
     }
 
-    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
+    let mut ctx = build_turn_context(
+        &thread_id,
+        turn,
+        total_usage,
+        state,
+        start_time,
+        #[cfg(feature = "otel")]
+        input_kind,
+    );
 
     let default_turn_options = TurnOptions::default();
 
@@ -2021,6 +2034,8 @@ where
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
+    #[cfg(feature = "otel")]
+    let input_kind = crate::observability::attrs::input_kind_str(&input);
     let init_state = match initialize_single_turn_state(
         input,
         &thread_id,
@@ -2094,6 +2109,8 @@ where
         state,
         start_time,
         #[cfg(feature = "otel")]
+        input_kind,
+        #[cfg(feature = "otel")]
         observability_store,
     })
     .await
@@ -2127,6 +2144,8 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     state: AgentState,
     start_time: Instant,
     #[cfg(feature = "otel")]
+    input_kind: &'static str,
+    #[cfg(feature = "otel")]
     observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
 
@@ -2153,6 +2172,8 @@ async fn run_single_turn_execute<Ctx, P, H, M, S>(
         state,
         start_time,
         #[cfg(feature = "otel")]
+        input_kind,
+        #[cfg(feature = "otel")]
         observability_store,
     }: SingleTurnExecuteParams<Ctx, P, H, M, S>,
 ) -> TurnOutcome
@@ -2163,7 +2184,15 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    let mut ctx = build_turn_context(&thread_id, turn, total_usage, state, start_time);
+    let mut ctx = build_turn_context(
+        &thread_id,
+        turn,
+        total_usage,
+        state,
+        start_time,
+        #[cfg(feature = "otel")]
+        input_kind,
+    );
 
     let current_turn = ctx.turn.saturating_add(1);
     let turn_tool_context = tool_context.clone().with_event_store(

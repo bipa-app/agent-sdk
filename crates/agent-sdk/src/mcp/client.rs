@@ -84,6 +84,8 @@ impl<T: McpTransport> McpClient<T> {
     /// Returns an error if the server rejects initialization.
     pub async fn initialize(&mut self) -> Result<&InitializeResult> {
         #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
         let mut span = {
             use crate::observability::langfuse;
             let mut span = start_mcp_span("mcp.initialize", &self.server_name);
@@ -94,7 +96,13 @@ impl<T: McpTransport> McpClient<T> {
         let result = self.initialize_inner().await;
 
         #[cfg(feature = "otel")]
-        finish_mcp_span(&mut span, &result);
+        finish_mcp_span(
+            &mut span,
+            &result,
+            "initialize",
+            &self.server_name,
+            started_at,
+        );
 
         result?;
 
@@ -151,6 +159,8 @@ impl<T: McpTransport> McpClient<T> {
     /// Returns an error if the request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDefinition>> {
         #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
         let mut span = {
             use crate::observability::langfuse;
             let mut span = start_mcp_span("mcp.tools/list", &self.server_name);
@@ -170,7 +180,13 @@ impl<T: McpTransport> McpClient<T> {
                     i64::try_from(tools.len()).unwrap_or(0),
                 ));
             }
-            finish_mcp_span(&mut span, &result);
+            finish_mcp_span(
+                &mut span,
+                &result,
+                "tools/list",
+                &self.server_name,
+                started_at,
+            );
         }
 
         result
@@ -203,6 +219,8 @@ impl<T: McpTransport> McpClient<T> {
     /// Returns an error if the tool call fails.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpToolCallResult> {
         #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
         let mut span = {
             use crate::observability::langfuse;
             use opentelemetry::KeyValue;
@@ -220,7 +238,13 @@ impl<T: McpTransport> McpClient<T> {
         let result = self.call_tool_inner(name, arguments).await;
 
         #[cfg(feature = "otel")]
-        finish_mcp_call_tool_span(&mut span, &result);
+        finish_mcp_call_tool_span(
+            &mut span,
+            &result,
+            "tools/call",
+            &self.server_name,
+            started_at,
+        );
 
         result
     }
@@ -302,13 +326,32 @@ fn start_mcp_span_with_attrs(
 }
 
 #[cfg(feature = "otel")]
-fn finish_mcp_span<T>(span: &mut opentelemetry::global::BoxedSpan, result: &Result<T>) {
-    use crate::observability::spans;
+fn finish_mcp_span<T>(
+    span: &mut opentelemetry::global::BoxedSpan,
+    result: &Result<T>,
+    method: &'static str,
+    server_name: &str,
+    started_at: std::time::Instant,
+) {
+    use crate::observability::{metrics, spans};
+    use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
+    let mut metric_attrs = vec![
+        KeyValue::new("mcp.method", method),
+        KeyValue::new("mcp.server.name", server_name.to_string()),
+    ];
     if let Err(err) = result {
         spans::set_span_error(span, "mcp_error", &format!("{err}"));
+        metric_attrs.push(KeyValue::new(
+            crate::observability::attrs::ERROR_TYPE,
+            "mcp_error",
+        ));
     }
+    let elapsed_secs = started_at.elapsed().as_secs_f64();
+    metrics::Metrics::global()
+        .mcp_requests_duration
+        .record(elapsed_secs, &metric_attrs);
     span.end();
 }
 
@@ -316,11 +359,19 @@ fn finish_mcp_span<T>(span: &mut opentelemetry::global::BoxedSpan, result: &Resu
 fn finish_mcp_call_tool_span(
     span: &mut opentelemetry::global::BoxedSpan,
     result: &Result<super::protocol::McpToolCallResult>,
+    method: &'static str,
+    server_name: &str,
+    started_at: std::time::Instant,
 ) {
-    use crate::observability::spans;
+    use crate::observability::{metrics, spans};
+    use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
-    match result {
+    let mut metric_attrs = vec![
+        KeyValue::new("mcp.method", method),
+        KeyValue::new("mcp.server.name", server_name.to_string()),
+    ];
+    let error_kind: Option<&'static str> = match result {
         Ok(tool_result) if tool_result.is_error => {
             let error_text = tool_result
                 .content
@@ -331,12 +382,21 @@ fn finish_mcp_call_tool_span(
                 })
                 .unwrap_or("MCP tool returned error");
             spans::set_span_error(span, "tool_error", error_text);
+            Some("tool_error")
         }
         Err(err) => {
             spans::set_span_error(span, "mcp_error", &format!("{err}"));
+            Some("mcp_error")
         }
-        Ok(_) => {}
+        Ok(_) => None,
+    };
+    if let Some(kind) = error_kind {
+        metric_attrs.push(KeyValue::new(crate::observability::attrs::ERROR_TYPE, kind));
     }
+    let elapsed_secs = started_at.elapsed().as_secs_f64();
+    metrics::Metrics::global()
+        .mcp_requests_duration
+        .record(elapsed_secs, &metric_attrs);
     span.end();
 }
 

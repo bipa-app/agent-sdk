@@ -358,7 +358,7 @@ where
     };
 
     #[cfg(feature = "otel")]
-    record_compaction_result(&mut compaction_span, &stored_result);
+    record_compaction_result(&mut compaction_span, &stored_result, trigger);
 
     if let Err(error) = message_store
         .replace_history(thread_id, stored_result.messages.clone())
@@ -399,8 +399,10 @@ fn start_compaction_span(trigger: &'static str) -> opentelemetry::global::BoxedS
 fn record_compaction_result(
     span: &mut opentelemetry::global::BoxedSpan,
     result: &StoredCompactionResult,
+    trigger: &'static str,
 ) {
-    use crate::observability::attrs;
+    use crate::observability::{attrs, metrics};
+    use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
     span.set_attribute(attrs::kv_i64(
@@ -419,6 +421,17 @@ fn record_compaction_result(
         attrs::SDK_COMPACTION_NEW_TOKENS,
         i64::try_from(result.new_tokens).unwrap_or(0),
     ));
+
+    let metrics_handle = metrics::Metrics::global();
+    metrics_handle
+        .context_compaction
+        .add(1, &[KeyValue::new(attrs::SDK_COMPACTION_TRIGGER, trigger)]);
+    let tokens_saved = result.original_tokens.saturating_sub(result.new_tokens);
+    let tokens_saved_u64 = u64::try_from(tokens_saved).unwrap_or(u64::MAX);
+    metrics_handle.context_compaction_tokens_saved.record(
+        tokens_saved_u64,
+        &[KeyValue::new(attrs::SDK_COMPACTION_TRIGGER, trigger)],
+    );
 }
 
 #[cfg(feature = "otel")]
@@ -620,36 +633,17 @@ where
     };
 
     #[cfg(feature = "otel")]
-    let mut llm_span = {
-        use crate::observability::{attrs, baggage, langfuse, spans};
-        use opentelemetry::KeyValue;
-
-        let span_name = format!("chat {}", provider.model());
-        let provider_name = crate::observability::provider_name::normalize(provider.provider());
-        let mut init_attrs = vec![
-            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
-            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
-            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, provider.model().to_string()),
-            attrs::kv_bool(attrs::SDK_LLM_STREAMING, config.streaming),
-            KeyValue::new(attrs::SDK_PROVIDER_ID, provider.provider()),
-        ];
-        if let Some(max_tokens) = config.max_tokens {
-            init_attrs.push(attrs::kv_i64(
-                attrs::GEN_AI_REQUEST_MAX_OUTPUT_TOKENS,
-                i64::from(max_tokens),
-            ));
-        }
-        let mut span = spans::start_client_span(span_name, init_attrs);
-        baggage::copy_baggage_to_active_span(&mut span);
-        langfuse::tag_observation(&mut span, langfuse::ObservationType::Generation);
-        span
-    };
+    let mut llm_span = build_llm_span(provider.as_ref(), config);
 
     #[cfg(feature = "otel")]
     let request_for_capture = observability_store.map(|_| request.clone());
     #[cfg(feature = "otel")]
     let provider_name_for_observer =
         crate::observability::provider_name::normalize(provider.provider());
+    #[cfg(feature = "otel")]
+    let request_model_for_metrics = provider.model().to_string();
+    #[cfg(feature = "otel")]
+    let llm_started_at = std::time::Instant::now();
 
     let (result, retry_count) = if config.streaming {
         call_llm_streaming(
@@ -702,13 +696,54 @@ where
     }
 
     #[cfg(feature = "otel")]
-    finish_llm_span(&mut llm_span, &result, retry_count);
+    finish_llm_span(FinishLlmSpanParams {
+        span: &mut llm_span,
+        result: &result,
+        retry_count,
+        llm_started_at,
+        provider_name: provider_name_for_observer,
+        request_model: &request_model_for_metrics,
+    });
 
     // Silence unused binding when otel is disabled.
     let _ = retry_count;
     let _ = thread_id;
 
     result
+}
+
+/// Build the per-call `chat <model>` span with the
+/// `gen_ai` semconv attributes the SDK has decided so far.
+///
+/// Extracted from [`request_llm_response`] so the request function
+/// stays under the clippy `too_many_lines` threshold.
+#[cfg(feature = "otel")]
+fn build_llm_span<P>(provider: &P, config: &AgentConfig) -> opentelemetry::global::BoxedSpan
+where
+    P: LlmProvider,
+{
+    use crate::observability::{attrs, baggage, langfuse, spans};
+    use opentelemetry::KeyValue;
+
+    let span_name = format!("chat {}", provider.model());
+    let provider_name = crate::observability::provider_name::normalize(provider.provider());
+    let mut init_attrs = vec![
+        KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+        KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, provider.model().to_string()),
+        attrs::kv_bool(attrs::SDK_LLM_STREAMING, config.streaming),
+        KeyValue::new(attrs::SDK_PROVIDER_ID, provider.provider()),
+    ];
+    if let Some(max_tokens) = config.max_tokens {
+        init_attrs.push(attrs::kv_i64(
+            attrs::GEN_AI_REQUEST_MAX_OUTPUT_TOKENS,
+            i64::from(max_tokens),
+        ));
+    }
+    let mut span = spans::start_client_span(span_name, init_attrs);
+    baggage::copy_baggage_to_active_span(&mut span);
+    langfuse::tag_observation(&mut span, langfuse::ObservationType::Generation);
+    span
 }
 
 #[cfg(feature = "otel")]
@@ -764,14 +799,34 @@ async fn capture_llm_payloads<P>(
 }
 
 #[cfg(feature = "otel")]
-fn finish_llm_span(
-    span: &mut opentelemetry::global::BoxedSpan,
-    result: &Result<ChatResponse, AgentError>,
+struct FinishLlmSpanParams<'a> {
+    span: &'a mut opentelemetry::global::BoxedSpan,
+    result: &'a Result<ChatResponse, AgentError>,
     retry_count: u32,
-) {
-    use crate::observability::{attrs, spans};
-    use opentelemetry::KeyValue;
+    /// Wall-clock instant at which the SDK called the provider. Used
+    /// to record `gen_ai.client.operation.duration`.
+    llm_started_at: std::time::Instant,
+    /// Normalized provider name, e.g. `anthropic`, `gcp.gemini`.
+    provider_name: &'static str,
+    /// `gen_ai.request.model` — the model the SDK *asked* for, before
+    /// any redirect the provider may have done. Captured before the
+    /// call because the response model can differ.
+    request_model: &'a str,
+}
+
+#[cfg(feature = "otel")]
+fn finish_llm_span(params: FinishLlmSpanParams<'_>) {
+    use crate::observability::{attrs, metrics};
     use opentelemetry::trace::Span;
+
+    let FinishLlmSpanParams {
+        span,
+        result,
+        retry_count,
+        llm_started_at,
+        provider_name,
+        request_model,
+    } = params;
 
     // Per-retry `llm.retry` events are emitted on the live span by
     // `call_llm_with_retry` / `call_llm_streaming` so they carry
@@ -784,69 +839,186 @@ fn finish_llm_span(
         ));
     }
 
+    let metrics_handle = metrics::Metrics::global();
+    let elapsed_secs = llm_started_at.elapsed().as_secs_f64();
+
     match result {
-        Ok(response) => {
-            if !response.id.is_empty() {
-                span.set_attribute(KeyValue::new(
-                    attrs::GEN_AI_RESPONSE_ID,
-                    response.id.clone(),
-                ));
-            }
-            span.set_attribute(KeyValue::new(
-                attrs::GEN_AI_RESPONSE_MODEL,
-                response.model.clone(),
-            ));
-            if let Some(reason) = response.stop_reason {
-                span.set_attribute(KeyValue::new(
-                    attrs::GEN_AI_RESPONSE_FINISH_REASONS,
-                    attrs::finish_reason_str(reason),
-                ));
-            }
-            span.set_attribute(attrs::kv_i64(
-                attrs::GEN_AI_USAGE_INPUT_TOKENS,
-                i64::from(response.usage.input_tokens),
-            ));
-            span.set_attribute(attrs::kv_i64(
-                attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
-                i64::from(response.usage.output_tokens),
-            ));
-            span.set_attribute(attrs::kv_i64(
-                attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-                i64::from(response.usage.cached_input_tokens),
-            ));
-            span.set_attribute(attrs::kv_i64(
-                attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-                i64::from(response.usage.cache_creation_input_tokens),
-            ));
-            span.set_attribute(attrs::kv_bool(
-                attrs::SDK_LLM_HAD_TOOL_CALLS,
-                response.has_tool_use(),
-            ));
-            span.set_attribute(attrs::kv_bool(
-                attrs::SDK_LLM_TEXT_OUTPUT_PRESENT,
-                response.first_text().is_some(),
-            ));
-            span.set_attribute(attrs::kv_bool(
-                attrs::SDK_LLM_THINKING_PRESENT,
-                response.first_thinking().is_some(),
-            ));
-        }
-        Err(err) => {
-            let error_type = if err.message.contains("Rate limited") {
-                "rate_limited"
-            } else if err.message.contains("Invalid request") {
-                "invalid_request"
-            } else if err.message.contains("Server error") {
-                "server_error"
-            } else if err.message.contains("Stream") {
-                "stream_error"
-            } else {
-                "_OTHER"
-            };
-            spans::set_span_error(span, error_type, &err.message);
-        }
+        Ok(response) => stamp_llm_success(
+            span,
+            response,
+            &metrics_handle,
+            elapsed_secs,
+            provider_name,
+            request_model,
+        ),
+        Err(err) => stamp_llm_error(
+            span,
+            err,
+            &metrics_handle,
+            elapsed_secs,
+            provider_name,
+            request_model,
+        ),
     }
     span.end();
+}
+
+/// Stamp a successful `chat` response onto the span and record its
+/// duration + per-token-type usage on the `OTel` `gen_ai.client.*`
+/// histograms. Called from [`finish_llm_span`] only.
+#[cfg(feature = "otel")]
+fn stamp_llm_success(
+    span: &mut opentelemetry::global::BoxedSpan,
+    response: &ChatResponse,
+    metrics_handle: &crate::observability::metrics::Metrics,
+    elapsed_secs: f64,
+    provider_name: &'static str,
+    request_model: &str,
+) {
+    use crate::observability::attrs;
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::Span;
+
+    if !response.id.is_empty() {
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_RESPONSE_ID,
+            response.id.clone(),
+        ));
+    }
+    span.set_attribute(KeyValue::new(
+        attrs::GEN_AI_RESPONSE_MODEL,
+        response.model.clone(),
+    ));
+    if let Some(reason) = response.stop_reason {
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_RESPONSE_FINISH_REASONS,
+            attrs::finish_reason_str(reason),
+        ));
+    }
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_INPUT_TOKENS,
+        i64::from(response.usage.input_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+        i64::from(response.usage.output_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        i64::from(response.usage.cached_input_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        i64::from(response.usage.cache_creation_input_tokens),
+    ));
+    span.set_attribute(attrs::kv_bool(
+        attrs::SDK_LLM_HAD_TOOL_CALLS,
+        response.has_tool_use(),
+    ));
+    span.set_attribute(attrs::kv_bool(
+        attrs::SDK_LLM_TEXT_OUTPUT_PRESENT,
+        response.first_text().is_some(),
+    ));
+    span.set_attribute(attrs::kv_bool(
+        attrs::SDK_LLM_THINKING_PRESENT,
+        response.first_thinking().is_some(),
+    ));
+
+    record_chat_token_usage(metrics_handle, response, provider_name, request_model);
+    metrics_handle.operation_duration.record(
+        elapsed_secs,
+        &[
+            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
+            KeyValue::new(attrs::GEN_AI_RESPONSE_MODEL, response.model.clone()),
+        ],
+    );
+}
+
+/// Stamp an LLM error onto the span and record its duration with the
+/// `error.type` label populated. Called from [`finish_llm_span`] only.
+#[cfg(feature = "otel")]
+fn stamp_llm_error(
+    span: &mut opentelemetry::global::BoxedSpan,
+    err: &AgentError,
+    metrics_handle: &crate::observability::metrics::Metrics,
+    elapsed_secs: f64,
+    provider_name: &'static str,
+    request_model: &str,
+) {
+    use crate::observability::{attrs, spans};
+    use opentelemetry::KeyValue;
+
+    let error_type = classify_llm_error(&err.message);
+    spans::set_span_error(span, error_type, &err.message);
+
+    metrics_handle.operation_duration.record(
+        elapsed_secs,
+        &[
+            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
+            KeyValue::new(attrs::ERROR_TYPE, error_type),
+        ],
+    );
+}
+
+/// Map an `AgentError::message` produced by the LLM call path to the
+/// stable `error.type` attribute value used on both the span and the
+/// `gen_ai.client.operation.duration` histogram.
+#[cfg(feature = "otel")]
+fn classify_llm_error(msg: &str) -> &'static str {
+    if msg.contains("Rate limited") {
+        "rate_limited"
+    } else if msg.contains("Invalid request") {
+        "invalid_request"
+    } else if msg.contains("Server error") {
+        "server_error"
+    } else if msg.contains("Stream") {
+        "stream_error"
+    } else {
+        "_OTHER"
+    }
+}
+
+/// Record one `gen_ai.client.token.usage` data point per non-zero
+/// token type. Splitting by type keeps the histogram aggregatable in
+/// Prometheus / Grafana — combining input + output + cache tokens
+/// into a single record would erase the dimension a dashboard cares
+/// about most (cache-hit ratio).
+#[cfg(feature = "otel")]
+fn record_chat_token_usage(
+    metrics: &crate::observability::metrics::Metrics,
+    response: &ChatResponse,
+    provider_name: &'static str,
+    request_model: &str,
+) {
+    use crate::observability::attrs;
+    use opentelemetry::KeyValue;
+
+    let entries: [(u32, &'static str); 4] = [
+        (response.usage.input_tokens, "input"),
+        (response.usage.output_tokens, "output"),
+        (response.usage.cached_input_tokens, "cache_read"),
+        (response.usage.cache_creation_input_tokens, "cache_creation"),
+    ];
+
+    for (count, token_type) in entries {
+        if count == 0 {
+            continue;
+        }
+        metrics.token_usage.record(
+            u64::from(count),
+            &[
+                KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+                KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+                KeyValue::new("gen_ai.token.type", token_type),
+                KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
+                KeyValue::new(attrs::GEN_AI_RESPONSE_MODEL, response.model.clone()),
+            ],
+        );
+    }
 }
 
 pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -> TokenUsage {
@@ -1596,6 +1768,13 @@ where
     let turn_number = ctx.turn + 1; // begin_turn increments
     #[cfg(feature = "otel")]
     let usage_before_turn = ctx.total_usage.clone();
+    #[cfg(feature = "otel")]
+    let turn_started_at = std::time::Instant::now();
+    #[cfg(feature = "otel")]
+    let provider_name_for_turn =
+        crate::observability::provider_name::normalize(provider.provider());
+    #[cfg(feature = "otel")]
+    let turn_input_kind = ctx.input_kind;
 
     let result = execute_turn_inner(ExecuteTurnParameters {
         event_store,
@@ -1620,21 +1799,48 @@ where
     .await;
 
     #[cfg(feature = "otel")]
-    record_turn_span(turn_number, &ctx.total_usage, &usage_before_turn, &result);
+    record_turn_span(&RecordTurnSpanParams {
+        turn_number,
+        total_usage: &ctx.total_usage,
+        usage_before_turn: &usage_before_turn,
+        result: &result,
+        turn_started_at,
+        provider_name: provider_name_for_turn,
+        input_kind: turn_input_kind,
+    });
 
     result
 }
 
 #[cfg(feature = "otel")]
-fn record_turn_span(
+#[derive(Clone, Copy)]
+struct RecordTurnSpanParams<'a> {
     turn_number: usize,
-    total_usage: &TokenUsage,
-    usage_before_turn: &TokenUsage,
-    result: &InternalTurnResult,
-) {
-    use crate::observability::{attrs, baggage, spans};
+    total_usage: &'a TokenUsage,
+    usage_before_turn: &'a TokenUsage,
+    result: &'a InternalTurnResult,
+    /// Start of `execute_turn` (so the histogram excludes wait time
+    /// the agent spent waiting on us upstream).
+    turn_started_at: std::time::Instant,
+    provider_name: &'static str,
+    input_kind: &'static str,
+}
+
+#[cfg(feature = "otel")]
+fn record_turn_span(params: &RecordTurnSpanParams<'_>) {
+    use crate::observability::{attrs, baggage, metrics, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
+
+    let RecordTurnSpanParams {
+        turn_number,
+        total_usage,
+        usage_before_turn,
+        result,
+        turn_started_at,
+        provider_name,
+        input_kind,
+    } = *params;
 
     let turn_usage = token_usage_delta(total_usage, usage_before_turn);
     let mut turn_span = spans::start_internal_span(
@@ -1663,19 +1869,22 @@ fn record_turn_span(
         i64::from(turn_usage.cache_creation_input_tokens),
     ));
 
-    match result {
+    let outcome = match result {
         InternalTurnResult::Continue { turn_usage } => {
             let had_tools = turn_usage.input_tokens > 0 || turn_usage.output_tokens > 0;
             turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "continue"));
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, had_tools));
+            "continue"
         }
         InternalTurnResult::Done => {
             turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "done"));
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            "done"
         }
         InternalTurnResult::Refusal => {
             turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "refusal"));
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            "refusal"
         }
         InternalTurnResult::AwaitingConfirmation { .. } => {
             turn_span.set_attribute(KeyValue::new(
@@ -1683,6 +1892,7 @@ fn record_turn_span(
                 "awaiting_confirmation",
             ));
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, true));
+            "awaiting_confirmation"
         }
         InternalTurnResult::PendingToolCalls { .. } => {
             turn_span.set_attribute(KeyValue::new(
@@ -1690,13 +1900,26 @@ fn record_turn_span(
                 "pending_tool_calls",
             ));
             turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, true));
+            "pending_tool_calls"
         }
         InternalTurnResult::Error(err) => {
             turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "error"));
             spans::set_span_error(&mut turn_span, "turn_error", &err.message);
+            "error"
         }
-    }
+    };
     turn_span.end();
+
+    let elapsed_secs = turn_started_at.elapsed().as_secs_f64();
+    let metrics_handle = metrics::Metrics::global();
+    metrics_handle.turns_duration.record(
+        elapsed_secs,
+        &[
+            KeyValue::new(attrs::SDK_OUTCOME, outcome),
+            KeyValue::new(attrs::SDK_INPUT_KIND, input_kind),
+            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+        ],
+    );
 }
 
 async fn execute_turn_inner<Ctx, P, H, M, S>(
