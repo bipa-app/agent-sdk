@@ -21,18 +21,64 @@ use tokio::time::sleep;
 pub(super) struct LlmSpanObserver<'a> {
     pub(super) span: &'a mut opentelemetry::global::BoxedSpan,
     pub(super) provider_name: &'static str,
+    /// `gen_ai.request.model` — used as a metric label on the
+    /// streaming TTFC / TPOC histograms so dashboards can split the
+    /// distribution by the model the SDK *asked* for. Borrowed from
+    /// the caller-owned `String` that lives for the duration of the
+    /// LLM call so we avoid an extra allocation per chunk.
+    pub(super) request_model: &'a str,
 }
 
 #[cfg(feature = "otel")]
 impl LlmSpanObserver<'_> {
-    fn record_first_chunk(&mut self, turn: usize, streaming: bool) {
-        use crate::observability::{attrs, spans};
+    fn record_first_chunk(&mut self, turn: usize, streaming: bool, ttfc_secs: f64) {
+        use crate::observability::{attrs, metrics, spans};
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::Span;
+
         spans::add_event(
             self.span,
             "llm.stream.first_chunk",
             vec![
                 attrs::kv_i64(attrs::SDK_TURN_NUMBER, i64::try_from(turn).unwrap_or(0)),
                 attrs::kv_bool(attrs::SDK_LLM_STREAMING, streaming),
+            ],
+        );
+        // Stamp TTFC on the span as f64 seconds. Per the GenAI
+        // semconv, this attribute MUST be present on streaming runs
+        // and absent on non-streaming runs; the latter is enforced
+        // because `record_first_chunk` is only ever called from the
+        // streaming path.
+        self.span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
+            ttfc_secs,
+        ));
+
+        let metrics_handle = metrics::Metrics::global();
+        metrics_handle.time_to_first_chunk.record(
+            ttfc_secs,
+            &[
+                KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+                KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, self.provider_name),
+                KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, self.request_model.to_string()),
+            ],
+        );
+    }
+
+    /// Record `gen_ai.client.operation.time_per_output_chunk` for one
+    /// post-first chunk. Pure metric — no span event, no span
+    /// attribute.
+    fn record_subsequent_chunk(&self, tpoc_secs: f64) {
+        use crate::observability::{attrs, metrics};
+        use opentelemetry::KeyValue;
+
+        let metrics_handle = metrics::Metrics::global();
+        metrics_handle.time_per_output_chunk.record(
+            tpoc_secs,
+            &[
+                KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
+                KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, self.provider_name),
+                KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, self.request_model.to_string()),
             ],
         );
     }
@@ -314,6 +360,14 @@ where
     let stream_started_at = std::time::Instant::now();
     #[cfg(feature = "otel")]
     let mut first_chunk_recorded = false;
+    // `last_chunk_at` advances once per *content* delta. The first
+    // content delta initialises it (and emits TTFC); every subsequent
+    // content delta records `now - last_chunk_at` to TPOC.
+    // Sentinel frames (`Usage`, `Done`) are excluded so the
+    // distribution stays meaningful — those are metadata, not output
+    // chunks.
+    #[cfg(feature = "otel")]
+    let mut last_chunk_at: Option<std::time::Instant> = None;
 
     log::debug!("Starting to consume LLM stream");
 
@@ -337,12 +391,28 @@ where
         delta_count += 1;
         accumulator.apply(&delta);
 
+        // The first content delta records TTFC + initialises the
+        // per-chunk clock; every later content delta records TPOC
+        // against the prior tick. A single `Instant::now()` per
+        // content iteration keeps the per-chunk overhead at one
+        // syscall plus three label allocations (the metric labels
+        // themselves).
         #[cfg(feature = "otel")]
-        if !first_chunk_recorded {
-            first_chunk_recorded = true;
-            if let Some(observer) = span_observer.as_mut() {
-                observer.record_first_chunk(event_ctx.turn, true);
+        if is_content_delta(&delta) {
+            let now = std::time::Instant::now();
+            if !first_chunk_recorded {
+                first_chunk_recorded = true;
+                if let Some(observer) = span_observer.as_mut() {
+                    let ttfc_secs = stream_started_at.elapsed().as_secs_f64();
+                    observer.record_first_chunk(event_ctx.turn, true, ttfc_secs);
+                }
+            } else if let Some(prev) = last_chunk_at
+                && let Some(observer) = span_observer.as_ref()
+            {
+                let tpoc_secs = now.duration_since(prev).as_secs_f64();
+                observer.record_subsequent_chunk(tpoc_secs);
             }
+            last_chunk_at = Some(now);
         }
 
         if let Some(stream_err) = dispatch_stream_delta(
@@ -494,6 +564,27 @@ const fn stream_error_kind_attr(kind: crate::llm::StreamErrorKind) -> &'static s
         crate::llm::StreamErrorKind::ServerError => "server_error",
         crate::llm::StreamErrorKind::InvalidRequest => "invalid_request",
     }
+}
+
+/// Whether a [`StreamDelta`] counts as a content chunk for the
+/// `gen_ai.client.operation.time_to_first_chunk` /
+/// `time_per_output_chunk` histograms.
+///
+/// Per the `GenAI` semconv, those histograms measure latency between
+/// **output** chunks: text, thinking, tool-use, tool-input, and
+/// signature deltas. Sentinel frames (`Usage`, `Done`, `Error`) are
+/// metadata and would inflate the per-chunk distribution if counted.
+#[cfg(feature = "otel")]
+const fn is_content_delta(delta: &StreamDelta) -> bool {
+    matches!(
+        delta,
+        StreamDelta::TextDelta { .. }
+            | StreamDelta::ThinkingDelta { .. }
+            | StreamDelta::ToolUseStart { .. }
+            | StreamDelta::ToolInputDelta { .. }
+            | StreamDelta::SignatureDelta { .. }
+            | StreamDelta::RedactedThinking { .. }
+    )
 }
 
 async fn send_llm_error_event<H>(

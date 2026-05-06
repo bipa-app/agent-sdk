@@ -74,15 +74,17 @@ const TOOL_DURATION_BUCKETS_MS: &[f64] = &[
 /// frequent recording (per LLM call, per tool call) can clone the
 /// handle into an async future without re-walking a `Mutex`.
 ///
-/// Streaming TTFC / TPOC instruments are intentionally **not**
-/// declared here. They are added by Track B2 alongside the per-chunk
-/// timing recorder so the bound to the meter provider happens at the
-/// same site as the recorder — declaring them ahead of time would
-/// otherwise produce dead-code warnings until B2 lands.
+/// The streaming TTFC / TPOC histograms live alongside the
+/// non-streaming `operation_duration` because the recorder
+/// (`agent_loop::llm::process_stream`) treats them as paired
+/// instruments — one fires once per stream, the other once per
+/// post-first chunk.
 #[derive(Debug)]
 pub struct Metrics {
     pub(crate) token_usage: Histogram<u64>,
     pub(crate) operation_duration: Histogram<f64>,
+    pub(crate) time_to_first_chunk: Histogram<f64>,
+    pub(crate) time_per_output_chunk: Histogram<f64>,
 
     pub(crate) turns_duration: Histogram<f64>,
     pub(crate) runs_outcome: Counter<u64>,
@@ -155,6 +157,20 @@ impl Metrics {
             .with_description("GenAI operation duration.")
             .with_boundaries(SHORT_DURATION_BUCKETS_S.to_vec())
             .build();
+        let time_to_first_chunk = meter
+            .f64_histogram("gen_ai.client.operation.time_to_first_chunk")
+            .with_unit("s")
+            .with_description("Time to first response chunk for streaming GenAI operations.")
+            .with_boundaries(SHORT_DURATION_BUCKETS_S.to_vec())
+            .build();
+        let time_per_output_chunk = meter
+            .f64_histogram("gen_ai.client.operation.time_per_output_chunk")
+            .with_unit("s")
+            .with_description(
+                "Time per output chunk after the first chunk for streaming GenAI operations.",
+            )
+            .with_boundaries(SHORT_DURATION_BUCKETS_S.to_vec())
+            .build();
 
         let turns_duration = meter
             .f64_histogram("agent_sdk.turns.duration")
@@ -204,6 +220,8 @@ impl Metrics {
         Self {
             token_usage,
             operation_duration,
+            time_to_first_chunk,
+            time_per_output_chunk,
             turns_duration,
             runs_outcome,
             tools_execution_duration,
