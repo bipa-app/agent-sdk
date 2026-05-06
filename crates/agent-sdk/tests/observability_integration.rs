@@ -2490,7 +2490,17 @@ mod metrics {
 
         let store = SharedStore::new();
         let thread_id = ThreadId::new();
-        seed_compaction_history(&store, &thread_id).await?;
+        // Seed the thread with a message large enough that the
+        // compaction summary genuinely shrinks the token count.
+        // A short two-message seed (~16 tokens) is dwarfed by the
+        // compaction prelude + acknowledgment + retained tail
+        // (~50 tokens), which would expand the context rather than
+        // shrink it and trip the new B3 skip-and-event guard.
+        let bulky_user = "Investigate why the dashboard times out under load. ".repeat(40);
+        store.append(&thread_id, Message::user(bulky_user)).await?;
+        store
+            .append(&thread_id, Message::assistant("Acknowledged."))
+            .await?;
 
         let provider = TestProvider::new(vec![
             TestProvider::text_response("Conversation summary"),
@@ -2794,6 +2804,455 @@ mod metrics {
             "TPOC must not fire when no chunks were ever accepted",
         );
 
+        Ok(())
+    }
+
+    // ── Subagent / MCP / retries / compaction-anomaly (B3) ───────────
+
+    use agent_sdk::EventStore as MetricsEventStore;
+    use agent_sdk::context::{CompactionConfig, CompactionResult, ContextCompactor};
+    use agent_sdk::llm::Message;
+    use agent_sdk::mcp::McpClient;
+    use agent_sdk::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
+    use agent_sdk::mcp::transport::McpTransport;
+    use agent_sdk::subagent::{SubagentConfig, SubagentTool};
+
+    /// `Clone`-able provider used by the subagent metrics test. The
+    /// scripted responses run a single subagent turn with a known
+    /// token budget so we can assert the histogram label set.
+    #[derive(Clone)]
+    struct CloneableMetricsProvider {
+        responses: Arc<Mutex<Vec<ChatOutcome>>>,
+    }
+
+    impl CloneableMetricsProvider {
+        fn new(responses: Vec<ChatOutcome>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CloneableMetricsProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                Ok(ChatOutcome::Success(ChatResponse {
+                    id: "resp_default".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "default".to_string(),
+                    }],
+                    model: "test-model".to_string(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Usage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    },
+                }))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        fn model(&self) -> &'static str {
+            "test-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "anthropic"
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_records_subagent_invocation_and_token_usage() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // Single subagent turn: text-only success with 5 input + 10
+        // output tokens. The metrics test asserts the histogram
+        // label set; the exact values matter only for the
+        // > 0 filter applied in `record_subagent_token_usage`.
+        let provider = Arc::new(CloneableMetricsProvider::new(vec![ChatOutcome::Success(
+            ChatResponse {
+                id: "resp_subagent_metric".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Subagent done".to_string(),
+                }],
+                model: "test-model".to_string(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 10,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            },
+        )]));
+        let tools = Arc::new(ToolRegistry::<()>::new());
+        let event_store_factory =
+            || -> Arc<dyn MetricsEventStore> { Arc::new(InMemoryEventStore::new()) };
+        let subagent = SubagentTool::new(
+            SubagentConfig::new("worker"),
+            provider,
+            tools,
+            event_store_factory,
+        );
+
+        let parent_ctx = ToolContext::new(());
+        let result = <SubagentTool<CloneableMetricsProvider> as Tool<()>>::execute(
+            &subagent,
+            &parent_ctx,
+            json!({ "task": "Inspect the repo" }),
+        )
+        .await?;
+        assert!(result.success, "subagent should succeed");
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let invocation_points = collect_counter_attrs(&snapshots, "agent_sdk.subagent.invocations");
+        assert!(
+            invocation_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.agent.name", "worker"),
+                    ("agent_sdk.outcome", "done"),
+                ],
+            )),
+            "missing subagent.invocations done record: {invocation_points:?}"
+        );
+
+        // The subagent token-usage record must land on the shared
+        // `gen_ai.client.token.usage` histogram with
+        // `gen_ai.operation.name=invoke_agent` so dashboards can
+        // tell delegated tokens apart from parent-turn `chat` tokens.
+        let token_points = collect_histogram_attrs(&snapshots, "gen_ai.client.token.usage");
+        assert!(
+            token_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "invoke_agent"),
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("gen_ai.token.type", "input"),
+                    ("gen_ai.request.model", "test-model"),
+                ],
+            )),
+            "missing subagent input-token data point: {token_points:?}"
+        );
+        assert!(
+            token_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "invoke_agent"),
+                    ("gen_ai.token.type", "output"),
+                ],
+            )),
+            "missing subagent output-token data point: {token_points:?}"
+        );
+        // No-double-counting guard: the only `chat` records should
+        // be those produced *inside* the subagent's own turn (which
+        // also use `gen_ai.operation.name=chat`). The synthetic
+        // subagent emit must not re-record under `chat` — so any
+        // `chat` record should NOT carry the subagent's
+        // `gen_ai.agent.name` label, because the chat call site
+        // doesn't set it.
+        for point in &token_points {
+            if has_label(point, "gen_ai.operation.name", "chat") {
+                assert!(
+                    !has_label(point, "gen_ai.agent.name", "worker"),
+                    "chat token-usage record must not carry subagent agent name: {point:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Stub MCP transport that yields scripted JSON-RPC responses. The
+    /// test asserts that recording happens on both the `tools/list` and
+    /// `tools/call` paths and that an erroring tool call surfaces as
+    /// `error.type=tool_error` on the metric.
+    struct ScriptedMcpTransport {
+        responses: Mutex<Vec<JsonRpcResponse>>,
+    }
+
+    impl ScriptedMcpTransport {
+        fn new(responses: Vec<JsonRpcResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for ScriptedMcpTransport {
+        async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let next = {
+                let mut responses = self.responses.lock().await;
+                responses
+                    .pop()
+                    .ok_or_else(|| anyhow!("ScriptedMcpTransport ran out of responses"))?
+            };
+            Ok(JsonRpcResponse {
+                id: request.id,
+                ..next
+            })
+        }
+
+        async fn send_notification(&self, _request: JsonRpcRequest) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_records_mcp_request_duration() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // Responses are popped (LIFO) so list order: tools/list first,
+        // then a successful tool call, then a failing tool call.
+        let transport = Arc::new(ScriptedMcpTransport::new(vec![
+            // call_tool failing path (popped third)
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: Some(json!({
+                    "content": [{"type": "text", "text": "boom"}],
+                    "isError": true,
+                })),
+                error: None,
+                id: RequestId::Number(0),
+            },
+            // call_tool success path (popped second)
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: Some(json!({
+                    "content": [{"type": "text", "text": "ok"}],
+                    "isError": false,
+                })),
+                error: None,
+                id: RequestId::Number(0),
+            },
+            // tools/list (popped first)
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: Some(json!({ "tools": [] })),
+                error: None,
+                id: RequestId::Number(0),
+            },
+        ]));
+
+        let client = McpClient::new_uninitialized(transport, "metrics-test-server".to_string());
+        let _list = client.list_tools().await?;
+        let _ok = client.call_tool("ok-tool", json!({})).await?;
+        let err = client.call_tool("err-tool", json!({})).await?;
+        assert!(err.is_error, "scripted error response should propagate");
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let mcp_points = collect_histogram_attrs(&snapshots, "agent_sdk.mcp.requests.duration");
+        assert!(
+            mcp_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("mcp.method", "tools/list"),
+                    ("mcp.server.name", "metrics-test-server"),
+                ],
+            )),
+            "missing mcp.requests.duration tools/list record: {mcp_points:?}"
+        );
+        assert!(
+            mcp_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("mcp.method", "tools/call"),
+                    ("mcp.server.name", "metrics-test-server"),
+                    ("error.type", "tool_error"),
+                ],
+            )),
+            "missing mcp.requests.duration tools/call error record: {mcp_points:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_records_llm_retries_with_provider_and_error_type() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // First chat is rate-limited; second succeeds. With
+        // `max_retries=1` the SDK will record exactly one
+        // `agent_sdk.llm.retries` increment with
+        // `error.type=rate_limited`.
+        let provider = TestProvider::new(vec![
+            ChatOutcome::RateLimited,
+            TestProvider::text_response("Done"),
+        ]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .event_store(new_event_store())
+            .config(agent_sdk::AgentConfig {
+                retry: agent_sdk::RetryConfig {
+                    max_retries: 1,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                },
+                ..Default::default()
+            })
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let retry_points = collect_counter_attrs(&snapshots, "agent_sdk.llm.retries");
+        assert!(
+            retry_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("error.type", "rate_limited"),
+                ],
+            )),
+            "missing llm.retries rate_limited record: {retry_points:?}"
+        );
+        Ok(())
+    }
+
+    /// Stub compactor that returns `new_tokens > original_tokens` to
+    /// exercise the `compaction.expanded_unexpectedly` skip-and-event
+    /// path. Triggered exactly once (`needs_compaction = true` then
+    /// `false` after the call) so the assertion-side metric is
+    /// well-bounded.
+    struct ExpandingCompactor {
+        called: AtomicUsize,
+    }
+
+    impl ExpandingCompactor {
+        const fn new() -> Self {
+            Self {
+                called: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContextCompactor for ExpandingCompactor {
+        async fn compact(&self, _messages: &[Message]) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn estimate_tokens(&self, _messages: &[Message]) -> usize {
+            // Returned unconditionally; the threshold below is set to
+            // 1 so any value above 1 triggers compaction once.
+            5
+        }
+
+        fn needs_compaction(&self, _messages: &[Message]) -> bool {
+            self.called.load(Ordering::SeqCst) == 0
+        }
+
+        async fn compact_history(&self, messages: Vec<Message>) -> Result<CompactionResult> {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            // Replace history with the same messages (no shrink) and
+            // claim the new token count is *higher*, so the
+            // recorder must skip the histogram and emit the
+            // anomaly span event.
+            Ok(CompactionResult {
+                original_count: messages.len(),
+                new_count: messages.len(),
+                original_tokens: 100,
+                new_tokens: 250,
+                messages,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_skips_tokens_saved_when_compaction_expanded_unexpectedly() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (tp, exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let store = SharedStore::new();
+        let thread_id = ThreadId::new();
+        seed_compaction_history(&store, &thread_id).await?;
+
+        let provider = TestProvider::new(vec![TestProvider::text_response("Done")]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .hooks(AllowAllHooks)
+            .message_store(store.clone())
+            .state_store(store.clone())
+            .event_store(new_event_store())
+            .with_compaction(
+                CompactionConfig::new()
+                    .with_threshold_tokens(1)
+                    .with_min_messages(1)
+                    .with_retain_recent(1),
+            )
+            .with_custom_compactor(ExpandingCompactor::new())
+            .build_with_stores();
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Follow up".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        tp.force_flush()
+            .context("failed to flush tracer provider")?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        // The counter still increments — we DID run a compaction; it
+        // just was unproductive — so the dashboard sees one record
+        // tagged with the `threshold` trigger.
+        let compaction_points = collect_counter_attrs(&snapshots, "agent_sdk.context.compaction");
+        assert!(
+            compaction_points
+                .iter()
+                .any(|p| matches_all(p, &[("agent_sdk.compaction.trigger", "threshold")],)),
+            "missing context.compaction trigger=threshold record: {compaction_points:?}"
+        );
+
+        // …but the histogram must be empty: a 0-or-negative saving
+        // is not informative and would skew dashboards.
+        let saved_total =
+            total_histogram_count(&snapshots, "agent_sdk.context.compaction.tokens_saved");
+        assert_eq!(
+            saved_total, 0,
+            "tokens_saved must not record when new_tokens > original_tokens",
+        );
+
+        // The compaction span carries the diagnostic event so the
+        // anomaly is observable in traces.
+        let spans = get_spans(&exporter)?;
+        let root = root_span_for_thread(&spans, &thread_id)?;
+        let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+        let compaction = find_span_in_trace(&trace_spans, "agent.context_compaction")?;
+        assert!(
+            span_has_event(compaction, "compaction.expanded_unexpectedly"),
+            "expected compaction.expanded_unexpectedly event on span; events were {:?}",
+            compaction
+                .events
+                .iter()
+                .map(|e| e.name.as_ref())
+                .collect::<Vec<_>>(),
+        );
         Ok(())
     }
 }
