@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_turn_attempts (\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\n) VALUES (\n    $1, $2, $3, $4, $5, $6, $7, $8, $9,\n    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a52824e5ddd7246e48e1abb1ece0aae606521ddbdccce620720047edc58ce8f7"
+}

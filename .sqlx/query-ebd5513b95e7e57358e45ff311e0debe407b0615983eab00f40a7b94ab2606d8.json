@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    opened_at,\n    closed_at,\n    duration_ms\nFROM agent_sdk_turn_attempts\nWHERE id = $1\n",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE task_id = $1\nORDER BY attempt_number\n",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,16 @@
         "ordinal": 16,
         "name": "duration_ms",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 17,
+        "name": "otel_trace_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "otel_span_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -111,8 +121,10 @@
       true,
       false,
       true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "6f690499fe5a02635490660e86d0eb4fb8b84e99fa8cfaeb2715628390df4209"
+  "hash": "ebd5513b95e7e57358e45ff311e0debe407b0615983eab00f40a7b94ab2606d8"
 }

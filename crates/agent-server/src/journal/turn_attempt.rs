@@ -242,6 +242,26 @@ pub struct TurnAttempt {
 
     /// Wall-clock duration in milliseconds. `None` while open.
     pub duration_ms: Option<u64>,
+
+    // ── OTel correlation (Phase 9 · A7) ─────────────────────────
+    /// Hex-encoded `OTel` `TraceId` of the live span at attempt-open.
+    ///
+    /// Captured from `Context::current().span().span_context()` when
+    /// the worker opens the attempt.  Null when the worker runs
+    /// without an active `OTel` span (e.g. local dev with no exporter,
+    /// or pre-A7 rows that predate this column).
+    ///
+    /// Used by `crate::worker::root_turn::call_llm_with_retry` on
+    /// replay to attach an `agent.replay.original_*` `SpanLink` from
+    /// the fresh attempt's span back to the original attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_trace_id: Option<String>,
+
+    /// Hex-encoded `OTel` `SpanId` of the live span at attempt-open.
+    ///
+    /// Companion to [`Self::otel_trace_id`]; same null semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_span_id: Option<String>,
 }
 
 impl TurnAttempt {
@@ -270,6 +290,8 @@ impl TurnAttempt {
             opened_at: params.now,
             closed_at: None,
             duration_ms: None,
+            otel_trace_id: params.otel_trace_id,
+            otel_span_id: params.otel_span_id,
         }
     }
 
@@ -397,6 +419,14 @@ pub struct OpenAttemptParams {
     pub request_blob: serde_json::Value,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
+    /// Optional hex-encoded `OTel` `TraceId` of the live span at
+    /// attempt-open.  Persisted on the row and surfaced to the next
+    /// attempt for replay-link emission.  Pass `None` when the worker
+    /// is not running under an `OTel` context.
+    pub otel_trace_id: Option<String>,
+    /// Optional hex-encoded `OTel` `SpanId` of the live span at
+    /// attempt-open; companion to [`Self::otel_trace_id`].
+    pub otel_span_id: Option<String>,
 }
 
 /// Arguments for [`TurnAttempt::close`].
@@ -451,6 +481,8 @@ mod tests {
                 "model": "claude-sonnet-4-5-20250929"
             }),
             now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
         }
     }
 
@@ -810,6 +842,69 @@ mod tests {
             .context("close")?;
         assert_eq!(closed.outcome, Some(TurnAttemptOutcome::Cancelled));
         closed.validate().context("validate")?;
+        Ok(())
+    }
+
+    // ── OTel correlation (Phase 9 · A7) ──────────────────────────
+
+    #[test]
+    fn open_attempt_defaults_otel_ids_to_none() {
+        let attempt = TurnAttempt::open(sample_open_params());
+        assert!(attempt.otel_trace_id.is_none());
+        assert!(attempt.otel_span_id.is_none());
+    }
+
+    #[test]
+    fn open_attempt_carries_otel_ids_when_supplied() -> Result<()> {
+        let params = OpenAttemptParams {
+            otel_trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            otel_span_id: Some("00f067aa0ba902b7".to_string()),
+            ..sample_open_params()
+        };
+        let attempt = TurnAttempt::open(params);
+        assert_eq!(
+            attempt.otel_trace_id.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+        );
+        assert_eq!(attempt.otel_span_id.as_deref(), Some("00f067aa0ba902b7"));
+        attempt.validate().context("validate")?;
+        Ok(())
+    }
+
+    #[test]
+    fn otel_ids_round_trip_through_json() -> Result<()> {
+        let params = OpenAttemptParams {
+            otel_trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            otel_span_id: Some("00f067aa0ba902b7".to_string()),
+            ..sample_open_params()
+        };
+        let attempt = TurnAttempt::open(params);
+        let json = serde_json::to_string(&attempt).context("serialize")?;
+        let back: TurnAttempt = serde_json::from_str(&json).context("deserialize")?;
+        assert_eq!(back.otel_trace_id, attempt.otel_trace_id);
+        assert_eq!(back.otel_span_id, attempt.otel_span_id);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_otel_ids_round_trip_through_json_for_legacy_rows() -> Result<()> {
+        // Older attempts (pre-A7) have no otel_* keys in their JSON.
+        // Make sure deserialization tolerates the absence and surfaces
+        // None.
+        let legacy = serde_json::json!({
+            "id": "attempt_legacy",
+            "task_id": "task_legacy",
+            "attempt_number": 1,
+            "provider": "anthropic",
+            "requested_model": "claude-sonnet-4-5-20250929",
+            "request_blob": {"messages": []},
+            "opened_at": "2024-11-15T00:00:00Z",
+        });
+        let attempt: TurnAttempt =
+            serde_json::from_value(legacy).context("deserialize legacy row")?;
+        assert!(attempt.otel_trace_id.is_none());
+        assert!(attempt.otel_span_id.is_none());
+        attempt.validate().context("validate")?;
         Ok(())
     }
 }

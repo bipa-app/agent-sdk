@@ -107,6 +107,21 @@ pub const SDK_OTEL_OUTPUT_MESSAGES_REF: &str = "agent_sdk.observability.output_m
 
 pub const ERROR_TYPE: &str = "error.type";
 
+// ── Span Link Attributes ─────────────────────────────────────────────
+
+/// Hex-encoded trace id of the original attempt that triggered a replay.
+///
+/// Set on a `SpanLink` from a fresh attempt's `chat <model>` (or
+/// equivalent) span pointing at the prior attempt that the worker is
+/// replaying.  Lets cross-trace queries answer "show me every attempt
+/// of this user submission" even when sampling drops one of the spans.
+pub const AGENT_REPLAY_ORIGINAL_TRACE_ID: &str = "agent.replay.original_trace_id";
+/// Hex-encoded span id of the original attempt that triggered a replay.
+pub const AGENT_REPLAY_ORIGINAL_SPAN_ID: &str = "agent.replay.original_span_id";
+/// 1-based attempt index for the replay link, mirroring
+/// `TurnAttempt::attempt_number`.
+pub const AGENT_REPLAY_ATTEMPT_INDEX: &str = "agent.replay.attempt_index";
+
 // ── Helper Functions ─────────────────────────────────────────────────
 
 /// Create a `KeyValue` pair for a string attribute.

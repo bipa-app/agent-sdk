@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 
 use opentelemetry::global::{self, BoxedSpan, BoxedTracer};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::trace::{
+    Span, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState, Tracer,
+};
 use opentelemetry::{InstrumentationScope, KeyValue};
 
 use super::types::CaptureDecision;
@@ -61,6 +63,95 @@ pub fn add_event(span: &mut BoxedSpan, name: impl Into<Cow<'static, str>>, attrs
         return;
     }
     span.add_event(name, attrs);
+}
+
+/// Add an `OTel` span link from `span` to `target`, carrying `attrs`.
+///
+/// Skips silently when the span is not recording, when `target` is
+/// not a valid `SpanContext` (zero trace/span ids), or when no tracer
+/// provider is installed.  This mirrors [`add_event`] so call sites
+/// don't have to gate every link emission with `is_recording` checks.
+pub fn add_link(span: &mut BoxedSpan, target: SpanContext, attrs: Vec<KeyValue>) {
+    if !span.is_recording() {
+        return;
+    }
+    if !target.is_valid() {
+        return;
+    }
+    span.add_link(target, attrs);
+}
+
+/// Add a `replay-of` link pointing at the original attempt's span.
+///
+/// `original_trace_id` and `original_span_id` are hex-encoded as
+/// stored on `agent_sdk_turn_attempts.{otel_trace_id,otel_span_id}`.
+/// Malformed hex values are treated as "no link" so a corrupt journal
+/// row never poisons the live span.
+///
+/// `attempt_index` is 1-based and matches
+/// `TurnAttempt::attempt_number` so cross-trace queries can join on it.
+pub fn link_to_replay_origin(
+    span: &mut BoxedSpan,
+    original_trace_id: &str,
+    original_span_id: &str,
+    attempt_index: u32,
+) {
+    let Some(target) = parse_span_context(original_trace_id, original_span_id) else {
+        return;
+    };
+    add_link(
+        span,
+        target,
+        vec![
+            KeyValue::new(
+                super::attrs::AGENT_REPLAY_ORIGINAL_TRACE_ID,
+                original_trace_id.to_string(),
+            ),
+            KeyValue::new(
+                super::attrs::AGENT_REPLAY_ORIGINAL_SPAN_ID,
+                original_span_id.to_string(),
+            ),
+            super::attrs::kv_i64(
+                super::attrs::AGENT_REPLAY_ATTEMPT_INDEX,
+                i64::from(attempt_index),
+            ),
+        ],
+    );
+}
+
+/// Add a `subagent-of` link pointing at the parent turn's span.
+///
+/// Even though parent and subagent share an `OTel` context today, the
+/// explicit link makes the relationship queryable when one of the
+/// spans is dropped by tail sampling.  Malformed ids are silently
+/// dropped (see [`link_to_replay_origin`]).
+pub fn link_to_parent_turn(span: &mut BoxedSpan, parent_trace_id: &str, parent_span_id: &str) {
+    let Some(target) = parse_span_context(parent_trace_id, parent_span_id) else {
+        return;
+    };
+    add_link(span, target, vec![]);
+}
+
+/// Build a `SpanContext` from hex-encoded trace + span ids.
+///
+/// Returns `None` when either id is malformed or zero (`TraceId::INVALID`
+/// / `SpanId::INVALID`).  The constructed context is marked
+/// `is_remote = true` and carries the SAMPLED flag so the link is
+/// honoured by all `OTel` exporters.
+fn parse_span_context(trace_hex: &str, span_hex: &str) -> Option<SpanContext> {
+    let trace_id = TraceId::from_hex(trace_hex).ok()?;
+    let span_id = SpanId::from_hex(span_hex).ok()?;
+    let ctx = SpanContext::new(
+        trace_id,
+        span_id,
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::default(),
+    );
+    if !ctx.is_valid() {
+        return None;
+    }
+    Some(ctx)
 }
 
 /// Record payload content on an LLM span based on store decisions.

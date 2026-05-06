@@ -3276,8 +3276,14 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
     // ── Round 2: resume -> re-suspend with 1 new tool call ──────
     let r2_provider =
         MockToolCallProvider::single("call_c", "bash", serde_json::json!({"c": "cat"}));
-    let outcome =
-        reacquire_and_resume(&stores, &parent, &r2_provider, t_plus(20), t_plus(25)).await?;
+    let outcome = Box::pin(reacquire_and_resume(
+        &stores,
+        &parent,
+        &r2_provider,
+        t_plus(20),
+        t_plus(25),
+    ))
+    .await?;
     let RootTurnOutcome::Suspended {
         parent_task: r2_parent,
         child_tasks: r2_children,
@@ -3300,10 +3306,15 @@ async fn resume_from_children_multi_round_does_not_collide() -> Result<()> {
 
     // ── Round 3: resume -> text-only -> Completed ───────────────
     let final_provider = MockTextProvider::new("All done");
-    let outcome_r3 =
-        reacquire_and_resume(&stores, &parent_r3, &final_provider, t_plus(30), t_plus(35))
-            .await
-            .context("round 3")?;
+    let outcome_r3 = Box::pin(reacquire_and_resume(
+        &stores,
+        &parent_r3,
+        &final_provider,
+        t_plus(30),
+        t_plus(35),
+    ))
+    .await
+    .context("round 3")?;
     let RootTurnOutcome::Completed {
         completed_task,
         response_text,

@@ -812,8 +812,17 @@ where
     S: StateStore + 'static,
 {
     use crate::observability::{attrs, baggage, langfuse, metrics, provider_name, spans};
+    use opentelemetry::Context;
     use opentelemetry::KeyValue;
-    use opentelemetry::trace::Span;
+    use opentelemetry::trace::{Span, TraceContextExt};
+
+    // Capture the parent turn's SpanContext **before** starting the
+    // synthetic subagent span so the link points at the caller, not at
+    // ourselves.  When the agent runs without an active parent span
+    // (e.g. running a subagent from a top-level test) the captured
+    // context is invalid and `link_to_parent_turn` becomes a no-op.
+    let parent_ctx = Context::current();
+    let parent_span_context = parent_ctx.span().span_context().clone();
 
     let normalized_provider_name = provider_name::normalize(tool.provider.provider());
     let request_model = tool.provider.model().to_string();
@@ -831,6 +840,13 @@ where
     );
     baggage::copy_baggage_to_active_span(&mut span);
     langfuse::tag_observation(&mut span, langfuse::ObservationType::Agent);
+    if parent_span_context.is_valid() {
+        spans::link_to_parent_turn(
+            &mut span,
+            &parent_span_context.trace_id().to_string(),
+            &parent_span_context.span_id().to_string(),
+        );
+    }
     let outcome = if result.success { "done" } else { "error" };
     span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
     span.set_attribute(attrs::kv_i64(
