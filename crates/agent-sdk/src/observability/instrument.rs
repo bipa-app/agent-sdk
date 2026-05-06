@@ -350,6 +350,14 @@ pub(crate) fn end_root_span(
     total_usage: &TokenUsage,
     outcome: &'static str,
 ) {
+    // Record the run-outcome counter unconditionally so dashboards
+    // see every run — even sampled-out ones — without depending on
+    // the live span.
+    let metrics = super::metrics::Metrics::global();
+    metrics
+        .runs_outcome
+        .add(1, &[KeyValue::new(attrs::SDK_OUTCOME, outcome)]);
+
     let Some(mut span) = sink.into_inner() else {
         log::warn!(
             "root span sink still has outstanding clones at end_root_span; \

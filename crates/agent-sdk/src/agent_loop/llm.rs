@@ -72,7 +72,7 @@ impl LlmSpanObserver<'_> {
     }
 
     fn record_retry(&mut self, attempt: u32, max_attempts: u32, delay_ms: u64, error_type: &str) {
-        use crate::observability::{attrs, spans};
+        use crate::observability::{attrs, metrics, spans};
         spans::add_event(
             self.span,
             "llm.retry",
@@ -84,6 +84,15 @@ impl LlmSpanObserver<'_> {
                     attrs::SDK_LLM_RETRY_DELAY_MS,
                     i64::try_from(delay_ms).unwrap_or(i64::MAX),
                 ),
+                opentelemetry::KeyValue::new(attrs::ERROR_TYPE, error_type.to_string()),
+            ],
+        );
+
+        let metrics_handle = metrics::Metrics::global();
+        metrics_handle.llm_retries.add(
+            1,
+            &[
+                opentelemetry::KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, self.provider_name),
                 opentelemetry::KeyValue::new(attrs::ERROR_TYPE, error_type.to_string()),
             ],
         );

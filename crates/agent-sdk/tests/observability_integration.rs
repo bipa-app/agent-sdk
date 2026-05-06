@@ -2152,3 +2152,386 @@ async fn tool_span_emits_confirmation_required_event() -> Result<()> {
 
     Ok(())
 }
+// ── Metrics (B1) ─────────────────────────────────────────────────────
+
+mod metrics {
+    use super::*;
+
+    use agent_sdk::observability::metrics::Metrics;
+    use opentelemetry::KeyValue as MetricKv;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    /// Install a fresh meter provider + in-memory exporter and reset
+    /// the cached `Metrics` singleton so the next `Metrics::global()`
+    /// call rebuilds against this provider. Tests share a process so
+    /// every metric case must call this before recording.
+    fn setup_meter() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        Metrics::reset_for_testing();
+        (provider, exporter)
+    }
+
+    fn collected(exporter: &InMemoryMetricExporter) -> Result<Vec<ResourceMetrics>> {
+        exporter
+            .get_finished_metrics()
+            .context("failed to read collected metrics")
+    }
+
+    /// Walk the per-test `ResourceMetrics` snapshot and return every
+    /// histogram data point recorded for `metric_name` under any
+    /// scope. Bypasses the scope-name layer because tests don't care
+    /// which meter scope produced the record — they only assert on
+    /// the metric name + attributes.
+    fn collect_histogram_attrs(
+        snapshots: &[ResourceMetrics],
+        metric_name: &str,
+    ) -> Vec<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for resource in snapshots {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != metric_name {
+                        continue;
+                    }
+                    match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                            for dp in h.data_points() {
+                                out.push(kv_pairs(dp.attributes()));
+                            }
+                        }
+                        AggregatedMetrics::U64(MetricData::Histogram(h)) => {
+                            for dp in h.data_points() {
+                                out.push(kv_pairs(dp.attributes()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Sum-instrument equivalent of [`collect_histogram_attrs`].
+    /// Counters land in the `Sum` variant; we fold all attribute
+    /// vectors so the test asserts on label combinations the
+    /// recorder produced.
+    fn collect_counter_attrs(
+        snapshots: &[ResourceMetrics],
+        metric_name: &str,
+    ) -> Vec<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for resource in snapshots {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != metric_name {
+                        continue;
+                    }
+                    match metric.data() {
+                        AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                            for dp in sum.data_points() {
+                                out.push(kv_pairs(dp.attributes()));
+                            }
+                        }
+                        AggregatedMetrics::F64(MetricData::Sum(sum)) => {
+                            for dp in sum.data_points() {
+                                out.push(kv_pairs(dp.attributes()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn kv_pairs<'a>(iter: impl Iterator<Item = &'a MetricKv>) -> Vec<(String, String)> {
+        iter.map(|kv| (kv.key.as_str().to_string(), format!("{}", kv.value)))
+            .collect()
+    }
+
+    fn has_label(set: &[(String, String)], key: &str, value: &str) -> bool {
+        set.iter()
+            .any(|(k, v)| k.as_str() == key && v.as_str() == value)
+    }
+
+    fn matches_all(set: &[(String, String)], expected: &[(&str, &str)]) -> bool {
+        expected.iter().all(|(k, v)| has_label(set, k, v))
+    }
+
+    #[tokio::test]
+    async fn metrics_records_token_usage_per_type() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let provider = TestProvider::new(vec![TestProvider::text_response("Done")]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .event_store(new_event_store())
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let points = collect_histogram_attrs(&snapshots, "gen_ai.client.token.usage");
+        assert!(
+            !points.is_empty(),
+            "gen_ai.client.token.usage produced no data points"
+        );
+        assert!(
+            points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("gen_ai.token.type", "input"),
+                    ("gen_ai.request.model", "test-model"),
+                ],
+            )),
+            "missing input-token data point: {points:?}"
+        );
+        assert!(
+            points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.token.type", "output"),
+                    ("gen_ai.operation.name", "chat")
+                ],
+            )),
+            "missing output-token data point: {points:?}"
+        );
+        // `cache_read` / `cache_creation` are only recorded when
+        // > 0 — `text_response` has both at zero, so they must NOT
+        // appear. The "never as a single combined value" rule from
+        // the card boils down to these per-type separations.
+        assert!(
+            !points
+                .iter()
+                .any(|p| has_label(p, "gen_ai.token.type", "cache_read")),
+            "unexpected cache_read data point: {points:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_records_operation_duration_with_error_type_on_failure() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // Force the rate-limit error path. `call_llm_with_retry`
+        // exhausts the retry budget and surfaces a "Rate limited
+        // after N retries" `AgentError`, which `classify_llm_error`
+        // maps to `error.type=rate_limited`.
+        let provider = TestProvider::new(vec![
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited,
+        ]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .event_store(new_event_store())
+            .config(agent_sdk::AgentConfig {
+                retry: agent_sdk::RetryConfig {
+                    max_retries: 1,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                },
+                ..Default::default()
+            })
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let points = collect_histogram_attrs(&snapshots, "gen_ai.client.operation.duration");
+        assert!(
+            points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("error.type", "rate_limited"),
+                ],
+            )),
+            "expected operation.duration data point with error.type=rate_limited; got {points:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_records_tool_execution_with_outcome_success() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let provider = TestProvider::new(vec![
+            TestProvider::tool_use_response("call_1", "echo", json!({"text": "hi"})),
+            TestProvider::text_response("Final"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+        let agent = builder::<()>()
+            .provider(provider)
+            .tools(tools)
+            .hooks(AllowAllHooks)
+            .message_store(InMemoryStore::new())
+            .state_store(InMemoryStore::new())
+            .event_store(new_event_store())
+            .build_with_stores();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Use echo".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let count_points = collect_counter_attrs(&snapshots, "agent_sdk.tools.execution.count");
+        assert!(
+            count_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.tool.name", "echo"),
+                    ("agent_sdk.tool.kind", "sync"),
+                    ("agent_sdk.tool.outcome", "success"),
+                ],
+            )),
+            "missing tools.execution.count success record: {count_points:?}"
+        );
+        let dur_points = collect_histogram_attrs(&snapshots, "agent_sdk.tools.execution.duration");
+        assert!(
+            dur_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.tool.name", "echo"),
+                    ("agent_sdk.tool.outcome", "success"),
+                ],
+            )),
+            "missing tools.execution.duration success record: {dur_points:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_records_run_outcome_counter() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let provider = TestProvider::new(vec![TestProvider::text_response("Done")]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .event_store(new_event_store())
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let outcome_points = collect_counter_attrs(&snapshots, "agent_sdk.runs.outcome");
+        assert!(
+            outcome_points
+                .iter()
+                .any(|p| matches_all(p, &[("agent_sdk.outcome", "done")],)),
+            "missing runs.outcome=done record: {outcome_points:?}"
+        );
+        let turns_points = collect_histogram_attrs(&snapshots, "agent_sdk.turns.duration");
+        assert!(
+            turns_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("agent_sdk.outcome", "done"),
+                    ("agent_sdk.input.kind", "text"),
+                    ("gen_ai.provider.name", "anthropic"),
+                ],
+            )),
+            "missing turns.duration record: {turns_points:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_records_context_compaction() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (_tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let store = SharedStore::new();
+        let thread_id = ThreadId::new();
+        seed_compaction_history(&store, &thread_id).await?;
+
+        let provider = TestProvider::new(vec![
+            TestProvider::text_response("Conversation summary"),
+            TestProvider::text_response("Done"),
+        ]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .hooks(AllowAllHooks)
+            .message_store(store.clone())
+            .state_store(store.clone())
+            .event_store(new_event_store())
+            .with_compaction(
+                agent_sdk::context::CompactionConfig::new()
+                    .with_threshold_tokens(1)
+                    .with_min_messages(1)
+                    .with_retain_recent(1),
+            )
+            .build_with_stores();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Follow up".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        let compaction_points = collect_counter_attrs(&snapshots, "agent_sdk.context.compaction");
+        assert!(
+            compaction_points
+                .iter()
+                .any(|p| matches_all(p, &[("agent_sdk.compaction.trigger", "threshold")],)),
+            "missing context.compaction trigger=threshold record: {compaction_points:?}"
+        );
+        let saved_points =
+            collect_histogram_attrs(&snapshots, "agent_sdk.context.compaction.tokens_saved");
+        assert!(
+            !saved_points.is_empty(),
+            "expected at least one tokens_saved data point"
+        );
+        Ok(())
+    }
+}

@@ -91,7 +91,7 @@ where
     H: AgentHooks,
 {
     #[cfg(feature = "otel")]
-    let mut tool_span = start_tool_span(pending, ctx);
+    let (mut tool_span, tool_kind) = start_tool_span(pending, ctx);
 
     let outcome = execute_tool_call_inner(
         pending,
@@ -102,7 +102,7 @@ where
     .await;
 
     #[cfg(feature = "otel")]
-    finish_tool_span(&mut tool_span, &outcome);
+    finish_tool_span(&mut tool_span, &outcome, &pending.name, tool_kind);
 
     outcome
 }
@@ -111,7 +111,7 @@ where
 fn start_tool_span<Ctx, H>(
     pending: &PendingToolCallInfo,
     ctx: &ToolCallExecutionContext<'_, Ctx, H>,
-) -> opentelemetry::global::BoxedSpan
+) -> (opentelemetry::global::BoxedSpan, &'static str)
 where
     Ctx: Send + Sync + 'static,
     H: AgentHooks,
@@ -131,40 +131,57 @@ where
         ));
     }
 
-    // Add tool metadata if the tool was found
-    if let Some(tool) = ctx.tools.get(&pending.name) {
+    // Resolve the tool kind exactly once and reuse it on the span and
+    // on the per-tool metric labels emitted in `finish_tool_span`. The
+    // `unknown` value covers the rare case where the LLM emitted a
+    // tool name no registry knows about — `execute_tool_call_inner`
+    // surfaces that as a `Completed` outcome with an "Unknown tool:"
+    // body, which we still want to be countable.
+    let tool_kind: &'static str = if let Some(tool) = ctx.tools.get(&pending.name) {
         span_attrs.push(KeyValue::new(
             attrs::SDK_TOOL_TIER,
             attrs::tool_tier_str(tool.tier()),
         ));
-        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "sync"));
+        "sync"
     } else if let Some(tool) = ctx.tools.get_async(&pending.name) {
         span_attrs.push(KeyValue::new(
             attrs::SDK_TOOL_TIER,
             attrs::tool_tier_str(tool.tier()),
         ));
-        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "async"));
+        "async"
     } else if let Some(tool) = ctx.tools.get_listen(&pending.name) {
         span_attrs.push(KeyValue::new(
             attrs::SDK_TOOL_TIER,
             attrs::tool_tier_str(tool.tier()),
         ));
-        span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, "listen"));
-    }
+        "listen"
+    } else {
+        "unknown"
+    };
+    span_attrs.push(KeyValue::new(attrs::SDK_TOOL_KIND, tool_kind));
 
     let mut span = spans::start_internal_span("execute_tool", span_attrs);
     baggage::copy_baggage_to_active_span(&mut span);
     langfuse::tag_observation(&mut span, langfuse::ObservationType::Tool);
-    span
+    (span, tool_kind)
 }
 
 #[cfg(feature = "otel")]
-fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolExecutionOutcome) {
-    use crate::observability::{attrs, spans};
+fn finish_tool_span(
+    span: &mut opentelemetry::global::BoxedSpan,
+    outcome: &ToolExecutionOutcome,
+    tool_name: &str,
+    tool_kind: &'static str,
+) {
+    use crate::observability::{attrs, metrics, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
 
-    match outcome {
+    let metrics_handle = metrics::Metrics::global();
+
+    // Outcome string + optional duration are reused below for both
+    // the span attribute and the metric labels.
+    let (outcome_str, duration_ms) = match outcome {
         ToolExecutionOutcome::Completed { result, .. } => {
             let outcome_str = if result.output.starts_with("Unknown tool:") {
                 span.set_attribute(KeyValue::new(attrs::ERROR_TYPE, "unknown_tool"));
@@ -186,6 +203,7 @@ fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolE
                     i64::try_from(ms).unwrap_or(i64::MAX),
                 ));
             }
+            (outcome_str, result.duration_ms)
         }
         ToolExecutionOutcome::RequiresConfirmation { tool_name, .. } => {
             span.set_attribute(attrs::kv_bool(attrs::SDK_TOOL_CONFIRMATION_REQUIRED, true));
@@ -198,15 +216,47 @@ fn finish_tool_span(span: &mut opentelemetry::global::BoxedSpan, outcome: &ToolE
                 "tool.confirmation_required",
                 vec![KeyValue::new(attrs::GEN_AI_TOOL_NAME, tool_name.clone())],
             );
+            ("awaiting_confirmation", None)
         }
         ToolExecutionOutcome::Error(error) => {
             span.set_attribute(KeyValue::new(attrs::ERROR_TYPE, "event_store"));
             span.set_status(opentelemetry::trace::Status::error(error.message.clone()));
             span.set_attribute(KeyValue::new(attrs::SDK_TOOL_OUTCOME, "error"));
+            ("error", None)
         }
+    };
+
+    let metric_attrs = [
+        KeyValue::new(attrs::GEN_AI_TOOL_NAME, tool_name.to_string()),
+        KeyValue::new(attrs::SDK_TOOL_KIND, tool_kind),
+        KeyValue::new(attrs::SDK_TOOL_OUTCOME, outcome_str),
+    ];
+    metrics_handle.tools_execution_count.add(1, &metric_attrs);
+    if let Some(ms) = duration_ms {
+        let ms_f = tool_duration_ms_to_f64(ms);
+        metrics_handle
+            .tools_execution_duration
+            .record(ms_f, &metric_attrs);
     }
 
     span.end();
+}
+
+/// Convert a `ToolResult::duration_ms` value (`u64` milliseconds)
+/// into a histogram-friendly `f64`.
+///
+/// Bounding through `u32` keeps the conversion lossless because
+/// `u32::MAX` ≈ 49.7 days — far above the histogram's 5-minute top
+/// bucket, so any clamped value still falls in the overflow bucket
+/// dashboards expect. The clamp path also emits a `warn!` so a real
+/// runaway duration is investigable rather than silently swallowed.
+#[cfg(feature = "otel")]
+fn tool_duration_ms_to_f64(ms: u64) -> f64 {
+    if let Ok(v) = u32::try_from(ms) {
+        return f64::from(v);
+    }
+    log::warn!("tool duration {ms}ms exceeds u32::MAX; clamping for histogram");
+    f64::from(u32::MAX)
 }
 
 async fn execute_tool_call_inner<Ctx, H>(

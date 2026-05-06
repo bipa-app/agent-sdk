@@ -811,23 +811,21 @@ where
     M: MessageStore + 'static,
     S: StateStore + 'static,
 {
-    use crate::observability::{attrs, baggage, langfuse, provider_name, spans};
+    use crate::observability::{attrs, baggage, langfuse, metrics, provider_name, spans};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::Span;
+
+    let normalized_provider_name = provider_name::normalize(tool.provider.provider());
+    let request_model = tool.provider.model().to_string();
+    let agent_name = tool.config.name.clone();
 
     let mut span = spans::start_internal_span(
         "invoke_agent",
         vec![
             KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
-            KeyValue::new(attrs::GEN_AI_AGENT_NAME, tool.config.name.clone()),
-            KeyValue::new(
-                attrs::GEN_AI_PROVIDER_NAME,
-                provider_name::normalize(tool.provider.provider()),
-            ),
-            KeyValue::new(
-                attrs::GEN_AI_REQUEST_MODEL,
-                tool.provider.model().to_string(),
-            ),
+            KeyValue::new(attrs::GEN_AI_AGENT_NAME, agent_name.clone()),
+            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, normalized_provider_name),
+            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.clone()),
             KeyValue::new(attrs::SDK_RUN_MODE, "loop"),
         ],
     );
@@ -851,6 +849,60 @@ where
         spans::set_span_error(&mut span, "agent_error", "subagent invocation failed");
     }
     span.end();
+
+    // ── Metrics ─────────────────────────────────────────────────────
+    //
+    // Subagent invocations get a dedicated counter so dashboards can
+    // tell parent-turn LLM activity apart from delegated subagent
+    // work. We also fold the subagent's token usage into the shared
+    // `gen_ai.client.token.usage` histogram so global token-spend
+    // accounting stays accurate; the `gen_ai.operation.name` label
+    // discriminates `invoke_agent` from regular `chat` calls.
+    let metrics_handle = metrics::Metrics::global();
+    metrics_handle.subagent_invocations.add(
+        1,
+        &[
+            KeyValue::new(attrs::GEN_AI_AGENT_NAME, agent_name),
+            KeyValue::new(attrs::SDK_OUTCOME, outcome),
+        ],
+    );
+    record_subagent_token_usage(
+        &metrics_handle,
+        result,
+        normalized_provider_name,
+        &request_model,
+    );
+}
+
+#[cfg(feature = "otel")]
+fn record_subagent_token_usage(
+    metrics: &crate::observability::metrics::Metrics,
+    result: &SubagentResult,
+    provider_name: &'static str,
+    request_model: &str,
+) {
+    use crate::observability::attrs;
+    use opentelemetry::KeyValue;
+
+    let entries: [(u32, &'static str); 2] = [
+        (result.usage.input_tokens, "input"),
+        (result.usage.output_tokens, "output"),
+    ];
+
+    for (count, token_type) in entries {
+        if count == 0 {
+            continue;
+        }
+        metrics.token_usage.record(
+            u64::from(count),
+            &[
+                KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
+                KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
+                KeyValue::new("gen_ai.token.type", token_type),
+                KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
+            ],
+        );
+    }
 }
 
 #[cfg(not(feature = "otel"))]

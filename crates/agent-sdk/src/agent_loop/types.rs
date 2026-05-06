@@ -80,6 +80,15 @@ pub(super) struct TurnContext {
     pub(super) stop_reason: Option<StopReason>,
     /// Number of tool calls the LLM requested in this turn.
     pub(super) tool_call_count: usize,
+    /// Static input-kind label captured from the run's [`AgentInput`].
+    ///
+    /// Threaded onto every per-turn metric so dashboards can group
+    /// turn timings by whether the run was kicked off with `text`,
+    /// `message`, `continue`, `resume`, or `submit_tool_results`. The
+    /// value is constant across turns because every continuation
+    /// turn shares the same originating run.
+    #[cfg(feature = "otel")]
+    pub(super) input_kind: &'static str,
 }
 
 /// Data extracted from `AgentInput::Resume` after validation.
