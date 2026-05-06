@@ -659,6 +659,7 @@ where
             Some(super::llm::LlmSpanObserver {
                 span: &mut llm_span,
                 provider_name: provider_name_for_observer,
+                request_model: &request_model_for_metrics,
             }),
         )
         .await
@@ -672,6 +673,7 @@ where
             Some(super::llm::LlmSpanObserver {
                 span: &mut llm_span,
                 provider_name: provider_name_for_observer,
+                request_model: &request_model_for_metrics,
             }),
         )
         .await

@@ -13,6 +13,13 @@ pub const GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
 pub const GEN_AI_RESPONSE_MODEL: &str = "gen_ai.response.model";
 pub const GEN_AI_RESPONSE_ID: &str = "gen_ai.response.id";
 pub const GEN_AI_RESPONSE_FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
+/// Time-to-first-chunk attribute on the `chat <model>` span.
+///
+/// Wall-clock seconds (f64) from request dispatch to the first
+/// streaming delta. Set on streaming runs only, alongside the
+/// matching `gen_ai.client.operation.time_to_first_chunk` histogram
+/// record.
+pub const GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK: &str = "gen_ai.response.time_to_first_chunk";
 pub const GEN_AI_CONVERSATION_ID: &str = "gen_ai.conversation.id";
 pub const GEN_AI_AGENT_NAME: &str = "gen_ai.agent.name";
 pub const GEN_AI_REQUEST_MAX_OUTPUT_TOKENS: &str = "gen_ai.request.max_output_tokens";

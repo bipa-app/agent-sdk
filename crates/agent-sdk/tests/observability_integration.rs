@@ -2534,6 +2534,268 @@ mod metrics {
         );
         Ok(())
     }
+
+    // ── Streaming TTFC / TPOC (B2) ───────────────────────────────────
+
+    /// Sum the `count()` of every histogram data point matching
+    /// `metric_name`. Used by the B2 streaming tests to assert that
+    /// TTFC fires exactly once and TPOC fires once per chunk after
+    /// the first.
+    fn total_histogram_count(snapshots: &[ResourceMetrics], metric_name: &str) -> u64 {
+        let mut total: u64 = 0;
+        for resource in snapshots {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != metric_name {
+                        continue;
+                    }
+                    match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                            for dp in h.data_points() {
+                                total = total.saturating_add(dp.count());
+                            }
+                        }
+                        AggregatedMetrics::U64(MetricData::Histogram(h)) => {
+                            for dp in h.data_points() {
+                                total = total.saturating_add(dp.count());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn metrics_records_streaming_ttfc_once_and_tpoc_per_subsequent_chunk() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (tp, exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // Three content deltas, then a Usage frame and a Done
+        // sentinel. Sentinel frames are metadata, not output chunks,
+        // so they MUST NOT bump TPOC. Three content deltas means: 1
+        // TTFC (on the first) + 2 TPOC (on the second and third).
+        let provider = ScriptedStreamProvider::new(vec![
+            StreamDelta::TextDelta {
+                delta: "one".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::TextDelta {
+                delta: " two".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::TextDelta {
+                delta: " three".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Usage(Usage {
+                input_tokens: 1,
+                output_tokens: 3,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .config(streaming_config())
+            .event_store(new_event_store())
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        tp.force_flush()
+            .context("failed to flush tracer provider")?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_to_first_chunk"),
+            1,
+            "expected TTFC to fire exactly once for a streaming run",
+        );
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_per_output_chunk"),
+            2,
+            "expected TPOC to fire once per chunk after the first (3 chunks → 2 TPOC samples)",
+        );
+
+        let ttfc_points =
+            collect_histogram_attrs(&snapshots, "gen_ai.client.operation.time_to_first_chunk");
+        assert!(
+            ttfc_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("gen_ai.request.model", "test-model"),
+                ],
+            )),
+            "TTFC data point missing required labels: {ttfc_points:?}"
+        );
+        let tpoc_points =
+            collect_histogram_attrs(&snapshots, "gen_ai.client.operation.time_per_output_chunk");
+        assert!(
+            tpoc_points.iter().any(|p| matches_all(
+                p,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.provider.name", "anthropic"),
+                    ("gen_ai.request.model", "test-model"),
+                ],
+            )),
+            "TPOC data point missing required labels: {tpoc_points:?}"
+        );
+
+        let spans = get_spans(&exporter)?;
+        let root = root_span_for_thread(&spans, &thread_id)?;
+        let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+        let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+        let raw = get_attr(llm, attrs::GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK)
+            .context("missing gen_ai.response.time_to_first_chunk on streaming chat span")?;
+        let ttfc_secs: f64 = raw
+            .parse()
+            .with_context(|| format!("expected TTFC attribute to parse as f64, got {raw}"))?;
+        assert!(
+            ttfc_secs >= 0.0 && ttfc_secs.is_finite(),
+            "TTFC attribute should be a finite non-negative float, got {ttfc_secs}",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_skip_streaming_histograms_for_non_streaming_run() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (tp, exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        // Non-streaming run: the SDK calls `provider.chat()` directly
+        // and never executes the per-chunk timing path.
+        let provider = TestProvider::new(vec![TestProvider::text_response("Done")]);
+        let agent = builder::<()>()
+            .provider(provider)
+            .event_store(new_event_store())
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        wait_for_run(final_state).await?;
+        tp.force_flush()
+            .context("failed to flush tracer provider")?;
+        mp.force_flush().context("force_flush meter provider")?;
+
+        let snapshots = collected(&mexporter)?;
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_to_first_chunk"),
+            0,
+            "TTFC must not fire on non-streaming runs",
+        );
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_per_output_chunk"),
+            0,
+            "TPOC must not fire on non-streaming runs",
+        );
+
+        let spans = get_spans(&exporter)?;
+        let root = root_span_for_thread(&spans, &thread_id)?;
+        let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+        let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+        assert_attr_absent(llm, attrs::GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK);
+
+        Ok(())
+    }
+
+    /// Provider that yields exactly one transport-level
+    /// `Err` from its `chat_stream`. This exercises the
+    /// `match result { Ok(d) => …, Err(e) => return … }`
+    /// short-circuit in `process_stream`, which fires *before* the
+    /// first-chunk recorder runs.
+    struct StreamErrorBeforeChunkProvider;
+
+    #[async_trait]
+    impl LlmProvider for StreamErrorBeforeChunkProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            Err(anyhow!(
+                "StreamErrorBeforeChunkProvider.chat() should not be called"
+            ))
+        }
+
+        fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+            Box::pin(stream! {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                yield Err(anyhow!("transport boom"));
+            })
+        }
+
+        fn model(&self) -> &'static str {
+            "test-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "anthropic"
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_skip_ttfc_when_stream_errors_before_first_chunk() -> Result<()> {
+        let _guard = acquire_test_lock().await;
+        let (tp, _exporter) = setup_tracer();
+        let (mp, mexporter) = setup_meter();
+
+        let mut config = streaming_config();
+        config.retry = agent_sdk::RetryConfig::no_retry();
+
+        let agent = builder::<()>()
+            .provider(StreamErrorBeforeChunkProvider)
+            .config(config)
+            .event_store(new_event_store())
+            .build();
+        let thread_id = ThreadId::new();
+        let final_state = agent.run(
+            thread_id,
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        );
+        let state = final_state.await.context("agent state channel closed")?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tp.force_flush()
+            .context("failed to flush tracer provider")?;
+        mp.force_flush().context("force_flush meter provider")?;
+        assert!(
+            matches!(state, AgentRunState::Error(_)),
+            "expected the stream-error run to surface an Error state, got {state:?}",
+        );
+
+        let snapshots = collected(&mexporter)?;
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_to_first_chunk"),
+            0,
+            "TTFC must not fire when the stream errors before the first chunk arrives",
+        );
+        assert_eq!(
+            total_histogram_count(&snapshots, "gen_ai.client.operation.time_per_output_chunk"),
+            0,
+            "TPOC must not fire when no chunks were ever accepted",
+        );
+
+        Ok(())
+    }
 }
 
 // ── Span links (A7) ─────────────────────────────────────────────────
