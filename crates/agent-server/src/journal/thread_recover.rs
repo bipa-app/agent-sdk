@@ -180,16 +180,33 @@ pub async fn recover_thread(
         bail!("recover: thread {thread_id} is already completed, no new turns can be committed");
     }
 
-    // 3. Load the in-flight draft, if any. The projection row may
-    //    not exist yet (very first turn never wrote anything), in
-    //    which case the draft is empty.
-    let draft_messages = match message_store
+    // 3. Load the in-flight draft AND the committed projection head.
+    //    The projection row may not exist yet (very first turn never
+    //    wrote anything), in which case both are empty.
+    //
+    //    Reading the committed history straight from the projection
+    //    (rather than the checkpoint's frozen `messages` snapshot)
+    //    is what makes auto-compaction durable across attempts: when
+    //    the worker rewrites the projection via
+    //    `MessageProjectionStore::replace_history` mid-turn (a
+    //    non-commit mutation), the checkpoint is still at the
+    //    pre-compaction snapshot, but the projection holds the
+    //    canonical compacted head. Recovering from the projection
+    //    means a fresh attempt after lease expiry — or a brand-new
+    //    turn after a failed-but-already-compacted prior attempt —
+    //    picks up the compacted state instead of replaying the
+    //    pre-compaction history that just blew the context window.
+    //    The checkpoint is still load-bearing for the agent-state
+    //    snapshot and the turn_number consistency guard, but the
+    //    `messages` field is now treated as a snapshot artifact, not
+    //    the recovery source of truth.
+    let (committed_messages, draft_messages) = match message_store
         .get(thread_id)
         .await
         .context("recover: load message projection")?
     {
-        Some(projection) => projection.draft_messages,
-        None => Vec::new(),
+        Some(projection) => (projection.messages, projection.draft_messages),
+        None => (Vec::new(), Vec::new()),
     };
 
     // 4. Fresh thread — no checkpoints to load. The draft may still
@@ -232,10 +249,21 @@ pub async fn recover_thread(
         );
     }
 
-    // 7. Build the merged message list: committed checkpoint history
-    //    followed by the in-flight draft (if any).
+    // 7. Build the merged message list. Source of truth: the
+    //    projection's committed `messages` (pre-compaction OR post-
+    //    compaction, whichever is current), followed by the
+    //    in-flight draft. Falls back to the checkpoint's frozen
+    //    snapshot only when the projection row is missing — which
+    //    shouldn't happen for a thread with `committed_turns > 0`
+    //    (the commit path always writes the projection before the
+    //    checkpoint), but keeps recovery robust against rare
+    //    storage divergence.
     let next_turn = thread.committed_turns + 1;
-    let mut messages = checkpoint.messages.clone();
+    let mut messages = if committed_messages.is_empty() {
+        checkpoint.messages.clone()
+    } else {
+        committed_messages
+    };
     messages.extend(draft_messages.iter().cloned());
     Ok(ThreadRecoveryView {
         thread,
