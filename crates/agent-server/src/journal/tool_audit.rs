@@ -308,6 +308,18 @@ impl ToolAuditEvent {
 /// Every tool-call lifecycle transition is recorded through this trait.
 /// Implementations should ensure events are durably written and
 /// queryable by operation, task, and thread.
+///
+/// # Observability contract
+///
+/// Implementations MUST emit the
+/// `agent_server.tool_audit.outcome` metric for every event
+/// successfully recorded. The reference in-memory implementation
+/// calls [`crate::observability::ServerMetrics::record_tool_audit`]
+/// from inside [`InMemoryToolAuditEventStore::record_event`];
+/// durable backends should mirror that — typically once the
+/// underlying transaction commits — so dashboards see the same
+/// counter regardless of which store is wired.  The metric is gated
+/// behind `feature = "otel"` and is a no-op when the feature is off.
 #[async_trait]
 pub trait ToolAuditEventStore: Send + Sync {
     /// Record a single lifecycle event.
@@ -426,6 +438,10 @@ impl ToolAuditEventStore for InMemoryToolAuditEventStore {
             .push(idx);
 
         drop(inner);
+
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_tool_audit(event);
+
         Ok(())
     }
 

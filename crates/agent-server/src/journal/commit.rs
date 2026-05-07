@@ -152,6 +152,9 @@ pub async fn commit_completed_turn(
     checkpoint_store: &dyn CheckpointStore,
     event_repo: &dyn EventRepository,
 ) -> Result<CommitOutcome> {
+    #[cfg(feature = "otel")]
+    let started_at = std::time::Instant::now();
+
     let events = std::mem::take(&mut params.events);
     let thread_id_for_events = params.thread_id.clone();
 
@@ -169,6 +172,12 @@ pub async fn commit_completed_turn(
                 .await
                 .context("commit: persist lifecycle events")?
         };
+
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_journal_commit(
+            crate::observability::attrs::COMMIT_KIND_ATOMIC,
+            started_at.elapsed().as_secs_f64(),
+        );
 
         return Ok(outcome);
     }
@@ -241,6 +250,12 @@ pub async fn commit_completed_turn(
             .await
             .context("commit: persist lifecycle events")?
     };
+
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global().record_journal_commit(
+        crate::observability::attrs::COMMIT_KIND_NON_ATOMIC,
+        started_at.elapsed().as_secs_f64(),
+    );
 
     Ok(CommitOutcome {
         thread,

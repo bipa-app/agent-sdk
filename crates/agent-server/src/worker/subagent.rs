@@ -1212,6 +1212,43 @@ pub async fn execute_subagent_task(
     deps: &SubagentResultDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SubagentTaskOutcome> {
+    #[cfg(feature = "otel")]
+    let started_at = std::time::Instant::now();
+
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global()
+        .record_task_acquired(crate::observability::attrs::KIND_SUBAGENT);
+
+    // Box-pin the inner future so the outer function's state
+    // machine stays small enough that clippy::large_futures does
+    // not fire on every test that drives subagent execution.
+    let result = Box::pin(execute_subagent_task_inner(bootstrap, deps, now)).await;
+
+    #[cfg(feature = "otel")]
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        let outcome = match &result {
+            Ok(_) => crate::observability::attrs::OUTCOME_DONE,
+            Err(_) => crate::observability::attrs::OUTCOME_ERROR,
+        };
+        metrics.record_task_execution(
+            crate::observability::attrs::KIND_SUBAGENT,
+            outcome,
+            started_at.elapsed().as_secs_f64(),
+        );
+    }
+
+    result
+}
+
+/// Inner body of [`execute_subagent_task`]. Kept separate so the
+/// outer function can wrap the entire call in a metric-recording
+/// shim without threading a stopwatch through every early return.
+async fn execute_subagent_task_inner(
+    bootstrap: SubagentTaskBootstrap,
+    deps: &SubagentResultDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SubagentTaskOutcome> {
     let subagent_result = materialize_terminal_subagent_result(&bootstrap, deps, now).await?;
     let tool_result = build_parent_tool_result(&subagent_result).context("build tool result")?;
     let result_payload =

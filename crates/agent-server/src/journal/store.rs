@@ -2267,6 +2267,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
 
         drop(inner);
+
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_lease_expiry_outcomes(&released);
+
         Ok(released)
     }
 

@@ -21,14 +21,20 @@ time = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
 
 [features]
 # Exposes in-crate test doubles (e.g. `CapturingThreadEventsWatchHandler`)
 # to downstream `[dev-dependencies]`.  Never enable on a release build.
 test-support = []
+# Compiles the `observability` module and wires every metric emit-site.
+# Default builds remain dependency-free.
+otel = ["dep:opentelemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -377,6 +377,50 @@ pub async fn execute_root_turn(
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<RootTurnOutcome> {
+    #[cfg(feature = "otel")]
+    let started_at = std::time::Instant::now();
+
+    // Box-pin the inner future to keep the outer function's state
+    // machine small — without this, clippy::large_futures fires on
+    // every test that calls execute_root_turn because the outer
+    // future stores both itself and the inner future inline.
+    let result = Box::pin(execute_root_turn_inner(
+        inputs,
+        user_prompt,
+        provider,
+        deps,
+        now,
+    ))
+    .await;
+
+    #[cfg(feature = "otel")]
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        let outcome = match &result {
+            Ok(RootTurnOutcome::Completed { .. }) => crate::observability::attrs::OUTCOME_DONE,
+            Ok(RootTurnOutcome::Suspended { .. }) => crate::observability::attrs::OUTCOME_SUSPENDED,
+            Err(_) => crate::observability::attrs::OUTCOME_ERROR,
+        };
+        metrics.record_task_execution(
+            crate::observability::attrs::KIND_ROOT,
+            outcome,
+            started_at.elapsed().as_secs_f64(),
+        );
+    }
+
+    result
+}
+
+/// Inner body of [`execute_root_turn`].  Kept separate so the outer
+/// function can wrap the entire call in a metric-recording shim
+/// without having to thread a stopwatch through every early return.
+async fn execute_root_turn_inner(
+    inputs: RootWorkerInputs,
+    user_prompt: &str,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
 
@@ -384,6 +428,10 @@ pub async fn execute_root_turn(
     let attempt = open_attempt(&inputs, definition, user_prompt, deps.attempt_store, now)
         .await
         .context("open turn attempt")?;
+
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global()
+        .record_task_acquired(crate::observability::attrs::KIND_ROOT);
 
     // 2. Commit the `Start` event NOW, before streaming begins, so
     //    later TextDelta / ThinkingDelta events have a parent in the

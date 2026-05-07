@@ -118,6 +118,8 @@
 #![forbid(unsafe_code)]
 
 pub mod journal;
+#[cfg(feature = "otel")]
+pub mod observability;
 pub mod worker;
 
 pub use journal::{
