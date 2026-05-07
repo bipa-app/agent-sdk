@@ -72,6 +72,8 @@ pub mod health;
 pub mod host;
 pub mod http_health;
 pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod observability;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod proto;

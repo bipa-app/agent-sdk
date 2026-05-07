@@ -493,6 +493,26 @@ impl StoreRegistry {
         })
     }
 
+    /// Borrow the underlying Postgres connection pool, if the
+    /// registry is backed by Postgres.
+    ///
+    /// Returns `None` for in-memory and `SQLite` backends. Used by
+    /// the host's observability bootstrap (Phase 9 · B5) to install
+    /// `db.pool.connections.{active,idle}` gauges. Default builds
+    /// (without `feature = "otel"`) never need to call this — the
+    /// accessor is feature-gated to avoid leaking the sqlx type
+    /// into builds that don't want the metric pipeline.
+    #[cfg(all(feature = "postgres", feature = "otel"))]
+    #[must_use]
+    pub fn postgres_pool(&self) -> Option<&sqlx::PgPool> {
+        match &self.backend {
+            RegistryBackend::Postgres(backend) => Some(backend.store.pool()),
+            RegistryBackend::InMemory => None,
+            #[cfg(feature = "sqlite")]
+            RegistryBackend::Sqlite => None,
+        }
+    }
+
     /// Build a [`agent_server::worker::root_turn::RootTurnDeps`] from
     /// the registry's stores.
     ///

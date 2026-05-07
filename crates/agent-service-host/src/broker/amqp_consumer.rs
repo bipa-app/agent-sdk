@@ -357,6 +357,12 @@ impl AmqpTaskWakeupConsumer {
         let routing_key = delivery.routing_key.as_str().to_owned();
         let delivery_tag = delivery.delivery_tag;
 
+        // Phase 9 · B5: time delivery → ack/nack. Recorded once per
+        // delivery so the histogram reflects total round-trip cost
+        // including handler work.
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+
         let payload = match serde_json::from_slice::<TaskWakeupPayload>(&delivery.data) {
             Ok(payload) => payload,
             Err(err) => {
@@ -378,6 +384,12 @@ impl AmqpTaskWakeupConsumer {
                 {
                     warn!(error = %err, "failed to nack undecodeable wakeup delivery");
                 }
+                #[cfg(feature = "otel")]
+                crate::observability::HostMetrics::global().record_amqp_consume(
+                    &routing_key,
+                    started_at.elapsed().as_secs_f64(),
+                    false,
+                );
                 return;
             }
         };
@@ -404,6 +416,12 @@ impl AmqpTaskWakeupConsumer {
                         "failed to ack wakeup delivery after re-check"
                     );
                 }
+                #[cfg(feature = "otel")]
+                crate::observability::HostMetrics::global().record_amqp_consume(
+                    &routing_key,
+                    started_at.elapsed().as_secs_f64(),
+                    true,
+                );
             }
             Err(err) => {
                 warn!(
@@ -429,6 +447,12 @@ impl AmqpTaskWakeupConsumer {
                         "failed to nack wakeup delivery; broker may redeliver on reconnect",
                     );
                 }
+                #[cfg(feature = "otel")]
+                crate::observability::HostMetrics::global().record_amqp_consume(
+                    &routing_key,
+                    started_at.elapsed().as_secs_f64(),
+                    false,
+                );
             }
         }
     }

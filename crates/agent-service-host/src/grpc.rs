@@ -1170,29 +1170,23 @@ impl GrpcTransport {
             }
         });
 
-        Server::builder()
-            // HTTP/2 keepalive — without these, a long-running
-            // streaming RPC with no in-flight frames (the agent
-            // host's `stream_thread_events` while a tool call is
-            // executing, a subagent is suspended, a model is
-            // thinking) gets reaped by the OS or any intermediary
-            // after a few minutes silent and the client surfaces
-            // it as "stream ended before any frame".  The pings
-            // both keep the connection alive *and* let either side
-            // detect a dead peer within ~`ping + timeout` instead
-            // of waiting for a TCP-level RST that may never come
-            // on a half-open connection.
-            //
-            // 20 s ping cadence is conservative — fast enough to
-            // detect dead peers within one client backoff cycle,
-            // slow enough to add ~3 frames/min of overhead even in
-            // the worst case.  10 s timeout means a missing PONG
-            // closes the stream within 30 s, before most idle-
-            // reaper deadlines.  60 s TCP keepalive is the OS-level
-            // backstop for stacks that don't honor HTTP/2 PING.
+        // Phase 9 · B5: stamp `rpc.server.duration` on every
+        // inbound call when the `otel` feature is on. The cfg
+        // gate keeps the default build dependency-free; the layer
+        // call is identical in either case.
+        #[cfg(feature = "otel")]
+        let mut server = Server::builder()
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
             .tcp_keepalive(Some(std::time::Duration::from_mins(1)))
+            .layer(crate::observability::grpc_layer::MetricsLayer::new());
+        #[cfg(not(feature = "otel"))]
+        let mut server = Server::builder()
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+            .tcp_keepalive(Some(std::time::Duration::from_mins(1)));
+
+        server
             .add_service(health_service)
             .add_service(AgentControlServiceServer::new(control_service))
             .add_service(AgentEventServiceServer::new(event_service))
