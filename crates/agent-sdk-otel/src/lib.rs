@@ -29,6 +29,7 @@
 //! `agent-sdk-otel`.
 
 mod config;
+mod propagator;
 mod resource;
 mod sampler;
 
@@ -36,10 +37,11 @@ use anyhow::{Context, Result};
 use opentelemetry::global;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
 pub use config::{OtelConfig, OtelConfigBuilder};
+pub use propagator::AllowListBaggagePropagator;
 pub use sampler::SamplerKind;
 
 /// Drop guard returned by [`install_global_provider`].
@@ -149,12 +151,20 @@ pub fn install_global_provider(cfg: &OtelConfig) -> Result<OtelGuard> {
     global::set_tracer_provider(tracer_provider.clone());
     global::set_meter_provider(meter_provider.clone());
 
-    // TODO(C3): wrap the BaggagePropagator with an allow-list so only the
-    // keys in `cfg.propagated_baggage_keys` ever leave the process.
-    let _ = &cfg.propagated_baggage_keys;
+    // Phase 9 · C3: wrap the upstream `BaggagePropagator` with an
+    // exact-match allow-list so non-allow-listed baggage entries
+    // never leave the process. An empty
+    // `cfg.propagated_baggage_keys` falls back to the SDK baseline
+    // (the five keys from `agent_sdk::observability::baggage`).
+    let baggage_keys = if cfg.propagated_baggage_keys.is_empty() {
+        AllowListBaggagePropagator::baseline_allow_list()
+    } else {
+        cfg.propagated_baggage_keys.clone()
+    };
+    let baggage_propagator = AllowListBaggagePropagator::new(baggage_keys);
     let propagator = opentelemetry::propagation::TextMapCompositePropagator::new(vec![
         Box::new(TraceContextPropagator::new()),
-        Box::new(BaggagePropagator::new()),
+        Box::new(baggage_propagator),
     ]);
     global::set_text_map_propagator(propagator);
 
