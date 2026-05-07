@@ -172,6 +172,15 @@ message ForkThreadResponse {
   uint32 fork_after_committed_turns = 5;
 }
 
+// Atomicity (durable backends): the fork-state copy is wrapped in
+// one transaction via `ThreadStore::atomic_fork_committer`. A crash
+// or transport failure mid-fork leaves the destination thread in
+// the not-created state — never partially-built. Backends without
+// the hook (in-memory) fall back to sequential writes; their
+// per-store mutations are already serialized under independent
+// write locks, so partial state is observable in-process but not
+// across restarts (in-memory state evaporates on restart anyway).
+
 message DecideConfirmationRequest {
   // Caller-supplied idempotency key for the logical confirmation decision.
   string request_id = 1;

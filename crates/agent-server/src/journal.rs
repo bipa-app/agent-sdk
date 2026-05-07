@@ -571,6 +571,7 @@ pub mod event_repository;
 pub mod event_stream;
 pub mod execution_context;
 pub mod execution_intent;
+pub mod fork_transaction;
 pub mod live_tail;
 #[cfg(test)]
 mod live_tail_test;

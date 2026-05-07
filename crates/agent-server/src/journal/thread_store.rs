@@ -59,6 +59,22 @@ pub trait ThreadStore: Send + Sync {
         None
     }
 
+    /// Optional backend-specific hook that can copy a thread's
+    /// committed state onto a freshly-minted destination thread
+    /// inside one durable transaction.
+    ///
+    /// Used by `agent.service.v1.AgentControlService.ForkThread` to
+    /// guarantee that a partial fork (aggregate written, projection
+    /// rewritten, but events / checkpoint never landed) is impossible
+    /// to observe. In-memory stores leave this as `None` because the
+    /// per-store mutations are already serialized under their own
+    /// write locks; durable SQL backends implement it via a single
+    /// transaction wrapping the entire write set.
+    #[must_use]
+    fn atomic_fork_committer(&self) -> Option<&dyn super::fork_transaction::AtomicForkCommitter> {
+        None
+    }
+
     /// Return the thread row, creating it if it does not exist.
     ///
     /// Idempotent: if the row already exists, returns it unchanged.

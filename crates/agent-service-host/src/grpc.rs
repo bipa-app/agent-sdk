@@ -10,6 +10,7 @@ use agent_sdk_core::llm::{self, ContentBlock, ContentSource};
 use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
+use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
     TaskStatus as JournalTaskStatus, WorkerId,
@@ -447,34 +448,32 @@ impl GrpcControlService {
     ///
     /// Returns `(message_count, event_count)` for the response.
     ///
-    /// Pipeline:
+    /// # Pipeline
     ///
-    /// 1. Bootstrap the destination's thread aggregate + projection
-    ///    so `GetThread` / `GetThreadMessages` succeed even before
-    ///    any content is copied.
-    /// 2. Locate the source's checkpoint at `turn_number =
-    ///    fork_after`. Use its `messages` as the seed for the
-    ///    destination's projection (`replace_history`). This is the
-    ///    canonical per-turn message snapshot — exactly what
-    ///    `recover_thread` would observe at that turn boundary.
-    /// 3. Mirror the source's `committed_turns` count by replaying
-    ///    `commit_turn(zero_usage)` `fork_after` times. The thread
-    ///    aggregate's other counters (`total_usage`, etc.) start fresh
-    ///    on the fork; the source's accumulated usage isn't
-    ///    meaningful on a divergent thread.
-    /// 4. Mirror the checkpoint with the snapshot's `thread_id`
-    ///    rewritten to the destination so the staged state store's
-    ///    bound-thread guard accepts it on the next save.
-    /// 5. Re-commit events whose committed turn `<= fork_after`. The
-    ///    event log carries `Done` events with cumulative
-    ///    `total_turns`; the cutoff is the highest sequence whose
-    ///    `Done.total_turns <= fork_after`. Events after the cutoff
-    ///    (in-flight or future turns of the source) are dropped.
+    /// 1. Read the source's projection state at the fork boundary
+    ///    (the per-turn checkpoint at `turn_number = fork_after`),
+    ///    along with every event whose enclosing turn is `<=
+    ///    fork_after`. The reads are pure queries — no destination
+    ///    state is mutated yet, so a failure here leaves nothing
+    ///    behind.
+    /// 2. Build a [`ForkCommitParams`] that bundles every write the
+    ///    destination needs (thread aggregate, projection,
+    ///    checkpoint, events) under one consistent `now` timestamp.
+    /// 3. Dispatch to the backend's optional
+    ///    [`AtomicForkCommitter`](agent_server::journal::fork_transaction::AtomicForkCommitter)
+    ///    if it's exposed on the active [`ThreadStore`]. Durable
+    ///    backends (`SQLite`, `Postgres`) wrap the entire write set in
+    ///    one transaction so a crash mid-fork can never leave a
+    ///    partially-built destination thread visible. Backends that
+    ///    don't expose the hook (in-memory) fall back to running the
+    ///    same writes sequentially through the per-store trait
+    ///    methods — partial state is observable in-process but
+    ///    in-memory state evaporates on restart anyway, so the gap
+    ///    is closed for production deployments.
     ///
-    /// `fork_after == 0` short-circuits steps 2–5 entirely: the new
-    /// thread is created bare (no messages, no checkpoint, no
-    /// events) — the same shape `CreateThread` produces. This is the
-    /// right behaviour for "branch from the very beginning".
+    /// `fork_after == 0` short-circuits steps 1–3 of the read phase
+    /// — the destination is created bare (thread aggregate +
+    /// empty projection only). Same shape as `CreateThread`.
     async fn copy_thread_state(
         &self,
         source_thread_id: &ThreadId,
@@ -482,29 +481,54 @@ impl GrpcControlService {
         fork_after: u32,
         now: OffsetDateTime,
     ) -> Result<(u64, u64), Status> {
-        // 1. Bootstrap thread aggregate + projection.
-        self.shared
-            .stores
-            .thread_store
-            .get_or_create(new_thread_id, now)
-            .await
-            .map_err(internal_status("creating forked thread"))?;
-        self.shared
-            .stores
-            .message_store
-            .get_or_create(new_thread_id, now)
-            .await
-            .map_err(internal_status("creating forked message projection"))?;
+        let params = self
+            .build_fork_commit_params(source_thread_id, new_thread_id, fork_after, now)
+            .await?;
+        let message_count = params.messages.len() as u64;
+        let event_count = params.events.len() as u64;
 
-        if fork_after == 0 {
-            // Empty fork — caller wants a fresh thread. Skip every
-            // copy step. The thread aggregate's `committed_turns`
-            // stays at 0 and the projection / event log stay empty.
-            return Ok((0, 0));
+        // Prefer the atomic hook when the backend exposes one. This
+        // is the load-bearing case: durable SQL backends commit the
+        // entire fork write set under one transaction so
+        // mid-operation failures can't leave a half-built
+        // destination thread observable to the next reader.
+        if let Some(committer) = self.shared.stores.thread_store.atomic_fork_committer() {
+            committer
+                .commit_fork_atomic(params)
+                .await
+                .map_err(internal_status("atomic fork commit"))?;
+        } else {
+            self.commit_fork_sequential(params).await?;
         }
 
-        // 2. Find the source checkpoint at the fork-point turn and
-        //    seed the projection from its messages snapshot.
+        Ok((message_count, event_count))
+    }
+
+    /// Read source state at the fork boundary and assemble the
+    /// [`ForkCommitParams`] the atomic committer (or the sequential
+    /// fallback) consumes. This phase is read-only on the source —
+    /// no destination state is mutated until either commit path
+    /// runs.
+    async fn build_fork_commit_params(
+        &self,
+        source_thread_id: &ThreadId,
+        new_thread_id: &ThreadId,
+        fork_after: u32,
+        now: OffsetDateTime,
+    ) -> Result<ForkCommitParams, Status> {
+        if fork_after == 0 {
+            // Empty fork — no projection, no checkpoint, no events.
+            return Ok(ForkCommitParams {
+                new_thread_id: new_thread_id.clone(),
+                now,
+                committed_turns: 0,
+                messages: Vec::new(),
+                checkpoint: None,
+                events: Vec::new(),
+            });
+        }
+
+        // Locate the source's checkpoint at the fork boundary.
         let checkpoint = self
             .shared
             .stores
@@ -519,56 +543,14 @@ impl GrpcControlService {
                     source_thread_id.0, fork_after,
                 ))
             })?;
-        let message_count = checkpoint.messages.len() as u64;
-        if !checkpoint.messages.is_empty() {
-            self.shared
-                .stores
-                .message_store
-                .replace_history(new_thread_id, checkpoint.messages.clone(), now)
-                .await
-                .map_err(internal_status("seeding forked message history"))?;
-        }
 
-        // 3. Mirror `committed_turns`.
-        for _ in 0..checkpoint.turn_number {
-            self.shared
-                .stores
-                .thread_store
-                .commit_turn(new_thread_id, &TokenUsage::default(), now)
-                .await
-                .map_err(internal_status(
-                    "mirroring source committed_turns onto fork",
-                ))?;
-        }
-
-        // 4. Mirror the checkpoint with the snapshot rewritten to
-        //    the destination's thread_id.
+        // Rewrite the snapshot so the staged state store's
+        // bound-thread guard accepts it on the destination.
         let agent_state_snapshot =
             rewrite_state_snapshot_thread_id(&checkpoint.agent_state_snapshot, new_thread_id)
                 .map_err(internal_status("rewriting forked agent_state_snapshot"))?;
-        self.shared
-            .stores
-            .checkpoint_store
-            .commit_checkpoint(NewCheckpointParams {
-                thread_id: new_thread_id.clone(),
-                turn_number: checkpoint.turn_number,
-                task_id: checkpoint.task_id.clone(),
-                messages: checkpoint.messages,
-                agent_state_snapshot,
-                turn_usage: checkpoint.turn_usage,
-                now,
-            })
-            .await
-            .map_err(internal_status("seeding forked checkpoint"))?;
 
-        // 5. Re-commit events whose committed turn `<= fork_after`.
-        //    Walk the source's events in sequence order, tracking
-        //    the running `total_turns` from `Done` events; cut at
-        //    the last `Done` with `total_turns == fork_after`. A
-        //    fork point higher than every `Done.total_turns` in the
-        //    source isn't possible here — `fork_after <=
-        //    source.committed_turns` is enforced upstream and every
-        //    committed turn writes a matching `Done`.
+        // Read source events whose enclosing turn `<= fork_after`.
         let source_events = self
             .shared
             .stores
@@ -576,7 +558,7 @@ impl GrpcControlService {
             .get_events(source_thread_id)
             .await
             .map_err(internal_status("loading source events for fork"))?;
-        let payloads: Vec<_> = source_events
+        let events: Vec<_> = source_events
             .into_iter()
             .take_while(|committed| {
                 turn_number_for_event(&committed.event)
@@ -584,17 +566,87 @@ impl GrpcControlService {
             })
             .map(|committed| committed.event)
             .collect();
-        let event_count = payloads.len() as u64;
-        if !payloads.is_empty() {
+
+        Ok(ForkCommitParams {
+            new_thread_id: new_thread_id.clone(),
+            now,
+            committed_turns: checkpoint.turn_number,
+            messages: checkpoint.messages.clone(),
+            checkpoint: Some(NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: checkpoint.turn_number,
+                task_id: checkpoint.task_id.clone(),
+                messages: checkpoint.messages,
+                agent_state_snapshot,
+                turn_usage: checkpoint.turn_usage,
+                now,
+            }),
+            events,
+        })
+    }
+
+    /// Sequential fallback for backends that don't expose
+    /// [`AtomicForkCommitter`].
+    ///
+    /// Mirrors what the atomic path does, but invokes the per-store
+    /// trait methods one at a time. Without a transaction, a failure
+    /// midway leaves a partially-built thread visible — the in-memory
+    /// reference store doesn't care because process restart wipes all
+    /// state, and durable backends bypass this fallback by exposing
+    /// the atomic hook.
+    async fn commit_fork_sequential(&self, params: ForkCommitParams) -> Result<(), Status> {
+        // Bootstrap the destination's aggregate + projection rows.
+        self.shared
+            .stores
+            .thread_store
+            .get_or_create(&params.new_thread_id, params.now)
+            .await
+            .map_err(internal_status("creating forked thread"))?;
+        self.shared
+            .stores
+            .message_store
+            .get_or_create(&params.new_thread_id, params.now)
+            .await
+            .map_err(internal_status("creating forked message projection"))?;
+
+        if !params.messages.is_empty() {
+            self.shared
+                .stores
+                .message_store
+                .replace_history(&params.new_thread_id, params.messages, params.now)
+                .await
+                .map_err(internal_status("seeding forked message history"))?;
+        }
+
+        for _ in 0..params.committed_turns {
+            self.shared
+                .stores
+                .thread_store
+                .commit_turn(&params.new_thread_id, &TokenUsage::default(), params.now)
+                .await
+                .map_err(internal_status(
+                    "mirroring source committed_turns onto fork",
+                ))?;
+        }
+
+        if let Some(checkpoint) = params.checkpoint {
+            self.shared
+                .stores
+                .checkpoint_store
+                .commit_checkpoint(checkpoint)
+                .await
+                .map_err(internal_status("seeding forked checkpoint"))?;
+        }
+
+        if !params.events.is_empty() {
             self.shared
                 .stores
                 .event_repo
-                .commit_event_batch(new_thread_id, payloads, now)
+                .commit_event_batch(&params.new_thread_id, params.events, params.now)
                 .await
                 .map_err(internal_status("re-committing events on forked thread"))?;
         }
-
-        Ok((message_count, event_count))
+        Ok(())
     }
 
     /// Replay a recorded `ForkThread` outcome under the same
