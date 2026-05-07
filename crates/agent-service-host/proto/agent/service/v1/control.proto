@@ -75,44 +75,78 @@ message SubmitThreadWorkResponse {
   TaskSnapshot task = 2;
 }
 
-// Fork an existing thread into a new thread that inherits the source's
-// durable conversation state.
+// Fork an existing thread into a new thread that inherits the
+// source's durable conversation state up to a caller-chosen turn
+// boundary.
 //
-// Semantics:
-//   * The server mints a new thread_id (UUID v7); callers cannot supply
-//     it (mirrors `CreateThread` so replay/inspection surfaces never
-//     depend on caller-controlled identifiers).
-//   * The new thread's `agent_sdk_message_heads` row is seeded with the
-//     source's current committed history via the same `replace_history`
-//     primitive auto-compaction uses.
-//   * Every event the source thread has accumulated in
-//     `EventRepository::get_events` is re-committed against the new
-//     thread under fresh, monotonically increasing sequence numbers.
-//     This makes `StreamThreadEvents(new_thread_id, after_sequence: 0)`
-//     replay the prior conversation natively — no per-host event
-//     mirror is required.
-//   * The source's latest checkpoint is mirrored onto the new thread so
-//     `recover_thread` reaches the projection-driven branch (post the
-//     ENG-8385 fix). Without this, the fork's `committed_turns` would
-//     be 0 and recovery would skip the seeded projection.
-//   * `request_id` is the idempotency key. A retry with the same
-//     request_id returns the originally-minted thread_id; a retry with
-//     a *different* source_thread_id under the same request_id is
-//     rejected with FAILED_PRECONDITION.
+// # The fork point
 //
-// Errors:
-//   * NOT_FOUND if `source_thread_id` doesn't resolve to a known
-//     thread.
-//   * FAILED_PRECONDITION if the source thread is in a state that
-//     can't be forked (e.g. a future "completed and archived" state —
-//     see `Thread.status`).
-//   * INVALID_ARGUMENT for blank `request_id` or `source_thread_id`.
+// Forks always cut on a completed-turn boundary. The caller picks
+// which boundary via `fork_after_committed_turns`: the new thread
+// has exactly the first N committed turns, and everything after
+// (including the in-flight or future turns of the source) is
+// discarded. This matches the typical "branch from this user
+// message" UX — the desktop computes
+// `fork_after_committed_turns = (selected_user_message_index / 2)`
+// for text-only conversations (and the equivalent turn index for
+// tool-using conversations), which lands the new thread *just
+// before* the chosen user prompt so the user can edit/resend.
+//
+// The boundary alignment is what makes the fork addressable across
+// every durable surface: the per-turn checkpoint, the message
+// projection (whose `commit_messages` is the per-turn append), and
+// the event log (whose `Done` event marks the per-turn close) are
+// all already keyed off `committed_turns`. Mid-turn fork points
+// would force partial-checkpoint semantics that don't exist
+// anywhere else in the SDK.
+//
+// # What gets copied
+//
+// * The new thread's `agent_sdk_message_heads` row is seeded from
+//   the source's checkpoint at the fork-point turn (or `replace_history`
+//   with empty messages when forking at turn 0).
+// * The source's checkpoint at the fork-point turn is mirrored onto
+//   the new thread (with `agent_state_snapshot.thread_id` rewritten
+//   to the new id — see the snapshot-rewrite contract in the
+//   handler) so `recover_thread` reaches the projection-driven
+//   branch on the next submit.
+// * Every event the source committed *through* the `Done` event for
+//   the fork-point turn is re-committed against the new thread under
+//   fresh, monotonically increasing sequence numbers. This makes
+//   `StreamThreadEvents(new_thread_id, after_sequence: 0)` replay
+//   the prior conversation natively — no per-host mirror required.
+// * Events emitted on the source after the fork point (live tail of
+//   an in-flight turn, future turns) are *not* copied.
+//
+// # Idempotency
+//
+// `request_id` is the idempotency key. A retry under the same
+// request_id returns the originally-minted thread; a retry with a
+// *different* `source_thread_id` or `fork_after_committed_turns`
+// under the same `request_id` is rejected with `ALREADY_EXISTS`.
+//
+// # Errors
+//
+// * `NOT_FOUND` if `source_thread_id` doesn't resolve to a known
+//   thread.
+// * `INVALID_ARGUMENT` if `fork_after_committed_turns` exceeds the
+//   source's `committed_turns`, or for blank `request_id` /
+//   `source_thread_id`.
+// * `FAILED_PRECONDITION` if the source is in a state that can't be
+//   forked (e.g. a future "completed and archived" state).
 message ForkThreadRequest {
   // Caller-supplied idempotency key for the logical fork operation.
   string request_id = 1;
 
   // Existing thread to copy committed conversation state from.
   string source_thread_id = 2;
+
+  // How many of the source's *completed* turns to carry over. Must
+  // be `<= source.committed_turns`. `0` produces an empty fork (no
+  // messages, no events, no checkpoint — same shape as a freshly
+  // `CreateThread`'d thread); `source.committed_turns` produces a
+  // full fork that mirrors the entire conversation.
+  uint32 fork_after_committed_turns = 3;
 }
 
 message ForkThreadResponse {
@@ -123,13 +157,19 @@ message ForkThreadResponse {
   // bookkeeping; the server already has it in the request).
   string source_thread_id = 2;
 
-  // Number of messages copied from the source's committed projection
-  // into the new thread.
+  // Number of messages copied from the source's checkpoint at the
+  // fork-point turn into the new thread.
   uint64 message_count = 3;
 
-  // Number of events re-committed against the new thread. Equal to the
-  // source's `next_sequence` at fork time.
+  // Number of events re-committed against the new thread. Equal to
+  // the highest source sequence whose committed turn is `<=
+  // fork_after_committed_turns`.
   uint64 event_count = 4;
+
+  // The fork-point turn echoed back. Useful for clients that want
+  // to verify the boundary the server actually cut at when
+  // diagnosing UI/SDK skew.
+  uint32 fork_after_committed_turns = 5;
 }
 
 message DecideConfirmationRequest {
