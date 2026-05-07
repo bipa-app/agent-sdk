@@ -75,6 +75,63 @@ message SubmitThreadWorkResponse {
   TaskSnapshot task = 2;
 }
 
+// Fork an existing thread into a new thread that inherits the source's
+// durable conversation state.
+//
+// Semantics:
+//   * The server mints a new thread_id (UUID v7); callers cannot supply
+//     it (mirrors `CreateThread` so replay/inspection surfaces never
+//     depend on caller-controlled identifiers).
+//   * The new thread's `agent_sdk_message_heads` row is seeded with the
+//     source's current committed history via the same `replace_history`
+//     primitive auto-compaction uses.
+//   * Every event the source thread has accumulated in
+//     `EventRepository::get_events` is re-committed against the new
+//     thread under fresh, monotonically increasing sequence numbers.
+//     This makes `StreamThreadEvents(new_thread_id, after_sequence: 0)`
+//     replay the prior conversation natively — no per-host event
+//     mirror is required.
+//   * The source's latest checkpoint is mirrored onto the new thread so
+//     `recover_thread` reaches the projection-driven branch (post the
+//     ENG-8385 fix). Without this, the fork's `committed_turns` would
+//     be 0 and recovery would skip the seeded projection.
+//   * `request_id` is the idempotency key. A retry with the same
+//     request_id returns the originally-minted thread_id; a retry with
+//     a *different* source_thread_id under the same request_id is
+//     rejected with FAILED_PRECONDITION.
+//
+// Errors:
+//   * NOT_FOUND if `source_thread_id` doesn't resolve to a known
+//     thread.
+//   * FAILED_PRECONDITION if the source thread is in a state that
+//     can't be forked (e.g. a future "completed and archived" state —
+//     see `Thread.status`).
+//   * INVALID_ARGUMENT for blank `request_id` or `source_thread_id`.
+message ForkThreadRequest {
+  // Caller-supplied idempotency key for the logical fork operation.
+  string request_id = 1;
+
+  // Existing thread to copy committed conversation state from.
+  string source_thread_id = 2;
+}
+
+message ForkThreadResponse {
+  // Snapshot of the freshly-minted thread.
+  ThreadView thread = 1;
+
+  // Source thread the fork was derived from (echoed for client
+  // bookkeeping; the server already has it in the request).
+  string source_thread_id = 2;
+
+  // Number of messages copied from the source's committed projection
+  // into the new thread.
+  uint64 message_count = 3;
+
+  // Number of events re-committed against the new thread. Equal to the
+  // source's `next_sequence` at fork time.
+  uint64 event_count = 4;
+}
+
 message DecideConfirmationRequest {
   // Caller-supplied idempotency key for the logical confirmation decision.
   string request_id = 1;
@@ -120,6 +177,12 @@ service AgentControlService {
 
   // Submit the next unit of client work to an existing thread.
   rpc SubmitThreadWork(SubmitThreadWorkRequest) returns (SubmitThreadWorkResponse);
+
+  // Fork an existing thread into a new thread carrying the same
+  // committed conversation state (messages + events + latest
+  // checkpoint). The new thread diverges from the source on the next
+  // submission.
+  rpc ForkThread(ForkThreadRequest) returns (ForkThreadResponse);
 
   // Apply a durable confirmation decision to an awaiting task.
   rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);

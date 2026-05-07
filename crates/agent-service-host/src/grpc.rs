@@ -8,6 +8,7 @@ use std::sync::Arc;
 use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::llm::{self, ContentBlock, ContentSource};
 use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
@@ -80,6 +81,7 @@ struct IdempotencyState {
     create_thread: HashMap<String, String>,
     submit_work: HashMap<String, SubmitWorkRecord>,
     decide_confirmation: HashMap<String, DecideConfirmationRecord>,
+    fork_thread: HashMap<String, ForkThreadRecord>,
 }
 
 #[derive(Clone)]
@@ -87,6 +89,20 @@ struct SubmitWorkRecord {
     fingerprint: Vec<u8>,
     thread_id: String,
     task_id: String,
+}
+
+#[derive(Clone)]
+struct ForkThreadRecord {
+    /// Source thread id the original call forked from. A retry that
+    /// repeats the same `request_id` against a *different* source is
+    /// rejected with `FAILED_PRECONDITION` rather than silently
+    /// returning the original fork — same shape as
+    /// `SubmitThreadWork`'s fingerprint guard.
+    source_thread_id: String,
+    /// The thread id minted by the original call. Returned verbatim on
+    /// any retry so clients can treat `ForkThread` as
+    /// at-least-once-safe.
+    new_thread_id: String,
 }
 
 #[derive(Clone)]
@@ -420,6 +436,180 @@ struct GrpcEventService {
 }
 
 impl GrpcControlService {
+    /// Copy the source thread's durable state onto the freshly-minted
+    /// destination thread.
+    ///
+    /// Bootstraps the destination's thread aggregate + message
+    /// projection, mirrors the source's committed message history,
+    /// the source's latest checkpoint (with the snapshot's
+    /// `thread_id` rewritten to the destination), the matching
+    /// `committed_turns` count, and re-commits every event under the
+    /// destination thread so `StreamThreadEvents` replay works
+    /// natively. The order is load-bearing — see the inline comments
+    /// at each step.
+    async fn copy_thread_state(
+        &self,
+        source_thread_id: &ThreadId,
+        new_thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<(u64, u64), Status> {
+        // 1. Bootstrap thread aggregate + projection so `GetThread` /
+        //    `GetThreadMessages` succeed for the new id even before
+        //    we start copying content.
+        self.shared
+            .stores
+            .thread_store
+            .get_or_create(new_thread_id, now)
+            .await
+            .map_err(internal_status("creating forked thread"))?;
+        self.shared
+            .stores
+            .message_store
+            .get_or_create(new_thread_id, now)
+            .await
+            .map_err(internal_status("creating forked message projection"))?;
+
+        // 2. Mirror the source's message projection. `replace_history`
+        //    is the same primitive auto-compaction uses, so the
+        //    projection rewrite shares the durability contract the
+        //    rest of the SDK already validates.
+        let source_messages = self
+            .shared
+            .stores
+            .message_store
+            .get_history(source_thread_id)
+            .await
+            .map_err(internal_status("loading source message history for fork"))?;
+        let message_count = source_messages.len() as u64;
+        if !source_messages.is_empty() {
+            self.shared
+                .stores
+                .message_store
+                .replace_history(new_thread_id, source_messages, now)
+                .await
+                .map_err(internal_status("seeding forked message history"))?;
+        }
+
+        // 3. Mirror the source's latest checkpoint. Without this the
+        //    fork's `committed_turns` would be 0 and `recover_thread`
+        //    would skip the seeded projection on the next turn (post
+        //    ENG-8385's projection-driven recovery).
+        if let Some(checkpoint) = self
+            .shared
+            .stores
+            .checkpoint_store
+            .get_latest_by_thread(source_thread_id)
+            .await
+            .map_err(internal_status("loading source checkpoint for fork"))?
+        {
+            for _ in 0..checkpoint.turn_number {
+                self.shared
+                    .stores
+                    .thread_store
+                    .commit_turn(new_thread_id, &TokenUsage::default(), now)
+                    .await
+                    .map_err(internal_status(
+                        "mirroring source committed_turns onto fork",
+                    ))?;
+            }
+            // Rewrite the snapshot's `thread_id` to the new id. The
+            // staged state store asserts `state.thread_id ==
+            // bound_thread_id` on every save, and the snapshot is
+            // deserialised verbatim — without this rewrite the
+            // agent loop's first save call on the fork's next turn
+            // would trip the bound-thread guard with the source's
+            // id, leaving the turn task stuck.
+            let agent_state_snapshot =
+                rewrite_state_snapshot_thread_id(&checkpoint.agent_state_snapshot, new_thread_id)
+                    .map_err(internal_status("rewriting forked agent_state_snapshot"))?;
+            self.shared
+                .stores
+                .checkpoint_store
+                .commit_checkpoint(NewCheckpointParams {
+                    thread_id: new_thread_id.clone(),
+                    turn_number: checkpoint.turn_number,
+                    task_id: checkpoint.task_id.clone(),
+                    messages: checkpoint.messages.clone(),
+                    agent_state_snapshot,
+                    turn_usage: checkpoint.turn_usage,
+                    now,
+                })
+                .await
+                .map_err(internal_status("seeding forked checkpoint"))?;
+        }
+
+        // 4. Re-commit every event under the new thread id.
+        //    `commit_event_batch` assigns fresh sequences, so
+        //    `StreamThreadEvents(new_thread_id, after_sequence: 0)`
+        //    replays the source's history natively. This step is
+        //    last so a crash mid-fork leaves the new thread in a
+        //    "messages but no events" state recovery treats as an
+        //    empty event log — better than a partial event log with
+        //    sequence holes.
+        let source_events = self
+            .shared
+            .stores
+            .event_repo
+            .get_events(source_thread_id)
+            .await
+            .map_err(internal_status("loading source events for fork"))?;
+        let event_count = source_events.len() as u64;
+        if !source_events.is_empty() {
+            let payloads: Vec<_> = source_events
+                .into_iter()
+                .map(|committed| committed.event)
+                .collect();
+            self.shared
+                .stores
+                .event_repo
+                .commit_event_batch(new_thread_id, payloads, now)
+                .await
+                .map_err(internal_status("re-committing events on forked thread"))?;
+        }
+
+        Ok((message_count, event_count))
+    }
+
+    /// Replay a recorded `ForkThread` outcome under the same
+    /// `request_id`. The source's `message_count` / `event_count` are
+    /// re-derived from the live stores rather than the original
+    /// response — clients that retry minutes after the first call see
+    /// a snapshot consistent with the projection right now, not a
+    /// stale point-in-time count.
+    async fn replay_fork_thread_response(
+        &self,
+        source_thread_id: &ThreadId,
+        record: &ForkThreadRecord,
+    ) -> RpcResult<pb::ForkThreadResponse> {
+        let new_thread_id = ThreadId::from_string(&record.new_thread_id);
+        let message_count = self
+            .shared
+            .stores
+            .message_store
+            .get_history(&new_thread_id)
+            .await
+            .map_err(internal_status(
+                "idempotent fork: load forked message history",
+            ))?
+            .len() as u64;
+        let event_count = self
+            .shared
+            .stores
+            .event_repo
+            .next_sequence(&new_thread_id)
+            .await
+            .map_err(internal_status(
+                "idempotent fork: load forked event sequence",
+            ))?;
+        let _ = source_thread_id;
+        Ok(pb::ForkThreadResponse {
+            thread: Some(self.shared.thread_view(&new_thread_id).await?),
+            source_thread_id: record.source_thread_id.clone(),
+            message_count,
+            event_count,
+        })
+    }
+
     async fn confirmation_response(
         &self,
         task: &AgentTask,
@@ -771,6 +961,65 @@ impl AgentControlService for GrpcControlService {
         Ok(Response::new(pb::SubmitThreadWorkResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
             task: Some(self.shared.task_snapshot(&task).await?),
+        }))
+    }
+
+    async fn fork_thread(
+        &self,
+        request: Request<pb::ForkThreadRequest>,
+    ) -> Result<Response<pb::ForkThreadResponse>, Status> {
+        let request = request.into_inner();
+        require_request_id(&request.request_id)?;
+        let source_thread_id = parse_thread_id(&request.source_thread_id)?;
+
+        // Idempotency replay. A retry under the same request_id must
+        // return the originally-minted thread (with whatever counts
+        // the source has *now*). A retry against a different source
+        // is a contract violation — surface it explicitly rather than
+        // silently aliasing.
+        if let Some(record) = {
+            let idempotency = self.shared.idempotency.lock().await;
+            idempotency.fork_thread.get(&request.request_id).cloned()
+        } {
+            if record.source_thread_id != request.source_thread_id {
+                return Err(idempotency_conflict_status(
+                    "ForkThread",
+                    &request.request_id,
+                ));
+            }
+            let response = self
+                .replay_fork_thread_response(&source_thread_id, &record)
+                .await?;
+            return Ok(Response::new(response));
+        }
+
+        // The source must exist before we mint anything. NOT_FOUND
+        // here matches `GetThread` / `SubmitThreadWork` semantics for
+        // an unknown thread id.
+        self.shared.require_thread(&source_thread_id).await?;
+
+        let now = OffsetDateTime::now_utc();
+        let new_thread_id = ThreadId::new();
+        let (message_count, event_count) = self
+            .copy_thread_state(&source_thread_id, &new_thread_id, now)
+            .await?;
+
+        {
+            let mut idempotency = self.shared.idempotency.lock().await;
+            idempotency.fork_thread.insert(
+                request.request_id,
+                ForkThreadRecord {
+                    source_thread_id: request.source_thread_id.clone(),
+                    new_thread_id: new_thread_id.0.clone(),
+                },
+            );
+        }
+
+        Ok(Response::new(pb::ForkThreadResponse {
+            thread: Some(self.shared.thread_view(&new_thread_id).await?),
+            source_thread_id: request.source_thread_id,
+            message_count,
+            event_count,
         }))
     }
 
@@ -1332,6 +1581,39 @@ fn submit_work_fingerprint(request: &pb::SubmitThreadWorkRequest) -> Vec<u8> {
     let mut request = request.clone();
     request.request_id.clear();
     request.encode_to_vec()
+}
+
+/// Rewrite the `thread_id` field on a JSON `AgentState` snapshot.
+///
+/// The forked thread inherits the source's checkpointed agent state
+/// (`turn_count`, `total_usage`, `metadata`, `created_at`) but lives under a
+/// new thread id. The agent loop's [`StagedStateStore::save`] guard
+/// rejects state writes whose `thread_id` doesn't match the bound
+/// thread, so the snapshot's `thread_id` field has to be rewritten in
+/// place before it lands on the fork's checkpoint. Operating directly
+/// on the JSON keeps the rewrite forward-compatible with new
+/// `AgentState` fields — we only touch the one key we know about.
+///
+/// `Value::Null` snapshots (fresh-thread case) round-trip unchanged,
+/// matching the contract `from_recovery_view` already honours when
+/// the snapshot is null.
+fn rewrite_state_snapshot_thread_id(
+    snapshot: &serde_json::Value,
+    new_thread_id: &ThreadId,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    if snapshot.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let mut snapshot = snapshot.clone();
+    let object = snapshot
+        .as_object_mut()
+        .context("agent_state_snapshot is not a JSON object")?;
+    object.insert(
+        "thread_id".to_string(),
+        serde_json::Value::String(new_thread_id.0.clone()),
+    );
+    Ok(snapshot)
 }
 
 fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> Vec<u8> {
@@ -3049,6 +3331,341 @@ mod tests {
                     .all(|task| task.status == pb::TaskStatus::Completed as i32),
                 "not every task completed after confirmation flow",
             );
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    // ── ForkThread ─────────────────────────────────────────────────
+
+    async fn fork_thread(
+        control: &mut ControlClient,
+        request_id: &str,
+        source_thread_id: &str,
+    ) -> Result<pb::ForkThreadResponse> {
+        let response = control
+            .fork_thread(pb::ForkThreadRequest {
+                request_id: request_id.into(),
+                source_thread_id: source_thread_id.into(),
+            })
+            .await
+            .context("fork_thread rpc")?
+            .into_inner();
+        Ok(response)
+    }
+
+    /// AC1: forking an unknown source thread surfaces `NOT_FOUND`
+    /// without minting any state on the destination.
+    #[tokio::test]
+    async fn fork_thread_returns_not_found_for_unknown_source() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_unused",
+                "unused",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let err = control
+                .fork_thread(pb::ForkThreadRequest {
+                    request_id: "fork-not-found".into(),
+                    source_thread_id: "00000000-0000-7000-8000-000000000000".into(),
+                })
+                .await
+                .expect_err("fork_thread on unknown source must error");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    /// AC2: a successful fork copies the source's committed history,
+    /// re-commits its events, creates a thread aggregate (so
+    /// `GetThread` / `GetThreadMessages` succeed), and is reachable
+    /// via `StreamThreadEvents` replay.
+    #[tokio::test]
+    async fn fork_thread_copies_messages_and_events() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_fork_src",
+                "hello from source",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+
+            // Build a source thread with one committed turn.
+            let source = create_thread(&mut control, "fork-src-create").await?;
+            submit_text_work(&mut control, "fork-src-submit", &source, "hi source").await?;
+            let mut stream =
+                open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
+            let _ = collect_until_closed(&mut stream).await?;
+
+            // Snapshot the source for comparison.
+            let source_messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: source.clone(),
+                })
+                .await
+                .context("get_thread_messages source")?
+                .into_inner()
+                .projection
+                .context("source projection missing")?;
+            assert_eq!(source_messages.messages.len(), 2);
+
+            // Fork it.
+            let fork_response = fork_thread(&mut control, "fork-once", &source).await?;
+            let fork_thread_view = fork_response
+                .thread
+                .as_ref()
+                .context("fork response missing thread view")?
+                .thread
+                .as_ref()
+                .context("fork response missing snapshot")?;
+            let fork_id = fork_thread_view.thread_id.clone();
+            assert_ne!(fork_id, source, "fork must mint a new thread id");
+            assert_eq!(fork_response.source_thread_id, source);
+            assert_eq!(fork_response.message_count, 2);
+            assert!(
+                fork_response.event_count >= 4,
+                "fork event_count should mirror source's committed events; got {}",
+                fork_response.event_count,
+            );
+
+            // GetThreadMessages on the fork must succeed (regression
+            // for the old bip-side fork that forgot to bootstrap the
+            // thread aggregate, leaving GetThreadMessages NOT_FOUND).
+            let fork_messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: fork_id.clone(),
+                })
+                .await
+                .context("get_thread_messages fork")?
+                .into_inner()
+                .projection
+                .context("fork projection missing")?;
+            assert_eq!(fork_messages.messages.len(), source_messages.messages.len());
+            for (left, right) in fork_messages
+                .messages
+                .iter()
+                .zip(source_messages.messages.iter())
+            {
+                assert_eq!(left.role, right.role);
+            }
+
+            // The fork's event log must be replay-able natively —
+            // this is what makes the desktop's "show prior history"
+            // work without any per-host event mirror.
+            let mut fork_stream =
+                open_stream(&mut events, &fork_id, None, pb::FollowMode::ReplayOnly).await?;
+            let fork_items = collect_until_closed(&mut fork_stream).await?;
+            let fork_event_count = fork_items
+                .iter()
+                .filter(|item| matches!(item.item.as_ref(), Some(StreamItem::Event(_))))
+                .count() as u64;
+            assert_eq!(
+                fork_event_count, fork_response.event_count,
+                "stream replay must surface every event the fork response promised",
+            );
+
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    /// AC3: fork is idempotent under the same `request_id`. A retry
+    /// returns the originally-minted thread; mismatched
+    /// `source_thread_id` under the same `request_id` is rejected.
+    #[tokio::test]
+    async fn fork_thread_is_idempotent_under_same_request_id() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_idem",
+                "idempotent fork test",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+
+            let source_a = create_thread(&mut control, "fork-idem-src-a").await?;
+            submit_text_work(&mut control, "fork-idem-submit-a", &source_a, "first").await?;
+            let mut stream = open_stream(
+                &mut events,
+                &source_a,
+                None,
+                pb::FollowMode::ReplayAndFollow,
+            )
+            .await?;
+            let _ = collect_until_closed(&mut stream).await?;
+
+            // First fork mints a thread.
+            let first = fork_thread(&mut control, "fork-idem-key", &source_a).await?;
+            let first_id = first
+                .thread
+                .as_ref()
+                .and_then(|view| view.thread.as_ref())
+                .map(|snapshot| snapshot.thread_id.clone())
+                .context("first fork missing thread id")?;
+
+            // A retry under the same request_id returns the same id —
+            // not a fresh mint.
+            let retry = fork_thread(&mut control, "fork-idem-key", &source_a).await?;
+            let retry_id = retry
+                .thread
+                .as_ref()
+                .and_then(|view| view.thread.as_ref())
+                .map(|snapshot| snapshot.thread_id.clone())
+                .context("retry fork missing thread id")?;
+            assert_eq!(
+                retry_id, first_id,
+                "idempotency replay must reuse thread id"
+            );
+
+            // Same request_id with a different source is a contract
+            // violation — reject loudly.
+            let source_b = create_thread(&mut control, "fork-idem-src-b").await?;
+            let conflict = control
+                .fork_thread(pb::ForkThreadRequest {
+                    request_id: "fork-idem-key".into(),
+                    source_thread_id: source_b.clone(),
+                })
+                .await
+                .expect_err("mismatched source under same request_id must error");
+            assert_eq!(conflict.code(), tonic::Code::AlreadyExists, "{conflict:?}");
+
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    /// AC4: source and fork diverge independently — appending work
+    /// to the fork doesn't mutate the source's committed projection.
+    #[tokio::test]
+    async fn fork_thread_diverges_independently() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                text_response("resp_div_1", "first turn reply"),
+                text_response("resp_div_2", "fork-only reply"),
+            ])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+
+            let source = create_thread(&mut control, "fork-div-create").await?;
+            submit_text_work(&mut control, "fork-div-submit", &source, "first").await?;
+            let mut stream =
+                open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
+            let _ = collect_until_closed(&mut stream).await?;
+
+            let fork_response = fork_thread(&mut control, "fork-div-fork", &source).await?;
+            let fork_id = fork_response
+                .thread
+                .as_ref()
+                .and_then(|view| view.thread.as_ref())
+                .map(|snapshot| snapshot.thread_id.clone())
+                .context("fork response missing thread id")?;
+
+            // Append a second turn ONLY to the fork. Wait for the
+            // commit by polling `get_thread_messages` rather than
+            // blocking on the event stream — `ReplayAndFollow` keeps
+            // the stream open across turns, so there's no terminal
+            // control frame we could anchor on.
+            submit_text_work(
+                &mut control,
+                "fork-div-fork-submit",
+                &fork_id,
+                "fork-specific second turn",
+            )
+            .await?;
+            let fork_id_for_poll = fork_id.clone();
+            let _ = wait_for(|| {
+                let mut control = control.clone();
+                let fork_id = fork_id_for_poll.clone();
+                async move {
+                    let projection = control
+                        .get_thread_messages(pb::GetThreadMessagesRequest { thread_id: fork_id })
+                        .await
+                        .context("poll get_thread_messages on fork")?
+                        .into_inner()
+                        .projection
+                        .context("fork projection missing")?;
+                    if projection.messages.len() >= 4 {
+                        Ok(Some(projection))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            })
+            .await?;
+
+            // Source must still report just the original turn.
+            let source_messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: source.clone(),
+                })
+                .await
+                .context("get_thread_messages source")?
+                .into_inner()
+                .projection
+                .context("source projection missing")?;
+            assert_eq!(
+                source_messages.messages.len(),
+                2,
+                "appending to the fork must not extend the source's history",
+            );
+
+            // Fork has both turns.
+            let fork_messages = control
+                .get_thread_messages(pb::GetThreadMessagesRequest {
+                    thread_id: fork_id.clone(),
+                })
+                .await
+                .context("get_thread_messages fork")?
+                .into_inner()
+                .projection
+                .context("fork projection missing")?;
+            assert_eq!(
+                fork_messages.messages.len(),
+                4,
+                "fork must carry the original 2 messages plus its own divergent turn",
+            );
+
             Ok(())
         }
         .await;
