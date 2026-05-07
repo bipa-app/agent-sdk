@@ -106,11 +106,14 @@ pub struct RootTurnDeps<'a> {
     pub subagent_spawn_selector:
         Option<&'a (dyn super::subagent_spawn_selector::SubagentSpawnSelector + 'a)>,
     /// Optional auto-compaction policy supplied by the host. When
-    /// set, [`build_chat_request`] runs a pre-call threshold check
-    /// against the staged history and rewrites the durable
-    /// [`MessageProjectionStore`] when the threshold is crossed,
-    /// and [`call_llm_with_retry`] reactively compacts on
-    /// `prompt is too long` errors instead of going fatal.
+    /// set, the worker's `build_chat_request` (and the resume-path
+    /// equivalent) run a pre-call threshold check against the staged
+    /// history and rewrite the durable [`MessageProjectionStore`]
+    /// when the threshold is crossed, and `call_llm_with_retry`
+    /// reactively compacts on `prompt is too long` errors instead
+    /// of going fatal. (Both helpers are private — see
+    /// `crates/agent-server/src/worker/compaction.rs` for the public
+    /// surface that drives them.)
     ///
     /// `None` (the default) preserves today's "no automatic
     /// compaction" behaviour for every existing host.

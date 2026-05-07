@@ -1,6 +1,6 @@
 //! Daemon-side auto-compaction integration.
 //!
-//! The in-process [`agent_sdk::agent_loop`] already wires
+//! The in-process `agent_sdk::agent_loop` already wires
 //! [`agent_sdk::context::LlmContextCompactor`] in two places:
 //!
 //! 1. A **proactive** check in `maybe_compact_messages` that fires
@@ -17,9 +17,9 @@
 //! tool results turn after turn — surfaced
 //! `LLM stream error (kind=InvalidRequest): "prompt is too long: …"`
 //! to the user with no recovery path. The host's
-//! [`crate::RootTurnDeps::compaction_config`] is now consulted by
-//! [`super::root_turn::execute_root_turn`] (pre-call) and
-//! [`super::root_turn::call_llm_with_retry`] (post-failure) via the
+//! [`RootTurnDeps::compaction_config`](crate::worker::RootTurnDeps::compaction_config)
+//! is now consulted by `execute_root_turn` (pre-call) and
+//! `call_llm_with_retry` (post-failure, both private) via the
 //! helpers in this module so both topologies share the same compaction
 //! contract.
 //!
@@ -67,8 +67,8 @@ use crate::journal::staged::StagedMessageStore;
 use super::root_turn::RootTurnDeps;
 
 /// Run a pre-call compaction pass against the staged history when the
-/// host has wired a [`CompactionConfig`] and the configured threshold
-/// is crossed.
+/// host has wired a [`agent_sdk::context::CompactionConfig`] and the
+/// configured threshold is crossed.
 ///
 /// Operates on the **staged history alone** — i.e. the messages that
 /// will become the seed of any subsequent commit. It deliberately
