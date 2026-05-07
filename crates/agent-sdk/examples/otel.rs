@@ -65,6 +65,21 @@ impl ObservabilityStore for InlinePayloadStore {
             output_messages: CaptureDecision::Inline,
         })
     }
+
+    // PRIVACY (Phase 9 · C2): this demo store does NOT override
+    // `acknowledge_pii_redaction`, so the SDK forces every `Inline`
+    // decision above down to `Omit` regardless of what `capture()`
+    // returns. To actually capture payloads on spans:
+    //
+    //   1. Build `OtelConfig` with `capture_payloads(true)` (or set
+    //      `OTEL_AGENT_SDK_CAPTURE_PAYLOADS=true` in the env).
+    //   2. Override `acknowledge_pii_redaction(&self) -> bool {
+    //      true }` *and* install a real `PayloadRedactor` via the
+    //      `redactor()` method that masks PII (e.g. wrap
+    //      `BaselineDetector`).
+    //
+    // The default-deny gate is intentional: it is the difference
+    // between an "OTel demo" and a "PII leak in production".
 }
 
 #[tokio::main]

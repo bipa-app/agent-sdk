@@ -817,9 +817,18 @@ async fn capture_llm_payloads<P>(
 
     match observability_store.capture(&bundle).await {
         Ok(result) => {
+            // Phase 9 · C2: enforce the default-deny privacy gate
+            // before any payload reaches the span.  `Inline`
+            // decisions only land when *both* the operator-level
+            // capture flag is on (via `OtelConfig::capture_payloads`)
+            // *and* the store has explicitly attested PII safety
+            // via `ObservabilityStore::acknowledge_pii_redaction`.
+            // Otherwise every `Inline` is downgraded to `Omit`;
+            // `Reference` always passes through.
+            let gated = crate::observability::payload_capture::gate(observability_store, result);
             spans::record_payload_on_span(
                 span,
-                &result,
+                &gated,
                 system_json.as_ref(),
                 &input_json,
                 &output_json,

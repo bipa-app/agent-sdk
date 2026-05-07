@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — Default-deny payload capture (Phase 9 · C2, ENG-8298).**
+  `ObservabilityStore::capture(...) -> CaptureDecision::Inline` no longer
+  unconditionally lands payloads on the LLM span. The SDK now forces every
+  `Inline` decision down to `Omit` unless **both** of these are true:
+
+  1. The operator opted in via `OtelConfig::capture_payloads(true)` (which
+     `agent-sdk-otel::install_global_provider` propagates onto a process-wide
+     gate at startup), and
+  2. The store overrode the new
+     `ObservabilityStore::acknowledge_pii_redaction()` method to return `true`.
+
+  The trait gains the `acknowledge_pii_redaction` method with a default impl
+  returning `false`, so existing implementations keep compiling. Behaviour
+  changes silently: any consumer that was relying on `Inline` to land
+  `gen_ai.input.messages` / `gen_ai.output.messages` on spans will see the
+  attributes disappear after upgrading until the store is updated.
+  `CaptureDecision::Reference` is unaffected — externalised payloads always
+  pass through. Bipa is the only known consumer; a sibling Bipa PR is needed
+  to attest its `InlinePayloadStore` and pair it with a real `PayloadRedactor`.
+
 ### Fixed
 
 - **Workspace compatibility for cached token usage fields** - Updated server and host token usage fixtures, stores, and turn accounting so the new cached-input and cache-creation fields compile across all targets and continue accumulating real provider-reported values.

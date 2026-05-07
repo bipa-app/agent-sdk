@@ -11,9 +11,11 @@ pub mod instrument;
 pub mod langfuse;
 pub mod metrics;
 pub mod payload;
+pub mod payload_capture;
 pub mod provider_name;
 pub mod spans;
 pub(crate) mod trace_io;
 pub mod types;
 
+pub use payload_capture::{is_payload_capture_enabled, set_payload_capture_enabled};
 pub use types::{CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle};
