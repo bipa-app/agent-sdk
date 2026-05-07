@@ -288,10 +288,25 @@ impl BrokerAdapter for AmqpBrokerAdapter {
             // to disk before acking when the target queue is durable.
             .with_delivery_mode(2);
 
-        let result = match self
+        // Phase 9 · B5: time the publish + confirm round-trip and
+        // record `agent_service_host.amqp.publish.duration` with an
+        // `outcome` attribute. The metric is feature-gated; default
+        // builds elide the timer entirely.
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+
+        let publish_result = self
             .publish_with_confirm(&routing_key, &payload, properties)
-            .await
-        {
+            .await;
+
+        #[cfg(feature = "otel")]
+        crate::observability::HostMetrics::global().record_amqp_publish(
+            self.config.exchange.as_str(),
+            started_at.elapsed().as_secs_f64(),
+            publish_result.is_ok(),
+        );
+
+        let result = match publish_result {
             Ok(result) => result,
             Err(err) => {
                 self.invalidate_channel().await;

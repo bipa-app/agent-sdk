@@ -105,15 +105,57 @@ impl PostgresDurableStore {
             pool_options = pool_options.after_connect(move |conn, _meta| {
                 let schema_name = schema_name.clone();
                 Box::pin(async move {
+                    // Phase 9 · B5: time the per-connection setup
+                    // (search_path config) so the host can publish
+                    // `db.client.connections.create_time`. sqlx 0.8
+                    // does not expose a true `before_connect` hook;
+                    // this captures the post-handshake setup latency,
+                    // which is the closest signal an operator can act
+                    // on without forking sqlx.
+                    #[cfg(feature = "otel")]
+                    let started_at = std::time::Instant::now();
+
                     let _ = sqlx::query_scalar!(
                         "SELECT pg_catalog.set_config('search_path', $1, false)",
                         schema_name,
                     )
                     .fetch_one(conn)
                     .await?;
+
+                    #[cfg(feature = "otel")]
+                    crate::observability::HostMetrics::global()
+                        .record_db_client_connection_create_time(
+                            "agent_service_host.postgres",
+                            started_at.elapsed().as_secs_f64(),
+                        );
                     Ok(())
                 })
             });
+        } else {
+            // Even when no schema override is configured we still
+            // want a `db.client.connections.create_time` sample on
+            // every fresh connection. Wrap a no-op probe query (a
+            // single-row `SELECT 1` is cheaper than `set_config` and
+            // does not allocate on the server).
+            #[cfg(feature = "otel")]
+            {
+                pool_options = pool_options.after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        let started_at = std::time::Instant::now();
+                        // Probe the connection so the timer captures
+                        // a real round-trip, not just future setup.
+                        let _ = sqlx::query_scalar::<_, i32>("SELECT 1")
+                            .fetch_one(conn)
+                            .await?;
+                        crate::observability::HostMetrics::global()
+                            .record_db_client_connection_create_time(
+                                "agent_service_host.postgres",
+                                started_at.elapsed().as_secs_f64(),
+                            );
+                        Ok(())
+                    })
+                });
+            }
         }
 
         Ok(Self::from_pool(
