@@ -1314,24 +1314,32 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
 
         // 2. Mirror `committed_turns` by repeatedly applying
-        //    `Thread::apply_committed_turn(zero_usage)`. The
-        //    aggregate's `total_usage` and `last_committed_at`
-        //    advance with each call, but for a fork — where the
-        //    source's accumulated usage isn't meaningful on a
-        //    divergent thread — landing on the right
-        //    `committed_turns` count is what matters. The loop is
-        //    O(N) in `committed_turns` but stays inside the same
-        //    transaction so the overhead is one round-trip per
-        //    iteration on the same connection.
+        //    `Thread::apply_committed_turn`. Each call advances
+        //    `committed_turns` by one and folds the supplied
+        //    `TokenUsage` into the aggregate's running
+        //    `total_usage`. Only the final iteration carries the
+        //    full `cumulative_total_usage` from the source's
+        //    snapshot at the fork boundary so the destination
+        //    lands at exactly that total without distributing
+        //    arbitrary per-turn usage values along the way (the
+        //    per-turn usage is already preserved on the source's
+        //    checkpoint chain — the fork only needs the cumulative
+        //    end state to keep cost reporting honest).
         let mut thread_row = Self::get_thread_tx(&mut tx, &params.new_thread_id)
             .await?
             .context("forked thread row missing after bootstrap")?;
-        for _ in 0..params.committed_turns {
-            thread_row = thread_row
-                .apply_committed_turn(&TokenUsage::default(), params.now)
-                .context("advancing forked thread aggregate inside sqlite fork transaction")?;
-        }
         if params.committed_turns > 0 {
+            let zero = TokenUsage::default();
+            for turn_index in 0..params.committed_turns {
+                let usage_for_this_turn = if turn_index + 1 == params.committed_turns {
+                    &params.cumulative_total_usage
+                } else {
+                    &zero
+                };
+                thread_row = thread_row
+                    .apply_committed_turn(usage_for_this_turn, params.now)
+                    .context("advancing forked thread aggregate inside sqlite fork transaction")?;
+            }
             Self::upsert_thread_tx(&mut tx, &thread_row).await?;
         }
 
@@ -5088,6 +5096,7 @@ mod tests {
             new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
+            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
                 thread_id: new_thread_id.clone(),
@@ -5129,6 +5138,76 @@ mod tests {
             sequences,
             vec![0, 1],
             "events committed with fresh sequences"
+        );
+
+        Ok(())
+    }
+
+    /// `ForkCommitParams::cumulative_total_usage` must land on the
+    /// destination's thread aggregate `total_usage` so cost reporting
+    /// on the fork picks up where the source left off.  The earlier
+    /// per-turn iterations contribute zero usage; only the final
+    /// `apply_committed_turn` carries the carryover, which means the
+    /// fork's running total ends at exactly `cumulative_total_usage`.
+    #[tokio::test]
+    async fn fork_atomic_carries_cumulative_total_usage() -> Result<()> {
+        use agent_sdk_core::TokenUsage;
+        use agent_sdk_core::llm::Message;
+        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::AgentTask;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let now = t0();
+
+        let source_thread_id = ThreadId::from_string("usage-source");
+        ThreadStore::get_or_create(&store, &source_thread_id, now).await?;
+        let source_task = AgentTask::new_root_turn(source_thread_id.clone(), now, 3);
+        let source_task_id = source_task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, source_task).await?;
+
+        let new_thread_id = ThreadId::from_string("usage-fork");
+        let cumulative = TokenUsage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let messages = vec![Message::user("u"), Message::assistant("a")];
+        let params = ForkCommitParams {
+            new_thread_id: new_thread_id.clone(),
+            now,
+            committed_turns: 3,
+            cumulative_total_usage: cumulative.clone(),
+            messages: messages.clone(),
+            checkpoint: Some(NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: 3,
+                task_id: source_task_id,
+                messages: messages.clone(),
+                agent_state_snapshot: serde_json::json!({
+                    "thread_id": new_thread_id.0.clone(),
+                    "turn_count": 3,
+                    "total_usage": cumulative,
+                    "metadata": {},
+                    "created_at": "2023-11-14T00:00:00Z",
+                }),
+                turn_usage: TokenUsage::default(),
+                now,
+            }),
+            events: Vec::new(),
+        };
+        store.commit_fork_atomic(params).await?;
+
+        let thread = ThreadStore::get(&store, &new_thread_id)
+            .await?
+            .context("fork must exist after commit")?;
+        assert_eq!(thread.committed_turns, 3);
+        assert_eq!(
+            thread.total_usage, cumulative,
+            "fork's total_usage must mirror the source's cumulative usage at the fork boundary",
         );
 
         Ok(())
@@ -5205,6 +5284,7 @@ mod tests {
             new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
+            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
                 thread_id: new_thread_id.clone(),

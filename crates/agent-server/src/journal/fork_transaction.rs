@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, llm};
+use agent_sdk_core::{ThreadId, TokenUsage, llm};
 
 use super::checkpoint::NewCheckpointParams;
 
@@ -52,12 +52,21 @@ pub struct ForkCommitParams {
     /// methods so the entire transaction observes one consistent
     /// timestamp.
     pub now: OffsetDateTime,
-    /// Number of `commit_turn(zero_usage)` calls to fold into the
-    /// destination thread aggregate. Mirrors the source's
-    /// `committed_turns` count at the fork boundary so
-    /// `recover_thread`'s `committed_turns == checkpoint.turn_number`
-    /// guard accepts the destination on the next worker pickup.
+    /// Number of `commit_turn` calls to fold into the destination
+    /// thread aggregate. Mirrors the source's `committed_turns`
+    /// count at the fork boundary so `recover_thread`'s
+    /// `committed_turns == checkpoint.turn_number` guard accepts
+    /// the destination on the next worker pickup.
     pub committed_turns: u32,
+    /// Cumulative `total_usage` to seed on the destination's
+    /// thread aggregate, extracted from the source's
+    /// `agent_state_snapshot.total_usage` at the fork boundary.
+    /// This makes the fork's `total_usage` match what the source
+    /// reported at that checkpoint instead of starting at zero —
+    /// the source's accumulated cost paid for every message we're
+    /// inheriting, so the fork's running total should reflect
+    /// that on day one.
+    pub cumulative_total_usage: TokenUsage,
     /// Seed messages for the destination's projection
     /// (`agent_sdk_message_heads`). Empty for a turn-zero fork.
     pub messages: Vec<llm::Message>,

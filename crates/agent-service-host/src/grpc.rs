@@ -522,6 +522,7 @@ impl GrpcControlService {
                 new_thread_id: new_thread_id.clone(),
                 now,
                 committed_turns: 0,
+                cumulative_total_usage: TokenUsage::default(),
                 messages: Vec::new(),
                 checkpoint: None,
                 events: Vec::new(),
@@ -543,6 +544,17 @@ impl GrpcControlService {
                     source_thread_id.0, fork_after,
                 ))
             })?;
+
+        // The source's checkpoint at the fork boundary already
+        // carries the cumulative `total_usage` at that turn inside
+        // its `agent_state_snapshot`. Pluck it before we rewrite
+        // the snapshot so the fork lands at the same total the
+        // source reported (instead of starting at zero, which
+        // hides the inherited cost).
+        let cumulative_total_usage =
+            total_usage_from_state_snapshot(&checkpoint.agent_state_snapshot).map_err(
+                internal_status("extracting cumulative total_usage from source snapshot"),
+            )?;
 
         // Rewrite the snapshot so the staged state store's
         // bound-thread guard accepts it on the destination.
@@ -571,6 +583,7 @@ impl GrpcControlService {
             new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: checkpoint.turn_number,
+            cumulative_total_usage,
             messages: checkpoint.messages.clone(),
             checkpoint: Some(NewCheckpointParams {
                 thread_id: new_thread_id.clone(),
@@ -618,15 +631,29 @@ impl GrpcControlService {
                 .map_err(internal_status("seeding forked message history"))?;
         }
 
-        for _ in 0..params.committed_turns {
-            self.shared
-                .stores
-                .thread_store
-                .commit_turn(&params.new_thread_id, &TokenUsage::default(), params.now)
-                .await
-                .map_err(internal_status(
-                    "mirroring source committed_turns onto fork",
-                ))?;
+        // Mirror the source's `committed_turns` count + cumulative
+        // `total_usage` at the fork boundary. Only the final
+        // iteration carries the cumulative usage so the destination
+        // ends at exactly that total without distributing arbitrary
+        // per-turn values across earlier commits (the per-turn
+        // breakdown is preserved on the source's checkpoint chain).
+        if params.committed_turns > 0 {
+            let zero = TokenUsage::default();
+            for turn_index in 0..params.committed_turns {
+                let usage_for_this_turn = if turn_index + 1 == params.committed_turns {
+                    &params.cumulative_total_usage
+                } else {
+                    &zero
+                };
+                self.shared
+                    .stores
+                    .thread_store
+                    .commit_turn(&params.new_thread_id, usage_for_this_turn, params.now)
+                    .await
+                    .map_err(internal_status(
+                        "mirroring source committed_turns onto fork",
+                    ))?;
+            }
         }
 
         if let Some(checkpoint) = params.checkpoint {
@@ -657,7 +684,6 @@ impl GrpcControlService {
     /// stale point-in-time count.
     async fn replay_fork_thread_response(
         &self,
-        source_thread_id: &ThreadId,
         record: &ForkThreadRecord,
     ) -> RpcResult<pb::ForkThreadResponse> {
         let new_thread_id = ThreadId::from_string(&record.new_thread_id);
@@ -680,7 +706,6 @@ impl GrpcControlService {
             .map_err(internal_status(
                 "idempotent fork: load forked event sequence",
             ))?;
-        let _ = source_thread_id;
         Ok(pb::ForkThreadResponse {
             thread: Some(self.shared.thread_view(&new_thread_id).await?),
             source_thread_id: record.source_thread_id.clone(),
@@ -1070,9 +1095,7 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
-            let response = self
-                .replay_fork_thread_response(&source_thread_id, &record)
-                .await?;
+            let response = self.replay_fork_thread_response(&record).await?;
             return Ok(Response::new(response));
         }
 
@@ -1712,6 +1735,43 @@ const fn turn_number_for_event(event: &agent_sdk_core::events::AgentEvent) -> Op
 /// `Value::Null` snapshots (fresh-thread case) round-trip unchanged,
 /// matching the contract `from_recovery_view` already honours when
 /// the snapshot is null.
+/// Pluck the cumulative `total_usage` field out of an
+/// `agent_state_snapshot` JSON value.
+///
+/// The snapshot is whatever
+/// [`agent_sdk_core::AgentState`] serializes to — the relevant
+/// shape is `{ "thread_id": ..., "turn_count": ...,
+/// "total_usage": { "input_tokens": N, "output_tokens": M, … },
+/// "metadata": ..., "created_at": ... }`. The fork uses this
+/// value to seed the destination thread aggregate's `total_usage`
+/// so cost reporting picks up where the source left off rather
+/// than zeroing out.
+///
+/// Failure modes:
+/// - `Value::Null` (fresh-thread case): returns
+///   [`TokenUsage::default()`].
+/// - Missing `total_usage` key: returns
+///   [`TokenUsage::default()`] (forward-compat with snapshots
+///   from older `AgentState` shapes).
+/// - Present-but-malformed `total_usage`: errors. A snapshot we
+///   can't parse is corruption; better to surface it than to
+///   silently land a fork with the wrong total.
+fn total_usage_from_state_snapshot(
+    snapshot: &serde_json::Value,
+) -> anyhow::Result<agent_sdk_core::TokenUsage> {
+    use anyhow::Context as _;
+    if snapshot.is_null() {
+        return Ok(agent_sdk_core::TokenUsage::default());
+    }
+    let object = snapshot
+        .as_object()
+        .context("agent_state_snapshot is not a JSON object")?;
+    let Some(value) = object.get("total_usage") else {
+        return Ok(agent_sdk_core::TokenUsage::default());
+    };
+    serde_json::from_value(value.clone()).context("agent_state_snapshot.total_usage is malformed")
+}
+
 fn rewrite_state_snapshot_thread_id(
     snapshot: &serde_json::Value,
     new_thread_id: &ThreadId,
