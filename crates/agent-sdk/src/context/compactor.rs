@@ -62,7 +62,14 @@ pub struct CompactionResult {
 /// LLM-based context compactor.
 ///
 /// Uses the LLM itself to summarize older messages into a compact form.
-pub struct LlmContextCompactor<P: LlmProvider> {
+///
+/// `P` is `?Sized` so callers can hold an `Arc<dyn LlmProvider>` —
+/// useful when the provider is resolved dynamically per-thread (e.g.
+/// inside `agent-server`'s daemon worker, where the same compactor
+/// type wraps whichever concrete provider the host's resolver picks).
+/// Concrete-type users (`Arc<AnthropicProvider>`, etc.) still work
+/// unchanged.
+pub struct LlmContextCompactor<P: LlmProvider + ?Sized> {
     provider: Arc<P>,
     config: CompactionConfig,
     system_prompt: String,
@@ -70,7 +77,7 @@ pub struct LlmContextCompactor<P: LlmProvider> {
     summary_prompt_suffix: String,
 }
 
-impl<P: LlmProvider> LlmContextCompactor<P> {
+impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
     /// Create a new LLM context compactor.
     #[must_use]
     pub fn new(provider: Arc<P>, config: CompactionConfig) -> Self {
@@ -292,7 +299,7 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
 }
 
 #[async_trait]
-impl<P: LlmProvider> ContextCompactor for LlmContextCompactor<P> {
+impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
     async fn compact(&self, messages: &[Message]) -> Result<String> {
         let messages_to_summarize: Vec<_> = messages
             .iter()

@@ -23,6 +23,11 @@ otel = ["dep:opentelemetry", "dep:tower", "dep:http"]
 agent-sdk-core.workspace = true
 agent-sdk-tools.workspace = true
 agent-sdk-providers.workspace = true
+# Pulled in for `agent_sdk::context::CompactionConfig`, the auto-compaction
+# knob hosts plumb through `ExecutionRuntime::with_compaction(...)` so the
+# worker can run pre-call threshold compaction and post-failure overflow
+# recovery (see `crates/agent-server/src/worker/root_turn.rs`).
+agent-sdk.workspace = true
 agent-server.workspace = true
 agent-service-proto = { path = "../agent-service-proto" }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net"] }

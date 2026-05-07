@@ -535,6 +535,8 @@ impl StoreRegistry {
             event_repo: self.event_repo.as_ref(),
             event_notifier: self.event_notifier.as_ref(),
             subagent_spawn_selector: None,
+            compaction_config: None,
+            compaction_provider: None,
         }
     }
 
@@ -550,6 +552,33 @@ impl StoreRegistry {
     ) -> agent_server::RootTurnDeps<'a> {
         let mut deps = self.root_turn_deps();
         deps.subagent_spawn_selector = Some(selector);
+        deps
+    }
+
+    /// Like [`Self::root_turn_deps_with_selector`] but also threads
+    /// an [`agent_sdk::context::CompactionConfig`] (and the matching
+    /// `Arc<dyn LlmProvider>`) so the worker runs pre-call threshold
+    /// compaction and post-failure overflow recovery. Hosts that
+    /// wire [`crate::runtime::ExecutionRuntime::with_compaction`]
+    /// use this method to forward the runtime's policy down to the
+    /// per-task deps the worker consumes.
+    ///
+    /// `compaction_provider` must be the same `Arc<dyn LlmProvider>`
+    /// the host passes positionally to
+    /// [`agent_server::worker::execute_root_turn`] / `resume_root_turn`.
+    /// The worker takes a borrowed view here so per-task lifetime
+    /// stays unchanged, then `Arc::clone`s it inside the compactor
+    /// when the threshold actually fires.
+    #[must_use]
+    pub fn root_turn_deps_with_selector_and_compaction<'a>(
+        &'a self,
+        selector: &'a dyn agent_server::SubagentSpawnSelector,
+        compaction_config: Option<&'a agent_sdk::context::CompactionConfig>,
+        compaction_provider: Option<&'a Arc<dyn agent_sdk_providers::LlmProvider>>,
+    ) -> agent_server::RootTurnDeps<'a> {
+        let mut deps = self.root_turn_deps_with_selector(selector);
+        deps.compaction_config = compaction_config;
+        deps.compaction_provider = compaction_provider;
         deps
     }
 
