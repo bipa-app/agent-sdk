@@ -306,10 +306,60 @@ where
     F: FnOnce(PendingToolCallInfo, ToolEventCollector) -> Fut,
     Fut: Future<Output = anyhow::Result<ToolResult>>,
 {
+    #[cfg(feature = "otel")]
+    let started_at = std::time::Instant::now();
+
+    // Box-pin the inner future so the outer function's state
+    // machine stays small enough that clippy::large_futures does
+    // not fire on every test that drives tool execution.
+    let result = Box::pin(execute_tool_task_inner(
+        bootstrap, task_store, event_repo, cancel, executor, now,
+    ))
+    .await;
+
+    #[cfg(feature = "otel")]
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        let outcome = match &result {
+            Ok(ToolTaskOutcome::Completed { .. }) => crate::observability::attrs::OUTCOME_DONE,
+            Ok(ToolTaskOutcome::Cancelled) => crate::observability::attrs::OUTCOME_CANCELLED,
+            Ok(ToolTaskOutcome::Failed { .. }) | Err(_) => {
+                crate::observability::attrs::OUTCOME_ERROR
+            }
+        };
+        metrics.record_task_execution(
+            crate::observability::attrs::KIND_TOOL,
+            outcome,
+            started_at.elapsed().as_secs_f64(),
+        );
+    }
+
+    result
+}
+
+/// Inner body of [`execute_tool_task`]. Kept separate so the outer
+/// function can wrap the entire call in a metric-recording shim
+/// without threading a stopwatch through every early return.
+async fn execute_tool_task_inner<F, Fut>(
+    bootstrap: ToolTaskBootstrap,
+    task_store: &dyn AgentTaskStore,
+    event_repo: &dyn EventRepository,
+    cancel: &CancellationToken,
+    executor: F,
+    now: OffsetDateTime,
+) -> anyhow::Result<ToolTaskOutcome>
+where
+    F: FnOnce(PendingToolCallInfo, ToolEventCollector) -> Fut,
+    Fut: Future<Output = anyhow::Result<ToolResult>>,
+{
     // ── Pre-execution cancellation check ─────────────────────────
     if cancel.is_cancelled() {
         return Ok(ToolTaskOutcome::Cancelled);
     }
+
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global()
+        .record_task_acquired(crate::observability::attrs::KIND_TOOL);
 
     let task_id = &bootstrap.task_id;
     let worker_id = &bootstrap.worker_id;

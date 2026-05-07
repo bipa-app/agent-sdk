@@ -390,6 +390,8 @@ impl FallbackWakeupSweep {
                 _ = ticker.tick() => {
                     log::debug!("fallback wakeup sweep firing pulse");
                     self.signal.wake_all_now();
+                    #[cfg(feature = "otel")]
+                    crate::observability::ServerMetrics::global().record_fallback_sweep();
                 }
             }
         }

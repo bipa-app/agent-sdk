@@ -339,7 +339,25 @@ pub async fn dispatch_thread_events_payload(
     handler: &(dyn ThreadEventsWatchHandler + '_),
     payload: &ThreadEventsAvailablePayload,
 ) -> Result<ThreadEventsWatchOutcome> {
+    #[cfg(feature = "otel")]
+    let started_at = std::time::Instant::now();
     let outcome = handler.handle_payload(payload).await?;
+    #[cfg(feature = "otel")]
+    {
+        // We can't observe true publish-to-receive lag without a
+        // publish timestamp on the advisory payload (ThreadEvents
+        // wire format does not yet carry it; see card delta #4 in
+        // the ENG-8296 plan and the TODO below).  Until then,
+        // publish dispatch-side latency: how long the handler took
+        // from invocation to outcome.  This still flags slow
+        // consumers, slow journal reads, and stuck notifiers.
+        //
+        // TODO(B5/D2): once the advisory payload carries an
+        // upstream `published_at`, swap in the wall-clock delta
+        // for the true end-to-end lag.
+        let lag_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+        crate::observability::ServerMetrics::global().record_thread_events_watch_lag(lag_ms);
+    }
     match &outcome {
         ThreadEventsWatchOutcome::Forwarded {
             emitted_count,

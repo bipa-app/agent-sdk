@@ -232,6 +232,9 @@ impl RelayWorker for OutboxRelayWorker {
             }
         }
 
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_relay_tick(&tick);
+
         Ok(tick)
     }
 }
