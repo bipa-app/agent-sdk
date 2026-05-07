@@ -396,7 +396,7 @@ async fn best_effort_close_open_attempts(
 /// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
 pub async fn execute_root_turn(
     inputs: RootWorkerInputs,
-    user_prompt: &str,
+    user_input: impl Into<super::user_input::UserInput>,
     provider: &dyn LlmProvider,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
@@ -404,16 +404,14 @@ pub async fn execute_root_turn(
     #[cfg(feature = "otel")]
     let started_at = std::time::Instant::now();
 
+    let user_input = user_input.into();
+
     // Box-pin the inner future to keep the outer function's state
     // machine small — without this, clippy::large_futures fires on
     // every test that calls execute_root_turn because the outer
     // future stores both itself and the inner future inline.
     let result = Box::pin(execute_root_turn_inner(
-        inputs,
-        user_prompt,
-        provider,
-        deps,
-        now,
+        inputs, user_input, provider, deps, now,
     ))
     .await;
 
@@ -440,7 +438,7 @@ pub async fn execute_root_turn(
 /// without having to thread a stopwatch through every early return.
 async fn execute_root_turn_inner(
     inputs: RootWorkerInputs,
-    user_prompt: &str,
+    user_input: super::user_input::UserInput,
     provider: &dyn LlmProvider,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
@@ -448,8 +446,13 @@ async fn execute_root_turn_inner(
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
 
-    // 1. Open turn attempt.
-    let attempt = open_attempt(&inputs, definition, user_prompt, deps.attempt_store, now)
+    // 1. Open turn attempt. The audit blob stores a string projection
+    //    of the user input — image / document blocks render as
+    //    `[<media_type> attachment]` placeholders so journal replay
+    //    keeps something descriptive without bloating the audit row
+    //    with binary payloads.
+    let audit_prompt = user_input.audit_summary();
+    let attempt = open_attempt(&inputs, definition, &audit_prompt, deps.attempt_store, now)
         .await
         .context("open turn attempt")?;
 
@@ -506,7 +509,7 @@ async fn execute_root_turn_inner(
         definition,
         &inputs.staged_stores.messages,
         thread_id,
-        user_prompt,
+        &user_input,
         inputs.bootstrap.task.caller_metadata.as_ref(),
     )
     .await
@@ -519,7 +522,8 @@ async fn execute_root_turn_inner(
     } = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
-        attempt_user_prompt: user_prompt,
+        user_input: &user_input,
+        attempt_audit_prompt: &audit_prompt,
         provider,
         chat_request,
         initial_attempt: attempt,
@@ -545,7 +549,7 @@ async fn execute_root_turn_inner(
     if response.has_tool_use() {
         return suspend_at_tool_boundary(
             inputs,
-            user_prompt,
+            &user_input,
             response,
             attempt,
             deps,
@@ -558,7 +562,7 @@ async fn execute_root_turn_inner(
     // ── Text-only path (Phase 4.3) ──────────────────────────────
     commit_text_only_turn(
         inputs,
-        user_prompt,
+        &user_input,
         response,
         attempt,
         deps,
@@ -576,7 +580,7 @@ async fn execute_root_turn_inner(
 /// from `call_llm`.
 async fn commit_text_only_turn(
     inputs: RootWorkerInputs,
-    user_prompt: &str,
+    user_input: &super::user_input::UserInput,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
@@ -591,7 +595,7 @@ async fn commit_text_only_turn(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
         thread_id,
-        user_prompt,
+        user_input,
         &response,
     )
     .await
@@ -768,7 +772,7 @@ async fn build_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
     thread_id: &agent_sdk_core::ThreadId,
-    user_prompt: &str,
+    user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     // Get existing message history from staged store.
@@ -777,8 +781,14 @@ async fn build_chat_request(
         .await
         .context("get staged history")?;
 
-    // Append the new user prompt.
-    messages.push(llm::Message::user(user_prompt));
+    // Append the new user message. `user_input` carries the typed
+    // block list (text + image + document) so the wire format
+    // preserves binary attachments end-to-end. Resume inputs (which
+    // have no fresh user prompt) skip the append because the staged
+    // store already contains every relevant message.
+    if let Some(message) = user_input.clone().into_message() {
+        messages.push(message);
+    }
 
     let thinking = match &definition.thinking {
         ThinkingPolicy::Disabled => None,
@@ -872,9 +882,9 @@ enum StreamAttemptError {
 /// readable and lets every call site (the fresh-turn path in
 /// [`execute_root_turn`] and the resume path in
 /// [`resume_root_turn`]) build the params with the same vocabulary —
-/// only `attempt_user_prompt` differs.  The lifetime parameter ties
-/// every borrow to a single scope so the wrapper can't outlive the
-/// store handles or the input bundle.
+/// only `user_input` and `attempt_audit_prompt` differ.  The
+/// lifetime parameter ties every borrow to a single scope so the
+/// wrapper can't outlive the store handles or the input bundle.
 pub(crate) struct LlmRetryParams<'a> {
     /// Worker inputs needed to re-open a [`TurnAttempt`] after a
     /// recoverable failure (the audit row references this task and
@@ -885,12 +895,18 @@ pub(crate) struct LlmRetryParams<'a> {
     /// against live-edit changes but is overkill for transient
     /// LLM-stream blips.
     pub(crate) definition: &'a AgentDefinition,
+    /// Typed user input for the fresh-turn path. The compaction-
+    /// recovery branch needs this to rebuild the chat request after
+    /// rewriting the staged history — without it, image / document
+    /// blocks would be silently lost on retry. Resume turns pass a
+    /// resume-marked input via [`super::user_input::UserInput::resume`]
+    /// (its block list is empty, its `is_resume()` is true).
+    pub(crate) user_input: &'a super::user_input::UserInput,
     /// String written into the per-attempt `request_blob.user_prompt`
-    /// audit field.  Fresh turns pass the user prompt; resumes pass
-    /// the placeholder `"<resume>"` because there is no fresh user
-    /// input — the durable child results carry the continuation
-    /// payload.
-    pub(crate) attempt_user_prompt: &'a str,
+    /// audit field. Derived from `user_input.audit_summary()` —
+    /// `<resume>` for resume retries, otherwise text content with
+    /// binary attachments rendered as `[<media_type> attachment]`.
+    pub(crate) attempt_audit_prompt: &'a str,
     /// LLM provider — borrowed because it can't be cloned cheaply.
     pub(crate) provider: &'a dyn LlmProvider,
     /// Chat request built once at the top of the turn and reused on
@@ -953,7 +969,8 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     let LlmRetryParams {
         inputs,
         definition,
-        attempt_user_prompt,
+        user_input,
+        attempt_audit_prompt,
         provider,
         mut chat_request,
         initial_attempt,
@@ -970,7 +987,6 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     // bug behind unlimited retries. Mirrors
     // `agent_sdk::agent_loop::types::MAX_COMPACTION_RETRIES`.
     let mut compaction_retries: u32 = 0;
-    let is_resume_attempt = attempt_user_prompt == "<resume>";
 
     loop {
         let attempt_now = if retries == 0 && compaction_retries == 0 {
@@ -1008,7 +1024,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                     retries: &mut retries,
                     inputs,
                     definition,
-                    attempt_user_prompt,
+                    attempt_audit_prompt,
                     deps,
                     thread_id,
                 })
@@ -1019,8 +1035,8 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                     try_recover_with_compaction(PromptTooLongRecoveryParams {
                         message: &message,
                         chat_request: &mut chat_request,
-                        attempt_user_prompt,
-                        is_resume_attempt,
+                        user_input,
+                        attempt_audit_prompt,
                         compaction_retries: &mut compaction_retries,
                         inputs,
                         definition,
@@ -1047,7 +1063,7 @@ struct RecoverableRetryParams<'a> {
     retries: &'a mut u32,
     inputs: &'a RootWorkerInputs,
     definition: &'a AgentDefinition,
-    attempt_user_prompt: &'a str,
+    attempt_audit_prompt: &'a str,
     deps: &'a RootTurnDeps<'a>,
     thread_id: &'a agent_sdk_core::ThreadId,
 }
@@ -1066,7 +1082,7 @@ async fn handle_recoverable_stream_error(
         retries,
         inputs,
         definition,
-        attempt_user_prompt,
+        attempt_audit_prompt,
         deps,
         thread_id,
     } = params;
@@ -1105,7 +1121,7 @@ async fn handle_recoverable_stream_error(
     open_attempt(
         inputs,
         definition,
-        attempt_user_prompt,
+        attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
     )
@@ -1119,8 +1135,12 @@ async fn handle_recoverable_stream_error(
 struct PromptTooLongRecoveryParams<'a> {
     message: &'a str,
     chat_request: &'a mut ChatRequest,
-    attempt_user_prompt: &'a str,
-    is_resume_attempt: bool,
+    /// Typed user input — if non-resume, the matching `Message` is
+    /// pushed back onto the rebuilt chat request so image / document
+    /// blocks survive emergency compaction.
+    user_input: &'a super::user_input::UserInput,
+    /// Audit string for the retry attempt's `request_blob`.
+    attempt_audit_prompt: &'a str,
     compaction_retries: &'a mut u32,
     inputs: &'a RootWorkerInputs,
     definition: &'a AgentDefinition,
@@ -1145,8 +1165,8 @@ async fn try_recover_with_compaction(
     let PromptTooLongRecoveryParams {
         message,
         chat_request,
-        attempt_user_prompt,
-        is_resume_attempt,
+        user_input,
+        attempt_audit_prompt,
         compaction_retries,
         inputs,
         definition,
@@ -1184,27 +1204,28 @@ async fn try_recover_with_compaction(
     }
 
     // Rebuild the chat request from the compacted staged history.
-    // For the fresh path, re-append the user prompt that
-    // `build_chat_request` pushed onto the original request — it's
-    // still not in the staged buffer (the commit path appends it
+    // For the fresh path, re-append the original user message —
+    // including any image / document blocks — that
+    // `build_chat_request` pushed onto the original request. The
+    // staged buffer doesn't carry it yet (the commit path appends it
     // via `buffer_turn_messages` after a successful turn). For the
-    // resume path the staged buffer already contains everything
-    // the LLM needs.
+    // resume path `user_input.into_message()` returns `None` and the
+    // staged buffer already contains everything the LLM needs.
     let mut messages = inputs
         .staged_stores
         .messages
         .get_history(thread_id)
         .await
         .context("read staged history after emergency compaction")?;
-    if !is_resume_attempt {
-        messages.push(agent_sdk_core::llm::Message::user(attempt_user_prompt));
+    if let Some(message) = user_input.clone().into_message() {
+        messages.push(message);
     }
     chat_request.messages = messages;
 
     let next_attempt = open_attempt(
         inputs,
         definition,
-        attempt_user_prompt,
+        attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
     )
@@ -1550,14 +1571,19 @@ async fn buffer_turn_messages(
     staged_messages: &crate::journal::staged::StagedMessageStore,
     staged_state: &crate::journal::staged::StagedStateStore,
     thread_id: &agent_sdk_core::ThreadId,
-    user_prompt: &str,
+    user_input: &super::user_input::UserInput,
     response: &llm::ChatResponse,
 ) -> Result<()> {
-    // Append user message.
-    staged_messages
-        .append(thread_id, llm::Message::user(user_prompt))
-        .await
-        .context("append user message")?;
+    // Append user message — preserves any image / document blocks
+    // alongside the text content. Resume inputs (`user_input.is_resume()`)
+    // produce no message; the staged store already contains the
+    // suspended-turn history that the resume path buffered earlier.
+    if let Some(message) = user_input.clone().into_message() {
+        staged_messages
+            .append(thread_id, message)
+            .await
+            .context("append user message")?;
+    }
 
     // Build and append assistant message from response content.
     let assistant_msg = build_assistant_message(response);
@@ -1780,7 +1806,7 @@ fn build_turn_complete_events(
 /// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
-    user_prompt: &str,
+    user_input: &super::user_input::UserInput,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
@@ -1834,10 +1860,15 @@ async fn suspend_at_tool_boundary(
     // 3. Capture the suspended messages (user prompt + full assistant
     //    response including tool-use blocks) so the resume path can
     //    reconstruct the conversation from durable state alone.
-    let suspended_messages = vec![
-        llm::Message::user(user_prompt),
-        build_full_assistant_message(&response),
-    ];
+    //    `user_input.into_message()` returns `None` for resume turns —
+    //    those don't reach this branch (resume goes through
+    //    `resume_root_turn` / `suspend_resumed_turn`), but the guard
+    //    keeps the call site type-safe.
+    let mut suspended_messages = Vec::with_capacity(2);
+    if let Some(user_message) = user_input.clone().into_message() {
+        suspended_messages.push(user_message);
+    }
+    suspended_messages.push(build_full_assistant_message(&response));
 
     // 4. One child task per tool call, inheriting the configured retry budget.
     let specs = child_spawn_specs_for_response(&response, &inputs);
@@ -2404,8 +2435,14 @@ pub async fn resume_root_turn(
     let definition = inputs.definition();
     let thread_id = &inputs.bootstrap.thread_id;
 
-    // 1. Open a new turn attempt for the resume LLM call.
-    let attempt = open_attempt(&inputs, definition, "<resume>", deps.attempt_store, now)
+    // 1. Open a new turn attempt for the resume LLM call. The
+    //    audit prompt is the canonical resume sentinel exported as
+    //    `super::user_input::RESUME_AUDIT_PROMPT` so the worker and
+    //    the resume path share a single source of truth for what
+    //    "this attempt is a resume" looks like in the audit row.
+    let resume_input = super::user_input::UserInput::resume();
+    let resume_audit = resume_input.audit_summary();
+    let attempt = open_attempt(&inputs, definition, &resume_audit, deps.attempt_store, now)
         .await
         .context("open resume turn attempt")?;
 
@@ -2469,7 +2506,8 @@ pub async fn resume_root_turn(
     } = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
-        attempt_user_prompt: "<resume>",
+        user_input: &resume_input,
+        attempt_audit_prompt: &resume_audit,
         provider,
         chat_request,
         initial_attempt: attempt,
@@ -3177,8 +3215,11 @@ pub async fn resume_from_children(
         .await
         .context("aggregate child outcomes for resume")?;
 
-    // 3. Delegate to the existing resume path.
-    resume_root_turn(
+    // 3. Delegate to the existing resume path. Box-pin the call so
+    //    `resume_from_children`'s own future stays under the
+    //    `clippy::large_futures` threshold — same pattern
+    //    `execute_root_turn` uses for `execute_root_turn_inner`.
+    Box::pin(resume_root_turn(
         inputs,
         continuation,
         suspended_messages,
@@ -3186,6 +3227,6 @@ pub async fn resume_from_children(
         provider,
         deps,
         now,
-    )
+    ))
     .await
 }

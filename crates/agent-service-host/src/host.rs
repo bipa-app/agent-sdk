@@ -50,7 +50,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -58,9 +58,7 @@ use agent_sdk_core::ToolTier;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
-use agent_server::journal::task::{
-    AgentTask, LeaseId, SubmittedInputItem, TaskKind, TaskStatus, WorkerId,
-};
+use agent_server::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, WorkerId};
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
     AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
@@ -1047,7 +1045,7 @@ async fn execute_root_task(
                 .await
                 .context("resume root task from durable child results")
         } else {
-            let user_prompt = root_task_prompt(&task)?;
+            let user_input = root_task_user_input(&task)?;
             let selector = runtime.subagent_spawn_selector();
             let deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),
@@ -1056,7 +1054,7 @@ async fn execute_root_task(
             );
             agent_server::worker::execute_root_turn(
                 inputs,
-                &user_prompt,
+                user_input,
                 provider.as_ref(),
                 &deps,
                 now,
@@ -1318,21 +1316,21 @@ fn running_lease(task: &AgentTask) -> Result<(WorkerId, LeaseId)> {
     Ok((worker_id, lease_id))
 }
 
-fn root_task_prompt(task: &AgentTask) -> Result<String> {
+/// Convert the root task's typed submitted-input items into the
+/// worker's [`agent_server::worker::UserInput`] payload.
+///
+/// The submitted-input shape (`text | image | document`) flows
+/// straight from the gRPC `UserInputItem` proto through the journal,
+/// and from here straight into `Message::user_with_content(blocks)`
+/// at the LLM call site — image and document attachments survive the
+/// daemon path end-to-end without lossy string flattening.
+fn root_task_user_input(task: &AgentTask) -> Result<agent_server::worker::UserInput> {
     if task.submitted_input.is_empty() {
         bail!("root task missing submitted input");
     }
-
-    task.submitted_input
-        .iter()
-        .map(|item| match item {
-            SubmittedInputItem::Text { text } => Ok(text.clone()),
-            other => Err(anyhow!(
-                "root task input item is not supported by the service host yet: {other:?}"
-            )),
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(|parts| parts.join("\n"))
+    Ok(agent_server::worker::user_input_from_submitted(
+        &task.submitted_input,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1350,6 +1348,7 @@ mod tests {
         ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
     };
     use agent_sdk_providers::LlmProvider;
+    use agent_server::journal::task::SubmittedInputItem;
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
     use async_trait::async_trait;
@@ -1426,6 +1425,90 @@ mod tests {
     }
 
     // ── Construction ─────────────────────────────────────────────
+
+    // ── root_task_user_input — gRPC binary inputs round-trip ────
+
+    fn task_with_input(items: Vec<SubmittedInputItem>) -> AgentTask {
+        let thread_id = agent_sdk_core::ThreadId::from_string("t-image-input");
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let mut task = AgentTask::new_root_turn(thread_id, now, 3);
+        task.submitted_input = items;
+        task
+    }
+
+    #[test]
+    fn root_task_user_input_preserves_image_attachments() -> Result<()> {
+        // Regression: before this slice landed, `root_task_prompt`
+        // explicitly rejected `Image` and `Document` items with
+        // `"root task input item is not supported by the service host
+        // yet"`, so any `submit_thread_work` call carrying a
+        // `BinaryAttachment` failed at root-task entry. The new
+        // `root_task_user_input` builds a typed `UserInput` whose
+        // block list flows straight into
+        // `Message::user_with_content(blocks)` at the LLM call site.
+        let task = task_with_input(vec![
+            SubmittedInputItem::Text {
+                text: "what's in this picture?".into(),
+            },
+            SubmittedInputItem::Image {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            },
+        ]);
+
+        let user_input = root_task_user_input(&task)?;
+        assert_eq!(user_input.blocks().len(), 2);
+        assert!(matches!(
+            &user_input.blocks()[0],
+            agent_sdk_core::llm::ContentBlock::Text { text } if text == "what's in this picture?"
+        ));
+        assert!(matches!(
+            &user_input.blocks()[1],
+            agent_sdk_core::llm::ContentBlock::Image { source }
+                if source.media_type == "image/png" && source.data == "AAAA"
+        ));
+
+        // The audit-string projection turns binary blocks into
+        // `[<media_type> attachment]` markers so audit rows stay
+        // descriptive without storing the raw payload twice.
+        assert_eq!(
+            user_input.audit_summary(),
+            "what's in this picture?\n[image/png attachment]",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn root_task_user_input_preserves_document_attachments() -> Result<()> {
+        let task = task_with_input(vec![
+            SubmittedInputItem::Text {
+                text: "summarise".into(),
+            },
+            SubmittedInputItem::Document {
+                media_type: "application/pdf".into(),
+                data_base64: "JVBERi0xLjQK".into(),
+            },
+        ]);
+
+        let user_input = root_task_user_input(&task)?;
+        assert_eq!(user_input.blocks().len(), 2);
+        assert!(matches!(
+            &user_input.blocks()[1],
+            agent_sdk_core::llm::ContentBlock::Document { source }
+                if source.media_type == "application/pdf" && source.data == "JVBERi0xLjQK"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn root_task_user_input_rejects_empty_submission() {
+        let task = task_with_input(Vec::new());
+        let result = root_task_user_input(&task);
+        assert!(result.is_err(), "empty submitted_input should error");
+        assert!(format!("{:#}", result.unwrap_err()).contains("missing submitted input"),);
+    }
+
+    // ── Host construction ─────────────────────────────────────────
 
     #[test]
     fn host_construction_succeeds() -> Result<()> {

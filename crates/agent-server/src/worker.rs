@@ -94,6 +94,7 @@ pub mod root_turn;
 pub mod subagent;
 pub mod subagent_spawn_selector;
 pub mod tool_task;
+pub mod user_input;
 
 #[cfg(test)]
 mod bootstrap_test;
@@ -107,6 +108,8 @@ mod event_commit_test;
 mod event_system_regression_test;
 #[cfg(test)]
 mod guarded_execution_test;
+#[cfg(test)]
+mod multimodal_input_test;
 #[cfg(test)]
 mod mutation_safety_test;
 #[cfg(test)]
@@ -147,6 +150,7 @@ pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,
     resolve_tool_bootstrap,
 };
+pub use user_input::{UserInput, user_input_from_submitted};
 
 // Phase 5.2: re-export durable execution intent from journal.
 pub use crate::journal::execution_intent::{
