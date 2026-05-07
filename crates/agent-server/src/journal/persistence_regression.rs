@@ -506,11 +506,21 @@ mod tests {
         Ok(())
     }
 
-    /// Recovery after compaction returns the checkpoint's raw history,
-    /// not the compacted projection. This is because recovery reads
-    /// from the checkpoint, not the message projection.
+    /// Recovery after compaction returns the **compacted projection**,
+    /// not the checkpoint's frozen pre-compaction snapshot.
+    ///
+    /// The previous contract — recovery reads checkpoint.messages —
+    /// was the load-bearing bug behind ENG-8385: when the daemon
+    /// worker rewrote the projection mid-turn (a non-commit mutation
+    /// driven by auto-compaction) and the turn then failed before
+    /// committing, the next attempt re-read the stale checkpoint
+    /// snapshot and tripped the same context-window error that
+    /// triggered the compaction. Switching recovery to read the
+    /// projection makes mid-turn `replace_history` durable across
+    /// attempts; the checkpoint remains the source of truth for the
+    /// agent-state snapshot and the turn-number consistency guard.
     #[tokio::test]
-    async fn recovery_after_compaction_returns_checkpoint_history() -> Result<()> {
+    async fn recovery_after_compaction_returns_projection_history() -> Result<()> {
         let s = Stores::new();
         let thread_id = ThreadId::from_string("t-recover-compact");
         let task = AgentTaskId::from_string("task_rc1");
@@ -553,14 +563,18 @@ mod tests {
             .await
             .context("compact")?;
 
-        // Recovery view comes from the checkpoint, not the compacted
-        // projection.
+        // Recovery now follows the projection — the compacted single
+        // summary message — not the checkpoint's 4-message frozen
+        // snapshot.
         let view = s.recover(&thread_id).await.context("recover")?;
         assert_eq!(view.thread.committed_turns, 2);
         assert_eq!(view.next_turn_number, 3);
-
-        // The checkpoint has the full 4 accumulated messages.
-        assert_eq!(view.messages.len(), 4);
+        assert_eq!(view.messages.len(), 1, "expected compacted projection");
+        assert!(matches!(
+            &view.messages[0].content,
+            llm::Content::Text(t) if t == "[Compacted summary]"
+        ));
+        // Agent-state snapshot still comes from the latest checkpoint.
         assert_eq!(view.agent_state_snapshot, serde_json::json!({"turn": 2}),);
         Ok(())
     }
@@ -1101,12 +1115,14 @@ mod tests {
             .await
             .context("compact")?;
 
-        // Recovery still works (from checkpoint, not projection).
+        // Recovery now follows the projection — see
+        // `recovery_after_compaction_returns_projection_history`
+        // for the full rationale.
         let view_post_compact = s
             .recover(&thread_id)
             .await
             .context("recover post compact")?;
-        assert_eq!(view_post_compact.messages.len(), 4);
+        assert_eq!(view_post_compact.messages.len(), 1);
 
         // Phase 3: New commit on top of compacted projection.
         let task3 = AgentTaskId::from_string("task_lc3");

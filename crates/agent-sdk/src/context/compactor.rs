@@ -175,22 +175,125 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         split_point
     }
 
-    /// Shift split point to satisfy both pair safety and retained-tail token cap.
+    /// Pick a split point that produces a self-consistent `to_keep`.
+    ///
+    /// `to_keep` is self-consistent (per Anthropic's API contract)
+    /// when every `tool_result` block it contains references a
+    /// `tool_use` block earlier in `to_keep`. The compactor inserts
+    /// a synthetic `[summary, summary_ack]` prefix in front of
+    /// `to_keep`, and that prefix has no `tool_use` blocks — so the
+    /// only path to a valid wire payload is for `to_keep` itself to
+    /// be self-contained.
+    ///
+    /// Three constraints, applied in order:
+    ///
+    /// 1. **Token cap (soft)** — push split forward to keep the
+    ///    retained tail under `max_tokens` of estimated content. The
+    ///    retained-tail cap is a soft hint; a tool chain that doesn't
+    ///    fit gets retained anyway because chain safety is hard.
+    /// 2. **Pair safety (hard)** — shift split backward to keep
+    ///    `assistant_with_tool_use` and the immediately following
+    ///    `user_with_tool_result` together. Catches the common case
+    ///    where the boundary lands inside a single tool turn.
+    /// 3. **Chain safety (hard)** — advance split forward past any
+    ///    leading `user_with_tool_result` whose `tool_use_id` isn't
+    ///    in the rest of `to_keep`. Catches the case pair-preservation
+    ///    can't see: when the message immediately before the original
+    ///    boundary is text-only (e.g. a `summary_ack` from a prior
+    ///    compaction), pair-preservation has nothing to anchor on
+    ///    and silently leaves the orphan in `to_keep[0]`. The wire
+    ///    payload would then start `[summary, summary_ack,
+    ///    user(orphan_tool_result), …]` — which Anthropic rejects
+    ///    with `messages.2.content.0: unexpected tool_use_id`. Step
+    ///    3 makes the split-point selection responsible for chain
+    ///    integrity instead of post-hoc stripping the output.
+    ///
+    /// Step 2 and step 3 can pull in opposite directions (step 2
+    /// shifts back, step 3 shifts forward), so the function applies
+    /// step 3 last: pair-safety puts the candidate as far back as
+    /// it needs to go, then chain-safety advances past any leading
+    /// orphan that survived because the immediate prev was text-only.
     fn split_point_preserves_tool_pairs_with_cap(
         messages: &[Message],
-        mut split_point: usize,
+        split_point: usize,
         max_tokens: usize,
     ) -> usize {
-        loop {
-            let candidate = Self::retain_tail_with_token_cap(messages, split_point, max_tokens);
-            let adjusted = Self::split_point_preserves_tool_pairs(messages, candidate);
+        let cap_limit = Self::retain_tail_with_token_cap(messages, split_point, max_tokens);
+        let pair_safe = Self::split_point_preserves_tool_pairs(messages, cap_limit);
+        Self::split_point_skips_leading_orphan(messages, pair_safe)
+    }
 
-            if adjusted == split_point {
-                return candidate;
+    /// Advance `split_point` forward until `to_keep[0]` doesn't
+    /// contain an orphan `tool_result` block — i.e. a `tool_result`
+    /// whose `tool_use_id` isn't satisfied by some `tool_use` block
+    /// in `to_keep`.
+    ///
+    /// Implements step 3 of `split_point_preserves_tool_pairs_with_cap`
+    /// (chain safety). Pair-preservation alone can't catch the
+    /// "synthetic `summary_ack` precedes an orphan" shape because it
+    /// only inspects the immediate prev/next pair; this helper
+    /// inspects whether `to_keep[0]`'s `tool_result` blocks point
+    /// anywhere `to_keep` will host a matching `tool_use`. When they
+    /// don't, the `tool_result` belongs in `to_summarize` (where it
+    /// gets text-ified into the summary prose), not in `to_keep`.
+    ///
+    /// Walks at most `messages.len()` steps because each iteration
+    /// advances `split_point` by at least 1.
+    fn split_point_skips_leading_orphan(messages: &[Message], mut split_point: usize) -> usize {
+        while split_point < messages.len() {
+            if Self::leading_message_has_orphan_tool_result(&messages[split_point..]) {
+                split_point = split_point.saturating_add(1);
+                continue;
             }
-
-            split_point = adjusted;
+            break;
         }
+        split_point
+    }
+
+    /// True when `to_keep[0]` is a `user` message whose `tool_result`
+    /// blocks reference at least one `tool_use_id` not present in
+    /// `to_keep`. The check is scoped to the first message because
+    /// well-formed Anthropic conversations always have `tool_use`
+    /// immediately before `tool_result` — an orphan deeper than
+    /// `to_keep[0]` would require the input itself to be malformed
+    /// upstream of compaction, which is out of scope here.
+    fn leading_message_has_orphan_tool_result(to_keep: &[Message]) -> bool {
+        let Some(first) = to_keep.first() else {
+            return false;
+        };
+        let Content::Blocks(blocks) = &first.content else {
+            return false;
+        };
+
+        // Pull the tool_result ids that appear in the first message.
+        // If there are none, the first message can't contribute an
+        // orphan and we're done early without scanning the tail.
+        let mut needed: Vec<&str> = Vec::new();
+        for block in blocks {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                needed.push(tool_use_id.as_str());
+            }
+        }
+        if needed.is_empty() {
+            return false;
+        }
+
+        // Build the set of tool_use ids `to_keep` will host.
+        let known_ids: std::collections::HashSet<&str> = to_keep
+            .iter()
+            .flat_map(|message| match &message.content {
+                Content::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                Content::Text(_) => Vec::new(),
+            })
+            .collect();
+
+        needed.iter().any(|id| !known_ids.contains(id))
     }
 
     /// Keep most recent messages that fit within the retained-message token budget.
@@ -408,7 +511,12 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             new_messages.push(Message::assistant(SUMMARY_ACKNOWLEDGMENT));
         }
 
-        // Add recent messages
+        // Add recent messages. `to_keep` is guaranteed self-consistent
+        // by `split_point_preserves_tool_pairs_with_cap` (steps 2 and
+        // 3): any orphan `tool_result` was either folded into the
+        // summary (split shifted forward) or paired with its
+        // `tool_use` inside `to_keep` (split shifted backward). No
+        // post-hoc rewriting of the assembled output is required.
         new_messages.extend(to_keep.iter().cloned());
 
         let new_count = new_messages.len();
@@ -838,68 +946,137 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compact_history_preserves_tool_result_tool_use_pairs() -> Result<()> {
-        let provider = Arc::new(MockProvider::new("Summary around tool pair."));
+    async fn test_compact_history_split_skips_leading_orphan_after_summary_ack() -> Result<()> {
+        // The user-visible bug at ENG-8385/M7.5: a previously
+        // compacted history was re-compacted in a later turn. The
+        // first compaction left
+        // `[summary, summary_ack, user(tool_result toolu_X),
+        //  assistant(toolu_X reply), ...]`. On the second pass the
+        // default `split_point` (len - retain_recent = 5 - 3 = 2)
+        // would have made `to_keep[0] == user(tool_result toolu_X)`,
+        // and the synthetic `[summary, summary_ack, …]` prefix the
+        // compactor inserts in front of `to_keep` has no `tool_use`
+        // blocks — so the next request to Anthropic blew up with
+        // `messages.2.content.0: unexpected tool_use_id`.
+        //
+        // Pair-preservation alone can't fix this: it only inspects
+        // the immediate prev/next pair (here `summary_ack` vs
+        // `user(tool_result)`) and `summary_ack` is text-only, so the
+        // pair check sees no `tool_use` to anchor on and lets the
+        // orphan through. The chain-safety pass added in
+        // `split_point_preserves_tool_pairs_with_cap` step 3 walks
+        // the candidate forward past any leading orphan, so the
+        // `tool_result` lands in `to_summarize` and gets folded into
+        // the summary's prose where it's harmless.
+        //
+        // The assertion is structural, not block-counting: every
+        // surviving `tool_result` must reference a `tool_use` that
+        // appears earlier in the new message list. No
+        // post-compaction stripping is involved — the split point
+        // alone is responsible for chain integrity.
+        let provider = Arc::new(MockProvider::new("Re-summary."));
+        let config = CompactionConfig::default()
+            .with_retain_recent(3)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::user(format!("{SUMMARY_PREFIX}Old summary about toolu_X.")),
+            Message::assistant(SUMMARY_ACKNOWLEDGMENT),
+            Message {
+                role: Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_X".to_string(),
+                    content: "result for X".to_string(),
+                    is_error: None,
+                }]),
+            },
+            Message::assistant("Result interpreted."),
+            Message::user("Now what?"),
+        ];
+
+        let result = compactor.compact_history(messages).await?;
+
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in &result.messages {
+            if let Content::Blocks(blocks) = &msg.content {
+                for block in blocks {
+                    match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            assert!(
+                                seen_ids.contains(tool_use_id),
+                                "orphan tool_use_id {tool_use_id} survived split selection",
+                            );
+                        }
+                        ContentBlock::ToolUse { id, .. } => {
+                            seen_ids.insert(id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_keeps_tool_pair_when_immediate_prev_is_text_only() -> Result<()> {
+        // Tighter regression for the chain-safety boundary: even
+        // when the message *before* the candidate split point is
+        // text-only (so pair-preservation has nothing to anchor on),
+        // chain-safety must shift the split forward past a leading
+        // `user(tool_result)` whose `tool_use` would otherwise be
+        // folded into the summary.
+        let provider = Arc::new(MockProvider::new("Boundary summary."));
         let config = CompactionConfig::default()
             .with_retain_recent(2)
             .with_min_messages(1);
         let compactor = LlmContextCompactor::new(provider, config);
 
-        // Build a history where split_point would land on tool-use tool-result crossing in the
-        // opposite direction:
-        // ... user tool_result | assistant tool_use ...
+        // Layout (5 messages, retain_recent=2 → initial split=3):
+        //   0: user("first turn") — to_summarize
+        //   1: assistant("text only") — to_summarize, immediate prev
+        //   2: user(tool_result toolu_Y) — orphan in default to_keep
+        //   3: assistant("then a reply")
+        //   4: user("ok thanks")
+        //
+        // The corresponding `tool_use` for toolu_Y was lost long
+        // ago — there's no `tool_use` anywhere in `messages`. With
+        // pair-preservation alone, `to_keep` would start at index 3
+        // (or 2 unshifted), leaving the orphan at the head and
+        // tripping Anthropic.
         let messages = vec![
-            Message::user("Start a workflow"),
+            Message::user("first turn"),
+            Message::assistant("text only"),
             Message {
                 role: Role::User,
                 content: Content::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool_odd".to_string(),
-                    content: "prior result".to_string(),
+                    tool_use_id: "toolu_Y".to_string(),
+                    content: "ancient result".to_string(),
                     is_error: None,
                 }]),
             },
-            Message {
-                role: Role::Assistant,
-                content: Content::Blocks(vec![ContentBlock::ToolUse {
-                    id: "tool_odd".to_string(),
-                    name: "follow_up".to_string(),
-                    input: serde_json::json!({}),
-                    thought_signature: None,
-                }]),
-            },
-            Message::assistant("Follow up done."),
+            Message::assistant("then a reply"),
+            Message::user("ok thanks"),
         ];
 
         let result = compactor.compact_history(messages).await?;
 
-        // Split-point starts at 2 and is adjusted back to 1, keeping the tool result and tool use.
-        assert_eq!(result.new_count, 5);
-
-        // tool_result should remain with the kept tail.
-        let kept_result = &result.messages[2];
-        if let Content::Blocks(blocks) = &kept_result.content {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
-                "Expected kept user tool_result in retained tail"
-            );
-        } else {
-            panic!("Expected tool_result blocks in retained tail");
-        }
-
-        // tool_use should remain with the kept tail.
-        let kept_tool_use = &result.messages[3];
-        if let Content::Blocks(blocks) = &kept_tool_use.content {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
-                "Expected kept assistant tool_use in retained tail"
-            );
-        } else {
-            panic!("Expected tool_use blocks in retained tail");
-        }
+        // No tool_result block survives anywhere — the only one in
+        // input was orphaned and the split-shift folded it into the
+        // summary.
+        let has_tool_result = result.messages.iter().any(|m| {
+            matches!(
+                &m.content,
+                Content::Blocks(blocks)
+                    if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            )
+        });
+        assert!(
+            !has_tool_result,
+            "orphan tool_result should have been pushed into to_summarize, not retained",
+        );
 
         Ok(())
     }
