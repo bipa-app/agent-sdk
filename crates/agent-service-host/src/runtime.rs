@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use agent_sdk::context::CompactionConfig;
 use agent_sdk_core::{PendingToolCallInfo, ToolResult};
 use agent_sdk_providers::LlmProvider;
 use agent_server::worker::{
@@ -52,6 +53,14 @@ pub struct ExecutionRuntime {
     /// behaviour (every tool call routes through
     /// `spawn_tool_children`).
     subagent_spawn_selector: Arc<dyn SubagentSpawnSelector>,
+    /// Optional auto-compaction policy. When set, the worker runs
+    /// the SDK compactor before each LLM call once the staged
+    /// history crosses [`CompactionConfig::threshold_tokens`] and,
+    /// reactively, when the provider rejects a turn with a
+    /// `prompt is too long` error. Defaults to `None` so existing
+    /// hosts keep today's "no automatic compaction" behaviour
+    /// unchanged.
+    compaction_config: Option<CompactionConfig>,
 }
 
 impl ExecutionRuntime {
@@ -66,6 +75,7 @@ impl ExecutionRuntime {
             tool_executor,
             confirmation_policy,
             subagent_spawn_selector: Arc::new(NoopSubagentSpawnSelector),
+            compaction_config: None,
         }
     }
 
@@ -79,6 +89,34 @@ impl ExecutionRuntime {
         selector: Arc<dyn SubagentSpawnSelector>,
     ) -> Self {
         self.subagent_spawn_selector = selector;
+        self
+    }
+
+    /// Enable host-driven auto-compaction with the given policy.
+    ///
+    /// The worker reads this config back via [`Self::compaction_config`]
+    /// once per turn:
+    ///
+    /// * **Pre-call**: if the staged message history exceeds
+    ///   [`CompactionConfig::threshold_tokens`], the worker compacts
+    ///   the durable projection (via `MessageProjectionStore::replace_history`),
+    ///   re-seeds the staged buffer, and proceeds with the compacted
+    ///   history.
+    /// * **Post-failure**: if the provider returns an
+    ///   `InvalidRequest` whose message matches the well-known
+    ///   "prompt is too long" patterns (Anthropic's 1M context cap,
+    ///   `OpenAI`'s `context_length_exceeded`, Gemini's "input is
+    ///   too long", Bedrock's "request too large"), the worker
+    ///   compacts and retries up to
+    ///   [`CompactionConfig::auto_compact`]'s budget instead of
+    ///   failing the turn fatally.
+    ///
+    /// Without a configured `CompactionConfig`, both paths preserve
+    /// today's behaviour (no automatic compaction; `InvalidRequest`
+    /// goes fatal).
+    #[must_use]
+    pub const fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction_config = Some(config);
         self
     }
 
@@ -100,6 +138,11 @@ impl ExecutionRuntime {
     #[must_use]
     pub fn subagent_spawn_selector(&self) -> &Arc<dyn SubagentSpawnSelector> {
         &self.subagent_spawn_selector
+    }
+
+    #[must_use]
+    pub const fn compaction_config(&self) -> Option<&CompactionConfig> {
+        self.compaction_config.as_ref()
     }
 }
 

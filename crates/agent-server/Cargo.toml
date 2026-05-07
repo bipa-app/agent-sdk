@@ -10,6 +10,11 @@ publish = false
 agent-sdk-core = { workspace = true }
 agent-sdk-tools = { workspace = true }
 agent-sdk-providers = { workspace = true }
+# Pulled in for `agent_sdk::context::{CompactionConfig, ContextCompactor,
+# LlmContextCompactor}` so the daemon worker can run auto-compaction
+# (proactive threshold trigger + post-failure overflow recovery) without
+# duplicating the in-process loop's compactor implementation.
+agent-sdk = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

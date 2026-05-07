@@ -86,6 +86,7 @@
 //!   bootstrapping a child task or a queued root.
 
 pub mod bootstrap;
+pub mod compaction;
 pub mod confirmation;
 pub mod definition;
 pub mod registry;
@@ -96,6 +97,8 @@ pub mod tool_task;
 
 #[cfg(test)]
 mod bootstrap_test;
+#[cfg(test)]
+mod compaction_integration_test;
 #[cfg(test)]
 mod confirmation_test;
 #[cfg(test)]

@@ -68,7 +68,19 @@ pub struct StagedMessageStore {
     /// Number of seed messages from the checkpoint. `drain_messages`
     /// returns only messages appended *after* the seed so the commit
     /// path can safely append the delta to the durable projection.
-    seed_len: usize,
+    ///
+    /// Re-points to the new history length whenever
+    /// [`MessageStore::replace_history`] is invoked: replacing the
+    /// history is conceptually "the new committed seed is THIS",
+    /// so any subsequent appends within the same attempt are the
+    /// delta the commit path needs to forward to the durable
+    /// projection. Without this update a mid-attempt rewrite (e.g.
+    /// the daemon worker's auto-compaction path that calls
+    /// `replace_history` after `MessageProjectionStore::replace_history`
+    /// rewrote the projection) would leave `seed_len` pointing past
+    /// the buffer's tail, and `drain_messages` would silently swallow
+    /// every new message added during the rest of the turn.
+    seed_len: RwLock<usize>,
 }
 
 impl StagedMessageStore {
@@ -79,7 +91,7 @@ impl StagedMessageStore {
         Self {
             thread_id,
             messages: RwLock::new(seed_messages),
-            seed_len,
+            seed_len: RwLock::new(seed_len),
         }
     }
 
@@ -98,7 +110,8 @@ impl StagedMessageStore {
     /// Returns an error if the internal lock is poisoned.
     pub fn drain_messages(&self) -> Result<Vec<llm::Message>> {
         let all = std::mem::take(&mut *self.messages.write().ok().context("lock poisoned")?);
-        Ok(all.into_iter().skip(self.seed_len).collect())
+        let seed_len = *self.seed_len.read().ok().context("lock poisoned")?;
+        Ok(all.into_iter().skip(seed_len).collect())
     }
 
     /// Snapshot the current buffered messages without consuming them.
@@ -162,7 +175,15 @@ impl MessageStore for StagedMessageStore {
             self.thread_id,
             thread_id,
         );
+        // Replacing history conceptually means "this *is* the new
+        // committed seed". `drain_messages` only returns appends made
+        // after the seed, so we have to re-point `seed_len` at the
+        // new buffer tail; otherwise a subsequent append within the
+        // same attempt would land between the seed-as-recorded and
+        // the buffer-as-mutated, and the commit path would drop it.
+        let new_len = messages.len();
         *self.messages.write().ok().context("lock poisoned")? = messages;
+        *self.seed_len.write().ok().context("lock poisoned")? = new_len;
         Ok(())
     }
 }

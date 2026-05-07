@@ -105,6 +105,30 @@ pub struct RootTurnDeps<'a> {
     /// [`crate::worker::subagent_spawn_selector`].
     pub subagent_spawn_selector:
         Option<&'a (dyn super::subagent_spawn_selector::SubagentSpawnSelector + 'a)>,
+    /// Optional auto-compaction policy supplied by the host. When
+    /// set, the worker's `build_chat_request` (and the resume-path
+    /// equivalent) run a pre-call threshold check against the staged
+    /// history and rewrite the durable [`MessageProjectionStore`]
+    /// when the threshold is crossed, and `call_llm_with_retry`
+    /// reactively compacts on `prompt is too long` errors instead
+    /// of going fatal. (Both helpers are private — see
+    /// `crates/agent-server/src/worker/compaction.rs` for the public
+    /// surface that drives them.)
+    ///
+    /// `None` (the default) preserves today's "no automatic
+    /// compaction" behaviour for every existing host.
+    pub compaction_config: Option<&'a agent_sdk::context::CompactionConfig>,
+    /// `Arc` handle to the same provider passed positionally to
+    /// [`execute_root_turn`] / [`resume_root_turn`]. Required when
+    /// `compaction_config` is `Some` so the worker can build an
+    /// [`agent_sdk::context::LlmContextCompactor`] (which takes
+    /// ownership of an `Arc<dyn LlmProvider>` for the duration of
+    /// the summarisation call). Leaving the borrowed-vs-owned
+    /// shapes side-by-side keeps every existing call site —
+    /// including the in-crate test fixtures that pass
+    /// `&MockTextProvider` — compiling unchanged; only hosts
+    /// opting into compaction need to supply the Arc.
+    pub compaction_provider: Option<&'a std::sync::Arc<dyn agent_sdk_providers::LlmProvider>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -456,6 +480,23 @@ async fn execute_root_turn_inner(
     deps.event_notifier
         .notify(std::slice::from_ref(&start_committed));
 
+    // 2.5 Pre-call auto-compaction.
+    //
+    //     Compaction operates on the staged history (which excludes
+    //     the fresh user prompt — that lives only inside
+    //     `chat_request.messages` after `build_chat_request` runs)
+    //     so the durable projection can be safely rewritten without
+    //     duplicating the user prompt at commit time. No-op when
+    //     `deps.compaction_config` is `None`.
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction")?;
+
     // 3. Build, send LLM request, and resolve the outcome — closing
     //    the attempt on any non-success path.  `call_llm` allocates
     //    per-block message/thinking IDs lazily as deltas arrive and
@@ -797,6 +838,16 @@ const STREAM_BASE_DELAY_MS: u64 = 500;
 /// blip and a daemon respawn share the same wall-clock vocabulary.
 const STREAM_MAX_DELAY_MS: u64 = 8_000;
 
+/// Maximum number of consecutive emergency compactions the worker
+/// will run inside a single [`call_llm_with_retry`] invocation
+/// before giving up and propagating the provider's
+/// `prompt is too long` error.  Mirrors
+/// `agent_sdk::agent_loop::types::MAX_COMPACTION_RETRIES` so the
+/// daemon and in-process loops fail at the same point — usually a
+/// signal that the system prompt + tools alone exceed the model's
+/// context window and no amount of summarisation will help.
+const MAX_COMPACTION_RETRIES: u32 = 3;
+
 /// Classified outcome of [`call_llm_once`].  The retry wrapper
 /// distinguishes recoverable transient failures from fatal ones so
 /// only the former enter the backoff loop.
@@ -904,7 +955,7 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         definition,
         attempt_user_prompt,
         provider,
-        chat_request,
+        mut chat_request,
         initial_attempt,
         deps,
         thread_id,
@@ -913,9 +964,16 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
 
     let mut attempt = initial_attempt;
     let mut retries: u32 = 0;
+    // Separate budget for compaction-driven retries so transient
+    // network blips can't burn through it before a real overflow
+    // arrives, and a runaway compaction loop can't hide a genuine
+    // bug behind unlimited retries. Mirrors
+    // `agent_sdk::agent_loop::types::MAX_COMPACTION_RETRIES`.
+    let mut compaction_retries: u32 = 0;
+    let is_resume_attempt = attempt_user_prompt == "<resume>";
 
     loop {
-        let attempt_now = if retries == 0 {
+        let attempt_now = if retries == 0 && compaction_retries == 0 {
             now
         } else {
             OffsetDateTime::now_utc()
@@ -944,52 +1002,216 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                 });
             }
             Err(StreamAttemptError::Recoverable { kind, message }) => {
-                retries = retries.saturating_add(1);
-                if retries > STREAM_MAX_RETRIES {
-                    let final_msg = format!(
-                        "LLM stream error after {STREAM_MAX_RETRIES} retries (kind={kind:?}): {message}"
-                    );
-                    emit_auto_retry_end(
-                        deps,
-                        thread_id,
-                        retries.saturating_sub(1),
-                        false,
-                        Some(final_msg.clone()),
-                    )
-                    .await;
-                    bail!("{final_msg}");
-                }
-                let delay = stream_backoff_delay(retries);
-                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                log::warn!(
-                    "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
-                     for thread {thread_id}; retrying in {delay_ms} ms — {message}"
-                );
-                emit_auto_retry_start(
-                    deps,
-                    thread_id,
-                    retries,
-                    STREAM_MAX_RETRIES,
-                    delay_ms,
-                    &message,
-                )
-                .await;
-                tokio::time::sleep(delay).await;
-                attempt = open_attempt(
+                attempt = handle_recoverable_stream_error(RecoverableRetryParams {
+                    kind,
+                    message: &message,
+                    retries: &mut retries,
                     inputs,
                     definition,
                     attempt_user_prompt,
-                    deps.attempt_store,
-                    OffsetDateTime::now_utc(),
-                )
-                .await
-                .context("open retry turn attempt")?;
+                    deps,
+                    thread_id,
+                })
+                .await?;
             }
             Err(StreamAttemptError::Fatal { message }) => {
+                if let Some(next_attempt) =
+                    try_recover_with_compaction(PromptTooLongRecoveryParams {
+                        message: &message,
+                        chat_request: &mut chat_request,
+                        attempt_user_prompt,
+                        is_resume_attempt,
+                        compaction_retries: &mut compaction_retries,
+                        inputs,
+                        definition,
+                        deps,
+                        thread_id,
+                    })
+                    .await?
+                {
+                    attempt = next_attempt;
+                    continue;
+                }
                 bail!("{message}");
             }
         }
     }
+}
+
+/// Parameters for [`handle_recoverable_stream_error`]. Bundled to
+/// dodge `clippy::too_many_arguments` and keep the call site at
+/// [`call_llm_with_retry`] readable.
+struct RecoverableRetryParams<'a> {
+    kind: StreamErrorKind,
+    message: &'a str,
+    retries: &'a mut u32,
+    inputs: &'a RootWorkerInputs,
+    definition: &'a AgentDefinition,
+    attempt_user_prompt: &'a str,
+    deps: &'a RootTurnDeps<'a>,
+    thread_id: &'a agent_sdk_core::ThreadId,
+}
+
+/// Handle a recoverable streaming failure: bump the retry counter,
+/// surface `AutoRetryStart`/`AutoRetryEnd`, sleep for the
+/// exponential-backoff delay, and open a fresh turn attempt for the
+/// next iteration. Returns the new attempt the caller should retry
+/// against.
+async fn handle_recoverable_stream_error(
+    params: RecoverableRetryParams<'_>,
+) -> Result<TurnAttempt> {
+    let RecoverableRetryParams {
+        kind,
+        message,
+        retries,
+        inputs,
+        definition,
+        attempt_user_prompt,
+        deps,
+        thread_id,
+    } = params;
+
+    *retries = retries.saturating_add(1);
+    if *retries > STREAM_MAX_RETRIES {
+        let final_msg = format!(
+            "LLM stream error after {STREAM_MAX_RETRIES} retries (kind={kind:?}): {message}"
+        );
+        emit_auto_retry_end(
+            deps,
+            thread_id,
+            retries.saturating_sub(1),
+            false,
+            Some(final_msg.clone()),
+        )
+        .await;
+        bail!("{final_msg}");
+    }
+    let delay = stream_backoff_delay(*retries);
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    log::warn!(
+        "LLM stream {kind:?} on attempt {retries}/{STREAM_MAX_RETRIES} \
+         for thread {thread_id}; retrying in {delay_ms} ms — {message}",
+    );
+    emit_auto_retry_start(
+        deps,
+        thread_id,
+        *retries,
+        STREAM_MAX_RETRIES,
+        delay_ms,
+        message,
+    )
+    .await;
+    tokio::time::sleep(delay).await;
+    open_attempt(
+        inputs,
+        definition,
+        attempt_user_prompt,
+        deps.attempt_store,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .context("open retry turn attempt")
+}
+
+/// Parameters for [`try_recover_with_compaction`]. Bundled because
+/// the helper would otherwise hit `clippy::too_many_arguments`, and
+/// because every field is borrowed from the same retry-loop scope.
+struct PromptTooLongRecoveryParams<'a> {
+    message: &'a str,
+    chat_request: &'a mut ChatRequest,
+    attempt_user_prompt: &'a str,
+    is_resume_attempt: bool,
+    compaction_retries: &'a mut u32,
+    inputs: &'a RootWorkerInputs,
+    definition: &'a AgentDefinition,
+    deps: &'a RootTurnDeps<'a>,
+    thread_id: &'a agent_sdk_core::ThreadId,
+}
+
+/// Detect a `prompt is too long`-class fatal error, run an emergency
+/// compaction against the durable projection + staged buffer, rebuild
+/// the chat request from the compacted history, and open a fresh
+/// turn attempt for the retry.
+///
+/// Returns `Ok(Some(attempt))` when compaction ran and the caller
+/// should retry with the rebuilt `chat_request` under the new
+/// `attempt`, `Ok(None)` when the error doesn't match the
+/// prompt-too-long shape (or compaction isn't configured / has been
+/// exhausted), and `Err` if compaction itself failed in a way the
+/// caller must surface.
+async fn try_recover_with_compaction(
+    params: PromptTooLongRecoveryParams<'_>,
+) -> Result<Option<TurnAttempt>> {
+    let PromptTooLongRecoveryParams {
+        message,
+        chat_request,
+        attempt_user_prompt,
+        is_resume_attempt,
+        compaction_retries,
+        inputs,
+        definition,
+        deps,
+        thread_id,
+    } = params;
+
+    if !super::compaction::is_prompt_too_long_error(message)
+        || deps.compaction_config.is_none()
+        || deps.compaction_provider.is_none()
+        || *compaction_retries >= MAX_COMPACTION_RETRIES
+    {
+        return Ok(None);
+    }
+
+    *compaction_retries = compaction_retries.saturating_add(1);
+    let now_compact = OffsetDateTime::now_utc();
+    log::warn!(
+        "Provider rejected turn with prompt-too-long on thread {thread_id} \
+         (compaction retry {}/{MAX_COMPACTION_RETRIES}); attempting emergency \
+         compaction before retry",
+        *compaction_retries,
+    );
+    let did_compact = super::compaction::compact_after_overflow(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now_compact,
+    )
+    .await
+    .context("emergency compaction after prompt-too-long")?;
+
+    if !did_compact {
+        return Ok(None);
+    }
+
+    // Rebuild the chat request from the compacted staged history.
+    // For the fresh path, re-append the user prompt that
+    // `build_chat_request` pushed onto the original request — it's
+    // still not in the staged buffer (the commit path appends it
+    // via `buffer_turn_messages` after a successful turn). For the
+    // resume path the staged buffer already contains everything
+    // the LLM needs.
+    let mut messages = inputs
+        .staged_stores
+        .messages
+        .get_history(thread_id)
+        .await
+        .context("read staged history after emergency compaction")?;
+    if !is_resume_attempt {
+        messages.push(agent_sdk_core::llm::Message::user(attempt_user_prompt));
+    }
+    chat_request.messages = messages;
+
+    let next_attempt = open_attempt(
+        inputs,
+        definition,
+        attempt_user_prompt,
+        deps.attempt_store,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .context("open retry turn attempt after emergency compaction")?;
+
+    Ok(Some(next_attempt))
 }
 
 /// Exponential backoff with bounded jitter.  Mirrors
@@ -2205,6 +2427,22 @@ pub async fn resume_root_turn(
         .set_draft(thread_id, resumed_draft, now)
         .await
         .context("refresh draft with completed child results before resume LLM call")?;
+
+    // 2.5 Pre-call auto-compaction.
+    //
+    //     The resume path's staged history already includes the
+    //     suspended messages + tool results buffered above, so
+    //     compacting here folds the prior turn's tool transcript
+    //     into the summary before the LLM sees it. No-op when
+    //     `deps.compaction_config` is `None`.
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction (resume path)")?;
 
     // 3. Build the chat request from staged history — no extra user
     //    prompt to append because everything is already buffered.

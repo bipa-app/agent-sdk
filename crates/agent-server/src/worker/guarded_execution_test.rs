@@ -231,6 +231,8 @@ impl TestStores {
             event_repo: &self.events,
             event_notifier: &self.event_notifier,
             subagent_spawn_selector: None,
+            compaction_config: None,
+            compaction_provider: None,
         }
     }
 }
