@@ -128,6 +128,28 @@ If you only want spans, you can omit `.observability_store(...)` and just config
 cargo run --example otel --features otel
 ```
 
+### Local Langfuse stack
+
+A self-contained Langfuse + OTel collector compose stack lives at
+`dev/observability/langfuse/`. From this repo:
+
+```bash
+docker compose -f dev/observability/langfuse/docker-compose.yml up -d
+```
+
+For a downstream consumer (e.g. `bip`) the workspace ships a small CLI
+(`agent-sdk-cli`) that materializes the same compose files into the
+consumer's working tree:
+
+```bash
+cargo install --path crates/agent-sdk-cli   # or --git for remote consumers
+agent-sdk local-langfuse init                 # writes ./dev/observability/langfuse/...
+agent-sdk doctor                              # checks docker, ports, dest writability
+```
+
+See `crates/agent-sdk/docs/observability/LANGFUSE.md` for the full
+setup walkthrough.
+
 ## Quick Start
 
 ```rust

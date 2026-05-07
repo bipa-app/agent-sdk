@@ -49,6 +49,7 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
 lapin = { version = "4.4.0", default-features = false, features = ["rustls", "tokio"] }
+clap = { version = "4", features = ["derive"] }
 
 # dev
 tempfile = "3"

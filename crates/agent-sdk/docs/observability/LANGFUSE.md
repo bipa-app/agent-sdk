@@ -75,7 +75,45 @@ Add `-v` to drop the named volumes
 `agent_sdk_langfuse_minio`) and reset the Langfuse database on the next
 boot.
 
-## 5. Troubleshooting
+## 5. Using this from a downstream consumer (bip, etc.)
+
+If your project depends on `agent-sdk` as a Cargo git dependency, the
+compose files don't materialize automatically — Cargo only fetches
+`crates/**`. Use the `agent-sdk-cli` to drop the same files into your
+working tree.
+
+```bash
+# Install the CLI (binary name: `agent-sdk`).
+cargo install --git https://github.com/bipa-app/agent-sdk.git \
+  --rev <pin-from-your-Cargo.toml> agent-sdk-cli
+
+# Or, when developing against a local checkout:
+cargo install --path /path/to/agent-sdk/crates/agent-sdk-cli
+```
+
+Then, from your project root:
+
+```bash
+agent-sdk doctor                 # checks docker, ports 4000/4317/4318
+agent-sdk local-langfuse init    # writes ./dev/observability/langfuse/{docker-compose.yml,otel-collector.yaml,LANGFUSE.md}
+agent-sdk local-langfuse up      # docker compose up -d (read this file before running)
+```
+
+`agent-sdk local-langfuse init --force` overwrites an existing copy when
+you bump the SDK pin and want the latest stack. The CLI is just a
+distribution channel — the bytes it writes are exactly the ones checked
+into the SDK at the rev you installed.
+
+Once your binary calls
+`agent_sdk_otel::install_global_provider(OtelConfig::from_env()?)?` at
+startup (Phase 9 · E1), pointing it at the local collector is a single
+env var:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p <your-binary>
+```
+
+## 6. Troubleshooting
 
 - **Port `4000`, `4317`, or `4318` already bound.** A parallel Bipa stack
   (`bipa-langfuse`) or another collector probably has the port. Run
