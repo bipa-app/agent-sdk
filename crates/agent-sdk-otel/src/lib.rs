@@ -111,6 +111,22 @@ impl Drop for OtelGuard {
 /// Returns an error if the OTLP exporter cannot be built — the most
 /// common cause is a malformed endpoint URL.
 pub fn install_global_provider(cfg: &OtelConfig) -> Result<OtelGuard> {
+    // Phase 9 · C2: flip the SDK's process-wide payload-capture
+    // gate to match the operator's choice.  The gate defaults to
+    // closed; flipping it open still requires every store to
+    // override `ObservabilityStore::acknowledge_pii_redaction()` to
+    // return true before any payload reaches a span inline.
+    agent_sdk::observability::set_payload_capture_enabled(cfg.capture_payloads);
+    if cfg.capture_payloads {
+        log::warn!(
+            target: "agent_sdk_otel",
+            "agent_sdk observability: payload capture is ENABLED. Stores must override \
+             ObservabilityStore::acknowledge_pii_redaction() to return true *and* \
+             install a non-noop PayloadRedactor for `gen_ai.input.messages` / \
+             `gen_ai.output.messages` to land on spans."
+        );
+    }
+
     let resource = resource::build(cfg);
     let sampler = sampler::resolve(cfg.sampler, cfg.sample_ratio)
         .context("failed to resolve OTel sampler")?;

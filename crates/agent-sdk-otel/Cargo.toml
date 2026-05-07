@@ -9,6 +9,7 @@ keywords = ["agent", "llm", "opentelemetry", "otlp", "observability"]
 categories = ["development-tools::profiling"]
 
 [dependencies]
+agent-sdk = { workspace = true, features = ["otel"] }
 anyhow = { workspace = true }
 log = { workspace = true }
 opentelemetry = { workspace = true }

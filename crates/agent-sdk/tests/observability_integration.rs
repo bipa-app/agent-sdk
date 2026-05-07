@@ -7,6 +7,7 @@ use agent_sdk::llm::{
 };
 use agent_sdk::observability::{
     CaptureDecision, CaptureResult, ObservabilityStore, PayloadBundle, attrs, langfuse,
+    set_payload_capture_enabled,
 };
 use agent_sdk::{
     AgentInput, AgentState, AllowAllHooks, CancellationToken, DynamicToolName, InMemoryEventStore,
@@ -197,6 +198,64 @@ impl ObservabilityStore for InlinePayloadStore {
             input_messages: CaptureDecision::Inline,
             output_messages: CaptureDecision::Inline,
         })
+    }
+}
+
+/// Phase 9 · C2 test double: same `Inline` decisions as
+/// [`InlinePayloadStore`] but with the PII attestation flipped to
+/// `true`. Used to prove the gate's two-prong AND semantics.
+struct AttestingInlinePayloadStore;
+
+#[async_trait]
+impl ObservabilityStore for AttestingInlinePayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> Result<CaptureResult> {
+        Ok(CaptureResult {
+            system_instructions: CaptureDecision::Inline,
+            input_messages: CaptureDecision::Inline,
+            output_messages: CaptureDecision::Inline,
+        })
+    }
+
+    fn acknowledge_pii_redaction(&self) -> bool {
+        true
+    }
+}
+
+/// Phase 9 · C2 test double: returns `Reference` for every
+/// artifact. Confirms that externalized payloads pass through the
+/// gate untouched.
+struct ReferencingPayloadStore;
+
+#[async_trait]
+impl ObservabilityStore for ReferencingPayloadStore {
+    async fn capture(&self, _bundle: &PayloadBundle) -> Result<CaptureResult> {
+        Ok(CaptureResult {
+            system_instructions: CaptureDecision::Reference("payload-ref://system/test".into()),
+            input_messages: CaptureDecision::Reference("payload-ref://input/test".into()),
+            output_messages: CaptureDecision::Reference("payload-ref://output/test".into()),
+        })
+    }
+}
+
+/// RAII guard that flips the SDK's process-wide payload-capture
+/// gate for the lifetime of the binding and restores the previous
+/// value on drop. Tests use this so concurrent cases do not poison
+/// each other through the leaked global flag.
+struct CaptureGateGuard {
+    previous: bool,
+}
+
+impl CaptureGateGuard {
+    fn set(enabled: bool) -> Self {
+        let previous = agent_sdk::observability::is_payload_capture_enabled();
+        set_payload_capture_enabled(enabled);
+        Self { previous }
+    }
+}
+
+impl Drop for CaptureGateGuard {
+    fn drop(&mut self) {
+        set_payload_capture_enabled(self.previous);
     }
 }
 
@@ -727,14 +786,67 @@ async fn turn_span_emits_cached_token_attributes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn inline_payload_store_records_input_and_output_messages() -> Result<()> {
+async fn inline_payload_store_without_attestation_records_no_payload_attributes() -> Result<()> {
+    // Phase 9 · C2: a store that returns `Inline` for everything
+    // but does not override `acknowledge_pii_redaction()` should
+    // see all of its decisions downgraded to `Omit` by the
+    // process-wide payload-capture gate. This is the privacy
+    // default-deny — the SDK never trusts an opt-in store unless
+    // the operator has *also* flipped `OtelConfig::capture_payloads`
+    // and the store has explicitly attested PII safety.
     let _guard = acquire_test_lock().await;
+    let _gate = CaptureGateGuard::set(true);
     let (tp, exporter) = setup_tracer();
 
     let provider = TestProvider::new(vec![TestProvider::text_response("Hi there")]);
     let agent = builder::<()>()
         .provider(provider)
         .observability_store(InlinePayloadStore)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_INPUT_MESSAGES),
+        None,
+        "input messages must NOT land on the span when the store does not attest PII safety",
+    );
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_OUTPUT_MESSAGES),
+        None,
+        "output messages must NOT land on the span when the store does not attest PII safety",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inline_payload_store_with_attestation_records_messages_when_capture_enabled() -> Result<()>
+{
+    // Pair the gate-open operator opt-in with a store that attests
+    // PII redaction. Both prerequisites met → payloads land on the
+    // span exactly as they did before the C2 hardening.
+    let _guard = acquire_test_lock().await;
+    let _gate = CaptureGateGuard::set(true);
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi there")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(AttestingInlinePayloadStore)
         .event_store(new_event_store())
         .build();
     let thread_id = ThreadId::new();
@@ -769,6 +881,94 @@ async fn inline_payload_store_records_input_and_output_messages() -> Result<()> 
     assert_eq!(output["role"], "assistant");
     assert_eq!(output["content"][0]["text"], "Hi there");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn attestation_alone_is_not_enough_when_capture_disabled() -> Result<()> {
+    // The store attests PII safety, but the operator has *not*
+    // flipped `OtelConfig::capture_payloads`. Default-deny: the
+    // SDK still drops the payloads. This is the AND semantics of
+    // the C2 gate.
+    let _guard = acquire_test_lock().await;
+    let _gate = CaptureGateGuard::set(false);
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi there")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(AttestingInlinePayloadStore)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert_eq!(
+        get_attr(llm, attrs::GEN_AI_INPUT_MESSAGES),
+        None,
+        "attestation alone must not be enough — the operator-level gate must also be open",
+    );
+    assert_eq!(get_attr(llm, attrs::GEN_AI_OUTPUT_MESSAGES), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reference_decisions_pass_through_the_gate_unchanged() -> Result<()> {
+    // `CaptureDecision::Reference` is always safe — the store has
+    // externalised the payload behind an opaque ID, no PII reaches
+    // the span. The gate must let it through even when capture is
+    // closed and the store has not attested.
+    let _guard = acquire_test_lock().await;
+    let _gate = CaptureGateGuard::set(false);
+    let (tp, exporter) = setup_tracer();
+
+    let provider = TestProvider::new(vec![TestProvider::text_response("Hi there")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .observability_store(ReferencingPayloadStore)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let final_state = agent.run(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    wait_for_run(final_state).await?;
+    tp.force_flush()
+        .context("failed to flush tracer provider")?;
+
+    let spans = get_spans(&exporter)?;
+    let root = root_span_for_thread(&spans, &thread_id)?;
+    let trace_spans = spans_in_trace(&spans, root.span_context.trace_id());
+    let llm = find_span_in_trace(&trace_spans, "chat test-model")?;
+
+    assert_eq!(
+        get_attr(llm, attrs::SDK_OTEL_INPUT_MESSAGES_REF).as_deref(),
+        Some("payload-ref://input/test"),
+    );
+    assert_eq!(
+        get_attr(llm, attrs::SDK_OTEL_OUTPUT_MESSAGES_REF).as_deref(),
+        Some("payload-ref://output/test"),
+    );
+    // Inline attributes must still be absent because Reference
+    // does not produce them.
+    assert_eq!(get_attr(llm, attrs::GEN_AI_INPUT_MESSAGES), None);
+    assert_eq!(get_attr(llm, attrs::GEN_AI_OUTPUT_MESSAGES), None);
     Ok(())
 }
 

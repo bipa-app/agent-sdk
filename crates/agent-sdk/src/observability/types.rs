@@ -120,6 +120,25 @@ pub trait ObservabilityStore: Send + Sync {
     fn redactor(&self) -> &PayloadRedactor {
         &NOOP_REDACTOR
     }
+
+    /// Affirm that this store has a real PII redactor installed and
+    /// is safe to honour [`CaptureDecision::Inline`].
+    ///
+    /// Returns `false` by default. The SDK gates every `Inline`
+    /// decision behind this method **and** the operator-facing
+    /// `OtelConfig::capture_payloads` flag — both must be true for
+    /// payloads to land on spans inline. Stores that have not
+    /// explicitly verified their redactor MUST leave the default in
+    /// place; otherwise the SDK silently drops payloads to protect
+    /// against PII leakage.
+    ///
+    /// [`CaptureDecision::Reference`] is **not** affected by this
+    /// gate — externalised payloads are always recorded as
+    /// references because the underlying content stays out of the
+    /// span entirely.
+    fn acknowledge_pii_redaction(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
