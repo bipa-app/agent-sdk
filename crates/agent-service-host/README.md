@@ -72,3 +72,76 @@ redaction for the event's `input`, `output`, and `error` fields
 before they reach the durable table. Read paths return the
 already-redacted rows, so sensitive tool data never lands in durable
 storage even if an operator replays or exports audit history.
+
+## Run with observability
+
+Phase 9 · E1 wires the
+[`agent-sdk-otel`](../agent-sdk-otel) bootstrap helper into the host
+binary so a single config section turns on traces + metrics.
+
+Build the host with the `otel` feature to pull in the OTLP exporter
+and the `agent_server.*` / `agent_service_host.*` / `gen_ai.*`
+metric instruments:
+
+```bash
+cargo run -p agent-service-host --features otel
+```
+
+Default builds remain dependency-free — the `otel` feature is
+strictly opt-in.
+
+### Quickest local-stack flow
+
+```bash
+# Bring up the local Tempo + Prometheus + Grafana stack (and
+# optionally fan out to Langfuse). See dev/observability/up.sh.
+./dev/observability/up.sh both
+
+# Tell the host to push to the local OTel collector.
+cat > /tmp/config.yaml <<'YAML'
+observability:
+  enabled: true
+  otlp_endpoint: "http://localhost:4317"
+  service_name: agent-service-host
+  deployment_environment: local
+  sampler: parentbased_traceidratio
+  sample_ratio: 1.0
+YAML
+
+AGENT_SERVICE_CONFIG=/tmp/config.yaml \
+  cargo run -p agent-service-host --features otel
+```
+
+Open <http://localhost:3001> (Grafana, `admin`/`admin`) and the
+starter `agent-sdk` dashboard renders as soon as the host emits its
+first batch of metrics.
+
+### Configuration reference
+
+| YAML key                                  | Env var equivalent                  | Default                                       |
+| ----------------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `observability.enabled`                   | —                                   | `false` (hard skip)                           |
+| `observability.service_name`              | `OTEL_SERVICE_NAME`                 | `agent-service-host`                          |
+| `observability.service_instance_id`       | `OTEL_SERVICE_INSTANCE_ID`          | random UUID v7                                |
+| `observability.deployment_environment`    | `OTEL_DEPLOYMENT_ENVIRONMENT`       | `unknown_deployment`                          |
+| `observability.otlp_endpoint`             | `OTEL_EXPORTER_OTLP_ENDPOINT`       | unset (exporter disabled)                     |
+| `observability.otlp_headers`              | `OTEL_EXPORTER_OTLP_HEADERS`        | empty                                         |
+| `observability.sampler`                   | `OTEL_TRACES_SAMPLER`               | `parentbased_traceidratio`                    |
+| `observability.sample_ratio`              | `OTEL_TRACES_SAMPLER_ARG`           | `1.0`                                         |
+| `observability.propagated_baggage_keys`   | —                                   | baseline allow-list (Phase 9 · C3)            |
+| `observability.capture_payloads`          | —                                   | `false` (default-deny per Phase 9 · C2)       |
+
+Resolution order: env vars are read first, then YAML overrides any
+field that is set explicitly. This keeps containerised deploys
+12-factor while still letting static config files pin values.
+
+### Prometheus exposition
+
+This release does **not** spin up an in-process `/metrics` server.
+The `opentelemetry-prometheus` crate is officially discontinued and
+the recommended path is to push OTLP and let an OTel collector or
+Prometheus' native OTLP receiver handle scraping. The local
+Grafana stack already does exactly that — see
+`dev/observability/grafana/otel-collector.yaml` for the collector
+config and `crates/agent-sdk/docs/observability/GRAFANA.md` for the
+end-to-end flow.

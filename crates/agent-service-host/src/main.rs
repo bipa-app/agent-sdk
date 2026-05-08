@@ -68,6 +68,25 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?
         .block_on(async move {
+            // Phase 9 · E1: install the global OTel tracer + meter
+            // providers as soon as we are inside the runtime. Batch
+            // span / periodic metric exporters need a tokio runtime
+            // for their flush tasks, so we deliberately stay inside
+            // `block_on` rather than installing in `fn main`. The
+            // returned guard is dropped at the *end* of this block,
+            // so `host.run().await` finishes first and any in-flight
+            // exports complete before tear-down.
+            //
+            // `install_observability` returns `Ok(None)` when
+            // `observability.enabled = false` so the default
+            // deployment story is unchanged: build without OTel
+            // dependencies, run without OTel pipelines.
+            #[cfg(feature = "otel")]
+            let _otel_guard = agent_service_host::observability::install_observability(
+                &host.config().observability,
+            )
+            .context("installing OTel global provider")?;
+
             host.initialize()
                 .await
                 .context("initializing service host")?;

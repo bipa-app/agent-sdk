@@ -106,6 +106,13 @@ pub struct ServiceHost {
     health: Arc<HealthSurface>,
     metrics: Arc<dyn MetricsRecorder>,
     shutdown: CancellationToken,
+    /// Phase 9 · E1: hold the `db.pool.connections.{active,idle}`
+    /// `ObservableGauge` handles for the host's lifetime so the
+    /// callback registrations are not dropped early.  Empty unless
+    /// the host was built with `--features otel` *and* the registry
+    /// is Postgres-backed.
+    #[cfg(feature = "otel")]
+    _pool_gauges: Vec<opentelemetry::metrics::ObservableGauge<u64>>,
 }
 
 impl ServiceHost {
@@ -126,6 +133,8 @@ impl ServiceHost {
         Self::validate_config(&config)?;
         let stores = StoreRegistry::from_config(&config.storage, definition_registry)
             .context("initialising store registry")?;
+        #[cfg(feature = "otel")]
+        let pool_gauges = super::observability::install_postgres_pool_gauges(&stores);
         Ok(Self {
             config,
             stores,
@@ -133,6 +142,8 @@ impl ServiceHost {
             health: HealthSurface::shared(),
             metrics: Arc::new(LoggingMetricsRecorder),
             shutdown: CancellationToken::new(),
+            #[cfg(feature = "otel")]
+            _pool_gauges: pool_gauges,
         })
     }
 
@@ -148,6 +159,8 @@ impl ServiceHost {
         runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
         Self::validate_config(&config)?;
+        #[cfg(feature = "otel")]
+        let pool_gauges = super::observability::install_postgres_pool_gauges(&stores);
         Ok(Self {
             config,
             stores,
@@ -155,6 +168,8 @@ impl ServiceHost {
             health: HealthSurface::shared(),
             metrics: Arc::new(LoggingMetricsRecorder),
             shutdown: CancellationToken::new(),
+            #[cfg(feature = "otel")]
+            _pool_gauges: pool_gauges,
         })
     }
 
