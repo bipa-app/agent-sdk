@@ -1,0 +1,76 @@
+# OpenTelemetry collector config for the local Agent SDK Grafana stack.
+#
+# Pipelines:
+#   traces  → Tempo (always) + Langfuse (when LANGFUSE_OTLP_ENDPOINT is
+#             set by `dev/observability/up.sh both`) + debug log.
+#   metrics → Prometheus pull endpoint on :8889 + debug log.
+#
+# See dev/observability/grafana/docker-compose.yml and
+# crates/agent-sdk/docs/observability/GRAFANA.md.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    # Local-dev safety net so a runaway producer doesn't OOM the
+    # collector. Numbers picked to fit a developer laptop.
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: normal
+
+  otlp/tempo:
+    # Tempo speaks OTLP gRPC on its distributor port. The compose file
+    # puts both services on the same Docker network, so service-name
+    # DNS resolves.
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: agent_sdk
+    # Keep span resource attributes (service.name, service.version, …)
+    # on the exported metric labels so Grafana queries can group by
+    # them.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  otlphttp/langfuse:
+    # `up.sh both` overrides this with
+    # http://host.docker.internal:4000/api/public/otel so the same
+    # collector can fan out to Langfuse alongside Tempo. Left at the
+    # default, the exporter aims at a black hole — failures are
+    # logged once per batch and never block the rest of the pipeline
+    # (sending_queue + retry_on_failure are off below).
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      # Same well-known local-dev key pair as the D1 stack
+      # (pk-lf-local-public-key:sk-lf-local-secret-key, base64).
+      Authorization: Basic cGstbGYtbG9jYWwtcHVibGljLWtleTpzay1sZi1sb2NhbC1zZWNyZXQta2V5
+    compression: gzip
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      enabled: false
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, otlphttp/langfuse, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus, debug]

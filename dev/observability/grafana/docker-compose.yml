@@ -1,0 +1,99 @@
+name: agent-sdk-grafana
+
+# Local Grafana + Tempo + Prometheus stack for testing the `agent-sdk`
+# OTLP exporter without going through Langfuse. Runs alongside the
+# Langfuse stack at dev/observability/langfuse/ and shares OTLP ports
+# 4317/4318 with that stack — only one collector can hold those ports
+# at a time. Use `dev/observability/up.sh both` to bring both stacks
+# up with this collector as the shared receiver and Langfuse's own
+# collector scaled to zero.
+#
+# Bring it up directly with:
+#   docker compose -f dev/observability/grafana/docker-compose.yml up -d
+#
+# Tempo HTTP:    http://localhost:3200
+# Prometheus:    http://localhost:9090
+# Grafana UI:    http://localhost:3001          (admin / admin)
+# OTLP gRPC:     http://localhost:4317
+# OTLP HTTP:     http://localhost:4318
+#
+# Setup walkthrough: crates/agent-sdk/docs/observability/GRAFANA.md
+#
+# Compose project name `agent-sdk-grafana` and the `agent_sdk_grafana_*`
+# volume prefix keep this stack distinct from the Langfuse stack
+# (`agent-sdk-langfuse`). Image versions are pinned so a fresh checkout
+# boots a known-good combination on Apple silicon and Linux.
+
+services:
+  tempo:
+    image: grafana/tempo:2.7.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - agent_sdk_grafana_tempo:/var/tempo
+    ports:
+      - "3200:3200"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - agent_sdk_grafana_prometheus:/prometheus
+    ports:
+      - "9090:9090"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    restart: unless-stopped
+    depends_on:
+      - tempo
+      - prometheus
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      # Optional Langfuse fan-out. `up.sh both` sets this to point at
+      # the host-exposed Langfuse UI so a single collector forwards to
+      # Tempo + Prometheus + Langfuse simultaneously. Left unset, the
+      # exporter targets a black hole and the collector logs the
+      # delivery failure without dropping the rest of the pipeline.
+      LANGFUSE_OTLP_ENDPOINT: ${LANGFUSE_OTLP_ENDPOINT:-http://disabled.local:9999}
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    extra_hosts:
+      # Linux parity for Docker Desktop's host.docker.internal — used
+      # by `up.sh both` to reach the Langfuse stack on the host
+      # network without binding the two stacks to the same Docker
+      # network.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    restart: unless-stopped
+    depends_on:
+      - tempo
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - agent_sdk_grafana_grafana:/var/lib/grafana
+    ports:
+      - "3001:3000"
+
+volumes:
+  agent_sdk_grafana_tempo:
+  agent_sdk_grafana_prometheus:
+  agent_sdk_grafana_grafana:

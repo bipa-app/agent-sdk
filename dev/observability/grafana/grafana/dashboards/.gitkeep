@@ -1,0 +1,3 @@
+# Placeholder so the directory exists for Grafana's dashboard
+# provisioning. D3 (ENG-8302) drops the starter dashboard JSON
+# alongside this file.

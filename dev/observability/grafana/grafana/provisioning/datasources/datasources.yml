@@ -1,0 +1,31 @@
+# Grafana datasource provisioning for the local Agent SDK Grafana
+# stack. Loaded automatically at boot; see
+# dev/observability/grafana/docker-compose.yml.
+
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    uid: tempo
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      httpMethod: GET
+      tracesToMetrics:
+        datasourceUid: prometheus
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: false
+    jsonData:
+      httpMethod: GET
+      timeInterval: 15s

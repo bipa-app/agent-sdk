@@ -1,0 +1,19 @@
+# Grafana dashboard provider. Picks up `*.json` files from
+# `/etc/grafana/provisioning/dashboards/` (mounted into the container
+# from `dev/observability/grafana/grafana/dashboards/`). D3 fills the
+# directory with the starter dashboard.
+
+apiVersion: 1
+
+providers:
+  - name: agent-sdk
+    orgId: 1
+    folder: Agent SDK
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
