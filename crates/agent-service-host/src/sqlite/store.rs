@@ -34,6 +34,7 @@ use agent_server::journal::event_outbox_transaction::{
 };
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
+use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::outbox::{
@@ -1288,6 +1289,101 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         })
     }
 
+    /// Atomic fork transaction for `SQLite`.
+    ///
+    /// Wraps the entire write set the fork RPC handler hands us
+    /// (thread aggregate bootstrap + projection rewrite +
+    /// `committed_turns` mirroring + checkpoint insert + event
+    /// re-commit) inside one transaction. A crash or rolled-back
+    /// transaction leaves the destination thread in the
+    /// not-created state — never partially-built — so the gRPC
+    /// handler's idempotency replay can safely retry under the
+    /// same `request_id` after a transport blip without seeing a
+    /// half-finished fork.
+    async fn commit_fork_atomic_inner(&self, params: ForkCommitParams) -> Result<()> {
+        use agent_server::journal::message::MessageProjection;
+
+        let mut tx = self.begin().await?;
+
+        // 1. Bootstrap the destination thread aggregate. Same call
+        //    `bootstrap_thread_row_tx` makes for `commit_completed_turn`,
+        //    which means the row layout (status, created_at, etc.)
+        //    matches what `CreateThread` would have produced — the
+        //    fork's destination is indistinguishable from a fresh
+        //    thread the moment the transaction commits.
+        Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+
+        // 2. Mirror `committed_turns` by repeatedly applying
+        //    `Thread::apply_committed_turn`. Each call advances
+        //    `committed_turns` by one and folds the supplied
+        //    `TokenUsage` into the aggregate's running
+        //    `total_usage`. Only the final iteration carries the
+        //    full `cumulative_total_usage` from the source's
+        //    snapshot at the fork boundary so the destination
+        //    lands at exactly that total without distributing
+        //    arbitrary per-turn usage values along the way (the
+        //    per-turn usage is already preserved on the source's
+        //    checkpoint chain — the fork only needs the cumulative
+        //    end state to keep cost reporting honest).
+        let mut thread_row = Self::get_thread_tx(&mut tx, &params.new_thread_id)
+            .await?
+            .context("forked thread row missing after bootstrap")?;
+        if params.committed_turns > 0 {
+            let zero = TokenUsage::default();
+            for turn_index in 0..params.committed_turns {
+                let usage_for_this_turn = if turn_index + 1 == params.committed_turns {
+                    &params.cumulative_total_usage
+                } else {
+                    &zero
+                };
+                thread_row = thread_row
+                    .apply_committed_turn(usage_for_this_turn, params.now)
+                    .context("advancing forked thread aggregate inside sqlite fork transaction")?;
+            }
+            Self::upsert_thread_tx(&mut tx, &thread_row).await?;
+        }
+
+        // 3. Seed the projection. `replace_history` builds a fresh
+        //    `MessageProjection` keyed on `new_thread_id` so the
+        //    bumped `version` is consistent with what
+        //    `recover_thread`'s draft / committed merge expects.
+        if !params.messages.is_empty() {
+            let projection_before =
+                Self::get_message_head_tx(&mut tx, &params.new_thread_id, params.now).await?;
+            let updated_projection =
+                MessageProjection::replace_history(projection_before, params.messages, params.now);
+            Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
+        }
+
+        // 4. Mirror the source's checkpoint at the fork-point turn.
+        if let Some(checkpoint_params) = params.checkpoint {
+            let checkpoint = agent_server::journal::checkpoint::Checkpoint::new(checkpoint_params)
+                .context("constructing forked checkpoint")?;
+            Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
+        }
+
+        // 5. Re-commit events under the new thread id with fresh
+        //    sequences. The starting sequence is always 0 because
+        //    a freshly-bootstrapped thread has no prior events;
+        //    `next_event_sequence_tx` returns 0 in that case.
+        if !params.events.is_empty() {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
+            Self::insert_events_tx(
+                &mut tx,
+                &params.new_thread_id,
+                params.events,
+                start_seq,
+                params.now,
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .context("commit sqlite fork transaction")?;
+        Ok(())
+    }
+
     /// Atomic completed-turn transaction for `SQLite`.
     async fn commit_completed_turn_atomic_inner(
         &self,
@@ -2461,6 +2557,10 @@ impl ThreadStore for SqliteDurableStore {
         Some(self)
     }
 
+    fn atomic_fork_committer(&self) -> Option<&dyn AtomicForkCommitter> {
+        Some(self)
+    }
+
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
@@ -2786,6 +2886,13 @@ impl AtomicCompletedTurnCommitter for SqliteDurableStore {
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params).await
+    }
+}
+
+#[async_trait]
+impl AtomicForkCommitter for SqliteDurableStore {
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()> {
+        self.commit_fork_atomic_inner(params).await
     }
 }
 
@@ -4936,6 +5043,286 @@ mod tests {
             projection_after_commit.message_count(),
             2,
             "committed history reflects the turn's final messages",
+        );
+
+        Ok(())
+    }
+
+    /// `AtomicForkCommitter` on `SQLite` must commit thread aggregate
+    /// + projection + checkpoint + events as one transaction. This
+    /// covers the happy path: every store reflects the committed
+    /// fork state after a single `commit_fork_atomic` call.
+    #[tokio::test]
+    async fn fork_atomic_commits_full_state_in_one_transaction() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_core::llm::Message;
+        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::checkpoint_store::CheckpointStore;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::message_store::MessageProjectionStore;
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::AgentTask;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let now = t0();
+
+        // The source thread + task have to actually exist on disk so
+        // the fork's mirrored checkpoint can carry the source's
+        // task_id without violating the
+        // agent_sdk_message_commits.task_id FK.
+        let source_thread_id = ThreadId::from_string("source-thread");
+        ThreadStore::get_or_create(&store, &source_thread_id, now).await?;
+        let source_task = AgentTask::new_root_turn(source_thread_id.clone(), now, 3);
+        let source_task_id = source_task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, source_task).await?;
+
+        let new_thread_id = ThreadId::from_string("forked-thread-id");
+        let messages = vec![
+            Message::user("hi from source"),
+            Message::assistant("hello from source"),
+        ];
+        let events = vec![
+            AgentEvent::start(source_thread_id.clone(), 1),
+            AgentEvent::done(
+                source_thread_id.clone(),
+                1,
+                agent_sdk_core::TokenUsage::default(),
+                std::time::Duration::from_secs(1),
+            ),
+        ];
+        let params = ForkCommitParams {
+            new_thread_id: new_thread_id.clone(),
+            now,
+            committed_turns: 1,
+            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
+            messages: messages.clone(),
+            checkpoint: Some(NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: 1,
+                task_id: source_task_id,
+                messages: messages.clone(),
+                agent_state_snapshot: serde_json::json!({
+                    "thread_id": new_thread_id.0.clone(),
+                    "turn_count": 1,
+                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "metadata": {},
+                    "created_at": "2023-11-14T00:00:00Z",
+                }),
+                turn_usage: agent_sdk_core::TokenUsage::default(),
+                now,
+            }),
+            events: events.clone(),
+        };
+
+        store.commit_fork_atomic(params).await?;
+
+        let thread = ThreadStore::get(&store, &new_thread_id)
+            .await?
+            .context("forked thread aggregate must exist after commit")?;
+        assert_eq!(thread.committed_turns, 1);
+
+        let projection = MessageProjectionStore::get_history(&store, &new_thread_id).await?;
+        assert_eq!(projection.len(), 2);
+
+        let checkpoint = CheckpointStore::get_by_turn(&store, &new_thread_id, 1)
+            .await?
+            .context("forked checkpoint must exist")?;
+        assert_eq!(checkpoint.messages.len(), 2);
+
+        let committed = EventRepository::get_events(&store, &new_thread_id).await?;
+        assert_eq!(committed.len(), 2);
+        let sequences: Vec<_> = committed.iter().map(|c| c.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![0, 1],
+            "events committed with fresh sequences"
+        );
+
+        Ok(())
+    }
+
+    /// `ForkCommitParams::cumulative_total_usage` must land on the
+    /// destination's thread aggregate `total_usage` so cost reporting
+    /// on the fork picks up where the source left off.  The earlier
+    /// per-turn iterations contribute zero usage; only the final
+    /// `apply_committed_turn` carries the carryover, which means the
+    /// fork's running total ends at exactly `cumulative_total_usage`.
+    #[tokio::test]
+    async fn fork_atomic_carries_cumulative_total_usage() -> Result<()> {
+        use agent_sdk_core::TokenUsage;
+        use agent_sdk_core::llm::Message;
+        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::AgentTask;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let now = t0();
+
+        let source_thread_id = ThreadId::from_string("usage-source");
+        ThreadStore::get_or_create(&store, &source_thread_id, now).await?;
+        let source_task = AgentTask::new_root_turn(source_thread_id.clone(), now, 3);
+        let source_task_id = source_task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, source_task).await?;
+
+        let new_thread_id = ThreadId::from_string("usage-fork");
+        let cumulative = TokenUsage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let messages = vec![Message::user("u"), Message::assistant("a")];
+        let params = ForkCommitParams {
+            new_thread_id: new_thread_id.clone(),
+            now,
+            committed_turns: 3,
+            cumulative_total_usage: cumulative.clone(),
+            messages: messages.clone(),
+            checkpoint: Some(NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: 3,
+                task_id: source_task_id,
+                messages: messages.clone(),
+                agent_state_snapshot: serde_json::json!({
+                    "thread_id": new_thread_id.0.clone(),
+                    "turn_count": 3,
+                    "total_usage": cumulative,
+                    "metadata": {},
+                    "created_at": "2023-11-14T00:00:00Z",
+                }),
+                turn_usage: TokenUsage::default(),
+                now,
+            }),
+            events: Vec::new(),
+        };
+        store.commit_fork_atomic(params).await?;
+
+        let thread = ThreadStore::get(&store, &new_thread_id)
+            .await?
+            .context("fork must exist after commit")?;
+        assert_eq!(thread.committed_turns, 3);
+        assert_eq!(
+            thread.total_usage, cumulative,
+            "fork's total_usage must mirror the source's cumulative usage at the fork boundary",
+        );
+
+        Ok(())
+    }
+
+    /// A failing fork must leave zero observable state on the
+    /// destination thread. We trigger a failure by passing a
+    /// checkpoint whose `task_id` collides with an already-inserted
+    /// row in another thread's table; the unique constraint on
+    /// `(thread_id, turn_number)` will reject the second commit
+    /// inside the transaction, the rollback fires, and the
+    /// destination must come up empty.
+    #[tokio::test]
+    async fn fork_atomic_rolls_back_on_failure() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_core::llm::Message;
+        use agent_server::journal::checkpoint::NewCheckpointParams;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::message_store::MessageProjectionStore;
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::AgentTask;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let new_thread_id = ThreadId::from_string("forked-rollback");
+        let now = t0();
+
+        // Both the pre-existing checkpoint and the fork checkpoint
+        // need real task rows behind them — the
+        // agent_sdk_message_commits → agent_sdk_tasks FK doesn't care
+        // which thread the task lives on, just that it exists.
+        let pre_thread_id = ThreadId::from_string("pre-thread");
+        ThreadStore::get_or_create(&store, &pre_thread_id, now).await?;
+        let pre_task = AgentTask::new_root_turn(pre_thread_id.clone(), now, 3);
+        let pre_task_id = pre_task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, pre_task).await?;
+
+        let source_thread_id = ThreadId::from_string("source-thread");
+        ThreadStore::get_or_create(&store, &source_thread_id, now).await?;
+        let source_task = AgentTask::new_root_turn(source_thread_id.clone(), now, 3);
+        let source_task_id = source_task.id.clone();
+        AgentTaskStore::submit_root_turn(&store, source_task).await?;
+
+        // Pre-insert a checkpoint at turn_number = 1 on the
+        // destination thread id. The fork's checkpoint insert hits
+        // the `(thread_id, turn_number)` unique constraint and rolls
+        // back the entire transaction.
+        ThreadStore::get_or_create(&store, &new_thread_id, now).await?;
+        agent_server::journal::checkpoint_store::CheckpointStore::commit_checkpoint(
+            &store,
+            NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: 1,
+                task_id: pre_task_id,
+                messages: vec![],
+                agent_state_snapshot: serde_json::json!({
+                    "thread_id": new_thread_id.0.clone(),
+                    "turn_count": 0,
+                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "metadata": {},
+                    "created_at": "2023-11-14T00:00:00Z",
+                }),
+                turn_usage: agent_sdk_core::TokenUsage::default(),
+                now,
+            },
+        )
+        .await?;
+
+        // Now run the fork. Its checkpoint insert at turn 1 will
+        // collide and the transaction rolls back.
+        let fresh_messages = vec![Message::user("seeded")];
+        let params = ForkCommitParams {
+            new_thread_id: new_thread_id.clone(),
+            now,
+            committed_turns: 1,
+            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
+            messages: fresh_messages.clone(),
+            checkpoint: Some(NewCheckpointParams {
+                thread_id: new_thread_id.clone(),
+                turn_number: 1,
+                task_id: source_task_id,
+                messages: fresh_messages.clone(),
+                agent_state_snapshot: serde_json::json!({
+                    "thread_id": new_thread_id.0.clone(),
+                    "turn_count": 1,
+                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "metadata": {},
+                    "created_at": "2023-11-14T00:00:00Z",
+                }),
+                turn_usage: agent_sdk_core::TokenUsage::default(),
+                now,
+            }),
+            events: vec![AgentEvent::start(source_thread_id.clone(), 1)],
+        };
+        let err = store
+            .commit_fork_atomic(params)
+            .await
+            .expect_err("checkpoint collision must fail the fork transaction");
+        let _ = err; // payload-shape doesn't matter; rollback is what we're checking.
+
+        // Crucially, the rolled-back transaction must NOT leave the
+        // fresh projection/event mutations behind. The pre-existing
+        // checkpoint is still there (that wasn't part of the failed
+        // tx), but the destination's projection must still be empty
+        // and the event log must have no entries.
+        let projection = MessageProjectionStore::get_history(&store, &new_thread_id).await?;
+        assert!(
+            projection.is_empty(),
+            "rolled-back fork must not leave seeded messages on the destination"
+        );
+        let committed = EventRepository::get_events(&store, &new_thread_id).await?;
+        assert!(
+            committed.is_empty(),
+            "rolled-back fork must not leave events on the destination"
         );
 
         Ok(())
