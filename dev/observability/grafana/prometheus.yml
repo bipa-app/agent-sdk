@@ -1,0 +1,16 @@
+# Prometheus scrape config for the local Agent SDK Grafana stack.
+#
+# We don't enable Prometheus' OTLP receiver — instead we let the OTel
+# collector expose a `prometheus` pull endpoint and scrape that. Same
+# end result, fewer experimental flags. See
+# dev/observability/grafana/otel-collector.yaml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: agent-sdk-otel-collector
+    static_configs:
+      - targets:
+          - otel-collector:8889

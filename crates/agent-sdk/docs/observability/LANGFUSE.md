@@ -15,12 +15,20 @@ without a real production endpoint.
 ## 1. Bring it up
 
 ```bash
-docker compose -f dev/observability/langfuse/docker-compose.yml up -d
+./dev/observability/up.sh langfuse
 ```
 
-The first boot pulls Postgres, ClickHouse, Redis, MinIO, the Langfuse
-web/worker, and the OTel collector. Allow ~30 s for `langfuse-web` to finish
-its migrations.
+That's a thin wrapper around
+`docker compose -f dev/observability/langfuse/docker-compose.yml up -d`
+— use whichever you prefer; the bytes are identical. The first boot
+pulls Postgres, ClickHouse, Redis, MinIO, the Langfuse web/worker, and
+the OTel collector. Allow ~30 s for `langfuse-web` to finish its
+migrations.
+
+> Want metrics dashboards in Grafana too? See
+> [`GRAFANA.md`](./GRAFANA.md) — `./dev/observability/up.sh both`
+> brings up Langfuse and the Grafana stack with a single shared
+> collector.
 
 Sign in at <http://localhost:4000>:
 
@@ -64,6 +72,14 @@ for the gate.
   `langfuse.trace.metadata.*` from a single struct (`agent.run_with_options`).
 
 ## 4. Tear down
+
+```bash
+./dev/observability/up.sh down
+```
+
+That stops both the Langfuse and Grafana stacks (whichever are
+running). To target only the Langfuse stack, the underlying primitive
+is:
 
 ```bash
 docker compose -f dev/observability/langfuse/docker-compose.yml down
