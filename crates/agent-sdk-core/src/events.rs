@@ -12,6 +12,7 @@
 //! 3. `TurnComplete` - One LLM round-trip finished
 //! 4. `Done` - Agent completed successfully, or `Error` if failed
 
+use crate::llm::ContentBlock;
 use crate::types::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -26,6 +27,36 @@ use time::OffsetDateTime;
 pub enum AgentEvent {
     /// Agent loop has started
     Start { thread_id: ThreadId, turn: usize },
+
+    /// The user prompt that opens a turn.
+    ///
+    /// Committed by the worker on the **first attempt** of each
+    /// root-turn task, immediately before the matching
+    /// [`AgentEvent::Start`]. Carries the task's admitted
+    /// `submitted_input` lifted into the LLM-content shape
+    /// (`Vec<ContentBlock>` — text, image, document) so consumers
+    /// can render the prompt without reaching into the projection
+    /// or the task store. Retries of the same turn do not re-emit
+    /// the event; downstream readers can pair `UserInput` 1:1
+    /// with the *first* `Start { turn: N }` per turn.
+    ///
+    /// This is the durable, sequence-numbered admission event the
+    /// projection never carried — `MessageProjection::messages`
+    /// still holds the same prompt as an `llm::Message`, but it
+    /// has no sequence and commingles with tool-result and
+    /// compaction-summary user-role rows. Replay clients that
+    /// need a clean, chronological "this is what the user typed"
+    /// signal read this event instead.
+    UserInput {
+        thread_id: ThreadId,
+        /// Lifted from the admitted task's
+        /// `submitted_input`. Only `Text`, `Image`, and `Document`
+        /// blocks appear — the runtime never admits user prompts
+        /// containing tool blocks, but the broader
+        /// `ContentBlock` type lets the field round-trip through
+        /// the same wire shapes the projection uses.
+        content: Vec<ContentBlock>,
+    },
 
     /// Agent is "thinking" - complete thinking text after stream ends
     Thinking { message_id: String, text: String },
@@ -182,6 +213,11 @@ impl AgentEvent {
     #[must_use]
     pub const fn start(thread_id: ThreadId, turn: usize) -> Self {
         Self::Start { thread_id, turn }
+    }
+
+    #[must_use]
+    pub const fn user_input(thread_id: ThreadId, content: Vec<ContentBlock>) -> Self {
+        Self::UserInput { thread_id, content }
     }
 
     #[must_use]

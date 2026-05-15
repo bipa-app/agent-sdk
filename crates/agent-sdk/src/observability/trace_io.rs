@@ -175,6 +175,7 @@ pub fn langfuse_trace_output(event: &AgentEvent) -> Option<String> {
         AgentEvent::Error { message, .. } => non_empty(message),
         AgentEvent::Refusal { text, .. } => text.as_deref().and_then(non_empty),
         AgentEvent::Start { .. }
+        | AgentEvent::UserInput { .. }
         | AgentEvent::Thinking { .. }
         | AgentEvent::ThinkingDelta { .. }
         | AgentEvent::TextDelta { .. }
@@ -200,6 +201,7 @@ pub const fn langfuse_trace_event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolRequiresConfirmation { .. } => "Tool Confirmation",
         AgentEvent::Error { .. } => "Error",
         AgentEvent::Refusal { .. } => "Refusal",
+        AgentEvent::UserInput { .. } => "User",
         AgentEvent::Start { .. }
         | AgentEvent::Thinking { .. }
         | AgentEvent::ThinkingDelta { .. }

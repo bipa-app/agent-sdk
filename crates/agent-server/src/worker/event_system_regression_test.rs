@@ -213,6 +213,7 @@ fn event_type_names(events: &[crate::journal::committed_event::CommittedEvent]) 
         .iter()
         .map(|e| match &e.event {
             AgentEvent::Start { .. } => "Start",
+            AgentEvent::UserInput { .. } => "UserInput",
             AgentEvent::Thinking { .. } => "Thinking",
             AgentEvent::Text { .. } => "Text",
             AgentEvent::ToolCallStart { .. } => "ToolCallStart",
@@ -944,15 +945,20 @@ async fn concurrent_child_progress_events_ordered() -> Result<()> {
     assert_contiguous_sequences(&all);
     assert_all_same_thread(&all, &thread_reg());
 
+    // Every root turn now commits a `UserInput` event before the
+    // matching `Start` (it's the durable per-turn admission
+    // record consumers replay from). Subsequent assertions shift
+    // by one to accommodate the new leading event.
     let types = event_type_names(&all);
-    assert_eq!(types[0], "Start");
-    assert_eq!(types[1], "ToolCallStart");
+    assert_eq!(types[0], "UserInput");
+    assert_eq!(types[1], "Start");
     assert_eq!(types[2], "ToolCallStart");
-    assert_eq!(types[3], "ToolProgress");
-    assert_eq!(types[4], "ToolCallEnd");
-    assert_eq!(types[5], "ToolProgress");
+    assert_eq!(types[3], "ToolCallStart");
+    assert_eq!(types[4], "ToolProgress");
+    assert_eq!(types[5], "ToolCallEnd");
     assert_eq!(types[6], "ToolProgress");
-    assert_eq!(types[7], "ToolCallEnd");
+    assert_eq!(types[7], "ToolProgress");
+    assert_eq!(types[8], "ToolCallEnd");
 
     Ok(())
 }

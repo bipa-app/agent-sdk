@@ -2106,6 +2106,18 @@ fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_e
                 text: text.clone(),
             })))
         }
+        AgentEvent::UserInput { thread_id, content } => {
+            let content_proto: Vec<pb::ConversationContentBlock> = content
+                .iter()
+                .map(map_content_block)
+                .collect::<RpcResult<_>>()?;
+            Ok(Some(pb::event_envelope::Event::UserInput(
+                pb::UserInputEvent {
+                    thread_id: thread_id.0.clone(),
+                    content: content_proto,
+                },
+            )))
+        }
         _ => Ok(None),
     }
 }

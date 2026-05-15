@@ -36,6 +36,22 @@ message StartEvent {
   uint64 turn = 2;
 }
 
+// The user prompt that opens a turn. Committed by the worker on
+// the first attempt of each root-turn task, immediately before
+// the matching `StartEvent`. Carries the admitted prompt as a
+// list of conversation content blocks (text, image, document)
+// so replay clients can render the user message without
+// re-deriving it from the projection's user-role messages —
+// the projection mixes prompts with tool-result responses and
+// compaction summaries, none of which carry a sequence number.
+message UserInputEvent {
+  string thread_id = 1;
+  // Lifted from the task's admitted `submitted_input`. Reuses
+  // the common `ConversationContentBlock` shape so wire types
+  // stay consistent with the projection snapshot.
+  repeated ConversationContentBlock content = 2;
+}
+
 message ThinkingEvent {
   string message_id = 1;
   string text = 2;
@@ -187,6 +203,7 @@ message EventEnvelope {
     SubagentProgressEvent subagent_progress = 24;
     AutoRetryStartEvent auto_retry_start = 25;
     AutoRetryEndEvent auto_retry_end = 26;
+    UserInputEvent user_input = 27;
   }
 }
 
