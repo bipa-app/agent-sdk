@@ -521,7 +521,8 @@ const DEFAULT_SERVICE_NAME: &str = "agent-service-host";
 pub use agent_sdk_otel::OtelGuard;
 
 /// Install the global `OTel` tracer + meter providers when the
-/// caller's [`ObservabilityConfig::enabled`] is `true`.
+/// caller's [`ObservabilityConfig::enabled`](crate::config::ObservabilityConfig::enabled)
+/// is `true`.
 ///
 /// The returned `Option<OtelGuard>` is `None` when
 /// `observability.enabled = false`, signalling "skip cleanly". The
@@ -531,7 +532,9 @@ pub use agent_sdk_otel::OtelGuard;
 /// Resolution order for every field:
 /// 1. Read the `OTEL_*` environment variables via
 ///    [`agent_sdk_otel::OtelConfig::from_env`].
-/// 2. Override anything the [`ObservabilityConfig`] explicitly sets.
+/// 2. Override anything the
+///    [`ObservabilityConfig`](crate::config::ObservabilityConfig) explicitly
+///    sets.
 ///
 /// This keeps containerised deploys 12-factor while still letting
 /// static config files pin values when they need to.
