@@ -213,11 +213,16 @@ struct StreamedTurn {
 /// streaming completes.
 ///
 /// Groups the per-block IDs (so the consolidated content events match
-/// the streamed deltas by id) with the `Start` [`CommittedEvent`]
+/// the streamed deltas by id) with the per-turn admission events
 /// produced at turn open (so the outcome's `committed_events` includes
 /// every event written for the turn).
 struct TurnCloseContext {
     content_ids: ContentIds,
+    /// Durable user-input event committed on the first attempt of
+    /// the task. `None` on retry attempts (the prompt has already
+    /// been committed once for the turn) and for resume / empty
+    /// inputs that do not surface a prompt to clients.
+    user_input_committed: Option<CommittedEvent>,
     start_committed: CommittedEvent,
 }
 
@@ -460,7 +465,32 @@ async fn execute_root_turn_inner(
     crate::observability::ServerMetrics::global()
         .record_task_acquired(crate::observability::attrs::KIND_ROOT);
 
-    // 2. Commit the `Start` event NOW, before streaming begins, so
+    // 2. Commit the durable user-input event for this turn,
+    //    once-per-task (gated on `attempt_number == 1`). The
+    //    projection's user-role message for this prompt is
+    //    written downstream, but it carries no sequence and gets
+    //    commingled with tool-result / compaction-summary
+    //    user-role rows on replay. Persisting the prompt as a
+    //    first-class event gives replay clients a clean,
+    //    chronological signal that's anchored to the event log
+    //    just like every other observable. Skipped for resume
+    //    inputs (they have no admitted prompt to surface).
+    let user_input_committed =
+        if attempt.attempt_number == 1 && !user_input.is_resume() && !user_input.is_empty() {
+            let user_input_event =
+                AgentEvent::user_input(thread_id.clone(), user_input.blocks().to_vec());
+            let committed = deps
+                .event_repo
+                .commit_event(thread_id, user_input_event, now)
+                .await
+                .context("commit user_input event")?;
+            deps.event_notifier.notify(std::slice::from_ref(&committed));
+            Some(committed)
+        } else {
+            None
+        };
+
+    // 3. Commit the `Start` event NOW, before streaming begins, so
     //    later TextDelta / ThinkingDelta events have a parent in the
     //    journal.  This trades the previous "Start committed atomically
     //    with the rest of the turn" guarantee for live streaming: if
@@ -538,6 +568,7 @@ async fn execute_root_turn_inner(
     let commit_now = OffsetDateTime::now_utc();
     let close_ctx = TurnCloseContext {
         content_ids,
+        user_input_committed,
         start_committed,
     };
 
@@ -662,10 +693,13 @@ async fn commit_text_only_turn(
     .await
     .context("commit completed turn")?;
 
-    // Prepend the `Start` event committed before streaming so the
+    // Prepend the durable per-turn admission events (`UserInput`
+    // when present + `Start`) committed before streaming so the
     // outcome's `committed_events` represents every event committed
     // for this turn (matching the pre-streaming contract).
-    let mut committed_events = vec![close_ctx.start_committed];
+    let mut committed_events: Vec<CommittedEvent> = Vec::new();
+    committed_events.extend(close_ctx.user_input_committed);
+    committed_events.push(close_ctx.start_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
 
     let (completed_task, _parent) = deps
@@ -1936,10 +1970,13 @@ async fn suspend_at_tool_boundary(
         .await
         .context("commit suspension events")?;
 
-    // Prepend the `Start` committed before streaming so the outcome's
-    // `committed_events` represents every event committed for this
-    // turn (matching the pre-streaming contract).
-    let mut committed_events = vec![close_ctx.start_committed];
+    // Prepend the durable per-turn admission events (`UserInput`
+    // when present + `Start`) committed before streaming so the
+    // outcome's `committed_events` represents every event committed
+    // for this turn (matching the pre-streaming contract).
+    let mut committed_events: Vec<CommittedEvent> = Vec::new();
+    committed_events.extend(close_ctx.user_input_committed);
+    committed_events.push(close_ctx.start_committed);
     committed_events.extend(suspension_committed);
 
     Ok(RootTurnOutcome::Suspended {
