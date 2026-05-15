@@ -15,9 +15,17 @@ postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 amqp = ["dep:lapin"]
 # Compiles the `observability` module + wire-in points (gRPC tower
-# layer, Postgres pool gauges, AMQP publish/consume timing).
+# layer, Postgres pool gauges, AMQP publish/consume timing) and
+# enables `agent-server`'s matching `otel` feature so server-side
+# metrics emit when the host is built with `--features otel`.
 # Default builds remain dependency-free.
-otel = ["dep:opentelemetry", "dep:tower", "dep:http"]
+otel = [
+    "dep:opentelemetry",
+    "dep:tower",
+    "dep:http",
+    "dep:agent-sdk-otel",
+    "agent-server/otel",
+]
 
 [dependencies]
 agent-sdk-core.workspace = true
@@ -53,6 +61,7 @@ uuid.workspace = true
 url.workspace = true
 lapin = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
+agent-sdk-otel = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 

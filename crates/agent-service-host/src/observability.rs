@@ -29,6 +29,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use anyhow::Context as _;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Histogram, ObservableGauge};
@@ -506,6 +507,148 @@ pub mod grpc_layer {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// E1: bootstrap helpers (Phase 9)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Default `service.name` used when the `[observability]` section
+/// does not override it. Aligns with the binary name so dashboards
+/// have a useful label even on a clean checkout.
+const DEFAULT_SERVICE_NAME: &str = "agent-service-host";
+
+/// Re-export of [`agent_sdk_otel::OtelGuard`] so callers don't need
+/// a second `use agent_sdk_otel::OtelGuard;`.
+pub use agent_sdk_otel::OtelGuard;
+
+/// Install the global `OTel` tracer + meter providers when the
+/// caller's [`ObservabilityConfig::enabled`](crate::config::ObservabilityConfig::enabled)
+/// is `true`.
+///
+/// The returned `Option<OtelGuard>` is `None` when
+/// `observability.enabled = false`, signalling "skip cleanly". The
+/// caller must hold the `Some(guard)` for the lifetime of the
+/// process — dropping it flushes pending exports.
+///
+/// Resolution order for every field:
+/// 1. Read the `OTEL_*` environment variables via
+///    [`agent_sdk_otel::OtelConfig::from_env`].
+/// 2. Override anything the
+///    [`ObservabilityConfig`](crate::config::ObservabilityConfig) explicitly
+///    sets.
+///
+/// This keeps containerised deploys 12-factor while still letting
+/// static config files pin values when they need to.
+///
+/// # Errors
+/// Returns an error if env parsing fails, the OTLP endpoint is
+/// malformed, or the configured sampler is unknown. The host should
+/// surface the error and refuse to start rather than running with
+/// half-installed observability.
+pub fn install_observability(
+    cfg: &super::config::ObservabilityConfig,
+) -> anyhow::Result<Option<OtelGuard>> {
+    if !cfg.enabled {
+        return Ok(None);
+    }
+
+    let otel_config = build_otel_config(cfg).context("assembling OtelConfig from host config")?;
+    let guard = agent_sdk_otel::install_global_provider(&otel_config)
+        .context("installing global OTel provider")?;
+    Ok(Some(guard))
+}
+
+/// Layer the YAML overrides on top of the env-derived `OtelConfig`.
+fn build_otel_config(
+    cfg: &super::config::ObservabilityConfig,
+) -> anyhow::Result<agent_sdk_otel::OtelConfig> {
+    use std::str::FromStr;
+
+    use agent_sdk_otel::SamplerKind;
+
+    let mut otel = agent_sdk_otel::OtelConfig::from_env().context("reading OTEL_* env vars")?;
+
+    if let Some(name) = &cfg.service_name {
+        otel.service_name.clone_from(name);
+    } else if otel.service_name == "agent-sdk" {
+        // `OtelConfig::from_env` falls back to "agent-sdk" when
+        // OTEL_SERVICE_NAME is unset.  Stamp the host's identity so
+        // operators can tell the host binary apart from in-process
+        // SDK consumers without having to set the env var.
+        otel.service_name = DEFAULT_SERVICE_NAME.to_string();
+    }
+
+    if let Some(version) = option_env!("CARGO_PKG_VERSION")
+        && otel.service_version.is_none()
+    {
+        otel.service_version = Some(version.to_string());
+    }
+
+    if let Some(instance_id) = &cfg.service_instance_id {
+        otel.service_instance_id = Some(instance_id.clone());
+    }
+    if let Some(env) = &cfg.deployment_environment {
+        otel.deployment_environment = Some(env.clone());
+    }
+
+    if let Some(endpoint) = &cfg.otlp_endpoint {
+        otel.otlp_endpoint = Some(endpoint.clone());
+    }
+    if !cfg.otlp_headers.is_empty() {
+        otel.otlp_headers.clone_from(&cfg.otlp_headers);
+    }
+
+    if let Some(sampler_str) = &cfg.sampler {
+        let sampler = SamplerKind::from_str(sampler_str)
+            .with_context(|| format!("parsing observability.sampler `{sampler_str}`"))?;
+        otel.sampler = sampler;
+    }
+    if let Some(ratio) = cfg.sample_ratio {
+        otel.sample_ratio = ratio;
+    }
+    if !cfg.propagated_baggage_keys.is_empty() {
+        otel.propagated_baggage_keys
+            .clone_from(&cfg.propagated_baggage_keys);
+    }
+    otel.capture_payloads = cfg.capture_payloads;
+
+    Ok(otel)
+}
+
+/// Register `db.pool.connections.{active,idle}` gauges against the
+/// host's Postgres pool when the registry is backed by Postgres.
+///
+/// The returned `Vec` holds the [`ObservableGauge`] handles that the
+/// caller must keep alive — dropping them de-registers the callbacks
+/// from the meter provider.  When the registry is not Postgres-backed
+/// the function returns an empty `Vec`.
+#[must_use]
+pub fn install_postgres_pool_gauges(
+    stores: &super::stores::StoreRegistry,
+) -> Vec<ObservableGauge<u64>> {
+    #[cfg(feature = "postgres")]
+    {
+        let Some(pool) = stores.postgres_pool() else {
+            return Vec::new();
+        };
+        let metrics = HostMetrics::global();
+        let (active, idle) =
+            metrics.register_postgres_pool_gauges("agent_service_host.postgres", pool.clone());
+        vec![active, idle]
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        // Without the Postgres feature there is no `postgres_pool`
+        // method on the registry; suppress the unused-variable
+        // warning explicitly.
+        let _ = stores;
+        Vec::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +668,57 @@ mod tests {
         assert_eq!(parse_grpc_path(""), None);
         assert_eq!(parse_grpc_path("/foo/"), None);
         assert_eq!(parse_grpc_path("//bar"), None);
+    }
+
+    #[test]
+    fn install_observability_skips_when_disabled() -> anyhow::Result<()> {
+        let cfg = super::super::config::ObservabilityConfig::default();
+        let guard = install_observability(&cfg)?;
+        assert!(guard.is_none(), "disabled config must return Ok(None)");
+        Ok(())
+    }
+
+    #[test]
+    fn build_otel_config_layers_yaml_over_env() -> anyhow::Result<()> {
+        let cfg = super::super::config::ObservabilityConfig {
+            enabled: true,
+            service_name: Some("agent-service-host".into()),
+            service_instance_id: Some("host-01".into()),
+            deployment_environment: Some("staging".into()),
+            otlp_endpoint: Some("http://collector:4317".into()),
+            otlp_headers: vec![("authorization".into(), "Bearer secret".into())],
+            sampler: Some("parentbased_traceidratio".into()),
+            sample_ratio: Some(0.25),
+            propagated_baggage_keys: vec!["user.id".into()],
+            capture_payloads: true,
+        };
+
+        let otel = build_otel_config(&cfg)?;
+        assert_eq!(otel.service_name, "agent-service-host");
+        assert_eq!(otel.service_instance_id.as_deref(), Some("host-01"));
+        assert_eq!(otel.deployment_environment.as_deref(), Some("staging"));
+        assert_eq!(otel.endpoint(), Some("http://collector:4317"));
+        assert_eq!(otel.otlp_headers.len(), 1);
+        assert!((otel.sample_ratio - 0.25).abs() < f64::EPSILON);
+        assert_eq!(otel.propagated_baggage_keys, vec!["user.id".to_string()]);
+        assert!(otel.capture_payloads);
+        Ok(())
+    }
+
+    #[test]
+    fn build_otel_config_rejects_unknown_sampler() {
+        let cfg = super::super::config::ObservabilityConfig {
+            enabled: true,
+            sampler: Some("definitely-not-a-sampler".into()),
+            ..Default::default()
+        };
+        let Err(err) = build_otel_config(&cfg) else {
+            panic!("must reject unknown sampler");
+        };
+        let chained = format!("{err:#}");
+        assert!(
+            chained.contains("observability.sampler"),
+            "unexpected error: {chained}"
+        );
     }
 }
