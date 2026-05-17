@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use super::helpers::{millis_to_u64, send_event, wrap_and_send};
 use super::idempotency::{execute_with_idempotency, try_get_cached_result};
@@ -947,6 +948,51 @@ where
     }
 }
 
+/// `ToolResult` content the SDK synthesises when the run's cancel
+/// token fires while a tool is still executing. Picked to read
+/// naturally for the LLM's next turn and to be searchable in
+/// dashboards as a single, well-known string.
+const CANCELLED_BY_USER: &str = "Cancelled by user";
+
+/// Race a tool's `execute()` future against the run's cancel token.
+///
+/// If the cancel arm wins, the SDK synthesises a successful
+/// [`ToolResult`] whose content is [`CANCELLED_BY_USER`] so the
+/// caller can commit a complete `tool_use` / `tool_result` pair
+/// before the run returns `AgentRunState::Cancelled`. Tools that
+/// observe `ToolContext::cancel_token()` themselves and return
+/// early are unaffected — their outcome wins the select before the
+/// cancel arm fires.
+///
+/// `cancel = None` (e.g. unit tests that never wire a token)
+/// short-circuits to the plain `execute.await` path so the helper
+/// is a true superset of the previous behaviour.
+async fn run_with_cancel<F>(
+    cancel: Option<CancellationToken>,
+    tool_start: Instant,
+    execute: F,
+) -> ToolResult
+where
+    F: std::future::Future<Output = anyhow::Result<ToolResult>>,
+{
+    let to_result = |outcome: anyhow::Result<ToolResult>| match outcome {
+        Ok(mut value) => {
+            value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+            value
+        }
+        Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
+            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+    };
+    match cancel {
+        Some(token) => tokio::select! {
+            outcome = execute => to_result(outcome),
+            () = token.cancelled() => ToolResult::success(CANCELLED_BY_USER)
+                .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
+        },
+        None => to_result(execute.await),
+    }
+}
+
 async fn complete_sync_tool_call<Ctx, H>(
     pending: &PendingToolCallInfo,
     tool: &Arc<dyn ErasedTool<Ctx>>,
@@ -958,18 +1004,15 @@ where
 {
     let tier = tool.tier();
     let tool_start = Instant::now();
+    let cancel = ctx.tool_context.cancel_token();
     let result =
         match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
-            Ok(
-                match tool.execute(ctx.tool_context, pending.input.clone()).await {
-                    Ok(mut value) => {
-                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        value
-                    }
-                    Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
-                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                },
+            Ok(run_with_cancel(
+                cancel,
+                tool_start,
+                tool.execute(ctx.tool_context, pending.input.clone()),
             )
+            .await)
         })
         .await
         {
@@ -1534,25 +1577,18 @@ where
 
     if let Some(tool) = ctx.tools.get(&awaiting_tool.name) {
         let tool_start = Instant::now();
+        let cancel = ctx.tool_context.cancel_token();
         return execute_with_idempotency(
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
             async {
-                Ok(
-                    match tool
-                        .execute(ctx.tool_context, awaiting_tool.input.clone())
-                        .await
-                    {
-                        Ok(mut value) => {
-                            value.duration_ms =
-                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                            value
-                        }
-                        Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
-                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                    },
+                Ok(run_with_cancel(
+                    cancel,
+                    tool_start,
+                    tool.execute(ctx.tool_context, awaiting_tool.input.clone()),
                 )
+                .await)
             },
         )
         .await;
