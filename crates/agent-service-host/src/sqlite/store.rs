@@ -172,12 +172,19 @@ impl SqliteDurableStore {
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────
 
-const TASK_COLUMNS: &str = r"
-    id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
-    last_heartbeat_at, state_json, attempt, max_attempts, last_error,
-    pending_child_count, spawn_index, result_payload,
-    created_at, updated_at, completed_at";
+// Defined as a macro (not a `const &str`) so the column list can be
+// spliced into `concat!(...)` at every query site, producing a real
+// `&'static str` literal that satisfies sqlx 0.9's `SqlSafeStr` bound
+// without an `AssertSqlSafe` escape hatch.
+macro_rules! task_columns {
+    () => {
+        "id, kind, status, parent_id, root_id, depth, thread_id, \
+         submitted_input_json, caller_metadata_json, worker_id, lease_id, \
+         lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts, \
+         last_error, pending_child_count, spawn_index, result_payload, \
+         created_at, updated_at, completed_at"
+    };
+}
 
 impl SqliteDurableStore {
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
@@ -641,22 +648,28 @@ INSERT INTO agent_sdk_turn_checkpoints (
         tx: &mut Transaction<'_, Sqlite>,
         id: &AgentTaskId,
     ) -> Result<Option<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE id = ?1");
-        let record = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(id.as_str())
-            .fetch_optional(&mut **tx)
-            .await
-            .with_context(|| format!("load task {id}"))?;
+        let record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE id = ?1",
+        ))
+        .bind(id.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load task {id}"))?;
         record.map(TryInto::try_into).transpose()
     }
 
     async fn get_task_pool(&self, id: &AgentTaskId) -> Result<Option<AgentTask>> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE id = ?1");
-        let record = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .with_context(|| format!("get task {id}"))?;
+        let record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE id = ?1",
+        ))
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("get task {id}"))?;
         record.map(TryInto::try_into).transpose()
     }
 
@@ -1086,19 +1099,20 @@ LIMIT 1
         child_root_id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks \
+        let maybe_record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
              WHERE kind = 'subagent' \
                AND status = 'waiting_on_children' \
-               AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1"
-        );
-        let maybe_record = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(child_root_id.as_str())
-            .fetch_optional(&mut **tx)
-            .await
-            .with_context(|| {
-                format!("resume_linked_subagent_invocation: lookup for child_root {child_root_id}")
-            })?;
+               AND json_extract(state_json, '$.invocation.child_root_task_id') = ?1",
+        ))
+        .bind(child_root_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| {
+            format!("resume_linked_subagent_invocation: lookup for child_root {child_root_id}")
+        })?;
 
         let Some(record) = maybe_record else {
             return Ok(None);
@@ -1115,14 +1129,15 @@ LIMIT 1
         tx: &mut Transaction<'_, Sqlite>,
         root_id: &AgentTaskId,
     ) -> Result<Vec<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE root_id = ?1 ORDER BY depth, created_at, id"
-        );
-        let records = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(root_id.as_str())
-            .fetch_all(&mut **tx)
-            .await
-            .with_context(|| format!("load subtree for {root_id}"))?;
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE root_id = ?1 ORDER BY depth, created_at, id",
+        ))
+        .bind(root_id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("load subtree for {root_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
 
@@ -1594,63 +1609,73 @@ impl AgentTaskStore for SqliteDurableStore {
     }
 
     async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 ORDER BY created_at, id"
-        );
-        let records = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(thread_key(thread_id))
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| format!("list tasks for thread {thread_id}"))?;
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE thread_id = ?1 ORDER BY created_at, id",
+        ))
+        .bind(thread_key(thread_id))
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list tasks for thread {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn list_children(&self, parent_id: &AgentTaskId) -> Result<Vec<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE parent_id = ?1 ORDER BY created_at, id"
-        );
-        let records = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(parent_id.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| format!("list children for {parent_id}"))?;
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE parent_id = ?1 ORDER BY created_at, id",
+        ))
+        .bind(parent_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list children for {parent_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
         let status_wire = enum_to_wire(&status)?;
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = ?1 ORDER BY created_at, id"
-        );
-        let records = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(status_wire)
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| format!("list tasks in status {status:?}"))?;
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks WHERE status = ?1 ORDER BY created_at, id",
+        ))
+        .bind(status_wire)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list tasks in status {status:?}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn active_root_for_thread(&self, thread_id: &ThreadId) -> Result<Option<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') ORDER BY created_at, id LIMIT 1"
-        );
-        let record = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(thread_key(thread_id))
-            .fetch_optional(&self.pool)
-            .await
-            .with_context(|| format!("load active root for {thread_id}"))?;
+        let record = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ", task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE thread_id = ?1 \
+               AND kind = 'root_turn' \
+               AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation') \
+             ORDER BY created_at, id LIMIT 1",
+        ))
+        .bind(thread_key(thread_id))
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("load active root for {thread_id}"))?;
         record.map(TryInto::try_into).transpose()
     }
 
     async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id"
-        );
-        let records = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(thread_key(thread_id))
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| format!("list queued roots for {thread_id}"))?;
+        let records = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' \
+             ORDER BY created_at, id",
+        ))
+        .bind(thread_key(thread_id))
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list queued roots for {thread_id}"))?;
         records.into_iter().map(TryInto::try_into).collect()
     }
 
@@ -1672,14 +1697,17 @@ impl AgentTaskStore for SqliteDurableStore {
             return Ok(None);
         }
 
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' ORDER BY created_at, id LIMIT 1"
-        );
-        let queued = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(thread_key(thread_id))
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("load queue head for {thread_id}"))?;
+        let queued = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE thread_id = ?1 AND kind = 'root_turn' AND status = 'queued' \
+             ORDER BY created_at, id LIMIT 1",
+        ))
+        .bind(thread_key(thread_id))
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("load queue head for {thread_id}"))?;
         let Some(queued) = queued else {
             return Ok(None);
         };
@@ -1750,13 +1778,15 @@ impl AgentTaskStore for SqliteDurableStore {
         // fail-closed rows, same as the Postgres backend.
         loop {
             let mut tx = self.begin().await?;
-            let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'pending' ORDER BY created_at, id LIMIT 1"
-            );
-            let record = sqlx::query_as::<_, TaskRecord>(&sql)
-                .fetch_optional(&mut *tx)
-                .await
-                .context("load runnable head")?;
+            let record = sqlx::query_as::<_, TaskRecord>(concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM agent_sdk_tasks WHERE status = 'pending' \
+                 ORDER BY created_at, id LIMIT 1",
+            ))
+            .fetch_optional(&mut *tx)
+            .await
+            .context("load runnable head")?;
             let Some(record) = record else {
                 return Ok(None);
             };
@@ -1831,14 +1861,17 @@ impl AgentTaskStore for SqliteDurableStore {
 
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
         let mut tx = self.begin().await?;
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM agent_sdk_tasks WHERE status = 'running' AND lease_expires_at <= ?1 ORDER BY lease_expires_at, id"
-        );
-        let expired = sqlx::query_as::<_, TaskRecord>(&sql)
-            .bind(now)
-            .fetch_all(&mut *tx)
-            .await
-            .context("load expired leases")?;
+        let expired = sqlx::query_as::<_, TaskRecord>(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM agent_sdk_tasks \
+             WHERE status = 'running' AND lease_expires_at <= ?1 \
+             ORDER BY lease_expires_at, id",
+        ))
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load expired leases")?;
 
         let mut released = Vec::with_capacity(expired.len());
         for record in expired {

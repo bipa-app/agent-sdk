@@ -4816,9 +4816,11 @@ mod tests {
                 let Ok(mut conn) = PgConnection::connect(&database_url).await else {
                     return;
                 };
-                let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                    .execute(&mut conn)
-                    .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                )))
+                .execute(&mut conn)
+                .await;
             });
         })
         .join();
@@ -4845,7 +4847,7 @@ mod tests {
         let mut admin = PgConnection::connect(&database_url)
             .await
             .context("connect postgres admin for tests")?;
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&mut admin)
             .await
             .with_context(|| format!("create test schema {schema}"))?;
@@ -4857,7 +4859,7 @@ mod tests {
             .after_connect(move |conn, _meta| {
                 let sql = format!("SET search_path TO {search_path}");
                 Box::pin(async move {
-                    sqlx::query(&sql).execute(conn).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
                     Ok(())
                 })
             })

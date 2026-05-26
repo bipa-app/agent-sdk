@@ -41,13 +41,13 @@ bytes = "1"
 log = { version = "0.4", features = ["kv_std"] }
 url = "2"
 tokio-util = "0.7"
-html2text = "0.16.7"
+html2text = "0.17.1"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.29.0", features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "migrate", "macros", "time", "json"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "migrate", "macros", "time", "json"] }
 lapin = { version = "4.4.0", default-features = false, features = ["rustls", "tokio"] }
 clap = { version = "4", features = ["derive"] }
 
