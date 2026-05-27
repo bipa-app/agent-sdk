@@ -196,7 +196,9 @@ impl MetricsRecorder for LoggingMetricsRecorder {
     }
 
     fn record_lease_sweep(&self, released: usize) {
-        info!(metric = "lease_sweep", released, "lease sweep observed",);
+        if released > 0 {
+            info!(metric = "lease_sweep", released, "lease sweep observed");
+        }
     }
 }
 
