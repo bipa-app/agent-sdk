@@ -124,10 +124,22 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Anthropic
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-opus-4-8",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.8 pricing matches the Opus 4.6 tier ($5/$25 per 1M); verify exact current SKU mapping before billing-critical use.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Opus 4.8 requires adaptive thinking — `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-opus-4-7",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
-        pricing: Some(Pricing::flat(15.0, 75.0).with_notes("Anthropic Opus 4.7 pricing from bundled Claude API guidance; verify exact current SKU mapping before billing-critical use.")),
+        pricing: Some(Pricing::flat(5.0, 25.0).with_notes("Anthropic Opus 4.7 pricing matches the Opus 4.6 tier ($5/$25 per 1M); verify exact current SKU mapping before billing-critical use.")),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: ANTHROPIC_MODELS_URL,
@@ -605,6 +617,15 @@ pub const fn supported_model_capabilities() -> &'static [ModelCapabilities] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lookup_anthropic_opus_48() {
+        let caps = get_model_capabilities("anthropic", "claude-opus-4-8").unwrap();
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert!(caps.supports_adaptive_thinking);
+    }
 
     #[test]
     fn test_lookup_anthropic_opus_46() {
