@@ -1,0 +1,6 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_redacted","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"usage":{"input_tokens":40,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_03GHI","name":"get_weather","input":{}}}
+

@@ -119,9 +119,13 @@ mod replay_coverage_test;
 #[cfg(test)]
 mod root_turn_test;
 #[cfg(test)]
+mod streaming_edge_cases_test;
+#[cfg(test)]
 mod subagent_execution_test;
 #[cfg(test)]
 mod subagent_test;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tool_task_test;
 

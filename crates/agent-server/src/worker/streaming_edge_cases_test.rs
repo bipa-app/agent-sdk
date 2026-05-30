@@ -1,0 +1,699 @@
+//! Streaming edge-case regression tests (plan §6.1 / §A2.4).
+//!
+//! These drive the worker's real `chat_stream` + `StreamAccumulator`
+//! commit path through the shared [`StreamingScriptedProvider`] over
+//! deliberately awkward scripted delta sequences:
+//!
+//! * interleaved text + tool-use deltas on different blocks,
+//! * out-of-order `block_index`,
+//! * a mid-stream `ServerError` / `RateLimited` that triggers a retry,
+//! * a stream that ends without a `Done` delta,
+//! * a stream truncated after `ToolUseStart` but before any
+//!   `ToolInputDelta`.
+//!
+//! Every case asserts the committed event order *and* that the
+//! synthesized turn produces a balanced, API-valid history (every
+//! `tool_use` is well-formed; text/tool blocks land in `block_index`
+//! order; no half-parsed tool input leaks through).
+//!
+//! Retry timing is virtual: the recovery cases use
+//! `#[tokio::test(start_paused = true)]` so the backoff `sleep`
+//! completes instantly and deterministically — no real wall-clock
+//! delay, no flakiness.
+
+use std::sync::Arc;
+
+use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
+use super::test_support::{StreamingScriptedProvider, TurnScript};
+use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::event_notifier::EventNotifier;
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
+use crate::journal::execution_context::build_root_worker_inputs;
+use crate::journal::message_store::InMemoryMessageProjectionStore;
+use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use crate::journal::task::{AgentTask, LeaseId, WorkerId};
+use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
+use crate::worker::bootstrap::WorkerBootstrapContext;
+use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+use agent_sdk_core::events::AgentEvent;
+use agent_sdk_core::llm::{StopReason, Tool};
+use agent_sdk_core::{ThreadId, ToolTier};
+use agent_sdk_providers::streaming::{StreamDelta, StreamErrorKind};
+use anyhow::{Context, Result};
+use time::Duration;
+
+// ─────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────
+
+fn t0() -> time::OffsetDateTime {
+    time::OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
+}
+
+fn t_plus(secs: i64) -> time::OffsetDateTime {
+    t0() + Duration::seconds(secs)
+}
+
+fn thread_id() -> ThreadId {
+    ThreadId::from_string("t-streaming-edge")
+}
+
+fn definition() -> AgentDefinition {
+    AgentDefinition {
+        provider: "mock".into(),
+        model: "mock-model".into(),
+        system_prompt: "You are a test assistant.".into(),
+        tools: vec![Tool {
+            name: "get_weather".into(),
+            description: "Get the weather".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}}
+            }),
+            display_name: "Weather".into(),
+            tier: ToolTier::Observe,
+        }],
+        max_tokens: 1024,
+        thinking: ThinkingPolicy::Disabled,
+        tools_fn: None,
+        policy: RuntimePolicy::server_default(),
+    }
+}
+
+struct Stores {
+    tasks: InMemoryAgentTaskStore,
+    threads: InMemoryThreadStore,
+    messages: InMemoryMessageProjectionStore,
+    attempts: InMemoryTurnAttemptStore,
+    checkpoints: InMemoryCheckpointStore,
+    events: InMemoryEventRepository,
+    event_notifier: Arc<EventNotifier>,
+}
+
+impl Stores {
+    fn new() -> Self {
+        Self {
+            tasks: InMemoryAgentTaskStore::new(),
+            threads: InMemoryThreadStore::new(),
+            messages: InMemoryMessageProjectionStore::new(),
+            attempts: InMemoryTurnAttemptStore::new(),
+            checkpoints: InMemoryCheckpointStore::new(),
+            events: InMemoryEventRepository::new(),
+            event_notifier: Arc::new(EventNotifier::new()),
+        }
+    }
+
+    fn deps(&self) -> RootTurnDeps<'_> {
+        RootTurnDeps {
+            task_store: &self.tasks,
+            thread_store: &self.threads,
+            message_store: &self.messages,
+            attempt_store: &self.attempts,
+            checkpoint_store: &self.checkpoints,
+            event_repo: &self.events,
+            event_notifier: &self.event_notifier,
+            subagent_spawn_selector: None,
+            compaction_config: None,
+            compaction_provider: None,
+        }
+    }
+}
+
+async fn acquire_root(stores: &Stores) -> Result<AgentTask> {
+    let task = AgentTask::new_root_turn(thread_id(), t0(), 3);
+    let task_id = task.id.clone();
+    stores
+        .tasks
+        .submit_root_turn(task)
+        .await
+        .context("submit")?;
+    stores
+        .tasks
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_edge"),
+            LeaseId::from_string("lease_edge"),
+            t_plus(300),
+            t0(),
+        )
+        .await
+        .context("acquire")?
+        .context("acquirable")
+}
+
+fn bootstrap(task: AgentTask) -> WorkerBootstrapContext {
+    let thread = task.thread_id.clone();
+    let task_id = task.id.clone();
+    WorkerBootstrapContext {
+        task,
+        definition: definition(),
+        thread_id: thread,
+        task_id,
+        worker_id: WorkerId::from_string("worker_edge"),
+        lease_id: LeaseId::from_string("lease_edge"),
+    }
+}
+
+/// Run a single scripted root turn end-to-end.
+async fn run_turn(
+    stores: &Stores,
+    provider: &StreamingScriptedProvider,
+) -> Result<RootTurnOutcome> {
+    let task = acquire_root(stores).await?;
+    let inputs = build_root_worker_inputs(
+        bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await
+    .context("build inputs")?;
+    execute_root_turn(inputs, "edge", provider, &stores.deps(), t0()).await
+}
+
+fn event_kinds(events: &[crate::journal::committed_event::CommittedEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|e| match &e.event {
+            AgentEvent::UserInput { .. } => "UserInput",
+            AgentEvent::Start { .. } => "Start",
+            AgentEvent::TextDelta { .. } => "TextDelta",
+            AgentEvent::Text { .. } => "Text",
+            AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
+            AgentEvent::Thinking { .. } => "Thinking",
+            AgentEvent::ToolCallStart { .. } => "ToolCallStart",
+            AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
+            AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::Done { .. } => "Done",
+            AgentEvent::AutoRetryStart { .. } => "AutoRetryStart",
+            AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
+            AgentEvent::Error { .. } => "Error",
+            other => panic!("unexpected event kind: {other:?}"),
+        })
+        .collect()
+}
+
+fn assert_contiguous(events: &[crate::journal::committed_event::CommittedEvent]) {
+    for (i, e) in events.iter().enumerate() {
+        assert_eq!(e.sequence, i as u64, "sequence gap at index {i}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 1 — interleaved text + tool-use deltas
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Result<()> {
+    let stores = Stores::new();
+    // Text on block 0 arrives interleaved with the tool-use blocks 1 & 2:
+    // text chunk, tool-1 start, text chunk, tool-1 input, tool-2 start,
+    // tool-2 input — exactly the kind of interleaving a real SSE stream
+    // produces when the model narrates between tool calls.
+    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "Let me ".into(),
+            block_index: 0,
+        },
+        StreamDelta::ToolUseStart {
+            id: "tc_1".into(),
+            name: "get_weather".into(),
+            block_index: 1,
+            thought_signature: None,
+        },
+        StreamDelta::TextDelta {
+            delta: "check both.".into(),
+            block_index: 0,
+        },
+        StreamDelta::ToolInputDelta {
+            id: "tc_1".into(),
+            delta: r#"{"city":"Lisbon"}"#.into(),
+            block_index: 1,
+        },
+        StreamDelta::ToolUseStart {
+            id: "tc_2".into(),
+            name: "get_weather".into(),
+            block_index: 2,
+            thought_signature: None,
+        },
+        StreamDelta::ToolInputDelta {
+            id: "tc_2".into(),
+            delta: r#"{"city":"Porto"}"#.into(),
+            block_index: 2,
+        },
+        StreamDelta::Usage(agent_sdk_core::llm::Usage {
+            input_tokens: 30,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::ToolUse),
+        },
+    ]));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Suspended {
+        child_tasks,
+        committed_events,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended with two tool calls");
+    };
+
+    // Two child tool tasks spawned, in block order.
+    assert_eq!(child_tasks.len(), 2);
+
+    // The suspend outcome carries the admission + narration text + a
+    // ToolCallStart per tool: UserInput, Start, Text, ToolCallStart×2.
+    assert_eq!(
+        event_kinds(&committed_events),
+        vec![
+            "UserInput",
+            "Start",
+            "Text",
+            "ToolCallStart",
+            "ToolCallStart"
+        ],
+    );
+
+    // The journal additionally carries the two streamed TextDelta
+    // chunks (block 0 arrived in two fragments, interleaved with the
+    // tool blocks) before the single consolidated Text; sequences are
+    // contiguous.
+    let journal = stores.events.get_events(&thread_id()).await?;
+    assert_eq!(
+        event_kinds(&journal),
+        vec![
+            "UserInput",
+            "Start",
+            "TextDelta",
+            "TextDelta",
+            "Text",
+            "ToolCallStart",
+            "ToolCallStart",
+        ],
+    );
+    assert_contiguous(&journal);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 2 — out-of-order block_index
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn out_of_order_block_index_sorts_into_block_order() -> Result<()> {
+    let stores = Stores::new();
+    // Deltas arrive with block 1's tool before block 0's text. The
+    // accumulator must sort the synthesized content back into block
+    // order so the persisted history is API-valid.
+    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
+        StreamDelta::ToolUseStart {
+            id: "tc_late".into(),
+            name: "get_weather".into(),
+            block_index: 1,
+            thought_signature: None,
+        },
+        StreamDelta::ToolInputDelta {
+            id: "tc_late".into(),
+            delta: r#"{"city":"Madrid"}"#.into(),
+            block_index: 1,
+        },
+        StreamDelta::TextDelta {
+            delta: "Checking Madrid.".into(),
+            block_index: 0,
+        },
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::ToolUse),
+        },
+    ]));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Suspended {
+        child_tasks,
+        committed_events,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended");
+    };
+    assert_eq!(child_tasks.len(), 1);
+
+    // Despite out-of-order arrival the suspend events stay in block
+    // order: the text (block 0) precedes the ToolCallStart (block 1).
+    assert_eq!(
+        event_kinds(&committed_events),
+        vec!["UserInput", "Start", "Text", "ToolCallStart"],
+    );
+    assert_contiguous(&stores.events.get_events(&thread_id()).await?);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 3 — mid-stream ServerError / RateLimited trigger a retry
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn mid_stream_server_error_retries_then_succeeds() -> Result<()> {
+    let stores = Stores::new();
+    // First attempt: stream one text delta, then die with a 5xx-class
+    // error mid-stream. Second attempt: succeed cleanly. The recoverable
+    // error must drive exactly one retry; the turn then completes.
+    let first = TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "partial".into(),
+            block_index: 0,
+        },
+        StreamDelta::TextDelta {
+            delta: " more".into(),
+            block_index: 0,
+        },
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+        },
+    ])
+    .fail_after(1, StreamErrorKind::ServerError, "upstream 503 mid-stream");
+    let second = TurnScript::text("recovered answer");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after retry");
+    };
+    assert_eq!(response_text, "recovered answer");
+
+    // Two attempts recorded (one failed mid-stream, one succeeded) and
+    // an auto-retry envelope landed in the journal.
+    let kinds = event_kinds(&stores.events.get_events(&thread_id()).await?);
+    assert!(
+        kinds.contains(&"AutoRetryStart"),
+        "expected AutoRetryStart in {kinds:?}",
+    );
+    assert!(
+        kinds.contains(&"AutoRetryEnd"),
+        "expected AutoRetryEnd in {kinds:?}",
+    );
+    // Final, recovered turn closes cleanly.
+    assert_eq!(kinds.last(), Some(&"Done"));
+
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_stream_rate_limit_retries_then_succeeds() -> Result<()> {
+    let stores = Stores::new();
+    let first = TurnScript::text("ignored").fail_after(
+        0,
+        StreamErrorKind::RateLimited,
+        "429 before any token",
+    );
+    let second = TurnScript::text("after backoff");
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed after rate-limit retry");
+    };
+    assert_eq!(response_text, "after backoff");
+
+    let attempts = stores
+        .attempts
+        .list_by_task(&acquire_existing_task_id(&stores).await?)
+        .await?;
+    assert_eq!(attempts.len(), 2, "one rate-limited attempt + one success");
+
+    Ok(())
+}
+
+/// The single root task's id (there is exactly one in these tests).
+async fn acquire_existing_task_id(stores: &Stores) -> Result<crate::journal::task::AgentTaskId> {
+    let tasks = stores.tasks.list_by_thread(&thread_id()).await?;
+    tasks
+        .into_iter()
+        .next()
+        .map(|t| t.id)
+        .context("a root task should exist")
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 4 — stream ends without a Done delta
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stream_ends_without_done_still_commits_text_turn() -> Result<()> {
+    let stores = Stores::new();
+    // The stream yields text + usage but the connection ends before a
+    // `Done`. The accumulator has no stop_reason; the worker must still
+    // synthesize and commit a well-formed text turn (no tool calls →
+    // Completed), never hang or panic.
+    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "no done marker".into(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(agent_sdk_core::llm::Usage {
+            input_tokens: 5,
+            output_tokens: 4,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }),
+        // no StreamDelta::Done
+    ]));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed even without a Done delta");
+    };
+    assert_eq!(response_text, "no done marker");
+
+    let journal = stores.events.get_events(&thread_id()).await?;
+    assert_eq!(
+        event_kinds(&journal),
+        vec![
+            "UserInput",
+            "Start",
+            "TextDelta",
+            "Text",
+            "TurnComplete",
+            "Done"
+        ],
+    );
+    assert_contiguous(&journal);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 5 — stream truncated after ToolUseStart, before ToolInputDelta
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn truncated_after_tool_start_yields_wellformed_tool_call() -> Result<()> {
+    let stores = Stores::new();
+    // The stream announces a tool use then dies before any input JSON
+    // arrives and before `Done`. The synthesized tool call must be
+    // well-formed (empty-object input), never a half-parsed fragment,
+    // so the suspended turn's continuation is API-valid.
+    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
+        StreamDelta::ToolUseStart {
+            id: "tc_trunc".into(),
+            name: "get_weather".into(),
+            block_index: 0,
+            thought_signature: None,
+        },
+        // truncated: no ToolInputDelta, no Done
+    ]));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Suspended {
+        child_tasks,
+        committed_events,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended on a tool-use turn");
+    };
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(
+        event_kinds(&committed_events),
+        vec!["UserInput", "Start", "ToolCallStart"],
+    );
+
+    // The spawned child tool task carries a well-formed (empty-object)
+    // input rather than a half-parsed JSON fragment.
+    let start = committed_events
+        .iter()
+        .find_map(|e| match &e.event {
+            AgentEvent::ToolCallStart { input, name, .. } => Some((name.clone(), input.clone())),
+            _ => None,
+        })
+        .context("a ToolCallStart event")?;
+    assert_eq!(start.0, "get_weather");
+    assert_eq!(
+        start.1,
+        serde_json::json!({}),
+        "truncated tool input must synthesize to an empty object, not garbage",
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 6 — per-delta delay under virtual time stays deterministic
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn chunked_text_with_per_delta_delay_commits_in_order() -> Result<()> {
+    let stores = Stores::new();
+    // Multiple text chunks on one block, each gated behind a per-delta
+    // delay. Under `start_paused` virtual time auto-advances, so the
+    // turn completes instantly yet the per-chunk commit ordering is
+    // exercised exactly as it would be against a slow real stream.
+    let provider = StreamingScriptedProvider::single(
+        TurnScript::text_chunked(&["Strea", "ming ", "answer"])
+            .with_delay(std::time::Duration::from_millis(25)),
+    );
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed");
+    };
+    assert_eq!(response_text, "Streaming answer");
+
+    // Each non-empty chunk is committed as its own TextDelta before the
+    // single consolidated Text block.
+    let journal = stores.events.get_events(&thread_id()).await?;
+    assert_eq!(
+        event_kinds(&journal),
+        vec![
+            "UserInput",
+            "Start",
+            "TextDelta",
+            "TextDelta",
+            "TextDelta",
+            "Text",
+            "TurnComplete",
+            "Done",
+        ],
+    );
+    assert_contiguous(&journal);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 7 — streamed thinking + text and thinking + tool
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn streamed_thinking_then_text_commits_both_blocks() -> Result<()> {
+    let stores = Stores::new();
+    let provider = StreamingScriptedProvider::single(TurnScript::thinking_text(
+        "weighing options",
+        "sig-abc",
+        "final answer",
+    ));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed { response_text, .. } = outcome else {
+        panic!("expected Completed");
+    };
+    assert_eq!(response_text, "final answer");
+
+    let journal = stores.events.get_events(&thread_id()).await?;
+    // Both deltas stream before both consolidated blocks.
+    assert_eq!(
+        event_kinds(&journal),
+        vec![
+            "UserInput",
+            "Start",
+            "ThinkingDelta",
+            "TextDelta",
+            "Thinking",
+            "Text",
+            "TurnComplete",
+            "Done",
+        ],
+    );
+    assert_contiguous(&journal);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_thinking_then_tool_suspends_in_block_order() -> Result<()> {
+    let stores = Stores::new();
+    let provider = StreamingScriptedProvider::single(TurnScript::thinking_tool_calls(
+        "I should look this up",
+        "sig-think",
+        &[(
+            "tc_think",
+            "get_weather",
+            serde_json::json!({"city": "Oslo"}),
+        )],
+    ));
+
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Suspended {
+        child_tasks,
+        committed_events,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended");
+    };
+    assert_eq!(child_tasks.len(), 1);
+    // Consolidated thinking precedes the tool-call boundary.
+    assert_eq!(
+        event_kinds(&committed_events),
+        vec!["UserInput", "Start", "Thinking", "ToolCallStart"],
+    );
+    assert_contiguous(&stores.events.get_events(&thread_id()).await?);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Edge case 8 — leading fatal stream error does not retry
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn leading_invalid_request_error_fails_without_retry() -> Result<()> {
+    let stores = Stores::new();
+    // A fatal (caller-side) error on the very first delta: no retry, no
+    // durable turn, exactly one closed audit attempt.
+    let provider = StreamingScriptedProvider::single(TurnScript::error(
+        StreamErrorKind::InvalidRequest,
+        "schema rejected",
+    ));
+
+    let err = run_turn(&stores, &provider)
+        .await
+        .expect_err("a fatal stream error must surface as a turn failure");
+    assert!(
+        format!("{err:#}").contains("schema rejected"),
+        "error should propagate the provider message: {err:#}",
+    );
+
+    let task_id = acquire_existing_task_id(&stores).await?;
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(attempts.len(), 1, "fatal error opens exactly one attempt");
+
+    let thread = stores
+        .threads
+        .get(&thread_id())
+        .await?
+        .context("thread row")?;
+    assert_eq!(
+        thread.committed_turns, 0,
+        "no durable turn on a fatal error"
+    );
+
+    Ok(())
+}

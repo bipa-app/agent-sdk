@@ -215,7 +215,9 @@ fn event_type_names(events: &[crate::journal::committed_event::CommittedEvent]) 
             AgentEvent::Start { .. } => "Start",
             AgentEvent::UserInput { .. } => "UserInput",
             AgentEvent::Thinking { .. } => "Thinking",
+            AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
             AgentEvent::Text { .. } => "Text",
+            AgentEvent::TextDelta { .. } => "TextDelta",
             AgentEvent::ToolCallStart { .. } => "ToolCallStart",
             AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
             AgentEvent::ToolProgress { .. } => "ToolProgress",
@@ -229,8 +231,35 @@ fn event_type_names(events: &[crate::journal::committed_event::CommittedEvent]) 
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Mock providers
+// Scripted providers
 // ─────────────────────────────────────────────────────────────────────
+//
+// These keep their field-based construction (so every call site stays
+// unchanged) but drive the *real* streaming commit path by overriding
+// `chat_stream` to emit scripted `StreamDelta`s.  A chat-only mock
+// would route through the trait's default single-shot adapter and never
+// exercise per-delta journal commits.
+
+use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
+
+/// Stream a single text turn: `TextDelta` on block 0, then `Usage` +
+/// `Done{EndTurn}`.
+fn text_turn_stream(text: String) -> StreamBox<'static> {
+    Box::pin(async_stream::stream! {
+        yield Ok(StreamDelta::TextDelta { delta: text, block_index: 0 });
+        yield Ok(StreamDelta::Usage(reg_usage()));
+        yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn) });
+    })
+}
+
+const fn reg_usage() -> Usage {
+    Usage {
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    }
+}
 
 struct MockTextProvider {
     response_text: String,
@@ -246,13 +275,12 @@ impl LlmProvider for MockTextProvider {
             }],
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
+            usage: reg_usage(),
         }))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        text_turn_stream(self.response_text.clone())
     }
 
     fn model(&self) -> &'static str {
@@ -273,6 +301,7 @@ struct MockToolCallProvider {
 #[async_trait]
 impl LlmProvider for MockToolCallProvider {
     async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        // Retained for completeness; the worker drives `chat_stream`.
         let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
         if call_num > 0 {
             return Ok(ChatOutcome::Success(ChatResponse {
@@ -282,12 +311,7 @@ impl LlmProvider for MockToolCallProvider {
                 }],
                 model: "mock-model".into(),
                 stop_reason: Some(StopReason::EndTurn),
-                usage: Usage {
-                    input_tokens: 50,
-                    output_tokens: 25,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                },
+                usage: reg_usage(),
             }));
         }
         let content: Vec<ContentBlock> = self
@@ -305,13 +329,33 @@ impl LlmProvider for MockToolCallProvider {
             content,
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
+            usage: reg_usage(),
         }))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if call_num > 0 {
+            return text_turn_stream(self.resume_text.clone());
+        }
+        let tool_calls = self.tool_calls.clone();
+        Box::pin(async_stream::stream! {
+            for (block_index, (id, name, input)) in tool_calls.into_iter().enumerate() {
+                yield Ok(StreamDelta::ToolUseStart {
+                    id: id.clone(),
+                    name,
+                    block_index,
+                    thought_signature: None,
+                });
+                yield Ok(StreamDelta::ToolInputDelta {
+                    id,
+                    delta: input.to_string(),
+                    block_index,
+                });
+            }
+            yield Ok(StreamDelta::Usage(reg_usage()));
+            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::ToolUse) });
+        })
     }
 
     fn model(&self) -> &'static str {
@@ -330,7 +374,6 @@ impl LlmProvider for MockToolCallProvider {
 /// Full root-turn lifecycle: suspend → tool execution → resume.
 /// All events on the thread have contiguous, monotonically increasing
 /// sequences with no gaps at worker-boundary transitions.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     let stores = TestStores::new();
@@ -426,22 +469,28 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
 
     // Verify: all events are contiguous and belong to the same thread.
     let events = stores.events.get_events(&thread_reg()).await?;
-    assert!(
-        events.len() >= 6,
-        "expected at least 6 events, got {}",
-        events.len()
-    );
     assert_contiguous_sequences(&events);
     assert_all_same_thread(&events, &thread_reg());
 
-    // Verify event type ordering.
-    let types = event_type_names(&events);
-    assert_eq!(types[0], "Start");
-    assert_eq!(types[1], "ToolCallStart");
-    assert_eq!(types[2], "ToolCallEnd");
-    assert_eq!(types[3], "Text");
-    assert_eq!(types[4], "TurnComplete");
-    assert_eq!(types[5], "Done");
+    // Post-streaming-refactor journal order across root suspend, child
+    // tool task, and the *streamed* resume turn.  The turn leads with
+    // its `UserInput` admission record before `Start`, and the resume
+    // `Text` is preceded by its streamed `TextDelta`:
+    //   UserInput → Start → ToolCallStart → ToolCallEnd
+    //            → TextDelta → Text → TurnComplete → Done
+    assert_eq!(
+        event_type_names(&events),
+        vec![
+            "UserInput",
+            "Start",
+            "ToolCallStart",
+            "ToolCallEnd",
+            "TextDelta",
+            "Text",
+            "TurnComplete",
+            "Done",
+        ],
+    );
 
     Ok(())
 }
@@ -539,10 +588,15 @@ async fn restart_replay_events_survive_notifier_recreation() -> Result<()> {
 /// A subscriber opens a stream before a root turn executes. The replay
 /// phase delivers pre-existing events, then the live tail seamlessly
 /// picks up events committed during the turn — no gaps, no duplicates.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
     let stores = TestStores::new();
+    // The subscriber listens on a fresh notifier, distinct from the one
+    // the worker commits through (`stores.event_notifier`).  This keeps
+    // the test deterministic: the turn's events land in the durable
+    // repository during execution, then we replay them to the live tail
+    // explicitly after the fact — no reliance on broadcast timing while
+    // the subscriber isn't polling.
     let notifier = EventNotifier::new();
 
     // Pre-commit 2 events (before any worker runs).
@@ -574,8 +628,10 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
         other => panic!("expected Event(seq=1), got {other:?}"),
     }
 
-    // Now execute a text-only root turn — its events will go to the
-    // repository and notify will push them to the live tail.
+    // Now execute a text-only root turn.  Its full event set — admission
+    // `UserInput`, `Start`, the streamed `TextDelta`, the consolidated
+    // `Text`, and the `TurnComplete` / `Done` edges — is written to the
+    // durable repository.
     let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
     let ctx = bootstrap(task, sample_definition());
     let inputs = build_root_worker_inputs(
@@ -590,16 +646,21 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
         response_text: "answer".into(),
     };
     let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t0()).await?;
-    let committed = match outcome {
-        RootTurnOutcome::Completed {
-            committed_events, ..
-        } => committed_events,
+    match outcome {
+        RootTurnOutcome::Completed { .. } => {}
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed"),
-    };
-    notifier.notify(&committed);
+    }
 
-    // Stream should deliver all worker events via live tail.
-    let expected_count = committed.len();
+    // Push every event the turn committed (seqs ≥ 2) to the live tail.
+    // The full journal — not just the outcome's consolidated projection
+    // — carries the streamed `TextDelta`, so the handoff must deliver it:
+    //   UserInput → Start → TextDelta → Text → TurnComplete → Done.
+    let all = stores.events.get_events(&thread_reg()).await?;
+    let turn_events: Vec<_> = all.iter().filter(|e| e.sequence >= 2).cloned().collect();
+    notifier.notify(&turn_events);
+    let expected_count = turn_events.len();
+    assert_eq!(expected_count, 6, "streamed text turn commits 6 events");
+
     let mut live_seen = Vec::new();
     for _ in 0..expected_count {
         match stream.next().await {
@@ -608,7 +669,8 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
         }
     }
 
-    // Sequences continue contiguously from pre-committed events.
+    // Sequences continue contiguously from the pre-committed events with
+    // no duplicates and no gaps.
     let expected_seqs: Vec<u64> = (2..2 + expected_count as u64).collect();
     assert_eq!(live_seen, expected_seqs);
 
@@ -757,7 +819,6 @@ async fn fail_closed_error_event_persisted() -> Result<()> {
 
 /// Events from a successful turn following a failed one continue with
 /// contiguous sequences.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn events_after_failure_continue_contiguous_sequence() -> Result<()> {
     let stores = TestStores::new();
@@ -812,15 +873,19 @@ async fn events_after_failure_continue_contiguous_sequence() -> Result<()> {
     };
     execute_root_turn(inputs2, "retry", &provider, &stores.deps(), t_plus(1)).await?;
 
-    // Verify: all events have contiguous sequences.
+    // Verify: all events have contiguous sequences.  The failed turn's
+    // `Error` leads, then the recovered streamed turn commits its
+    // admission `UserInput` and `Start` before any content.
     let all_events = stores.events.get_events(&thread_reg()).await?;
     assert!(
         all_events.len() >= 5,
-        "Error + Start + Text + TurnComplete + Done"
+        "Error + UserInput + Start + Text + TurnComplete + Done"
     );
     assert_contiguous_sequences(&all_events);
-    assert_eq!(event_type_names(&all_events)[0], "Error");
-    assert_eq!(event_type_names(&all_events)[1], "Start");
+    let names = event_type_names(&all_events);
+    assert_eq!(names[0], "Error");
+    assert_eq!(names[1], "UserInput");
+    assert_eq!(names[2], "Start");
 
     Ok(())
 }
@@ -1016,7 +1081,6 @@ async fn execute_child_and_resume_parent(
 /// A full suspend → tool → resume cycle produces a contiguous event
 /// stream. The resumed root adds `Text` + `TurnComplete` + `Done` after the
 /// tool's `ToolCallEnd`.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
     let stores = TestStores::new();
@@ -1051,10 +1115,12 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
         } => (child_tasks, committed_events),
         RootTurnOutcome::Completed { .. } => panic!("expected Suspended"),
     };
-    assert_eq!(suspend_events.len(), 2);
+    // Suspend outcome leads with the durable `UserInput` admission
+    // record before `Start`, then a `ToolCallStart` per tool call.
+    assert_eq!(suspend_events.len(), 3);
     assert_eq!(
         event_type_names(&suspend_events),
-        vec!["Start", "ToolCallStart"]
+        vec!["UserInput", "Start", "ToolCallStart"]
     );
 
     // Execute child and resume parent.
@@ -1071,20 +1137,27 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
         } => committed_events,
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed after resume"),
     };
+    // The resume outcome carries the consolidated content + lifecycle
+    // edges only; the streamed `TextDelta` is committed to the journal
+    // out-of-band and is not threaded back into the outcome vec.
     assert_eq!(resume_events.len(), 3);
     assert_eq!(
         event_type_names(&resume_events),
         vec!["Text", "TurnComplete", "Done"]
     );
 
-    // Full thread event stream is contiguous.
+    // Full thread event stream is contiguous and carries the streamed
+    // resume `TextDelta` between `ToolCallEnd` and the consolidated
+    // resume `Text`.
     let all = stores.events.get_events(&thread_reg()).await?;
     assert_eq!(
         event_type_names(&all),
         vec![
+            "UserInput",
             "Start",
             "ToolCallStart",
             "ToolCallEnd",
+            "TextDelta",
             "Text",
             "TurnComplete",
             "Done",
@@ -1102,7 +1175,6 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
 /// Two threads receive events concurrently. Each thread maintains
 /// independent monotonic sequences starting from 0, and events do
 /// not leak across threads.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn cross_thread_isolation() -> Result<()> {
     let stores = TestStores::new();

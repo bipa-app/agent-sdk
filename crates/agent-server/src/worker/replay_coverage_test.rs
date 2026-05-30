@@ -160,6 +160,36 @@ async fn create_and_acquire(
 // Mock providers
 // ─────────────────────────────────────────────────────────────────────
 
+use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
+
+const fn replay_usage() -> Usage {
+    Usage {
+        input_tokens: 200,
+        output_tokens: 100,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    }
+}
+
+/// Stream a `thinking` block (with signature) on block 0 followed by a
+/// `text` block on block 1, then `Usage` + `Done{EndTurn}`.  Empty
+/// `thinking` / `text` are skipped so callers can request text-only or
+/// tool-only shapes.  This mirrors what a real provider's SSE decoder
+/// emits and exercises the per-delta journal-commit path.
+fn thinking_text_stream(thinking: String, signature: String, text: String) -> StreamBox<'static> {
+    Box::pin(async_stream::stream! {
+        if !thinking.is_empty() {
+            yield Ok(StreamDelta::ThinkingDelta { delta: thinking, block_index: 0 });
+            yield Ok(StreamDelta::SignatureDelta { delta: signature, block_index: 0 });
+        }
+        if !text.is_empty() {
+            yield Ok(StreamDelta::TextDelta { delta: text, block_index: 1 });
+        }
+        yield Ok(StreamDelta::Usage(replay_usage()));
+        yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::EndTurn) });
+    })
+}
+
 struct ThinkingTextProvider {
     thinking: String,
     response_text: String,
@@ -181,13 +211,16 @@ impl LlmProvider for ThinkingTextProvider {
             ],
             model: "mock-model".into(),
             stop_reason: Some(StopReason::EndTurn),
-            usage: Usage {
-                input_tokens: 200,
-                output_tokens: 100,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
+            usage: replay_usage(),
         }))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        thinking_text_stream(
+            self.thinking.clone(),
+            "sig_test".to_owned(),
+            self.response_text.clone(),
+        )
     }
 
     fn model(&self) -> &'static str {
@@ -252,13 +285,53 @@ impl LlmProvider for ThinkingToolCallProvider {
             content,
             model: "mock-model".into(),
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
+            usage: replay_usage(),
         }))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if call_num > 0 {
+            // Resume turn: thinking (optional) + text.
+            return thinking_text_stream(
+                self.resume_thinking.clone(),
+                "sig_resume".to_owned(),
+                self.resume_text.clone(),
+            );
+        }
+        // First turn: optional thinking on block 0, then a tool call per
+        // subsequent block, then `Usage` + `Done{ToolUse}`.
+        let thinking = self.thinking.clone();
+        let tool_calls = self.tool_calls.clone();
+        Box::pin(async_stream::stream! {
+            // Optional thinking occupies block 0; tool calls then start
+            // at block 1.  With no thinking they start at block 0.
+            let has_thinking = !thinking.is_empty();
+            let first_tool_block = usize::from(has_thinking);
+            if has_thinking {
+                yield Ok(StreamDelta::ThinkingDelta { delta: thinking, block_index: 0 });
+                yield Ok(StreamDelta::SignatureDelta {
+                    delta: "sig_first".to_owned(),
+                    block_index: 0,
+                });
+            }
+            for (offset, (id, name, input)) in tool_calls.into_iter().enumerate() {
+                let block_index = first_tool_block + offset;
+                yield Ok(StreamDelta::ToolUseStart {
+                    id: id.clone(),
+                    name,
+                    block_index,
+                    thought_signature: None,
+                });
+                yield Ok(StreamDelta::ToolInputDelta {
+                    id,
+                    delta: input.to_string(),
+                    block_index,
+                });
+            }
+            yield Ok(StreamDelta::Usage(replay_usage()));
+            yield Ok(StreamDelta::Done { stop_reason: Some(StopReason::ToolUse) });
+        })
     }
 
     fn model(&self) -> &'static str {
@@ -274,8 +347,10 @@ impl LlmProvider for ThinkingToolCallProvider {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-/// Text-only turn with thinking: `Start` → `Thinking` → `Text` → `TurnComplete` → `Done`.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
+/// Streamed text-with-thinking turn.  Post-streaming-refactor journal
+/// order: `UserInput → Start → ThinkingDelta → Thinking → TextDelta →
+/// Text → TurnComplete → Done`.  The streamed `ThinkingDelta` /
+/// `TextDelta` precede their consolidated `Thinking` / `Text` blocks.
 #[tokio::test]
 async fn text_only_with_thinking_replays_in_order() -> Result<()> {
     let stores = TestStores::new();
@@ -296,26 +371,33 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
     };
     execute_root_turn(inputs, "question", &provider, &stores.deps(), t0()).await?;
 
+    // The turn streams both deltas (thinking then text) before
+    // committing both consolidated blocks at turn close:
+    //   UserInput → Start → ThinkingDelta → TextDelta
+    //            → Thinking → Text → TurnComplete → Done
     let events = stores.events.get_events(&thread_replay()).await?;
     assert_eq!(
         events.len(),
-        5,
-        "Start + Thinking + Text + TurnComplete + Done"
+        8,
+        "UserInput + Start + ThinkingDelta + TextDelta + Thinking + Text + TurnComplete + Done"
     );
 
-    assert!(matches!(&events[0].event, AgentEvent::Start { .. }));
-    assert!(matches!(&events[1].event, AgentEvent::Thinking { .. }));
-    assert!(matches!(&events[2].event, AgentEvent::Text { .. }));
-    assert!(matches!(&events[3].event, AgentEvent::TurnComplete { .. }));
-    assert!(matches!(&events[4].event, AgentEvent::Done { .. }));
+    assert!(matches!(&events[0].event, AgentEvent::UserInput { .. }));
+    assert!(matches!(&events[1].event, AgentEvent::Start { .. }));
+    assert!(matches!(&events[2].event, AgentEvent::ThinkingDelta { .. }));
+    assert!(matches!(&events[3].event, AgentEvent::TextDelta { .. }));
+    assert!(matches!(&events[4].event, AgentEvent::Thinking { .. }));
+    assert!(matches!(&events[5].event, AgentEvent::Text { .. }));
+    assert!(matches!(&events[6].event, AgentEvent::TurnComplete { .. }));
+    assert!(matches!(&events[7].event, AgentEvent::Done { .. }));
 
-    // Verify content fidelity.
-    if let AgentEvent::Thinking { text, .. } = &events[1].event {
+    // Verify content fidelity of the consolidated blocks.
+    if let AgentEvent::Thinking { text, .. } = &events[4].event {
         assert_eq!(text, "Let me think about this...");
     } else {
         panic!("expected Thinking");
     }
-    if let AgentEvent::Text { text, .. } = &events[2].event {
+    if let AgentEvent::Text { text, .. } = &events[5].event {
         assert_eq!(text, "Here is my answer");
     } else {
         panic!("expected Text");
@@ -331,7 +413,6 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
 
 /// Tool progress events emitted by the executor are durably committed
 /// between `ToolCallStart` and `ToolCallEnd`.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn tool_progress_events_are_durable() -> Result<()> {
@@ -434,20 +515,23 @@ async fn tool_progress_events_are_durable() -> Result<()> {
     ));
 
     // Verify from the event repository: full thread replay order.
+    // The first turn streams a tool call with no thinking, so the
+    // journal leads with the `UserInput` admission record, then `Start`:
+    //   UserInput → Start → ToolCallStart → ToolProgress(running)
+    //            → ToolProgress(complete) → ToolCallEnd
     let all = stores.events.get_events(&thread_replay()).await?;
-    // Start → ToolCallStart → ToolProgress(running) → ToolProgress(complete)
-    // → ToolCallEnd → ...
-    assert!(matches!(&all[0].event, AgentEvent::Start { .. }));
-    assert!(matches!(&all[1].event, AgentEvent::ToolCallStart { .. }));
+    assert!(matches!(&all[0].event, AgentEvent::UserInput { .. }));
+    assert!(matches!(&all[1].event, AgentEvent::Start { .. }));
+    assert!(matches!(&all[2].event, AgentEvent::ToolCallStart { .. }));
     assert!(matches!(
-        &all[2].event,
+        &all[3].event,
         AgentEvent::ToolProgress { stage, .. } if stage == "running"
     ));
     assert!(matches!(
-        &all[3].event,
+        &all[4].event,
         AgentEvent::ToolProgress { stage, .. } if stage == "complete"
     ));
-    assert!(matches!(&all[4].event, AgentEvent::ToolCallEnd { .. }));
+    assert!(matches!(&all[5].event, AgentEvent::ToolCallEnd { .. }));
 
     // Sequences are contiguous.
     for (i, evt) in all.iter().enumerate() {
@@ -525,9 +609,10 @@ async fn execute_child_and_resume(
     Ok(())
 }
 
-/// Full lifecycle: `Start` → `Thinking` → `ToolCallStart` → `ToolCallEnd`
-/// → `Thinking` → `Text` → `TurnComplete` → `Done`.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
+/// Full streamed lifecycle across a root suspend, a child tool task,
+/// and a streamed resume.  The streamed `ThinkingDelta` / `TextDelta`
+/// precede their consolidated blocks, and each root turn leads with its
+/// `UserInput` admission record before `Start`.
 #[tokio::test]
 async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<()> {
     let stores = TestStores::new();
@@ -569,9 +654,12 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
     let types: Vec<&str> = events
         .iter()
         .map(|e| match &e.event {
+            AgentEvent::UserInput { .. } => "UserInput",
             AgentEvent::Start { .. } => "Start",
             AgentEvent::Thinking { .. } => "Thinking",
+            AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
             AgentEvent::Text { .. } => "Text",
+            AgentEvent::TextDelta { .. } => "TextDelta",
             AgentEvent::ToolCallStart { .. } => "ToolCallStart",
             AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
             AgentEvent::ToolProgress { .. } => "ToolProgress",
@@ -581,15 +669,25 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
         })
         .collect();
 
+    // Suspend turn streams thinking then a tool call; the resume turn
+    // streams thinking then text.  Streamed deltas precede their
+    // consolidated blocks.
+    // The resume turn streams *both* deltas (thinking then text) before
+    // committing *both* consolidated blocks at turn close, so the resume
+    // tail is `ThinkingDelta → TextDelta → Thinking → Text`.
     assert_eq!(
         types,
         vec![
+            "UserInput",
             "Start",
-            "Thinking", // from first LLM call (tool-call response)
+            "ThinkingDelta", // streamed (first LLM call)
+            "Thinking",      // consolidated (first LLM call)
             "ToolCallStart",
             "ToolCallEnd",
-            "Thinking", // from resume LLM call
-            "Text",     // from resume LLM call
+            "ThinkingDelta", // streamed (resume LLM call)
+            "TextDelta",     // streamed (resume LLM call)
+            "Thinking",      // consolidated (resume LLM call)
+            "Text",          // consolidated (resume LLM call)
             "TurnComplete",
             "Done",
         ],
@@ -614,7 +712,6 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
 
 /// Two interleaved tool tasks produce correctly ordered events within
 /// the shared thread event stream.
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
     let stores = TestStores::new();
@@ -703,24 +800,26 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
         .await?;
     }
 
-    // Verify event stream: Start → ToolCallStart(read) → ToolCallStart(write)
-    // → ToolCallEnd(read) → ToolCallEnd(write)
+    // Verify event stream (no thinking, so no `ThinkingDelta`):
+    //   UserInput → Start → ToolCallStart(read) → ToolCallStart(write)
+    //            → ToolCallEnd → ToolCallEnd
     let events = stores.events.get_events(&thread_replay()).await?;
 
-    // Start + 2 ToolCallStart + 2 ToolCallEnd = 5 before resume.
-    assert!(events.len() >= 5);
-    assert!(matches!(&events[0].event, AgentEvent::Start { .. }));
+    // UserInput + Start + 2 ToolCallStart + 2 ToolCallEnd = 6 before resume.
+    assert!(events.len() >= 6);
+    assert!(matches!(&events[0].event, AgentEvent::UserInput { .. }));
+    assert!(matches!(&events[1].event, AgentEvent::Start { .. }));
     assert!(matches!(
-        &events[1].event,
+        &events[2].event,
         AgentEvent::ToolCallStart { name, .. } if name == "read"
     ));
     assert!(matches!(
-        &events[2].event,
+        &events[3].event,
         AgentEvent::ToolCallStart { name, .. } if name == "write"
     ));
     // ToolCallEnd events follow (order depends on execution order).
-    assert!(matches!(&events[3].event, AgentEvent::ToolCallEnd { .. }));
     assert!(matches!(&events[4].event, AgentEvent::ToolCallEnd { .. }));
+    assert!(matches!(&events[5].event, AgentEvent::ToolCallEnd { .. }));
 
     // Sequences are contiguous.
     for (i, evt) in events.iter().enumerate() {

@@ -22,14 +22,9 @@ use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
-};
+use agent_sdk_core::llm::{StopReason, Tool};
 use agent_sdk_core::{ThreadId, ToolResult, ToolTier};
-use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -164,130 +159,41 @@ async fn create_and_acquire_task(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Mock providers
+// Scripted providers
 // ─────────────────────────────────────────────────────────────────────
+//
+// These tests now drive the *real* streaming commit path through the
+// shared `StreamingScriptedProvider` (see `worker::test_support`).  A
+// chat-only mock would route through `LlmProvider::chat_stream`'s
+// default single-shot adapter and never exercise per-delta commits.
 
-struct MockTextProvider {
-    response_text: String,
-    stop_reason: Option<StopReason>,
+use crate::worker::test_support::{StreamingScriptedProvider, TurnScript};
+
+/// A single text turn (`UserInput → Start → TextDelta → Text →
+/// TurnComplete → Done`).
+fn text_provider(text: &str) -> StreamingScriptedProvider {
+    StreamingScriptedProvider::single(TurnScript::text(text))
 }
 
-impl MockTextProvider {
-    fn new(text: &str) -> Self {
-        Self {
-            response_text: text.to_owned(),
-            stop_reason: Some(StopReason::EndTurn),
-        }
-    }
-
-    fn with_refusal(text: &str) -> Self {
-        Self {
-            response_text: text.to_owned(),
-            stop_reason: Some(StopReason::Refusal),
-        }
-    }
+/// A single text turn ending with [`StopReason::Refusal`].
+fn refusal_provider(text: &str) -> StreamingScriptedProvider {
+    StreamingScriptedProvider::single(TurnScript::text_with_stop(text, StopReason::Refusal))
 }
 
-#[async_trait]
-impl LlmProvider for MockTextProvider {
-    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: "msg_evt_01".into(),
-            content: vec![ContentBlock::Text {
-                text: self.response_text.clone(),
-            }],
-            model: "mock-model".into(),
-            stop_reason: self.stop_reason,
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        }))
-    }
-
-    fn model(&self) -> &'static str {
-        "mock-model"
-    }
-
-    fn provider(&self) -> &'static str {
-        "mock"
-    }
-}
-
-struct MockToolCallProvider {
-    tool_calls: Vec<(String, String, serde_json::Value)>,
-    call_count: AtomicUsize,
-}
-
-impl MockToolCallProvider {
-    fn new(tool_calls: Vec<(String, String, serde_json::Value)>) -> Self {
-        Self {
-            tool_calls,
-            call_count: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for MockToolCallProvider {
-    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-        let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
-        if call_num > 0 {
-            return Ok(ChatOutcome::Success(ChatResponse {
-                id: "msg_evt_resume".into(),
-                content: vec![ContentBlock::Text {
-                    text: "done".into(),
-                }],
-                model: "mock-model".into(),
-                stop_reason: Some(StopReason::EndTurn),
-                usage: Usage {
-                    input_tokens: 50,
-                    output_tokens: 25,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                },
-            }));
-        }
-        let content: Vec<ContentBlock> = self
-            .tool_calls
-            .iter()
-            .map(|(id, name, input)| ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-                thought_signature: None,
-            })
-            .collect();
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: "msg_evt_tool_01".into(),
-            content,
-            model: "mock-model".into(),
-            stop_reason: Some(StopReason::ToolUse),
-            usage: Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        }))
-    }
-
-    fn model(&self) -> &'static str {
-        "mock-model"
-    }
-
-    fn provider(&self) -> &'static str {
-        "mock"
-    }
+/// A turn that emits the given tool calls and suspends.  The provider
+/// queue also carries a follow-up `text("done")` turn so the same
+/// instance can drive the post-tool resume call.
+fn tool_call_provider(tool_calls: &[(&str, &str, serde_json::Value)]) -> StreamingScriptedProvider {
+    StreamingScriptedProvider::new(vec![
+        TurnScript::tool_calls(tool_calls),
+        TurnScript::text("done"),
+    ])
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     let stores = TestStores::new();
@@ -303,7 +209,7 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     .await
     .context("build inputs")?;
 
-    let provider = MockTextProvider::new("hello");
+    let provider = text_provider("hello");
     let outcome = execute_root_turn(inputs, "hi", &provider, &stores.deps(), t0()).await?;
 
     let committed_events = match outcome {
@@ -313,35 +219,85 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
-    // Should have Start + Text + TurnComplete + Done (4 events).
-    assert_eq!(committed_events.len(), 4, "expected 4 events");
+    // Post-streaming-refactor invariant for the *outcome* vec:
+    // `UserInput → Start → Text → TurnComplete → Done` (5 events).
+    // The streamed `TextDelta` is committed to the journal during
+    // streaming but is *not* threaded back into the outcome vec (it is
+    // committed out-of-band by `commit_streaming_delta`), so the outcome
+    // carries only the consolidated content + lifecycle edges.
+    assert_eq!(committed_events.len(), 5, "expected 5 outcome events");
     assert!(
-        matches!(&committed_events[0].event, AgentEvent::Start { .. }),
-        "event[0] should be Start, got {:?}",
+        matches!(&committed_events[0].event, AgentEvent::UserInput { .. }),
+        "event[0] should be UserInput, got {:?}",
         committed_events[0].event,
     );
     assert!(
-        matches!(&committed_events[1].event, AgentEvent::Text { .. }),
-        "event[1] should be Text, got {:?}",
+        matches!(&committed_events[1].event, AgentEvent::Start { .. }),
+        "event[1] should be Start, got {:?}",
         committed_events[1].event,
     );
     assert!(
-        matches!(&committed_events[2].event, AgentEvent::TurnComplete { .. }),
-        "event[2] should be TurnComplete, got {:?}",
+        matches!(&committed_events[2].event, AgentEvent::Text { .. }),
+        "event[2] should be Text, got {:?}",
         committed_events[2].event,
     );
     assert!(
-        matches!(&committed_events[3].event, AgentEvent::Done { .. }),
-        "event[3] should be Done, got {:?}",
+        matches!(&committed_events[3].event, AgentEvent::TurnComplete { .. }),
+        "event[3] should be TurnComplete, got {:?}",
         committed_events[3].event,
     );
+    assert!(
+        matches!(&committed_events[4].event, AgentEvent::Done { .. }),
+        "event[4] should be Done, got {:?}",
+        committed_events[4].event,
+    );
 
-    // Events should also be in the repository.
+    // The journal additionally carries the streamed `TextDelta` between
+    // `Start` and the consolidated `Text`, so the full replay is
+    // `UserInput → Start → TextDelta → Text → TurnComplete → Done`
+    // (6 events) with contiguous sequences.
     let repo_events = stores.events.get_events(&thread_a()).await?;
-    assert_eq!(repo_events.len(), 4);
+    assert_eq!(repo_events.len(), 6, "expected 6 journal events");
+    assert!(matches!(
+        &repo_events[0].event,
+        AgentEvent::UserInput { .. }
+    ));
+    assert!(matches!(&repo_events[1].event, AgentEvent::Start { .. }));
+    assert!(
+        matches!(&repo_events[2].event, AgentEvent::TextDelta { .. }),
+        "event[2] should be the streamed TextDelta, got {:?}",
+        repo_events[2].event,
+    );
+    assert!(matches!(&repo_events[3].event, AgentEvent::Text { .. }));
+    assert!(matches!(
+        &repo_events[4].event,
+        AgentEvent::TurnComplete { .. }
+    ));
+    assert!(matches!(&repo_events[5].event, AgentEvent::Done { .. }));
     for (i, evt) in repo_events.iter().enumerate() {
         assert_eq!(evt.sequence, i as u64);
     }
+
+    // The streamed `TextDelta` and the consolidated `Text` share the
+    // same lazily-allocated message id (`content_ids`), so a live
+    // observer can stitch the delta onto the final block.
+    let (
+        AgentEvent::TextDelta {
+            message_id: delta_id,
+            ..
+        },
+        AgentEvent::Text {
+            message_id: text_id,
+            ..
+        },
+    ) = (&repo_events[2].event, &repo_events[3].event)
+    else {
+        panic!("expected TextDelta then Text");
+    };
+    assert_eq!(
+        delta_id, text_id,
+        "delta and consolidated Text must share a message id"
+    );
 
     Ok(())
 }
@@ -361,7 +317,7 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
     .await
     .context("build inputs")?;
 
-    let provider = MockTextProvider::with_refusal("I cannot do that");
+    let provider = refusal_provider("I cannot do that");
     let outcome =
         execute_root_turn(inputs, "do something bad", &provider, &stores.deps(), t0()).await?;
 
@@ -423,17 +379,9 @@ async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
     .await
     .context("build inputs")?;
 
-    let provider = MockToolCallProvider::new(vec![
-        (
-            "tc_1".into(),
-            "bash".into(),
-            serde_json::json!({"command": "ls"}),
-        ),
-        (
-            "tc_2".into(),
-            "bash".into(),
-            serde_json::json!({"command": "pwd"}),
-        ),
+    let provider = tool_call_provider(&[
+        ("tc_1", "bash", serde_json::json!({"command": "ls"})),
+        ("tc_2", "bash", serde_json::json!({"command": "pwd"})),
     ]);
     let outcome =
         execute_root_turn(inputs, "run commands", &provider, &stores.deps(), t0()).await?;
@@ -492,11 +440,8 @@ async fn tool_completion_emits_tool_call_end() -> Result<()> {
     .context("build inputs")?;
 
     // Suspend to create child tasks.
-    let provider = MockToolCallProvider::new(vec![(
-        "tc_1".into(),
-        "bash".into(),
-        serde_json::json!({"command": "echo hi"}),
-    )]);
+    let provider =
+        tool_call_provider(&[("tc_1", "bash", serde_json::json!({"command": "echo hi"}))]);
     let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
     let child_tasks = match outcome {
         RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
@@ -572,11 +517,8 @@ async fn tool_failure_emits_tool_call_end_with_error() -> Result<()> {
     .await
     .context("build inputs")?;
 
-    let provider = MockToolCallProvider::new(vec![(
-        "tc_fail".into(),
-        "bash".into(),
-        serde_json::json!({"command": "false"}),
-    )]);
+    let provider =
+        tool_call_provider(&[("tc_fail", "bash", serde_json::json!({"command": "false"}))]);
     let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
     let child_tasks = match outcome {
         RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
@@ -663,7 +605,7 @@ async fn fail_root_turn_emits_error_event() -> Result<()> {
 async fn execute_child_and_resume(
     stores: &TestStores,
     child_tasks: &[AgentTask],
-    provider: &MockToolCallProvider,
+    provider: &StreamingScriptedProvider,
 ) -> Result<()> {
     let child = stores
         .tasks
@@ -735,7 +677,6 @@ async fn execute_child_and_resume(
     Ok(())
 }
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     let stores = TestStores::new();
@@ -751,11 +692,8 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     .await?;
 
     // Step 1: suspend (emits ToolCallStart).
-    let provider = MockToolCallProvider::new(vec![(
-        "tc_seq".into(),
-        "bash".into(),
-        serde_json::json!({"command": "echo"}),
-    )]);
+    let provider =
+        tool_call_provider(&[("tc_seq", "bash", serde_json::json!({"command": "echo"}))]);
     let outcome = execute_root_turn(inputs, "run", &provider, &stores.deps(), t0()).await?;
     let child_tasks = match outcome {
         RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
@@ -765,15 +703,10 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
     // Steps 2-3: execute child tool + resume parent.
     Box::pin(execute_child_and_resume(&stores, &child_tasks, &provider)).await?;
 
-    // Verify all events have strictly monotonic sequences.
-    // Expected: Start → ToolCallStart → ToolCallEnd → Text → TurnComplete → Done
+    // Every event on the thread — across the root suspend, the child
+    // tool task, and the streamed resume — has a contiguous, strictly
+    // monotonic sequence with no gaps at worker-boundary transitions.
     let all_events = stores.events.get_events(&thread_a()).await?;
-    assert!(
-        all_events.len() >= 7,
-        "expected at least 7 events (UserInput + Start + ToolCallStart + ToolCallEnd + Text + TurnComplete + Done), got {}",
-        all_events.len(),
-    );
-
     for i in 1..all_events.len() {
         assert_eq!(
             all_events[i].sequence,
@@ -786,30 +719,46 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
         );
     }
 
-    // Verify event type ordering across root + tool task boundaries.
-    // Every root turn now leads with `UserInput` (the durable
-    // admission record) before `Start`.
-    assert!(matches!(&all_events[0].event, AgentEvent::UserInput { .. }));
-    assert!(matches!(&all_events[1].event, AgentEvent::Start { .. }));
-    assert!(matches!(
-        &all_events[2].event,
-        AgentEvent::ToolCallStart { .. }
-    ));
-    assert!(matches!(
-        &all_events[3].event,
-        AgentEvent::ToolCallEnd { .. }
-    ));
-    assert!(matches!(&all_events[4].event, AgentEvent::Text { .. }));
-    assert!(matches!(
-        &all_events[5].event,
-        AgentEvent::TurnComplete { .. }
-    ));
-    assert!(matches!(&all_events[6].event, AgentEvent::Done { .. }));
+    // Post-streaming-refactor journal ordering across root + tool task
+    // boundaries.  The resume turn now streams, so the resume `Text` is
+    // preceded by its `TextDelta`:
+    //   UserInput → Start → ToolCallStart → ToolCallEnd
+    //            → TextDelta → Text → TurnComplete → Done
+    // Each root turn leads with `UserInput` (the durable admission
+    // record) before `Start`, and there is a single `Start` for the
+    // turn — resume does not re-emit `Start`.
+    let kinds: Vec<&str> = all_events
+        .iter()
+        .map(|e| match &e.event {
+            AgentEvent::UserInput { .. } => "UserInput",
+            AgentEvent::Start { .. } => "Start",
+            AgentEvent::ToolCallStart { .. } => "ToolCallStart",
+            AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
+            AgentEvent::TextDelta { .. } => "TextDelta",
+            AgentEvent::Text { .. } => "Text",
+            AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::Done { .. } => "Done",
+            other => panic!("unexpected event in lifecycle: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "UserInput",
+            "Start",
+            "ToolCallStart",
+            "ToolCallEnd",
+            "TextDelta",
+            "Text",
+            "TurnComplete",
+            "Done",
+        ],
+        "full-lifecycle journal order changed",
+    );
 
     Ok(())
 }
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn committed_events_returned_in_outcome_types() -> Result<()> {
     let stores = TestStores::new();
@@ -824,10 +773,9 @@ async fn committed_events_returned_in_outcome_types() -> Result<()> {
     )
     .await?;
 
-    let provider = MockTextProvider::new("result");
+    let provider = text_provider("result");
     let outcome = execute_root_turn(inputs, "test", &provider, &stores.deps(), t0()).await?;
 
-    // Verify committed_events in outcome matches what's in the repository.
     let outcome_events = match outcome {
         RootTurnOutcome::Completed {
             committed_events, ..
@@ -835,13 +783,53 @@ async fn committed_events_returned_in_outcome_types() -> Result<()> {
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
+    // Post-streaming-refactor invariant: the outcome's `committed_events`
+    // is the consolidated/lifecycle projection of the turn and does *not*
+    // include the per-delta `TextDelta` events committed out-of-band by
+    // `commit_streaming_delta`.  So the journal carries exactly one more
+    // event (the streamed `TextDelta`) than the outcome, and the outcome
+    // events are a *subsequence* of the journal — matched by event_id —
+    // with a sequence gap where the delta was dropped.
     let repo_events = stores.events.get_events(&thread_a()).await?;
-    assert_eq!(outcome_events.len(), repo_events.len());
+    assert_eq!(
+        outcome_events.len() + 1,
+        repo_events.len(),
+        "journal must carry exactly one extra (streamed TextDelta) event",
+    );
 
-    for (outcome_evt, repo_evt) in outcome_events.iter().zip(repo_events.iter()) {
-        assert_eq!(outcome_evt.event_id, repo_evt.event_id);
+    // Every outcome event is present in the journal, in order, identified
+    // by its stable event_id and sequence.
+    let repo_by_id: std::collections::HashMap<_, _> =
+        repo_events.iter().map(|e| (e.event_id, e)).collect();
+    let mut last_seq: Option<u64> = None;
+    for outcome_evt in &outcome_events {
+        let repo_evt = repo_by_id
+            .get(&outcome_evt.event_id)
+            .context("outcome event missing from journal")?;
         assert_eq!(outcome_evt.sequence, repo_evt.sequence);
+        if let Some(prev) = last_seq {
+            assert!(
+                outcome_evt.sequence > prev,
+                "outcome events must stay in journal order",
+            );
+        }
+        last_seq = Some(outcome_evt.sequence);
     }
+
+    // The one journal event absent from the outcome is the streamed
+    // `TextDelta`.
+    let outcome_ids: std::collections::HashSet<_> =
+        outcome_events.iter().map(|e| e.event_id).collect();
+    let extra: Vec<_> = repo_events
+        .iter()
+        .filter(|e| !outcome_ids.contains(&e.event_id))
+        .collect();
+    assert_eq!(extra.len(), 1, "exactly one journal-only event");
+    assert!(
+        matches!(&extra[0].event, AgentEvent::TextDelta { .. }),
+        "the journal-only event is the streamed TextDelta, got {:?}",
+        extra[0].event,
+    );
 
     Ok(())
 }

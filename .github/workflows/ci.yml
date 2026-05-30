@@ -5,6 +5,12 @@ on:
     branches: [main, sdk/v2]
   pull_request:
     branches: [main, sdk/v2]
+  # Nightly cron drives the Tier-C live-smoke job (the only place real
+  # provider keys are used). PR / push events never set the `schedule`
+  # context, so live smoke is opt-in via cron or manual dispatch only.
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +39,11 @@ jobs:
       # and writes a JUnit report. This does NOT need a database: the
       # Postgres-backed tests early-return (or are `#[ignore]`'d) without
       # TEST_DATABASE_URL — they run in the dedicated `postgres` job below.
+      #
+      # This is also where the provider Tier-A (unit) and Tier-B
+      # (deterministic wiremock SSE + cassette replay) tests run: no API
+      # keys, no live network. Tier-C live smoke is `#[ignore]`'d here and
+      # runs only in the nightly `live-smoke` job below.
       - run: cargo nextest run --workspace --all-features --profile ci
 
   postgres:
@@ -131,3 +142,55 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p agent-sdk --examples --all-features
+
+  # ───────────────────────────────────────────────────────────────────
+  # Tier-C provider live smoke — NIGHTLY / SECRETS ONLY.
+  #
+  # This is the *only* job that uses real provider API keys. It is gated
+  # on the `schedule` (nightly cron) or a manual `workflow_dispatch`, so
+  # it never runs on pull requests — PR CI stays key-free (the `test`
+  # job above already runs Tier-A unit + Tier-B deterministic wiremock
+  # integration with no keys / no live network).
+  #
+  # Each provider gets one round-trip: a streamed turn, a non-streaming
+  # completion, and a tool call. Tests are doubly guarded: `#[ignore]`
+  # plus an `AGENT_SDK_LIVE_SMOKE=1` env check, so a missing key makes
+  # them a clean no-op rather than a failure.
+  live-smoke:
+    name: Provider live smoke (Tier C)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      AGENT_SDK_LIVE_SMOKE: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # `--run-ignored all` opts the Tier-C tests in; they still no-op
+      # for any provider whose key secret is absent.
+      - name: Run Tier-C live smoke
+        run: >-
+          cargo nextest run -p agent-sdk-providers --profile ci
+          --run-ignored all -E 'test(/tier_c_/)'
+
+  # Optional, non-blocking BFCL-style tool-call smoke vs a mock. Kept off
+  # the PR critical path: it runs nightly and never fails the build.
+  tool-call-smoke:
+    name: Tool-call smoke (non-blocking)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # The Tier-B tool-use cassette tests double as a deterministic,
+      # key-free tool-call smoke (function-calling decode + JSON
+      # round-trip) without depending on a live model.
+      - name: Tool-call decode smoke
+        run: >-
+          cargo nextest run -p agent-sdk-providers --profile ci
+          -E 'test(/tool_use/) + test(/truncated_after_tool_start/) + test(/tool_use_json/)'

@@ -60,6 +60,13 @@ insta = { version = "1", features = ["json"] }
 # Exhaustive concurrency-permutation model checker (Phase 11 · D). Only
 # compiled under `RUSTFLAGS="--cfg loom"`; never part of a normal build.
 loom = "0.7"
+# Provider Tier-B deterministic integration tests: a local HTTP server
+# that replays scripted / recorded-and-redacted SSE fixtures (cassettes)
+# so the streaming decode + accumulate path is exercised end-to-end with
+# zero live network and zero API keys.  `wiremock` is HTTP-client-version
+# agnostic (it is just a server), so it composes with the SDK's
+# `reqwest 0.13` provider clients without a second reqwest in the tree.
+wiremock = "0.6"
 
 # Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
 # feature set on every crate so production builds never compile it in;
