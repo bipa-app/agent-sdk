@@ -86,8 +86,22 @@ pub mod stores;
 pub mod wakeup;
 pub mod watch;
 
+/// Re-export of the `fail-rs` registry, available only under the
+/// `failpoints` feature (which forwards to `agent-server/failpoints`).
+///
+/// Durability tests in this crate arm the `commit.before_event_commit`
+/// failpoint — the one the durable completed-turn committers fire just
+/// before their atomic `tx.commit()` — through this re-export, so they do
+/// not need a direct `fail` dependency. Like `agent-server`'s mirror, the
+/// symbol simply does not exist in a default build, keeping production
+/// builds free of `fail-rs`.
+#[cfg(feature = "failpoints")]
+pub use agent_server::__fail_reexport as fail;
+
 #[cfg(test)]
 mod conformance;
+#[cfg(test)]
+mod durability_suite;
 #[cfg(test)]
 mod ga_regression;
 #[cfg(test)]
