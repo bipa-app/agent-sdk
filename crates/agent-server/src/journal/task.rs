@@ -649,8 +649,18 @@ pub struct AgentTask {
 }
 
 impl AgentTask {
-    /// Default retry budget for root turns before Phase 2.5 tunes it.
+    /// Default retry budget for internal / leaf task plumbing
+    /// (e.g. [`ChildSpawnSpec::default`] tool-runtime children).
     pub const DEFAULT_MAX_ATTEMPTS: u32 = 1;
+
+    /// Default retry budget for an externally-submitted **root turn**.
+    ///
+    /// Phase 10 · E reconciles this with the server-owned runtime policy
+    /// ([`RuntimePolicy::server_default`](crate::worker::definition::RuntimePolicy::server_default)
+    /// also resolves to `3`). A budget-1 root that crashes mid-turn is
+    /// failed-closed by the recovery matrix instead of being requeued;
+    /// admitting roots with this budget lets a mid-turn crash retry.
+    pub const DEFAULT_ROOT_MAX_ATTEMPTS: u32 = 3;
 
     /// Allocate a fresh [`TaskKind::RootTurn`] for the given thread.
     ///
@@ -2412,6 +2422,19 @@ mod tests {
     fn child_spawn_spec_default_matches_default_max_attempts() {
         let spec = ChildSpawnSpec::default();
         assert_eq!(spec.max_attempts, AgentTask::DEFAULT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn root_default_budget_matches_server_policy() {
+        // Phase 10 · E: the externally-submitted root default must equal
+        // the server runtime policy default so a budget that crashes
+        // mid-turn is requeued (>1), not failed-closed.
+        use crate::worker::definition::RuntimePolicy;
+        assert_eq!(
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+            RuntimePolicy::server_default().max_attempts,
+        );
+        const { assert!(AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS > 1) };
     }
 
     #[test]

@@ -34,6 +34,7 @@ use agent_server::journal::event_outbox_transaction::{
 };
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
+use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::outbox::kind_payload_invariants_hold;
@@ -50,7 +51,10 @@ use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
-use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
+use agent_server::journal::store::{
+    AgentTaskStore, SubagentInvocationSpawn, SubmitRootIdempotency, SubmitRootTurnError,
+    SubmitRootTurnOutcome, SubmitRootTurnParams,
+};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
     TaskKind, TaskStatus, WorkerId,
@@ -886,6 +890,207 @@ WHERE id = $1
         .await
         .with_context(|| format!("get task {id}"))?;
         record.map(TryInto::try_into).transpose()
+    }
+
+    async fn get_task_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        id: &AgentTaskId,
+    ) -> Result<Option<AgentTask>> {
+        let record = sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    created_at,
+    updated_at,
+    completed_at
+FROM agent_sdk_tasks
+WHERE id = $1
+",
+            id.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("get task {id} (tx)"))?;
+        record.map(TryInto::try_into).transpose()
+    }
+
+    /// Count the queued (not active/blocking) root turns on a thread,
+    /// inside the supplied transaction.
+    async fn queued_root_count_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+    ) -> Result<u32> {
+        let count = sqlx::query_scalar!(
+            r#"
+SELECT COUNT(*) AS "count!"
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+  AND kind = 'root_turn'
+  AND status = 'queued'
+"#,
+            thread_key(thread_id),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .with_context(|| format!("count queued roots for {thread_id}"))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Look up an existing `SubmitWork` idempotency record inside the
+    /// admission transaction and, if it matches, build the replay
+    /// outcome (committing the read transaction). Returns `Ok(None)`
+    /// when the key is unused (the caller proceeds to admit) and
+    /// [`SubmitRootTurnError::IdempotencyConflict`] on a kind/fingerprint
+    /// mismatch.
+    async fn try_replay_submit_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        claim: &agent_server::journal::store::SubmitRootIdempotency,
+    ) -> std::result::Result<Option<SubmitRootTurnOutcome>, SubmitRootTurnError> {
+        let existing = sqlx::query!(
+            r#"SELECT kind, fingerprint, result_json FROM agent_sdk_idempotency WHERE request_id = $1"#,
+            claim.request_id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("idempotency lookup for {}", claim.request_id))
+        .map_err(SubmitRootTurnError::Other)?;
+
+        let Some(row) = existing else {
+            return Ok(None);
+        };
+        if row.kind != IdempotencyKind::SubmitWork.as_str() || row.fingerprint != claim.fingerprint
+        {
+            return Err(SubmitRootTurnError::IdempotencyConflict);
+        }
+        let task_id = row
+            .result_json
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("submit idempotency record missing task_id reference"))
+            .map_err(SubmitRootTurnError::Other)?;
+        let admitted = self
+            .get_task_tx(tx, &AgentTaskId::from_string(task_id))
+            .await
+            .map_err(SubmitRootTurnError::Other)?
+            .ok_or_else(|| anyhow!("idempotent submit record points at missing task"))
+            .map_err(SubmitRootTurnError::Other)?;
+        let queued_depth = Self::queued_root_count_tx(tx, &admitted.thread_id)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+        Ok(Some(SubmitRootTurnOutcome {
+            task: admitted,
+            replayed: true,
+            replayed_result: Some(row.result_json),
+            queued_depth,
+        }))
+    }
+
+    /// Insert the `SubmitWork` idempotency record inside the admission
+    /// transaction.
+    async fn claim_submit_idempotency_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        claim: &SubmitRootIdempotency,
+        created_at: OffsetDateTime,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+            claim.request_id,
+            IdempotencyKind::SubmitWork.as_str(),
+            claim.fingerprint,
+            claim.result_json,
+            created_at,
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert idempotency record for {}", claim.request_id))?;
+        Ok(())
+    }
+
+    /// Admit a fresh root turn, claim its idempotency key, and commit
+    /// the transaction. `would_queue` is the admission decision computed
+    /// under the thread lock.
+    async fn commit_fresh_admission_tx(
+        mut tx: Transaction<'_, Postgres>,
+        task: AgentTask,
+        would_queue: bool,
+        idempotency: Option<SubmitRootIdempotency>,
+    ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
+        let admitted = if would_queue {
+            let created_at = task.created_at;
+            task.admit_as_queued(created_at)
+                .context("submit_root_turn rejected: cannot admit as queued")
+                .map_err(SubmitRootTurnError::Other)?
+        } else {
+            task
+        };
+
+        Self::insert_task_tx(&mut tx, &admitted)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+
+        // Phase 10 · D: when the new root is immediately runnable
+        // (`Pending`, not parked behind an active/queued root), emit a
+        // durable `task_wakeup` advisory row in the SAME transaction so a
+        // worker in any process is nudged to run `acquire_next_runnable`
+        // even after this host dies. A queued root is parked, so its
+        // eventual promotion emits the wakeup instead. This mirrors the
+        // non-idempotent `submit_root_turn` path; the transport calls this
+        // idempotent variant, so the wakeup emit must live here too.
+        if admitted.status == TaskStatus::Pending {
+            Self::insert_task_wakeup_outbox_row_tx(
+                &mut tx,
+                &admitted.id,
+                &admitted.thread_id,
+                TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS,
+                admitted.created_at,
+            )
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+        }
+
+        if let Some(claim) = idempotency {
+            Self::claim_submit_idempotency_tx(&mut tx, &claim, admitted.created_at)
+                .await
+                .map_err(SubmitRootTurnError::Other)?;
+        }
+
+        let queued_depth = Self::queued_root_count_tx(&mut tx, &admitted.thread_id)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+
+        tx.commit()
+            .await
+            .context("commit submit_root_turn_idempotent")
+            .map_err(SubmitRootTurnError::Other)?;
+        Ok(SubmitRootTurnOutcome {
+            task: admitted,
+            replayed: false,
+            replayed_result: None,
+            queued_depth,
+        })
     }
 
     async fn insert_task_tx(tx: &mut Transaction<'_, Postgres>, task: &AgentTask) -> Result<()> {
@@ -1804,6 +2009,156 @@ SELECT EXISTS (
 
         tx.commit().await.context("commit submit_root_turn")?;
         Ok(admitted)
+    }
+
+    async fn submit_root_turn_idempotent(
+        &self,
+        params: SubmitRootTurnParams,
+    ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
+        let SubmitRootTurnParams {
+            task,
+            idempotency,
+            max_queued_depth,
+        } = params;
+        agent_server::journal::store::validate_submit_root_shape(&task)?;
+
+        let mut tx = self.begin().await.map_err(SubmitRootTurnError::Other)?;
+        Self::bootstrap_thread_row_tx(&mut tx, &task.thread_id, task.created_at)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+        // Serialize concurrent submissions on the same thread so the
+        // idempotency claim, queue-depth check, and admission insert are
+        // atomic with respect to one another.
+        let _ = Self::lock_thread_tx(&mut tx, &task.thread_id)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+
+        // 1. Idempotency replay / conflict, inside the same transaction.
+        // Both the replay and the conflict path must release the
+        // FOR UPDATE thread lock promptly — a dropped-but-uncommitted
+        // tx parks the connection `idle in transaction`, holding the
+        // lock and stalling other writers. So we always explicitly
+        // commit (replay) or roll back (conflict / rejection) rather
+        // than relying on `Drop`.
+        if let Some(claim) = &idempotency {
+            match self.try_replay_submit_tx(&mut tx, claim).await {
+                Ok(Some(outcome)) => {
+                    tx.commit()
+                        .await
+                        .context("commit idempotent submit replay")
+                        .map_err(SubmitRootTurnError::Other)?;
+                    return Ok(outcome);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
+            }
+        }
+
+        let id_exists = sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE id = $1 LIMIT 1",
+            task.id.as_str(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("check existing task {}", task.id))
+        .map_err(SubmitRootTurnError::Other)?;
+        if id_exists.is_some() {
+            let _ = tx.rollback().await;
+            return Err(SubmitRootTurnError::Other(anyhow!(
+                "submit_root_turn rejected: task id {} already exists",
+                task.id
+            )));
+        }
+
+        let thread_has_blocking_root = sqlx::query_scalar!(
+            r#"
+SELECT EXISTS (
+    SELECT 1
+    FROM agent_sdk_tasks
+    WHERE thread_id = $1
+      AND kind = 'root_turn'
+      AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+) AS "exists!"
+"#,
+            thread_key(&task.thread_id),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("check active root slot for {}", task.thread_id))
+        .map_err(SubmitRootTurnError::Other)?;
+
+        let current_queued = Self::queued_root_count_tx(&mut tx, &task.thread_id)
+            .await
+            .map_err(SubmitRootTurnError::Other)?;
+
+        // 2. Back-pressure: reject a submission that would be queued and
+        // push the queued depth past the cap before any write.
+        let would_queue = thread_has_blocking_root || current_queued > 0;
+        if let Some(cap) = max_queued_depth
+            && would_queue
+            && current_queued >= cap
+        {
+            let _ = tx.rollback().await;
+            return Err(SubmitRootTurnError::QueueDepthExceeded {
+                cap,
+                current_depth: current_queued,
+            });
+        }
+
+        // 3. Admit, claim the idempotency key, and commit — all atomic.
+        Self::commit_fresh_admission_tx(tx, task, would_queue, idempotency).await
+    }
+
+    async fn claim_idempotency(
+        &self,
+        request_id: &str,
+        kind: IdempotencyKind,
+        fingerprint: &[u8],
+    ) -> Result<IdempotencyClaim> {
+        let existing = sqlx::query!(
+            r#"SELECT kind, fingerprint, result_json FROM agent_sdk_idempotency WHERE request_id = $1"#,
+            request_id,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("idempotency lookup for {request_id}"))?;
+
+        let Some(row) = existing else {
+            return Ok(IdempotencyClaim::Fresh);
+        };
+        if row.kind != kind.as_str() || row.fingerprint != fingerprint {
+            return Ok(IdempotencyClaim::Conflict);
+        }
+        let stored_kind = IdempotencyKind::from_wire(&row.kind)
+            .ok_or_else(|| anyhow!("unknown idempotency kind {} stored", row.kind))?;
+        Ok(IdempotencyClaim::Replay(Box::new(IdempotencyRecord {
+            request_id: request_id.to_owned(),
+            kind: stored_kind,
+            fingerprint: row.fingerprint,
+            result_json: row.result_json,
+        })))
+    }
+
+    async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()> {
+        // Insert-if-absent: a record committed by a racing retry that
+        // already claimed the key must not be clobbered.
+        sqlx::query!(
+            r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (request_id) DO NOTHING"#,
+            record.request_id,
+            record.kind.as_str(),
+            record.fingerprint,
+            record.result_json,
+            OffsetDateTime::now_utc(),
+        )
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("insert idempotency record for {}", record.request_id))?;
+        Ok(())
     }
 
     async fn get(&self, id: &AgentTaskId) -> Result<Option<AgentTask>> {
@@ -6370,6 +6725,184 @@ mod tests {
             OutboxStore::reclaim_expired_claims(&store, t_plus(6), time::Duration::seconds(30))
                 .await?;
         assert_eq!(reclaimed, 0);
+
+        Ok(())
+    }
+
+    // ── Phase 10 · E: durable idempotency (transactional with admission) ──
+
+    fn submit_params(
+        task: AgentTask,
+        request_id: &str,
+        fingerprint: &[u8],
+        max_queued_depth: Option<u32>,
+    ) -> SubmitRootTurnParams {
+        let result_json = serde_json::json!({ "task_id": task.id.to_string() });
+        SubmitRootTurnParams {
+            task,
+            idempotency: Some(SubmitRootIdempotency {
+                request_id: request_id.to_owned(),
+                fingerprint: fingerprint.to_vec(),
+                result_json,
+            }),
+            max_queued_depth,
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_submit_dedups_and_replays() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let tid = thread_id("pg-idem");
+        let first = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        let first_id = first.id.clone();
+        let outcome = store
+            .submit_root_turn_idempotent(submit_params(first, "pg-req", b"fp", None))
+            .await
+            .map_err(|error| anyhow!("first submit failed: {error}"))?;
+        assert!(!outcome.replayed);
+
+        let retry = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let replay = store
+            .submit_root_turn_idempotent(submit_params(retry, "pg-req", b"fp", None))
+            .await
+            .map_err(|error| anyhow!("retry submit failed: {error}"))?;
+        assert!(replay.replayed);
+        assert_eq!(replay.task.id, first_id);
+
+        let tasks = AgentTaskStore::list_by_thread(&store, &tid).await?;
+        assert_eq!(tasks.iter().filter(|t| t.is_root()).count(), 1);
+        Ok(())
+    }
+
+    /// Concurrent retries under the same `request_id` admit exactly one
+    /// root — the strongest proof the dedup is transactional with
+    /// admission (no TOCTOU). The `FOR UPDATE` thread lock serializes
+    /// the racing claims so only the first commits the insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_idempotent_submits_admit_exactly_one_root() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let tid = thread_id("pg-idem-race");
+        let count = 8usize;
+        let mut handles = Vec::with_capacity(count);
+        for idx in 0..count {
+            let store = store.clone();
+            let tid = tid.clone();
+            handles.push(tokio::spawn(async move {
+                let root =
+                    AgentTask::new_root_turn(tid, t_plus(i64::try_from(idx).context("idx")?), 3);
+                store
+                    .submit_root_turn_idempotent(submit_params(root, "race-req", b"fp", None))
+                    .await
+                    .map_err(|error| anyhow!("submit: {error}"))
+            }));
+        }
+
+        let mut admitted = 0usize;
+        let mut replayed = 0usize;
+        for handle in handles {
+            let outcome = handle.await.context("join submit")??;
+            if outcome.replayed {
+                replayed += 1;
+            } else {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1, "exactly one racing retry admitted a root");
+        assert_eq!(replayed, count - 1, "the rest replayed the original");
+
+        let tasks = AgentTaskStore::list_by_thread(&store, &tid).await?;
+        assert_eq!(tasks.iter().filter(|t| t.is_root()).count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idempotent_submit_queue_depth_cap_rejects() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let tid = thread_id("pg-queue-cap");
+        let active = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        store
+            .submit_root_turn_idempotent(submit_params(active, "c-active", b"fp", Some(1)))
+            .await
+            .map_err(|error| anyhow!("active: {error}"))?;
+        let queued = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let outcome = store
+            .submit_root_turn_idempotent(submit_params(queued, "c-1", b"fp", Some(1)))
+            .await
+            .map_err(|error| anyhow!("queued: {error}"))?;
+        assert_eq!(outcome.queued_depth, 1);
+
+        let overflow = AgentTask::new_root_turn(tid.clone(), t_plus(12), 3);
+        let result = store
+            .submit_root_turn_idempotent(submit_params(overflow, "c-2", b"fp", Some(1)))
+            .await;
+        assert!(matches!(
+            result,
+            Err(SubmitRootTurnError::QueueDepthExceeded {
+                cap: 1,
+                current_depth: 1
+            })
+        ));
+        Ok(())
+    }
+
+    /// Phase 10 · D + E regression: the transport-facing
+    /// `submit_root_turn_idempotent` path must also emit the durable
+    /// `task_wakeup` advisory row inside the admission transaction when
+    /// the root lands runnable (`Pending`) — exactly like the
+    /// non-idempotent `submit_root_turn`. A root that lands `Queued`
+    /// (parked behind the active slot) must NOT emit a wakeup; it is
+    /// nudged on promotion instead.
+    #[tokio::test]
+    async fn idempotent_submit_emits_durable_task_wakeup_when_runnable() -> Result<()> {
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::outbox_message::OutboxMessageKind;
+
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+        let tid = thread_id("pg-idem-wakeup");
+
+        // First root lands Pending → exactly one durable task_wakeup row.
+        let first = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        let outcome = store
+            .submit_root_turn_idempotent(submit_params(first, "w-1", b"fp", None))
+            .await
+            .map_err(|error| anyhow!("first submit: {error}"))?;
+        assert_eq!(outcome.task.status, TaskStatus::Pending);
+
+        let wakeups_after_first = OutboxStore::list_by_thread(&store, &tid)
+            .await?
+            .into_iter()
+            .filter(|row| row.kind == OutboxMessageKind::TaskWakeup)
+            .count();
+        assert_eq!(
+            wakeups_after_first, 1,
+            "idempotent admission of a runnable root must emit exactly one durable task_wakeup"
+        );
+
+        // Second root lands Queued (parked) → no additional wakeup.
+        let queued = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let queued_outcome = store
+            .submit_root_turn_idempotent(submit_params(queued, "w-2", b"fp", None))
+            .await
+            .map_err(|error| anyhow!("queued submit: {error}"))?;
+        assert_eq!(queued_outcome.task.status, TaskStatus::Queued);
+
+        let wakeups_after_queued = OutboxStore::list_by_thread(&store, &tid)
+            .await?
+            .into_iter()
+            .filter(|row| row.kind == OutboxMessageKind::TaskWakeup)
+            .count();
+        assert_eq!(
+            wakeups_after_queued, 1,
+            "a queued (parked) root must not emit an extra task_wakeup"
+        );
 
         Ok(())
     }

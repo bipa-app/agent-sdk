@@ -73,6 +73,12 @@ message SubmitThreadWorkResponse {
   // The admitted root-turn task. The task is `pending` when the thread had no
   // blocking root, or `queued` when it was accepted behind existing work.
   TaskSnapshot task = 2;
+
+  // Number of *queued* root turns on the thread after this admission (the
+  // active/blocking root is not counted). Surfaced so at-least-once clients
+  // can observe back-pressure before they hit the per-thread queue cap
+  // (which returns RESOURCE_EXHAUSTED).
+  uint32 current_queue_depth = 3;
 }
 
 // Fork an existing thread into a new thread that inherits the

@@ -572,6 +572,7 @@ pub mod event_stream;
 pub mod execution_context;
 pub mod execution_intent;
 pub mod fork_transaction;
+pub mod idempotency;
 pub mod live_tail;
 #[cfg(test)]
 mod live_tail_test;

@@ -1,6 +1,6 @@
 //! gRPC transport and local-daemon runtime for the durable service host.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +11,10 @@ use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
+use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
+use agent_server::journal::store::{
+    SubmitRootIdempotency, SubmitRootTurnError, SubmitRootTurnParams,
+};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, SubmittedInputItem, TaskKind as JournalTaskKind,
     TaskStatus as JournalTaskStatus, WorkerId,
@@ -31,7 +35,6 @@ use prost_types::{
 };
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -39,7 +42,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::config::ServiceConfig;
+use crate::config::{AdmissionConfig, ServiceConfig};
 use crate::health::HealthSurface;
 use crate::host::ServiceHost;
 use crate::proto::agent::service::v1 as pb;
@@ -77,34 +80,26 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-#[derive(Default)]
-struct IdempotencyState {
-    create_thread: HashMap<String, String>,
-    submit_work: HashMap<String, SubmitWorkRecord>,
-    decide_confirmation: HashMap<String, DecideConfirmationRecord>,
-    fork_thread: HashMap<String, ForkThreadRecord>,
-}
-
-#[derive(Clone)]
-struct SubmitWorkRecord {
-    fingerprint: Vec<u8>,
+/// Durable references stored in a `SubmitThreadWork` idempotency
+/// record's `result_json` so a retry can reconstruct the response.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SubmitWorkResult {
     thread_id: String,
     task_id: String,
 }
 
-#[derive(Clone)]
-struct ForkThreadRecord {
-    /// Source thread id the original call forked from. A retry that
-    /// repeats the same `request_id` against a *different* source is
-    /// rejected with `ALREADY_EXISTS` rather than silently returning
-    /// the original fork — same shape as `SubmitThreadWork`'s
-    /// fingerprint guard.
+/// Durable references for a `CreateThread` idempotency record.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CreateThreadResult {
+    thread_id: String,
+}
+
+/// Durable references for a `ForkThread` idempotency record.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ForkThreadResult {
+    /// Source thread id the original call forked from.
     source_thread_id: String,
-    /// Fork-point turn from the original call. A retry that targets
-    /// a different turn under the same `request_id` is also rejected
-    /// — the server-minted thread on the original call captured
-    /// state at the original turn boundary, and silently aliasing
-    /// would expose two divergent histories under one id.
+    /// Fork-point turn from the original call.
     fork_after_committed_turns: u32,
     /// The thread id minted by the original call. Returned verbatim on
     /// any retry so clients can treat `ForkThread` as
@@ -112,9 +107,9 @@ struct ForkThreadRecord {
     new_thread_id: String,
 }
 
-#[derive(Clone)]
-struct DecideConfirmationRecord {
-    fingerprint: Vec<u8>,
+/// Durable references for a `DecideConfirmation` idempotency record.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DecideConfirmationResult {
     task_id: String,
     parent_task_id: Option<String>,
 }
@@ -126,16 +121,17 @@ struct GrpcShared {
     health: Arc<HealthSurface>,
     shutdown: CancellationToken,
     lease_duration: time::Duration,
-    idempotency: Arc<Mutex<IdempotencyState>>,
+    admission: AdmissionConfig,
 }
 
 impl GrpcShared {
-    fn new(
+    const fn new(
         stores: StoreRegistry,
         runtime: Arc<ExecutionRuntime>,
         health: Arc<HealthSurface>,
         shutdown: CancellationToken,
         lease_duration: time::Duration,
+        admission: AdmissionConfig,
     ) -> Self {
         Self {
             stores,
@@ -143,7 +139,7 @@ impl GrpcShared {
             health,
             shutdown,
             lease_duration,
-            idempotency: Arc::new(Mutex::new(IdempotencyState::default())),
+            admission,
         }
     }
 
@@ -430,6 +426,35 @@ impl GrpcShared {
         }
         Ok(())
     }
+
+    /// Reject an oversized `SubmitThreadWork` input set with a clean
+    /// `INVALID_ARGUMENT` (Phase 10 · E). Both an aggregate cap and a
+    /// per-item cap are enforced so a single huge inline attachment, or
+    /// a flood of medium items, is bounded before anything is stored.
+    fn check_submit_input_size(&self, input: &[pb::UserInputItem]) -> Result<(), Status> {
+        let mut total: usize = 0;
+        for (index, item) in input.iter().enumerate() {
+            let item_len = item.encoded_len();
+            if let Some(item_cap) = self.admission.max_submit_item_bytes
+                && item_len > item_cap
+            {
+                return Err(Status::invalid_argument(format!(
+                    "submit_thread_work input item {index} is {item_len} bytes, \
+                     exceeding the per-item limit of {item_cap} bytes"
+                )));
+            }
+            total = total.saturating_add(item_len);
+            if let Some(total_cap) = self.admission.max_submit_input_bytes
+                && total > total_cap
+            {
+                return Err(Status::invalid_argument(format!(
+                    "submit_thread_work input is at least {total} bytes, \
+                     exceeding the aggregate limit of {total_cap} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -684,7 +709,7 @@ impl GrpcControlService {
     /// stale point-in-time count.
     async fn replay_fork_thread_response(
         &self,
-        record: &ForkThreadRecord,
+        record: &ForkThreadResult,
     ) -> RpcResult<pb::ForkThreadResponse> {
         let new_thread_id = ThreadId::from_string(&record.new_thread_id);
         let message_count = self
@@ -731,48 +756,29 @@ impl GrpcControlService {
 
     async fn replay_decide_confirmation(
         &self,
-        request: &pb::DecideConfirmationRequest,
-        fingerprint: &[u8],
-    ) -> RpcResult<Option<pb::DecideConfirmationResponse>> {
-        let record = {
-            let idempotency = self.shared.idempotency.lock().await;
-            idempotency
-                .decide_confirmation
-                .get(&request.request_id)
-                .cloned()
-        };
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        if record.fingerprint != fingerprint {
-            return Err(
-                idempotency_conflict_status("DecideConfirmation", &request.request_id).into(),
-            );
-        }
-
+        record: &DecideConfirmationResult,
+    ) -> RpcResult<pb::DecideConfirmationResponse> {
         let task = self
             .shared
             .stores
             .task_store
-            .get(&AgentTaskId::from_string(record.task_id))
+            .get(&AgentTaskId::from_string(record.task_id.clone()))
             .await
             .map_err(internal_status("loading idempotent confirmation task"))?
             .ok_or_else(|| not_found_status("task", "idempotent confirmation result"))?;
-        let parent_task = match record.parent_task_id {
+        let parent_task = match &record.parent_task_id {
             Some(parent_task_id) => self
                 .shared
                 .stores
                 .task_store
-                .get(&AgentTaskId::from_string(parent_task_id))
+                .get(&AgentTaskId::from_string(parent_task_id.clone()))
                 .await
                 .map_err(internal_status("loading idempotent confirmation parent"))?,
             None => None,
         };
 
-        Ok(Some(
-            self.confirmation_response(&task, parent_task.as_ref())
-                .await?,
-        ))
+        self.confirmation_response(&task, parent_task.as_ref())
+            .await
     }
 
     async fn load_task_and_parent(
@@ -859,19 +865,38 @@ impl AgentControlService for GrpcControlService {
         let request = request.into_inner();
         require_request_id(&request.request_id)?;
 
-        let existing = {
-            let idempotency = self.shared.idempotency.lock().await;
-            idempotency.create_thread.get(&request.request_id).cloned()
-        };
-        if let Some(thread_id) = existing {
-            let response = pb::CreateThreadResponse {
-                thread: Some(
-                    self.shared
-                        .thread_view(&ThreadId::from_string(thread_id))
-                        .await?,
-                ),
-            };
-            return Ok(Response::new(response));
+        // CreateThread has no payload beyond the key, so the fingerprint
+        // is empty. Durable dedup survives restart (Phase 10 · E).
+        let fingerprint: &[u8] = &[];
+        match self
+            .shared
+            .stores
+            .task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::CreateThread,
+                fingerprint,
+            )
+            .await
+            .map_err(internal_status("create-thread idempotency lookup"))?
+        {
+            IdempotencyClaim::Conflict => {
+                return Err(idempotency_conflict_status(
+                    "CreateThread",
+                    &request.request_id,
+                ));
+            }
+            IdempotencyClaim::Replay(record) => {
+                let result: CreateThreadResult = decode_idempotency_result(&record.result_json)?;
+                return Ok(Response::new(pb::CreateThreadResponse {
+                    thread: Some(
+                        self.shared
+                            .thread_view(&ThreadId::from_string(result.thread_id))
+                            .await?,
+                    ),
+                }));
+            }
+            IdempotencyClaim::Fresh => {}
         }
 
         let now = OffsetDateTime::now_utc();
@@ -889,12 +914,25 @@ impl AgentControlService for GrpcControlService {
             .await
             .map_err(internal_status("creating message projection"))?;
 
-        {
-            let mut idempotency = self.shared.idempotency.lock().await;
-            idempotency
-                .create_thread
-                .insert(request.request_id, thread_id.0.clone());
-        }
+        let result_json = serde_json::to_value(CreateThreadResult {
+            thread_id: thread_id.0.clone(),
+        })
+        .map_err(|error| {
+            Status::internal(format!(
+                "encoding create-thread idempotency result: {error}"
+            ))
+        })?;
+        self.shared
+            .stores
+            .task_store
+            .record_idempotency(IdempotencyRecord {
+                request_id: request.request_id,
+                kind: IdempotencyKind::CreateThread,
+                fingerprint: fingerprint.to_vec(),
+                result_json,
+            })
+            .await
+            .map_err(internal_status("recording create-thread idempotency"))?;
 
         Ok(Response::new(pb::CreateThreadResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
@@ -977,33 +1015,19 @@ impl AgentControlService for GrpcControlService {
         let request = request.into_inner();
         require_request_id(&request.request_id)?;
         let thread_id = parse_thread_id(&request.thread_id)?;
-        let fingerprint = submit_work_fingerprint(&request);
 
-        if let Some(record) = {
-            let idempotency = self.shared.idempotency.lock().await;
-            idempotency.submit_work.get(&request.request_id).cloned()
-        } {
-            if record.fingerprint != fingerprint || record.thread_id != request.thread_id {
-                return Err(idempotency_conflict_status(
-                    "SubmitThreadWork",
-                    &request.request_id,
-                ));
-            }
-
-            let task = self
-                .shared
-                .stores
-                .task_store
-                .get(&AgentTaskId::from_string(record.task_id))
-                .await
-                .map_err(internal_status("loading idempotent submitted task"))?
-                .ok_or_else(|| not_found_status("task", "idempotent submit result"))?;
-
-            return Ok(Response::new(pb::SubmitThreadWorkResponse {
-                thread: Some(self.shared.thread_view(&thread_id).await?),
-                task: Some(self.shared.task_snapshot(&task).await?),
-            }));
+        if request.input.is_empty() {
+            return Err(Status::invalid_argument(
+                "submit_thread_work requires at least one input item",
+            ));
         }
+
+        // Reject oversized input with a clean INVALID_ARGUMENT before
+        // doing any durable work, rather than silently truncating or
+        // letting a multi-MB attachment land inline in the journal.
+        self.shared.check_submit_input_size(&request.input)?;
+
+        let fingerprint = submit_work_fingerprint(&request);
 
         let thread = self.shared.require_thread(&thread_id).await?;
         if thread.status.is_completed() {
@@ -1013,12 +1037,6 @@ impl AgentControlService for GrpcControlService {
             )));
         }
 
-        if request.input.is_empty() {
-            return Err(Status::invalid_argument(
-                "submit_thread_work requires at least one input item",
-            ));
-        }
-
         let submitted_input = request
             .input
             .iter()
@@ -1026,8 +1044,14 @@ impl AgentControlService for GrpcControlService {
             .collect::<Result<Vec<_>, _>>()?;
 
         let now = OffsetDateTime::now_utc();
+        // Resolve the agent definition from a throwaway template. The
+        // registry resolves on task identity (kind + thread), so the
+        // template's retry budget is irrelevant — but we seed it with
+        // the reconciled root default so the template can never carry a
+        // budget that would fail-closed if it were ever submitted
+        // directly (Phase 10 · E).
         let submission_template =
-            AgentTask::new_root_turn(thread_id.clone(), now, AgentTask::DEFAULT_MAX_ATTEMPTS);
+            AgentTask::new_root_turn(thread_id.clone(), now, AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS);
         let definition = self
             .shared
             .stores
@@ -1043,29 +1067,40 @@ impl AgentControlService for GrpcControlService {
             now,
             definition.policy.max_attempts,
         );
-        let task = self
+
+        // The idempotency claim + queue-depth cap + admission all run in
+        // one store transaction so a retried (restart-surviving) request
+        // produces exactly one root turn (no TOCTOU).
+        let result_json = serde_json::to_value(SubmitWorkResult {
+            thread_id: thread_id.0.clone(),
+            task_id: task.id.to_string(),
+        })
+        .map_err(|error| {
+            Status::internal(format!("encoding submit idempotency result: {error}"))
+        })?;
+
+        let outcome = self
             .shared
             .stores
             .task_store
-            .submit_root_turn(task)
-            .await
-            .map_err(internal_status("submitting root turn"))?;
-
-        {
-            let mut idempotency = self.shared.idempotency.lock().await;
-            idempotency.submit_work.insert(
-                request.request_id,
-                SubmitWorkRecord {
+            .submit_root_turn_idempotent(SubmitRootTurnParams {
+                task,
+                idempotency: Some(SubmitRootIdempotency {
+                    request_id: request.request_id.clone(),
                     fingerprint,
-                    thread_id: thread_id.0.clone(),
-                    task_id: task.id.to_string(),
-                },
-            );
-        }
+                    result_json,
+                }),
+                max_queued_depth: self.shared.admission.max_queued_roots_per_thread,
+            })
+            .await
+            .map_err(|error| {
+                map_submit_root_error("SubmitThreadWork", &request.request_id, error)
+            })?;
 
         Ok(Response::new(pb::SubmitThreadWorkResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
-            task: Some(self.shared.task_snapshot(&task).await?),
+            task: Some(self.shared.task_snapshot(&outcome.task).await?),
+            current_queue_depth: outcome.queued_depth,
         }))
     }
 
@@ -1077,26 +1112,38 @@ impl AgentControlService for GrpcControlService {
         require_request_id(&request.request_id)?;
         let source_thread_id = parse_thread_id(&request.source_thread_id)?;
         let fork_after = request.fork_after_committed_turns;
+        let fingerprint = fork_thread_fingerprint(&request);
 
         // Idempotency replay. A retry under the same request_id must
         // return the originally-minted thread (with whatever counts
         // the source has *now*). A retry against a different source
-        // OR a different fork point is a contract violation — surface
-        // it explicitly rather than silently aliasing.
-        if let Some(record) = {
-            let idempotency = self.shared.idempotency.lock().await;
-            idempotency.fork_thread.get(&request.request_id).cloned()
-        } {
-            if record.source_thread_id != request.source_thread_id
-                || record.fork_after_committed_turns != fork_after
-            {
+        // OR a different fork point is a contract violation — the
+        // fingerprint guard rejects it with ALREADY_EXISTS. Durable so
+        // a retry survives restart (Phase 10 · E).
+        match self
+            .shared
+            .stores
+            .task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::ForkThread,
+                &fingerprint,
+            )
+            .await
+            .map_err(internal_status("fork-thread idempotency lookup"))?
+        {
+            IdempotencyClaim::Conflict => {
                 return Err(idempotency_conflict_status(
                     "ForkThread",
                     &request.request_id,
                 ));
             }
-            let response = self.replay_fork_thread_response(&record).await?;
-            return Ok(Response::new(response));
+            IdempotencyClaim::Replay(record) => {
+                let result: ForkThreadResult = decode_idempotency_result(&record.result_json)?;
+                let response = self.replay_fork_thread_response(&result).await?;
+                return Ok(Response::new(response));
+            }
+            IdempotencyClaim::Fresh => {}
         }
 
         // The source must exist before we mint anything. NOT_FOUND
@@ -1116,17 +1163,25 @@ impl AgentControlService for GrpcControlService {
             .copy_thread_state(&source_thread_id, &new_thread_id, fork_after, now)
             .await?;
 
-        {
-            let mut idempotency = self.shared.idempotency.lock().await;
-            idempotency.fork_thread.insert(
-                request.request_id,
-                ForkThreadRecord {
-                    source_thread_id: request.source_thread_id.clone(),
-                    fork_after_committed_turns: fork_after,
-                    new_thread_id: new_thread_id.0.clone(),
-                },
-            );
-        }
+        let result_json = serde_json::to_value(ForkThreadResult {
+            source_thread_id: request.source_thread_id.clone(),
+            fork_after_committed_turns: fork_after,
+            new_thread_id: new_thread_id.0.clone(),
+        })
+        .map_err(|error| {
+            Status::internal(format!("encoding fork-thread idempotency result: {error}"))
+        })?;
+        self.shared
+            .stores
+            .task_store
+            .record_idempotency(IdempotencyRecord {
+                request_id: request.request_id.clone(),
+                kind: IdempotencyKind::ForkThread,
+                fingerprint,
+                result_json,
+            })
+            .await
+            .map_err(internal_status("recording fork-thread idempotency"))?;
 
         Ok(Response::new(pb::ForkThreadResponse {
             thread: Some(self.shared.thread_view(&new_thread_id).await?),
@@ -1147,28 +1202,60 @@ impl AgentControlService for GrpcControlService {
         let task_id = parse_task_id(&request.task_id)?;
         let fingerprint = decide_confirmation_fingerprint(&request);
 
-        if let Some(response) = self
-            .replay_decide_confirmation(&request, &fingerprint)
-            .await?
+        // Durable idempotency replay (Phase 10 · E): a retried decision
+        // — even across a restart — applies the decision exactly once.
+        match self
+            .shared
+            .stores
+            .task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::DecideConfirmation,
+                &fingerprint,
+            )
+            .await
+            .map_err(internal_status("decide-confirmation idempotency lookup"))?
         {
-            return Ok(Response::new(response));
+            IdempotencyClaim::Conflict => {
+                return Err(idempotency_conflict_status(
+                    "DecideConfirmation",
+                    &request.request_id,
+                ));
+            }
+            IdempotencyClaim::Replay(record) => {
+                let result: DecideConfirmationResult =
+                    decode_idempotency_result(&record.result_json)?;
+                return Ok(Response::new(
+                    self.replay_decide_confirmation(&result).await?,
+                ));
+            }
+            IdempotencyClaim::Fresh => {}
         }
 
         let (task, parent_task) = self
             .run_confirmation_decision(&request, &thread_id, &task_id)
             .await?;
 
-        {
-            let mut idempotency = self.shared.idempotency.lock().await;
-            idempotency.decide_confirmation.insert(
-                request.request_id,
-                DecideConfirmationRecord {
-                    fingerprint,
-                    task_id: task.id.to_string(),
-                    parent_task_id: parent_task.as_ref().map(|parent| parent.id.to_string()),
-                },
-            );
-        }
+        let result_json = serde_json::to_value(DecideConfirmationResult {
+            task_id: task.id.to_string(),
+            parent_task_id: parent_task.as_ref().map(|parent| parent.id.to_string()),
+        })
+        .map_err(|error| {
+            Status::internal(format!(
+                "encoding decide-confirmation idempotency result: {error}"
+            ))
+        })?;
+        self.shared
+            .stores
+            .task_store
+            .record_idempotency(IdempotencyRecord {
+                request_id: request.request_id,
+                kind: IdempotencyKind::DecideConfirmation,
+                fingerprint,
+                result_json,
+            })
+            .await
+            .map_err(internal_status("recording decide-confirmation idempotency"))?;
 
         Ok(Response::new(
             self.confirmation_response(&task, parent_task.as_ref())
@@ -1469,6 +1556,27 @@ impl GrpcTransport {
         shutdown: CancellationToken,
         lease_duration: time::Duration,
     ) -> Self {
+        Self::with_admission(
+            stores,
+            runtime,
+            health,
+            shutdown,
+            lease_duration,
+            AdmissionConfig::default(),
+        )
+    }
+
+    /// Like [`Self::new`] but with explicit admission back-pressure and
+    /// input-size limits (Phase 10 · E).
+    #[must_use]
+    pub fn with_admission(
+        stores: StoreRegistry,
+        runtime: Arc<ExecutionRuntime>,
+        health: Arc<HealthSurface>,
+        shutdown: CancellationToken,
+        lease_duration: time::Duration,
+        admission: AdmissionConfig,
+    ) -> Self {
         Self {
             shared: Arc::new(GrpcShared::new(
                 stores,
@@ -1476,6 +1584,7 @@ impl GrpcTransport {
                 health,
                 shutdown,
                 lease_duration,
+                admission,
             )),
         }
     }
@@ -1549,9 +1658,16 @@ impl GrpcTransport {
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
             .tcp_keepalive(Some(std::time::Duration::from_mins(1)));
 
+        // Bound the transport-level decode buffer so an oversized frame
+        // is rejected before it is fully decoded into memory (Phase 10 ·
+        // E). The application-level input-size check returns a cleaner
+        // INVALID_ARGUMENT for normal payloads; this is the hard ceiling.
+        let control_server = AgentControlServiceServer::new(control_service)
+            .max_decoding_message_size(self.shared.admission.max_decoding_message_bytes);
+
         server
             .add_service(health_service)
-            .add_service(AgentControlServiceServer::new(control_service))
+            .add_service(control_server)
             .add_service(AgentEventServiceServer::new(event_service))
             .serve_with_incoming_shutdown(
                 TcpListenerStream::new(listener),
@@ -1594,12 +1710,13 @@ impl LocalDaemon {
             .context("creating daemon host")?;
         let health = Arc::clone(host.health());
         let shutdown = host.shutdown_token();
-        let grpc = GrpcTransport::new(
+        let grpc = GrpcTransport::with_admission(
             stores,
             runtime,
             health,
             shutdown.clone(),
             config.worker.lease_duration(),
+            config.admission.clone(),
         );
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1691,10 +1808,36 @@ fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
     ))
 }
 
+/// Map a transactional [`SubmitRootTurnError`] onto the gRPC status the
+/// caller should see.
+fn map_submit_root_error(method: &str, request_id: &str, error: SubmitRootTurnError) -> Status {
+    match error {
+        SubmitRootTurnError::IdempotencyConflict => idempotency_conflict_status(method, request_id),
+        SubmitRootTurnError::QueueDepthExceeded { cap, current_depth } => {
+            Status::resource_exhausted(format!(
+                "thread queued-root depth {current_depth} reached the configured cap {cap}; \
+                 retry after in-flight roots drain"
+            ))
+        }
+        SubmitRootTurnError::Other(error) => {
+            Status::internal(format!("submitting root turn: {error:#}"))
+        }
+    }
+}
+
 fn submit_work_fingerprint(request: &pb::SubmitThreadWorkRequest) -> Vec<u8> {
     let mut request = request.clone();
     request.request_id.clear();
     request.encode_to_vec()
+}
+
+/// Decode the durable references stored in an idempotency record's
+/// `result_json` into the operation-specific result struct.
+fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
+    result_json: &serde_json::Value,
+) -> Result<T, Status> {
+    serde_json::from_value(result_json.clone())
+        .map_err(|error| Status::internal(format!("decoding stored idempotency result: {error}")))
 }
 
 /// Return the cumulative `total_turns` count carried by a `Done`
@@ -1792,6 +1935,12 @@ fn rewrite_state_snapshot_thread_id(
 }
 
 fn decide_confirmation_fingerprint(request: &pb::DecideConfirmationRequest) -> Vec<u8> {
+    let mut request = request.clone();
+    request.request_id.clear();
+    request.encode_to_vec()
+}
+
+fn fork_thread_fingerprint(request: &pb::ForkThreadRequest) -> Vec<u8> {
     let mut request = request.clone();
     request.request_id.clear();
     request.encode_to_vec()
@@ -4098,6 +4247,117 @@ mod tests {
                 })
                 .await
                 .expect_err("forking past committed_turns must reject");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    // ── Phase 10 · E: idempotency + back-pressure + input limits ─────
+
+    /// A retried `SubmitThreadWork` under the same `request_id` returns
+    /// the originally-admitted task (durable dedup) and surfaces the
+    /// queue depth in the response.
+    #[tokio::test]
+    async fn submit_thread_work_is_idempotent_under_same_request_id() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response("r", "ok")])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread = create_thread(&mut control, "idem-create").await?;
+
+            let first = control
+                .submit_thread_work(pb::SubmitThreadWorkRequest {
+                    request_id: "idem-submit".into(),
+                    thread_id: thread.clone(),
+                    input: vec![text_input("hello")],
+                })
+                .await
+                .context("first submit")?
+                .into_inner();
+            let first_task = first.task.context("first task")?;
+
+            // A retry with the same request_id + payload returns the
+            // same task id without admitting a second root.
+            let retry = control
+                .submit_thread_work(pb::SubmitThreadWorkRequest {
+                    request_id: "idem-submit".into(),
+                    thread_id: thread.clone(),
+                    input: vec![text_input("hello")],
+                })
+                .await
+                .context("retry submit")?
+                .into_inner();
+            let retry_task = retry.task.context("retry task")?;
+            assert_eq!(
+                retry_task.task_id, first_task.task_id,
+                "retry replays original"
+            );
+
+            // A retry with a *different* payload under the same key is a
+            // conflict, not a silent alias.
+            let conflict = control
+                .submit_thread_work(pb::SubmitThreadWorkRequest {
+                    request_id: "idem-submit".into(),
+                    thread_id: thread.clone(),
+                    input: vec![text_input("different")],
+                })
+                .await
+                .expect_err("payload change under same key must conflict");
+            assert_eq!(conflict.code(), tonic::Code::AlreadyExists, "{conflict:?}");
+            Ok(())
+        }
+        .await;
+
+        daemon.stop().await?;
+        result
+    }
+
+    /// Oversized input returns a clean `INVALID_ARGUMENT`, not a
+    /// transport failure or OOM.
+    #[tokio::test]
+    async fn submit_thread_work_rejects_oversized_input() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response("r", "ok")])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        // Tighten the per-item cap so the test payload stays small.
+        let config = ServiceConfig {
+            admission: crate::config::AdmissionConfig {
+                max_submit_item_bytes: Some(64),
+                max_submit_input_bytes: Some(128),
+                ..crate::config::AdmissionConfig::default()
+            },
+            ..ServiceConfig::default()
+        };
+        let daemon = LocalDaemon::start(config, registry, runtime).await?;
+
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread = create_thread(&mut control, "big-create").await?;
+
+            let huge = "x".repeat(256);
+            let err = control
+                .submit_thread_work(pb::SubmitThreadWorkRequest {
+                    request_id: "big-submit".into(),
+                    thread_id: thread.clone(),
+                    input: vec![text_input(&huge)],
+                })
+                .await
+                .expect_err("oversized input must reject");
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
             Ok(())
         }
