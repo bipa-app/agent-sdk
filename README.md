@@ -152,47 +152,50 @@ setup walkthrough.
 
 ## Quick Start
 
+Build an agent, run a prompt, and read the reply from the agent's event store.
+The agent loop writes every [`AgentEvent`] to the configured `EventStore`; you
+read them back once the run completes (or wrap the store to observe them live —
+see the [`streaming`](crates/agent-sdk/examples/streaming.rs) example).
+
 ```rust
+use std::sync::Arc;
 use agent_sdk::{
-    builder, AgentEvent, AgentInput, CancellationToken, ThreadId, ToolContext,
-    providers::AnthropicProvider,
+    builder, AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
+    ThreadId, ToolContext, providers::AnthropicProvider,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Get your API key from the environment
+    // Read your API key from the environment.
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
 
-    // Build an agent with the Anthropic provider
-    // The ::<()> specifies no custom context type (see "Custom Context" below)
+    // Build an agent with the Anthropic provider.
+    // `::<()>` means "no custom tool context" (see "Custom Context" below).
+    let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
+        .event_store(event_store.clone())
         .build();
 
-    // Each conversation gets a unique thread ID
+    // Each conversation gets a unique thread id.
     let thread_id = ThreadId::new();
 
-    // ToolContext can carry custom data to your tools (empty here)
-    let tool_ctx = ToolContext::new(());
-
-    // Run the agent and get a stream of events plus final state
-    let (mut events, _final_state) = agent.run(
-        thread_id,
+    // Run the agent; await the final run state.
+    let final_state = agent.run(
+        thread_id.clone(),
         AgentInput::Text("What is the capital of France?".to_string()),
-        tool_ctx,
+        ToolContext::new(()),
         CancellationToken::new(),
     );
+    let _ = final_state.await?;
 
-    // Process events as they arrive
-    while let Some(envelope) = events.recv().await {
+    // Read the persisted events.
+    for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {
-            AgentEvent::Text {
-                message_id: _,
-                text,
-            } => print!("{text}"),
+            AgentEvent::Text { text, .. } => print!("{text}"),
             AgentEvent::Done { .. } => break,
             AgentEvent::Error { message, .. } => eprintln!("Error: {message}"),
-            _ => {} // Other events: ToolCallStart, ToolCallEnd, etc.
+            _ => {} // ToolCallStart, ToolCallEnd, TextDelta, etc.
         }
     }
 
@@ -200,11 +203,43 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Examples
+This Quickstart talks to Anthropic and needs `ANTHROPIC_API_KEY`. The same code
+is exercised by a **keyless doctest** in the crate root (it swaps in a tiny stub
+provider so `cargo test --doc` compiles and runs the flow with no network and no
+key); see the "Quick Start" `rustdoc` example in
+[`crates/agent-sdk/src/lib.rs`](crates/agent-sdk/src/lib.rs).
 
-From an authorized checkout, run the examples from the repository root:
+### Try it from the CLI
+
+The `agent-sdk` binary can run an agent directly — no code required:
 
 ```bash
+# Single prompt, streamed to stdout
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk-cli -- run "Explain Rust ownership in two sentences."
+
+# Interactive chat (keeps conversation history for the session)
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk-cli -- chat
+```
+
+`agent-sdk run`/`chat` build an Anthropic-backed agent, read the key from
+`ANTHROPIC_API_KEY`, and stream the reply as it arrives. The CLI also keeps the
+`local-langfuse` and `doctor` subcommands.
+
+## Examples
+
+From an authorized checkout, run the examples from the repository root. The
+first three are the quickstart trio referenced above:
+
+```bash
+# Stream the reply to stdout token-by-token
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example streaming
+
+# Full tool round-trip: model calls a tool, gets the result, answers
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example tool_round_trip
+
+# Connect to an external MCP server (stdio) and use its tools
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example mcp_filesystem
+
 # Basic conversation (no tools)
 ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example basic_agent
 

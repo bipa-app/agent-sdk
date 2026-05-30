@@ -29,35 +29,101 @@
 //! [`ask`](AgentLoop::ask) builds the [`ToolContext`] and [`CancellationToken`]
 //! internally and returns the assembled assistant text. When you need
 //! application context, a confirmation flow, explicit cancellation, or the raw
-//! [`AgentRunState`], drop down to [`run`](AgentLoop::run):
+//! [`AgentRunState`], drop down to [`run`](AgentLoop::run). The runnable example
+//! below uses a tiny stub provider so it compiles **and runs** under
+//! `cargo test --doc` with no network and no API key:
 //!
-//! ```no_run
+//! ```
+//! use std::sync::Arc;
 //! use agent_sdk::{
 //!     builder, AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
-//!     ThreadId, ToolContext, providers::AnthropicProvider,
+//!     ThreadId, ToolContext,
 //! };
-//! use std::sync::Arc;
+//! use agent_sdk::llm::{
+//!     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StopReason, Usage,
+//! };
+//! use async_trait::async_trait;
+//!
+//! // A stub provider that always replies with a fixed line. Keeps the
+//! // quickstart key-free and offline. Swap for `AnthropicProvider` (below)
+//! // for real conversations.
+//! struct StubProvider;
+//!
+//! #[async_trait]
+//! impl LlmProvider for StubProvider {
+//!     async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatOutcome> {
+//!         Ok(ChatOutcome::Success(ChatResponse {
+//!             id: "stub".to_string(),
+//!             content: vec![ContentBlock::Text { text: "Paris.".to_string() }],
+//!             model: self.model().to_string(),
+//!             stop_reason: Some(StopReason::EndTurn),
+//!             usage: Usage {
+//!                 input_tokens: 0,
+//!                 output_tokens: 0,
+//!                 cached_input_tokens: 0,
+//!                 cache_creation_input_tokens: 0,
+//!             },
+//!         }))
+//!     }
+//!     fn model(&self) -> &str { "stub-model" }
+//!     fn provider(&self) -> &'static str { "stub" }
+//! }
 //!
 //! # async fn example() -> anyhow::Result<()> {
+//! // 1. Build the agent.
 //! let event_store = Arc::new(InMemoryEventStore::new());
 //! let agent = builder::<()>()
-//!     .provider(AnthropicProvider::from_env())
+//!     .provider(StubProvider)
 //!     .event_store(event_store.clone())
 //!     .build();
 //!
+//! // 2. Run a conversation.
 //! let thread_id = ThreadId::new();
 //! let final_state = agent.run(
 //!     thread_id.clone(),
-//!     AgentInput::Text("Hello!".to_string()),
+//!     AgentInput::Text("What is the capital of France?".to_string()),
 //!     ToolContext::new(()),
 //!     CancellationToken::new(),
-//! ).await?;
+//! );
+//! let _ = final_state.await?;
 //!
+//! // 3. Read persisted events.
+//! let mut reply = String::new();
 //! for envelope in event_store.get_events(&thread_id).await? {
-//!     if let AgentEvent::Text { text, .. } = envelope.event {
-//!         print!("{text}");
+//!     match envelope.event {
+//!         AgentEvent::Text { text, .. } => reply.push_str(&text),
+//!         AgentEvent::Done { .. } => break,
+//!         _ => {}
 //!     }
 //! }
+//! assert_eq!(reply, "Paris.");
+//! # Ok(())
+//! # }
+//! # tokio::runtime::Builder::new_current_thread()
+//! #     .enable_all()
+//! #     .build()
+//! #     .unwrap()
+//! #     .block_on(example())
+//! #     .unwrap();
+//! ```
+//!
+//! ### Run with a real key
+//!
+//! For a live conversation, depend on the `anthropic` provider and read your
+//! key from the environment — the only change is the provider line:
+//!
+//! ```no_run
+//! use agent_sdk::{builder, InMemoryEventStore, providers::AnthropicProvider};
+//! use std::sync::Arc;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+//! let event_store = Arc::new(InMemoryEventStore::new());
+//! let agent = builder::<()>()
+//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .event_store(event_store)
+//!     .build();
+//! # let _ = agent;
 //! # Ok(())
 //! # }
 //! ```
