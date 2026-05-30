@@ -21,13 +21,75 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features
 
   test:
-    name: Test
+    name: Test (nextest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - uses: taiki-e/install-action@nextest
+      # nextest runs every test in its own process (required for the
+      # `failpoints` feature) and the `ci` profile surfaces flaky retries
+      # and writes a JUnit report. This does NOT need a database: the
+      # Postgres-backed tests early-return (or are `#[ignore]`'d) without
+      # TEST_DATABASE_URL — they run in the dedicated `postgres` job below.
+      - run: cargo nextest run --workspace --all-features --profile ci
+
+  postgres:
+    name: Postgres integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: agent_sdk
+          POSTGRES_USER: agent_sdk
+          POSTGRES_PASSWORD: agent_sdk
+        ports:
+          - 5432:5432
+        # Wait until Postgres is accepting connections before any step runs.
+        options: >-
+          --health-cmd "pg_isready -U agent_sdk -d agent_sdk"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # The host store + host-level integration tests read TEST_DATABASE_URL
+      # (falling back to DATABASE_URL). Point both at the service container.
+      DATABASE_URL: postgres://agent_sdk:agent_sdk@127.0.0.1:5432/agent_sdk
+      TEST_DATABASE_URL: postgres://agent_sdk:agent_sdk@127.0.0.1:5432/agent_sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+      # Migration check: apply the Postgres migrations against the live
+      # service DB and ensure they're a no-op on re-run (idempotent).
+      # SQLX_OFFLINE=false so sqlx talks to the real DB. This is the CI
+      # equivalent of `scripts/postgres18-dev.sh test-migrations` — the
+      # script uses `database reset` because it owns a throwaway local
+      # docker DB; CI uses `migrate run` because the service DB already
+      # exists and is created/owned by the Postgres container.
+      - name: Apply migrations
+        env:
+          SQLX_OFFLINE: "false"
+        run: |
+          cargo sqlx migrate run --source crates/agent-service-host/migrations/postgres
+          cargo sqlx migrate run --source crates/agent-service-host/migrations/postgres
+      # Run the previously-skipped Postgres tests against the live DB. With
+      # TEST_DATABASE_URL set, the store tests exercise real FOR UPDATE /
+      # SKIP LOCKED / txn-atomicity paths, and `--run-ignored all` also runs
+      # the `#[ignore = "requires TEST_DATABASE_URL"]` host integration tests.
+      # `otel` is required because the host integration test files are
+      # `#![cfg(feature = "otel")]`-gated; without it they compile out and
+      # the ignored DB tests would silently not exist. The `db` nextest
+      # test-group serializes these so they don't race on the shared DB.
+      - name: Run Postgres-backed tests
+        run: >-
+          cargo nextest run --profile ci -p agent-service-host
+          --features postgres,otel --run-ignored all
 
   clippy:
     name: Clippy

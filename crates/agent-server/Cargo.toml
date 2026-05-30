@@ -27,6 +27,7 @@ uuid = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
+fail = { workspace = true, optional = true }
 
 [features]
 # Exposes in-crate test doubles (e.g. `CapturingThreadEventsWatchHandler`)
@@ -35,6 +36,13 @@ test-support = []
 # Compiles the `observability` module and wires every metric emit-site.
 # Default builds remain dependency-free.
 otel = ["dep:opentelemetry"]
+# Crash-injection failpoints (tikv `fail-rs`). When OFF (the default), the
+# `fail_point!` call sites in the durable commit path compile to nothing and
+# `fail-rs` is not even a dependency — production builds are zero-cost. When
+# ON, `dep:fail` is pulled in with its own `failpoints` feature so injected
+# panics/returns fire. Tests that exercise this MUST run under nextest, which
+# isolates each test in its own process (the `fail-rs` registry is global).
+failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

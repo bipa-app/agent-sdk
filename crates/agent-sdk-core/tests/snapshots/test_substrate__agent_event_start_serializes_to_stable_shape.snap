@@ -1,0 +1,9 @@
+---
+source: crates/agent-sdk-core/tests/test_substrate.rs
+expression: event
+---
+{
+  "type": "start",
+  "thread_id": "thread-fixture-001",
+  "turn": 1
+}

@@ -117,6 +117,9 @@
 
 #![forbid(unsafe_code)]
 
+#[macro_use]
+pub mod failpoints;
+
 pub mod journal;
 #[cfg(feature = "otel")]
 pub mod observability;
