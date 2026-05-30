@@ -4,9 +4,63 @@ use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{ChatResponse, Content, ContentBlock, Message, Role};
 use crate::stores::EventStore;
-use crate::types::{AgentError, PendingToolCallInfo, RetryConfig, ThreadId};
+use crate::types::{AgentError, PendingToolCallInfo, RetryConfig, ThreadId, ToolResult};
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Render a caught panic payload (`Box<dyn Any>`) as a human-readable
+/// string.
+///
+/// `std::panic`/`catch_unwind` hand back the payload that `panic!`
+/// produced. The standard library only guarantees the common cases —
+/// a `&'static str` (from `panic!("literal")`) or a `String` (from
+/// `panic!("{}", x)` / `.expect(...)`). Anything else (a custom
+/// `panic_any`) falls back to a stable placeholder so the message is
+/// never empty.
+pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
+/// Run a tool's execution future under [`catch_unwind`], converting an
+/// unwinding panic into a structured error [`ToolResult`] instead of
+/// letting it tear down the whole run task.
+///
+/// A buggy tool that panics (an `unwrap()` on `None`, an index out of
+/// bounds, …) would otherwise unwind the spawned run task, drop
+/// `state_tx`, and leave the assistant `tool_use` orphaned. By catching
+/// the panic here — *inside* the `execute_with_idempotency` closure —
+/// the synthesised error result still flows through the normal
+/// completion path (idempotency commit + `tool_call_end` event +
+/// `append_tool_results`), so the `tool_use` / `tool_result` pair stays
+/// balanced.
+///
+/// `AssertUnwindSafe` is sound here: the future borrows shared state
+/// (`ToolContext`, stores) only through `&`/`Arc`, and the SDK never
+/// observes tool-local state after a panic — the only value produced is
+/// the returned `ToolResult`. A panicking tool that left its *own*
+/// interior-mutable state torn is the tool's contract to uphold; the
+/// SDK simply records the failure and moves on.
+pub(super) async fn catch_tool_panic<Fut>(execute: Fut) -> Result<ToolResult, AgentError>
+where
+    Fut: std::future::Future<Output = Result<ToolResult, AgentError>>,
+{
+    match AssertUnwindSafe(execute).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_payload_message(payload.as_ref());
+            log::error!("tool execution panicked: {message}");
+            Ok(ToolResult::error(format!("Tool panicked: {message}")))
+        }
+    }
+}
 
 /// Saturating conversion from usize to u32.
 pub(super) fn turns_to_u32(turns: usize) -> u32 {

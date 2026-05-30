@@ -4,7 +4,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use super::helpers::{millis_to_u64, send_event, wrap_and_send};
+use super::helpers::{catch_tool_panic, millis_to_u64, send_event, wrap_and_send};
 use super::idempotency::{execute_with_idempotency, try_get_cached_result};
 use super::listen::{
     ListenWaitError, build_listen_confirmation_input, cancel_listen_with_warning,
@@ -491,8 +491,11 @@ where
     H: AgentHooks,
 {
     let tier = listen_tool.tier();
-    let result =
-        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+    let result = match execute_with_idempotency(
+        ctx.execution_store,
+        pending,
+        ctx.thread_id,
+        catch_tool_panic(async {
             Ok(
                 match listen_tool
                     .execute(ctx.tool_context, &ready.operation_id, ready.revision)
@@ -506,26 +509,27 @@ where
                         .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                 },
             )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                emit_audit(
-                    ctx.audit_sink,
-                    ctx.provenance,
-                    pending,
-                    tier,
-                    ctx.turn,
-                    ToolAuditOutcome::PersistenceFailed {
-                        result: None,
-                        error: error.message.clone(),
-                    },
-                )
-                .await;
-                return ToolExecutionOutcome::Error(error);
-            }
-        };
+        }),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_audit(
+                ctx.audit_sink,
+                ctx.provenance,
+                pending,
+                tier,
+                ctx.turn,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: None,
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+            return ToolExecutionOutcome::Error(error);
+        }
+    };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -881,8 +885,11 @@ where
     H: AgentHooks,
 {
     let tier = async_tool.tier();
-    let result =
-        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+    let result = match execute_with_idempotency(
+        ctx.execution_store,
+        pending,
+        ctx.thread_id,
+        catch_tool_panic(async {
             execute_async_tool(AsyncToolExecutionParams {
                 pending,
                 tool: async_tool,
@@ -895,26 +902,27 @@ where
                 tool_span: Some(tool_span),
             })
             .await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                emit_audit(
-                    ctx.audit_sink,
-                    ctx.provenance,
-                    pending,
-                    tier,
-                    ctx.turn,
-                    ToolAuditOutcome::PersistenceFailed {
-                        result: None,
-                        error: error.message.clone(),
-                    },
-                )
-                .await;
-                return ToolExecutionOutcome::Error(error);
-            }
-        };
+        }),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_audit(
+                ctx.audit_sink,
+                ctx.provenance,
+                pending,
+                tier,
+                ctx.turn,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: None,
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+            return ToolExecutionOutcome::Error(error);
+        }
+    };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -1005,34 +1013,38 @@ where
     let tier = tool.tier();
     let tool_start = Instant::now();
     let cancel = ctx.tool_context.cancel_token();
-    let result =
-        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+    let result = match execute_with_idempotency(
+        ctx.execution_store,
+        pending,
+        ctx.thread_id,
+        catch_tool_panic(async {
             Ok(run_with_cancel(
                 cancel,
                 tool_start,
                 tool.execute(ctx.tool_context, pending.input.clone()),
             )
             .await)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                emit_audit(
-                    ctx.audit_sink,
-                    ctx.provenance,
-                    pending,
-                    tier,
-                    ctx.turn,
-                    ToolAuditOutcome::PersistenceFailed {
-                        result: None,
-                        error: error.message.clone(),
-                    },
-                )
-                .await;
-                return ToolExecutionOutcome::Error(error);
-            }
-        };
+        }),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_audit(
+                ctx.audit_sink,
+                ctx.provenance,
+                pending,
+                tier,
+                ctx.turn,
+                ToolAuditOutcome::PersistenceFailed {
+                    result: None,
+                    error: error.message.clone(),
+                },
+            )
+            .await;
+            return ToolExecutionOutcome::Error(error);
+        }
+    };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -1532,7 +1544,7 @@ where
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            async {
+            catch_tool_panic(async {
                 Ok(
                     match listen_tool
                         .execute(ctx.tool_context, &listen.operation_id, listen.revision)
@@ -1547,7 +1559,7 @@ where
                             .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
                     },
                 )
-            },
+            }),
         )
         .await;
     }
@@ -1557,7 +1569,7 @@ where
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            async {
+            catch_tool_panic(async {
                 execute_async_tool(AsyncToolExecutionParams {
                     pending: awaiting_tool,
                     tool: async_tool,
@@ -1570,7 +1582,7 @@ where
                     tool_span: None,
                 })
                 .await
-            },
+            }),
         )
         .await;
     }
@@ -1582,14 +1594,14 @@ where
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            async {
+            catch_tool_panic(async {
                 Ok(run_with_cancel(
                     cancel,
                     tool_start,
                     tool.execute(ctx.tool_context, awaiting_tool.input.clone()),
                 )
                 .await)
-            },
+            }),
         )
         .await;
     }
