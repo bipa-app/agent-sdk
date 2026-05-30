@@ -397,6 +397,30 @@ impl ServiceHost {
                 );
             }
         }
+
+        // Phase 10 · D: on a durable (SQL) backend the completed-turn
+        // commit and task admission both write advisory outbox rows
+        // (`thread_events_available`, `task_wakeup`) in the same
+        // transaction as the journal mutation. Those rows are only
+        // delivered to a broker — and thus drive cross-process broker
+        // event delivery and durable cross-process wakeup — when the
+        // relay is running. Warn loudly if it is disabled so a
+        // multi-process deploy is not silently left with no durable
+        // fan-out (the per-worker acquisition ticker still makes
+        // progress, but at polling latency, and broker subscribers
+        // receive nothing).
+        let backend = self.stores.backend_name();
+        if (backend == "postgres" || backend == "sqlite") && !self.config.relay.enabled {
+            warn!(
+                storage_backend = backend,
+                "relay is DISABLED on a durable backend: advisory outbox rows \
+                 (thread_events_available, task_wakeup) will accumulate without \
+                 broker delivery, so multi-process deploys have no durable \
+                 cross-process wakeup or broker event fan-out — progress falls \
+                 back to the per-worker acquisition ticker. Set relay.enabled=true \
+                 to deliver them.",
+            );
+        }
     }
 
     fn spawn_worker_pool(

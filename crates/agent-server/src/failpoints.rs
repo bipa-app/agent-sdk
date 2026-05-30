@@ -49,13 +49,13 @@
 #[macro_export]
 macro_rules! fail_point {
     ($name:expr) => {{
-        ::fail::fail_point!($name);
+        $crate::__fail_reexport::fail_point!($name);
     }};
     ($name:expr, $cond:expr) => {{
-        ::fail::fail_point!($name, $cond);
+        $crate::__fail_reexport::fail_point!($name, $cond);
     }};
     ($name:expr, $e:expr, $($args:tt)*) => {{
-        ::fail::fail_point!($name, $e, $($args)*);
+        $crate::__fail_reexport::fail_point!($name, $e, $($args)*);
     }};
 }
 

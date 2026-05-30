@@ -638,7 +638,8 @@ pub use redaction::{
 };
 pub use relay::{
     BrokerPublisher, InMemoryTaskWakeupEmitter, OutboxRelayWorker, Publisher, RelayTick,
-    RelayWorker, RetryBackoff, TaskWakeupEmitter, TaskWakeupTrigger,
+    RelayWorker, RetryBackoff, TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter,
+    TaskWakeupTrigger,
 };
 pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use retention_janitor::{

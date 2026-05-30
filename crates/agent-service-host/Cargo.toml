@@ -26,6 +26,13 @@ otel = [
     "dep:agent-sdk-otel",
     "agent-server/otel",
 ]
+# Crash-injection failpoints. Forwards to `agent-server`'s `failpoints`
+# feature so the `agent_server::fail_point!` macro is wired to the live
+# `fail-rs` registry. The durable completed-turn committers arm
+# `commit.before_event_commit` immediately before their atomic
+# `tx.commit()`. OFF by default — production builds compile the call
+# sites away to nothing.
+failpoints = ["agent-server/failpoints"]
 
 [dependencies]
 agent-sdk-core.workspace = true

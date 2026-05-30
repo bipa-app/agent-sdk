@@ -20,7 +20,9 @@
 //! internally atomic (single write-lock scope). Durable backends can
 //! expose an atomic transaction hook through
 //! [`super::thread_store::ThreadStore::atomic_completed_turn_committer`]
-//! so this helper routes steps 1-5 through one database transaction.
+//! so this helper routes steps 1-5 — plus the turn's lifecycle events
+//! and their coalesced advisory outbox row — through one database
+//! transaction (see "Event + state atomicity" below).
 //! Atomic backends are responsible for clearing the draft as part of
 //! their transaction — the helper does not call `clear_draft` after
 //! the atomic hook returns, because doing so outside the transaction
@@ -38,13 +40,25 @@
 //!   suspension boundary survives so the next turn can recover the
 //!   in-flight conversation.
 //!
+//! # Event + state atomicity (Phase 10 · D)
+//!
+//! On a durable backend the lifecycle events **and** their single
+//! coalesced `thread_events_available` advisory outbox row are written
+//! inside the same transaction as the state projections, via
+//! [`super::completed_turn_transaction::AtomicCompletedTurnCommitter`].
+//! The previous design committed events in a *separate* transaction
+//! after the state commit, so a crash in between could leave a
+//! committed turn with no persisted events and a lost in-process
+//! notify. Folding both into one transaction makes the invariant
+//! "events exist iff the turn committed" hold on Postgres and `SQLite`.
+//! The in-memory path keeps committing events after the state steps
+//! because each individual store mutation is already atomic.
+//!
 //! # What this module does **not** own
 //!
 //! - Recovery loaders — see [`super::thread_recover`].
 //! - Task state transitions — the caller is responsible for calling
 //!   [`super::store::AgentTaskStore::complete_task`] separately.
-//! - Event persistence — lifecycle events are committed as step 6
-//!   after all state projections (Phase 6.2).
 
 use agent_sdk_core::events::AgentEvent;
 use agent_sdk_core::{ThreadId, TokenUsage, llm};
@@ -89,12 +103,37 @@ pub struct CompletedTurnCommit {
     pub agent_state_snapshot: serde_json::Value,
     /// Lifecycle events to commit atomically with the turn.
     ///
-    /// These are committed as step 5, after all state projections.
-    /// An empty vec skips the event-commit step.
+    /// On a durable backend that exposes an
+    /// [`AtomicCompletedTurnCommitter`](super::completed_turn_transaction::AtomicCompletedTurnCommitter),
+    /// these events — together with the single coalesced advisory outbox
+    /// row — are written inside the **same** transaction as the state
+    /// projections (attempt close, thread aggregate, message head, raw
+    /// message batch, checkpoint). A crash between the state commit and
+    /// the event commit can therefore no longer leave a committed turn
+    /// with zero persisted events.
+    ///
+    /// On the non-atomic in-memory path each store mutation is already
+    /// atomic under its own write lock, so the events are committed via
+    /// [`EventRepository::commit_event_batch`]
+    /// after the state steps. An empty vec skips the event-commit step.
     pub events: Vec<AgentEvent>,
+    /// Maximum relay attempts for the coalesced advisory outbox row
+    /// written alongside `events` on the atomic durable path.
+    ///
+    /// Ignored when `events` is empty or when the backend has no atomic
+    /// committer (the in-memory path writes no outbox row from this
+    /// helper).
+    pub outbox_max_attempts: u32,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
 }
+
+/// Default relay attempt budget for the coalesced `thread_events_available`
+/// advisory row written alongside a completed turn's lifecycle events.
+///
+/// Matches the long-standing 3-attempt default used elsewhere for the
+/// event outbox; production callers may override per [`CompletedTurnCommit`].
+pub const DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS: u32 = 3;
 
 // ─────────────────────────────────────────────────────────────────────
 // Outcome
@@ -155,29 +194,27 @@ pub async fn commit_completed_turn(
     #[cfg(feature = "otel")]
     let started_at = std::time::Instant::now();
 
-    let events = std::mem::take(&mut params.events);
-    let thread_id_for_events = params.thread_id.clone();
-
     if let Some(committer) = thread_store.atomic_completed_turn_committer() {
-        let mut outcome = committer
+        // Atomic durable path: events + the coalesced advisory outbox
+        // row commit inside the SAME transaction as the state
+        // projections, so the params (including `events`) are handed
+        // straight to the committer. This closes the crash window where
+        // a host death between the state commit and a separate event
+        // commit left a committed turn with no persisted events.
+        //
+        // Phase 10 · D × 11 · A: because the events now commit inside the
+        // atomic transaction, there is no separate post-commit event write
+        // on this path. The `commit.before_event_commit` failpoint that
+        // 11 · A placed here therefore moves to its true crash boundary —
+        // immediately before the atomic `tx.commit()` in the backend
+        // committer (`agent-service-host`), alongside the
+        // `InjectedCommitFailure` test hook. Both still target the
+        // "about to commit the events/outbox" boundary, now inside the
+        // single transaction.
+        let outcome = committer
             .commit_completed_turn_atomic(params)
             .await
             .context("commit: atomic completed-turn transaction")?;
-
-        // Failpoint: simulate a crash after the atomic turn commit but
-        // before lifecycle events are persisted. Recovery must replay
-        // idempotently with no lost or duplicated events. No-op (and
-        // not compiled) unless the `failpoints` feature is enabled.
-        crate::fail_point!("commit.before_event_commit");
-
-        outcome.committed_events = if events.is_empty() {
-            Vec::new()
-        } else {
-            event_repo
-                .commit_event_batch(&thread_id_for_events, events, outcome.checkpoint.created_at)
-                .await
-                .context("commit: persist lifecycle events")?
-        };
 
         #[cfg(feature = "otel")]
         crate::observability::ServerMetrics::global().record_journal_commit(
@@ -187,6 +224,12 @@ pub async fn commit_completed_turn(
 
         return Ok(outcome);
     }
+
+    // Non-atomic in-memory path: each store mutation is already atomic
+    // under its own write lock. Pull the events out so the state steps
+    // run first, then commit the events as the final step.
+    let events = std::mem::take(&mut params.events);
+    let thread_id_for_events = params.thread_id.clone();
 
     // 1. Close the turn attempt.
     let closed_attempt = turn_attempt_store
@@ -396,6 +439,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(5),
             },
             &s.threads,
@@ -456,6 +500,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(1),
             },
             &s.threads,
@@ -478,6 +523,7 @@ mod tests {
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({"turn": 2}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(2),
             },
             &s.threads,
@@ -539,6 +585,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(1),
             },
             &s.threads,
@@ -560,6 +607,7 @@ mod tests {
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(2),
             },
             &s.threads,
@@ -601,6 +649,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(1),
             },
             &s.threads,
@@ -653,6 +702,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(2),
             },
             &s.threads,
@@ -695,6 +745,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(1),
             },
             &s.threads,
@@ -722,6 +773,7 @@ mod tests {
                 turn_usage: usage(200, 80),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(3),
             },
             &s.threads,
@@ -786,6 +838,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(5),
             },
             &s.threads,
@@ -831,6 +884,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: serde_json::json!({}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(1),
             },
             &s.threads,
@@ -889,6 +943,7 @@ mod tests {
                 turn_usage: usage(100, 50),
                 agent_state_snapshot: snapshot.clone(),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(5),
             },
             &s.threads,

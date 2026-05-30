@@ -41,10 +41,13 @@ use agent_server::journal::outbox::{
     NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore,
 };
 use agent_server::journal::outbox_message::{
-    OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+    OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
     RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+};
+use agent_server::journal::relay::{
+    TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
@@ -1521,7 +1524,7 @@ FOR UPDATE
         maybe_inject_failure(fail_after, InjectedCommitFailure::MessageCommit)?;
 
         let checkpoint = Checkpoint::new(NewCheckpointParams {
-            thread_id: params.thread_id,
+            thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
             messages: updated_projection.messages,
@@ -1533,6 +1536,45 @@ FOR UPDATE
         Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
         maybe_inject_failure(fail_after, InjectedCommitFailure::CheckpointInsert)?;
 
+        // Phase 10 · D: commit the turn's lifecycle events AND the single
+        // coalesced advisory outbox row inside this SAME transaction so a
+        // crash can never leave a committed turn with zero persisted
+        // events (or a committed-but-unpublished event batch).
+        let committed_events = if params.events.is_empty() {
+            Vec::new()
+        } else {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
+            let committed = Self::insert_events_tx(
+                &mut tx,
+                &params.thread_id,
+                params.events,
+                start_seq,
+                params.now,
+            )
+            .await
+            .context("insert lifecycle events inside postgres completed-turn transaction")?;
+            Self::insert_thread_events_outbox_row_tx(
+                &mut tx,
+                &committed,
+                params.outbox_max_attempts,
+                params.now,
+            )
+            .await
+            .context("insert advisory outbox row inside postgres completed-turn transaction")?;
+            committed
+        };
+        maybe_inject_failure(fail_after, InjectedCommitFailure::EventCommit)?;
+
+        // Failpoint (11 · A): simulate a crash at the true atomic-commit
+        // boundary — the events and the coalesced advisory outbox row are
+        // staged in `tx` but `tx.commit()` has not yet run, so the whole
+        // turn (state + events) will roll back. Recovery must replay
+        // idempotently. Complements the `InjectedCommitFailure` test hook
+        // above (a deterministic test double); this is the runtime
+        // `fail-rs` failpoint. No-op (and not compiled) without the
+        // `failpoints` feature.
+        agent_server::fail_point!("commit.before_event_commit");
+
         tx.commit()
             .await
             .context("commit postgres completed-turn transaction")?;
@@ -1541,7 +1583,7 @@ FOR UPDATE
             thread,
             checkpoint,
             closed_attempt,
-            committed_events: Vec::new(),
+            committed_events,
         })
     }
 }
@@ -1741,6 +1783,25 @@ SELECT EXISTS (
         };
 
         Self::insert_task_tx(&mut tx, &admitted).await?;
+
+        // Phase 10 · D: when the new root is immediately runnable
+        // (`Pending`, not parked behind an active/queued root), emit a
+        // durable `task_wakeup` advisory row in the SAME transaction so
+        // a worker in any process — including one on another host after
+        // this one dies — is nudged to run `acquire_next_runnable`. A
+        // queued root is parked, so its eventual promotion emits the
+        // wakeup instead.
+        if admitted.status == TaskStatus::Pending {
+            Self::insert_task_wakeup_outbox_row_tx(
+                &mut tx,
+                &admitted.id,
+                &admitted.thread_id,
+                TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS,
+                admitted.created_at,
+            )
+            .await?;
+        }
+
         tx.commit().await.context("commit submit_root_turn")?;
         Ok(admitted)
     }
@@ -3610,6 +3671,52 @@ VALUES ($1, 'thread_events_available', $2, $3, $4, 'pending', $5, $6, $6, 0, $7)
             delivered_at: None,
         })
     }
+
+    /// Insert a durable `task_wakeup` advisory outbox row inside an
+    /// existing transaction.
+    ///
+    /// Phase 10 · D: the row carries no `event_id`/`sequence` (those are
+    /// reserved for `thread_events_available`); its advisory payload is
+    /// `{task_id, thread_id}`.  Inserting it inside the admission
+    /// transaction guarantees the wakeup becomes visible iff the
+    /// task-journal mutation that made the task runnable also commits —
+    /// the durable analogue of the in-process `WakeupSignal` nudge so
+    /// another process's worker pool can be woken even after this host
+    /// dies.
+    async fn insert_task_wakeup_outbox_row_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task_id: &AgentTaskId,
+        thread_id: &ThreadId,
+        max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<OutboxRowId> {
+        let id = OutboxRowId::new();
+        let payload_json = OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id: task_id.clone(),
+            thread_id: thread_id.clone(),
+        })
+        .to_payload_json()
+        .context("serialise task_wakeup advisory payload")?;
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_outbox
+    (id, kind, thread_id, event_id, sequence, status, payload_json,
+     created_at, next_attempt_at, attempt_count, max_attempts)
+VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
+",
+            id.as_str(),
+            thread_key(thread_id),
+            payload_json,
+            now,
+            i64::from(max_attempts),
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert task_wakeup outbox row for task {task_id}"))?;
+
+        Ok(id)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3654,6 +3761,42 @@ impl AtomicEventOutboxCommitter for PostgresDurableStore {
             committed_events: committed,
             outbox_row: Some(outbox_row),
         })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TaskWakeupEmitter (Phase 10 · D — durable cross-process wakeup)
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl TaskWakeupEmitter for PostgresDurableStore {
+    /// Insert a durable `task_wakeup` advisory row in its own
+    /// transaction.
+    ///
+    /// The admission paths (`submit_root_turn`, queue promotion) call
+    /// `Self::insert_task_wakeup_outbox_row_tx` inside their own
+    /// transaction so the wakeup is atomic with the journal mutation
+    /// that made the task runnable.  This standalone hook serves
+    /// callers that need to emit a wakeup independently (e.g. a
+    /// re-publish path) where there is no surrounding journal write.
+    async fn emit_in_transaction(&self, trigger: TaskWakeupTrigger) -> Result<OutboxRowId> {
+        ensure!(
+            trigger.max_attempts >= 1,
+            "task_wakeup max_attempts must be at least 1"
+        );
+        let mut tx = self.begin().await?;
+        let id = Self::insert_task_wakeup_outbox_row_tx(
+            &mut tx,
+            &trigger.task_id,
+            &trigger.thread_id,
+            trigger.max_attempts,
+            trigger.now,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit task_wakeup emit transaction")?;
+        Ok(id)
     }
 }
 
@@ -4723,6 +4866,7 @@ enum InjectedCommitFailure {
     ThreadAdvance,
     MessageCommit,
     CheckpointInsert,
+    EventCommit,
 }
 
 fn maybe_inject_failure(
@@ -5142,6 +5286,7 @@ mod tests {
                     },
                     agent_state_snapshot: serde_json::json!({"turn": 1}),
                     events: Vec::new(),
+                    outbox_max_attempts: 3,
                     now: t_plus(2),
                 },
                 Some(InjectedCommitFailure::ThreadAdvance),
@@ -5170,6 +5315,100 @@ mod tests {
 
         let checkpoints = CheckpointStore::list_by_thread(&store, &running.thread_id).await?;
         assert!(checkpoints.is_empty(), "checkpoint insert must roll back");
+
+        Ok(())
+    }
+
+    /// Phase 10 · D regression: events exist **iff** the turn committed.
+    ///
+    /// A crash injected *after* the state projections but *before* the
+    /// transaction commits (at the `EventCommit` step) must roll the
+    /// whole turn back — leaving zero committed turns AND zero events.
+    /// A clean commit must then persist both the turn and its events
+    /// (plus the coalesced advisory outbox row) atomically. This is the
+    /// invariant the old split-transaction design could violate: a
+    /// committed turn with no persisted events.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_exist_iff_turn_committed_postgres() -> Result<()> {
+        let Some((store, _schema_guard)) = test_store().await? else {
+            return Ok(());
+        };
+
+        let root = fresh_root("t-pg-events-iff", 0);
+        let admitted = store.submit_root_turn(root.clone()).await?;
+        let running = store
+            .try_acquire_task(
+                &admitted.id,
+                WorkerId::from_string("w-events-iff"),
+                LeaseId::from_string("l-events-iff"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .await?
+            .context("acquire running task")?;
+        let attempt = store.open_attempt(open_params(&running.id)).await?;
+
+        let thread_id = running.thread_id.clone();
+        let commit_params = |now| CompletedTurnCommit {
+            thread_id: thread_id.clone(),
+            task_id: running.id.clone(),
+            turn_attempt_id: attempt.id.clone(),
+            close_attempt_params: close_params(),
+            messages: vec![llm::Message::user("hello"), llm::Message::assistant("hi")],
+            turn_usage: TokenUsage {
+                input_tokens: 120,
+                output_tokens: 60,
+                ..Default::default()
+            },
+            agent_state_snapshot: serde_json::json!({"turn": 1}),
+            events: vec![AgentEvent::Start {
+                thread_id: thread_id.clone(),
+                turn: 1,
+            }],
+            outbox_max_attempts: 3,
+            now,
+        };
+
+        // ── Phase 1: crash inside the commit transaction ─────────────
+        let err = store
+            .commit_completed_turn_atomic_with_failure(
+                commit_params(t_plus(2)),
+                Some(InjectedCommitFailure::EventCommit),
+            )
+            .await
+            .err()
+            .context("event-commit fault injection should fail")?;
+        assert!(format!("{err:#}").contains("injected postgres completed-turn failure"));
+
+        // The turn must NOT have committed, and ZERO events may persist —
+        // never a committed turn with no events (the old design's bug).
+        let thread = ThreadStore::get(&store, &running.thread_id)
+            .await?
+            .context("thread row exists from task bootstrap")?;
+        assert_eq!(thread.committed_turns, 0, "turn must roll back");
+        let events = EventRepository::get_events(&store, &running.thread_id).await?;
+        assert!(events.is_empty(), "no events when the turn rolled back");
+        let checkpoints = CheckpointStore::list_by_thread(&store, &running.thread_id).await?;
+        assert!(checkpoints.is_empty(), "checkpoint must roll back too");
+
+        // ── Phase 2: a clean commit persists turn + events together ──
+        let outcome = store
+            .commit_completed_turn_atomic(commit_params(t_plus(3)))
+            .await
+            .context("clean commit")?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(outcome.committed_events.len(), 1, "returns committed event");
+
+        // Turn committed → events exist, and the coalesced advisory
+        // outbox row landed in the SAME transaction.
+        let events = EventRepository::get_events(&store, &running.thread_id).await?;
+        assert_eq!(events.len(), 1, "committed turn has its persisted events");
+        let outbox_rows = OutboxStore::list_by_thread(&store, &running.thread_id).await?;
+        let thread_events_rows = outbox_rows
+            .iter()
+            .filter(|r| r.kind == OutboxMessageKind::ThreadEventsAvailable)
+            .count();
+        assert_eq!(thread_events_rows, 1, "one advisory row per committed turn");
 
         Ok(())
     }
@@ -5212,6 +5451,7 @@ mod tests {
                     thread_id: running.thread_id.clone(),
                     turn: 1,
                 }],
+                outbox_max_attempts: 3,
                 now: t_plus(2),
             },
             &store,
