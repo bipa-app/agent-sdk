@@ -90,3 +90,5 @@ pub mod watch;
 mod conformance;
 #[cfg(test)]
 mod ga_regression;
+#[cfg(test)]
+mod journal_conformance;
