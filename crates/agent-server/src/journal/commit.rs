@@ -164,6 +164,12 @@ pub async fn commit_completed_turn(
             .await
             .context("commit: atomic completed-turn transaction")?;
 
+        // Failpoint: simulate a crash after the atomic turn commit but
+        // before lifecycle events are persisted. Recovery must replay
+        // idempotently with no lost or duplicated events. No-op (and
+        // not compiled) unless the `failpoints` feature is enabled.
+        crate::fail_point!("commit.before_event_commit");
+
         outcome.committed_events = if events.is_empty() {
             Vec::new()
         } else {
@@ -239,6 +245,11 @@ pub async fn commit_completed_turn(
         .clear_draft(&params.thread_id, params.now)
         .await
         .context("commit: clear in-flight draft")?;
+
+    // Failpoint: simulate a crash after the thread/checkpoint/draft
+    // steps committed but before lifecycle events are persisted. No-op
+    // (and not compiled) unless the `failpoints` feature is enabled.
+    crate::fail_point!("commit.before_event_commit");
 
     // 6. Commit lifecycle events. Skipped when no events are provided
     //    (e.g. callers that don't produce lifecycle events yet).

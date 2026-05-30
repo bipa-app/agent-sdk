@@ -54,6 +54,15 @@ clap = { version = "4", features = ["derive"] }
 # dev
 tempfile = "3"
 env_logger = "0.11"
+proptest = "1"
+proptest-state-machine = "0.4"
+insta = { version = "1", features = ["json"] }
+
+# Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
+# feature set on every crate so production builds never compile it in;
+# `fail_point!` is a no-op unless a crate's `failpoints` feature pulls
+# this in with its own `failpoints` feature enabled.
+fail = "0.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

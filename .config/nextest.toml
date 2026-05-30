@@ -1,0 +1,77 @@
+# cargo-nextest configuration.
+#
+# Two profiles:
+#
+#   * `default` — used for local runs. `retries = 2` surfaces flakiness:
+#     a test that only passes intermittently shows up as `FLAKY` in the
+#     summary instead of silently passing or failing.
+#   * `ci` — used in CI (`cargo nextest run --profile ci`). Emits a JUnit
+#     report for the test-summary UI and serializes the integration tests
+#     that touch process-global or shared external resources (Postgres,
+#     AMQP, and the process-wide `FAILPOINTS` registry) so they cannot
+#     interfere with each other.
+#
+# Nextest runs every test in its own process, which is a hard requirement
+# for the `failpoints` feature: `fail-rs` keeps a process-global registry,
+# so two failpoint tests in the same process would clobber each other.
+
+[profile.default]
+# Surface flaky tests instead of letting an intermittent pass hide them.
+retries = 2
+# Show output for failures (including retried/flaky runs) immediately.
+failure-output = "immediate-final"
+# Treat a test that only passes on retry as a first-class signal.
+status-level = "retry"
+
+[profile.ci]
+# Be strict in CI: do not silently tolerate empty filter sets, and keep
+# the full failure output in the log.
+retries = 2
+failure-output = "immediate-final"
+fail-fast = false
+
+[profile.ci.junit]
+# Written to `target/nextest/ci/junit.xml` for CI test-summary upload.
+path = "junit.xml"
+
+# ── Test groups ──────────────────────────────────────────────────────
+#
+# Each group is capped at a single concurrent test so that tests sharing
+# an external resource (the Postgres database, the AMQP broker) or a
+# process-global (the `fail-rs` failpoint registry) run serially. This
+# prevents cross-test interference: e.g. two Postgres tests racing on the
+# same schema, or two failpoint tests mutating the same global registry.
+
+[test-groups]
+db = { max-threads = 1 }
+amqp = { max-threads = 1 }
+failpoints = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Postgres-backed store + host DB tests serialize on `db`.
+filter = 'package(agent-service-host) and (test(postgres) or test(/(?i)database|db_/))'
+test-group = 'db'
+
+[[profile.default.overrides]]
+# AMQP / broker tests serialize on `amqp`.
+filter = 'test(/(?i)amqp|broker|rabbit/)'
+test-group = 'amqp'
+
+[[profile.default.overrides]]
+# Any test exercising the `failpoints` feature serializes on the global
+# `fail-rs` registry.
+filter = 'test(/(?i)failpoint|fail_point/)'
+test-group = 'failpoints'
+
+# CI reuses the same serialization rules.
+[[profile.ci.overrides]]
+filter = 'package(agent-service-host) and (test(postgres) or test(/(?i)database|db_/))'
+test-group = 'db'
+
+[[profile.ci.overrides]]
+filter = 'test(/(?i)amqp|broker|rabbit/)'
+test-group = 'amqp'
+
+[[profile.ci.overrides]]
+filter = 'test(/(?i)failpoint|fail_point/)'
+test-group = 'failpoints'
