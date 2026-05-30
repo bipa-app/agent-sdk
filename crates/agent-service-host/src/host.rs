@@ -587,6 +587,12 @@ impl ServiceHost {
 // Relay wiring helpers
 // ─────────────────────────────────────────────────────────────────────
 
+// The `Result` return is needed by the fallible `amqp` arm; without the
+// `amqp` feature only the infallible in-memory arm is compiled, so clippy
+// sees an unconditionally-`Ok` wrapper. The signature stays uniform across
+// feature combinations, so scope the `unnecessary_wraps` allow to exactly
+// the build where the wrap is trivially infallible.
+#[cfg_attr(not(feature = "amqp"), allow(clippy::unnecessary_wraps))]
 fn build_broker_adapter(config: &BrokerConfig) -> Result<Arc<dyn BrokerAdapter>> {
     match config {
         BrokerConfig::InMemory => {

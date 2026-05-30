@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT kind, fingerprint, result_json FROM agent_sdk_idempotency WHERE request_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "kind",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "fingerprint",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "result_json",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5d0ef12b6b9d1c2ff40767691311ec9959e33049036acac37eec3f96d618755f"
+}

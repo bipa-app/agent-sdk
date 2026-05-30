@@ -57,6 +57,7 @@ fn main() -> Result<()> {
     let grpc_enabled = config.transport.grpc_enabled;
     let grpc_addr = config.transport.grpc_addr;
     let lease_duration = config.worker.lease_duration();
+    let admission = config.admission.clone();
     let host = ServiceHost::new(config, registry, Arc::clone(&runtime))
         .context("creating service host")?;
     let stores = host.stores().clone();
@@ -91,7 +92,14 @@ fn main() -> Result<()> {
                 .await
                 .context("initializing service host")?;
             if grpc_enabled {
-                let grpc = GrpcTransport::new(stores, runtime, health, shutdown, lease_duration);
+                let grpc = GrpcTransport::with_admission(
+                    stores,
+                    runtime,
+                    health,
+                    shutdown,
+                    lease_duration,
+                    admission,
+                );
                 tokio::try_join!(host.run(), grpc.serve(grpc_addr))?;
                 Ok(())
             } else {

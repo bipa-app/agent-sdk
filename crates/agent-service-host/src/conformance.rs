@@ -551,6 +551,178 @@ mod tests {
         Ok(())
     }
 
+    // ── Phase 10 · E: idempotency + back-pressure ───────────────────
+
+    fn submit_params(
+        task: AgentTask,
+        request_id: &str,
+        fingerprint: &[u8],
+        max_queued_depth: Option<u32>,
+    ) -> agent_server::journal::store::SubmitRootTurnParams {
+        let result_json = serde_json::json!({ "task_id": task.id.to_string() });
+        agent_server::journal::store::SubmitRootTurnParams {
+            task,
+            idempotency: Some(agent_server::journal::store::SubmitRootIdempotency {
+                request_id: request_id.to_owned(),
+                fingerprint: fingerprint.to_vec(),
+                result_json,
+            }),
+            max_queued_depth,
+        }
+    }
+
+    /// A retried submission under the same `request_id` admits exactly
+    /// one root turn and replays the original on the retry. This is the
+    /// at-least-once dedup contract (gap #6).
+    async fn test_submit_idempotent_dedup(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let tid = thread_id("conformance-idem");
+        let first = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        let first_id = first.id.clone();
+        let outcome = task_store
+            .submit_root_turn_idempotent(submit_params(first, "req-1", b"fp", None))
+            .await
+            .map_err(|error| anyhow::anyhow!("first submit failed: {error}"))?;
+        assert!(!outcome.replayed, "first submit must not be a replay");
+        assert_eq!(outcome.task.id, first_id);
+
+        // A retry with a *different* task row but the same request_id +
+        // fingerprint replays the original task and admits nothing new.
+        let retry = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let retry_id = retry.id.clone();
+        let replay = task_store
+            .submit_root_turn_idempotent(submit_params(retry, "req-1", b"fp", None))
+            .await
+            .map_err(|error| anyhow::anyhow!("retry submit failed: {error}"))?;
+        assert!(replay.replayed, "retry must be a replay");
+        assert_eq!(replay.task.id, first_id, "replay returns the original task");
+        assert_ne!(
+            replay.task.id, retry_id,
+            "the retry row must not be admitted"
+        );
+
+        // Exactly one root task exists on the thread.
+        let tasks = task_store.list_by_thread(&tid).await?;
+        let roots = tasks.iter().filter(|task| task.is_root()).count();
+        assert_eq!(roots, 1, "exactly one root admitted across the retry");
+        Ok(())
+    }
+
+    /// A retry that re-uses a `request_id` with a *different* payload
+    /// fingerprint is a conflict, not a silent alias.
+    async fn test_submit_idempotent_conflict(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let tid = thread_id("conformance-idem-conflict");
+        let first = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        task_store
+            .submit_root_turn_idempotent(submit_params(first, "req-c", b"fp-a", None))
+            .await
+            .map_err(|error| anyhow::anyhow!("first submit failed: {error}"))?;
+
+        let second = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let result = task_store
+            .submit_root_turn_idempotent(submit_params(second, "req-c", b"fp-b", None))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(agent_server::journal::store::SubmitRootTurnError::IdempotencyConflict)
+            ),
+            "a different fingerprint under the same key must conflict",
+        );
+        Ok(())
+    }
+
+    /// Exceeding the per-thread queued-root depth cap returns
+    /// `QueueDepthExceeded` (gap #9). The active root never counts
+    /// against the cap; only queued roots do.
+    async fn test_submit_queue_depth_cap(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let tid = thread_id("conformance-queue-cap");
+        // First admission takes the active slot (queued_depth == 0).
+        let active = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+        let outcome = task_store
+            .submit_root_turn_idempotent(submit_params(active, "q-active", b"fp", Some(1)))
+            .await
+            .map_err(|error| anyhow::anyhow!("active submit failed: {error}"))?;
+        assert_eq!(outcome.queued_depth, 0);
+
+        // Second admission queues behind the active slot (queued_depth
+        // becomes 1, which equals the cap — still allowed because the
+        // check is "would exceed", i.e. current >= cap before insert).
+        let queued = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let outcome = task_store
+            .submit_root_turn_idempotent(submit_params(queued, "q-1", b"fp", Some(1)))
+            .await
+            .map_err(|error| anyhow::anyhow!("queued submit failed: {error}"))?;
+        assert_eq!(
+            outcome.queued_depth, 1,
+            "one queued root after second admit"
+        );
+
+        // Third admission would push queued depth to 2 > cap of 1.
+        let overflow = AgentTask::new_root_turn(tid.clone(), t_plus(12), 3);
+        let result = task_store
+            .submit_root_turn_idempotent(submit_params(overflow, "q-2", b"fp", Some(1)))
+            .await;
+        match result {
+            Err(agent_server::journal::store::SubmitRootTurnError::QueueDepthExceeded {
+                cap,
+                current_depth,
+            }) => {
+                assert_eq!(cap, 1);
+                assert_eq!(current_depth, 1);
+            }
+            other => anyhow::bail!("expected QueueDepthExceeded, got {other:?}"),
+        }
+
+        // The rejected submission left no trace — still exactly two roots.
+        let tasks = task_store.list_by_thread(&tid).await?;
+        let roots = tasks.iter().filter(|task| task.is_root()).count();
+        assert_eq!(roots, 2, "the over-cap submission admitted nothing");
+        Ok(())
+    }
+
+    /// A root admitted with the production budget that crashes mid-turn
+    /// is requeued (not failed-closed). This is the `max_attempts`
+    /// reconciliation (gap #10): `DEFAULT_ROOT_MAX_ATTEMPTS == 3`.
+    async fn test_root_default_budget_requeues_on_crash(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        assert_eq!(
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+            3,
+            "root default budget must allow a mid-turn crash to retry",
+        );
+        let tid = thread_id("conformance-root-budget");
+        let root = AgentTask::new_root_turn(
+            tid.clone(),
+            t_plus(10),
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+        );
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+
+        // Acquire (attempt 1) and let the lease expire — simulating a
+        // mid-turn host crash.
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(11),
+                t_plus(10),
+            )
+            .await?;
+        let records = task_store.release_expired_leases(t_plus(12)).await?;
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].action.is_requeue(),
+            "budget-3 root must requeue on first crash, got {:?}",
+            records[0].action,
+        );
+
+        let task = task_store.get(&root.id).await?.context("task exists")?;
+        assert_eq!(task.status, TaskStatus::Pending, "requeued back to Pending");
+        Ok(())
+    }
+
     // ── Backend runners ──────────────────────────────────────────────
 
     // ── In-memory backend ────────────────────────────────────────────
@@ -633,6 +805,30 @@ mod tests {
     async fn conformance_in_memory_fail_closed_child_wakes_parent() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_fail_closed_child_wakes_parent(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_submit_idempotent_dedup() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_submit_idempotent_dedup(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_submit_idempotent_conflict() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_submit_idempotent_conflict(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_submit_queue_depth_cap() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_submit_queue_depth_cap(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_root_default_budget_requeues() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_root_default_budget_requeues_on_crash(s.task.as_ref()).await
     }
 
     struct InMemoryStores {
@@ -746,5 +942,86 @@ mod tests {
     async fn conformance_sqlite_fail_closed_child_wakes_parent() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_fail_closed_child_wakes_parent(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_submit_idempotent_dedup() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_submit_idempotent_dedup(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_submit_idempotent_conflict() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_submit_idempotent_conflict(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_submit_queue_depth_cap() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_submit_queue_depth_cap(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_root_default_budget_requeues() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_root_default_budget_requeues_on_crash(&store).await
+    }
+
+    /// Cross-restart idempotency (gap #6, the headline acceptance
+    /// criterion): submit the same `request_id` before and after a
+    /// simulated host restart — modeled by dropping the `SQLite` store +
+    /// pool and reopening the *same file* — and assert exactly one
+    /// `RootTurn` task exists, with the retry replaying the original.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn cross_restart_submit_idempotency_admits_exactly_one_root() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("restart.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let tid = thread_id("restart-idem");
+
+        // ── Before the "restart" ─────────────────────────────────────
+        let original_task_id = {
+            let store = crate::sqlite::SqliteDurableStore::connect(&url).await?;
+            let root = AgentTask::new_root_turn(tid.clone(), t_plus(10), 3);
+            let task_id = root.id.clone();
+            let outcome = store
+                .submit_root_turn_idempotent(submit_params(root, "restart-req", b"fp", None))
+                .await
+                .map_err(|error| anyhow::anyhow!("pre-restart submit failed: {error}"))?;
+            assert!(!outcome.replayed);
+            // Drop the store + pool to simulate process death.
+            drop(store);
+            task_id
+        };
+
+        // ── After the "restart": reopen the same file ────────────────
+        let store = crate::sqlite::SqliteDurableStore::connect(&url).await?;
+        // The in-memory dedup cache is gone, but the durable record
+        // survives. A retry under the same request_id must replay the
+        // original task, not admit a duplicate.
+        let retry = AgentTask::new_root_turn(tid.clone(), t_plus(11), 3);
+        let replay = store
+            .submit_root_turn_idempotent(submit_params(retry, "restart-req", b"fp", None))
+            .await
+            .map_err(|error| anyhow::anyhow!("post-restart retry failed: {error}"))?;
+        assert!(replay.replayed, "post-restart retry must replay, not admit");
+        assert_eq!(
+            replay.task.id, original_task_id,
+            "replay returns the original task minted before the restart",
+        );
+
+        let tasks = AgentTaskStore::list_by_thread(&store, &tid).await?;
+        let roots = tasks.iter().filter(|task| task.is_root()).count();
+        assert_eq!(
+            roots, 1,
+            "exactly one RootTurn task survives the request_id retry across restart",
+        );
+        Ok(())
     }
 }

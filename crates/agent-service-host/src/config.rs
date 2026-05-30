@@ -82,6 +82,8 @@ pub struct ServiceConfig {
     /// `--features otel` (or one started without an `[observability]`
     /// section in YAML) behaves exactly like prior versions.
     pub observability: ObservabilityConfig,
+    /// gRPC admission back-pressure and input-size limits.
+    pub admission: AdmissionConfig,
 }
 
 impl ServiceConfig {
@@ -393,6 +395,59 @@ impl Default for TransportConfig {
             grpc_addr: ([127, 0, 0, 1], 50051).into(),
             http_enabled: false,
             http_addr: ([127, 0, 0, 1], 8080).into(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Admission back-pressure + input limits (Phase 10 · E)
+// ─────────────────────────────────────────────────────────────────────
+
+/// gRPC admission back-pressure and input-size limits.
+///
+/// These guard the `SubmitThreadWork` path against unbounded backlog
+/// growth (a retry storm enqueuing serial work) and oversized inputs
+/// (large inline base64 attachments). Defaults are generous but finite
+/// so a misbehaving client gets a clean `RESOURCE_EXHAUSTED` /
+/// `INVALID_ARGUMENT` rather than unbounded memory growth or a transport
+/// failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdmissionConfig {
+    /// Maximum number of *queued* root turns a single thread may hold
+    /// (the active/blocking root is not counted). A submission that
+    /// would exceed this returns `RESOURCE_EXHAUSTED`. `None` disables
+    /// the cap.
+    pub max_queued_roots_per_thread: Option<u32>,
+    /// Maximum total encoded size, in bytes, of a single
+    /// `SubmitThreadWork` request's input items. A request larger than
+    /// this returns `INVALID_ARGUMENT`. `None` disables the aggregate
+    /// limit.
+    pub max_submit_input_bytes: Option<usize>,
+    /// Maximum encoded size, in bytes, of any single input item within
+    /// a `SubmitThreadWork` request. `None` disables the per-item limit.
+    pub max_submit_item_bytes: Option<usize>,
+    /// Maximum gRPC decoded message size, in bytes, applied to the
+    /// control service via tonic's `max_decoding_message_size`. Bounds
+    /// the transport-level buffer so an oversized frame is rejected
+    /// before it is fully decoded into memory.
+    pub max_decoding_message_bytes: usize,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            // 1024 queued roots per thread is far above any sane backlog
+            // but still bounds a retry storm.
+            max_queued_roots_per_thread: Some(1024),
+            // 8 MiB aggregate / 4 MiB per item keeps large multimodal
+            // submissions working while bounding inline-attachment abuse.
+            max_submit_input_bytes: Some(8 * 1024 * 1024),
+            max_submit_item_bytes: Some(4 * 1024 * 1024),
+            // 16 MiB transport ceiling — comfortably above the aggregate
+            // input limit so the application-level check (which returns a
+            // clean INVALID_ARGUMENT) fires first for normal payloads.
+            max_decoding_message_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -1021,6 +1076,58 @@ watch:
     }
 
     // ── Phase 9 · E1: observability ─────────────────────────────────
+
+    // ── Phase 10 · E: admission back-pressure + input limits ────────
+
+    #[test]
+    fn admission_defaults_are_finite_but_generous() {
+        let config = AdmissionConfig::default();
+        assert_eq!(config.max_queued_roots_per_thread, Some(1024));
+        assert_eq!(config.max_submit_input_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(config.max_submit_item_bytes, Some(4 * 1024 * 1024));
+        assert_eq!(config.max_decoding_message_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn admission_yaml_round_trips() -> Result<()> {
+        let yaml = r"
+admission:
+  max_queued_roots_per_thread: 8
+  max_submit_input_bytes: 2048
+  max_submit_item_bytes: 1024
+  max_decoding_message_bytes: 65536
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert_eq!(config.admission.max_queued_roots_per_thread, Some(8));
+        assert_eq!(config.admission.max_submit_input_bytes, Some(2048));
+        assert_eq!(config.admission.max_submit_item_bytes, Some(1024));
+        assert_eq!(config.admission.max_decoding_message_bytes, 65536);
+
+        let re_yaml = serde_yaml::to_string(&config)?;
+        let re_config = ServiceConfig::from_yaml_str(&re_yaml)?;
+        assert_eq!(re_config.admission.max_queued_roots_per_thread, Some(8));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_null_disables_caps() -> Result<()> {
+        let yaml = r"
+admission:
+  max_queued_roots_per_thread: null
+  max_submit_input_bytes: null
+  max_submit_item_bytes: null
+";
+        let config = ServiceConfig::from_yaml_str(yaml)?;
+        assert!(config.admission.max_queued_roots_per_thread.is_none());
+        assert!(config.admission.max_submit_input_bytes.is_none());
+        assert!(config.admission.max_submit_item_bytes.is_none());
+        // Unset transport ceiling falls back to the default.
+        assert_eq!(
+            config.admission.max_decoding_message_bytes,
+            16 * 1024 * 1024
+        );
+        Ok(())
+    }
 
     #[test]
     fn observability_defaults_are_disabled() {

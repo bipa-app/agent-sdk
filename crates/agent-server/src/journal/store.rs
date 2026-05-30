@@ -207,6 +207,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
+use super::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use super::recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
 };
@@ -230,6 +231,154 @@ pub struct SubagentInvocationSpawn {
     pub child_root_input: Vec<SubmittedInputItem>,
     pub spawn_index: u32,
     pub payload: SuspensionPayload,
+}
+
+/// The idempotency key a [`AgentTaskStore::submit_root_turn_idempotent`]
+/// call claims atomically inside the admission transaction.
+#[derive(Clone, Debug)]
+pub struct SubmitRootIdempotency {
+    /// Caller-supplied idempotency key.
+    pub request_id: String,
+    /// Fingerprint of the submission payload (everything but the key).
+    pub fingerprint: Vec<u8>,
+    /// Operation-specific durable references the gRPC layer needs to
+    /// reconstruct the original response on a replay. The journal layer
+    /// treats this as opaque.
+    pub result_json: serde_json::Value,
+}
+
+/// Parameters for [`AgentTaskStore::submit_root_turn_idempotent`].
+///
+/// Phase 10 · E bundles the durable idempotency claim and the
+/// queued-root depth cap into the same admission transaction as the task
+/// insert so dedup, back-pressure, and admission are atomic (no TOCTOU).
+#[derive(Clone, Debug)]
+pub struct SubmitRootTurnParams {
+    /// The freshly-constructed root turn to admit (same shape contract
+    /// as [`AgentTaskStore::submit_root_turn`]).
+    pub task: AgentTask,
+    /// Optional idempotency claim. `None` skips dedup (used by internal
+    /// callers that already guarantee uniqueness).
+    pub idempotency: Option<SubmitRootIdempotency>,
+    /// Maximum number of *queued* (not the active/blocking) roots a
+    /// thread may hold before a new submission is rejected with
+    /// [`SubmitRootTurnError::QueueDepthExceeded`]. `None` disables the
+    /// cap.
+    pub max_queued_depth: Option<u32>,
+}
+
+/// Successful outcome of [`AgentTaskStore::submit_root_turn_idempotent`].
+#[derive(Clone, Debug)]
+pub struct SubmitRootTurnOutcome {
+    /// The admitted (or, on replay, originally-admitted) task.
+    pub task: AgentTask,
+    /// `true` if this call replayed a previously-recorded submission
+    /// rather than admitting a fresh one.
+    pub replayed: bool,
+    /// Stored idempotency references, present only on a replay so the
+    /// caller can reconstruct the original response.
+    pub replayed_result: Option<serde_json::Value>,
+    /// Number of queued roots on the thread *after* this admission
+    /// (excludes the active/blocking root). Surfaced to the caller so
+    /// at-least-once clients can observe back-pressure.
+    pub queued_depth: u32,
+}
+
+/// Typed failure modes for
+/// [`AgentTaskStore::submit_root_turn_idempotent`] that the transport
+/// layer maps to specific gRPC status codes.
+#[derive(Debug)]
+pub enum SubmitRootTurnError {
+    /// The `request_id` was already used for a different operation kind
+    /// or a different payload fingerprint. Maps to `ALREADY_EXISTS`.
+    IdempotencyConflict,
+    /// The thread already holds the maximum number of queued roots.
+    /// Maps to `RESOURCE_EXHAUSTED`. Carries the configured cap and the
+    /// current depth so the caller can report both.
+    QueueDepthExceeded {
+        /// The configured maximum queued-root depth.
+        cap: u32,
+        /// The current queued-root depth at rejection time.
+        current_depth: u32,
+    },
+    /// Any other store-level failure (validation, IO, …).
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SubmitRootTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdempotencyConflict => {
+                write!(f, "request_id already used for a different request")
+            }
+            Self::QueueDepthExceeded { cap, current_depth } => write!(
+                f,
+                "thread queued-root depth {current_depth} reached the cap {cap}"
+            ),
+            Self::Other(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitRootTurnError {}
+
+impl From<anyhow::Error> for SubmitRootTurnError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// Shared shape gate for root-turn admission.
+///
+/// Both [`AgentTaskStore::submit_root_turn`] and
+/// [`AgentTaskStore::submit_root_turn_idempotent`] require a
+/// freshly-constructed [`TaskKind::RootTurn`] in [`TaskStatus::Pending`]
+/// with `attempt == 0`.
+///
+/// # Errors
+/// Returns an error if the task is not a freshly-constructed root turn
+/// or fails schema validation.
+pub fn validate_submit_root_shape(task: &AgentTask) -> Result<()> {
+    if task.kind != TaskKind::RootTurn {
+        let kind = task.kind;
+        return Err(anyhow!(
+            "submit_root_turn rejected: expected root_turn, got {kind:?}"
+        ));
+    }
+    if task.status != TaskStatus::Pending {
+        let status = task.status;
+        return Err(anyhow!(
+            "submit_root_turn rejected: new root must start in Pending (got {status:?})"
+        ));
+    }
+    if task.attempt != 0 {
+        let attempt = task.attempt;
+        return Err(anyhow!(
+            "submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"
+        ));
+    }
+    if !task.is_root() {
+        return Err(anyhow!("submit_root_turn rejected: task must be a root"));
+    }
+    task.validate()
+        .context("submit_root_turn rejected: task failed schema validation")?;
+    Ok(())
+}
+
+/// Extract the admitted task id stored in a `SubmitWork` idempotency
+/// record's `result_json` (encoded by the gRPC layer as
+/// `{"task_id": "..."}`).
+///
+/// # Errors
+/// Returns an error if the record's `result_json` does not carry a
+/// `task_id` string.
+pub fn submit_record_task_id(record: &IdempotencyRecord) -> Result<AgentTaskId> {
+    let task_id = record
+        .result_json
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("submit idempotency record missing task_id reference"))?;
+    Ok(AgentTaskId::from_string(task_id))
 }
 
 /// Persistent store for [`AgentTask`] rows.
@@ -312,6 +461,70 @@ pub trait AgentTaskStore: Send + Sync {
     /// Returns an error if the task is not a freshly-constructed root turn,
     /// if the row fails validation, or if the underlying store write fails.
     async fn submit_root_turn(&self, task: AgentTask) -> Result<AgentTask>;
+
+    /// Durably admit a root turn with at-least-once idempotency and
+    /// queued-root back-pressure, all inside a single transaction.
+    ///
+    /// This is the transport-facing admission entry point (Phase 10 ·
+    /// E). It composes three guarantees that must be atomic with each
+    /// other so a retried, restart-surviving client request produces
+    /// exactly one effect:
+    ///
+    /// 1. **Idempotency** — when `params.idempotency` is set, the store
+    ///    looks up the `request_id` in the durable idempotency table
+    ///    *inside the admission transaction*. A matching record replays
+    ///    the original task; a mismatching kind/fingerprint returns
+    ///    [`SubmitRootTurnError::IdempotencyConflict`]; an absent record
+    ///    is claimed and committed together with the task insert (no
+    ///    time-of-check / time-of-use window).
+    /// 2. **Back-pressure** — when `params.max_queued_depth` is set, a
+    ///    submission that would exceed the per-thread queued-root cap is
+    ///    rejected with [`SubmitRootTurnError::QueueDepthExceeded`]
+    ///    before anything is written.
+    /// 3. **Admission** — the same FIFO admission rule as
+    ///    [`Self::submit_root_turn`].
+    ///
+    /// The returned [`SubmitRootTurnOutcome`] reports whether the call
+    /// replayed a prior submission and the resulting queued-root depth.
+    ///
+    /// # Errors
+    /// Returns [`SubmitRootTurnError`] for idempotency conflicts, queue
+    /// back-pressure, and any underlying store failure.
+    async fn submit_root_turn_idempotent(
+        &self,
+        params: SubmitRootTurnParams,
+    ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError>;
+
+    /// Claim a `request_id` for a non-submission control-plane operation
+    /// (`CreateThread`, `ForkThread`, `DecideConfirmation`) against the
+    /// durable idempotency table.
+    ///
+    /// Returns [`IdempotencyClaim::Fresh`] when the key was unused (the
+    /// caller now owns it and must run the effect, then call
+    /// [`Self::record_idempotency`] to persist the result),
+    /// [`IdempotencyClaim::Replay`] when a matching record exists, and
+    /// [`IdempotencyClaim::Conflict`] when the key was used for a
+    /// different kind or payload fingerprint.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be queried.
+    async fn claim_idempotency(
+        &self,
+        request_id: &str,
+        kind: IdempotencyKind,
+        fingerprint: &[u8],
+    ) -> Result<IdempotencyClaim>;
+
+    /// Persist the durable references for a freshly-completed
+    /// non-submission idempotent operation.
+    ///
+    /// Idempotent on the key: a second call with the same `request_id`
+    /// and a matching kind/fingerprint is a no-op (so a retry that races
+    /// past [`Self::claim_idempotency`] cannot corrupt the record).
+    ///
+    /// # Errors
+    /// Returns an error if the store write fails.
+    async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()>;
 
     /// Look up a task by id.
     ///
@@ -1099,6 +1312,10 @@ struct Inner {
     /// ascending so [`AgentTaskStore::release_expired_leases`] can walk
     /// the head of the set until it hits a still-live lease and stop.
     leased_by_expiry: BTreeSet<(OffsetDateTime, AgentTaskId)>,
+    /// Phase 10 · E durable idempotency table, keyed by `request_id`.
+    /// Mirrors the `agent_sdk_idempotency` row the SQL backends own so
+    /// in-memory tests exercise the same dedup contract.
+    idempotency: HashMap<String, IdempotencyRecord>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -1232,6 +1449,13 @@ impl Inner {
     /// Is the thread's active-root slot currently held by a blocking root?
     fn thread_has_blocking_root(&self, thread_id: &ThreadId) -> bool {
         self.active_root_by_thread.contains_key(thread_id)
+    }
+
+    /// Number of queued (not active/blocking) root turns on a thread.
+    fn queued_root_count(&self, thread_id: &ThreadId) -> u32 {
+        self.queued_roots_by_thread
+            .get(thread_id)
+            .map_or(0, |queue| u32::try_from(queue.len()).unwrap_or(u32::MAX))
     }
 
     /// Rebalance every secondary index after mutating a row from `old`
@@ -1929,29 +2153,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // and only with freshly-constructed rows. Everything else must
         // go through `insert` / `update` and pays for the tighter
         // per-call invariants there.
-        if task.kind != TaskKind::RootTurn {
-            let kind = task.kind;
-            return Err(anyhow!(
-                "submit_root_turn rejected: expected root_turn, got {kind:?}"
-            ));
-        }
-        if task.status != TaskStatus::Pending {
-            let status = task.status;
-            return Err(anyhow!(
-                "submit_root_turn rejected: new root must start in Pending (got {status:?})"
-            ));
-        }
-        if task.attempt != 0 {
-            let attempt = task.attempt;
-            return Err(anyhow!(
-                "submit_root_turn rejected: new root must have attempt == 0 (got {attempt})"
-            ));
-        }
-        if !task.is_root() {
-            return Err(anyhow!("submit_root_turn rejected: task must be a root"));
-        }
-        task.validate()
-            .context("submit_root_turn rejected: task failed schema validation")?;
+        validate_submit_root_shape(&task)?;
 
         let mut inner = self.inner.write().await;
 
@@ -1991,6 +2193,139 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.by_id.insert(admitted.id.clone(), admitted.clone());
         drop(inner);
         Ok(admitted)
+    }
+
+    async fn submit_root_turn_idempotent(
+        &self,
+        params: SubmitRootTurnParams,
+    ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError> {
+        let SubmitRootTurnParams {
+            task,
+            idempotency,
+            max_queued_depth,
+        } = params;
+        validate_submit_root_shape(&task)?;
+
+        // Everything below runs under a single write lock so the
+        // idempotency claim, the queue-depth check, and the admission
+        // insert are atomic — a concurrent retry on the same key cannot
+        // slip between the lookup and the insert.
+        let mut inner = self.inner.write().await;
+
+        // 1. Idempotency replay / conflict, checked before any write.
+        if let Some(claim) = &idempotency
+            && let Some(record) = inner.idempotency.get(&claim.request_id)
+        {
+            if record.kind != IdempotencyKind::SubmitWork || record.fingerprint != claim.fingerprint
+            {
+                return Err(SubmitRootTurnError::IdempotencyConflict);
+            }
+            let recorded = record.clone();
+            let task_id = submit_record_task_id(&recorded)?;
+            let admitted = inner
+                .by_id
+                .get(&task_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("idempotent submit record points at missing task"))?;
+            let queued_depth = inner.queued_root_count(&admitted.thread_id);
+            drop(inner);
+            return Ok(SubmitRootTurnOutcome {
+                task: admitted,
+                replayed: true,
+                replayed_result: Some(recorded.result_json),
+                queued_depth,
+            });
+        }
+
+        if inner.by_id.contains_key(&task.id) {
+            let id = &task.id;
+            return Err(SubmitRootTurnError::Other(anyhow!(
+                "submit_root_turn rejected: task id {id} already exists"
+            )));
+        }
+
+        let has_blocking = inner.thread_has_blocking_root(&task.thread_id);
+        let current_queued = inner.queued_root_count(&task.thread_id);
+
+        // 2. Back-pressure: a submission that would be *queued* (the
+        // thread already holds the active slot or has queued roots) and
+        // would push the queued depth past the cap is rejected before
+        // anything is written. A submission that lands in the active
+        // slot (no blocking root, no queued roots) never counts against
+        // the cap.
+        let would_queue = has_blocking || current_queued > 0;
+        if let Some(cap) = max_queued_depth
+            && would_queue
+            && current_queued >= cap
+        {
+            return Err(SubmitRootTurnError::QueueDepthExceeded {
+                cap,
+                current_depth: current_queued,
+            });
+        }
+
+        let admitted = if would_queue {
+            let created_at = task.created_at;
+            task.admit_as_queued(created_at)
+                .context("submit_root_turn rejected: cannot admit as queued")?
+        } else {
+            task
+        };
+
+        inner.add_to_indexes(&admitted);
+        inner.by_id.insert(admitted.id.clone(), admitted.clone());
+
+        // 3. Claim the idempotency key in the same critical section.
+        if let Some(claim) = idempotency {
+            inner.idempotency.insert(
+                claim.request_id.clone(),
+                IdempotencyRecord {
+                    request_id: claim.request_id,
+                    kind: IdempotencyKind::SubmitWork,
+                    fingerprint: claim.fingerprint,
+                    result_json: claim.result_json,
+                },
+            );
+        }
+
+        let queued_depth = inner.queued_root_count(&admitted.thread_id);
+        drop(inner);
+        Ok(SubmitRootTurnOutcome {
+            task: admitted,
+            replayed: false,
+            replayed_result: None,
+            queued_depth,
+        })
+    }
+
+    async fn claim_idempotency(
+        &self,
+        request_id: &str,
+        kind: IdempotencyKind,
+        fingerprint: &[u8],
+    ) -> Result<IdempotencyClaim> {
+        let inner = self.inner.read().await;
+        let claim = match inner.idempotency.get(request_id) {
+            None => IdempotencyClaim::Fresh,
+            Some(record) if record.kind == kind && record.fingerprint == fingerprint => {
+                IdempotencyClaim::Replay(Box::new(record.clone()))
+            }
+            Some(_) => IdempotencyClaim::Conflict,
+        };
+        drop(inner);
+        Ok(claim)
+    }
+
+    async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        // Insert-if-absent: a record committed by a racing retry that
+        // already claimed the key must not be clobbered.
+        inner
+            .idempotency
+            .entry(record.request_id.clone())
+            .or_insert(record);
+        drop(inner);
+        Ok(())
     }
 
     async fn list_queued_roots(&self, thread_id: &ThreadId) -> Result<Vec<AgentTask>> {

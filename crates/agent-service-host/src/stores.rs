@@ -373,8 +373,16 @@ impl StoreRegistry {
     ///
     /// This is idempotent and safe to call more than once.
     ///
+    /// The `async`/`Result` signature is uniform across every backend so
+    /// callers do not branch on feature flags. Only the `Postgres` backend
+    /// actually awaits work (running migrations); the in-memory and `SQLite`
+    /// arms are trivially infallible, so without the `postgres` feature the
+    /// body has no `await` — hence the narrowly-scoped `unused_async` allow
+    /// for exactly that build configuration.
+    ///
     /// # Errors
     /// Returns an error if backend initialization fails.
+    #[cfg_attr(not(feature = "postgres"), allow(clippy::unused_async))]
     pub async fn initialize(&self) -> Result<()> {
         match &self.backend {
             RegistryBackend::InMemory => Ok(()),

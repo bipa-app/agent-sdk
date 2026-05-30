@@ -82,11 +82,11 @@ mod tests {
     fn sqlite_executable_migration_bundle_contains_all_migrations() -> Result<()> {
         let migrations = &DURABLE_CORE_MIGRATOR.migrations;
         ensure!(
-            migrations.len() == 8,
-            "expected 8 executable migrations, got {:?}",
+            migrations.len() == 9,
+            "expected 9 executable migrations, got {:?}",
             migrations.iter().map(|m| m.version).collect::<Vec<_>>(),
         );
-        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+        for (idx, expected) in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9].iter().enumerate() {
             ensure!(
                 migrations[idx].version == *expected,
                 "expected version {expected}, got {}",
@@ -199,7 +199,7 @@ mod tests {
     async fn sqlite_migrations_apply_to_in_memory_database() -> Result<()> {
         let store = super::SqliteDurableStore::connect("sqlite::memory:").await?;
 
-        // Verify all 10 tables exist by querying sqlite_master.
+        // Verify every durable-core table exists by querying sqlite_master.
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'agent_sdk_%' ORDER BY name",
         )
@@ -219,6 +219,7 @@ mod tests {
             "agent_sdk_retention_cursors",
             "agent_sdk_execution_intents",
             "agent_sdk_tool_audit_events",
+            "agent_sdk_idempotency",
         ]
         .into_iter()
         .map(String::from)

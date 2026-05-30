@@ -44,11 +44,15 @@ const TURN_ATTEMPT_OTEL_IDS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0008_turn_attempt_otel_ids.sql"
 ));
+const IDEMPOTENCY_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0009_idempotency.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 6] = [
+const MIGRATIONS: [SqliteMigration; 7] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -78,6 +82,11 @@ const MIGRATIONS: [SqliteMigration; 6] = [
         version: "0008",
         summary: "Phase 9 A7 turn attempt OTel trace + span ids for replay-link emission",
         sql: TURN_ATTEMPT_OTEL_IDS_SQL,
+    },
+    SqliteMigration {
+        version: "0009",
+        summary: "Phase 10 E durable at-least-once idempotency records",
+        sql: IDEMPOTENCY_SQL,
     },
 ];
 
@@ -131,4 +140,10 @@ pub const fn outbox_message_kind_migration() -> &'static str {
 #[must_use]
 pub const fn turn_attempt_otel_ids_migration() -> &'static str {
     TURN_ATTEMPT_OTEL_IDS_SQL
+}
+
+/// The reviewable Phase 10 E idempotency migration SQL.
+#[must_use]
+pub const fn idempotency_migration() -> &'static str {
+    IDEMPOTENCY_SQL
 }
