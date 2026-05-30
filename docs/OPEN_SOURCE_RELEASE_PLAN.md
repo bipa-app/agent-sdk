@@ -175,14 +175,14 @@ Linear is canonical for state; this table is a convenience mirror that **may lag
 | 10·D atomic commit + durable wakeup | `ENG-8706` | Merged | [#255](https://github.com/bipa-app/agent-sdk/pull/255) |
 | 10·E idempotency + back-pressure + retry | `ENG-8707` | Merged | [#257](https://github.com/bipa-app/agent-sdk/pull/257) |
 | 11·A test substrate + Postgres-in-CI | `ENG-8708` | Merged | [#253](https://github.com/bipa-app/agent-sdk/pull/253) |
-| 11·B journal conformance battery | `ENG-8709` | In Progress | — |
-| 11·C cancel/lifecycle matrix | `ENG-8710` | In Progress | — |
-| 11·D durability/replay/DST/loom | `ENG-8711` | In Progress | — |
-| 11·E provider determinism + streaming | `ENG-8712` | In Progress | — |
-| 12·A ergonomics + façade | `ENG-8713` | Backlog (blocked) | — |
-| 12·B feature-gating + deps | `ENG-8714` | Backlog (blocked) | — |
-| 12·C CLI + examples | `ENG-8715` | Backlog (blocked) | — |
-| 12·D relicense + scrub + secret scan | `ENG-8716` | Backlog (blocked) | — |
+| 11·B journal conformance battery | `ENG-8709` | Merged | [#260](https://github.com/bipa-app/agent-sdk/pull/260) |
+| 11·C cancel/lifecycle matrix | `ENG-8710` | Merged | [#259](https://github.com/bipa-app/agent-sdk/pull/259) |
+| 11·D durability/replay/DST/loom | `ENG-8711` | Merged | [#261](https://github.com/bipa-app/agent-sdk/pull/261) |
+| 11·E provider determinism + streaming | `ENG-8712` | Merged | [#262](https://github.com/bipa-app/agent-sdk/pull/262) |
+| 12·A ergonomics + façade | `ENG-8713` | In Progress | — |
+| 12·B feature-gating + deps | `ENG-8714` | In Progress | — |
+| 12·C CLI + examples | `ENG-8715` | In Progress | — |
+| 12·D relicense + scrub + secret scan | `ENG-8716` | In Progress | — |
 | 12·E crates.io packaging | `ENG-8717` | Backlog (blocked) | — |
 | 12·F CI/release automation | `ENG-8718` | Backlog (blocked) | — |
 | 12·G publish + go public | `ENG-8719` | Backlog (blocked) | — |
@@ -196,6 +196,7 @@ Append-only; newest last. One line per event: date — what changed.
 - 2026-05-30 — Restructured this document into a living execution log (how-to-use + update protocol, per-task tables with done-when bars, status mirror, append-only log); applied an adversarial review pass (precedence rule for the §7 mirror, per-task done-when on Phases 11/12, conformance-battery naming, and a §6.4 scrub-location correction).
 - 2026-05-30 — 10·E (`ENG-8707`) landed (draft PR #257; verified on live Postgres + SQLite): durable cross-restart idempotency, queue/input back-pressure, retry-budget reconciliation. **Phase 10 implementation drafts are now complete (A–E)**; all six initially-unblocked tasks (10·A–E, 11·A) are in review. This plan log is now on `main`, so subsequent §7/§8 updates ride along with each task's PR.
 - 2026-05-30 — **Phase 10 complete.** 10·A–E merged to `main` (#256 / #254 / #252 / #255 / #257) alongside 11·A (#253). Each landed after rebasing onto the moving `main` with all CI green. Two silent issues were caught during rebase and fixed before merge: a `large_futures` regression from 10·B's added plumbing, and an auto-merge (zero textual conflicts) that dropped 10·D's durable `task_wakeup` on 10·E's idempotent admission path — both locked in with regression tests. Launching the Phase 11·B–E robustness-test wave in parallel worktrees off the updated `main`.
+- 2026-05-30 — **Phase 11 complete.** 11·B–E implemented in a parallel workflow wave and merged (#260 / #259 / #261 / #262), each rebased onto the moving `main`: the `run_journal_store_conformance` battery across in-mem/SQLite/Postgres; the §6.1 cancellation + message-lifecycle matrix; the durability suite (on-disk reopen-resume, `fail-rs` crash-between-steps, replay-determinism, seeded DST, scoped `loom` in a new `agent-server-loom` crate); and provider determinism (shared streaming provider, 16 re-enabled streaming tests, `wiremock` Tier-B, gated Tier-C). Also fixed `main`'s branch protection (required check `Test` → `Test (nextest)` + `Postgres integration`) after 11·A's CI rename. Notes for Phase 12: `rvcr` was not viable (reqwest 0.11 vs the providers' 0.13) so Tier-B uses `wiremock` only; the new `agent-server-loom` crate must be accounted for in packaging (12·E). Launching the Phase 12·A–D simplification+release wave.
 
 ## 9. Definition of Done (launch)
 
@@ -204,9 +205,9 @@ This is the aggregate launch gate; it rolls up the per-phase definitions of done
 - [ ] Full git history secret-scanned clean; repo can go public
 - [ ] MIT `LICENSE`; README/CONTRIBUTING/SECURITY consistent; no Bipa-internal coupling remains
 - [x] All Phase 10 tasks merged, each with a regression test
-- [ ] `run_journal_store_conformance` passes on in-memory + SQLite + Postgres
-- [ ] Edge-case matrix (§6.1) implemented; the 17 ignored streaming tests re-enabled and green
-- [ ] ≥1 real reopen-from-disk resume test and ≥1 `fail-rs` crash-between-steps test green
+- [x] `run_journal_store_conformance` passes on in-memory + SQLite + Postgres
+- [x] Edge-case matrix (§6.1) implemented; the 16 ignored streaming tests re-enabled and green
+- [x] ≥1 real reopen-from-disk resume test and ≥1 `fail-rs` crash-between-steps test green
 - [ ] Postgres tests run in CI; nextest + cargo-deny/audit/semver-checks in CI; MSRV declared & tested
 - [ ] `cargo add agent-sdk` works with the documented quickstart; `agent-sdk chat` runs an agent
 - [ ] Every published crate has metadata + docs.rs config; `cargo publish --dry-run` clean for all
