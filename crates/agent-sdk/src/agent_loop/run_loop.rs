@@ -35,6 +35,25 @@ enum RunLoopTurnAction {
     Return(AgentRunState),
 }
 
+/// Stamp the run's SDK-boundary controls onto the tool context.
+///
+/// Injects the run's cancel token and the configured per-tool timeout
+/// (`AgentConfig::tool_timeout_ms`) so the tool-execution boundary can
+/// race every tool's `execute()` against both. Mirrors the historical
+/// `with_cancel_token` injection and is the single place the timeout
+/// crosses from config into the tool context.
+fn apply_tool_boundary_controls<Ctx>(
+    tool_context: ToolContext<Ctx>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    tool_timeout_ms: Option<u64>,
+) -> ToolContext<Ctx> {
+    let tool_context = tool_context.with_cancel_token(cancel_token.clone());
+    match tool_timeout_ms {
+        Some(ms) => tool_context.with_tool_timeout(std::time::Duration::from_millis(ms)),
+        None => tool_context,
+    }
+}
+
 /// Initialize agent state from the given input.
 ///
 /// Handles the three input variants:
@@ -1885,7 +1904,8 @@ where
     M: MessageStore,
     S: StateStore,
 {
-    let tool_context = tool_context.with_cancel_token(cancel_token.clone());
+    let tool_context =
+        apply_tool_boundary_controls(tool_context, &cancel_token, config.tool_timeout_ms);
     let provenance =
         agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
@@ -2135,7 +2155,8 @@ where
         .await;
     }
 
-    let tool_context = tool_context.with_cancel_token(cancel_token.clone());
+    let tool_context =
+        apply_tool_boundary_controls(tool_context, &cancel_token, config.tool_timeout_ms);
     let start_time = Instant::now();
     #[cfg(feature = "otel")]
     let input_kind = crate::observability::attrs::input_kind_str(&input);

@@ -104,6 +104,23 @@ where
     }
 }
 
+/// Drop a spawned run task's [`tokio::task::JoinHandle`], logging a
+/// `debug!` to make the detach visible.
+///
+/// `run` / `run_with_options` intentionally drop the handle: the run is
+/// stopped through the cancel token or the per-tool timeout, not by
+/// aborting the task. Surfacing the detach at `debug` level gives a
+/// breadcrumb when a subprocess-backed tool that ignores the
+/// cooperative-cancel contract leaks a process after cancellation.
+fn warn_on_detached_run_handle(handle: tokio::task::JoinHandle<()>) {
+    log::debug!(
+        "agent run JoinHandle dropped (task detached); the run can only be \
+         stopped via its cancel token or per-tool timeout. Subprocess-backed \
+         tools must honour kill_on_drop or a token-aware kill to avoid leaks"
+    );
+    drop(handle);
+}
+
 /// Handle to a persistent agent thread.
 ///
 /// Returned by [`AgentLoop::run_persistent`]. Allows the caller to send
@@ -360,6 +377,23 @@ where
     ///     AgentRunState::Error(e) => { /* handle error */ }
     /// }
     /// ```
+    /// # Cancellation, timeout, and the dropped `JoinHandle`
+    ///
+    /// `run` spawns the agent loop on a Tokio task and returns only the
+    /// state receiver — it **drops** the task's [`tokio::task::JoinHandle`].
+    /// Dropping a `JoinHandle` *detaches* the task rather than aborting
+    /// it, so the only ways to stop an in-flight run are the
+    /// `cancel_token` (cooperative) or the per-tool
+    /// [`AgentConfig::tool_timeout_ms`](crate::types::AgentConfig::tool_timeout_ms)
+    /// boundary. Callers that need to forcibly abort must use
+    /// [`run_abortable`](Self::run_abortable) and keep the handle.
+    ///
+    /// Because the handle is dropped, a tool that holds a subprocess open
+    /// must obey the
+    /// [cooperative-cancel contract](crate::tools::Tool#cooperative-cancellation)
+    /// (`kill_on_drop` or a token-aware `kill`) or the subprocess will
+    /// outlive the cancelled / timed-out run. A `debug!` is logged here so
+    /// the detach is visible when chasing a leaked subprocess.
     pub fn run(
         &self,
         thread_id: ThreadId,
@@ -370,7 +404,8 @@ where
     where
         Ctx: Clone,
     {
-        let (state_rx, _handle) = self.run_abortable(thread_id, input, tool_context, cancel_token);
+        let (state_rx, handle) = self.run_abortable(thread_id, input, tool_context, cancel_token);
+        warn_on_detached_run_handle(handle);
         state_rx
     }
 
@@ -396,13 +431,14 @@ where
     where
         Ctx: Clone,
     {
-        let (state_rx, _handle) = self.run_abortable_with_options(
+        let (state_rx, handle) = self.run_abortable_with_options(
             thread_id,
             input,
             tool_context,
             cancel_token,
             run_options,
         );
+        warn_on_detached_run_handle(handle);
         state_rx
     }
 
