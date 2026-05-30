@@ -26,7 +26,11 @@ html2text = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+wiremock = { workspace = true }
+# Tier-C live smoke constructs a `Tool` whose `tier` is the core
+# `ToolTier` enum (not re-exported through the `llm` glob).
+agent-sdk-core = { workspace = true }
 
 [lints]
 workspace = true

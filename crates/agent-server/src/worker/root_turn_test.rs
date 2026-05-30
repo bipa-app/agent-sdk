@@ -485,7 +485,6 @@ async fn checkpoint_contains_correct_agent_state() -> Result<()> {
     Ok(())
 }
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn turn_attempt_is_opened_and_closed() -> Result<()> {
     let stores = TestStores::new();
@@ -512,8 +511,14 @@ async fn turn_attempt_is_opened_and_closed() -> Result<()> {
     // Verify turn attempt lifecycle.
     let attempt = &commit.closed_attempt;
     assert!(attempt.is_closed());
-    assert_eq!(attempt.response_id, Some("msg_mock_01".into()));
+    // Post-streaming-refactor invariant: the worker drives `chat_stream`
+    // and synthesizes the response from the `StreamAccumulator`, which
+    // never reaches a provider's response-id space — so the closed
+    // attempt records no `response_id` even though the underlying mock
+    // returns one for the non-streaming `chat()` path.
+    assert_eq!(attempt.response_id, None);
     assert_eq!(attempt.response_model, Some("mock-model".into()));
+    // Usage is carried through the streamed `Usage` delta unchanged.
     assert_eq!(attempt.input_tokens, Some(100));
     assert_eq!(attempt.output_tokens, Some(50));
 
@@ -525,15 +530,20 @@ async fn turn_attempt_is_opened_and_closed() -> Result<()> {
     Ok(())
 }
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn llm_error_propagates() -> Result<()> {
+    // A caller-side `InvalidRequest` is a *fatal* stream error: the
+    // retry wrapper skips the backoff loop entirely.  This is the
+    // cleanest "an LLM error propagates and no durable turn is
+    // committed" probe — the recoverable `ServerError` path (which
+    // retries to budget exhaustion) is covered separately by
+    // `stream_server_error_exhausts_budget_and_fails`.
     struct ErrorProvider;
 
     #[async_trait]
     impl LlmProvider for ErrorProvider {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-            Ok(ChatOutcome::ServerError("internal error".into()))
+            Ok(ChatOutcome::InvalidRequest("internal error".into()))
         }
 
         fn model(&self) -> &'static str {
@@ -564,8 +574,8 @@ async fn llm_error_propagates() -> Result<()> {
 
     let err_msg = format!("{err:#}");
     assert!(
-        err_msg.contains("server error"),
-        "expected LLM server error, got: {err_msg}",
+        err_msg.contains("internal error"),
+        "expected the LLM error to propagate, got: {err_msg}",
     );
 
     // No durable turn data committed.
@@ -576,7 +586,8 @@ async fn llm_error_propagates() -> Result<()> {
         .context("thread from recovery")?;
     assert_eq!(thread.committed_turns, 0);
 
-    // Turn attempt was opened and closed with the error outcome.
+    // Exactly one turn attempt, opened and closed with the error
+    // outcome — the fatal kind does not retry.
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert_eq!(attempts.len(), 1);
     assert!(
@@ -591,7 +602,6 @@ async fn llm_error_propagates() -> Result<()> {
 // Phase 4.4 — tool-boundary suspension tests
 // ─────────────────────────────────────────────────────────────────────
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn tool_suspension_end_to_end() -> Result<()> {
     let stores = TestStores::new();
@@ -668,7 +678,9 @@ async fn tool_suspension_end_to_end() -> Result<()> {
     let attempts = stores.attempts.list_by_task(&task_id).await?;
     assert_eq!(attempts.len(), 1);
     assert!(attempts[0].is_closed());
-    assert_eq!(attempts[0].response_id, Some("msg_tool_01".into()));
+    // Post-streaming-refactor: synthesized responses carry no provider
+    // response-id, so the closed attempt records `None`.
+    assert_eq!(attempts[0].response_id, None);
     assert_eq!(attempts[0].response_model, Some("mock-model".into()));
     assert_eq!(attempts[0].input_tokens, Some(120));
     assert_eq!(attempts[0].output_tokens, Some(60));
@@ -734,7 +746,6 @@ async fn tool_suspension_multiple_tool_calls() -> Result<()> {
     Ok(())
 }
 
-#[ignore = "streaming refactor: Start now committed pre-LLM, deltas added; see PR for new event-ordering invariants"]
 #[tokio::test]
 async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     let stores = TestStores::new();
@@ -816,8 +827,11 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     // No completed results yet (tools haven't run).
     assert!(payload.completed_results.is_empty());
 
-    // LLM metadata preserved.
-    assert_eq!(payload.response_id, Some("msg_tool_01".into()));
+    // LLM metadata preserved.  Post-streaming-refactor the synthesized
+    // response carries no provider response-id, so the continuation's
+    // `response_id` is `None`; the stop reason still flows through the
+    // streamed `Done` delta.
+    assert_eq!(payload.response_id, None);
     assert_eq!(payload.stop_reason, Some(StopReason::ToolUse));
 
     // Agent state snapshot.

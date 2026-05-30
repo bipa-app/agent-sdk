@@ -45,7 +45,8 @@ otel = ["dep:opentelemetry"]
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+async-stream = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
