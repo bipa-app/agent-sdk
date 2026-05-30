@@ -38,11 +38,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run a single prompt against an Anthropic-backed agent and stream the
-    /// reply to stdout. Reads `ANTHROPIC_API_KEY` from the environment.
+    /// Run a single prompt against an LLM-backed agent and stream the reply to
+    /// stdout. Pick a backend with `--provider` (default `anthropic`); reads
+    /// that provider's credentials from the environment.
     Run(agent::RunArgs),
-    /// Interactive chat with an Anthropic-backed agent; streams replies and
-    /// keeps conversation history for the session. Reads `ANTHROPIC_API_KEY`.
+    /// Interactive chat with an LLM-backed agent; streams replies and keeps
+    /// conversation history for the session. Pick a backend with `--provider`
+    /// (default `anthropic`); reads that provider's credentials from the env.
     Chat(agent::ChatArgs),
     /// Manage the local Langfuse + `OTel` collector dev stack.
     LocalLangfuse {
