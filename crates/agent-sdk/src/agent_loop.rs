@@ -56,6 +56,7 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentError, AgentInput, AgentRunState, RunOptions, ThreadId};
 use futures::FutureExt;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -119,6 +120,22 @@ fn warn_on_detached_run_handle(handle: tokio::task::JoinHandle<()>) {
          tools must honour kill_on_drop or a token-aware kill to avoid leaks"
     );
     drop(handle);
+}
+
+/// Await a run's state receiver, mapping a dropped channel to an `anyhow`
+/// error so `run`/`run_with_options` can present an `impl Future` instead of
+/// a bare [`oneshot::Receiver`].
+///
+/// A panic inside the run is already converted to
+/// [`AgentRunState::Error`] before the channel send (see
+/// [`run_loop_isolated`]), so the only way `recv` fails is the sender being
+/// dropped without sending — a runtime shutdown rather than an agent error.
+async fn recv_run_state(
+    state_rx: oneshot::Receiver<AgentRunState>,
+) -> anyhow::Result<AgentRunState> {
+    state_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("agent run task was dropped before reporting a final state"))
 }
 
 /// Handle to a persistent agent thread.
@@ -287,7 +304,7 @@ where
 
     /// Set the authoritative tool audit sink.
     ///
-    /// When set, the loop emits a [`ToolAuditRecord`](crate::ToolAuditRecord)
+    /// When set, the loop emits a [`ToolAuditRecord`](crate::advanced::ToolAuditRecord)
     /// at every tool-lifecycle transition (blocked, requires-confirmation,
     /// cached, replayed, invalidated, completed, persistence-failed).
     ///
@@ -344,7 +361,16 @@ where
     ///
     /// # Returns
     ///
-    /// A [`oneshot::Receiver`] that resolves to the final run state.
+    /// A future that resolves to the final [`AgentRunState`]. Awaiting it
+    /// drives the run to completion:
+    ///
+    /// ```ignore
+    /// let final_state = agent.run(thread_id, input, tool_ctx, cancel).await?;
+    /// ```
+    ///
+    /// The future is `'static` — the run is already spawned on a Tokio task
+    /// before this returns, so dropping the future does **not** stop the run
+    /// (use `cancel_token`). Awaiting it only waits for the result.
     ///
     /// # Example
     ///
@@ -355,9 +381,9 @@ where
     ///     AgentInput::Text("Hello".to_string()),
     ///     tool_ctx,
     ///     cancel.clone(),
-    /// );
+    /// ).await?;
     ///
-    /// match final_state.await.unwrap() {
+    /// match final_state {
     ///     AgentRunState::Done { .. } => { /* completed */ }
     ///     AgentRunState::Cancelled { .. } => { /* user cancelled */ }
     ///     AgentRunState::AwaitingConfirmation { continuation, .. } => {
@@ -372,18 +398,18 @@ where
     ///             },
     ///             tool_ctx,
     ///             cancel.clone(),
-    ///         );
+    ///         ).await?;
     ///     }
     ///     AgentRunState::Error(e) => { /* handle error */ }
     /// }
     /// ```
     /// # Cancellation, timeout, and the dropped `JoinHandle`
     ///
-    /// `run` spawns the agent loop on a Tokio task and returns only the
-    /// state receiver — it **drops** the task's [`tokio::task::JoinHandle`].
-    /// Dropping a `JoinHandle` *detaches* the task rather than aborting
-    /// it, so the only ways to stop an in-flight run are the
-    /// `cancel_token` (cooperative) or the per-tool
+    /// `run` spawns the agent loop on a Tokio task and returns a future over
+    /// the state channel — it **drops** the task's
+    /// [`tokio::task::JoinHandle`]. Dropping a `JoinHandle` *detaches* the
+    /// task rather than aborting it, so the only ways to stop an in-flight
+    /// run are the `cancel_token` (cooperative) or the per-tool
     /// [`AgentConfig::tool_timeout_ms`](crate::types::AgentConfig::tool_timeout_ms)
     /// boundary. Callers that need to forcibly abort must use
     /// [`run_abortable`](Self::run_abortable) and keep the handle.
@@ -394,19 +420,25 @@ where
     /// (`kill_on_drop` or a token-aware `kill`) or the subprocess will
     /// outlive the cancelled / timed-out run. A `debug!` is logged here so
     /// the detach is visible when chasing a leaked subprocess.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the spawned run task is dropped before it can
+    /// report a final state (e.g. a runtime shutdown). A panic inside the run
+    /// is caught and surfaced as [`AgentRunState::Error`], not as an `Err`.
     pub fn run(
         &self,
         thread_id: ThreadId,
         input: AgentInput,
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
-    ) -> oneshot::Receiver<AgentRunState>
+    ) -> impl Future<Output = anyhow::Result<AgentRunState>> + Send + 'static
     where
         Ctx: Clone,
     {
         let (state_rx, handle) = self.run_abortable(thread_id, input, tool_context, cancel_token);
         warn_on_detached_run_handle(handle);
-        state_rx
+        recv_run_state(state_rx)
     }
 
     /// Like [`run`](Self::run), but with caller-supplied trace metadata.
@@ -420,6 +452,10 @@ where
     /// Use this instead of `run` whenever the consumer needs the
     /// SDK to populate Langfuse trace metadata; `run` itself
     /// continues to delegate here with `RunOptions::default()`.
+    ///
+    /// # Errors
+    ///
+    /// See [`run`](Self::run).
     pub fn run_with_options(
         &self,
         thread_id: ThreadId,
@@ -427,7 +463,7 @@ where
         tool_context: ToolContext<Ctx>,
         cancel_token: CancellationToken,
         run_options: RunOptions,
-    ) -> oneshot::Receiver<AgentRunState>
+    ) -> impl Future<Output = anyhow::Result<AgentRunState>> + Send + 'static
     where
         Ctx: Clone,
     {
@@ -439,7 +475,7 @@ where
             run_options,
         );
         warn_on_detached_run_handle(handle);
-        state_rx
+        recv_run_state(state_rx)
     }
 
     /// Like [`run`](Self::run), but also returns the [`tokio::task::JoinHandle`] for the
@@ -826,5 +862,94 @@ where
             observability_store: self.observability_store.clone(),
         })
         .await
+    }
+}
+
+/// High-level convenience API for agents whose tools take no application
+/// context (`Ctx = ()`).
+///
+/// [`ask`](Self::ask) and [`send`](Self::send) collapse the four pieces of
+/// ceremony in the low-level [`run`](Self::run) path — constructing a
+/// [`ToolContext::new(())`](crate::ToolContext::new), creating a
+/// [`CancellationToken`], awaiting the run, and reassembling the assistant
+/// text out of the event store — into a single call that returns a `String`.
+///
+/// Reach for [`run`](Self::run) or [`run_turn`](Self::run_turn) when you need
+/// application context, cancellation, confirmation flow, or access to the raw
+/// [`AgentRunState`].
+impl<P, H, M, S> AgentLoop<(), P, H, M, S>
+where
+    P: LlmProvider + 'static,
+    H: AgentHooks + 'static,
+    M: MessageStore + 'static,
+    S: StateStore + 'static,
+{
+    /// Ask the agent a question and return its assembled reply.
+    ///
+    /// This is the 30-second on-ramp: it builds a fresh
+    /// [`ToolContext::new(())`](crate::ToolContext::new) and a
+    /// [`CancellationToken`] internally, runs the agent to completion, and
+    /// returns the assistant text emitted during this call concatenated into
+    /// one `String`.
+    ///
+    /// For confirmation flows, application context, or explicit cancellation,
+    /// use [`run`](Self::run) directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run task is dropped before reporting a state,
+    /// if the run ends in [`AgentRunState::Error`], or if the event store
+    /// cannot be read back.
+    pub async fn ask(
+        &self,
+        thread_id: ThreadId,
+        text: impl Into<String>,
+    ) -> anyhow::Result<String> {
+        self.send(thread_id, AgentInput::Text(text.into())).await
+    }
+
+    /// Send an [`AgentInput`] to the agent and return its assembled reply.
+    ///
+    /// Like [`ask`](Self::ask) but accepts a full [`AgentInput`] (e.g. to
+    /// resume after confirmation). Builds the
+    /// [`ToolContext`](crate::ToolContext) and [`CancellationToken`]
+    /// internally and returns the assistant text emitted during this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run task is dropped before reporting a state,
+    /// if the run ends in [`AgentRunState::Error`], or if the event store
+    /// cannot be read back.
+    pub async fn send(&self, thread_id: ThreadId, input: AgentInput) -> anyhow::Result<String> {
+        use crate::events::AgentEvent;
+
+        // Snapshot the existing event count so we only assemble text emitted
+        // by this call, not earlier turns persisted on the same thread.
+        let baseline = self.event_store.get_events(&thread_id).await?.len();
+
+        let state = self
+            .run(
+                thread_id.clone(),
+                input,
+                ToolContext::new(()),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        if let AgentRunState::Error(error) = state {
+            return Err(anyhow::Error::new(error));
+        }
+
+        let events = self.event_store.get_events(&thread_id).await?;
+        let reply = events
+            .into_iter()
+            .skip(baseline)
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+
+        Ok(reply)
     }
 }

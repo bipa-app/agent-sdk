@@ -224,7 +224,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     /// Set the authoritative tool audit sink.
     ///
     /// When set, the agent loop emits a
-    /// [`ToolAuditRecord`](crate::ToolAuditRecord) at every tool
+    /// [`ToolAuditRecord`](crate::advanced::ToolAuditRecord) at every tool
     /// lifecycle transition — blocked, requires-confirmation, cached,
     /// replayed, invalidated, completed, and persistence-failed. This
     /// gives servers a complete audit trail without relying on the weaker
@@ -362,7 +362,14 @@ where
     /// - `DefaultHooks` for hooks
     /// - `InMemoryStore` for message store
     /// - `InMemoryStore` for state store
+    /// - `InMemoryEventStore` for the event store, when none was set
     /// - `AgentConfig::default()` if no config is set
+    ///
+    /// Supplying an [`event_store`](Self::event_store) is optional for this
+    /// convenience build — a fresh [`InMemoryEventStore`](crate::InMemoryEventStore)
+    /// is used by default so the 30-second path needs no `Arc` ceremony. Wire
+    /// a durable store explicitly when you need persistence across process
+    /// restarts.
     ///
     /// # Panics
     ///
@@ -372,9 +379,9 @@ where
         let Some(provider) = self.provider else {
             panic!("provider is required");
         };
-        let Some(event_store) = self.event_store else {
-            panic!("event_store is required");
-        };
+        let event_store = self
+            .event_store
+            .unwrap_or_else(|| Arc::new(crate::stores::InMemoryEventStore::new()));
         let tools = self.tools.unwrap_or_default();
         let config = self.config.unwrap_or_default();
 

@@ -10,6 +10,27 @@
 //!
 //! ## Quick Start
 //!
+//! Ask a question and print the answer — the whole 30-second path:
+//!
+//! ```no_run
+//! use agent_sdk::{builder, ThreadId, providers::AnthropicProvider};
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let agent = builder::<()>()
+//!     .provider(AnthropicProvider::from_env()) // reads ANTHROPIC_API_KEY
+//!     .build();
+//!
+//! let answer = agent.ask(ThreadId::new(), "What is the capital of France?").await?;
+//! println!("{answer}");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`ask`](AgentLoop::ask) builds the [`ToolContext`] and [`CancellationToken`]
+//! internally and returns the assembled assistant text. When you need
+//! application context, a confirmation flow, explicit cancellation, or the raw
+//! [`AgentRunState`], drop down to [`run`](AgentLoop::run):
+//!
 //! ```no_run
 //! use agent_sdk::{
 //!     builder, AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
@@ -18,35 +39,23 @@
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // 1. Create an LLM provider
-//! let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-//! let provider = AnthropicProvider::sonnet(api_key);
-//!
-//! // 2. Build the agent
 //! let event_store = Arc::new(InMemoryEventStore::new());
 //! let agent = builder::<()>()
-//!     .provider(provider)
+//!     .provider(AnthropicProvider::from_env())
 //!     .event_store(event_store.clone())
 //!     .build();
 //!
-//! // 3. Run a conversation
 //! let thread_id = ThreadId::new();
-//! let ctx = ToolContext::new(());
-//! let cancel = CancellationToken::new();
 //! let final_state = agent.run(
 //!     thread_id.clone(),
 //!     AgentInput::Text("Hello!".to_string()),
-//!     ctx,
-//!     cancel,
-//! );
-//! let _ = final_state.await?;
+//!     ToolContext::new(()),
+//!     CancellationToken::new(),
+//! ).await?;
 //!
-//! // 4. Read persisted events
 //! for envelope in event_store.get_events(&thread_id).await? {
-//!     match envelope.event {
-//!         AgentEvent::Text { message_id: _, text } => print!("{text}"),
-//!         AgentEvent::Done { .. } => break,
-//!         _ => {}
+//!     if let AgentEvent::Text { text, .. } = envelope.event {
+//!         print!("{text}");
 //!     }
 //! }
 //! # Ok(())
@@ -68,58 +77,38 @@
 //! Use [`builder()`] to construct an agent:
 //!
 //! ```no_run
-//! use agent_sdk::{builder, AgentConfig, InMemoryEventStore, providers::AnthropicProvider};
-//! use std::sync::Arc;
+//! use agent_sdk::{builder, AgentConfig, providers::AnthropicProvider};
 //!
 //! # fn example() {
-//! # let api_key = String::new();
-//! let event_store = Arc::new(InMemoryEventStore::new());
 //! let agent = builder::<()>()
-//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .provider(AnthropicProvider::from_env())
 //!     .config(AgentConfig {
 //!         max_turns: Some(20),
 //!         system_prompt: "You are a helpful assistant.".into(),
 //!         ..Default::default()
 //!     })
-//!     .event_store(event_store)
 //!     .build();
 //! # }
 //! ```
 //!
 //! ### Tools
 //!
-//! Tools let the LLM interact with external systems. Implement the [`Tool`] trait:
+//! Tools let the LLM interact with external systems. The lowest-ceremony way
+//! is the [`SimpleTool`] trait — a `&'static str` name, no [`ToolName`] type:
 //!
 //! ```
-//! use agent_sdk::{DynamicToolName, Tool, ToolContext, ToolResult, ToolTier};
+//! use agent_sdk::{SimpleTool, ToolContext, ToolResult};
 //! use serde_json::{json, Value};
 //! use std::future::Future;
 //!
 //! struct WeatherTool;
 //!
-//! // No #[async_trait] needed - Rust 1.75+ supports native async traits
-//! impl Tool<()> for WeatherTool {
-//!     type Name = DynamicToolName;
-//!
-//!     fn name(&self) -> DynamicToolName { DynamicToolName::new("get_weather") }
-//!
-//!     fn display_name(&self) -> &'static str { "Weather" }
-//!
-//!     fn description(&self) -> &'static str {
-//!         "Get current weather for a city"
-//!     }
-//!
+//! impl SimpleTool<()> for WeatherTool {
+//!     fn name(&self) -> &'static str { "get_weather" }
+//!     fn description(&self) -> &'static str { "Get current weather for a city" }
 //!     fn input_schema(&self) -> Value {
-//!         json!({
-//!             "type": "object",
-//!             "properties": {
-//!                 "city": { "type": "string" }
-//!             },
-//!             "required": ["city"]
-//!         })
+//!         json!({ "type": "object", "properties": { "city": { "type": "string" } } })
 //!     }
-//!
-//!     fn tier(&self) -> ToolTier { ToolTier::Observe }
 //!
 //!     fn execute(
 //!         &self,
@@ -134,18 +123,16 @@
 //! }
 //! ```
 //!
-//! Register tools with [`ToolRegistry`]:
+//! Register it with [`ToolRegistry::register_simple`]:
 //!
 //! ```no_run
-//! use agent_sdk::{builder, DynamicToolName, ToolRegistry, providers::AnthropicProvider};
-//! # use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier};
+//! use agent_sdk::{builder, ToolRegistry, providers::AnthropicProvider};
+//! # use agent_sdk::{SimpleTool, ToolContext, ToolResult};
 //! # use serde_json::Value;
 //! # use std::future::Future;
 //! # struct WeatherTool;
-//! # impl Tool<()> for WeatherTool {
-//! #     type Name = DynamicToolName;
-//! #     fn name(&self) -> DynamicToolName { DynamicToolName::new("weather") }
-//! #     fn display_name(&self) -> &'static str { "" }
+//! # impl SimpleTool<()> for WeatherTool {
+//! #     fn name(&self) -> &'static str { "get_weather" }
 //! #     fn description(&self) -> &'static str { "" }
 //! #     fn input_schema(&self) -> Value { Value::Null }
 //! #     fn execute(&self, _: &ToolContext<()>, _: Value) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
@@ -154,18 +141,19 @@
 //! # }
 //!
 //! # fn example() {
-//! # let api_key = String::new();
 //! let mut tools = ToolRegistry::new();
-//! tools.register(WeatherTool);
+//! tools.register_simple(WeatherTool);
 //!
-//! let event_store = std::sync::Arc::new(agent_sdk::InMemoryEventStore::new());
 //! let agent = builder::<()>()
-//!     .provider(AnthropicProvider::sonnet(api_key))
+//!     .provider(AnthropicProvider::from_env())
 //!     .tools(tools)
-//!     .event_store(event_store)
 //!     .build();
 //! # }
 //! ```
+//!
+//! For full control over the serialized tool name, implement the [`Tool`]
+//! trait directly with a strongly-typed [`ToolName`] (e.g. a `#[derive(Serialize,
+//! Deserialize)]` enum or the built-in [`DynamicToolName`]).
 //!
 //! ### Tool Tiers
 //!
@@ -371,7 +359,10 @@ mod tools;
 mod types;
 
 // ── Flat re-exports ──────────────────────────────────────────────────
-// Grouped by source crate so the provenance is clear.
+// Grouped by source crate so the provenance is clear. The names kept at
+// the crate root are the newcomer-facing surface; server/host contract
+// types live under [`advanced`] so they don't dominate autocomplete or the
+// docs.rs front page.
 
 // agent-sdk (owned — agent loop)
 pub use agent_loop::{
@@ -382,21 +373,15 @@ pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;
 
 // agent-sdk-core (via thin modules)
-pub use agent_sdk_core::audit::{
-    AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
-};
 pub use agent_sdk_core::privacy::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
     redact_string, redact_value,
 };
-pub use authority::{EventAuthority, LocalEventAuthority};
 pub use events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 pub use types::{
-    AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    CONTINUATION_VERSION, ContinuationEnvelope, ExecutionStatus, ExternalToolResult,
-    ListenExecutionContext, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId, TokenUsage,
+    AgentConfig, AgentError, AgentInput, AgentRunState, AgentState, ExecutionStatus,
+    ExternalToolResult, PendingToolCallInfo, RetryConfig, RunOptions, ThreadId, TokenUsage,
     ToolExecution, ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
-    TurnOutcome, TurnSummary,
 };
 
 // agent-sdk-tools (via thin modules)
@@ -405,15 +390,14 @@ pub use hooks::{
     AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, NoopAuditSink, ToolAuditSink,
     ToolDecision,
 };
-pub use seed::{DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed};
+pub use seed::{DefaultContextFactory, ToolContextSeed};
 pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
     StateStore, StoredTurnEvents, ToolExecutionStore,
 };
 pub use tools::{
-    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
-    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
-    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
+    AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,
+    Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
     tool_name_to_string,
 };
 
@@ -423,6 +407,62 @@ pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
 };
+
+// ── Advanced / server-internal contract types ───────────────────────
+/// Server- and host-facing contract types.
+///
+/// These types are not needed by a typical in-process agent. They form the
+/// authoritative boundary that `agent-server` / `agent-service-host` build
+/// on: per-turn outcome and summary contracts, the durable continuation
+/// envelope, the audit-record protocol, the listen/erased tool plumbing, and
+/// the worker-context reconstruction factory.
+///
+/// They are grouped here so that `agent_sdk::` autocomplete and the docs.rs
+/// front page stay dominated by the newcomer-facing surface (see
+/// [`prelude`]). Everything here remains a stable, public re-export — moving
+/// a name into `advanced` is a path change, not a removal.
+pub mod advanced {
+    // Per-turn outcome / summary contract and the durable continuation.
+    pub use crate::types::{
+        AgentContinuation, CONTINUATION_VERSION, ContinuationEnvelope, ListenExecutionContext,
+        TurnOutcome, TurnSummary,
+    };
+
+    // Audit-record protocol emitted at every tool-lifecycle transition.
+    pub use agent_sdk_core::audit::{
+        AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
+    };
+
+    // Event-sequencing authority used by the server commit path.
+    pub use crate::authority::{EventAuthority, LocalEventAuthority};
+
+    // Worker-context reconstruction for externalized tool runtimes.
+    pub use crate::seed::{ExecutionContextFactory, HostDependencies};
+
+    // Listen/execute tool protocol and the type-erased registry wrappers.
+    pub use crate::tools::{
+        ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenExecuteTool,
+        ListenStopReason, ListenToolUpdate,
+    };
+}
+
+// ── Prelude ──────────────────────────────────────────────────────────
+/// The common imports for building an in-process agent.
+///
+/// `use agent_sdk::prelude::*;` brings the ~dozen names a newcomer needs:
+/// the [`builder`], configuration and I/O types, the [`Tool`] surface, the
+/// in-memory event store, the cancellation token, and the default
+/// [`AnthropicProvider`](crate::providers::AnthropicProvider). Server-only
+/// contract types are intentionally excluded — reach for [`crate::advanced`]
+/// when you need them.
+pub mod prelude {
+    pub use crate::builder;
+    pub use crate::providers::AnthropicProvider;
+    pub use crate::{
+        AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
+        InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier,
+    };
+}
 
 // Convenience re-exports
 pub use reminders::{

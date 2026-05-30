@@ -34,7 +34,8 @@ fn core_events() {
 
 #[test]
 fn event_authority() {
-    use agent_sdk::{EventAuthority, LocalEventAuthority};
+    // Server-internal sequencing authority lives under `advanced`.
+    use agent_sdk::advanced::{EventAuthority, LocalEventAuthority};
 
     let auth = LocalEventAuthority::new();
     let _: &dyn EventAuthority = &auth;
@@ -44,9 +45,10 @@ fn event_authority() {
 
 #[test]
 fn seed_and_factory_types() {
-    use agent_sdk::{
-        DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
-    };
+    // `ToolContextSeed` / `DefaultContextFactory` stay newcomer-facing;
+    // the host-only factory trait + deps live under `advanced`.
+    use agent_sdk::advanced::{ExecutionContextFactory, HostDependencies};
+    use agent_sdk::{DefaultContextFactory, ToolContextSeed};
 
     let seed = ToolContextSeed::first_turn(agent_sdk::ThreadId::new());
     let _ = seed.with_metadata("key", serde_json::json!("val"));
@@ -59,10 +61,13 @@ fn seed_and_factory_types() {
 
 #[test]
 fn core_turn_outcomes() {
+    // Server-facing turn outcome + continuation contract under `advanced`.
+    use agent_sdk::advanced::{
+        AgentContinuation, CONTINUATION_VERSION, ContinuationEnvelope, TurnOutcome,
+    };
     use agent_sdk::{
-        AgentContinuation, AgentError, AgentRunState, AgentState, CONTINUATION_VERSION,
-        ContinuationEnvelope, ExecutionStatus, TokenUsage, ToolExecution, ToolInvocation,
-        ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions, TurnOutcome,
+        AgentError, AgentRunState, AgentState, ExecutionStatus, TokenUsage, ToolExecution,
+        ToolInvocation, ToolOutcome, ToolResult, ToolRuntime, ToolTier, TurnOptions,
     };
 
     let _result = ToolResult::success("ok");
@@ -135,10 +140,12 @@ fn hooks_and_stores() {
 
 #[test]
 fn audit_sink_and_records() {
-    use agent_sdk::{
-        AuditProvenance, NoopAuditSink, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
-        ToolAuditSink, ToolResult, ToolTier,
+    // The audit *sink* trait stays newcomer-facing (it's a builder hook);
+    // the audit *record* protocol types live under `advanced`.
+    use agent_sdk::advanced::{
+        AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
     };
+    use agent_sdk::{NoopAuditSink, ToolAuditSink, ToolResult, ToolTier};
 
     // Trait object reachable from the facade.
     let _sink: &dyn ToolAuditSink = &NoopAuditSink;
@@ -312,4 +319,80 @@ fn cancellation_token() {
 fn filesystem_types() {
     use agent_sdk::{InMemoryFileSystem, LocalFileSystem};
     fn _assert(_mem: InMemoryFileSystem, _local: LocalFileSystem) {}
+}
+
+// ── Newcomer ergonomics (Phase 12 · A) ───────────────────────────────
+
+#[test]
+fn prelude_brings_newcomer_surface() {
+    // `use agent_sdk::prelude::*` must resolve the common building blocks.
+    use agent_sdk::prelude::*;
+
+    let _builder = builder::<()>();
+    let _reg = ToolRegistry::<()>::new();
+    let _ctx = ToolContext::new(());
+    let _store = InMemoryEventStore::new();
+    let _token = CancellationToken::new();
+    let _name = DynamicToolName::new("x");
+    let _cfg = AgentConfig::default();
+    let _result = ToolResult::success("ok");
+    let _tier = ToolTier::Observe;
+    let _input = AgentInput::Text("hi".into());
+
+    fn _assert_provider(_p: AnthropicProvider) {}
+    fn _assert_event(_e: AgentEvent) {}
+    fn _assert_tool<T: Tool<()>>() {}
+    fn _assert_simple<T: SimpleTool<()>>() {}
+}
+
+#[test]
+fn simple_tool_needs_no_tool_name() {
+    use agent_sdk::{SimpleTool, ToolContext, ToolRegistry, ToolResult};
+    use serde_json::{Value, json};
+
+    // A first custom tool with no `ToolName` type and no `Tool` impl.
+    struct EchoTool;
+
+    impl SimpleTool<()> for EchoTool {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "Echo the input"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            input: Value,
+        ) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::success(input.to_string()))
+        }
+    }
+
+    let mut reg = ToolRegistry::<()>::new();
+    reg.register_simple(EchoTool);
+    assert!(reg.get("echo").is_some());
+}
+
+#[test]
+fn provider_from_env_constructors_exist() {
+    use agent_sdk::providers::{AnthropicProvider, GeminiProvider, OpenAIProvider};
+
+    // `try_from_env` must compile against each first-party provider and
+    // accept `impl Into<String>` keys (both `&str` and `String`).
+    fn _assert() {
+        let _ = AnthropicProvider::try_from_env();
+        let _ = OpenAIProvider::try_from_env();
+        let _ = GeminiProvider::try_from_env();
+        let _ = AnthropicProvider::sonnet("key-as-str");
+        let _ = AnthropicProvider::sonnet(String::from("key-as-string"));
+    }
+
+    // Conventional env-var names are exposed as associated consts.
+    assert_eq!(AnthropicProvider::API_KEY_ENV, "ANTHROPIC_API_KEY");
+    assert_eq!(OpenAIProvider::API_KEY_ENV, "OPENAI_API_KEY");
+    assert_eq!(GeminiProvider::API_KEY_ENV, "GEMINI_API_KEY");
 }
