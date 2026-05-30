@@ -9,7 +9,10 @@ edition = "2024"
 [workspace.dependencies]
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
 agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.8.0" }
-agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0" }
+# `default-features = false` here lets each consumer (notably the `agent-sdk`
+# façade) decide which provider impls compile. Crates that only use the
+# `LlmProvider` trait / streaming types pull no concrete provider at all.
+agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0", default-features = false }
 agent-sdk = { path = "crates/agent-sdk", version = "0.8.0" }
 agent-sdk-otel = { path = "crates/agent-sdk-otel", version = "0.8.0" }
 agent-server = { path = "crates/agent-server", version = "0.8.0" }
@@ -28,7 +31,15 @@ tower = { version = "0.5", default-features = false }
 http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `serde_yaml` (0.9.34+deprecated) is unmaintained. It is being phased out:
+# the `agent-sdk` skills loader now uses the maintained `serde_yaml_ng` fork
+# behind the `skills` feature. The remaining use is the internal,
+# unpublished `agent-service-host` config/broker plumbing (not part of the
+# public `agent-sdk` dependency tree); migrating it is tracked as follow-up.
 serde_yaml = "0.9"
+# Maintained, API-compatible successor to the deprecated `serde_yaml`.
+# Used only behind the `agent-sdk` `skills` feature (YAML frontmatter parsing).
+serde_yaml_ng = "0.10"
 anyhow = "1"
 thiserror = "2"
 regex = { version = "1.12.3", default-features = false, features = ["std", "unicode-perl"] }

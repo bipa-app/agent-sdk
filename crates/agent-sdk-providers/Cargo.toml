@@ -21,9 +21,25 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
-tokio-tungstenite = { workspace = true }
-html2text = { workspace = true }
 uuid = { workspace = true }
+# WebSocket transport — only the OpenAI Codex / ChatGPT provider needs it,
+# so it is gated behind the `openai-codex` feature.
+tokio-tungstenite = { workspace = true, optional = true }
+
+[features]
+# Anthropic is the default provider so the common case works out of the box.
+default = ["anthropic"]
+anthropic = []
+openai = []
+# The Codex / ChatGPT provider speaks WebSocket; gate the transport dep here.
+openai-codex = ["dep:tokio-tungstenite"]
+gemini = []
+# The Vertex provider reuses the Anthropic model constants and the Gemini
+# request/response codec, so it requires both of those providers.
+vertex = ["anthropic", "gemini"]
+# The Cloudflare AI Gateway provider is a thin proxy that wraps the
+# Anthropic, OpenAI, and Gemini providers, so it requires all three.
+cloudflare = ["anthropic", "openai", "gemini"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

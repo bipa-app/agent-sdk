@@ -73,7 +73,10 @@ tower = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
-agent-sdk.workspace = true
+# The `with_builtin_tools_v2` example and `registry_tool_executor` test build
+# `BuiltinToolsConfig { link_fetch, .. }`, whose `link_fetch` field is gated
+# behind the `agent-sdk` `web` feature.
+agent-sdk = { workspace = true, features = ["web"] }
 # Re-enables `agent-server`'s test doubles (e.g.
 # `CapturingThreadEventsWatchHandler`) for host-level tests.
 agent-server = { workspace = true, features = ["test-support"] }

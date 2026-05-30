@@ -37,6 +37,7 @@ use agent_sdk_tools::tools::ToolRegistry;
 
 use crate::primitive_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 use crate::todo::{TodoReadTool, TodoState, TodoWriteTool};
+#[cfg(feature = "web")]
 use crate::web::{LinkFetchTool, SearchProvider, WebSearchTool};
 use crate::{AgentCapabilities, Environment};
 
@@ -61,6 +62,9 @@ pub struct BuiltinToolsConfig<E: Environment + 'static> {
     /// Shared todo state.  When `Some`, registers `TodoRead` / `TodoWrite`.
     pub todo_state: Option<Arc<RwLock<TodoState>>>,
     /// When `true`, registers [`LinkFetchTool`] with default settings.
+    ///
+    /// Only present when the `web` feature is enabled.
+    #[cfg(feature = "web")]
     pub link_fetch: bool,
 }
 
@@ -83,6 +87,7 @@ pub fn register_builtin_tools<Ctx, E>(
         register_todo_tools(registry, state);
     }
 
+    #[cfg(feature = "web")]
     if config.link_fetch {
         register_link_fetch(registry);
     }
@@ -132,6 +137,7 @@ where
 
 /// Register [`LinkFetchTool`] with default HTTP client and
 /// SSRF-protecting [`UrlValidator`](crate::web::security::UrlValidator).
+#[cfg(feature = "web")]
 pub fn register_link_fetch<Ctx>(registry: &mut ToolRegistry<Ctx>)
 where
     Ctx: Send + Sync + 'static,
@@ -144,6 +150,7 @@ where
 /// Kept separate from [`BuiltinToolsConfig`] so hosts can pick a
 /// concrete [`SearchProvider`] (Brave, custom, etc.) without that
 /// choice leaking into every call site of [`register_builtin_tools`].
+#[cfg(feature = "web")]
 pub fn register_web_search<Ctx, P>(registry: &mut ToolRegistry<Ctx>, provider: P)
 where
     Ctx: Send + Sync + 'static,
@@ -157,6 +164,7 @@ mod tests {
     use super::*;
     use crate::InMemoryFileSystem;
 
+    #[cfg(feature = "web")]
     #[test]
     fn register_builtin_tools_wires_primitives_and_todo_and_fetch() {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
@@ -215,6 +223,7 @@ mod tests {
                 environment: fs,
                 capabilities: AgentCapabilities::full_access(),
                 todo_state: None,
+                #[cfg(feature = "web")]
                 link_fetch: false,
             },
         );

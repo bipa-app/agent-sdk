@@ -381,9 +381,29 @@
 //!
 //! ## Feature Flags
 //!
-//! | Feature | Default | Description |
-//! |---------|---------|-------------|
-//! | `otel`  | No      | Enable OpenTelemetry tracing instrumentation |
+//! Providers and the heavier tool families are gated behind cargo features so
+//! a minimal consumer only compiles (and only pulls the transitive
+//! dependencies of) what it uses. The common case — an Anthropic agent — works
+//! out of the box because `anthropic` is the only default feature.
+//!
+//! | Feature | Default | Pulls | Description |
+//! |---------|---------|-------|-------------|
+//! | `anthropic`    | **Yes** | — | Anthropic Messages API provider |
+//! | `openai`       | No  | — | `OpenAI` Chat Completions + Responses providers |
+//! | `openai-codex` | No  | `tokio-tungstenite` | `OpenAI` Codex / `ChatGPT` WebSocket provider |
+//! | `gemini`       | No  | — | Google Gemini provider |
+//! | `vertex`       | No  | — | Google Vertex AI provider (implies `anthropic` + `gemini`) |
+//! | `cloudflare`   | No  | — | Cloudflare AI Gateway proxy (implies `anthropic` + `openai` + `gemini`) |
+//! | `web`          | No  | `html2text` | [`web`] search + fetch tools |
+//! | `mcp`          | No  | — | [`mcp`] Model Context Protocol client |
+//! | `skills`       | No  | `serde_yaml_ng` | [`skills`] markdown skill loader |
+//! | `otel`         | No  | `opentelemetry` | OpenTelemetry tracing instrumentation |
+//!
+//! A minimal Anthropic-only build pulls no WebSocket, HTML, or YAML crates:
+//!
+//! ```toml
+//! agent-sdk = { version = "0.8", default-features = false, features = ["anthropic"] }
+//! ```
 //!
 //! When `otel` is enabled, the SDK emits OpenTelemetry spans for agent
 //! invocations, turns, LLM requests, tool execution, subagent runs, MCP
@@ -397,13 +417,18 @@ pub mod builtin_tools;
 mod capabilities;
 pub mod context;
 mod filesystem;
-pub mod mcp;
 pub mod primitive_tools;
 pub mod reminders;
-pub mod skills;
 pub mod subagent;
 pub mod todo;
 pub mod user_interaction;
+
+// ── Feature-gated tool modules (opt-in, pull extra deps) ──────────────
+#[cfg(feature = "mcp")]
+pub mod mcp;
+#[cfg(feature = "skills")]
+pub mod skills;
+#[cfg(feature = "web")]
 pub mod web;
 
 #[cfg(feature = "otel")]

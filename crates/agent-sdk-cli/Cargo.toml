@@ -13,7 +13,7 @@ name = "agent-sdk"
 path = "src/main.rs"
 
 [dependencies]
-agent-sdk = { workspace = true }
+agent-sdk = { workspace = true, features = ["openai", "gemini", "vertex", "cloudflare"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

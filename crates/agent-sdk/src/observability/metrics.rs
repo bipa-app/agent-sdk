@@ -93,6 +93,9 @@ pub struct Metrics {
     pub(crate) context_compaction: Counter<u64>,
     pub(crate) context_compaction_tokens_saved: Histogram<u64>,
     pub(crate) subagent_invocations: Counter<u64>,
+    // Only recorded by the MCP client, which is compiled behind the `mcp`
+    // feature; gated here so the field is not dead code without it.
+    #[cfg(feature = "mcp")]
     pub(crate) mcp_requests_duration: Histogram<f64>,
     pub(crate) llm_retries: Counter<u64>,
 }
@@ -206,6 +209,7 @@ impl Metrics {
             .u64_counter("agent_sdk.subagent.invocations")
             .with_description("Count of subagent invocations by agent name and outcome.")
             .build();
+        #[cfg(feature = "mcp")]
         let mcp_requests_duration = meter
             .f64_histogram("agent_sdk.mcp.requests.duration")
             .with_unit("s")
@@ -229,6 +233,7 @@ impl Metrics {
             context_compaction,
             context_compaction_tokens_saved,
             subagent_invocations,
+            #[cfg(feature = "mcp")]
             mcp_requests_duration,
             llm_retries,
         }
