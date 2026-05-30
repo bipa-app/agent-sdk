@@ -1,5 +1,5 @@
 use super::helpers::{calculate_backoff_delay, send_event};
-use super::types::{LlmEventContext, LlmStreamIds, StreamError};
+use super::types::{LlmEventContext, LlmOutcome, LlmStreamIds, StreamError};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{
@@ -145,6 +145,41 @@ impl LlmSpanObserver<'_> {
     }
 }
 
+/// Result of racing a single non-streaming `provider.chat` call against
+/// the run's cancel token.
+enum ProviderCall {
+    Outcome(ChatOutcome),
+    Cancelled,
+    Error(AgentError),
+}
+
+/// Race one non-streaming provider call against cancel.
+///
+/// Without this race a cancel issued while the model is still composing
+/// the full response is ignored until the call returns. `biased` honors
+/// a token flipped before the call even starts.
+async fn chat_or_cancel<P, H>(
+    provider: &Arc<P>,
+    request: &ChatRequest,
+    event_ctx: &LlmEventContext<'_, H>,
+) -> ProviderCall
+where
+    P: LlmProvider,
+    H: AgentHooks,
+{
+    tokio::select! {
+        biased;
+        () = event_ctx.cancel_token.cancelled() => {
+            log::info!("LLM call cancelled (turn={})", event_ctx.turn);
+            ProviderCall::Cancelled
+        }
+        res = provider.chat(request.clone()) => match res {
+            Ok(outcome) => ProviderCall::Outcome(outcome),
+            Err(e) => ProviderCall::Error(AgentError::new(format!("LLM error: {e}"), false)),
+        },
+    }
+}
+
 /// Call the LLM with retry logic for rate limits and server errors.
 ///
 /// Returns the result and the number of retries that occurred.
@@ -154,7 +189,7 @@ pub(super) async fn call_llm_with_retry<P, H>(
     config: &AgentConfig,
     event_ctx: &LlmEventContext<'_, H>,
     #[cfg(feature = "otel")] mut span_observer: Option<LlmSpanObserver<'_>>,
-) -> (Result<ChatResponse, AgentError>, u32)
+) -> (LlmOutcome, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -163,103 +198,152 @@ where
     let mut attempt = 0u32;
 
     loop {
-        let outcome = match provider.chat(request.clone()).await {
-            Ok(o) => o,
-            Err(e) => {
-                return (
-                    Err(AgentError::new(format!("LLM error: {e}"), false)),
-                    attempt,
-                );
-            }
+        let outcome = match chat_or_cancel(provider, &request, event_ctx).await {
+            ProviderCall::Outcome(outcome) => outcome,
+            ProviderCall::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            ProviderCall::Error(error) => return (LlmOutcome::Error(error), attempt),
         };
 
-        match outcome {
+        // `retry_reason` is the human-readable label shown on the
+        // `AutoRetryStart` event; `failure_message` is the error the
+        // run surfaces once the retry budget is exhausted. They differ
+        // per variant, so both are resolved here and threaded through.
+        let (kind, retry_reason, failure_message) = match outcome {
             ChatOutcome::Success(response) => {
                 if attempt > 0 {
                     send_auto_retry_end_event(event_ctx, attempt, true, None).await;
                 }
-                return (Ok(response), attempt);
-            }
-            ChatOutcome::RateLimited => {
-                attempt += 1;
-                if attempt > max_retries {
-                    error!("Rate limited by LLM provider after {max_retries} retries");
-                    let error_msg = format!("Rate limited after {max_retries} retries");
-                    send_auto_retry_end_event(
-                        event_ctx,
-                        attempt - 1,
-                        false,
-                        Some(error_msg.clone()),
-                    )
-                    .await;
-                    if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
-                        return (Err(error), attempt);
-                    }
-                    return (Err(AgentError::new(error_msg, true)), attempt);
-                }
-                let delay = calculate_backoff_delay(attempt, &config.retry);
-                warn!(
-                    "Rate limited, retrying after backoff (attempt={}, delay_ms={})",
-                    attempt,
-                    delay.as_millis()
-                );
-
-                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                #[cfg(feature = "otel")]
-                if let Some(observer) = span_observer.as_mut() {
-                    observer.record_retry(attempt, max_retries, delay_ms, "rate_limited");
-                }
-
-                send_auto_retry_start_event(
-                    event_ctx,
-                    attempt,
-                    max_retries,
-                    delay_ms,
-                    "Rate limited by LLM provider",
-                )
-                .await;
-                sleep(delay).await;
+                return (LlmOutcome::Response(response), attempt);
             }
             ChatOutcome::InvalidRequest(msg) => {
                 error!("Invalid request to LLM: {msg}");
                 return (
-                    Err(AgentError::new(format!("Invalid request: {msg}"), false)),
+                    LlmOutcome::Error(AgentError::new(format!("Invalid request: {msg}"), false)),
                     attempt,
                 );
             }
-            ChatOutcome::ServerError(msg) => {
-                attempt += 1;
-                if attempt > max_retries {
-                    error!("LLM server error after {max_retries} retries: {msg}");
-                    let error_msg = format!("Server error after {max_retries} retries: {msg}");
-                    send_auto_retry_end_event(
-                        event_ctx,
-                        attempt - 1,
-                        false,
-                        Some(error_msg.clone()),
-                    )
-                    .await;
-                    if let Err(error) = send_llm_error_event(event_ctx, &error_msg).await {
-                        return (Err(error), attempt);
-                    }
-                    return (Err(AgentError::new(error_msg, true)), attempt);
-                }
-                let delay = calculate_backoff_delay(attempt, &config.retry);
-                warn!(
-                    "Server error, retrying after backoff (attempt={attempt}, delay_ms={}, error={msg})",
-                    delay.as_millis()
-                );
+            ChatOutcome::RateLimited => (
+                "rate_limited",
+                "Rate limited by LLM provider".to_string(),
+                format!("Rate limited after {max_retries} retries"),
+            ),
+            ChatOutcome::ServerError(msg) => (
+                "server_error",
+                msg.clone(),
+                format!("Server error after {max_retries} retries: {msg}"),
+            ),
+        };
 
-                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                #[cfg(feature = "otel")]
-                if let Some(observer) = span_observer.as_mut() {
-                    observer.record_retry(attempt, max_retries, delay_ms, "server_error");
-                }
-
-                send_auto_retry_start_event(event_ctx, attempt, max_retries, delay_ms, &msg).await;
-                sleep(delay).await;
-            }
+        attempt += 1;
+        match handle_retry_backoff(RetryBackoff {
+            event_ctx,
+            config,
+            attempt,
+            max_retries,
+            error_kind: kind,
+            retry_reason,
+            failure_message,
+            #[cfg(feature = "otel")]
+            span_observer: span_observer.as_mut(),
+            #[cfg(not(feature = "otel"))]
+            _observer: std::marker::PhantomData,
+        })
+        .await
+        {
+            RetryStep::Retry => {}
+            RetryStep::Cancelled => return (LlmOutcome::Cancelled, attempt),
+            RetryStep::GiveUp(outcome) => return (outcome, attempt),
         }
+    }
+}
+
+/// Whether the retry loop should retry, was cancelled, or has exhausted
+/// its budget.
+enum RetryStep {
+    Retry,
+    Cancelled,
+    GiveUp(LlmOutcome),
+}
+
+struct RetryBackoff<'a, 'o, H> {
+    event_ctx: &'a LlmEventContext<'a, H>,
+    config: &'a AgentConfig,
+    attempt: u32,
+    max_retries: u32,
+    /// Stable `error.type` label, e.g. `rate_limited` / `server_error`.
+    error_kind: &'static str,
+    /// Human-readable reason shown on the `AutoRetryStart` event.
+    retry_reason: String,
+    /// Error surfaced once the retry budget is exhausted.
+    failure_message: String,
+    #[cfg(feature = "otel")]
+    span_observer: Option<&'a mut LlmSpanObserver<'o>>,
+    #[cfg(not(feature = "otel"))]
+    _observer: std::marker::PhantomData<&'o ()>,
+}
+
+/// Shared backoff handling for the retryable `ChatOutcome` variants
+/// (rate-limit, server error). Emits the auto-retry telemetry, sleeps
+/// the computed backoff raced against cancel, and reports whether the
+/// caller should retry, stop for cancel, or give up.
+async fn handle_retry_backoff<H>(params: RetryBackoff<'_, '_, H>) -> RetryStep
+where
+    H: AgentHooks,
+{
+    let RetryBackoff {
+        event_ctx,
+        config,
+        attempt,
+        max_retries,
+        error_kind,
+        retry_reason,
+        failure_message,
+        #[cfg(feature = "otel")]
+        span_observer,
+        #[cfg(not(feature = "otel"))]
+            _observer: _,
+    } = params;
+
+    if attempt > max_retries {
+        error!("LLM {error_kind} exhausted retries: {failure_message}");
+        send_auto_retry_end_event(event_ctx, attempt - 1, false, Some(failure_message.clone()))
+            .await;
+        if let Err(error) = send_llm_error_event(event_ctx, &failure_message).await {
+            return RetryStep::GiveUp(LlmOutcome::Error(error));
+        }
+        return RetryStep::GiveUp(LlmOutcome::Error(AgentError::new(failure_message, true)));
+    }
+
+    let delay = calculate_backoff_delay(attempt, &config.retry);
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    warn!("LLM {error_kind}, retrying (attempt={attempt}, delay_ms={delay_ms})");
+    #[cfg(feature = "otel")]
+    if let Some(observer) = span_observer {
+        observer.record_retry(attempt, max_retries, delay_ms, error_kind);
+    }
+    send_auto_retry_start_event(event_ctx, attempt, max_retries, delay_ms, &retry_reason).await;
+    if sleep_or_cancel(delay, event_ctx.cancel_token)
+        .await
+        .is_break()
+    {
+        return RetryStep::Cancelled;
+    }
+    RetryStep::Retry
+}
+
+/// Sleep for `delay`, but return early if the cancel token fires first.
+///
+/// Returns [`ControlFlow::Break`] when the cancel won the race so the
+/// caller can short-circuit the retry loop into a cancellation; returns
+/// [`ControlFlow::Continue`] when the full backoff elapsed.
+async fn sleep_or_cancel(
+    delay: std::time::Duration,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> std::ops::ControlFlow<()> {
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => std::ops::ControlFlow::Break(()),
+        () = sleep(delay) => std::ops::ControlFlow::Continue(()),
     }
 }
 
@@ -277,7 +361,7 @@ pub(super) async fn call_llm_streaming<P, H>(
     event_ctx: &LlmEventContext<'_, H>,
     stream_ids: LlmStreamIds<'_>,
     #[cfg(feature = "otel")] mut span_observer: Option<LlmSpanObserver<'_>>,
-) -> (Result<ChatResponse, AgentError>, u32)
+) -> (LlmOutcome, u32)
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -301,7 +385,7 @@ where
                 if attempt > 0 {
                     send_auto_retry_end_event(event_ctx, attempt, true, None).await;
                 }
-                return (Ok(response), attempt);
+                return (LlmOutcome::Response(response), attempt);
             }
             Err(StreamError::Recoverable(msg)) => {
                 attempt += 1;
@@ -311,9 +395,9 @@ where
                     send_auto_retry_end_event(event_ctx, attempt - 1, false, Some(err_msg.clone()))
                         .await;
                     if let Err(error) = send_llm_error_event(event_ctx, &err_msg).await {
-                        return (Err(error), attempt);
+                        return (LlmOutcome::Error(error), attempt);
                     }
-                    return (Err(AgentError::new(err_msg, true)), attempt);
+                    return (LlmOutcome::Error(AgentError::new(err_msg, true)), attempt);
                 }
                 let delay = calculate_backoff_delay(attempt, &config.retry);
                 warn!(
@@ -328,14 +412,25 @@ where
                 }
 
                 send_auto_retry_start_event(event_ctx, attempt, max_retries, delay_ms, &msg).await;
-                sleep(delay).await;
+                if sleep_or_cancel(delay, event_ctx.cancel_token)
+                    .await
+                    .is_break()
+                {
+                    return (LlmOutcome::Cancelled, attempt);
+                }
             }
             Err(StreamError::Fatal(msg)) => {
                 error!("Streaming error (non-recoverable): {msg}");
                 return (
-                    Err(AgentError::new(format!("Streaming error: {msg}"), false)),
+                    LlmOutcome::Error(AgentError::new(format!("Streaming error: {msg}"), false)),
                     attempt,
                 );
+            }
+            Err(StreamError::Cancelled) => {
+                // A cancel raced the stream — terminal, not retried.
+                // No `llm.error` event: the cancellation surfaces as the
+                // run-level `Cancelled` terminal event instead.
+                return (LlmOutcome::Cancelled, attempt);
             }
         }
     }
@@ -371,7 +466,33 @@ where
 
     log::debug!("Starting to consume LLM stream");
 
-    while let Some(result) = stream.next().await {
+    loop {
+        // Race each frame against the run's cancel token so a cancel
+        // mid-stream — or before the first frame — stops further model
+        // events promptly instead of waiting for the provider to finish
+        // the response. `biased` picks the cancel arm first, so an
+        // already-cancelled token (cancel before first token) is
+        // honored without consuming any delta, leaving the accumulator
+        // empty and emitting no `tool_use`.
+        let result = tokio::select! {
+            biased;
+            () = event_ctx.cancel_token.cancelled() => {
+                log::info!(
+                    "LLM stream cancelled (turn={}, delta_count={delta_count})",
+                    event_ctx.turn
+                );
+                #[cfg(feature = "otel")]
+                if let Some(observer) = span_observer.as_mut() {
+                    observer.record_dropped("cancelled", delta_count, "cancelled");
+                }
+                return Err(StreamError::Cancelled);
+            }
+            next = stream.next() => match next {
+                Some(result) => result,
+                None => break,
+            },
+        };
+
         if delta_count > 0 && delta_count.is_multiple_of(50) {
             log::debug!("Stream progress: delta_count={delta_count}");
         }
@@ -431,6 +552,28 @@ where
 
     log::debug!("Stream while loop exited normally at delta_count={delta_count}");
 
+    #[cfg(feature = "otel")]
+    if let Some(observer) = span_observer.as_mut() {
+        let duration_ms =
+            u64::try_from(stream_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        observer.record_completed(delta_count, duration_ms);
+    }
+
+    Ok(finalize_stream_response(
+        accumulator,
+        provider.model(),
+        delta_count,
+    ))
+}
+
+/// Assemble the final [`ChatResponse`] from a fully-consumed stream
+/// accumulator. Extracted from [`process_stream`] to keep it under the
+/// clippy line ceiling.
+fn finalize_stream_response(
+    accumulator: StreamAccumulator,
+    model: &str,
+    delta_count: u64,
+) -> ChatResponse {
     let usage = accumulator.usage().cloned().unwrap_or(Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -447,20 +590,13 @@ where
         usage.output_tokens
     );
 
-    #[cfg(feature = "otel")]
-    if let Some(observer) = span_observer.as_mut() {
-        let duration_ms =
-            u64::try_from(stream_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        observer.record_completed(delta_count, duration_ms);
-    }
-
-    Ok(ChatResponse {
+    ChatResponse {
         id: uuid::Uuid::new_v4().to_string(),
         content: content_blocks,
-        model: provider.model().to_string(),
+        model: model.to_string(),
         stop_reason,
         usage,
-    })
+    }
 }
 
 /// Dispatch a single decoded delta: forward text/thinking content to

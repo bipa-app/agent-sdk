@@ -27,6 +27,7 @@ use log::warn;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 enum RunLoopTurnAction {
     Continue,
@@ -1086,6 +1087,41 @@ fn cancelled_turn_outcome(
     }
 }
 
+/// Handle a single-turn run cancelled before any work started: record
+/// the root event, emit the terminal `Cancelled` event so streaming
+/// consumers see a closing marker, and return the cancelled outcome.
+async fn precheck_single_turn_cancelled<H>(
+    event_store: &Arc<dyn EventStore>,
+    thread_id: &ThreadId,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+) -> TurnOutcome
+where
+    H: AgentHooks,
+{
+    log::info!("Agent turn cancelled before execution started");
+    #[cfg(feature = "otel")]
+    crate::observability::instrument::record_root_event(
+        "agent.cancelled",
+        vec![crate::observability::attrs::kv(
+            crate::observability::attrs::SDK_CANCEL_REASON,
+            "cancel_token",
+        )],
+    );
+    let _ = send_event(
+        event_store,
+        thread_id,
+        0,
+        hooks,
+        authority,
+        AgentEvent::cancelled(0, TokenUsage::default()),
+    )
+    .await;
+    cancelled_turn_outcome(thread_id, 0, provenance, turn_options)
+}
+
 const fn turn_outcome_keeps_turn_open(outcome: &TurnOutcome) -> bool {
     matches!(outcome, TurnOutcome::AwaitingConfirmation { .. })
 }
@@ -1102,6 +1138,35 @@ fn cancelled_run_state(ctx: &TurnContext) -> AgentRunState {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
     }
+}
+
+/// Emit the terminal [`AgentEvent::Cancelled`] so a streaming consumer
+/// receives a closing marker and does not hang waiting for `Done`.
+/// Mirrors the `Done` / `Refusal` emission shape.
+///
+/// `event_turn` is the **storage** turn the event is keyed under — it
+/// must not be a turn that was already closed via `finish_turn`, or the
+/// append is rejected. The `Cancelled` payload itself always reports
+/// `ctx.turn` (the last turn the run actually reached).
+async fn emit_cancelled_event<H>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    event_turn: usize,
+) -> Result<(), AgentError>
+where
+    H: AgentHooks,
+{
+    send_event(
+        event_store,
+        &ctx.thread_id,
+        event_turn,
+        hooks,
+        authority,
+        AgentEvent::cancelled(ctx.turn, ctx.total_usage.clone()),
+    )
+    .await
 }
 
 fn refusal_run_state(ctx: &TurnContext) -> AgentRunState {
@@ -1201,6 +1266,16 @@ where
                     ),
                 ],
             );
+            // `current_turn` was just closed by
+            // `emit_persistent_turn_complete`; key the terminal event
+            // under the next turn so the append is accepted.
+            let event_turn = current_turn.saturating_add(1);
+            if let Err(error) =
+                emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
+            {
+                return Some(AgentRunState::Error(error));
+            }
+            let _ = finish_turn_or_error(event_store, &ctx.thread_id, event_turn).await;
             Some(cancelled_run_state(ctx))
         }
     }
@@ -1267,6 +1342,23 @@ where
                 .await
                 .map_or_else(std::convert::identity, |()| {
                     RunLoopTurnAction::Return(refusal_run_state(ctx))
+                })
+        }
+        InternalTurnResult::Cancelled { .. } => {
+            // The LLM call or compaction was cancelled mid-turn. The
+            // turn is still open (begin_turn started it, no finish has
+            // run), so emit the terminal `Cancelled` event under
+            // `current_turn`. History is already balanced (no orphan
+            // tool_use), then close the turn and end the run.
+            if let Err(error) =
+                emit_cancelled_event(ctx, event_store, hooks, authority, current_turn).await
+            {
+                return RunLoopTurnAction::Return(AgentRunState::Error(error));
+            }
+            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
+                .await
+                .map_or_else(std::convert::identity, |()| {
+                    RunLoopTurnAction::Return(cancelled_run_state(ctx))
                 })
         }
         InternalTurnResult::AwaitingConfirmation {
@@ -1397,6 +1489,17 @@ where
                     ),
                 ],
             );
+            // The previous turn (`ctx.turn`) was already finished by
+            // the in-loop result handler, so key the terminal event
+            // under the next (never-started) turn to avoid appending to
+            // a closed turn, then close it.
+            let event_turn = ctx.turn.saturating_add(1);
+            if let Err(error) =
+                emit_cancelled_event(ctx, event_store, hooks, authority, event_turn).await
+            {
+                return Some(AgentRunState::Error(error));
+            }
+            let _ = finish_turn_or_error(event_store, &ctx.thread_id, event_turn).await;
             return Some(cancelled_run_state(ctx));
         }
 
@@ -1424,6 +1527,7 @@ where
             audit_sink,
             provenance,
             turn_options,
+            cancel_token,
             #[cfg(feature = "otel")]
             observability_store,
         })
@@ -2018,18 +2122,17 @@ where
     let provenance =
         agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
 
-    // Check for cancellation before starting any work
+    // Check for cancellation before starting any work.
     if cancel_token.is_cancelled() {
-        log::info!("Agent turn cancelled before execution started");
-        #[cfg(feature = "otel")]
-        crate::observability::instrument::record_root_event(
-            "agent.cancelled",
-            vec![crate::observability::attrs::kv(
-                crate::observability::attrs::SDK_CANCEL_REASON,
-                "cancel_token",
-            )],
-        );
-        return cancelled_turn_outcome(&thread_id, 0, &provenance, &turn_options);
+        return precheck_single_turn_cancelled(
+            &event_store,
+            &thread_id,
+            &hooks,
+            &authority,
+            &provenance,
+            &turn_options,
+        )
+        .await;
     }
 
     let tool_context = tool_context.with_cancel_token(cancel_token.clone());
@@ -2104,6 +2207,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        cancel_token,
         turn,
         total_usage,
         state,
@@ -2139,6 +2243,7 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
     provenance: agent_sdk_core::audit::AuditProvenance,
     turn_options: TurnOptions,
+    cancel_token: CancellationToken,
     turn: usize,
     total_usage: TokenUsage,
     state: AgentState,
@@ -2167,6 +2272,7 @@ async fn run_single_turn_execute<Ctx, P, H, M, S>(
         audit_sink,
         provenance,
         turn_options,
+        cancel_token,
         turn,
         total_usage,
         state,
@@ -2218,6 +2324,7 @@ where
         audit_sink: &audit_sink,
         provenance: &provenance,
         turn_options: &turn_options,
+        cancel_token: &cancel_token,
         #[cfg(feature = "otel")]
         observability_store: observability_store.as_ref(),
     })
@@ -2244,6 +2351,94 @@ where
     }
 
     outcome
+}
+
+/// Build the single-turn `Cancelled` outcome: emit the terminal
+/// `Cancelled` event under the still-open turn (`ctx.turn`, started by
+/// `begin_turn` and never finished in single-turn mode), then return the
+/// cancelled `TurnOutcome`.
+async fn convert_cancelled_turn<H>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    provenance: &AuditProvenance,
+    turn_options: &TurnOptions,
+    turn_usage: TokenUsage,
+) -> TurnOutcome
+where
+    H: AgentHooks,
+{
+    if let Err(error) = emit_cancelled_event(ctx, event_store, hooks, authority, ctx.turn).await {
+        return TurnOutcome::Error(error);
+    }
+    let summary = build_turn_summary(ctx, provenance, turn_options, turn_usage);
+    TurnOutcome::Cancelled {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        summary,
+    }
+}
+
+struct ConvertDoneParams<'a, H, S> {
+    ctx: &'a TurnContext,
+    state_store: &'a Arc<S>,
+    event_store: &'a Arc<dyn EventStore>,
+    hooks: &'a Arc<H>,
+    authority: &'a Arc<dyn EventAuthority>,
+    thread_id: &'a ThreadId,
+    current_turn: usize,
+    provenance: &'a AuditProvenance,
+    turn_options: &'a TurnOptions,
+}
+
+/// Build the `Done` outcome: persist final state, emit the terminal
+/// `Done` event, and report cumulative usage as the summary's turn
+/// usage. Extracted from `convert_turn_result` to keep it under the
+/// clippy line ceiling.
+async fn convert_done_turn<H, S>(params: ConvertDoneParams<'_, H, S>) -> TurnOutcome
+where
+    H: AgentHooks,
+    S: StateStore,
+{
+    let ConvertDoneParams {
+        ctx,
+        state_store,
+        event_store,
+        hooks,
+        authority,
+        thread_id,
+        current_turn,
+        provenance,
+        turn_options,
+    } = params;
+    if let Err(e) = state_store.save(&ctx.state).await {
+        warn!("Failed to save final state: {e}");
+    }
+    let duration = ctx.start_time.elapsed();
+    if let Err(error) = send_event(
+        event_store,
+        thread_id,
+        current_turn,
+        hooks,
+        authority,
+        AgentEvent::done(
+            thread_id.clone(),
+            ctx.turn,
+            ctx.total_usage.clone(),
+            duration,
+        ),
+    )
+    .await
+    {
+        return TurnOutcome::Error(error);
+    }
+    let summary = build_turn_summary(ctx, provenance, turn_options, ctx.total_usage.clone());
+    TurnOutcome::Done {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        summary,
+    }
 }
 
 pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
@@ -2274,37 +2469,18 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
             }
         }
         InternalTurnResult::Done => {
-            if let Err(e) = state_store.save(&ctx.state).await {
-                warn!("Failed to save final state: {e}");
-            }
-            let duration = ctx.start_time.elapsed();
-            if let Err(error) = send_event(
+            convert_done_turn(ConvertDoneParams {
+                ctx: &ctx,
+                state_store,
                 event_store,
-                &thread_id,
-                current_turn,
                 hooks,
                 authority,
-                AgentEvent::done(
-                    thread_id.clone(),
-                    ctx.turn,
-                    ctx.total_usage.clone(),
-                    duration,
-                ),
-            )
+                thread_id: &thread_id,
+                current_turn,
+                provenance,
+                turn_options,
+            })
             .await
-            {
-                return TurnOutcome::Error(error);
-            }
-            // For terminal outcomes, the "turn usage" reported to the
-            // summary is the cumulative usage because we no longer have
-            // a distinct per-turn slice to expose.
-            let summary =
-                build_turn_summary(&ctx, provenance, turn_options, ctx.total_usage.clone());
-            TurnOutcome::Done {
-                total_turns: turns_to_u32(ctx.turn),
-                total_usage: ctx.total_usage.clone(),
-                summary,
-            }
         }
         InternalTurnResult::Refusal => {
             let summary =
@@ -2314,6 +2490,18 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
                 total_usage: ctx.total_usage.clone(),
                 summary,
             }
+        }
+        InternalTurnResult::Cancelled { turn_usage } => {
+            convert_cancelled_turn(
+                &ctx,
+                event_store,
+                hooks,
+                authority,
+                provenance,
+                turn_options,
+                turn_usage,
+            )
+            .await
         }
         InternalTurnResult::AwaitingConfirmation {
             tool_call_id,

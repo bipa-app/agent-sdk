@@ -27,6 +27,11 @@ pub(super) enum InternalTurnResult {
     Done,
     /// Model refused the request (safety/policy)
     Refusal,
+    /// Run was cancelled via the cancellation token while the turn was
+    /// in flight — during the LLM call (streaming or non-streaming) or
+    /// during context compaction. Carries the partial usage accrued in
+    /// the turn before the cancel was honored.
+    Cancelled { turn_usage: TokenUsage },
     /// Awaiting confirmation (yields)
     AwaitingConfirmation {
         tool_call_id: String,
@@ -203,6 +208,21 @@ pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
 pub(super) enum StreamError {
     Recoverable(String),
     Fatal(String),
+    /// The run's cancellation token fired while the stream was still
+    /// being consumed. Terminal — not retried.
+    Cancelled,
+}
+
+/// Three-state outcome of an LLM call (streaming or non-streaming).
+///
+/// Distinguishes a clean cancellation from an error so the turn loop
+/// can return [`InternalTurnResult::Cancelled`] (balanced history, a
+/// `Cancelled` terminal event) instead of folding the cancel into a
+/// generic [`InternalTurnResult::Error`].
+pub(super) enum LlmOutcome {
+    Response(crate::llm::ChatResponse),
+    Cancelled,
+    Error(AgentError),
 }
 
 /// Turn-summary metrics captured from the LLM call that preceded the
@@ -424,6 +444,9 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
     pub(super) provenance: &'a AuditProvenance,
     pub(super) turn_options: &'a TurnOptions,
+    /// Run-level cancellation token, threaded into the LLM call and the
+    /// compaction path so both phases are raced against cancel.
+    pub(super) cancel_token: &'a CancellationToken,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -438,6 +461,10 @@ pub(super) struct TurnMessageLoadParams<'a, P, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
+    /// Run-level cancellation token; checked before the destructive
+    /// `replace_history` write so a cancel during compaction cannot let
+    /// a slow summary land after the user asked to stop.
+    pub(super) cancel_token: &'a CancellationToken,
 }
 
 pub(super) struct LlmCallParams<'a, P, H> {
@@ -451,6 +478,11 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) turn: usize,
     pub(super) message_id: &'a str,
     pub(super) thinking_id: &'a str,
+    /// Run-level cancellation token, raced against the provider call
+    /// (streaming + non-streaming) so a cancel mid-stream or before
+    /// the first token stops the LLM phase promptly instead of waiting
+    /// for the response to complete.
+    pub(super) cancel_token: &'a CancellationToken,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -461,6 +493,9 @@ pub(super) struct LlmEventContext<'a, H> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
+    /// Run-level cancellation token observed inside the streaming /
+    /// retry loops. See [`LlmCallParams::cancel_token`].
+    pub(super) cancel_token: &'a CancellationToken,
 }
 
 #[derive(Clone, Copy)]
@@ -562,6 +597,9 @@ pub(super) struct TurnStopReasonParams<'a, P, H, M> {
     pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) hooks: &'a Arc<H>,
     pub(super) authority: &'a Arc<dyn EventAuthority>,
+    /// Run-level cancellation token, forwarded into the overflow-driven
+    /// compaction path triggered by `ModelContextWindowExceeded`.
+    pub(super) cancel_token: &'a CancellationToken,
 }
 
 pub(super) struct ConvertTurnResultParams<'a, H, S> {

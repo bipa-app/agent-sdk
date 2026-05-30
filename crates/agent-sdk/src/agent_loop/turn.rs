@@ -2,8 +2,8 @@ use super::helpers::{build_assistant_message, extract_content, pending_tool_inde
 use super::llm::{call_llm_streaming, call_llm_with_retry};
 use super::tool_execution::{append_tool_results, execute_tool_call};
 use super::types::{
-    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmStreamIds,
-    ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
+    ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmOutcome,
+    LlmStreamIds, ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
     ToolExecutionOutcome, TurnCompletionParams, TurnContext, TurnMessageLoadParams,
     TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
@@ -25,6 +25,7 @@ use agent_sdk_core::audit::AuditProvenance;
 
 use log::{debug, info, warn};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub(super) async fn begin_turn<H>(
     ctx: &mut TurnContext,
@@ -99,6 +100,17 @@ where
     Ok(())
 }
 
+/// Outcome of loading (and optionally compacting) a turn's history.
+///
+/// Compaction can run a slow LLM summarization that the user may cancel
+/// mid-flight; in that case we stop *before* the destructive
+/// `replace_history` write and report [`LoadedMessages::Cancelled`] so
+/// the turn closes as `Cancelled` with history left untouched.
+pub(super) enum LoadedMessages {
+    Ready(Vec<Message>),
+    Cancelled,
+}
+
 pub(super) async fn load_turn_messages<P, H, M>(
     TurnMessageLoadParams {
         thread_id,
@@ -110,8 +122,9 @@ pub(super) async fn load_turn_messages<P, H, M>(
         event_store,
         hooks,
         authority,
+        cancel_token,
     }: TurnMessageLoadParams<'_, P, H, M>,
-) -> Result<Vec<Message>, AgentError>
+) -> Result<LoadedMessages, AgentError>
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -147,6 +160,7 @@ where
         event_store,
         hooks,
         authority,
+        cancel_token,
     })
     .await
 }
@@ -162,6 +176,7 @@ struct MaybeCompactParams<'a, P, H, M> {
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
+    cancel_token: &'a CancellationToken,
 }
 
 async fn maybe_compact_messages<P, H, M>(
@@ -176,8 +191,9 @@ async fn maybe_compact_messages<P, H, M>(
         event_store,
         hooks,
         authority,
+        cancel_token,
     }: MaybeCompactParams<'_, P, H, M>,
-) -> Result<Vec<Message>, AgentError>
+) -> Result<LoadedMessages, AgentError>
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -199,13 +215,14 @@ where
                 turn,
                 hooks,
                 authority,
+                cancel_token,
             })
             .await;
         }
 
         #[cfg(feature = "otel")]
         record_compaction_skipped(&messages);
-        return Ok(messages);
+        return Ok(LoadedMessages::Ready(messages));
     }
 
     if let Some(compact_config) = compaction_config {
@@ -226,6 +243,7 @@ where
                 turn,
                 hooks,
                 authority,
+                cancel_token,
             })
             .await;
         }
@@ -234,7 +252,7 @@ where
         record_compaction_skipped(&messages);
     }
 
-    Ok(messages)
+    Ok(LoadedMessages::Ready(messages))
 }
 
 struct StoredCompactionResult {
@@ -254,6 +272,17 @@ struct ThresholdCompactionParams<'a, C: ?Sized, H, M> {
     turn: usize,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
+    cancel_token: &'a CancellationToken,
+}
+
+/// Outcome of a single compaction attempt that ends in storing the
+/// summarized history.
+enum CompactionOutcome {
+    Stored(StoredCompactionResult),
+    /// Cancel fired before the destructive `replace_history` write —
+    /// history is untouched.
+    Cancelled,
+    Failed(AgentError),
 }
 
 async fn compact_messages_for_threshold<C, H, M>(
@@ -266,8 +295,9 @@ async fn compact_messages_for_threshold<C, H, M>(
         turn,
         hooks,
         authority,
+        cancel_token,
     }: ThresholdCompactionParams<'_, C, H, M>,
-) -> Result<Vec<Message>, AgentError>
+) -> Result<LoadedMessages, AgentError>
 where
     C: ContextCompactor + ?Sized,
     H: AgentHooks,
@@ -282,10 +312,11 @@ where
         "threshold",
         "Context compaction failed",
         "Failed to replace history after compaction",
+        cancel_token,
     )
     .await
     {
-        Ok(result) => {
+        CompactionOutcome::Stored(result) => {
             send_event(
                 event_store,
                 thread_id,
@@ -306,15 +337,17 @@ where
                 result.original_count, result.new_count, result.original_tokens, result.new_tokens
             );
 
-            Ok(result.messages)
+            Ok(LoadedMessages::Ready(result.messages))
         }
-        Err(error) => {
+        CompactionOutcome::Cancelled => Ok(LoadedMessages::Cancelled),
+        CompactionOutcome::Failed(error) => {
             warn!("Context compaction failed, continuing with full history: {error}");
-            Ok(original_messages)
+            Ok(LoadedMessages::Ready(original_messages))
         }
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn compact_history_and_store<C, M>(
     compactor: &C,
     messages: Vec<Message>,
@@ -323,7 +356,8 @@ async fn compact_history_and_store<C, M>(
     trigger: &'static str,
     compaction_error_prefix: &'static str,
     replace_history_error_prefix: &'static str,
-) -> Result<StoredCompactionResult, AgentError>
+    cancel_token: &CancellationToken,
+) -> CompactionOutcome
 where
     C: ContextCompactor + ?Sized,
     M: MessageStore,
@@ -333,21 +367,52 @@ where
     #[cfg(feature = "otel")]
     let mut compaction_span = start_compaction_span(trigger);
 
-    let result = match compactor.compact_history(messages).await {
-        Ok(result) => result,
-        Err(error) => {
+    // Race the (potentially slow) LLM summarization against cancel so
+    // a cancel during compaction stops us before the destructive write.
+    let result = tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => {
+            log::info!("Context compaction cancelled during summarization");
             #[cfg(feature = "otel")]
             finish_compaction_span_error(
                 &mut compaction_span,
-                "context_compaction_failed",
-                &error.to_string(),
+                "context_compaction_cancelled",
+                "cancelled",
             );
-            return Err(AgentError::new(
-                format!("{compaction_error_prefix}: {error}"),
-                false,
-            ));
+            return CompactionOutcome::Cancelled;
         }
+        res = compactor.compact_history(messages) => match res {
+            Ok(result) => result,
+            Err(error) => {
+                #[cfg(feature = "otel")]
+                finish_compaction_span_error(
+                    &mut compaction_span,
+                    "context_compaction_failed",
+                    &error.to_string(),
+                );
+                return CompactionOutcome::Failed(AgentError::new(
+                    format!("{compaction_error_prefix}: {error}"),
+                    false,
+                ));
+            }
+        },
     };
+
+    // Final guard before the destructive `replace_history`: if the
+    // cancel landed after summarization but before we wrote, do not
+    // mutate history. This is the invariant from gap #2 — an
+    // uncancellable destructive `replace_history` must never complete
+    // after the user asked to stop.
+    if cancel_token.is_cancelled() {
+        log::info!("Context compaction cancelled before replace_history write");
+        #[cfg(feature = "otel")]
+        finish_compaction_span_error(
+            &mut compaction_span,
+            "context_compaction_cancelled",
+            "cancelled",
+        );
+        return CompactionOutcome::Cancelled;
+    }
 
     let stored_result = StoredCompactionResult {
         messages: result.messages,
@@ -370,7 +435,7 @@ where
             "context_compaction_history_replace_failed",
             &error.to_string(),
         );
-        return Err(AgentError::new(
+        return CompactionOutcome::Failed(AgentError::new(
             format!("{replace_history_error_prefix}: {error}"),
             false,
         ));
@@ -379,7 +444,7 @@ where
     #[cfg(feature = "otel")]
     finish_compaction_span_success(&mut compaction_span);
 
-    Ok(stored_result)
+    CompactionOutcome::Stored(stored_result)
 }
 
 #[cfg(feature = "otel")]
@@ -647,10 +712,11 @@ pub(super) async fn request_llm_response<P, H>(
         turn,
         message_id,
         thinking_id,
+        cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     }: LlmCallParams<'_, P, H>,
-) -> Result<ChatResponse, AgentError>
+) -> LlmOutcome
 where
     P: LlmProvider,
     H: AgentHooks,
@@ -662,6 +728,7 @@ where
         authority,
         thread_id,
         turn,
+        cancel_token,
     };
 
     #[cfg(feature = "otel")]
@@ -711,11 +778,23 @@ where
         .await
     };
 
+    // Project the three-state outcome onto a `Result` for the OTel
+    // span / payload bookkeeping. A cancellation is recorded as an
+    // `AgentError` purely so the span carries a stable, filterable
+    // terminal status; the caller still receives the original
+    // `LlmOutcome::Cancelled` and routes it to the `Cancelled` event.
+    #[cfg(feature = "otel")]
+    let span_result: Result<ChatResponse, AgentError> = match &result {
+        LlmOutcome::Response(response) => Ok(response.clone()),
+        LlmOutcome::Cancelled => Err(AgentError::new("LLM call cancelled", false)),
+        LlmOutcome::Error(error) => Err(error.clone()),
+    };
+
     #[cfg(feature = "otel")]
     if let (Some(observability_store), Some(request), Ok(response)) = (
         observability_store,
         request_for_capture.as_ref(),
-        result.as_ref(),
+        span_result.as_ref(),
     ) {
         capture_llm_payloads(
             &mut llm_span,
@@ -732,7 +811,7 @@ where
     #[cfg(feature = "otel")]
     finish_llm_span(FinishLlmSpanParams {
         span: &mut llm_span,
-        result: &result,
+        result: &span_result,
         retry_count,
         llm_started_at,
         provider_name: provider_name_for_observer,
@@ -1497,13 +1576,21 @@ where
     Ok(())
 }
 
+/// Outcome of an overflow-driven (emergency) compaction.
+pub(super) enum OverflowCompaction {
+    Done,
+    /// Cancel fired during the emergency compaction; history untouched.
+    Cancelled,
+}
+
 pub(super) async fn compact_after_context_overflow<P, M>(
     provider: &Arc<P>,
     compaction_config: &CompactionConfig,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     message_store: &Arc<M>,
     thread_id: &ThreadId,
-) -> Result<(), AgentError>
+    cancel_token: &CancellationToken,
+) -> Result<OverflowCompaction, AgentError>
 where
     P: LlmProvider,
     M: MessageStore,
@@ -1518,7 +1605,7 @@ where
             )
         })?;
 
-    let result = if let Some(compactor) = compactor {
+    let outcome = if let Some(compactor) = compactor {
         compact_history_and_store(
             compactor.as_ref(),
             history,
@@ -1527,8 +1614,9 @@ where
             "overflow",
             "Context compaction failed after overflow",
             "Failed to replace history after overflow compaction",
+            cancel_token,
         )
-        .await?
+        .await
     } else {
         let default_compactor =
             LlmContextCompactor::new(Arc::clone(provider), compaction_config.clone());
@@ -1540,16 +1628,22 @@ where
             "overflow",
             "Context compaction failed after overflow",
             "Failed to replace history after overflow compaction",
+            cancel_token,
         )
-        .await?
+        .await
     };
 
-    info!(
-        "Context compacted after overflow (original_tokens={}, new_tokens={})",
-        result.original_tokens, result.new_tokens
-    );
-
-    Ok(())
+    match outcome {
+        CompactionOutcome::Stored(result) => {
+            info!(
+                "Context compacted after overflow (original_tokens={}, new_tokens={})",
+                result.original_tokens, result.new_tokens
+            );
+            Ok(OverflowCompaction::Done)
+        }
+        CompactionOutcome::Cancelled => Ok(OverflowCompaction::Cancelled),
+        CompactionOutcome::Failed(error) => Err(error),
+    }
 }
 
 pub(super) async fn handle_turn_stop_reason<P, H, M>(
@@ -1567,6 +1661,7 @@ pub(super) async fn handle_turn_stop_reason<P, H, M>(
         event_store,
         hooks,
         authority,
+        cancel_token,
     }: TurnStopReasonParams<'_, P, H, M>,
 ) -> InternalTurnResult
 where
@@ -1634,6 +1729,7 @@ where
                 message_store,
                 compaction_config,
                 compactor,
+                cancel_token,
             )
             .await
         }
@@ -1668,6 +1764,7 @@ async fn handle_context_window_exceeded<P, M>(
     message_store: &Arc<M>,
     compaction_config: Option<&CompactionConfig>,
     compactor: Option<&Arc<dyn ContextCompactor>>,
+    cancel_token: &CancellationToken,
 ) -> InternalTurnResult
 where
     P: LlmProvider,
@@ -1693,16 +1790,21 @@ where
         ));
     }
     if let Some(compact_config) = compaction_config {
-        if let Err(error) = compact_after_context_overflow(
+        match compact_after_context_overflow(
             provider,
             compact_config,
             compactor,
             message_store,
             &ctx.thread_id,
+            cancel_token,
         )
         .await
         {
-            return InternalTurnResult::Error(error);
+            Ok(OverflowCompaction::Done) => {}
+            Ok(OverflowCompaction::Cancelled) => {
+                return InternalTurnResult::Cancelled { turn_usage };
+            }
+            Err(error) => return InternalTurnResult::Error(error),
         }
         ctx.turn = ctx.turn.saturating_sub(1);
         return InternalTurnResult::Continue { turn_usage };
@@ -1734,6 +1836,7 @@ async fn try_recover_prompt_too_long<P, M>(
     compactor: Option<&Arc<dyn ContextCompactor>>,
     provider: &Arc<P>,
     message_store: &Arc<M>,
+    cancel_token: &CancellationToken,
 ) -> Option<InternalTurnResult>
 where
     P: LlmProvider,
@@ -1756,16 +1859,25 @@ where
             "Prompt too long, attempting emergency context compaction (turn={}, retry={})",
             ctx.turn, ctx.compaction_retries
         );
-        if let Err(compact_err) = compact_after_context_overflow(
+        match compact_after_context_overflow(
             provider,
             compact_config,
             compactor,
             message_store,
             &ctx.thread_id,
+            cancel_token,
         )
         .await
         {
-            return Some(InternalTurnResult::Error(compact_err));
+            Ok(OverflowCompaction::Done) => {}
+            Ok(OverflowCompaction::Cancelled) => {
+                return Some(InternalTurnResult::Cancelled {
+                    turn_usage: TokenUsage::default(),
+                });
+            }
+            Err(compact_err) => {
+                return Some(InternalTurnResult::Error(compact_err));
+            }
         }
         // Don't count the failed attempt as a turn
         ctx.turn = ctx.turn.saturating_sub(1);
@@ -1803,6 +1915,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     } = params;
@@ -1836,6 +1949,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     })
@@ -1950,6 +2064,11 @@ fn record_turn_span(params: &RecordTurnSpanParams<'_>) {
             spans::set_span_error(&mut turn_span, "turn_error", &err.message);
             "error"
         }
+        InternalTurnResult::Cancelled { .. } => {
+            turn_span.set_attribute(KeyValue::new(attrs::SDK_TURN_STOP_REASON, "cancelled"));
+            turn_span.set_attribute(attrs::kv_bool(attrs::SDK_TURN_HAD_TOOL_CALLS, false));
+            "cancelled"
+        }
     };
     turn_span.end();
 
@@ -1983,6 +2102,7 @@ async fn execute_turn_inner<Ctx, P, H, M, S>(
         audit_sink,
         provenance,
         turn_options,
+        cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     }: ExecuteTurnParameters<'_, Ctx, P, H, M, S>,
@@ -2008,10 +2128,16 @@ where
         event_store,
         hooks,
         authority,
+        cancel_token,
     })
     .await
     {
-        Ok(messages) => messages,
+        Ok(LoadedMessages::Ready(messages)) => messages,
+        Ok(LoadedMessages::Cancelled) => {
+            return InternalTurnResult::Cancelled {
+                turn_usage: TokenUsage::default(),
+            };
+        }
         Err(error) => return InternalTurnResult::Error(error),
     };
 
@@ -2040,13 +2166,23 @@ where
         turn: ctx.turn,
         message_id: &message_id,
         thinking_id: &thinking_id,
+        cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     })
     .await
     {
-        Ok(response) => response,
-        Err(error) => {
+        LlmOutcome::Response(response) => response,
+        LlmOutcome::Cancelled => {
+            // The cancel was honored before any assistant message was
+            // persisted, so there is no orphan `tool_use` to balance —
+            // history is already consistent. Surface a partial-usage
+            // `Cancelled` so the run closes with the terminal event.
+            return InternalTurnResult::Cancelled {
+                turn_usage: TokenUsage::default(),
+            };
+        }
+        LlmOutcome::Error(error) => {
             if let Some(result) = try_recover_prompt_too_long(
                 &error,
                 ctx,
@@ -2054,6 +2190,7 @@ where
                 compactor,
                 provider,
                 message_store,
+                cancel_token,
             )
             .await
             {
@@ -2082,6 +2219,7 @@ where
         turn_options,
         event_store,
         authority,
+        cancel_token,
     )
     .await
 }
@@ -2106,6 +2244,7 @@ async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     turn_options: &TurnOptions,
     event_store: &Arc<dyn EventStore>,
     authority: &Arc<dyn EventAuthority>,
+    cancel_token: &CancellationToken,
 ) -> InternalTurnResult
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -2220,6 +2359,7 @@ where
         event_store,
         hooks,
         authority,
+        cancel_token,
     })
     .await
 }
