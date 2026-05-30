@@ -565,6 +565,13 @@ pub mod checkpoint_store;
 pub mod commit;
 pub mod committed_event;
 pub mod completed_turn_transaction;
+/// Reusable journal/store conformance battery.
+///
+/// Compiled both for this crate's own tests and for downstream
+/// consumers that enable the `test-support` feature, so the SQLite and
+/// Postgres backends in `agent-service-host` can run the same battery.
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
 pub mod event_notifier;
 pub mod event_outbox_transaction;
 pub mod event_repository;
