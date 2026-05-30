@@ -304,6 +304,16 @@ pub struct ToolContext<Ctx> {
     cancel_token: Option<CancellationToken>,
     /// Optional semaphore for limiting concurrent subagent threads.
     subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Optional per-tool execution timeout enforced at the SDK boundary.
+    ///
+    /// When set, the agent loop races each tool's `execute()` future
+    /// against this duration. A tool that does not finish within the
+    /// budget is stopped at the boundary and reported with a synthetic
+    /// timeout [`ToolResult`] so the `tool_use` / `tool_result` pair stays
+    /// balanced. Tools that hold OS resources (subprocesses, sockets) must
+    /// observe the [cooperative-cancel contract](Tool#cooperative-cancellation)
+    /// so the timeout actually reclaims them.
+    tool_timeout: Option<std::time::Duration>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -318,6 +328,7 @@ impl<Ctx> ToolContext<Ctx> {
             event_authority: None,
             cancel_token: None,
             subagent_semaphore: None,
+            tool_timeout: None,
         }
     }
 
@@ -346,6 +357,7 @@ impl<Ctx> ToolContext<Ctx> {
             event_authority: Some(authority),
             cancel_token: Some(deps.cancel_token),
             subagent_semaphore: deps.subagent_semaphore,
+            tool_timeout: None,
         }
     }
 
@@ -422,6 +434,25 @@ impl<Ctx> ToolContext<Ctx> {
         self.cancel_token.clone()
     }
 
+    /// Set the per-tool execution timeout enforced at the SDK boundary.
+    ///
+    /// The agent loop populates this from `AgentConfig::tool_timeout_ms`;
+    /// callers can also set it directly when constructing a context.
+    #[must_use]
+    pub const fn with_tool_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.tool_timeout = Some(timeout);
+        self
+    }
+
+    /// Get the per-tool execution timeout (if set).
+    ///
+    /// Read by the agent loop's SDK-boundary execution race; tools do not
+    /// normally need to consult this themselves.
+    #[must_use]
+    pub const fn tool_timeout(&self) -> Option<std::time::Duration> {
+        self.tool_timeout
+    }
+
     /// Set a shared semaphore for limiting concurrent subagent threads.
     #[must_use]
     pub fn with_subagent_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
@@ -449,6 +480,32 @@ impl<Ctx> ToolContext<Ctx> {
 ///
 /// This trait uses Rust's native async functions in traits (stabilized in Rust 1.75).
 /// You do NOT need the `async_trait` crate to implement this trait.
+///
+/// # Cooperative cancellation
+///
+/// The agent loop races every tool's `execute()` future against the run's
+/// [`ToolContext::cancel_token`] and, when configured, against
+/// [`ToolContext::tool_timeout`]. If either fires the SDK drops the
+/// in-flight `execute()` future and synthesises a balanced `tool_result`
+/// (`"Cancelled by user"` or a timeout message). Dropping a future runs
+/// its destructors but cannot, on its own, reclaim OS resources a tool
+/// has handed to the kernel.
+///
+/// **Subprocess contract:** a tool that spawns a child process MUST make
+/// the process die when its `execute()` future is dropped. The two
+/// supported ways to satisfy this are:
+///
+/// * Build the command with `tokio::process::Command::kill_on_drop(true)`,
+///   so the child is killed when the `Child` handle is dropped together
+///   with the cancelled future (this is what the SDK's MCP stdio transport
+///   does), or
+/// * Observe [`ToolContext::cancel_token`] directly and `kill()` the child
+///   when it fires.
+///
+/// A tool that holds a subprocess open without either of these will leak
+/// the process when cancelled or timed out — the synthesised `tool_result`
+/// keeps the conversation balanced, but the orphaned OS process is the
+/// tool author's bug, not the SDK's.
 pub trait Tool<Ctx>: Send + Sync {
     /// The type of name for this tool.
     type Name: ToolName;

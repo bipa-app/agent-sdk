@@ -49,15 +49,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Run exactly one turn directly in this task — no spawn, no extra
     // indirection. This is the authoritative `run_turn` boundary.
-    let outcome = agent
-        .run_turn(
-            thread_id.clone(),
-            AgentInput::Text("What is the capital of France?".into()),
-            tool_ctx,
-            CancellationToken::new(),
-            server_options,
-        )
-        .await;
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("What is the capital of France?".into()),
+        tool_ctx,
+        CancellationToken::new(),
+        server_options,
+    ))
+    .await;
 
     // Every variant except `Error` carries a structured `TurnSummary`.
     // Server code reads from the summary, not the legacy per-variant

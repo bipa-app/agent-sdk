@@ -56,15 +56,16 @@ where
 {
     let existing_turns = agent.event_store.get_turns(&thread_id).await?;
     let expected_turn = expected_turn_for_input(&input, &existing_turns);
-    let outcome = agent
-        .run_turn(
-            thread_id.clone(),
-            input,
-            tool_context,
-            CancellationToken::new(),
-            options,
-        )
-        .await;
+    // Box the `run_turn` future so this helper's own future stays under
+    // the `clippy::large_futures` threshold across its ~60 call sites.
+    let outcome = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        input,
+        tool_context,
+        CancellationToken::new(),
+        options,
+    ))
+    .await;
     let events = load_turn_events(agent.event_store.as_ref(), &thread_id, expected_turn).await?;
     Ok((outcome, events))
 }
@@ -1813,15 +1814,14 @@ async fn test_run_turn_returns_error_when_event_append_fails() -> anyhow::Result
         .event_store(FailingEventStore::new(EventStoreFailureMode::Append))
         .build();
 
-    let outcome = agent
-        .run_turn(
-            ThreadId::new(),
-            AgentInput::Text("Hi".to_string()),
-            ToolContext::new(()),
-            CancellationToken::new(),
-            TurnOptions::default(),
-        )
-        .await;
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
 
     match outcome {
         TurnOutcome::Error(error) => {
@@ -1868,15 +1868,14 @@ async fn test_run_turn_returns_error_when_finish_turn_fails() -> anyhow::Result<
         .event_store(FailingEventStore::new(EventStoreFailureMode::FinishTurn))
         .build();
 
-    let outcome = agent
-        .run_turn(
-            ThreadId::new(),
-            AgentInput::Text("Hi".to_string()),
-            ToolContext::new(()),
-            CancellationToken::new(),
-            TurnOptions::default(),
-        )
-        .await;
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
 
     match outcome {
         TurnOutcome::Error(error) => {
@@ -1928,15 +1927,14 @@ async fn test_run_turn_repeated_init_failures_preserve_original_error() -> anyho
         .build_with_stores();
 
     for _ in 0..2 {
-        let outcome = agent
-            .run_turn(
-                thread_id.clone(),
-                AgentInput::Text("Hi".to_string()),
-                ToolContext::new(()),
-                CancellationToken::new(),
-                TurnOptions::default(),
-            )
-            .await;
+        let outcome = Box::pin(agent.run_turn(
+            thread_id.clone(),
+            AgentInput::Text("Hi".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+            TurnOptions::default(),
+        ))
+        .await;
 
         match outcome {
             TurnOutcome::Error(error) => {
@@ -2300,21 +2298,20 @@ async fn test_submit_tool_results_thread_id_mismatch() -> anyhow::Result<()> {
 
     // Submit on a DIFFERENT thread_id → should error
     let wrong_thread = ThreadId::new();
-    let outcome2 = agent
-        .run_turn(
-            wrong_thread,
-            AgentInput::SubmitToolResults {
-                continuation,
-                results: vec![ExternalToolResult {
-                    tool_call_id: "tool_1".to_string(),
-                    result: ToolResult::success("echo"),
-                }],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts,
-        )
-        .await;
+    let outcome2 = Box::pin(agent.run_turn(
+        wrong_thread,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("echo"),
+            }],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    ))
+    .await;
 
     assert!(
         matches!(outcome2, TurnOutcome::Error(_)),
@@ -2362,21 +2359,20 @@ async fn test_submit_tool_results_missing_result() -> anyhow::Result<()> {
     };
 
     // Submit only one result for two tool calls → should error
-    let outcome2 = agent
-        .run_turn(
-            thread_id,
-            AgentInput::SubmitToolResults {
-                continuation,
-                results: vec![crate::types::ExternalToolResult {
-                    tool_call_id: "call_a".to_string(),
-                    result: crate::types::ToolResult::success("only one"),
-                }],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts,
-        )
-        .await;
+    let outcome2 = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![crate::types::ExternalToolResult {
+                tool_call_id: "call_a".to_string(),
+                result: crate::types::ToolResult::success("only one"),
+            }],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    ))
+    .await;
 
     assert!(
         matches!(outcome2, TurnOutcome::Error(_)),
@@ -2425,21 +2421,20 @@ async fn test_submit_tool_results_unknown_tool_call_id() -> anyhow::Result<()> {
     };
 
     // Submit with wrong tool_call_id → should error
-    let outcome2 = agent
-        .run_turn(
-            thread_id,
-            AgentInput::SubmitToolResults {
-                continuation,
-                results: vec![ExternalToolResult {
-                    tool_call_id: "unknown_id".to_string(),
-                    result: ToolResult::success("echo"),
-                }],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts,
-        )
-        .await;
+    let outcome2 = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "unknown_id".to_string(),
+                result: ToolResult::success("echo"),
+            }],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    ))
+    .await;
 
     assert!(
         matches!(outcome2, TurnOutcome::Error(_)),
@@ -2620,27 +2615,26 @@ async fn test_submit_tool_results_duplicate_tool_call_id() -> anyhow::Result<()>
     };
 
     // Submit the same tool_call_id twice → should error
-    let outcome2 = agent
-        .run_turn(
-            thread_id,
-            AgentInput::SubmitToolResults {
-                continuation,
-                results: vec![
-                    ExternalToolResult {
-                        tool_call_id: "tool_1".to_string(),
-                        result: ToolResult::success("first"),
-                    },
-                    ExternalToolResult {
-                        tool_call_id: "tool_1".to_string(),
-                        result: ToolResult::success("second"),
-                    },
-                ],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts,
-        )
-        .await;
+    let outcome2 = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![
+                ExternalToolResult {
+                    tool_call_id: "tool_1".to_string(),
+                    result: ToolResult::success("first"),
+                },
+                ExternalToolResult {
+                    tool_call_id: "tool_1".to_string(),
+                    result: ToolResult::success("second"),
+                },
+            ],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    ))
+    .await;
 
     assert!(
         matches!(outcome2, TurnOutcome::Error(_)),
@@ -3888,21 +3882,20 @@ async fn test_audit_external_append_failure_does_not_mark_execution_store() -> a
     // Turn 2: submit results — the first message-store append fails,
     // which should emit Completed + PersistenceFailed audit records and
     // leave the execution store clean.
-    let outcome2 = agent
-        .run_turn(
-            thread_id.clone(),
-            AgentInput::SubmitToolResults {
-                continuation,
-                results: vec![ExternalToolResult {
-                    tool_call_id: "tool_1".to_string(),
-                    result: ToolResult::success("external"),
-                }],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts.clone(),
-        )
-        .await;
+    let outcome2 = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::SubmitToolResults {
+            continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("external"),
+            }],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts.clone(),
+    ))
+    .await;
     assert!(
         matches!(outcome2, TurnOutcome::Error(_)),
         "Expected Error from failed append, got {outcome2:?}"
@@ -3921,21 +3914,20 @@ async fn test_audit_external_append_failure_does_not_mark_execution_store() -> a
     // time the message store succeeds. The audit sink must emit a
     // *fresh* Completed record (not Replayed) because the first
     // attempt never persisted.
-    let _ = agent
-        .run_turn(
-            thread_id,
-            AgentInput::SubmitToolResults {
-                continuation: retry_continuation,
-                results: vec![ExternalToolResult {
-                    tool_call_id: "tool_1".to_string(),
-                    result: ToolResult::success("external"),
-                }],
-            },
-            ToolContext::new(()),
-            CancellationToken::new(),
-            opts,
-        )
-        .await;
+    let _ = Box::pin(agent.run_turn(
+        thread_id,
+        AgentInput::SubmitToolResults {
+            continuation: retry_continuation,
+            results: vec![ExternalToolResult {
+                tool_call_id: "tool_1".to_string(),
+                result: ToolResult::success("external"),
+            }],
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+        opts,
+    ))
+    .await;
 
     let kinds = sink.kinds().await;
     // Expected sequence over both attempts:
@@ -4211,15 +4203,14 @@ async fn test_turn_summary_cancelled_before_llm_still_records_provenance() -> an
     let cancel = CancellationToken::new();
     cancel.cancel();
 
-    let outcome = agent
-        .run_turn(
-            ThreadId::from_string("t-cancelled-summary"),
-            AgentInput::Text("Hi".to_string()),
-            ToolContext::new(()),
-            cancel,
-            TurnOptions::default(),
-        )
-        .await;
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::from_string("t-cancelled-summary"),
+        AgentInput::Text("Hi".to_string()),
+        ToolContext::new(()),
+        cancel,
+        TurnOptions::default(),
+    ))
+    .await;
 
     let summary: TurnSummary = match outcome {
         TurnOutcome::Cancelled { summary, .. } => summary,

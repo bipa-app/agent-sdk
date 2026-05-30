@@ -70,6 +70,16 @@ pub struct AgentConfig {
     /// in real-time. When `false` (default), waits for the complete response
     /// before emitting `Text` and `Thinking` events.
     pub streaming: bool,
+    /// Optional per-tool execution timeout in milliseconds.
+    ///
+    /// When set, the agent loop races each tool's `execute()` future
+    /// against this budget at the SDK boundary (mirroring
+    /// `SubagentConfig::timeout_ms`). A tool that exceeds the budget is
+    /// stopped and reported with a synthetic timeout `ToolResult`, keeping
+    /// the `tool_use` / `tool_result` history balanced even for
+    /// non-cooperative tools. `None` (default) disables the boundary
+    /// timeout entirely.
+    pub tool_timeout_ms: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -81,6 +91,7 @@ impl Default for AgentConfig {
             model: String::from("claude-sonnet-4-5-20250929"),
             retry: RetryConfig::default(),
             streaming: false,
+            tool_timeout_ms: None,
         }
     }
 }

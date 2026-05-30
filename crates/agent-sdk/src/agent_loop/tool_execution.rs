@@ -491,45 +491,41 @@ where
     H: AgentHooks,
 {
     let tier = listen_tool.tier();
-    let result = match execute_with_idempotency(
-        ctx.execution_store,
-        pending,
-        ctx.thread_id,
-        catch_tool_panic(async {
-            Ok(
-                match listen_tool
-                    .execute(ctx.tool_context, &ready.operation_id, ready.revision)
-                    .await
-                {
-                    Ok(mut value) => {
-                        value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                        value
-                    }
-                    Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                        .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                },
+    let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
+    let result =
+        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+            race_boundary_result(
+                &controls,
+                tool_start,
+                catch_tool_panic(listen_execute_ok(
+                    listen_tool,
+                    ctx.tool_context,
+                    &ready.operation_id,
+                    ready.revision,
+                    tool_start,
+                )),
             )
-        }),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            emit_audit(
-                ctx.audit_sink,
-                ctx.provenance,
-                pending,
-                tier,
-                ctx.turn,
-                ToolAuditOutcome::PersistenceFailed {
-                    result: None,
-                    error: error.message.clone(),
-                },
-            )
-            .await;
-            return ToolExecutionOutcome::Error(error);
-        }
-    };
+            .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                emit_audit(
+                    ctx.audit_sink,
+                    ctx.provenance,
+                    pending,
+                    tier,
+                    ctx.turn,
+                    ToolAuditOutcome::PersistenceFailed {
+                        result: None,
+                        error: error.message.clone(),
+                    },
+                )
+                .await;
+                return ToolExecutionOutcome::Error(error);
+            }
+        };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -889,19 +885,18 @@ where
         ctx.execution_store,
         pending,
         ctx.thread_id,
-        catch_tool_panic(async {
-            execute_async_tool(AsyncToolExecutionParams {
-                pending,
-                tool: async_tool,
-                tool_context: ctx.tool_context,
-                event_store: ctx.event_store,
-                thread_id: ctx.thread_id,
-                turn: ctx.turn,
-                authority: ctx.authority,
-                #[cfg(feature = "otel")]
-                tool_span: Some(tool_span),
-            })
-            .await
+        // `execute_async_tool` already composes panic isolation inside
+        // the cancel / timeout race, so no outer `catch_tool_panic` here.
+        execute_async_tool(AsyncToolExecutionParams {
+            pending,
+            tool: async_tool,
+            tool_context: ctx.tool_context,
+            event_store: ctx.event_store,
+            thread_id: ctx.thread_id,
+            turn: ctx.turn,
+            authority: ctx.authority,
+            #[cfg(feature = "otel")]
+            tool_span: Some(tool_span),
         }),
     )
     .await
@@ -962,43 +957,187 @@ where
 /// dashboards as a single, well-known string.
 const CANCELLED_BY_USER: &str = "Cancelled by user";
 
-/// Race a tool's `execute()` future against the run's cancel token.
+/// `ToolResult` content the SDK synthesises when a tool exceeds its
+/// configured [`crate::types::AgentConfig::tool_timeout_ms`] budget.
+/// Like [`CANCELLED_BY_USER`], this is a single well-known string so
+/// it reads naturally for the LLM and is searchable in dashboards.
+const TIMED_OUT_AT_BOUNDARY: &str = "Tool timed out";
+
+/// SDK-boundary controls for racing a tool's `execute()` future.
 ///
-/// If the cancel arm wins, the SDK synthesises a successful
-/// [`ToolResult`] whose content is [`CANCELLED_BY_USER`] so the
-/// caller can commit a complete `tool_use` / `tool_result` pair
-/// before the run returns `AgentRunState::Cancelled`. Tools that
-/// observe `ToolContext::cancel_token()` themselves and return
-/// early are unaffected — their outcome wins the select before the
-/// cancel arm fires.
-///
-/// `cancel = None` (e.g. unit tests that never wire a token)
-/// short-circuits to the plain `execute.await` path so the helper
-/// is a true superset of the previous behaviour.
-async fn run_with_cancel<F>(
+/// Bundles the run's cancel token and the optional per-tool timeout so
+/// every tool kind (sync, async, listen) can apply the same balanced
+/// cancel / timeout synthesis through [`race_boundary_result`].
+#[derive(Clone)]
+pub(super) struct ToolBoundaryControls {
     cancel: Option<CancellationToken>,
+    timeout: Option<std::time::Duration>,
+}
+
+impl ToolBoundaryControls {
+    /// Read the cancel token and per-tool timeout off the tool context.
+    pub(super) fn from_tool_context<Ctx>(tool_context: &ToolContext<Ctx>) -> Self {
+        Self {
+            cancel: tool_context.cancel_token(),
+            timeout: tool_context.tool_timeout(),
+        }
+    }
+
+    /// True when neither a cancel token nor a timeout is configured, so
+    /// callers can take the plain `execute.await` fast path.
+    const fn is_noop(&self) -> bool {
+        self.cancel.is_none() && self.timeout.is_none()
+    }
+}
+
+/// Why the SDK boundary stopped a tool before it produced its own result.
+#[derive(Clone, Copy)]
+enum BoundaryStop {
+    Cancelled,
+    TimedOut,
+}
+
+impl BoundaryStop {
+    fn synthesize(self, tool_start: Instant) -> ToolResult {
+        let duration = millis_to_u64(tool_start.elapsed().as_millis());
+        match self {
+            // Cancellation is synthesised as a *successful* result so the
+            // pair stays balanced and the LLM reads it as a clean stop
+            // rather than a tool failure. Timeout is an error: the tool
+            // did not do its job in the allotted time.
+            Self::Cancelled => ToolResult::success(CANCELLED_BY_USER).with_duration(duration),
+            Self::TimedOut => ToolResult::error(TIMED_OUT_AT_BOUNDARY).with_duration(duration),
+        }
+    }
+}
+
+/// Future that resolves to the [`BoundaryStop`] reason whenever the
+/// run's cancel token fires or the per-tool timeout elapses.
+///
+/// An absent cancel token / timeout is modelled as a future that never
+/// resolves, so a configured-but-partial `controls` still arms only the
+/// arm(s) that are set. Cancellation is preferred over timeout when both
+/// are ready in the same poll.
+async fn wait_for_boundary_stop(controls: &ToolBoundaryControls) -> BoundaryStop {
+    let cancel = controls.cancel.clone();
+    let cancelled = async move {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let timeout = controls.timeout;
+    let timed_out = async move {
+        match timeout {
+            Some(duration) => tokio::time::sleep(duration).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancelled => BoundaryStop::Cancelled,
+        () = timed_out => BoundaryStop::TimedOut,
+    }
+}
+
+/// Race an arbitrary tool future that yields a `Result<ToolResult,
+/// AgentError>` against the run's cancel token and the per-tool timeout.
+///
+/// Returns the tool's own result if it finishes first, or a synthetic
+/// balanced result ([`CANCELLED_BY_USER`] / [`TIMED_OUT_AT_BOUNDARY`],
+/// as `Ok`) if the boundary fires. This is the shared primitive behind
+/// the sync, async, and listen execution paths — every kind of tool
+/// gets the same cancel + timeout semantics.
+///
+/// A boundary stop (cancel / timeout) is synthesised as
+/// `Ok(balanced ToolResult)`; the inner `Err` only propagates when the
+/// tool's own future produces it first. This is what lets the async
+/// poll loop be cancelled mid-stream while still committing one
+/// balanced `tool_result`. The `produce` future is the panic-isolated
+/// tool future ([`catch_tool_panic`]), so a panic becomes an error
+/// `ToolResult` that the race returns normally while a cancel / timeout
+/// still wins.
+///
+/// When `controls` is a no-op (no cancel token, no timeout — e.g. unit
+/// tests that never wire either) it short-circuits to `produce.await`
+/// so the helper is a true superset of the previous behaviour.
+async fn race_boundary_result<F>(
+    controls: &ToolBoundaryControls,
     tool_start: Instant,
-    execute: F,
-) -> ToolResult
+    produce: F,
+) -> Result<ToolResult, AgentError>
+where
+    F: std::future::Future<Output = Result<ToolResult, AgentError>>,
+{
+    if controls.is_noop() {
+        return produce.await;
+    }
+    tokio::select! {
+        biased;
+        result = produce => result,
+        stop = wait_for_boundary_stop(controls) => Ok(stop.synthesize(tool_start)),
+    }
+}
+
+/// Run a sync tool's `execute()` future and normalise its
+/// `anyhow::Result` into a duration-stamped [`ToolResult`], wrapped as
+/// `Ok` so it can be fed through [`catch_tool_panic`] (panic isolation)
+/// and then [`race_boundary_result`] (cancel / timeout).
+///
+/// This is the *innermost* layer of the sync-tool composition. A panic
+/// inside `execute` unwinds into the surrounding `catch_tool_panic`
+/// (becoming an error `ToolResult`); a cancel / timeout is decided by
+/// the surrounding `race_boundary_result`. Tools that observe
+/// `ToolContext::cancel_token()` themselves and return early are
+/// unaffected — their outcome wins the race before the boundary arms
+/// fire.
+async fn sync_execute_ok<F>(execute: F, tool_start: Instant) -> Result<ToolResult, AgentError>
 where
     F: std::future::Future<Output = anyhow::Result<ToolResult>>,
 {
-    let to_result = |outcome: anyhow::Result<ToolResult>| match outcome {
+    Ok(match execute.await {
         Ok(mut value) => {
             value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
             value
         }
         Err(error) => ToolResult::error(format!("Tool error: {error:#}"))
             .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-    };
-    match cancel {
-        Some(token) => tokio::select! {
-            outcome = execute => to_result(outcome),
-            () = token.cancelled() => ToolResult::success(CANCELLED_BY_USER)
+    })
+}
+
+/// Run a listen tool's `execute()` and normalise its `Result` into a
+/// duration-stamped [`ToolResult`], wrapped as `Ok` so it can be fed
+/// through [`catch_tool_panic`] then [`race_boundary_result`].
+///
+/// Pulled out so both the first-pass listen path and the confirmed
+/// resume path share the same Ok/Err mapping and the same
+/// panic-isolation + cancel/timeout composition. `operation_id` /
+/// `revision` are passed directly because the two call sites carry the
+/// listen metadata in different wrapper types (`ListenReady` vs
+/// `ListenExecutionContext`).
+async fn listen_execute_ok<Ctx>(
+    listen_tool: &Arc<dyn ErasedListenTool<Ctx>>,
+    tool_context: &ToolContext<Ctx>,
+    operation_id: &str,
+    revision: u64,
+    tool_start: Instant,
+) -> Result<ToolResult, AgentError>
+where
+    Ctx: Send + Sync + Clone,
+{
+    Ok(
+        match listen_tool
+            .execute(tool_context, operation_id, revision)
+            .await
+        {
+            Ok(mut value) => {
+                value.duration_ms = Some(millis_to_u64(tool_start.elapsed().as_millis()));
+                value
+            }
+            Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
                 .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
         },
-        None => to_result(execute.await),
-    }
+    )
 }
 
 async fn complete_sync_tool_call<Ctx, H>(
@@ -1012,39 +1151,38 @@ where
 {
     let tier = tool.tier();
     let tool_start = Instant::now();
-    let cancel = ctx.tool_context.cancel_token();
-    let result = match execute_with_idempotency(
-        ctx.execution_store,
-        pending,
-        ctx.thread_id,
-        catch_tool_panic(async {
-            Ok(run_with_cancel(
-                cancel,
+    let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
+    let result =
+        match execute_with_idempotency(ctx.execution_store, pending, ctx.thread_id, async {
+            race_boundary_result(
+                &controls,
                 tool_start,
-                tool.execute(ctx.tool_context, pending.input.clone()),
+                catch_tool_panic(sync_execute_ok(
+                    tool.execute(ctx.tool_context, pending.input.clone()),
+                    tool_start,
+                )),
             )
-            .await)
-        }),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            emit_audit(
-                ctx.audit_sink,
-                ctx.provenance,
-                pending,
-                tier,
-                ctx.turn,
-                ToolAuditOutcome::PersistenceFailed {
-                    result: None,
-                    error: error.message.clone(),
-                },
-            )
-            .await;
-            return ToolExecutionOutcome::Error(error);
-        }
-    };
+            .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                emit_audit(
+                    ctx.audit_sink,
+                    ctx.provenance,
+                    pending,
+                    tier,
+                    ctx.turn,
+                    ToolAuditOutcome::PersistenceFailed {
+                        result: None,
+                        error: error.message.clone(),
+                    },
+                )
+                .await;
+                return ToolExecutionOutcome::Error(error);
+            }
+        };
     ctx.hooks.post_tool_use(&pending.name, &result).await;
     emit_audit(
         ctx.audit_sink,
@@ -1189,8 +1327,37 @@ pub(super) struct AsyncToolExecutionParams<'a, Ctx> {
 /// This function handles the two-phase execution of async tools:
 /// 1. Execute the tool (returns immediately with Success/Failed/`InProgress`)
 /// 2. If `InProgress`, stream status updates until completion
+///
+/// Both phases run under the SDK-boundary cancel / timeout race
+/// ([`race_boundary_result`]). A cancel or timeout that fires during
+/// the lightweight execute or the long-running poll loop drops the
+/// in-flight future and synthesises a single balanced `ToolResult`, so
+/// the async path never leaves an orphan `tool_use`.
+///
+/// The inner execution is also panic-isolated ([`catch_tool_panic`])
+/// *inside* the race, so a panic in the async tool / poll loop becomes
+/// an error `ToolResult` while a cancel / timeout still wins the race.
+/// Because panic isolation is applied here, the async call sites must
+/// **not** wrap [`execute_async_tool`] in `catch_tool_panic` again.
 pub(super) async fn execute_async_tool<Ctx>(
     params: AsyncToolExecutionParams<'_, Ctx>,
+) -> Result<ToolResult, AgentError>
+where
+    Ctx: Send + Sync + Clone,
+{
+    let controls = ToolBoundaryControls::from_tool_context(params.tool_context);
+    let tool_start = Instant::now();
+    race_boundary_result(
+        &controls,
+        tool_start,
+        catch_tool_panic(execute_async_tool_inner(params, tool_start)),
+    )
+    .await
+}
+
+async fn execute_async_tool_inner<Ctx>(
+    params: AsyncToolExecutionParams<'_, Ctx>,
+    tool_start: Instant,
 ) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone,
@@ -1206,8 +1373,6 @@ where
         #[cfg(feature = "otel")]
         tool_span,
     } = params;
-
-    let tool_start = Instant::now();
 
     // Step 1: Execute (lightweight, returns quickly)
     let outcome = match tool.execute(tool_context, pending.input.clone()).await {
@@ -1540,26 +1705,25 @@ where
             )));
         };
         let tool_start = Instant::now();
+        let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
         return execute_with_idempotency(
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            catch_tool_panic(async {
-                Ok(
-                    match listen_tool
-                        .execute(ctx.tool_context, &listen.operation_id, listen.revision)
-                        .await
-                    {
-                        Ok(mut value) => {
-                            value.duration_ms =
-                                Some(millis_to_u64(tool_start.elapsed().as_millis()));
-                            value
-                        }
-                        Err(error) => ToolResult::error(format!("Listen execute error: {error}"))
-                            .with_duration(millis_to_u64(tool_start.elapsed().as_millis())),
-                    },
+            async {
+                race_boundary_result(
+                    &controls,
+                    tool_start,
+                    catch_tool_panic(listen_execute_ok(
+                        listen_tool,
+                        ctx.tool_context,
+                        &listen.operation_id,
+                        listen.revision,
+                        tool_start,
+                    )),
                 )
-            }),
+                .await
+            },
         )
         .await;
     }
@@ -1569,19 +1733,18 @@ where
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            catch_tool_panic(async {
-                execute_async_tool(AsyncToolExecutionParams {
-                    pending: awaiting_tool,
-                    tool: async_tool,
-                    tool_context: ctx.tool_context,
-                    event_store: ctx.event_store,
-                    thread_id: ctx.thread_id,
-                    turn: ctx.turn,
-                    authority: ctx.authority,
-                    #[cfg(feature = "otel")]
-                    tool_span: None,
-                })
-                .await
+            // `execute_async_tool` already composes panic isolation inside
+            // the cancel / timeout race, so no outer `catch_tool_panic` here.
+            execute_async_tool(AsyncToolExecutionParams {
+                pending: awaiting_tool,
+                tool: async_tool,
+                tool_context: ctx.tool_context,
+                event_store: ctx.event_store,
+                thread_id: ctx.thread_id,
+                turn: ctx.turn,
+                authority: ctx.authority,
+                #[cfg(feature = "otel")]
+                tool_span: None,
             }),
         )
         .await;
@@ -1589,19 +1752,22 @@ where
 
     if let Some(tool) = ctx.tools.get(&awaiting_tool.name) {
         let tool_start = Instant::now();
-        let cancel = ctx.tool_context.cancel_token();
+        let controls = ToolBoundaryControls::from_tool_context(ctx.tool_context);
         return execute_with_idempotency(
             ctx.execution_store,
             awaiting_tool,
             ctx.thread_id,
-            catch_tool_panic(async {
-                Ok(run_with_cancel(
-                    cancel,
+            async {
+                race_boundary_result(
+                    &controls,
                     tool_start,
-                    tool.execute(ctx.tool_context, awaiting_tool.input.clone()),
+                    catch_tool_panic(sync_execute_ok(
+                        tool.execute(ctx.tool_context, awaiting_tool.input.clone()),
+                        tool_start,
+                    )),
                 )
-                .await)
-            }),
+                .await
+            },
         )
         .await;
     }

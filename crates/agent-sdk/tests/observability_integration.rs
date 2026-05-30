@@ -1191,15 +1191,14 @@ async fn single_turn_mode_sets_run_mode() -> Result<()> {
         .event_store(new_event_store())
         .build();
     let thread_id = ThreadId::new();
-    let _ = agent
-        .run_turn(
-            thread_id.clone(),
-            AgentInput::Text("Hello".to_string()),
-            ToolContext::new(()),
-            CancellationToken::new(),
-            TurnOptions::default(),
-        )
-        .await;
+    let _ = Box::pin(agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("Hello".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
     tp.force_flush()
         .context("failed to flush tracer provider")?;
 
@@ -1881,16 +1880,15 @@ async fn run_turn_with_options_stamps_metadata_in_single_turn_mode() -> Result<(
         trace_text_max_chars: None,
     };
 
-    let _ = agent
-        .run_turn_with_options(
-            thread_id.clone(),
-            AgentInput::Text("One-shot".to_string()),
-            ToolContext::new(()),
-            CancellationToken::new(),
-            TurnOptions::default(),
-            opts,
-        )
-        .await;
+    let _ = Box::pin(agent.run_turn_with_options(
+        thread_id.clone(),
+        AgentInput::Text("One-shot".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+        opts,
+    ))
+    .await;
 
     tp.force_flush()
         .context("failed to flush tracer provider")?;
