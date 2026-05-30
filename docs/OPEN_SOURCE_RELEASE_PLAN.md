@@ -173,7 +173,7 @@ Linear is canonical for state; this table is a convenience mirror that **may lag
 | 10·B cancel async/listen + timeout | `ENG-8704` | In Review | [#254](https://github.com/bipa-app/agent-sdk/pull/254) |
 | 10·C panic isolation | `ENG-8705` | In Review | [#252](https://github.com/bipa-app/agent-sdk/pull/252) |
 | 10·D atomic commit + durable wakeup | `ENG-8706` | In Review | [#255](https://github.com/bipa-app/agent-sdk/pull/255) |
-| 10·E idempotency + back-pressure + retry | `ENG-8707` | In Progress | — |
+| 10·E idempotency + back-pressure + retry | `ENG-8707` | In Review | [#257](https://github.com/bipa-app/agent-sdk/pull/257) |
 | 11·A test substrate + Postgres-in-CI | `ENG-8708` | In Review | [#253](https://github.com/bipa-app/agent-sdk/pull/253) |
 | 11·B journal conformance battery | `ENG-8709` | Backlog (blocked) | — |
 | 11·C cancel/lifecycle matrix | `ENG-8710` | Backlog (blocked) | — |
@@ -194,6 +194,7 @@ Append-only; newest last. One line per event: date — what changed.
 - 2026-05-29 — Plan drafted from a multi-agent audit of the harness (concurrency, durability, lifecycle, tests, API, release-readiness). Linear milestones Phase 10/11/12 created with tracking cards `ENG-8700/8701/8702` and 17 child cards; dependency links wired. Plan committed (PR #251).
 - 2026-05-30 — Launched the unblocked set in parallel worktrees (one per task). Draft PRs opened and cards moved to In Review: 10·A #256, 10·B #254, 10·C #252, 10·D #255, 11·A #253. 10·D and 11·A verified against live Postgres 18. 10·E in progress.
 - 2026-05-30 — Restructured this document into a living execution log (how-to-use + update protocol, per-task tables with done-when bars, status mirror, append-only log); applied an adversarial review pass (precedence rule for the §7 mirror, per-task done-when on Phases 11/12, conformance-battery naming, and a §6.4 scrub-location correction).
+- 2026-05-30 — 10·E (`ENG-8707`) landed (draft PR #257; verified on live Postgres + SQLite): durable cross-restart idempotency, queue/input back-pressure, retry-budget reconciliation. **Phase 10 implementation drafts are now complete (A–E)**; all six initially-unblocked tasks (10·A–E, 11·A) are in review. This plan log is now on `main`, so subsequent §7/§8 updates ride along with each task's PR.
 
 ## 9. Definition of Done (launch)
 
