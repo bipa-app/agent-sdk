@@ -1,390 +1,198 @@
-# Open-Source Release Plan — Agent SDK
+# Agent SDK — Open-Source Release Plan & Execution Log
 
-> Status: **draft for review** · Owner: @luiz · Date: 2026-05-29
->
-> Decisions locked for this plan: **all 9 crates go public**, distributed via
-> **public GitHub repo + crates.io**, licensed **MIT**, and the launch quality
-> bar for end-to-end testing is **harness robustness** — proving the runtime
-> handles every asynchronous scenario (cancellation mid-turn, message
-> start/queueing/ordering, durable journals that persist and replay correctly)
-> for any agent type (coding, knowledge, etc.), not model-output benchmarks.
+**Status:** Active · **Last updated:** 2026-05-30 · **Linear project:** [Server SDK](https://linear.app/bipa/project/server-sdk-1f17d8469d74) · **Tracking:** Phase 10 `ENG-8700`, Phase 11 `ENG-8701`, Phase 12 `ENG-8702`
+
+This is the plan of record **and** the running execution log for re-open-sourcing the Agent SDK. It is the document an engineer or coding agent reads to pick up any task cold, and the document they update when work lands.
+
+## How to use this document
+
+- **Before starting a task:** read the Linear card, then this plan's task row (§6) and the workstream it belongs to. Linear is the canonical source for task *state*; this file is the canonical source for task *scope, rationale, and dependencies*.
+- **When you open or land a PR:** update the task's row in §7 (Status) with the PR link and state, and add a dated line to §8 (Change log). Keep entries terse and factual.
+- **When reality diverges from the plan:** edit the relevant section in the same PR that causes the divergence, and note it in §8. Do not let the plan drift from the code.
+- **Editing etiquette:** §8 is append-only (newest last). Everything else is living — correct it in place. Keep prose professional and skimmable; preserve `file:line` evidence and acceptance criteria.
 
 ---
 
-## Project mappings
+## 1. Objective
 
-This initiative is implemented entirely in this repository.
+Re-open-source the Agent SDK as a welcoming public project: a correct, well-tested, and ergonomic Rust agent runtime that external developers can adopt with `cargo add agent-sdk`. The SDK was previously public (Apache-2.0), was taken private to mature it, and is now being re-opened.
+
+The release bar is **harness robustness**: the runtime must behave correctly under every asynchronous scenario a real agent (coding, knowledge, or otherwise) encounters — cancellation at any point in a turn, message start/queueing/ordering, and durable journals that persist and replay correctly. This is prioritised over model-output benchmarks.
+
+## 2. Key decisions
+
+| Decision | Choice | Rationale | Date |
+|---|---|---|---|
+| Release scope | **All 9 crates public** | Ship the full stack, including the durable server/host. | 2026-05-29 |
+| Distribution | **Public GitHub repo + crates.io** | `cargo add agent-sdk` is the target on-ramp. | 2026-05-29 |
+| License | **MIT** | Maximally permissive; simplest for adopters. Historical releases were Apache-2.0; dual-licensing was considered and declined. | 2026-05-29 |
+| Quality bar | **Harness robustness** (async/durability correctness), not model benchmarks | The runtime's correctness under cancellation/queueing/crash is what makes it safe to hand to others. | 2026-05-29 |
+
+## 3. Architecture snapshot
+
+Cargo workspace, 9 crates, ~160k LOC, cleanly layered:
+
+| Layer | Crates | ~LOC | Role |
+|---|---|---|---|
+| **SDK (in-process)** | `agent-sdk-core`, `agent-sdk-tools`, `agent-sdk-providers`, `agent-sdk` (façade), `agent-sdk-otel`, `agent-sdk-cli` | 57k | The library most users consume |
+| **Durable server/host** | `agent-server`, `agent-service-host`, `agent-service-proto` | 93k | gRPC + journal + Postgres/SQLite + AMQP orchestration |
+
+Dependency layering: `agent-sdk-core` → `agent-sdk-tools` / `agent-sdk-providers` → `agent-sdk` → `agent-server` → `agent-service-host`.
+
+**Load-bearing fact:** the heavy-dependency boundary is already clean — a plain `cargo add agent-sdk` (no features) pulls **none** of `sqlx`, `tonic`, `lapin`, `prost`, or `opentelemetry`. Simplification is therefore a DX/packaging effort, not a re-architecture.
+
+## 4. Project mapping
+
+Implemented entirely in this repository.
 
 - **agent-sdk** — `git@github.com:bipa-app/agent-sdk.git`
-  - local: `~/work/trees/agent-sdk/main`
-  - strategy: `worktree`, base `main`
-  - Rust 2024 workspace. Gates: `cargo check --all-targets`, `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`. SQLX offline builds (`.sqlx`); after any `sqlx::query!` change run `scripts/postgres18-dev.sh prepare` + `scripts/sqlite-dev.sh prepare`.
+  - local root: `~/work/trees/agent-sdk` (worktree-per-task; main worktree at `~/work/trees/agent-sdk/main`)
+  - strategy: `worktree`, base branch `main`
+  - Rust 2024. Gates: `cargo check --all-targets`, `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` (or `cargo nextest run`). Builds are `SQLX_OFFLINE`; after any `sqlx::query!` change run `scripts/postgres18-dev.sh prepare` + `scripts/sqlite-dev.sh prepare` and commit `.sqlx/`.
 
-## Linear delivery — Server SDK · Phases 10–12
+## 5. Workstreams
 
-Tracked in the **Server SDK** Linear project (team ENG). The three workstreams map to three milestones; each tracking card links back to this document.
+- **A — Harness robustness.** Close async/durability correctness gaps (A1) and build the test suite that proves them (A2). This is the launch gate.
+- **B — Simplification & DX.** API ergonomics, dependency feature-gating, façade curation, a CLI that runs an agent.
+- **C — Release mechanics.** MIT relicense, Bipa-internal scrub + secret scan, crates.io packaging, CI/release automation, publish.
 
-| Milestone | Workstream | Tracking | Children |
+Workstream A maps to Phases 10–11; Workstreams B + C map to Phase 12.
+
+---
+
+## 6. Phases & tasks
+
+Dependency rule across phases: **Phase 10 → 11 → 12.** Cross-phase and intra-phase blockers are noted per task and enforced as Linear `Blocked by` links.
+
+### Phase 10 — Harness Correctness (Workstream A1) · `ENG-8700`
+
+Behavioural fixes. Each task ships with its own regression test. `file:line` references are entry points, not exhaustive.
+
+| Task | Scope | Evidence | Sev |
 |---|---|---|---|
-| Phase 10: Harness Correctness — Async & Durability Hardening | A1 | ENG-8700 | ENG-8703 (A · cancel LLM/stream/compaction + `Cancelled`), ENG-8704 (B · cancel async/listen + timeout + kill-on-drop), ENG-8705 (C · panic isolation), ENG-8706 (D · durable commit + wakeup), ENG-8707 (E · idempotency + back-pressure + retry budget) |
-| Phase 11: Robustness Test Suite & Provider Determinism | A2 | ENG-8701 | ENG-8708 (A · test substrate + Postgres-in-CI), ENG-8709 (B · journal conformance battery), ENG-8710 (C · cancel/lifecycle matrix), ENG-8711 (D · durability/replay/DST/loom), ENG-8712 (E · provider determinism + streaming tests) |
-| Phase 12: Simplification, DX & Public Open-Source Release | B + C | ENG-8702 | ENG-8713 (A · ergonomics + façade), ENG-8714 (B · feature-gating + deps), ENG-8715 (C · CLI + examples), ENG-8716 (D · MIT relicense + scrub + secret scan), ENG-8717 (E · crates.io packaging), ENG-8718 (F · CI/release automation), ENG-8719 (G · publish + go public) |
+| **A** `ENG-8703` | Honor cancellation during the LLM call (streaming + non-streaming) and during compaction (guard the destructive `replace_history`); add a first-class `AgentEvent::Cancelled`. | `agent_loop/llm.rs:345-464`, `run_loop.rs:1383-1401`, `compactor.rs:433-434`, `agent-sdk-core/src/events.rs` | High |
+| **B** `ENG-8704` | Extend the SDK-boundary cancel race to async tools, the `stream_async_tool_progress` poll loop, and listen tools; add a configurable per-tool timeout; document + enforce the subprocess kill-on-drop contract. | `tool_execution.rs:957-994,1201,1312` | High |
+| **C** `ENG-8705` | Isolate panics in tool/LLM/compaction futures (`catch_unwind`) → structured error result with balanced history; never unwind the run task or drop `state_tx`. | no `catch_unwind` today | High |
+| **D** `ENG-8706` | Make the production turn-commit atomic across **events + state** (route through `commit_events_with_outbox`); implement durable cross-process wakeup (`emit_in_transaction`, Postgres + SQLite). | `commit.rs:167-174,245-252`, `root_turn.rs:675-703`, `relay.rs:263-327`, `wakeup.rs:86-95` | High |
+| **E** `ENG-8707` | Persist `request_id` idempotency atomically with admission (survive restart); per-thread queued-root depth cap; `SubmitThreadWork` input-size limit; reconcile `max_attempts` so a mid-turn crash requeues instead of failing closed. | `grpc.rs:81-85,982-1006,1030,1040-1045`, `store.rs:1927-2051`, `definition.rs:99` | High |
 
-**Dependency gating (Linear `Blocked by`):** Phase 10 → Phase 11 → Phase 12 at the tracking level. Cross-phase: 11·C ← 10·A/B/D; 11·D ← 10·D/E; 11·B/C/D/E ← 11·A. Within Phase 12: 12·E ← 12·B+12·D; 12·F ← 12·E; 12·G ← 12·D+12·E+12·F.
+**Definition of done (Phase 10):** a cancel issued during streaming, compaction, or an async/listen tool stops work promptly and leaves balanced `tool_use`/`tool_result` history; a panicking tool ends the run as a structured error; a crash between state-commit and event-commit cannot leave a committed turn with zero events; a `request_id` retried across a restart produces exactly one effect.
 
----
+### Phase 11 — Robustness Test Suite & Provider Determinism (Workstream A2) · `ENG-8701`
 
-## 0. Where we are today
+Gated on Phase 10 (tests the corrected behaviour). `11·A` and `11·B` can begin in parallel with late Phase 10 work.
 
-`agent-sdk` was public under Apache-2.0, was privatized to improve it, and is
-now being re-opened. The workspace is **9 crates, ~160k LOC**, cleanly layered:
+| Task | Scope | Blocked by |
+|---|---|---|
+| **A** `ENG-8708` | Test substrate: `cargo-nextest` (+ test groups), **Postgres-in-CI** running the `#[ignore]`-gated store/host tests, `proptest`/`proptest-state-machine`/`insta`/`tokio start_paused`, and a zero-cost `failpoints` (`fail-rs`) feature. | — |
+| **B** `ENG-8709` | Port Anthropic's `run_session_store_conformance` to a reusable Rust trait battery; run across in-memory + SQLite + Postgres; include checkpointer cases (incl. LangGraph #6821 latest-by-insertion-order). | 11·A |
+| **C** `ENG-8710` | Cancellation + message-lifecycle edge-case matrix (§6.1), incl. the composite "new input mid-stream + cancel mid-tool" and the hard-abort/crash-recovery synth path. | 11·A, 10·A/B/D |
+| **D** `ENG-8711` | Durability suite: real on-disk SQLite reopen-and-resume, `fail-rs` crash-between-steps, Temporal-style replay-determinism, a seeded DST loop, scoped `loom` on the lock-free hot spots. | 11·A, 10·D/E |
+| **E** `ENG-8712` | Provider determinism: shared streaming-capable scripted provider harness; re-enable the 17 `#[ignore]`'d streaming tests; `wiremock` + `rvcr` Tier-B tests; gated live-smoke Tier-C; CI tiering. | 11·A |
 
-| Layer | Crates | LOC | Role |
+#### 6.1 Harness edge-case test matrix (spec for 11·C/D/E)
+
+Borrowed from the Claude Agent SDK, OpenAI Agents SDK, LangGraph, Temporal, Mastra, Pydantic AI, Vercel AI SDK, and DBOS/Inngest/Restate.
+
+**Cancellation mid-turn** — cancel during streaming; cancel before first token; cancel during compaction; cancel during the parallel observe `join_all`; double-cancel; cancel-vs-result race determinism; interrupt-then-drain ordering (Claude SDK); aborted stream yields well-formed (not half-parsed) tool calls (Pydantic AI); `AbortSignal` forwarded into tools (Mastra); caller-cancel must not outrun teardown (Pydantic AI #5132); persistence not gated on clean finish (Mastra #13984); hard-abort → `synthesize_error_tool_results` produces a provider-acceptable next turn; panic-in-tool.
+
+**Message start / queueing / ordering** — concurrent send+receive on one thread; concurrent same-thread submit serialises to exactly one `Pending`; composite "new input mid-stream + cancel mid-tool" (in-flight turn settles, FIFO preserved, queued message runs next with balanced history, event streams isolated); `receive_response` stops at the terminal result; distinct-thread isolation; queue-depth/oversize back-pressure.
+
+**Durable journal / replay / resume** — real on-disk SQLite reopen-and-resume of a mid-flight turn/tool/subagent tree; `fail-rs` crash between durable steps → no lost/duplicate work; idempotent resume re-run; replay-determinism check (divergence fails CI); exactly-once-effect over at-least-once delivery; completed steps replay cached output; same `request_id` across restart → one effect.
+
+#### 6.2 Testing toolchain (priority order)
+
+| Pri | Tool | Covers |
+|---|---|---|
+| P1 | `cargo-nextest` + Postgres-in-CI | process isolation (needed for `fail-rs`), retries surface flakiness, and the prod backend's concurrency/txn tests that never run today |
+| P2 | `proptest` + `proptest-state-machine`; `tokio start_paused`; `insta` | model-based journal/outbox invariants; deterministic virtual time; ordering snapshots |
+| P3 | `fail-rs`; lightweight seeded DST loop | crash-between-steps; seeded interleavings with replayable seed |
+| P4 | `loom` (scoped) | exhaustive interleavings of the wakeup fold + the two CAS sites only |
+| P5–P6 | `toxiproxy`; Jepsen (`elle`/`porcupine`) | wire-fault and linearizability proofs — deferred to a formal durability audit |
+
+Provider tests are tiered: **A** unit (SSE decode, tool_use JSON round-trip), **B** deterministic integration (`wiremock` scripted SSE + `rvcr` cassettes), **C** env-gated live-smoke (one round-trip per real provider, nightly/secrets only). Model benchmarks (tau-bench/SWE-bench/GAIA/terminal-bench) are **not** CI gates; an optional non-blocking BFCL-style tool-call smoke vs a mock is the only one with SDK relevance.
+
+### Phase 12 — Simplification, DX & Public Release (Workstreams B + C) · `ENG-8702`
+
+Gated on Phases 10 + 11 green. `12·G` (publish + go public) is the final, irreversible gate.
+
+| Task | Scope | Type | Blocked by |
 |---|---|---|---|
-| **SDK (in-process)** | `agent-sdk-core`, `agent-sdk-tools`, `agent-sdk-providers`, `agent-sdk` (façade), `agent-sdk-otel`, `agent-sdk-cli` | ~57k | The library most users consume |
-| **Durable server/host** | `agent-server`, `agent-service-host`, `agent-service-proto` | ~93k | gRPC + journal + Postgres/SQLite + AMQP orchestration |
+| **A** `ENG-8713` | API ergonomics + façade curation: `agent.ask()`/`send()`, `run()` returns `impl Future`, `prelude`, provider `from_env()`, default `Tool::Name`; move server-only types behind `agent_sdk::advanced`. | AFK | 10+11 |
+| **B** `ENG-8714` | Dependency hygiene: feature-gate providers/tools (`anthropic` default, `openai`, `openai-codex`, `gemini`/`vertex`, `web`, `mcp`, `skills`); replace deprecated `serde_yaml`. | AFK | 10+11 |
+| **C** `ENG-8715` | CLI that runs an agent (`agent-sdk chat`/`run`) + runnable quickstart examples; README quickstart compiles without a key. | AFK | 10+11 |
+| **D** `ENG-8716` | MIT relicense + governance rewrite (README/CONTRIBUTING/SECURITY) + Bipa scrub + **full git-history secret scan**. | **HITL** | 10+11 |
+| **E** `ENG-8717` | crates.io packaging: flip `publish`, path+version deps, metadata, docs.rs config, commit `Cargo.lock`, resolve `agent-service-proto` packaging. | AFK | 12·B, 12·D |
+| **F** `ENG-8718` | CI/release automation: `release-plz`, `cargo-deny`/`cargo-audit`, `cargo-semver-checks`, MSRV (`rust-version = 1.85`) + pinned-toolchain job, cross-platform matrix, fix `claude.yml`. | AFK | 12·E |
+| **G** `ENG-8719` | Publish to crates.io in dependency order + flip repo public + announce. | **HITL** | 12·D, 12·E, 12·F |
 
-**The single best piece of news:** the heavy-dependency boundary is already
-clean. A plain `cargo add agent-sdk` (no features) pulls **none** of `sqlx`,
-`tonic`, `lapin`, `prost`, or `opentelemetry` — those live only in the
-server/host crates. The in-process SDK does not drag in Postgres/AMQP. So
-"simplify" is mostly DX and dependency-hygiene, not a re-architecture.
+#### 6.3 Release blockers (spec for 12·D/E/F)
 
-### Direct answers to your three questions
-
-1. **"Is there a dataset or another framework's test suite we can base on and
-   pass?"** — Yes, but **not a model-quality benchmark**. The right targets for
-   *harness* confidence are:
-   - **Anthropic Claude Agent SDK's `run_session_store_conformance`** — a
-     shipped, packaged store/journal conformance battery. This is the *single
-     most directly borrowable artifact*; port it as a Rust trait test.
-   - **LangGraph's checkpointer conformance suite** (one spec, many backends)
-     and its interrupt/resume semantics.
-   - The **harness edge-case matrix** distilled below from Temporal, OpenAI
-     Agents SDK, Mastra, Pydantic AI, and Vercel AI SDK.
-   - For tool-calling correctness only, **BFCL** is the one model-benchmark
-     with SDK relevance — and only as a *non-blocking* smoke. **Do not** chase
-     tau-bench / SWE-bench / GAIA / terminal-bench for an SDK; they conflate
-     model behavior with harness plumbing.
-
-2. **"Simplify as much as we can"** — the crate graph is already well-factored;
-   the wins are API ergonomics, feature-gating heavy/optional deps, curating
-   the façade, swapping a deprecated dependency, and making the CLI able to
-   actually run an agent. See **Workstream B**.
-
-3. **"Plan an open release + simple ways to use it"** — relicense to MIT, scrub
-   Bipa-internal coupling (and secret-scan the full git history *before* going
-   public), fix crates.io packaging, and add release/CI automation. See
-   **Workstream C**.
-
-### The verdict in one paragraph
-
-The harness *core* is genuinely strong: a CAS-guarded single-writer-per-thread
-journal, FIFO per-thread queue, atomic completed-turn commit, checkpoint-
-anchored recovery, cooperative cancellation with the "balanced tool_use/
-tool_result history" fix, and deep unit coverage (827 inline tests in
-`agent-server` alone). But three things stand between today and a confident
-launch: **(A)** real *correctness* gaps in the async/durability machinery (not
-just missing tests), **(B)** a test suite that cannot yet *prove* robustness
-(no E2E streaming, Postgres never runs in CI, "crashes" are simulated by
-dropping in-memory stores), and **(C)** release blockers (proprietary license,
-`publish = false` everywhere, Bipa coupling). The plan tackles all three.
-
----
-
-## Workstream A — Harness robustness (the heart of #1)
-
-Two halves: **A1** fixes correctness gaps in the harness itself; **A2** builds
-the test infrastructure and the borrowed edge-case matrix that *proves* it.
-
-### A1 — Correctness gaps to close (do these before claiming "robust")
-
-These are behaviors that are **missing or wrong today**, with file:line
-evidence from the code audit. Severity is impact-on-a-real-agent.
-
-| # | Gap | Sev | Fix | Effort | Evidence |
-|---|---|---|---|---|---|
-| 1 | **Cancel during streaming / before first token is ignored** until the stream completes — tokens keep burning, honored only at next loop-top check | High | Race `process_stream` loop + `call_llm_with_retry` against `token.cancelled()`; thread cancel into `LlmCallParams` | M | `agent_loop/llm.rs:345-464`; `run_loop.rs:1383-1401` |
-| 2 | **Cancel during compaction is ignored** — a slow, *destructive* `replace_history` can complete after the user asked to stop | High | Pass token into compaction; race `provider.chat`; check `is_cancelled` before `replace_history` | M | `compactor.rs:433-434` |
-| 3 | **Async tools, listen tools, and the async poll loop are not raced against cancel** — the long-running tools where cancel matters most | High | Extend `run_with_cancel` to async/listen paths; synthesize the same balanced "Cancelled by user" result | L | `tool_execution.rs:1201,1312` |
-| 4 | **Panic in a tool/LLM future unwinds the whole run**, drops `state_tx` (caller sees `RecvError`), and orphans the `tool_use` — re-creating the unbalanced-history 400 the cancel fix solved | High | `catch_unwind(AssertUnwindSafe)` around tool/LLM futures → commit an error `ToolResult` via the idempotency path | M | no `catch_unwind` anywhere |
-| 5 | **Production turn-commit splits events from state** — worker calls `commit_event_batch` (separate tx) not `commit_events_with_outbox`; a crash between state commit and event commit leaves a committed turn **with no persisted events**, and the in-process notify is lost on host death | High | Route the production path through `commit_events_with_outbox` so events+outbox row commit in the same tx as state | L | `commit.rs:167-174,245-252`; `root_turn.rs:675-703` |
-| 6 | **Idempotency cache is in-memory only** (`Arc<Mutex<IdempotencyState>>`) — a `SubmitThreadWork`/`ForkThread`/`DecideConfirmation` retried with the same `request_id` *across a restart* is **not deduped** → duplicate turn / double fork / double-applied decision (the classic at-least-once delivery footgun) | High | Persist dedup records in the store keyed by `request_id`, checked atomically inside task admission | L | `grpc.rs:81-85,982-1006,1072-1138` |
-| 7 | **No durable cross-process wakeup** — relay/wakeup off by default; durable SQL emitter is a future phase (in-memory only). Multi-process deploys lack durable broker delivery + cross-process wakeup beyond the fallback sweep | High | Implement `emit_in_transaction` for Postgres/SQLite; default-enable (or warn) relay on SQL backends | L | `relay.rs:263-327`; `wakeup.rs:86-95` |
-| 8 | **No `Cancelled` (or generic terminal) event in the stream** — streaming consumers get no closing marker and can hang waiting for `Done` | Med | Add `AgentEvent::Cancelled`, emit at every cancellation return site | S | `agent-sdk-core/src/events.rs` |
-| 9 | **No per-thread queued-root depth cap and no input-size limit** — a retry storm enqueues unbounded serial work; large base64 attachments are stored inline with no cap | Med | Configurable queue-depth cap (`RESOURCE_EXHAUSTED`); aggregate/per-item input size limit (`invalid_argument`) + explicit tonic `max_decoding_message_size` | S–M | `store.rs:1927-2051`; `grpc.rs` submit handler |
-| 10 | **`max_attempts` footgun** — submission template uses `DEFAULT_MAX_ATTEMPTS=1` while policy default is 3; a root admitted with budget 1 that crashes mid-turn is **failed-closed, not retried** | Med | Reconcile to the resolved `definition.policy.max_attempts`; regression test crash→requeue | M | `definition.rs:99`; `grpc.rs:1030,1040-1045` |
-| 11 | Per-tool timeout missing; dropped tool future doesn't kill subprocess; detached `run()` handle keeps spending tokens if caller drops the receiver | Low–Med | Configurable per-tool timeout in `run_with_cancel`; document/enforce `kill_on_drop` contract; warn on dropped handle or expose only `run_abortable` | S–M | `tool_execution.rs`; `agent_loop.rs:328` |
-
-> Items **1–7** are the launch-blocking set: they are the difference between
-> "cancellation works for one tested case" and "the runtime is correct under
-> the asynchronous scenarios users will actually hit."
-
-### A2 — Prove it: test infrastructure + the borrowed edge-case matrix
-
-Today's suite is overwhelmingly **observability conformance** (spans/metrics),
-serialized behind a global `TEST_LOCK`, with a basic sequential stub provider
-and `sleep(50ms)` timing. The gaps that block confidence:
-
-- **No E2E streaming** — every worker/SDK mock implements only `chat()`, so the
-  `chat_stream` + `StreamAccumulator` commit/ordering path runs the default
-  single-shot adapter; **17 streaming tests are `#[ignore]`'d** after a refactor.
-- **Postgres tests never run in CI** — `cargo test --all-features` with no DB
-  service and no `--ignored`; ~40 prod-store tests + host DB tests silently skip.
-- **"Crashes" are simulated** by dropping/recreating in-memory stores — never a
-  real torn write, never reopen-from-disk, never `sqlite::memory:` → file.
-- **No interleaving/property/fault tooling** — no loom, proptest, fail-rs, wiremock.
-
-#### A2.1 — Port the conformance battery (highest-leverage borrow)
-
-Port Anthropic's `run_session_store_conformance` to a reusable Rust trait test
-and run it across **every backend** (in-memory, SQLite, Postgres) à la LangGraph:
-
-```rust
-// crates/agent-sdk/src/testing.rs  (new public test surface)
-pub async fn run_journal_store_conformance<S: JournalStore>(store: S) { /* ... */ }
-```
-
-Conformance cases (each maps 1:1 to a borrowed contract):
-
-- append preserves insertion order across multiple appends
-- `load()` returns an **independent deep-equal copy** (mutating it doesn't mutate storage)
-- `load()` of an unknown key returns `None`, not an error/empty session
-- semantic (not byte) equality on roundtrip (Postgres `jsonb` may reorder keys)
-- optional methods absent → auto-skip those contracts
-- `delete()` of the main key cascades to subkeys; safe no-op for append-only backends
-- subkey count vs main-session count separation; `clear()`/empty-store invariants
-- **N concurrent `append()` to one key serialize without loss or intra-batch interleave**
-- checkpoint roundtrip; `list()` reverse-chronological; **latest-by-insertion-order, not lexicographic id** (LangGraph #6821 regression); pending-writes persisted; parent-checkpoint link; metadata filter; `before+limit` pagination
-
-#### A2.2 — The harness edge-case matrix (grouped by your three concerns)
-
-Borrowed from Claude Agent SDK, OpenAI Agents SDK, LangGraph, Temporal, Mastra,
-Pydantic AI, Vercel AI SDK, DBOS/Inngest/Restate. Each row is a test to write.
-
-**Cancellation mid-turn**
-
-| Scenario | Assert | Borrowed from |
+| Blocker | Location | Fix |
 |---|---|---|
-| Cancel during streaming | further model events stop promptly; a cancellation surfaces, not a normal final output; balanced history | OpenAI Agents SDK |
-| Cancel before first token | run ends `Cancelled`, no orphan `tool_use`, no half-written assistant msg | (gap #1) |
-| Cancel during compaction | `replace_history` does not complete after cancel | (gap #2) |
-| Cancel during parallel observe `join_all` | each child races cancel; batch settles deterministically | (gap, concurrency) |
-| Double-cancel & cancel-vs-result race | double-cancel is a no-op; a just-finished real result is **not** turned into "Cancelled by user" nondeterministically | (gap, `select!` bias) |
-| **Interrupt-then-drain ordering** | after interrupt, the in-flight turn still emits a terminal result (`error_during_execution`); a new query's messages only appear after the prior turn is drained | Claude Agent SDK |
-| Aborted model stream | yields a well-formed (or clearly-incomplete) tool call — never truncated JSON args presented as complete | Pydantic AI |
-| AbortSignal forwarded into tools | aborting the run cancels in-flight tool executions, not just top-level generation | Mastra |
-| Caller-cancel must not outrun teardown | awaiting the cancel does not return until the background task + channels are torn down (no leaked task) | Pydantic AI #5132 |
-| Persistence not gated on clean finish | aborting mid-stream still persists the user message + completed steps (not behind `if(!aborted)`) | Mastra #13984 |
-| **Hard-abort / crash-recovery synth path** | `JoinHandle::abort` leaves an orphan `tool_use`; next turn's `synthesize_error_tool_results` produces a balanced request the provider accepts | (currently untested; cancel_mid_tool.rs scopes it out) |
-| Panic in a tool | run ends with a structured error, history stays balanced, no `RecvError` | (gap #4) |
+| Proprietary LICENSE; `publish = false` on all crates; out-of-crate `license-file`; no SPDX | `LICENSE`; `crates/*/Cargo.toml` | MIT `LICENSE`; `license = "MIT"` in `[workspace.package]`; drop `license-file`/`publish=false` |
+| Path-only intra-workspace deps; `agent-service-proto` excluded from workspace with sibling-dir `build.rs` | `crates/agent-service-host/Cargo.toml:40`; `crates/agent-service-proto/build.rs` | path + version deps; bring proto in-crate or keep proto+host `publish=false` |
+| Missing metadata; no docs.rs config; `Cargo.lock` gitignored | root + per-crate `Cargo.toml`; `.gitignore` | fill metadata; `[package.metadata.docs.rs]` + `doc_cfg`; commit `Cargo.lock` |
+| `claude.yml` uses an OAuth secret + write perms on any comment trigger | `.github/workflows/claude.yml` | gate on `OWNER`/`MEMBER`, reduce perms, or remove |
+| CI ubuntu-only, no MSRV/release/audit/deny/semver | `.github/workflows/ci.yml` | add the gates in 12·F |
 
-**Message start / queuing / ordering**
-
-| Scenario | Assert | Borrowed from |
-|---|---|---|
-| Concurrent send + receive on one thread | well-formed first message, no interleave corruption, no deadlock | Claude Agent SDK |
-| Concurrent submits, same thread | exactly one `Pending`; rest `Queued` FIFO; cross-process single-writer holds (Postgres `FOR UPDATE`) | repo + LangGraph/Temporal |
-| **Composite: new input while a turn is streaming + cancel mid-tool** | in-flight turn settles, FIFO preserved, queued message runs next with balanced history, event streams isolated | (highest-risk real-world race; untested) |
-| `receive_response` stops at terminal result | iterator ends at `ResultMessage`, doesn't consume into next turn | Claude Agent SDK |
-| String prompt → single user message; per-message session tagging | exact encoding/tagging | Claude Agent SDK |
-| Concurrent runs on distinct threads | no cross-read/overwrite of journal/checkpoint; each final state == its own event sequence | LangGraph / Temporal |
-| Queued-root depth cap + oversized input | back-pressure error, not unbounded growth / transport failure | (gap #9) |
-
-**Durable journal / replay / resume**
-
-| Scenario | Assert | Borrowed from |
-|---|---|---|
-| **Real on-disk SQLite reopen-and-resume** | write a mid-flight turn/tool/subagent tree → drop store+pool → reopen from the same file → lease-sweep + `recover_thread` resumes to a deterministic terminal state, no orphan, no dup | (core durability promise; only ever tested in-memory) |
-| **Fault-injection crash between durable steps** | `fail-rs` panic after broker-ack-before-mark-delivered, and after journal-commit-before-outbox-insert → recovery reclaims/republishes, no lost/dup, no torn projection | DBOS/Temporal + repo doc-comments |
-| Resume re-runs idempotently | code before an interrupt re-executes on resume; an upsert is fine, a raw insert duplicates — assert both to prove the re-run semantics | LangGraph interrupts |
-| **Temporal-style replay-determinism check** | capture committed-event histories from conformance runs; re-run through current commit/recovery code → byte/semantic-identical durable state; divergence fails CI | Temporal / Restate |
-| Exactly-once-effect over at-least-once delivery | duplicate/reordered wakeups → at-most-one execution effect (the `Pending→Running` CAS is the dedup point) | outbox pattern |
-| Completed steps replay cached output | after a crash, recovery re-runs but each checkpointed step returns cached output (body invoked 0 extra times) | DBOS / Inngest |
-| Cross-restart idempotency | same `request_id` before and after a simulated host restart → exactly one `RootTurn` task | (gap #6) |
-
-#### A2.3 — Tooling, prioritized for low-risk incremental adoption
-
-| Priority | Tool | Covers | Notes |
-|---|---|---|---|
-| **P1** | **cargo-nextest** | process isolation (needed for `fail-rs`), speed, `--retries` to surface flakiness, test-groups to serialize DB tests | zero code change; add `.config/nextest.toml` |
-| **P1** | **Postgres service in CI** | the prod backend's `FOR UPDATE`/`SKIP LOCKED`/txn-atomicity tests that never run today | add `services: postgres:18` + a job running the `#[ignore]`-gated tests |
-| **P2** | **proptest + proptest-state-machine** | model-based fuzz of journal lifecycle + outbox idempotency vs a reference model; auto-shrinks | reuse the trait objects `conformance.rs` already exposes |
-| **P2** | **tokio `start_paused`** | deterministic virtual time for lease-expiry/heartbeat/fallback-sweep/retry-backoff | already used in 5 host tests — extend everywhere |
-| **P2** | **insta** | snapshot the ordered event/message stream + post-resume reconstructed transcript | catches ordering/queueing regressions as diffs |
-| **P3** | **fail-rs (failpoints)** | crash between durable steps → idempotent replay | gate behind a `failpoints` cargo feature; run under nextest |
-| **P3** | **Lightweight seeded DST** | single-process seeded scheduler over the in-memory store, randomly interleaving workers + injecting expiry/dup-wakeup/cancel/crash; print seed on failure | cheap — no runtime swap; journal authority model is already deterministic |
-| **P4** | **loom** | the 2-3 genuinely lock-free hot spots: `WakeupSignal::notify_one` fold, `Pending→Running` CAS, `(worker_id, lease_id)` heartbeat CAS | scope tightly (2-3 threads, `LOOM_MAX_PREEMPTIONS=2..3`); do **not** loom-ify the whole store |
-| **P5** | **toxiproxy** (testcontainers) | wire-level partition/latency to Postgres + RabbitMQ to prove outbox reclaim + publisher-confirm under real faults | integration-tier; adopt after P3 is green |
-| **P6** | **Jepsen (elle/porcupine)** | linearizability/serializability of the real Postgres path under partitions | reserve for a formal durability audit; the cheap Temporal-style replay check delivers most of the value |
-
-#### A2.4 — Provider determinism (the LLM boundary)
-
-Make provider tests reproducible and key-free, in three tiers:
-
-- **Tier A (unit, always on):** SSE decode of provider events; `tool_use` JSON
-  serialization round-trip (snapshot vs exact wire JSON).
-- **Tier B (deterministic integration, always on):** **wiremock-rs** mock server
-  (custom `Respond` impl for scripted SSE) for happy-path, streamed turns, and
-  **429/5xx retry + backoff**; **rvcr** cassettes (recorded, redacted, replayed)
-  for large tool/streamed exchanges.
-- **Tier C (gated live-smoke, nightly with secrets):** one completion + one
-  streamed turn + one tool call per real provider, `#[ignore]` / env-guarded.
-
-**CI tiering:** PR runs Tier A+B (no secrets, no network) + the conformance
-battery + SQLite/in-memory durability; a **nightly secrets job** runs Tier C and
-(optionally, non-blocking) a BFCL-style tool-call smoke vs a mock provider.
-
----
-
-## Workstream B — Simplify (the heart of #2)
-
-The crate graph is already clean, so this is DX, dependency hygiene, façade
-curation, and the CLI.
-
-### B1 — API ergonomics (the 30-second path)
-
-| Change | Why | Effort |
-|---|---|---|
-| `agent.ask(thread, text)` / `agent.send(...)` convenience that builds `ToolContext::new(())` + a `CancellationToken` internally and returns assembled text | Collapses the 4-arg + double-await pattern; removes the surprising `RecvError` | M |
-| `run()` returns `impl Future`/`async fn` instead of a bare `oneshot::Receiver` | Removes the non-obvious double-step and an error mode unrelated to agent logic | M |
-| `pub mod prelude` exporting ~12 newcomer names (`builder`, `AgentConfig`, `AgentInput`, `AgentEvent`, `Tool`, `ToolContext`, `ToolResult`, `ToolTier`, `ToolRegistry`, `DynamicToolName`, `InMemoryEventStore`, `CancellationToken`, `providers::AnthropicProvider`) | Shrinks apparent surface; cleaner docs.rs / autocomplete | M |
-| `Provider::from_env()` / `try_from_env()`; accept `impl Into<String>` keys | Kills the most-copied `std::env::var(...).expect(...)` snippet | S |
-| Default `Tool::Name = DynamicToolName` (or a `SimpleTool` taking `&str`, or `#[derive(Tool)]`) | Removes the biggest tool-authoring papercut (learning `ToolName`) | M |
-
-### B2 — Dependency hygiene
-
-| Change | Why | Effort |
-|---|---|---|
-| Gate providers/tools behind cargo features: `anthropic` (default), `openai`, `openai-codex` (pulls `tokio-tungstenite`), `gemini`/`vertex`, `web` (pulls `html2text`), `mcp`, `skills` | Cuts the ~171-crate transitive tree; an Anthropic-only consumer drops WebSocket + HTML deps | L |
-| **Replace deprecated `serde_yaml`** (`0.9.34+deprecated`) with `serde_yaml_ng`/`serde_yml`, behind the `skills` feature | Shipping an unmaintained crate as a *mandatory* public dep is a bad look + latent security liability | S |
-
-### B3 — Façade curation
-
-Move server/internal contract types (`TurnSummary`, `TurnOutcome`,
-`AuditProvenance`/`ToolAuditRecord*`, `EventAuthority`/`LocalEventAuthority`,
-`ContinuationEnvelope`/`CONTINUATION_VERSION`, `ListenExecuteTool`/`Erased*`,
-`HostDependencies`, `ExecutionContextFactory`) behind an `advanced`/`server`
-submodule so the front page of `agent_sdk::` and docs.rs isn't dominated by
-names a normal user never touches. (Effort: M)
-
-### B4 — The CLI can't run an agent
-
-`agent-sdk-cli` (binary `agent-sdk`) today only installs a Langfuse/OTel docker
-stack + `doctor`. For an OSS launch, `cargo install agent-sdk-cli && agent-sdk
-chat` should *talk to an agent*. **Recommendation:** add a minimal `chat`/`run`
-subcommand (Anthropic provider, streams to stdout) — this *is* a "simple way to
-use the framework" and the highest-leverage first-impression win. (Effort: L)
-
-### B5 — Crate count (decision)
-
-The audit floated consolidating `core` + `tools` + `providers` into `agent-sdk`
-behind features (XL, risky — server/host depend on the sub-crates).
-**Recommendation: keep the 9 crates** (they're already cleanly layered) but make
-`agent-sdk` the single documented entry point and let `release-plz` handle the
-lockstep versioning overhead. Revisit consolidation only if multi-crate release
-friction proves painful in practice.
-
----
-
-## Workstream C — Open release mechanics (the heart of #3)
-
-### C1 — Relicense to MIT
-
-- Replace proprietary `LICENSE` with MIT; set `license = "MIT"` in
-  `[workspace.package]`; drop `license-file` and `publish = false`.
-- Rewrite `README.md` (drop "private/proprietary", show `cargo add agent-sdk`),
-  `CONTRIBUTING.md` ("open to public contributions"), `SECURITY.md` (public
-  contact; fix the stale `0.1.x` → `0.8.x`).
-- *Provenance note:* the project was historically Apache-2.0. Audit contributor
-  provenance and retain any incorporated third-party `NOTICE` files. (You chose
-  MIT; the only thing Apache-2.0 added was an explicit patent grant — flagging
-  once, not advocating a change.)
-
-### C2 — Scrub Bipa-internal coupling — and secret-scan history FIRST
+#### 6.4 Bipa-internal scrub (spec for 12·D)
 
 | Item | Location | Action |
 |---|---|---|
-| **Run `gitleaks`/`trufflehog` over the FULL git history** | entire repo history | **Critical, do before flipping public** — a previously-private history may contain real keys even if current fixtures are local-only |
-| Hardcoded GCP project `bipa-278720` | `agent-sdk-providers/src/impls/vertex.rs:929,937` | replace with `my-project` (already used at 889/905) |
-| ~27 `ENG-####` refs; ADRs link `linear.app/bipa`; comments cite private `bipa/master/src/...` paths | `agent-server/src/journal*`, `agent-sdk-core/src/types.rs:1285,1304`, `CHANGELOG.md`, `docs/adr/0001,0002`, `CLAUDE.md:173` | sweep `ENG-[0-9]+` and `bipa/master`; drop private links/lines; rewrite comments |
-| `bipa.exchange`, `chave_bipa`, CPF in test fixtures | `observability_conformance.rs:680,691,714`, `observability/payload.rs:511-622`, `privacy/redaction.rs:1085,1090` | replace with `example.com` / generic categories (low urgency) |
-| `ssh://git@github.com/bipa-app/...` git deps; "private repository" language | `README.md`, `LANGFUSE.md:103` | rewrite for crates.io install |
-
-### C3 — crates.io packaging
-
-- **Publish in dependency order:** `core` → `tools`/`providers` → `sdk` →
-  `otel` → (`server` → `proto` → `host`). `cargo publish --dry-run`/`package`
-  each crate in a clean checkout first.
-- Convert intra-workspace deps to **path + version** (crates.io rejects
-  path-only). Decide `agent-service-proto`: bring it into the workspace with
-  protos in-crate (`build.rs` currently reads a sibling dir + `protoc-bin-
-  vendored`), **or** keep `proto` + `host` `publish = false` if the gRPC host
-  isn't meant for `cargo add`.
-- Fill metadata: `description`, `keywords`, `categories`, `repository`,
-  `authors`; add `[package.metadata.docs.rs]` (`all-features = true`,
-  `rustdoc-args = ["--cfg","docsrs"]`) + `#![cfg_attr(docsrs, feature(doc_cfg))]`
-  for feature-gated crates; ship `.sqlx`; **commit `Cargo.lock`** (currently
-  gitignored).
-
-### C4 — CI / release automation
-
-| Add | Why |
-|---|---|
-| Postgres service + a job running the gated DB tests (`scripts/postgres18-dev.sh test-migrations`) | the prod backend never runs in CI today (see A2.3 P1) |
-| `cargo-deny` (advisories + license allowlist + banned/dup crates) + `cargo-audit` | MIT redistribution needs a clean, redistributable graph |
-| `cargo-semver-checks` | catch SemVer-incompatible API changes pre-publish |
-| `rust-version = 1.85` + a pinned-older-toolchain CI job | declare/enforce MSRV |
-| Windows + macOS matrix | currently ubuntu-only |
-| **`release-plz`** | automated dependency-order publishing, changelog (git-cliff), version bumps, breaking-change detection — the right tool for a 9-crate workspace |
-| Fix `claude.yml` | uses an OAuth secret absent on public forks and grants write perms on any comment trigger → gate on `OWNER`/`MEMBER`, reduce permissions, or remove |
+| **Full git-history secret scan** (do before going public) | entire history | `gitleaks`/`trufflehog`; rotate + rewrite history on any real finding |
+| Hardcoded GCP project `bipa-278720` | `crates/agent-sdk-providers/src/impls/vertex.rs:929,937` | replace with `my-project` |
+| `ENG-####` refs; `linear.app/bipa` ADR links; `bipa/master/src/...` comments | `agent-server/src/journal*`, `agent-sdk-core/src/types.rs:1285,1304`, `CHANGELOG.md`, `docs/adr/0001,0002`, `CLAUDE.md:173` | sweep + rewrite |
+| `bipa.exchange`, `chave_bipa`, CPF fixtures | `observability_conformance.rs:680,691,714`, `observability/payload.rs:511-622`, `privacy/redaction.rs:1085,1090` | replace with `example.com` / generic |
+| `ssh://…bipa-app…` git deps; "private repository" language | `README.md`, `LANGFUSE.md:103` | rewrite for crates.io install |
 
 ---
 
-## Sequencing
+## 7. Status at a glance
 
-Each phase is a set of independently-mergeable PRs. **Gate the public flip on
-Phase 0 + Phase 1 + Phase 2 green.**
+Linear is canonical for state; this table mirrors it for convenience. Update the row when a task's PR opens/merges.
 
-- **Phase 0 — Pre-flight (private):** full-history secret scan; MIT relicense +
-  Bipa scrub PR; CI hardening (nextest, Postgres-in-CI, deny/audit/semver, MSRV,
-  commit `Cargo.lock`).
-- **Phase 1 — Robustness correctness:** A1 items **1–7** (streaming/compaction/
-  async-tool cancel, panic isolation, `Cancelled` event, production outbox
-  commit, persisted idempotency, durable wakeup) + items 8–11 as capacity allows.
-- **Phase 2 — Prove it:** A2 conformance battery; the edge-case matrix; provider
-  wiremock/cassette tiering; fault-injection + seeded DST; re-enable the 17
-  ignored streaming tests against a shared streaming-capable provider harness.
-- **Phase 3 — Simplify / DX:** features, `prelude`, `ask()`, CLI `chat`,
-  `serde_yaml` swap, façade curation, runnable quickstart examples.
-- **Phase 4 — Publish:** metadata, `--dry-run` package each crate, docs.rs,
-  `release-plz`, flip repo public, `cargo publish` in order, announce.
+| Task | Linear | State | PR |
+|---|---|---|---|
+| Plan & Linear setup | — | Open | [#251](https://github.com/bipa-app/agent-sdk/pull/251) |
+| 10·A cancel LLM/stream/compaction | `ENG-8703` | In Review | [#256](https://github.com/bipa-app/agent-sdk/pull/256) |
+| 10·B cancel async/listen + timeout | `ENG-8704` | In Review | [#254](https://github.com/bipa-app/agent-sdk/pull/254) |
+| 10·C panic isolation | `ENG-8705` | In Review | [#252](https://github.com/bipa-app/agent-sdk/pull/252) |
+| 10·D atomic commit + durable wakeup | `ENG-8706` | In Review | [#255](https://github.com/bipa-app/agent-sdk/pull/255) |
+| 10·E idempotency + back-pressure + retry | `ENG-8707` | In Progress | — |
+| 11·A test substrate + Postgres-in-CI | `ENG-8708` | In Review | [#253](https://github.com/bipa-app/agent-sdk/pull/253) |
+| 11·B journal conformance battery | `ENG-8709` | Backlog (blocked) | — |
+| 11·C cancel/lifecycle matrix | `ENG-8710` | Backlog (blocked) | — |
+| 11·D durability/replay/DST/loom | `ENG-8711` | Backlog (blocked) | — |
+| 11·E provider determinism + streaming | `ENG-8712` | Backlog (blocked) | — |
+| 12·A ergonomics + façade | `ENG-8713` | Backlog (blocked) | — |
+| 12·B feature-gating + deps | `ENG-8714` | Backlog (blocked) | — |
+| 12·C CLI + examples | `ENG-8715` | Backlog (blocked) | — |
+| 12·D relicense + scrub + secret scan | `ENG-8716` | Backlog (blocked) | — |
+| 12·E crates.io packaging | `ENG-8717` | Backlog (blocked) | — |
+| 12·F CI/release automation | `ENG-8718` | Backlog (blocked) | — |
+| 12·G publish + go public | `ENG-8719` | Backlog (blocked) | — |
 
----
+## 8. Change log
 
-## Definition of Done (launch checklist)
+Append-only; newest last. One line per event: date — what changed.
+
+- 2026-05-29 — Plan drafted from a multi-agent audit of the harness (concurrency, durability, lifecycle, tests, API, release-readiness). Linear milestones Phase 10/11/12 created with tracking cards `ENG-8700/8701/8702` and 17 child cards; dependency links wired. Plan committed (PR #251).
+- 2026-05-30 — Launched the unblocked set in parallel worktrees (one per task). Draft PRs opened and cards moved to In Review: 10·A #256, 10·B #254, 10·C #252, 10·D #255, 11·A #253. 10·D and 11·A verified against live Postgres 18. 10·E in progress.
+
+## 9. Definition of Done (launch)
 
 - [ ] Full git history secret-scanned clean; repo can go public
-- [ ] MIT `LICENSE` + consistent README/CONTRIBUTING/SECURITY; no Bipa coupling
-- [ ] All A1 items 1–7 fixed, each with a regression test
-- [ ] `run_journal_store_conformance` passes on in-memory **+ SQLite + Postgres**
-- [ ] Harness edge-case matrix implemented; 17 ignored streaming tests re-enabled and green
-- [ ] At least one **real reopen-from-disk resume** test + one **fail-rs crash-between-steps** test green
+- [ ] MIT `LICENSE`; README/CONTRIBUTING/SECURITY consistent; no Bipa-internal coupling remains
+- [ ] All Phase 10 tasks merged, each with a regression test
+- [ ] `run_journal_store_conformance` passes on in-memory + SQLite + Postgres
+- [ ] Edge-case matrix (§6.1) implemented; the 17 ignored streaming tests re-enabled and green
+- [ ] ≥1 real reopen-from-disk resume test and ≥1 `fail-rs` crash-between-steps test green
 - [ ] Postgres tests run in CI; nextest + cargo-deny/audit/semver-checks in CI; MSRV declared & tested
 - [ ] `cargo add agent-sdk` works with the documented quickstart; `agent-sdk chat` runs an agent
 - [ ] Every published crate has metadata + docs.rs config; `cargo publish --dry-run` clean for all
-- [ ] `release-plz` configured; crates published in dependency order
+- [ ] Crates published in dependency order; repo public; launch announced
 
----
+## 10. References
 
-### Appendix — primary sources for the borrowed tests
-
-Claude Agent SDK (`run_session_store_conformance`, `test_streaming_client.py`,
-session-storage docs) · LangGraph checkpointer conformance + interrupts (incl.
-issue #6821) · OpenAI Agents SDK (runner lifecycle, RunState resume) · Temporal
-(replay/determinism, time-skipping, cancellation scopes) · Restate / DBOS /
-Inngest (journal-mismatch, idempotency-key, step memoization) · Mastra (#13984
-abort-persistence, snapshots) · Pydantic AI (#5132 teardown ordering) · Vercel
-AI SDK (abort vs resumable-stream disconnect) · Rust tooling: loom, turmoil/
-madsim, proptest, tokio test-util, fail-rs, wiremock-rs, rvcr, cargo-nextest,
-release-plz, cargo-deny. (Full URL list in the analysis artifact.)
+Borrowed-test sources: Claude Agent SDK (`run_session_store_conformance`, `test_streaming_client.py`, session-storage docs) · LangGraph checkpointer conformance + interrupts (incl. #6821) · OpenAI Agents SDK · Temporal (replay/determinism, time-skipping, cancellation scopes) · Restate / DBOS / Inngest (journal-mismatch, idempotency-key, step memoization) · Mastra (#13984, snapshots) · Pydantic AI (#5132) · Vercel AI SDK (abort vs resumable-stream). Tooling: `loom`, `turmoil`/`madsim`, `proptest`, `tokio` test-util, `fail-rs`, `wiremock-rs`, `rvcr`, `cargo-nextest`, `release-plz`, `cargo-deny`.
