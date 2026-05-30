@@ -5,6 +5,7 @@ exclude = ["crates/agent-service-proto"]
 
 [workspace.package]
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }

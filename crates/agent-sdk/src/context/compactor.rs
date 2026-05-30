@@ -947,7 +947,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_history_split_skips_leading_orphan_after_summary_ack() -> Result<()> {
-        // The user-visible bug at ENG-8385/M7.5: a previously
+        // The user-visible bug at M7.5: a previously
         // compacted history was re-compacted in a later turn. The
         // first compaction left
         // `[summary, summary_ack, user(tool_result toolu_X),

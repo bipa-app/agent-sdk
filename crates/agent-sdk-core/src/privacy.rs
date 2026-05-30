@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn custom_category_round_trips() -> serde_json::Result<()> {
-        let original = PiiCategory::Custom("chave_bipa".to_owned());
+        let original = PiiCategory::Custom("account_key".to_owned());
         let json = serde_json::to_string(&original)?;
         let back: PiiCategory = serde_json::from_str(&json)?;
         assert_eq!(back, original);
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn detects_email() -> TestResult {
         let d = EntityDetector::baseline()?;
-        let spans = d.detect("please email me at ana.silva+bipa@bipa.exchange tomorrow");
+        let spans = d.detect("please email me at ana.silva+tag@example.com tomorrow");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].category, PiiCategory::Email);
         Ok(())

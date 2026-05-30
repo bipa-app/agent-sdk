@@ -2,7 +2,7 @@
 name = "agent-sdk-core"
 version = "0.8.0"
 edition.workspace = true
-license-file = "../../LICENSE"
+license.workspace = true
 publish = false
 description = "Shared contract types for the Agent SDK (IDs, events, LLM messages, turn outcomes)"
 keywords = ["agent", "llm", "ai", "types"]

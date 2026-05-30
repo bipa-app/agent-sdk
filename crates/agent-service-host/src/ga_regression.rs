@@ -6,7 +6,7 @@
 //! unit tests still live in their owning modules
 //! (`relay::tests`, `host::tests`, `journal::thread_events_watch_regression`,
 //! `journal::retention_janitor`); this suite codifies the GA story so
-//! one file demonstrates all four acceptance criteria of ENG-7971.
+//! one file demonstrates all four GA acceptance criteria.
 
 #![cfg(test)]
 

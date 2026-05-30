@@ -1,6 +1,6 @@
 //! Cross-instance thread-event watch lifecycle.
 //!
-//! Phase 8.4 (ENG-7968) closes the "broker as nudge, journal as
+//! Phase 8.4 closes the "broker as nudge, journal as
 //! authority" contract for committed events.  An instance that does
 //! **not** commit the event batch learns about it through an advisory
 //! `thread_events_available` delivery, which this module turns into a

@@ -12,9 +12,9 @@
 //! - `agent_sdk_turn_checkpoints`
 //!
 //! Event persistence and outbox relay tables are called out separately
-//! in follow-up notes under `notes/` because ENG-7984 is not
-//! implementing that behavior yet, and those notes must not be picked
-//! up by `sqlx::migrate!`.
+//! in follow-up notes under `notes/` because this migration bundle is
+//! not implementing that behavior yet, and those notes must not be
+//! picked up by `sqlx::migrate!`.
 //!
 //! The bundle is embedded through [`sqlx::migrate!`] so the future
 //! backend can use `sqlx`'s built-in migration table and startup

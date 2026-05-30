@@ -926,7 +926,7 @@ mod tests {
     fn test_base_url_global_region_has_no_prefix() {
         let provider = VertexProvider::new(
             "token".to_string(),
-            "bipa-278720".to_string(),
+            "my-project".to_string(),
             "global".to_string(),
             "gemini-3.1-pro-preview".to_string(),
         );
@@ -934,7 +934,7 @@ mod tests {
         let url = provider.base_url("google");
         assert_eq!(
             url,
-            "https://aiplatform.googleapis.com/v1/projects/bipa-278720/locations/global/publishers/google/models/gemini-3.1-pro-preview"
+            "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/google/models/gemini-3.1-pro-preview"
         );
     }
 

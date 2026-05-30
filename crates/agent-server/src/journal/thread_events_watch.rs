@@ -1,6 +1,6 @@
 //! Cross-instance thread-event watch-handler contract.
 //!
-//! Phase 8.4 (ENG-7968) consumes the `thread_events_available` advisory
+//! Phase 8.4 consumes the `thread_events_available` advisory
 //! messages that Phase 8.1 writes and Phase 8.2 publishes.  Every
 //! advisory is **only a hint** that a thread advanced; the authoritative
 //! stream is [`EventRepository`] and the committed-event table behind
@@ -347,7 +347,7 @@ pub async fn dispatch_thread_events_payload(
         // We can't observe true publish-to-receive lag without a
         // publish timestamp on the advisory payload (ThreadEvents
         // wire format does not yet carry it; see card delta #4 in
-        // the ENG-8296 plan and the TODO below).  Until then,
+        // the plan and the TODO below).  Until then,
         // publish dispatch-side latency: how long the handler took
         // from invocation to outcome.  This still flags slow
         // consumers, slow journal reads, and stuck notifiers.

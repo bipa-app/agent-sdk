@@ -3,7 +3,7 @@
 //! Phase 2.1's `AgentTask::state` field was deliberately a loose
 //! `serde_json::Value` so the schema could land before the rewrite knew
 //! exactly what each task kind needed to remember across pause / resume.
-//! Phase 2.4 (ENG-7918) replaces it with [`TaskState`], a strongly typed
+//! Phase 2.4 replaces it with [`TaskState`], a strongly typed
 //! enum keyed on the row's pause status.
 //!
 //! The variants cover every paused-status payload the rewrite needs

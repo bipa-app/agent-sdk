@@ -1,6 +1,6 @@
 -- Durable at-least-once idempotency records (SQLite dialect).
 -- Mirror of postgres/0009_idempotency.sql. See the Postgres variant for
--- the full rationale (ENG-8707, Phase 10 · E).
+-- the full rationale (Phase 10 · E).
 --
 -- SQLite stores the fingerprint as BLOB and result_json as TEXT per the
 -- SQLite dialect (no native JSONB / BYTEA types).

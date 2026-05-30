@@ -102,7 +102,7 @@
 //!
 //! # Retry budget, failure handling, and the recovery matrix (Phase 2.5)
 //!
-//! Phase 2.5 (ENG-7919) replaces the Phase 2.3 "loud failure on
+//! Phase 2.5 replaces the Phase 2.3 "loud failure on
 //! retry exhaustion" placeholder with a deterministic recovery
 //! matrix shared by every acquisition and sweep call site:
 //!
@@ -142,7 +142,7 @@
 //!
 //! # Tool-runtime child tasks and cancellation tree (Phase 2.6)
 //!
-//! Phase 2.6 (ENG-7920) takes the child-task story from schema
+//! Phase 2.6 takes the child-task story from schema
 //! placeholder to a real orchestration contract on top of the
 //! Phase 2.1–2.5 foundation. Four new entry points land on the
 //! trait and one placeholder is retired:
@@ -3695,7 +3695,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Phase 2.2 — Root submission queue and FIFO promotion (ENG-7916)
+    // Phase 2.2 — Root submission queue and FIFO promotion
     // ──────────────────────────────────────────────────────────────
     //
     // These tests exercise the queue admission contract across every
@@ -4560,7 +4560,7 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // Phase 2.3 — Runnable acquisition, lease ownership, heartbeats
-    // (ENG-7917)
+    //
     // ──────────────────────────────────────────────────────────────
     //
     // These tests pin down Phase 2.3's acceptance criteria:
@@ -4851,7 +4851,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn try_acquire_task_fails_closed_exhausted_rows_and_returns_none() -> Result<()> {
-        // Phase 2.5 (ENG-7919) replaces the Phase 2.3 "loud error on
+        // Phase 2.5 replaces the Phase 2.3 "loud error on
         // retry exhaustion" placeholder: the store now fails the row
         // closed atomically and returns `Ok(None)`, the same signal it
         // returns for any other non-runnable row. This guarantees no
@@ -5614,7 +5614,7 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // Phase 2.4 — Parent waiting states, confirmation pause/resume,
-    // and typed durable task state (ENG-7918)
+    // and typed durable task state
     // ──────────────────────────────────────────────────────────────
     //
     // Acceptance criteria these tests pin down:
@@ -6315,7 +6315,7 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // Phase 2.5 — Retry budget, failure handling, and recovery matrix
-    // (ENG-7919)
+    //
     // ──────────────────────────────────────────────────────────────
     //
     // Acceptance criteria these tests pin down:
@@ -6880,7 +6880,7 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // Phase 2.6 — Tool-runtime child tasks, cancellation tree, and
-    // journal-driven parent resume triggers (ENG-7920)
+    // journal-driven parent resume triggers
     // ──────────────────────────────────────────────────────────────
     //
     // Acceptance criteria these tests pin down:
@@ -9570,7 +9570,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Phase 2.7 — Concurrency regression suite (ENG-7921)
+    // Phase 2.7 — Concurrency regression suite
     // ──────────────────────────────────────────────────────────────
     //
     // Every test below spawns real async tasks via `tokio::spawn` and

@@ -3,7 +3,7 @@
 //! This example demonstrates how a server-side orchestrator reads the
 //! authoritative [`TurnSummary`] that `run_turn` attaches to every
 //! terminal `TurnOutcome` variant. It pairs with Phase 1 of the
-//! sdk/v2 rewrite (ENG-7914) and shows the fields later server
+//! sdk/v2 rewrite and shows the fields later server
 //! phases (`journal`, `workers`, `transport`, `storage`) depend on.
 //!
 //! The example uses [`ToolRuntime::External`] and `strict_durability:

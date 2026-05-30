@@ -1,6 +1,6 @@
 -- SQLite-dialect mirror of postgres/0005_outbox_message_kind.sql.
 --
--- ENG-7965: Phase 8.1 — Transactional Outbox Contract and Message Kinds.
+-- Phase 8.1 — Transactional Outbox Contract and Message Kinds.
 --
 -- SQLite cannot ALTER existing CHECK constraints or relax NOT NULL on
 -- columns referenced by foreign keys without rebuilding the table, so
@@ -102,9 +102,9 @@ CREATE TABLE agent_sdk_outbox (
 
 -- ---------------------------------------------------------------------
 -- 4. Backfill from the legacy table.  Every legacy row was logically
---    a thread_events_available message (the only kind written by
---    ENG-7986), so we hard-code the kind during the copy and rewrite
---    payload_json into the Phase 8.1 advisory shape.
+--    a thread_events_available message (the only kind the original
+--    outbox layer wrote), so we hard-code the kind during the copy
+--    and rewrite payload_json into the Phase 8.1 advisory shape.
 -- ---------------------------------------------------------------------
 
 INSERT INTO agent_sdk_outbox (

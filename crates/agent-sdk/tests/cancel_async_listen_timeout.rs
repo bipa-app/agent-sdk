@@ -1,5 +1,5 @@
 //! Cancellation + per-tool-timeout completeness for the long-running
-//! tool kinds (Phase 10 · B, ENG-8704).
+//! tool kinds (Phase 10 · B).
 //!
 //! The sync-tool cancellation contract is locked in by
 //! `cancel_mid_tool.rs`. This file extends the same SDK-boundary

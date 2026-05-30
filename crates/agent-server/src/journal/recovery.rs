@@ -1,8 +1,8 @@
 //! Phase 2.5 retry budget, failure handling, and stale-task recovery matrix.
 //!
-//! Phase 2.3 (ENG-7917) landed the acquisition / lease / heartbeat /
+//! Phase 2.3 landed the acquisition / lease / heartbeat /
 //! expiry-sweep primitives and deliberately deferred retry-budget
-//! enforcement to Phase 2.5. Phase 2.4 (ENG-7918) layered typed
+//! enforcement to Phase 2.5. Phase 2.4 layered typed
 //! durable pause state on top, which introduced the one variant
 //! ([`TaskState::AwaitingConfirmation`] with a
 //! [`ListenExecutionContext`] prepared operation) that can carry a

@@ -2,7 +2,7 @@
 name = "agent-sdk-tools"
 version = "0.8.0"
 edition.workspace = true
-license-file = "../../LICENSE"
+license.workspace = true
 publish = false
 description = "Tool traits, registry, hooks, and store contracts for the Agent SDK"
 

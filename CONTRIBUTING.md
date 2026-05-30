@@ -1,6 +1,9 @@
 # Contributing to Agent SDK
 
-This repository is maintained internally at Bipa. It is not open to public contributions. This document describes the internal workflow for engineers working on the SDK.
+Thanks for your interest in contributing! Agent SDK is an open-source
+project and we welcome bug reports, feature requests, documentation
+improvements, and code contributions from the community. This document
+describes the workflow for working on the SDK.
 
 ## Code of Conduct
 
@@ -8,13 +11,16 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ## Getting Started
 
-1. Sync your local checkout with the current `main` branch
+1. Fork the repository and clone your fork
 2. Create a feature branch from `main`
 3. Make your changes
 4. Run the quality checks (see below)
 5. Commit your changes
-6. Push your branch to the private repository
-7. Open an internal pull request for review
+6. Push your branch to your fork
+7. Open a pull request against `main` for review
+
+For larger changes, please open an issue first to discuss the approach
+before investing significant effort.
 
 ## Development Setup
 
@@ -74,7 +80,7 @@ cargo test
 
 ## Code Quality
 
-Before submitting an internal pull request, ensure your code passes all quality checks:
+Before submitting a pull request, ensure your code passes all quality checks:
 
 ```bash
 # Type check
@@ -176,19 +182,7 @@ pub fn create(params: CreateParams) { }
 
 ## Pull Request Process
 
-### sdk/v2 Rewrite PRs
-
-The SDK rewrite is developed on the **`sdk/v2`** branch. All rewrite PRs
-must target `sdk/v2` as their base branch — **not** `main`.
-
-```bash
-# Start a rewrite feature branch
-git checkout sdk/v2
-git pull --rebase origin sdk/v2
-git checkout -b feat/my-phase-0-work
-```
-
-### General PRs
+All pull requests target the **`main`** branch.
 
 1. Ensure all quality checks pass
 2. Update documentation if you're changing public APIs
@@ -199,7 +193,7 @@ git checkout -b feat/my-phase-0-work
 
 ## Reporting Issues
 
-When reporting issues, please include:
+When reporting issues, please open a GitHub issue and include:
 
 - A clear description of the problem
 - Steps to reproduce
@@ -210,7 +204,7 @@ When reporting issues, please include:
 
 ## Feature Requests
 
-Feature requests are welcome. Open an internal issue describing:
+Feature requests are welcome. Open a GitHub issue describing:
 
 - The problem you're trying to solve
 - Your proposed solution
@@ -218,4 +212,8 @@ Feature requests are welcome. Open an internal issue describing:
 
 ## License
 
-Contributions to this repository are internal Bipa contributions made under the contributor's employment or contractor agreement. Do not add third-party code, assets, or documentation unless Bipa has the rights required to use and redistribute them.
+By contributing to this repository, you agree that your contributions
+will be licensed under the [MIT License](LICENSE) that covers the
+project. Only contribute code, assets, or documentation that you have
+the right to submit under that license; do not add third-party material
+unless its license is compatible and you retain any required notices.

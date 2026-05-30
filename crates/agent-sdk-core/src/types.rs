@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn agent_continuation_round_trips_llm_metadata() {
-        // ENG-7914: `response_id` and `stop_reason` travel through
+        // `response_id` and `stop_reason` travel through
         // durable persistence so the resume-side `TurnSummary` reports
         // the same LLM metadata as the pre-pause summary for the same
         // turn. Guard the wire format so future renames break here
@@ -1312,8 +1312,9 @@ mod tests {
 
     #[test]
     fn agent_continuation_deserializes_legacy_payload_without_llm_metadata() {
-        // Servers that persisted continuations before ENG-7914 don't
-        // have `response_id` / `stop_reason` fields on disk. Those
+        // Servers that persisted continuations before this contract
+        // landed don't have `response_id` / `stop_reason` fields on
+        // disk. Those
         // payloads must still deserialise so running servers do not
         // break on SDK upgrade — the fields default to `None`.
         let thread = ThreadId::from_string("t-legacy");

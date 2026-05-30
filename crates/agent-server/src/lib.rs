@@ -615,7 +615,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 1.7 — TurnSummary contract regression suite (ENG-7914)
+    // Phase 1.7 — TurnSummary contract regression suite
     // ========================================================================
     //
     // These tests validate the `TurnSummary` server-facing outcome

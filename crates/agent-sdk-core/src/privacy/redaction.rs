@@ -1082,12 +1082,12 @@ mod tests {
     fn baseline_masks_email_in_non_sensitive_string_value() {
         let policy = RedactionPolicy::baseline();
         let input = serde_json::json!({
-            "note": "forward to ana.silva+bipa@bipa.exchange please"
+            "note": "forward to ana.silva+tag@example.com please"
         });
         let result = redact_value(&input, &policy);
         let note = result["note"].as_str().expect("note is string");
         assert!(note.contains("[REDACTED:email]"), "got: {note}");
-        assert!(!note.contains("ana.silva+bipa@bipa.exchange"));
+        assert!(!note.contains("ana.silva+tag@example.com"));
     }
 
     #[test]

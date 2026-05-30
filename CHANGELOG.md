@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — Default-deny payload capture (Phase 9 · C2, ENG-8298).**
+- **BREAKING — Default-deny payload capture (Phase 9 · C2).**
   `ObservabilityStore::capture(...) -> CaptureDecision::Inline` no longer
   unconditionally lands payloads on the LLM span. The SDK now forces every
   `Inline` decision down to `Omit` unless **both** of these are true:
@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gen_ai.input.messages` / `gen_ai.output.messages` on spans will see the
   attributes disappear after upgrading until the store is updated.
   `CaptureDecision::Reference` is unaffected — externalised payloads always
-  pass through. Bipa is the only known consumer; a sibling Bipa PR is needed
-  to attest its `InlinePayloadStore` and pair it with a real `PayloadRedactor`.
+  pass through. Consumers that inline payloads must update their
+  `ObservabilityStore` to attest PII redaction and pair it with a real
+  `PayloadRedactor`.
 
 ### Fixed
 
@@ -47,11 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **GA observability and operator package for the AMQP latency layer (ENG-7971)** - Phase 8.7 closes Phase 8 by exposing a programmatic [`MetricsRecorder`](crates/agent-service-host/src/metrics.rs) trait covering relay ticks, reclaim sweeps, backlog observations, wakeup nudges, watch advisories, retention janitor cycles, and lease sweeps. The host crate ships three implementations: `LoggingMetricsRecorder` (default — emits `tracing::info!` events with stable `metric=…` field names), `InMemoryMetricsRecorder` (atomic counters, snapshottable for tests), and `NoopMetricsRecorder`. Adds opt-in `relay.backlog_threshold` configuration with `soft` / `hard` bands; the soft band flips `LatencyLayerHealth` to `Degraded`, the hard band emits a separate alerting log line. Adds the `ga_regression` module that proves duplicate delivery, publish-then-crash recovery, backlog protection, and metrics lifecycle behaviour together. Ships two new operator runbooks under `docs/runbook/` covering the AMQP relay (normal / degraded / retention behaviour, multi-instance fanout topology, recovery procedures) and the health & readiness contract (probe endpoints, Kubernetes integration, alerting matrix).
+- **GA observability and operator package for the AMQP latency layer** - Phase 8.7 closes Phase 8 by exposing a programmatic [`MetricsRecorder`](crates/agent-service-host/src/metrics.rs) trait covering relay ticks, reclaim sweeps, backlog observations, wakeup nudges, watch advisories, retention janitor cycles, and lease sweeps. The host crate ships three implementations: `LoggingMetricsRecorder` (default — emits `tracing::info!` events with stable `metric=…` field names), `InMemoryMetricsRecorder` (atomic counters, snapshottable for tests), and `NoopMetricsRecorder`. Adds opt-in `relay.backlog_threshold` configuration with `soft` / `hard` bands; the soft band flips `LatencyLayerHealth` to `Degraded`, the hard band emits a separate alerting log line. Adds the `ga_regression` module that proves duplicate delivery, publish-then-crash recovery, backlog protection, and metrics lifecycle behaviour together. Ships two new operator runbooks under `docs/runbook/` covering the AMQP relay (normal / degraded / retention behaviour, multi-instance fanout topology, recovery procedures) and the health & readiness contract (probe endpoints, Kubernetes integration, alerting matrix).
 
 - **Cached token usage observability** - OpenTelemetry spans now emit `gen_ai.usage.cache_creation.input_tokens` and `gen_ai.usage.cache_read.input_tokens`, and provider usage mappings preserve cache-read and cache-creation token breakdowns.
 
-- **`TurnSummary` server-facing outcome contract (ENG-7914)** - Every `TurnOutcome` variant except `Error` now carries a structured `TurnSummary` alongside the legacy per-variant fields. The summary captures provider/model provenance, response ID, stop reason, tool-call count, wall-clock duration, and the `TurnOptions` used for the turn. This is the authoritative Phase 1 contract later server phases (journal, workers, transport, storage) build on. Use `TurnOutcome::summary()` to extract it, or pattern-match on the `summary` field directly.
+- **`TurnSummary` server-facing outcome contract** - Every `TurnOutcome` variant except `Error` now carries a structured `TurnSummary` alongside the legacy per-variant fields. The summary captures provider/model provenance, response ID, stop reason, tool-call count, wall-clock duration, and the `TurnOptions` used for the turn. This is the authoritative Phase 1 contract later server phases (journal, workers, transport, storage) build on. Use `TurnOutcome::summary()` to extract it, or pattern-match on the `summary` field directly.
 
   - `TurnSummary` is fully `Serialize + Deserialize` with a stable `snake_case` JSON wire format so servers can persist it directly as part of durable turn rows.
   - `StopReason` is now `Serialize` and exposes an `as_str()` helper whose discriminants match the serde wire format.

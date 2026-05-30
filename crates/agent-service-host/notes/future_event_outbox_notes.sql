@@ -1,4 +1,4 @@
--- ENG-7984 / ENG-7986 / ENG-7965 contract notes for the durable
+-- Internal contract notes for the durable
 -- event journal and transactional outbox.  Not an executable
 -- migration — `notes/` is intentionally excluded from
 -- `sqlx::migrate!`.  Read this alongside:
@@ -24,7 +24,7 @@
 --     that produced the events
 --   * replay window query ordered by (thread_id, sequence)
 --
--- Table: agent_sdk_outbox  (Phase 8.1, ENG-7965)
+-- Table: agent_sdk_outbox  (Phase 8.1)
 -- ----------------------------------------------
 -- Purpose:
 --   Hold relay work for AMQP / pub-sub delivery without weakening the
