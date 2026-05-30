@@ -541,6 +541,145 @@ pub trait Tool<Ctx>: Send + Sync {
 }
 
 // ============================================================================
+// SimpleTool Trait
+// ============================================================================
+
+/// An ergonomic [`Tool`] whose name is a plain string.
+///
+/// Most custom tools don't need a strongly-typed [`ToolName`] enum — they have
+/// a single, fixed name. `SimpleTool` lets you write a tool by returning a
+/// `&str` from [`name`](SimpleTool::name) instead of defining a `ToolName`
+/// type and an associated [`Tool::Name`].
+///
+/// Any `SimpleTool` is automatically a [`Tool`] (via a blanket impl) with
+/// `Name = DynamicToolName`, so it can be registered and used exactly like a
+/// hand-written `Tool`.
+///
+/// # Example
+///
+/// ```
+/// use agent_sdk_tools::tools::{SimpleTool, ToolContext};
+/// use agent_sdk_core::types::ToolResult;
+/// use serde_json::{json, Value};
+/// use std::future::Future;
+///
+/// struct WeatherTool;
+///
+/// impl SimpleTool<()> for WeatherTool {
+///     fn name(&self) -> &'static str { "get_weather" }
+///     fn description(&self) -> &'static str { "Get current weather for a city" }
+///     fn input_schema(&self) -> Value {
+///         json!({ "type": "object", "properties": { "city": { "type": "string" } } })
+///     }
+///
+///     fn execute(
+///         &self,
+///         _ctx: &ToolContext<()>,
+///         input: Value,
+///     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+///         async move {
+///             let city = input["city"].as_str().unwrap_or("Unknown");
+///             Ok(ToolResult::success(format!("Weather in {city}: Sunny")))
+///         }
+///     }
+/// }
+/// ```
+pub trait SimpleTool<Ctx>: Send + Sync {
+    /// The tool's name as sent to (and parsed from) the LLM.
+    ///
+    /// Returns `&'static str` because a simple tool has one fixed name; reach
+    /// for the full [`Tool`] trait with a [`DynamicToolName`] when the name is
+    /// computed at runtime.
+    fn name(&self) -> &'static str;
+
+    /// Human-readable display name for UI.
+    ///
+    /// Defaults to an empty string; override for a friendlier label.
+    fn display_name(&self) -> &'static str {
+        ""
+    }
+
+    /// Human-readable description of what the tool does.
+    fn description(&self) -> &'static str;
+
+    /// JSON schema for the tool's input parameters.
+    fn input_schema(&self) -> Value;
+
+    /// Permission tier for this tool. Defaults to [`ToolTier::Observe`].
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    /// Execute the tool with the given input.
+    ///
+    /// # Errors
+    /// Returns an error if tool execution fails.
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Value,
+    ) -> impl Future<Output = Result<ToolResult>> + Send;
+}
+
+/// Adapter that turns any [`SimpleTool`] into a full [`Tool`] with
+/// `Name = DynamicToolName`.
+///
+/// You rarely name this type directly — register a [`SimpleTool`] with
+/// [`ToolRegistry::register_simple`], which wraps it for you. Use this adapter
+/// explicitly only when you need a `Tool` value (e.g. to pass to code that is
+/// generic over [`Tool`]).
+pub struct SimpleToolAdapter<T> {
+    inner: T,
+}
+
+impl<T> SimpleToolAdapter<T> {
+    /// Wrap a [`SimpleTool`] so it can be used anywhere a [`Tool`] is expected.
+    pub const fn new(tool: T) -> Self {
+        Self { inner: tool }
+    }
+
+    /// Unwrap the inner [`SimpleTool`].
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<Ctx, T> Tool<Ctx> for SimpleToolAdapter<T>
+where
+    T: SimpleTool<Ctx>,
+{
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new(SimpleTool::name(&self.inner))
+    }
+
+    fn display_name(&self) -> &'static str {
+        SimpleTool::display_name(&self.inner)
+    }
+
+    fn description(&self) -> &'static str {
+        SimpleTool::description(&self.inner)
+    }
+
+    fn input_schema(&self) -> Value {
+        SimpleTool::input_schema(&self.inner)
+    }
+
+    fn tier(&self) -> ToolTier {
+        SimpleTool::tier(&self.inner)
+    }
+
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Value,
+    ) -> impl Future<Output = Result<ToolResult>> + Send {
+        SimpleTool::execute(&self.inner, ctx, input)
+    }
+}
+
+// ============================================================================
 // AsyncTool Trait
 // ============================================================================
 
@@ -1051,6 +1190,19 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         let name = wrapper.name_str().to_string();
         self.tools.insert(name, Arc::new(wrapper));
         self
+    }
+
+    /// Register a [`SimpleTool`] — a tool whose name is a plain `&str` and
+    /// which needs no [`ToolName`] type.
+    ///
+    /// The tool is wrapped in a [`SimpleToolAdapter`] (giving it
+    /// `Name = DynamicToolName`) and registered like any other [`Tool`].
+    /// This is the lowest-ceremony way to add a first custom tool.
+    pub fn register_simple<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: SimpleTool<Ctx> + 'static,
+    {
+        self.register(SimpleToolAdapter::new(tool))
     }
 
     /// Register an async tool in the registry.

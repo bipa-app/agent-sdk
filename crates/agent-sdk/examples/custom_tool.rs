@@ -14,23 +14,22 @@
 //! ```
 
 use agent_sdk::{
-    AgentEvent, AgentInput, CancellationToken, DynamicToolName, EventStore, InMemoryEventStore,
-    ThreadId, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier, builder,
-    providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore, SimpleTool,
+    ThreadId, ToolContext, ToolRegistry, ToolResult, builder, providers::AnthropicProvider,
 };
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// A simple calculator tool that can add two numbers.
+///
+/// Implemented via [`SimpleTool`], so it needs no `ToolName` type — just a
+/// `&str` name.
 struct CalculatorTool;
 
-// No #[async_trait] needed - Rust 1.75+ supports native async traits
-impl Tool<()> for CalculatorTool {
-    type Name = DynamicToolName;
-
-    fn name(&self) -> DynamicToolName {
-        DynamicToolName::new("calculator")
+impl SimpleTool<()> for CalculatorTool {
+    fn name(&self) -> &'static str {
+        "calculator"
     }
 
     fn display_name(&self) -> &'static str {
@@ -58,11 +57,6 @@ impl Tool<()> for CalculatorTool {
         })
     }
 
-    fn tier(&self) -> ToolTier {
-        // Observe tier means no confirmation needed
-        ToolTier::Observe
-    }
-
     async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
         let a = input
             .get("a")
@@ -83,11 +77,9 @@ impl Tool<()> for CalculatorTool {
 /// A tool that gets the current time.
 struct CurrentTimeTool;
 
-impl Tool<()> for CurrentTimeTool {
-    type Name = DynamicToolName;
-
-    fn name(&self) -> DynamicToolName {
-        DynamicToolName::new("current_time")
+impl SimpleTool<()> for CurrentTimeTool {
+    fn name(&self) -> &'static str {
+        "current_time"
     }
 
     fn display_name(&self) -> &'static str {
@@ -103,10 +95,6 @@ impl Tool<()> for CurrentTimeTool {
             "type": "object",
             "properties": {}
         })
-    }
-
-    fn tier(&self) -> ToolTier {
-        ToolTier::Observe
     }
 
     async fn execute(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<ToolResult> {
@@ -125,13 +113,11 @@ impl Tool<()> for CurrentTimeTool {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("ANTHROPIC_API_KEY environment variable must be set");
-
-    // Create a tool registry and register our custom tools
+    // Create a tool registry and register our custom tools. `register_simple`
+    // wraps a `SimpleTool` so no `ToolName` type is required.
     let mut tools = ToolRegistry::new();
-    tools.register(CalculatorTool);
-    tools.register(CurrentTimeTool);
+    tools.register_simple(CalculatorTool);
+    tools.register_simple(CurrentTimeTool);
 
     println!("Registered {} tools:", tools.len());
     for tool in tools.all() {
@@ -139,25 +125,26 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    // Build the agent with our tools
+    // Build the agent with our tools. We keep an explicit event store here so
+    // we can inspect the tool-call events after the run.
     let event_store = Arc::new(InMemoryEventStore::new());
     let agent = builder::<()>()
-        .provider(AnthropicProvider::sonnet(api_key))
+        .provider(AnthropicProvider::try_from_env()?)
         .tools(tools)
         .event_store(event_store.clone())
         .build();
 
     let thread_id = ThreadId::new();
-    let tool_ctx = ToolContext::new(());
 
     // Ask the agent something that requires using our tools
-    let final_state = agent.run(
-        thread_id.clone(),
-        AgentInput::Text("What is 42 + 17? Also, what time is it right now?".to_string()),
-        tool_ctx,
-        CancellationToken::new(),
-    );
-    let _ = final_state.await?;
+    let _ = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("What is 42 + 17? Also, what time is it right now?".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
 
     for envelope in event_store.get_events(&thread_id).await? {
         match envelope.event {

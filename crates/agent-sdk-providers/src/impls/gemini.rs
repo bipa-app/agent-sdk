@@ -54,13 +54,16 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
+    /// The conventional environment variable holding the Gemini API key.
+    pub const API_KEY_ENV: &'static str = "GEMINI_API_KEY";
+
     /// Create a new Gemini provider with the specified API key and model.
     #[must_use]
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
+            api_key: api_key.into(),
+            model: model.into(),
             base_url: API_BASE_URL.to_owned(),
             thinking: None,
             use_header_auth: true,
@@ -68,10 +71,35 @@ impl GeminiProvider {
         }
     }
 
+    /// Create a provider using Gemini Flash, reading the API key from the
+    /// conventional [`GEMINI_API_KEY`](Self::API_KEY_ENV) environment variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `GEMINI_API_KEY` is not set. Prefer
+    /// [`try_from_env`](Self::try_from_env) outside of examples/tests.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Create a provider using Gemini Flash, reading the API key from the
+    /// conventional [`GEMINI_API_KEY`](Self::API_KEY_ENV) environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `GEMINI_API_KEY` is unset or not valid UTF-8.
+    pub fn try_from_env() -> Result<Self> {
+        let api_key = std::env::var(Self::API_KEY_ENV).map_err(|_| {
+            anyhow::anyhow!("environment variable `{}` is not set", Self::API_KEY_ENV)
+        })?;
+        Ok(Self::flash(api_key))
+    }
+
     /// Create a provider using Gemini 3 Flash Preview (fast and capable, current default).
     #[must_use]
-    pub fn flash(api_key: String) -> Self {
-        Self::new(api_key, MODEL_GEMINI_3_FLASH.to_owned())
+    pub fn flash(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_GEMINI_3_FLASH)
     }
 
     /// Create a provider using Gemini 3.1 Flash Lite Preview.
@@ -107,8 +135,8 @@ impl GeminiProvider {
 
     /// Override the base URL.
     #[must_use]
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
         self
     }
 

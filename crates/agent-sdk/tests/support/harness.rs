@@ -329,12 +329,14 @@ impl Drop for CaptureGateGuard {
 
 // ── Run-helper ───────────────────────────────────────────────────────
 
-/// Wait for the agent's final-state oneshot, then yield long enough
+/// Wait for the agent's final-state future, then yield long enough
 /// for any post-state span emissions to drain through the exporter.
 pub async fn wait_for_run(
-    final_state: tokio::sync::oneshot::Receiver<agent_sdk::AgentRunState>,
+    final_state: impl std::future::Future<Output = Result<agent_sdk::AgentRunState>>,
 ) -> Result<()> {
-    let _ = final_state.await.context("agent state channel closed")?;
+    let _ = final_state
+        .await
+        .context("agent run did not report a state")?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(())
 }

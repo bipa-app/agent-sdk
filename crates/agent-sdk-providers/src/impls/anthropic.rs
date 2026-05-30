@@ -119,12 +119,17 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// The conventional environment variable holding the Anthropic API key.
+    pub const API_KEY_ENV: &'static str = "ANTHROPIC_API_KEY";
+
     /// Create a new Anthropic provider with the specified API key and model.
     ///
     /// Automatically detects OAuth tokens (`sk-ant-oat-*`) and switches to
     /// Bearer auth with Claude Code identity headers.
     #[must_use]
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let api_key = api_key.into();
+        let model = model.into();
         let auth_mode = if is_oauth_token(&api_key) {
             AuthMode::OAuth
         } else {
@@ -250,34 +255,65 @@ impl AnthropicProvider {
         }
     }
 
+    /// Create a provider using Claude Sonnet, reading the API key from the
+    /// conventional [`ANTHROPIC_API_KEY`](Self::API_KEY_ENV) environment
+    /// variable.
+    ///
+    /// This is the zero-ceremony on-ramp for the quickstart. Use
+    /// [`try_from_env`](Self::try_from_env) if you want to handle a missing
+    /// key without a panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ANTHROPIC_API_KEY` is not set. Prefer
+    /// [`try_from_env`](Self::try_from_env) outside of examples/tests.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Create a provider using Claude Sonnet, reading the API key from the
+    /// conventional [`ANTHROPIC_API_KEY`](Self::API_KEY_ENV) environment
+    /// variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ANTHROPIC_API_KEY` is unset or not valid UTF-8.
+    pub fn try_from_env() -> Result<Self> {
+        let api_key = std::env::var(Self::API_KEY_ENV).map_err(|_| {
+            anyhow::anyhow!("environment variable `{}` is not set", Self::API_KEY_ENV)
+        })?;
+        Ok(Self::sonnet(api_key))
+    }
+
     /// Create a provider using Claude Haiku 4.5.
     #[must_use]
-    pub fn haiku(api_key: String) -> Self {
-        Self::new(api_key, MODEL_HAIKU_45.to_owned())
+    pub fn haiku(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_HAIKU_45)
     }
 
     /// Create a provider using Claude Sonnet 4.6.
     #[must_use]
-    pub fn sonnet(api_key: String) -> Self {
-        Self::new(api_key, MODEL_SONNET_46.to_owned())
+    pub fn sonnet(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_SONNET_46)
     }
 
     /// Create a provider using Claude Sonnet 4.5.
     #[must_use]
-    pub fn sonnet_45(api_key: String) -> Self {
-        Self::new(api_key, MODEL_SONNET_45.to_owned())
+    pub fn sonnet_45(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_SONNET_45)
     }
 
     /// Create a provider using Claude Sonnet 4.6.
     #[must_use]
-    pub fn sonnet_46(api_key: String) -> Self {
-        Self::new(api_key, MODEL_SONNET_46.to_owned())
+    pub fn sonnet_46(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_SONNET_46)
     }
 
     /// Create a provider using Claude Opus 4.6.
     #[must_use]
-    pub fn opus(api_key: String) -> Self {
-        Self::new(api_key, MODEL_OPUS_46.to_owned())
+    pub fn opus(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_OPUS_46)
     }
 
     /// Create a provider using Claude Opus 4.7.
@@ -287,8 +323,8 @@ impl AnthropicProvider {
     /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
     /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
     #[must_use]
-    pub fn opus_47(api_key: String) -> Self {
-        Self::new(api_key, MODEL_OPUS_47.to_owned())
+    pub fn opus_47(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_OPUS_47)
     }
 
     /// Create a provider using Claude Opus 4.8.
@@ -298,8 +334,8 @@ impl AnthropicProvider {
     /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
     /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
     #[must_use]
-    pub fn opus_48(api_key: String) -> Self {
-        Self::new(api_key, MODEL_OPUS_48.to_owned())
+    pub fn opus_48(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_OPUS_48)
     }
 
     /// Set the provider-owned thinking configuration for this model.
@@ -311,8 +347,8 @@ impl AnthropicProvider {
 
     /// Override the base URL (default: `https://api.anthropic.com`).
     #[must_use]
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
         self
     }
 
@@ -837,8 +873,7 @@ mod tests {
 
     #[test]
     fn test_new_creates_provider_with_custom_model() {
-        let provider =
-            AnthropicProvider::new("test-api-key".to_string(), "custom-model".to_string());
+        let provider = AnthropicProvider::new("test-api-key", "custom-model");
 
         assert_eq!(provider.model(), "custom-model");
         assert_eq!(provider.provider(), "anthropic");
@@ -1012,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_provider_is_cloneable() {
-        let provider = AnthropicProvider::new("test-api-key".to_string(), "test-model".to_string());
+        let provider = AnthropicProvider::new("test-api-key", "test-model");
         let cloned = provider.clone();
 
         assert_eq!(provider.model(), cloned.model());

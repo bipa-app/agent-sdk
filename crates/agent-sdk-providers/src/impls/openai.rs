@@ -113,27 +113,59 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    /// The conventional environment variable holding the `OpenAI` API key.
+    pub const API_KEY_ENV: &'static str = "OPENAI_API_KEY";
+
     /// Create a new `OpenAI` provider with the specified API key and model.
     #[must_use]
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
+            api_key: api_key.into(),
+            model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
             extra_headers: Vec::new(),
         }
     }
 
+    /// Create a provider using GPT-5, reading the API key from the
+    /// conventional [`OPENAI_API_KEY`](Self::API_KEY_ENV) environment variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `OPENAI_API_KEY` is not set. Prefer
+    /// [`try_from_env`](Self::try_from_env) outside of examples/tests.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Create a provider using GPT-5, reading the API key from the
+    /// conventional [`OPENAI_API_KEY`](Self::API_KEY_ENV) environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `OPENAI_API_KEY` is unset or not valid UTF-8.
+    pub fn try_from_env() -> Result<Self> {
+        let api_key = std::env::var(Self::API_KEY_ENV).map_err(|_| {
+            anyhow::anyhow!("environment variable `{}` is not set", Self::API_KEY_ENV)
+        })?;
+        Ok(Self::gpt5(api_key))
+    }
+
     /// Create a new provider with a custom base URL for OpenAI-compatible APIs.
     #[must_use]
-    pub fn with_base_url(api_key: String, model: String, base_url: String) -> Self {
+    pub fn with_base_url(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
-            base_url,
+            api_key: api_key.into(),
+            model: model.into(),
+            base_url: base_url.into(),
             thinking: None,
             extra_headers: Vec::new(),
         }

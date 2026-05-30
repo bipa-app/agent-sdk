@@ -226,8 +226,8 @@ async fn provider_for(body: String) -> (MockServer, AnthropicProvider, Arc<Mutex
         })
         .mount(&server)
         .await;
-    let provider = AnthropicProvider::new("test-key-not-a-secret".into(), "claude-test".into())
-        .with_base_url(server.uri());
+    let provider =
+        AnthropicProvider::new("test-key-not-a-secret", "claude-test").with_base_url(server.uri());
     (server, provider, seen)
 }
 
@@ -294,8 +294,8 @@ async fn tier_b_server_error_surfaces_recoverable_stream_error() {
         .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
         .mount(&server)
         .await;
-    let provider = AnthropicProvider::new("test-key-not-a-secret".into(), "claude-test".into())
-        .with_base_url(server.uri());
+    let provider =
+        AnthropicProvider::new("test-key-not-a-secret", "claude-test").with_base_url(server.uri());
 
     let err = drain(&provider, sample_request())
         .await
@@ -311,8 +311,8 @@ async fn tier_b_rate_limit_surfaces_recoverable_stream_error() {
         .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
         .mount(&server)
         .await;
-    let provider = AnthropicProvider::new("test-key-not-a-secret".into(), "claude-test".into())
-        .with_base_url(server.uri());
+    let provider =
+        AnthropicProvider::new("test-key-not-a-secret", "claude-test").with_base_url(server.uri());
 
     let err = drain(&provider, sample_request())
         .await
@@ -329,8 +329,8 @@ async fn tier_b_invalid_request_surfaces_fatal_stream_error() {
         .respond_with(ResponseTemplate::new(400).set_body_string("bad schema"))
         .mount(&server)
         .await;
-    let provider = AnthropicProvider::new("test-key-not-a-secret".into(), "claude-test".into())
-        .with_base_url(server.uri());
+    let provider =
+        AnthropicProvider::new("test-key-not-a-secret", "claude-test").with_base_url(server.uri());
 
     let err = drain(&provider, sample_request())
         .await

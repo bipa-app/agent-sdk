@@ -37,9 +37,9 @@ pub use stores::{
 };
 pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
-    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
-    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
-    tool_name_to_string,
+    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage,
+    SimpleTool, SimpleToolAdapter, Tool, ToolContext, ToolName, ToolRegistry, ToolStatus,
+    stage_to_string, tool_name_from_str, tool_name_to_string,
 };
 
 // Core audit record re-exports for downstream convenience.

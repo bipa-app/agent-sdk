@@ -18,9 +18,10 @@
 //! ANTHROPIC_API_KEY=your_key cargo run --example server_turn_summary
 //! ```
 
+use agent_sdk::advanced::TurnOutcome;
 use agent_sdk::{
     AgentInput, CancellationToken, InMemoryEventStore, ThreadId, ToolContext, ToolRuntime,
-    TurnOptions, TurnOutcome, builder, providers::AnthropicProvider,
+    TurnOptions, builder, providers::AnthropicProvider,
 };
 use std::sync::Arc;
 
