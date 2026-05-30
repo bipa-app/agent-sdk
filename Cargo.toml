@@ -57,6 +57,9 @@ env_logger = "0.11"
 proptest = "1"
 proptest-state-machine = "0.4"
 insta = { version = "1", features = ["json"] }
+# Exhaustive concurrency-permutation model checker (Phase 11 · D). Only
+# compiled under `RUSTFLAGS="--cfg loom"`; never part of a normal build.
+loom = "0.7"
 
 # Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
 # feature set on every crate so production builds never compile it in;
@@ -66,6 +69,11 @@ fail = "0.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `loom` is a custom cfg set only by `RUSTFLAGS="--cfg loom"` for the
+# scoped concurrency models in the `agent-server-loom` crate. Declared
+# here so a normal build does not warn (and `-D warnings` does not error)
+# on the `#![cfg(loom)]` gate in that crate's loom test.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 all = "warn"

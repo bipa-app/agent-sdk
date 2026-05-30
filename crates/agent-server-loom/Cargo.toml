@@ -1,0 +1,26 @@
+[package]
+name = "agent-server-loom"
+version = "0.8.0"
+edition.workspace = true
+license-file = "../../LICENSE"
+description = "Scoped loom concurrency models for agent-server's lock-free journal hot spots (internal, test-only)"
+publish = false
+
+# This crate carries no library or binary surface — it exists purely to
+# host the `loom` models in `tests/loom_models.rs`, which are compiled
+# and run only under `RUSTFLAGS="--cfg loom"`. Keeping them in a
+# dedicated crate that depends on nothing but `loom` is mandatory:
+# `--cfg loom` is applied to the entire build graph, and `tokio` gates
+# its `net` module out under `cfg(loom)`, so a crate that pulls in the
+# async networking stack (as `agent-server` does, transitively via
+# `reqwest`) cannot be built under loom at all. This crate's dependency
+# closure is exactly `loom`, so the loom build graph stays tiny and
+# fast.
+[lib]
+path = "src/lib.rs"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
+[lints]
+workspace = true

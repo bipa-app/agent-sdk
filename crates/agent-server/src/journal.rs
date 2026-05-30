@@ -572,6 +572,8 @@ pub mod completed_turn_transaction;
 /// Postgres backends in `agent-service-host` can run the same battery.
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
+#[cfg(test)]
+mod durability_dst_test;
 pub mod event_notifier;
 pub mod event_outbox_transaction;
 pub mod event_repository;
@@ -592,6 +594,8 @@ mod persistence_regression;
 pub mod recovery;
 pub mod redaction;
 pub mod relay;
+#[cfg(test)]
+mod replay_determinism_test;
 #[cfg(test)]
 mod replay_test;
 pub mod retention;
