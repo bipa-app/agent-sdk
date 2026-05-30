@@ -1420,6 +1420,11 @@ mod tests {
     #[async_trait]
     impl LlmProvider for PanicProvider {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            // Panic isolation (ENG-8705) catches this at the run-loop
+            // boundary and turns it into a structured `Error`, so the
+            // parent classifies it as an agent error rather than a
+            // dropped channel. The literal text is asserted on by
+            // `test_run_subagent_panic_classified_as_error_not_disconnected`.
             panic!("panic provider should disconnect subagent");
         }
 
@@ -1707,7 +1712,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_subagent_disconnected_marks_result_as_failed() -> Result<()> {
+    async fn test_run_subagent_panic_classified_as_error_not_disconnected() -> Result<()> {
+        // A subagent whose LLM provider panics must surface as a
+        // structured `Error` — NOT the `Disconnected` ("ended
+        // unexpectedly") path. Before panic isolation (ENG-8705) the
+        // panic unwound the spawned run task, dropped `state_tx`, and
+        // the parent saw a `RecvError` it misclassified as
+        // `Disconnected`. The run-loop catch_unwind boundary now turns
+        // the panic into `AgentRunState::Error`, which the subagent
+        // classifies correctly.
         let tool = SubagentTool::new(
             SubagentConfig::new("worker"),
             Arc::new(PanicProvider),
@@ -1725,12 +1738,23 @@ mod tests {
             .await?;
 
         assert!(!result.success);
-        assert_eq!(result.final_response, "Subagent ended unexpectedly");
+        // The disconnect path must NOT be taken: a caught panic is a
+        // structured agent error, not an opaque dropped channel.
+        assert_ne!(result.final_response, "Subagent ended unexpectedly");
+        let details = result
+            .error_details
+            .context("panicking subagent must carry structured error details")?;
         assert!(
-            result
-                .error_details
-                .context("missing disconnect details")?
-                .contains("ended before returning a final state")
+            !details.contains("ended before returning a final state"),
+            "panic must not be classified as Disconnected; got {details:?}",
+        );
+        assert!(
+            details.contains("panicked"),
+            "structured error should reflect the panic; got {details:?}",
+        );
+        assert!(
+            details.contains("panic provider should disconnect subagent"),
+            "structured error should carry the original panic message; got {details:?}",
         );
 
         Ok(())

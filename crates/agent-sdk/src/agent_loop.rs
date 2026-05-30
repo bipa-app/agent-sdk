@@ -54,10 +54,55 @@ use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, AgentRunState, RunOptions, ThreadId};
+use crate::types::{AgentConfig, AgentError, AgentInput, AgentRunState, RunOptions, ThreadId};
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Run the agent loop with panic isolation at the spawned-task boundary.
+///
+/// A panic anywhere inside the run loop — most importantly inside the
+/// LLM provider call or the compaction provider call, neither of which
+/// is otherwise guarded — would unwind the spawned task, drop the
+/// `state_tx` oneshot, and surface to the caller as an opaque
+/// [`oneshot::error::RecvError`] (and, for subagents, be misclassified
+/// as `Disconnected`). Catching the unwind here turns it into a
+/// structured [`AgentRunState::Error`] that the task can still send on
+/// `state_tx`, so the run ends observably rather than silently tearing
+/// down the channel.
+///
+/// `AssertUnwindSafe` is sound at this boundary: the run loop owns its
+/// `RunLoopParameters` by value, so nothing it touches outlives the
+/// caught panic and is observed afterwards. The only value produced is
+/// the returned `AgentRunState`. Tool-level panics are already caught
+/// closer to the tool boundary (see
+/// `agent_loop::helpers::catch_tool_panic`) so the assistant
+/// `tool_use` / `tool_result` history stays balanced; this guard is the
+/// outer safety net for everything else.
+async fn run_loop_isolated<Ctx, P, H, M, S>(
+    params: RunLoopParameters<Ctx, P, H, M, S>,
+) -> AgentRunState
+where
+    Ctx: Send + Sync + Clone + 'static,
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+    S: StateStore,
+{
+    match AssertUnwindSafe(run_loop(params)).catch_unwind().await {
+        Ok(state) => state,
+        Err(payload) => {
+            let message = self::helpers::panic_payload_message(payload.as_ref());
+            log::error!("agent run loop panicked: {message}");
+            AgentRunState::Error(AgentError::new(
+                format!("Agent run panicked: {message}"),
+                false,
+            ))
+        }
+    }
+}
 
 /// Handle to a persistent agent thread.
 ///
@@ -434,7 +479,7 @@ where
         let parent_cx = crate::observability::context::capture_context();
 
         let task = async move {
-            let result = run_loop(RunLoopParameters {
+            let result = run_loop_isolated(RunLoopParameters {
                 event_store,
                 authority,
                 thread_id,
@@ -544,7 +589,7 @@ where
         let parent_cx = crate::observability::context::capture_context();
 
         let task = async move {
-            let result = run_loop(RunLoopParameters {
+            let result = run_loop_isolated(RunLoopParameters {
                 event_store,
                 authority,
                 thread_id,
