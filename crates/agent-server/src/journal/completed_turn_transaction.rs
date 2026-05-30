@@ -5,8 +5,10 @@
 //! individual mutation is already atomic under a single write lock.
 //! Durable SQL backends need a stronger contract: the attempt close,
 //! thread aggregate advance, message projection update, raw message
-//! batch append, and checkpoint insert must share one database
-//! transaction so recovery never observes a partial turn commit.
+//! batch append, checkpoint insert, **and** the turn's lifecycle events
+//! plus their coalesced advisory outbox row must share one database
+//! transaction so recovery never observes a partial turn commit and a
+//! committed turn never lacks its persisted events (Phase 10 · D).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,13 +24,19 @@ use super::commit::{CommitOutcome, CompletedTurnCommit};
 /// exposes it.
 #[async_trait]
 pub trait AtomicCompletedTurnCommitter: Send + Sync {
-    /// Commit the completed-turn state projections atomically.
+    /// Commit the completed-turn state projections, the turn's
+    /// lifecycle events, and the coalesced advisory outbox row
+    /// atomically.
     ///
-    /// Implementations should commit the durable state projections only
-    /// (attempt close, thread aggregate, message batch/head, and
-    /// checkpoint). Lifecycle events remain outside this hook because
-    /// the current durable-core Postgres contract intentionally leaves
-    /// the public event journal for a later track.
+    /// Implementations commit the durable state projections (attempt
+    /// close, thread aggregate, message batch/head, checkpoint) and —
+    /// when `params.events` is non-empty — the contiguous event batch
+    /// plus exactly one
+    /// [`OutboxMessageKind::ThreadEventsAvailable`](super::outbox_message::OutboxMessageKind::ThreadEventsAvailable)
+    /// row inside the same SQL transaction (Phase 10 · D). The returned
+    /// [`CommitOutcome::committed_events`] carries the server-assigned
+    /// metadata for those events. An empty `params.events` skips the
+    /// event/outbox writes and returns an empty `committed_events`.
     async fn commit_completed_turn_atomic(
         &self,
         params: CompletedTurnCommit,

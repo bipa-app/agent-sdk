@@ -53,7 +53,9 @@ use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
 use crate::journal::checkpoint_store::CheckpointStore;
-use crate::journal::commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
+use crate::journal::commit::{
+    CommitOutcome, CompletedTurnCommit, DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS, commit_completed_turn,
+};
 use crate::journal::committed_event::CommittedEvent;
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
@@ -682,6 +684,7 @@ async fn commit_text_only_turn(
             turn_usage,
             agent_state_snapshot,
             events: lifecycle_events,
+            outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             now,
         },
         deps.thread_store,
@@ -2745,6 +2748,7 @@ async fn commit_resumed_turn(
             turn_usage,
             agent_state_snapshot,
             events: lifecycle_events,
+            outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             now,
         },
         deps.thread_store,

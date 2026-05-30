@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_outbox\n    (id, kind, thread_id, event_id, sequence, status, payload_json,\n     created_at, next_attempt_at, attempt_count, max_attempts)\nVALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "988d768ffa6db40c13a95fb6f6d66937a603f3ed7723183c8234016872a80758"
+}

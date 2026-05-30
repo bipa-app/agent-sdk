@@ -41,10 +41,13 @@ use agent_server::journal::outbox::{
     NewOutboxRow, OutboxRow, OutboxRowId, OutboxStatus, OutboxStore, kind_payload_invariants_hold,
 };
 use agent_server::journal::outbox_message::{
-    OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+    OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
 };
 use agent_server::journal::recovery::{
     RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,
+};
+use agent_server::journal::relay::{
+    TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
 use agent_server::journal::store::{AgentTaskStore, SubagentInvocationSpawn};
@@ -1304,6 +1307,53 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         })
     }
 
+    /// Insert a durable `task_wakeup` advisory outbox row inside an
+    /// existing transaction.  See the Postgres analogue
+    /// (`insert_task_wakeup_outbox_row_tx`) for the Phase 10 · D
+    /// contract — the row carries no `event_id`/`sequence`, only a
+    /// `{task_id, thread_id}` advisory payload, and becomes visible iff
+    /// the surrounding admission transaction commits.
+    async fn insert_task_wakeup_outbox_row_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &AgentTaskId,
+        thread_id: &ThreadId,
+        max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<OutboxRowId> {
+        let id = OutboxRowId::new();
+        let payload_json = OutboxMessage::TaskWakeup(TaskWakeupPayload {
+            task_id: task_id.clone(),
+            thread_id: thread_id.clone(),
+        })
+        .to_payload_json()
+        .context("serialise task_wakeup advisory payload")?;
+
+        let id_str = id.as_str();
+        let thread_id_key = thread_key(thread_id);
+        let kind_str = OutboxMessageKind::TaskWakeup.as_str();
+        let max_attempts_i64 = i64::from(max_attempts);
+
+        sqlx::query!(
+            r"
+INSERT INTO agent_sdk_outbox
+    (id, kind, thread_id, event_id, sequence, status, payload_json,
+     created_at, next_attempt_at, attempt_count, max_attempts)
+VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
+",
+            id_str,
+            kind_str,
+            thread_id_key,
+            payload_json,
+            now,
+            max_attempts_i64,
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert task_wakeup outbox row for task {task_id}"))?;
+
+        Ok(id)
+    }
+
     /// Atomic fork transaction for `SQLite`.
     ///
     /// Wraps the entire write set the fork RPC handler hands us
@@ -1449,7 +1499,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
 
         let checkpoint = Checkpoint::new(NewCheckpointParams {
-            thread_id: params.thread_id,
+            thread_id: params.thread_id.clone(),
             turn_number: thread.committed_turns,
             task_id: params.task_id,
             messages: updated_projection.messages,
@@ -1459,6 +1509,42 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
         })?;
         Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
 
+        // Phase 10 · D: commit the turn's lifecycle events AND the single
+        // coalesced advisory outbox row inside this SAME transaction so a
+        // crash can never leave a committed turn with zero persisted
+        // events (or a committed-but-unpublished event batch).
+        let committed_events = if params.events.is_empty() {
+            Vec::new()
+        } else {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
+            let committed = Self::insert_events_tx(
+                &mut tx,
+                &params.thread_id,
+                params.events,
+                start_seq,
+                params.now,
+            )
+            .await
+            .context("insert lifecycle events inside sqlite completed-turn transaction")?;
+            Self::insert_thread_events_outbox_row_tx(
+                &mut tx,
+                &committed,
+                params.outbox_max_attempts,
+                params.now,
+            )
+            .await
+            .context("insert advisory outbox row inside sqlite completed-turn transaction")?;
+            committed
+        };
+
+        // Failpoint (11 · A): simulate a crash at the true atomic-commit
+        // boundary — the events and the coalesced advisory outbox row are
+        // staged in `tx` but `tx.commit()` has not yet run, so the whole
+        // turn (state + events) will roll back. Recovery must replay
+        // idempotently. No-op (and not compiled) without the `failpoints`
+        // feature.
+        agent_server::fail_point!("commit.before_event_commit");
+
         tx.commit()
             .await
             .context("commit sqlite completed-turn transaction")?;
@@ -1467,7 +1553,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?7, 0, ?8)
             closed_attempt,
             thread,
             checkpoint,
-            committed_events: Vec::new(),
+            committed_events,
         })
     }
 }
@@ -1592,6 +1678,23 @@ impl AgentTaskStore for SqliteDurableStore {
         };
 
         Self::insert_task_tx(&mut tx, &admitted).await?;
+
+        // Phase 10 · D: emit a durable `task_wakeup` advisory row in the
+        // SAME transaction when the new root is immediately runnable, so
+        // a worker (even in another process) is nudged to call
+        // `acquire_next_runnable`. A queued root is parked behind an
+        // active/queued root and is nudged when promoted instead.
+        if admitted.status == TaskStatus::Pending {
+            Self::insert_task_wakeup_outbox_row_tx(
+                &mut tx,
+                &admitted.id,
+                &admitted.thread_id,
+                TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS,
+                admitted.created_at,
+            )
+            .await?;
+        }
+
         tx.commit().await.context("commit submit_root_turn")?;
         Ok(admitted)
     }
@@ -3117,6 +3220,39 @@ impl AtomicEventOutboxCommitter for SqliteDurableStore {
             committed_events: committed,
             outbox_row: Some(outbox_row),
         })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TaskWakeupEmitter (Phase 10 · D — durable cross-process wakeup)
+// ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl TaskWakeupEmitter for SqliteDurableStore {
+    /// Insert a durable `task_wakeup` advisory row in its own
+    /// transaction.  The admission paths use
+    /// `Self::insert_task_wakeup_outbox_row_tx` directly so the
+    /// wakeup is atomic with the journal mutation; this standalone
+    /// hook covers callers that emit a wakeup without a surrounding
+    /// journal write.
+    async fn emit_in_transaction(&self, trigger: TaskWakeupTrigger) -> Result<OutboxRowId> {
+        ensure!(
+            trigger.max_attempts >= 1,
+            "task_wakeup max_attempts must be at least 1"
+        );
+        let mut tx = self.begin().await?;
+        let id = Self::insert_task_wakeup_outbox_row_tx(
+            &mut tx,
+            &trigger.task_id,
+            &trigger.thread_id,
+            trigger.max_attempts,
+            trigger.now,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit task_wakeup emit transaction")?;
+        Ok(id)
     }
 }
 
@@ -5058,6 +5194,7 @@ mod tests {
                 },
                 agent_state_snapshot: serde_json::json!({"turn": 1}),
                 events: Vec::new(),
+                outbox_max_attempts: 3,
                 now: t_plus(3),
             },
         )
@@ -5078,6 +5215,169 @@ mod tests {
             "committed history reflects the turn's final messages",
         );
 
+        Ok(())
+    }
+
+    /// Phase 10 · D regression: on `SQLite` a committed turn's lifecycle
+    /// events and the coalesced advisory outbox row land in the SAME
+    /// transaction as the state projections. "Events exist iff the turn
+    /// committed": a successful commit yields both the turn AND its
+    /// events; an empty-events commit yields neither events nor an
+    /// advisory row.
+    #[tokio::test]
+    async fn events_and_outbox_commit_atomically_with_turn_sqlite() -> Result<()> {
+        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_core::llm;
+        use agent_sdk_core::{TokenUsage, audit::AuditProvenance};
+        use agent_server::journal::commit::CompletedTurnCommit;
+        use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::outbox_message::OutboxMessageKind;
+        use agent_server::journal::task::{AgentTask, TaskStatus};
+        use agent_server::journal::thread_store::ThreadStore;
+        use agent_server::journal::turn_attempt::{
+            CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
+        };
+        use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-events-iff");
+
+        let task = AgentTask::new_root_turn(thread_id.clone(), t_plus(1), 3);
+        let task_id = task.id.clone();
+        let admitted = AgentTaskStore::submit_root_turn(&store, task).await?;
+
+        // The runnable admission must have emitted a durable task_wakeup
+        // advisory row in the same transaction.
+        assert_eq!(admitted.status, TaskStatus::Pending);
+        let rows = OutboxStore::list_by_thread(&store, &thread_id).await?;
+        let wakeup_rows = rows
+            .iter()
+            .filter(|r| r.kind == OutboxMessageKind::TaskWakeup)
+            .count();
+        assert_eq!(
+            wakeup_rows, 1,
+            "submit_root_turn must emit exactly one durable task_wakeup row"
+        );
+
+        let attempt = TurnAttemptStore::open_attempt(
+            &store,
+            OpenAttemptParams {
+                task_id: task_id.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                request_blob: serde_json::json!({"messages": []}),
+                now: t_plus(2),
+                otel_trace_id: None,
+                otel_span_id: None,
+            },
+        )
+        .await?;
+
+        let outcome = AtomicCompletedTurnCommitter::commit_completed_turn_atomic(
+            &store,
+            CompletedTurnCommit {
+                thread_id: thread_id.clone(),
+                task_id,
+                turn_attempt_id: attempt.id.clone(),
+                close_attempt_params: CloseAttemptParams {
+                    response_blob: serde_json::json!({"id": "msg_01"}),
+                    response_id: Some("msg_01".into()),
+                    response_model: Some("claude-sonnet-4-5-20250929".into()),
+                    stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+                    outcome: TurnAttemptOutcome::Success,
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cached_input_tokens: 0,
+                },
+                messages: vec![llm::Message::user("hi"), llm::Message::assistant("there")],
+                turn_usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: vec![AgentEvent::Start {
+                    thread_id: thread_id.clone(),
+                    turn: 1,
+                }],
+                outbox_max_attempts: 3,
+                now: t_plus(3),
+            },
+        )
+        .await?;
+
+        // Turn committed → events exist, returned and persisted.
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(outcome.committed_events.len(), 1);
+        let events = EventRepository::get_events(&store, &thread_id).await?;
+        assert_eq!(
+            events.len(),
+            1,
+            "a committed turn must carry its persisted events"
+        );
+
+        // The coalesced advisory outbox row landed in the SAME tx.
+        let rows = OutboxStore::list_by_thread(&store, &thread_id).await?;
+        let thread_events_rows = rows
+            .iter()
+            .filter(|r| r.kind == OutboxMessageKind::ThreadEventsAvailable)
+            .count();
+        assert_eq!(
+            thread_events_rows, 1,
+            "exactly one thread_events_available advisory row per committed turn"
+        );
+
+        // Confirm the thread aggregate also advanced.
+        let thread = ThreadStore::get(&store, &thread_id)
+            .await?
+            .context("thread row")?;
+        assert_eq!(thread.committed_turns, 1);
+
+        Ok(())
+    }
+
+    /// Phase 10 · D: the standalone durable `emit_in_transaction` hook
+    /// persists a `task_wakeup` advisory row that a consumer can decode
+    /// back into its `{task_id, thread_id}` payload.
+    #[tokio::test]
+    async fn task_wakeup_emit_in_transaction_persists_durable_row_sqlite() -> Result<()> {
+        use agent_server::journal::outbox::OutboxStore;
+        use agent_server::journal::outbox_message::{OutboxMessage, OutboxMessageKind};
+        use agent_server::journal::relay::{TaskWakeupEmitter, TaskWakeupTrigger};
+        use agent_server::journal::task::AgentTaskId;
+        use agent_server::journal::thread_store::ThreadStore;
+
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        let thread_id = ThreadId::from_string("t-sqlite-wakeup-emit");
+        // The outbox row carries a FK to agent_sdk_threads; the thread is
+        // always bootstrapped before a task on it becomes runnable.
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+        let task_id = AgentTaskId::new();
+
+        let id = TaskWakeupEmitter::emit_in_transaction(
+            &store,
+            TaskWakeupTrigger {
+                task_id: task_id.clone(),
+                thread_id: thread_id.clone(),
+                now: t0(),
+                max_attempts: 3,
+            },
+        )
+        .await?;
+
+        let row = OutboxStore::get(&store, &id).await?.context("wakeup row")?;
+        assert_eq!(row.kind, OutboxMessageKind::TaskWakeup);
+        assert_eq!(row.thread_id, thread_id);
+        assert!(row.event_id.is_none());
+        assert!(row.sequence.is_none());
+        let payload = OutboxMessage::from_payload_json(row.kind, row.payload_json)?;
+        let OutboxMessage::TaskWakeup(p) = payload else {
+            anyhow::bail!("expected task_wakeup payload, got {payload:?}");
+        };
+        assert_eq!(p.task_id, task_id);
+        assert_eq!(p.thread_id, thread_id);
         Ok(())
     }
 

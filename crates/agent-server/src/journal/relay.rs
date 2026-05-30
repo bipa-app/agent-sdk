@@ -260,6 +260,15 @@ pub struct TaskWakeupTrigger {
     pub max_attempts: u32,
 }
 
+/// Default relay attempt budget for a durable `task_wakeup` advisory
+/// row.
+///
+/// The wakeup is only a latency nudge — the worker pool's acquisition
+/// ticker and [`super::task_wakeup::FallbackWakeupSweep`] still make
+/// progress if every delivery is lost — so a small fixed budget is
+/// plenty.  Matches the 3-attempt default used for the event outbox.
+pub const TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS: u32 = 3;
+
 /// Same-transaction emitter for `task_wakeup` outbox rows.
 ///
 /// Implementations MUST insert the outbox row inside the same SQL

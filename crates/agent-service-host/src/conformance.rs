@@ -252,6 +252,7 @@ mod tests {
                 turn_usage,
                 agent_state_snapshot: serde_json::json!({}),
                 events: vec![],
+                outbox_max_attempts: 3,
                 now: t_plus(55),
             },
             thread_store,

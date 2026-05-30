@@ -120,6 +120,16 @@
 #[macro_use]
 pub mod failpoints;
 
+/// Crate-root re-export of `fail-rs` so the exported [`fail_point!`] macro
+/// resolves the registry through `$crate::__fail_reexport` rather than a
+/// bare `::fail` path. This lets the macro fire from **other** workspace
+/// crates (e.g. `agent-service-host`'s durable committers) that enable
+/// `agent-server/failpoints` without depending on `fail-rs` directly.
+/// Hidden from docs; not part of the public API.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use fail as __fail_reexport;
+
 pub mod journal;
 #[cfg(feature = "otel")]
 pub mod observability;
