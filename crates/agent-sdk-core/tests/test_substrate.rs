@@ -11,9 +11,13 @@
 //! * `proptest` — property-based fuzzing of an invariant.
 //! * `proptest-state-machine` — model-based testing against a reference
 //!   model (here: a plain integer mirroring `SequenceCounter`).
-//! * `tokio` `start_paused` — deterministic virtual time, no real sleeps.
 //! * `insta` — snapshot of a serialized event so ordering/shape
 //!   regressions show up as a reviewable diff.
+//!
+//! `tokio` `start_paused` virtual time is also part of this substrate, but it
+//! is only meaningful against time-dependent logic, so it is exercised in the
+//! `agent-service-host` scheduling/lease tests (extended in Phase 11·D) rather
+//! than demonstrated here against bare `tokio` primitives.
 
 use agent_sdk_core::{AgentEvent, SequenceCounter, ThreadId};
 
@@ -122,31 +126,6 @@ mod state_machine {
             sequential 1..50 => CounterSut
         );
     }
-}
-
-// ── tokio start_paused: deterministic virtual time ───────────────────
-//
-// `start_paused = true` freezes the clock and auto-advances it whenever
-// all tasks are idle, so a "10 second" timeout resolves instantly and
-// deterministically — no wall-clock sleep, no flakiness.
-
-#[tokio::test(start_paused = true)]
-async fn virtual_time_resolves_long_timeouts_instantly() {
-    use std::time::Duration;
-    use tokio::time::{Instant, sleep, timeout};
-
-    let started = Instant::now();
-
-    // A timeout that "waits" ten seconds completes immediately in virtual
-    // time because nothing else is runnable.
-    let result = timeout(Duration::from_secs(10), sleep(Duration::from_secs(5))).await;
-
-    assert!(
-        result.is_ok(),
-        "inner sleep should finish before the timeout"
-    );
-    // Virtual time advanced by the inner sleep, not the full timeout.
-    assert_eq!(started.elapsed(), Duration::from_secs(5));
 }
 
 // ── insta: snapshot testing ──────────────────────────────────────────
