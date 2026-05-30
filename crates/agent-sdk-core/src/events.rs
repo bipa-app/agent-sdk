@@ -162,6 +162,23 @@ pub enum AgentEvent {
         text: Option<String>,
     },
 
+    /// The run was cancelled via its [`CancellationToken`].
+    ///
+    /// This is a **terminal** event, emitted exactly once on every
+    /// cancellation return site (mirroring [`AgentEvent::Done`] and
+    /// [`AgentEvent::Refusal`]). Cancellation can land at the top of a
+    /// turn, mid-stream while the model is still producing tokens,
+    /// while a tool is in flight, or during context compaction — in
+    /// every case the run closes with this event so a streaming
+    /// consumer receives a closing marker and never hangs waiting for
+    /// `Done`.
+    ///
+    /// `turn` is the turn number reached when the cancel was honored
+    /// and `usage` is the partial token usage accumulated so far.
+    ///
+    /// [`CancellationToken`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
+    Cancelled { turn: usize, usage: TokenUsage },
+
     /// Context was compacted to reduce size
     ContextCompacted {
         /// Number of messages before compaction
@@ -349,6 +366,11 @@ impl AgentEvent {
             message_id: message_id.into(),
             text,
         }
+    }
+
+    #[must_use]
+    pub const fn cancelled(turn: usize, usage: TokenUsage) -> Self {
+        Self::Cancelled { turn, usage }
     }
 
     #[must_use]

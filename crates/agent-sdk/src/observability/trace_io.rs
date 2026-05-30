@@ -182,6 +182,7 @@ pub fn langfuse_trace_output(event: &AgentEvent) -> Option<String> {
         | AgentEvent::ToolProgress { .. }
         | AgentEvent::TurnComplete { .. }
         | AgentEvent::Done { .. }
+        | AgentEvent::Cancelled { .. }
         | AgentEvent::AutoRetryStart { .. }
         | AgentEvent::AutoRetryEnd { .. }
         | AgentEvent::ContextCompacted { .. }
@@ -201,6 +202,7 @@ pub const fn langfuse_trace_event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolRequiresConfirmation { .. } => "Tool Confirmation",
         AgentEvent::Error { .. } => "Error",
         AgentEvent::Refusal { .. } => "Refusal",
+        AgentEvent::Cancelled { .. } => "Cancelled",
         AgentEvent::UserInput { .. } => "User",
         AgentEvent::Start { .. }
         | AgentEvent::Thinking { .. }
