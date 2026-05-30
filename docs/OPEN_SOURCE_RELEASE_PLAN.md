@@ -179,7 +179,7 @@ Linear is canonical for state; this table is a convenience mirror that **may lag
 | 11·C cancel/lifecycle matrix | `ENG-8710` | Merged | [#259](https://github.com/bipa-app/agent-sdk/pull/259) |
 | 11·D durability/replay/DST/loom | `ENG-8711` | Merged | [#261](https://github.com/bipa-app/agent-sdk/pull/261) |
 | 11·E provider determinism + streaming | `ENG-8712` | Merged | [#262](https://github.com/bipa-app/agent-sdk/pull/262) |
-| 12·A ergonomics + façade | `ENG-8713` | In Progress | — |
+| 12·A ergonomics + façade | `ENG-8713` | In Review | [#266](https://github.com/bipa-app/agent-sdk/pull/266) |
 | 12·B feature-gating + deps | `ENG-8714` | In Progress | — |
 | 12·C CLI + examples | `ENG-8715` | In Progress | — |
 | 12·D relicense + scrub + secret scan | `ENG-8716` | In Progress | — |
