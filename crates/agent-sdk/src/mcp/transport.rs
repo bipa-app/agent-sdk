@@ -40,6 +40,15 @@ pub trait McpTransport: Send + Sync {
     /// Returns an error if the message fails to serialize or write.
     async fn send_notification(&self, request: JsonRpcRequest) -> Result<()>;
 
+    /// Record the protocol revision negotiated during `initialize`.
+    ///
+    /// Transports that carry the revision out-of-band (e.g. the streamable-HTTP
+    /// transport, which must send a `MCP-Protocol-Version` header on every
+    /// request after initialization) override this. The default is a no-op for
+    /// transports like stdio where the revision lives only in the JSON-RPC
+    /// payload.
+    async fn set_protocol_version(&self, _version: &str) {}
+
     /// Close the transport connection.
     ///
     /// # Errors

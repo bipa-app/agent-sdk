@@ -354,7 +354,7 @@
 //! | [`primitive_tools`] | Built-in file operation tools (Read, Write, Edit, Glob, Grep, Bash) |
 //! | [`llm`] | LLM abstraction layer |
 //! | [`subagent`] | Nested agent execution with [`SubagentFactory`] |
-//! | [`mcp`] | Model Context Protocol support |
+//! | [`mcp`] | Model Context Protocol client (stdio + streamable-HTTP/SSE, resources/prompts) |
 //! | [`todo`](mod@todo) | Task tracking tools ([`TodoWriteTool`], [`TodoReadTool`]) |
 //! | [`user_interaction`] | User question/confirmation tools ([`AskUserQuestionTool`]) |
 //! | [`web`] | Web search and fetch tools |
@@ -395,7 +395,7 @@
 //! | `vertex`       | No  | — | Google Vertex AI provider (implies `anthropic` + `gemini`) |
 //! | `cloudflare`   | No  | — | Cloudflare AI Gateway proxy (implies `anthropic` + `openai` + `gemini`) |
 //! | `web`          | No  | `html2text` | [`web`] search + fetch tools |
-//! | `mcp`          | No  | — | [`mcp`] Model Context Protocol client |
+//! | `mcp`          | No  | — | [`mcp`] Model Context Protocol client (stdio + streamable-HTTP/SSE) |
 //! | `skills`       | No  | `serde_yaml_ng` | [`skills`] markdown skill loader |
 //! | `otel`         | No  | `opentelemetry` | OpenTelemetry tracing instrumentation |
 //!
