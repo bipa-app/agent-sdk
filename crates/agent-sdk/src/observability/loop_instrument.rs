@@ -38,14 +38,17 @@
 //!
 //! Compiled only with `feature = "otel"`.
 
-use opentelemetry::KeyValue;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use opentelemetry::global::BoxedSpan;
-use opentelemetry::trace::{Span, Status};
+use opentelemetry::trace::{Span, Status, TraceContextExt};
+use opentelemetry::{Context, KeyValue, global};
 
 use super::metrics::Metrics;
 use super::{attrs, baggage, langfuse, provider_name, spans};
 use crate::llm::{ChatResponse, StopReason};
-use crate::types::ToolTier;
+use crate::types::{TokenUsage, ToolTier};
 
 // ── Chat (LLM client) span ───────────────────────────────────────────
 
@@ -381,4 +384,270 @@ pub fn finish_tool_span(
 
     Metrics::global().record_tool_execution(tool_name, tool_kind, outcome_str, duration_ms);
     span.end();
+}
+
+// ── Root turn span (daemon cross-task) ───────────────────────────────
+
+/// Inputs needed to open the daemon's root `invoke_agent` span.
+///
+/// The daemon-hosted worker drives one turn across multiple tokio tasks
+/// (execute → suspend at the tool boundary → resume). Unlike the
+/// in-process loop's `agent_loop` root span — which keeps a single live
+/// span wrapping the whole run future — the worker creates this span
+/// live on the FRESH turn, captures its `(trace_id, span_id)` to persist
+/// on the turn attempt, and re-parents every later span (resumed `chat`
+/// calls, child-task `execute_tool` calls) under those ids via
+/// [`remote_parent_context`].
+#[derive(Clone, Copy)]
+pub struct RootTurnSpanParams<'a> {
+    /// Raw SDK provider id (e.g. `anthropic`); normalised to the
+    /// `gen_ai.provider.name` semconv value internally.
+    pub provider_id: &'static str,
+    /// Model driving the turn (`gen_ai.request.model`).
+    pub model: &'a str,
+    /// Thread / conversation id (`gen_ai.conversation.id`).
+    pub conversation_id: &'a str,
+}
+
+/// A started root-turn span plus the hex ids the worker persists so the
+/// turn's later tasks can re-parent their spans under it.
+pub struct StartedRootTurnSpan {
+    /// The live `invoke_agent` span. The worker holds it for the fresh
+    /// segment, finishing it with [`finish_root_turn_span`] on a
+    /// text-only terminal or letting it end on drop when the turn
+    /// suspends for tools.
+    pub span: BoxedSpan,
+    /// Hex-encoded `TraceId` — persist to
+    /// `agent_sdk_turn_attempts.otel_trace_id`.
+    pub trace_id_hex: String,
+    /// Hex-encoded root `SpanId` — persist to
+    /// `agent_sdk_turn_attempts.otel_span_id`.
+    pub span_id_hex: String,
+}
+
+/// Start the daemon's root `invoke_agent` INTERNAL span and capture the
+/// ids the worker persists so the turn's later tasks can nest under it.
+///
+/// Mirrors the structural / `gen_ai.*` attributes of the in-process
+/// loop's root span (operation name, provider, model, conversation id)
+/// with the minimal parameter set the daemon worker supplies cheaply,
+/// and tags the same Langfuse `agent` observation. Pair a text-only
+/// terminal with [`finish_root_turn_span`]; on the tool-suspend path the
+/// span ends when dropped — its duration then covers the fresh segment
+/// only, because the OTel 0.32 `SpanBuilder` exposes no way to assign a
+/// span id, so a single span cannot be reopened on resume to span the
+/// whole turn. The persisted ids still re-parent every later span, so
+/// the turn remains one coherent trace tree.
+#[must_use]
+pub fn start_root_turn_span(params: RootTurnSpanParams<'_>) -> StartedRootTurnSpan {
+    let provider = provider_name::normalize(params.provider_id);
+    let span_attrs = vec![
+        KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
+        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider),
+        KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, params.model.to_string()),
+        KeyValue::new(
+            attrs::GEN_AI_CONVERSATION_ID,
+            params.conversation_id.to_string(),
+        ),
+        KeyValue::new(attrs::SDK_PROVIDER_ID, params.provider_id),
+    ];
+    let mut span = spans::start_internal_span("invoke_agent", span_attrs);
+    baggage::copy_baggage_to_active_span(&mut span);
+    langfuse::tag_observation(&mut span, langfuse::ObservationType::Agent);
+    let span_context = span.span_context().clone();
+    StartedRootTurnSpan {
+        trace_id_hex: span_context.trace_id().to_string(),
+        span_id_hex: span_context.span_id().to_string(),
+        span,
+    }
+}
+
+/// Build a [`Context`] whose active parent is the root-turn span
+/// identified by the hex ids persisted on the turn attempt.
+///
+/// Spans created while this context is attached become children of the
+/// root span. This is how the worker re-parents resumed `chat` calls and
+/// child-task `execute_tool` calls under the turn root after the original
+/// live span has gone (the worker suspended, or a fresh task / process
+/// picked the turn up). Returns `None` when the ids are absent or
+/// malformed — the caller then leaves the span un-parented (a new trace),
+/// exactly as before this wiring.
+#[must_use]
+pub fn remote_parent_context(trace_id_hex: &str, span_id_hex: &str) -> Option<Context> {
+    let span_context = spans::remote_span_context(trace_id_hex, span_id_hex)?;
+    Some(Context::current().with_remote_span_context(span_context))
+}
+
+/// Finalize the root-turn span with run-outcome attributes + the
+/// `agent_sdk.runs.outcome` counter, then end it.
+///
+/// Mirrors `agent_loop`'s `end_root_span`: same total-turns / usage /
+/// outcome attribute set and the same outcome counter. Reached on the
+/// text-only terminal path where the worker still holds the live span;
+/// tool turns end the span on drop at the suspend boundary (see
+/// [`start_root_turn_span`]).
+pub fn finish_root_turn_span(
+    span: &mut BoxedSpan,
+    total_turns: usize,
+    total_usage: &TokenUsage,
+    outcome: &'static str,
+) {
+    Metrics::global()
+        .runs_outcome
+        .add(1, &[KeyValue::new(attrs::SDK_OUTCOME, outcome)]);
+    span.set_attribute(attrs::kv_i64(
+        attrs::SDK_TOTAL_TURNS,
+        i64::try_from(total_turns).unwrap_or(0),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_INPUT_TOKENS,
+        i64::from(total_usage.input_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+        i64::from(total_usage.output_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        i64::from(total_usage.cached_input_tokens),
+    ));
+    span.set_attribute(attrs::kv_i64(
+        attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        i64::from(total_usage.cache_creation_input_tokens),
+    ));
+    span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
+    if outcome == "error" {
+        spans::set_span_error(span, "agent_error", "agent invocation failed");
+    }
+    span.end();
+}
+
+// ── W3C traceparent ⇄ Context propagation ────────────────────────────
+
+/// W3C `traceparent` header key. The only carrier entry the daemon
+/// needs to persist a parent span context durably (on `AgentTask`) and
+/// rebuild it in a later task / process.
+const TRACEPARENT_KEY: &str = "traceparent";
+
+/// Rebuild an `OTel` [`Context`] from a persisted W3C `traceparent`.
+///
+/// The daemon decouples the gRPC call that submits work from the worker
+/// that runs it (a durable task queue, possibly a different process), so
+/// the inbound client trace context cannot ride an in-memory
+/// [`Context`]. It is persisted as a `traceparent` string on the task
+/// and rebuilt here via the globally-installed
+/// [`opentelemetry::propagation::TextMapPropagator`]. Spans started while
+/// the returned context is attached become children of the encoded span.
+///
+/// Returns `None` when `traceparent` is empty, malformed, or no
+/// propagator is installed (the extracted context then carries no valid
+/// span) — the caller leaves its span un-parented, exactly as before
+/// this wiring.
+#[must_use]
+pub fn context_from_traceparent(traceparent: &str) -> Option<Context> {
+    if traceparent.is_empty() {
+        return None;
+    }
+    let mut carrier = HashMap::with_capacity(1);
+    carrier.insert(TRACEPARENT_KEY.to_string(), traceparent.to_string());
+    let cx = global::get_text_map_propagator(|propagator| propagator.extract(&carrier));
+    if cx.span().span_context().is_valid() {
+        Some(cx)
+    } else {
+        None
+    }
+}
+
+/// Encode hex trace + span ids into a W3C `traceparent` string.
+///
+/// Used to stamp a child tool task's parent span: the root
+/// `invoke_agent` span's `(trace_id, span_id)` — persisted on the turn
+/// attempt — is encoded here and stored on the child task's
+/// `otel_traceparent` so the child's `execute_tool` span nests under the
+/// turn root. Returns `None` for malformed / zero ids (validated via
+/// [`spans::remote_span_context`]). The `SAMPLED` flag is always set, to
+/// match the remote context the daemon reconstructs.
+#[must_use]
+pub fn traceparent_from_ids(trace_id_hex: &str, span_id_hex: &str) -> Option<String> {
+    let span_context = spans::remote_span_context(trace_id_hex, span_id_hex)?;
+    Some(format!(
+        "00-{}-{}-01",
+        span_context.trace_id(),
+        span_context.span_id()
+    ))
+}
+
+// ── Live root-span registry (correct cross-task duration) ────────────
+
+/// Process-global home for the live root-turn span between the task that
+/// opens it and the (possibly later) task that finalizes it.
+///
+/// The daemon drives one turn across several tokio tasks
+/// (execute → suspend at the tool boundary → resume), and OTel 0.32
+/// offers no way to assign a span id, so a root span cannot be re-minted
+/// on resume to cover the whole turn. Instead the worker stashes the
+/// *live* `invoke_agent` span here at the fresh turn and finalizes it at
+/// the terminal — even though that runs in a different task — so the span
+/// carries the **full** turn duration (it legitimately stays open while
+/// tools run). Children never read this map; they nest via the ids
+/// persisted on the turn attempt (see [`remote_parent_context`]), so the
+/// tree is correct regardless of whether the live span survives.
+///
+/// Keyed by `AgentTask` id (stringified). An entry that is never
+/// finalized — the daemon crashed/restarted mid-turn, so a fresh process
+/// owns the resume — simply leaks its (small) span object until process
+/// exit; that turn's root span is the only one missing its terminal
+/// finalize, and its children still nest correctly.
+static LIVE_ROOT_SPANS: LazyLock<Mutex<HashMap<String, BoxedSpan>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Stash the live root-turn `span` under `task_id` so a later task can
+/// finalize it with the correct full duration (see [`LIVE_ROOT_SPANS`]).
+///
+/// First write wins: a retry that re-opens the same turn keeps the
+/// original span (and its start time) rather than resetting the clock.
+pub fn stash_root_turn_span(task_id: &str, span: BoxedSpan) {
+    let Ok(mut spans) = LIVE_ROOT_SPANS.lock() else {
+        log::warn!("live root-span registry poisoned; dropping root span for task {task_id}");
+        return;
+    };
+    spans.entry(task_id.to_string()).or_insert(span);
+}
+
+/// Finalize and end the stashed root-turn span for `task_id`, stamping
+/// run-outcome + usage attributes (see [`finish_root_turn_span`]).
+///
+/// No-op when no span is stashed — the expected path when the daemon
+/// restarted mid-turn and a fresh process owns the terminal. The outcome
+/// counter is still recorded in that case so dashboards see every run.
+pub fn finalize_root_turn_span(
+    task_id: &str,
+    total_turns: usize,
+    total_usage: &TokenUsage,
+    outcome: &'static str,
+) {
+    let stashed = LIVE_ROOT_SPANS
+        .lock()
+        .ok()
+        .and_then(|mut spans| spans.remove(task_id));
+    match stashed {
+        Some(mut span) => finish_root_turn_span(&mut span, total_turns, total_usage, outcome),
+        None => {
+            // Live span lost (cross-restart resume). Still record the
+            // run-outcome counter so the metric isn't undercounted.
+            Metrics::global()
+                .runs_outcome
+                .add(1, &[KeyValue::new(attrs::SDK_OUTCOME, outcome)]);
+        }
+    }
+}
+
+/// Drop the stashed root-turn span for `task_id` without finalizing.
+///
+/// For paths that abandon a turn without a meaningful outcome (e.g. an
+/// idempotent duplicate-suspension bail) so the registry doesn't leak.
+pub fn discard_root_turn_span(task_id: &str) {
+    if let Ok(mut spans) = LIVE_ROOT_SPANS.lock() {
+        drop(spans.remove(task_id));
+    }
 }
