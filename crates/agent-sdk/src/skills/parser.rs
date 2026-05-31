@@ -112,7 +112,7 @@ pub fn parse_skill_file(content: &str) -> Result<Skill> {
 
     // Parse YAML frontmatter
     let frontmatter: SkillFrontmatter =
-        serde_yaml::from_str(yaml_content).context("Failed to parse YAML frontmatter")?;
+        serde_yaml_ng::from_str(yaml_content).context("Failed to parse YAML frontmatter")?;
 
     // Name is required (can come from name, id, or title via aliases)
     let name = frontmatter

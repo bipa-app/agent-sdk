@@ -33,7 +33,9 @@ use agent_sdk::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, LlmProvider, StopReason, StreamBox,
     StreamDelta, Usage,
 };
+#[cfg(feature = "mcp")]
 use agent_sdk::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
+#[cfg(feature = "mcp")]
 use agent_sdk::mcp::transport::McpTransport;
 use anyhow::{Result, anyhow};
 use async_stream::stream;
@@ -256,10 +258,12 @@ impl Tool<()> for EchoTool {
 /// Tests push responses in reverse order so the next `send()` pops
 /// the back of the vector and binds the caller's request id into the
 /// returned envelope.
+#[cfg(feature = "mcp")]
 pub struct ScriptedMcpTransport {
     responses: Mutex<Vec<JsonRpcResponse>>,
 }
 
+#[cfg(feature = "mcp")]
 impl ScriptedMcpTransport {
     pub fn new(responses: Vec<JsonRpcResponse>) -> Self {
         Self {
@@ -291,6 +295,7 @@ impl ScriptedMcpTransport {
     }
 }
 
+#[cfg(feature = "mcp")]
 #[async_trait]
 impl McpTransport for ScriptedMcpTransport {
     async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {

@@ -1,4 +1,7 @@
-#![cfg(feature = "otel")]
+// The metrics battery asserts MCP request-duration histograms, so this suite
+// requires the `mcp` tool feature in addition to `otel`. Both are enabled
+// under `--all-features` in CI.
+#![cfg(all(feature = "otel", feature = "mcp"))]
 
 //! Integration tests for the observability instrumentation.
 

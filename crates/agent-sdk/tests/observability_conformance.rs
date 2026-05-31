@@ -23,7 +23,10 @@
 //! All tests run against in-memory exporters — no live `OTel`
 //! backend, no Postgres, no AMQP.
 
-#![cfg(feature = "otel")]
+// The conformance battery asserts the full SDK boundary contract, including
+// MCP request span/metric emission, so it requires the `mcp` tool feature in
+// addition to `otel`. Both are enabled under `--all-features` in CI.
+#![cfg(all(feature = "otel", feature = "mcp"))]
 
 use agent_sdk::context::CompactionConfig;
 use agent_sdk::llm::Message;

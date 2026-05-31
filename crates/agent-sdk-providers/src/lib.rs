@@ -36,11 +36,19 @@ pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
 // Re-export all core LLM types so consumers can `use agent_sdk_providers::*`
 pub use agent_sdk_core::llm::*;
 
-// Provider re-exports
-pub use impls::{
-    AnthropicProvider, CloudflareAIGatewayProvider, GeminiProvider, OpenAICodexResponsesProvider,
-    OpenAIProvider, OpenAIResponsesProvider, VertexProvider, is_oauth_token,
-};
+// Provider re-exports — each is gated behind its provider feature.
+#[cfg(feature = "cloudflare")]
+pub use impls::CloudflareAIGatewayProvider;
+#[cfg(feature = "gemini")]
+pub use impls::GeminiProvider;
+#[cfg(feature = "openai-codex")]
+pub use impls::OpenAICodexResponsesProvider;
+#[cfg(feature = "vertex")]
+pub use impls::VertexProvider;
+#[cfg(feature = "anthropic")]
+pub use impls::{AnthropicProvider, is_oauth_token};
+#[cfg(feature = "openai")]
+pub use impls::{OpenAIProvider, OpenAIResponsesProvider};
 
 // Model capabilities
 pub use model_capabilities::{

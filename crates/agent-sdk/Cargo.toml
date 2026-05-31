@@ -12,6 +12,9 @@ categories = ["api-bindings", "asynchronous"]
 [dependencies]
 agent-sdk-core = { workspace = true }
 agent-sdk-tools = { workspace = true }
+# Providers are pulled in with no default features (set at the workspace
+# level) so this crate's own feature flags decide which provider impls
+# (and their deps) compile.
 agent-sdk-providers = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -19,7 +22,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
@@ -32,13 +34,36 @@ bytes = { workspace = true }
 log = { workspace = true }
 url = { workspace = true }
 tokio-util = { workspace = true }
-html2text = { workspace = true }
 base64 = { workspace = true }
-tokio-tungstenite = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
+# Maintained YAML parser — only the `skills` loader uses it (frontmatter).
+serde_yaml_ng = { workspace = true, optional = true }
+# HTML→text rendering — only the `web` fetch tool uses it.
+html2text = { workspace = true, optional = true }
 
 [features]
-default = []
+# The common case is an Anthropic agent, so `anthropic` is the only default
+# provider. Everything else (other providers, web/MCP/skills tools) is
+# opt-in so a minimal consumer does not pay for WebSocket, HTML, or YAML deps.
+default = ["anthropic"]
+
+# ── Providers (forward to the providers crate's matching feature) ──────
+anthropic = ["agent-sdk-providers/anthropic"]
+openai = ["agent-sdk-providers/openai"]
+openai-codex = ["agent-sdk-providers/openai-codex"]
+gemini = ["agent-sdk-providers/gemini"]
+vertex = ["agent-sdk-providers/vertex"]
+cloudflare = ["agent-sdk-providers/cloudflare"]
+
+# ── Tools (gate optional modules + their heavy deps) ───────────────────
+# Web search + fetch tools; `html2text` renders fetched pages.
+web = ["dep:html2text"]
+# Model Context Protocol client.
+mcp = []
+# Skill/command loading from markdown; `serde_yaml_ng` parses frontmatter.
+skills = ["dep:serde_yaml_ng"]
+
+# ── Observability (unchanged) ──────────────────────────────────────────
 otel = ["opentelemetry"]
 
 [dev-dependencies]
@@ -63,6 +88,7 @@ path = "examples/tool_round_trip.rs"
 [[example]]
 name = "mcp_filesystem"
 path = "examples/mcp_filesystem.rs"
+required-features = ["mcp"]
 
 [[example]]
 name = "custom_tool"

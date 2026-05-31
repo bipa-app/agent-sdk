@@ -2,6 +2,7 @@ use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
+#[cfg(feature = "skills")]
 use crate::skills::Skill;
 use crate::stores::{EventStore, InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::ToolRegistry;
@@ -316,6 +317,8 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     /// This merges the skill's system prompt with the existing configuration
     /// and filters tools based on the skill's allowed/denied lists.
     ///
+    /// Available when the `skills` feature is enabled.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -328,6 +331,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     ///     .with_skill(skill)
     ///     .build();
     /// ```
+    #[cfg(feature = "skills")]
     #[must_use]
     pub fn with_skill(mut self, skill: Skill) -> Self
     where

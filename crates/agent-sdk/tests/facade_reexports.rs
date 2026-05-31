@@ -198,23 +198,49 @@ fn provider_trait_and_streaming() {
     fn _assert_chat(_req: ChatRequest, _res: ChatResponse, _out: ChatOutcome) {}
 }
 
+// Each provider re-export is gated behind its cargo feature, so the
+// accessibility assertions are split per feature. Under `--all-features`
+// every branch compiles; the default build only exercises `anthropic`.
+#[cfg(feature = "anthropic")]
 #[test]
-fn provider_impls_accessible() {
-    use agent_sdk::providers::{
-        AnthropicProvider, CloudflareAIGatewayProvider, GeminiProvider,
-        OpenAICodexResponsesProvider, OpenAIProvider, OpenAIResponsesProvider, VertexProvider,
-    };
+fn anthropic_provider_accessible() {
+    use agent_sdk::providers::AnthropicProvider;
+    fn _assert(_a: AnthropicProvider) {}
+}
 
-    fn _assert(
-        _a: AnthropicProvider,
-        _c: CloudflareAIGatewayProvider,
-        _g: GeminiProvider,
-        _oc: OpenAICodexResponsesProvider,
-        _o: OpenAIProvider,
-        _or: OpenAIResponsesProvider,
-        _v: VertexProvider,
-    ) {
-    }
+#[cfg(feature = "openai")]
+#[test]
+fn openai_providers_accessible() {
+    use agent_sdk::providers::{OpenAIProvider, OpenAIResponsesProvider};
+    fn _assert(_o: OpenAIProvider, _or: OpenAIResponsesProvider) {}
+}
+
+#[cfg(feature = "openai-codex")]
+#[test]
+fn openai_codex_provider_accessible() {
+    use agent_sdk::providers::OpenAICodexResponsesProvider;
+    fn _assert(_oc: OpenAICodexResponsesProvider) {}
+}
+
+#[cfg(feature = "gemini")]
+#[test]
+fn gemini_provider_accessible() {
+    use agent_sdk::providers::GeminiProvider;
+    fn _assert(_g: GeminiProvider) {}
+}
+
+#[cfg(feature = "vertex")]
+#[test]
+fn vertex_provider_accessible() {
+    use agent_sdk::providers::VertexProvider;
+    fn _assert(_v: VertexProvider) {}
+}
+
+#[cfg(feature = "cloudflare")]
+#[test]
+fn cloudflare_provider_accessible() {
+    use agent_sdk::providers::CloudflareAIGatewayProvider;
+    fn _assert(_c: CloudflareAIGatewayProvider) {}
 }
 
 #[test]
@@ -377,22 +403,44 @@ fn simple_tool_needs_no_tool_name() {
     assert!(reg.get("echo").is_some());
 }
 
+// `try_from_env` must compile against each first-party provider and accept
+// `impl Into<String>` keys; conventional env-var names are exposed as
+// associated consts. Each provider's checks are gated behind its feature so
+// the assertions still hold under any partial feature set.
+#[cfg(feature = "anthropic")]
 #[test]
-fn provider_from_env_constructors_exist() {
-    use agent_sdk::providers::{AnthropicProvider, GeminiProvider, OpenAIProvider};
+fn anthropic_from_env_constructors_exist() {
+    use agent_sdk::providers::AnthropicProvider;
 
-    // `try_from_env` must compile against each first-party provider and
-    // accept `impl Into<String>` keys (both `&str` and `String`).
     fn _assert() {
         let _ = AnthropicProvider::try_from_env();
-        let _ = OpenAIProvider::try_from_env();
-        let _ = GeminiProvider::try_from_env();
         let _ = AnthropicProvider::sonnet("key-as-str");
         let _ = AnthropicProvider::sonnet(String::from("key-as-string"));
     }
 
-    // Conventional env-var names are exposed as associated consts.
     assert_eq!(AnthropicProvider::API_KEY_ENV, "ANTHROPIC_API_KEY");
+}
+
+#[cfg(feature = "openai")]
+#[test]
+fn openai_from_env_constructors_exist() {
+    use agent_sdk::providers::OpenAIProvider;
+
+    fn _assert() {
+        let _ = OpenAIProvider::try_from_env();
+    }
+
     assert_eq!(OpenAIProvider::API_KEY_ENV, "OPENAI_API_KEY");
+}
+
+#[cfg(feature = "gemini")]
+#[test]
+fn gemini_from_env_constructors_exist() {
+    use agent_sdk::providers::GeminiProvider;
+
+    fn _assert() {
+        let _ = GeminiProvider::try_from_env();
+    }
+
     assert_eq!(GeminiProvider::API_KEY_ENV, "GEMINI_API_KEY");
 }
