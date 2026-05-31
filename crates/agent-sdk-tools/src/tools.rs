@@ -541,6 +541,248 @@ pub trait Tool<Ctx>: Send + Sync {
 }
 
 // ============================================================================
+// TypedTool Trait (typed input + runtime validation / self-correction)
+// ============================================================================
+
+/// A tool whose model-emitted arguments are validated against a typed,
+/// deserializable [`Input`](TypedTool::Input) **before** [`execute`](TypedTool::execute)
+/// runs.
+///
+/// Today a raw [`serde_json::Value`] is handed straight to [`Tool::execute`],
+/// so a malformed tool call reaches tool code unvalidated. `TypedTool` closes
+/// that gap: you declare a `Serialize` / `Deserialize` argument struct as
+/// [`Input`](TypedTool::Input), and the runtime deserializes the model's args
+/// into it at the dispatch boundary. On a deserialization/validation failure
+/// the runtime synthesises a structured error [`ToolResult`] (carrying the
+/// serde error message) so the model can self-correct on its next turn —
+/// `execute` is **never** called with invalid arguments.
+///
+/// # Relationship to [`Tool`]
+///
+/// `TypedTool` is the typed, opt-in *sugar* layer; [`Tool`] remains the
+/// untyped baseline. A [`TypedTool`] becomes a full [`Tool`] through
+/// [`TypedToolAdapter`] (mirroring how [`SimpleTool`] becomes a [`Tool`] via
+/// [`SimpleToolAdapter`]). Register one with
+/// [`ToolRegistry::register_typed`], which wraps it in the adapter for you;
+/// the adapter performs the deserialize-then-dispatch (or
+/// deserialize-then-synthesise-error) described above.
+///
+/// # Back-compat / migration
+///
+/// Existing [`Tool`] impls (and [`SimpleTool`] / [`DynamicToolName`] tools)
+/// keep compiling and running unchanged — they stay on the `Value`-in
+/// baseline, which is the identity passthrough (a `Value` always
+/// "deserializes" into a `Value`). Migrate a tool to typed args by moving its
+/// `impl Tool<Ctx>` to `impl TypedTool<Ctx>`, setting `type Input = MyArgs`,
+/// and changing `execute`'s signature from `input: Value` to `input: MyArgs`.
+/// The hand-written [`input_schema`](TypedTool::input_schema) JSON stays
+/// user-declared; this trait does **not** auto-derive a schema from `Input`.
+///
+/// # Example
+///
+/// ```
+/// use agent_sdk_tools::tools::{TypedTool, ToolContext};
+/// use agent_sdk_core::types::ToolResult;
+/// use serde::{Deserialize, Serialize};
+/// use serde_json::{json, Value};
+/// use std::future::Future;
+///
+/// #[derive(Debug, Serialize, Deserialize)]
+/// struct WeatherArgs {
+///     city: String,
+/// }
+///
+/// struct WeatherTool;
+///
+/// impl TypedTool<()> for WeatherTool {
+///     type Input = WeatherArgs;
+///
+///     fn name(&self) -> &'static str { "get_weather" }
+///     fn description(&self) -> &'static str { "Get current weather for a city" }
+///     fn input_schema(&self) -> Value {
+///         json!({
+///             "type": "object",
+///             "properties": { "city": { "type": "string" } },
+///             "required": ["city"]
+///         })
+///     }
+///
+///     fn execute(
+///         &self,
+///         _ctx: &ToolContext<()>,
+///         input: WeatherArgs,
+///     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+///         async move { Ok(ToolResult::success(format!("Weather in {}: Sunny", input.city))) }
+///     }
+/// }
+/// ```
+///
+/// Like [`SimpleTool`], a `TypedTool` has a single fixed `&'static str`
+/// [`name`](TypedTool::name) (mapping to [`DynamicToolName`] via
+/// [`TypedToolAdapter`]). Reach for a hand-written [`Tool`] with a
+/// strongly-typed [`ToolName`] when the name must be computed at runtime or
+/// constrained to an enum.
+pub trait TypedTool<Ctx>: Send + Sync {
+    /// The typed input the model's arguments are deserialized into before
+    /// [`execute`](TypedTool::execute) runs.
+    ///
+    /// Must be [`DeserializeOwned`] (to parse model args), [`Serialize`] (so
+    /// the typed value round-trips for logging/storage), and `Send + 'static`
+    /// (to cross the async dispatch boundary).
+    type Input: DeserializeOwned + Serialize + Send + 'static;
+
+    /// The tool's name as sent to (and parsed from) the model.
+    fn name(&self) -> &'static str;
+
+    /// Human-readable display name for UI. Defaults to an empty string.
+    fn display_name(&self) -> &'static str {
+        ""
+    }
+
+    /// Human-readable description of what the tool does.
+    fn description(&self) -> &'static str;
+
+    /// User-declared JSON schema for the tool's input parameters.
+    ///
+    /// This stays hand-written JSON — it is **not** auto-derived from
+    /// [`Input`](TypedTool::Input). Keeping the schema explicit lets the
+    /// declared provider-facing contract diverge from the Rust type when that
+    /// is useful (descriptions, examples, provider-specific keywords).
+    fn input_schema(&self) -> Value;
+
+    /// Permission tier for this tool. Defaults to [`ToolTier::Observe`].
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    /// Execute the tool with the already-validated, typed input.
+    ///
+    /// The runtime guarantees `input` deserialized cleanly from the model's
+    /// arguments; a malformed call is turned into a structured error
+    /// [`ToolResult`] before this method is reached, so implementations never
+    /// see invalid arguments.
+    ///
+    /// # Errors
+    /// Returns an error if tool execution fails.
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Self::Input,
+    ) -> impl Future<Output = Result<ToolResult>> + Send;
+}
+
+/// Synthesise the structured validation-error [`ToolResult`] returned to the
+/// model when its arguments fail to deserialize into a [`TypedTool::Input`].
+///
+/// Factored out (and `pub`) so the exact self-correction wording is
+/// consistent with [`TypedToolAdapter`] and is directly unit-testable. The
+/// error is an *error* [`ToolResult`] (not a thrown `anyhow::Error`): it flows
+/// through the normal balanced `tool_use` / `tool_result` path so history
+/// stays balanced and the model gets a concrete, machine-actionable hint on
+/// its next turn.
+#[must_use]
+pub fn invalid_tool_input_result(tool_name: &str, error: &serde_json::Error) -> ToolResult {
+    ToolResult::error(format!(
+        "Invalid arguments for tool `{tool_name}`: {error}. \
+         The arguments did not match the tool's input schema — \
+         re-read the schema and call the tool again with corrected arguments."
+    ))
+}
+
+/// Deserialize raw model args into a typed `Input`, or synthesise the
+/// structured validation-error result.
+///
+/// Returns `Ok(typed)` for the happy path and `Err(result)` carrying the
+/// balanced error [`ToolResult`] for the self-correction path.
+/// [`TypedToolAdapter`] uses this to ensure [`TypedTool::execute`] is never
+/// reached with invalid arguments.
+///
+/// # Errors
+/// Returns the synthesised error [`ToolResult`] when `raw` does not
+/// deserialize into `Input`.
+pub fn validate_tool_input<Input>(tool_name: &str, raw: Value) -> Result<Input, ToolResult>
+where
+    Input: DeserializeOwned,
+{
+    serde_json::from_value(raw).map_err(|error| invalid_tool_input_result(tool_name, &error))
+}
+
+/// Adapter that turns any [`TypedTool`] into a full [`Tool`].
+///
+/// It gives the wrapped tool `Name = DynamicToolName`, deserializes the
+/// model's `Value` arguments into [`TypedTool::Input`] before dispatching, and
+/// synthesises a structured validation-error [`ToolResult`] when that fails.
+///
+/// You rarely name this type directly — register a [`TypedTool`] with
+/// [`ToolRegistry::register_typed`], which wraps it for you. The adapter
+/// pattern (rather than a blanket `impl Tool for T: TypedTool`) is required
+/// for coherence: a blanket impl would conflict with the existing
+/// [`SimpleToolAdapter`] impl, because the compiler cannot rule out a
+/// downstream `TypedTool` impl for `SimpleToolAdapter`.
+///
+/// This adapter is also where the typed `Input` is threaded through the
+/// erased-tool machinery without leaking the generic into trait objects: the
+/// registry's [`ErasedTool`] wrapper still only ever sees `Value`, while the
+/// concrete `Input` type (and the deserialize) live here, inside the adapter's
+/// concrete `T`.
+pub struct TypedToolAdapter<T> {
+    inner: T,
+}
+
+impl<T> TypedToolAdapter<T> {
+    /// Wrap a [`TypedTool`] so it can be used anywhere a [`Tool`] is expected.
+    pub const fn new(tool: T) -> Self {
+        Self { inner: tool }
+    }
+
+    /// Unwrap the inner [`TypedTool`].
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<Ctx, T> Tool<Ctx> for TypedToolAdapter<T>
+where
+    T: TypedTool<Ctx>,
+    Ctx: Send + Sync,
+{
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new(TypedTool::name(&self.inner))
+    }
+
+    fn display_name(&self) -> &'static str {
+        TypedTool::display_name(&self.inner)
+    }
+
+    fn description(&self) -> &'static str {
+        TypedTool::description(&self.inner)
+    }
+
+    fn input_schema(&self) -> Value {
+        TypedTool::input_schema(&self.inner)
+    }
+
+    fn tier(&self) -> ToolTier {
+        TypedTool::tier(&self.inner)
+    }
+
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
+        match validate_tool_input::<<T as TypedTool<Ctx>>::Input>(
+            TypedTool::name(&self.inner),
+            input,
+        ) {
+            Ok(typed) => TypedTool::execute(&self.inner, ctx, typed).await,
+            // A validation failure is returned as an error `ToolResult`,
+            // never `?`-bailed: it must reach the model as a balanced
+            // `tool_result` for self-correction. `execute` is not called.
+            Err(result) => Ok(result),
+        }
+    }
+}
+
+// ============================================================================
 // SimpleTool Trait
 // ============================================================================
 
@@ -1205,6 +1447,22 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.register(SimpleToolAdapter::new(tool))
     }
 
+    /// Register a [`TypedTool`] — a tool whose model-emitted arguments are
+    /// deserialized into a typed [`TypedTool::Input`] and validated **before**
+    /// `execute` runs.
+    ///
+    /// The tool is wrapped in a [`TypedToolAdapter`] (giving it
+    /// `Name = DynamicToolName`) and registered like any other [`Tool`]. A
+    /// malformed tool call is turned into a structured validation-error
+    /// [`ToolResult`] at the dispatch boundary so the model can self-correct;
+    /// `execute` is never reached with invalid arguments.
+    pub fn register_typed<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: TypedTool<Ctx> + 'static,
+    {
+        self.register(TypedToolAdapter::new(tool))
+    }
+
     /// Register an async tool in the registry.
     ///
     /// Async tools have two phases: execute (lightweight, starts operation)
@@ -1365,6 +1623,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     // Test tool name enum for tests
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1616,5 +1875,192 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(registry.get_listen("mock_tool").is_some());
         assert!(registry.is_listen("mock_tool"));
+    }
+
+    // ── TypedTool: typed input + validation / self-correction ───────────
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct GreetArgs {
+        name: String,
+        // Required so a missing/typo'd field is a hard validation error.
+        greeting: String,
+    }
+
+    /// A typed tool that records whether `execute` was reached, so tests can
+    /// assert the validation boundary never calls `execute` with bad args.
+    struct GreetTool {
+        executed: Arc<AtomicBool>,
+    }
+
+    impl TypedTool<()> for GreetTool {
+        type Input = GreetArgs;
+
+        fn name(&self) -> &'static str {
+            "greet"
+        }
+
+        fn description(&self) -> &'static str {
+            "Greet someone by name"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "greeting": { "type": "string" }
+                },
+                "required": ["name", "greeting"]
+            })
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, input: GreetArgs) -> Result<ToolResult> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(ToolResult::success(format!(
+                "{}, {}!",
+                input.greeting, input.name
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_tool_happy_path_receives_typed_input() -> Result<()> {
+        let executed = Arc::new(AtomicBool::new(false));
+        let adapter = TypedToolAdapter::new(GreetTool {
+            executed: executed.clone(),
+        });
+        let ctx = ToolContext::new(());
+
+        let result = Tool::execute(
+            &adapter,
+            &ctx,
+            serde_json::json!({ "name": "Ada", "greeting": "Hello" }),
+        )
+        .await?;
+
+        assert!(executed.load(Ordering::SeqCst), "execute must be called");
+        assert!(result.success);
+        assert_eq!(result.output, "Hello, Ada!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_tool_invalid_args_self_correct_without_executing() -> Result<()> {
+        let executed = Arc::new(AtomicBool::new(false));
+        let adapter = TypedToolAdapter::new(GreetTool {
+            executed: executed.clone(),
+        });
+        let ctx = ToolContext::new(());
+
+        // `greeting` is missing — must not deserialize into `GreetArgs`.
+        let result = Tool::execute(&adapter, &ctx, serde_json::json!({ "name": "Ada" })).await?;
+
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "execute must NOT be called with invalid arguments"
+        );
+        assert!(!result.success, "validation failure is an error result");
+        assert!(
+            result.output.contains("Invalid arguments for tool `greet`"),
+            "error must identify the tool: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("greeting"),
+            "error must surface the serde message naming the bad field: {}",
+            result.output
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_tool_wrong_type_self_corrects() -> Result<()> {
+        let executed = Arc::new(AtomicBool::new(false));
+        let adapter = TypedToolAdapter::new(GreetTool {
+            executed: executed.clone(),
+        });
+        let ctx = ToolContext::new(());
+
+        // `name` is a number, not a string.
+        let result = Tool::execute(
+            &adapter,
+            &ctx,
+            serde_json::json!({ "name": 42, "greeting": "Hi" }),
+        )
+        .await?;
+
+        assert!(!executed.load(Ordering::SeqCst));
+        assert!(!result.success);
+        Ok(())
+    }
+
+    /// Back-compat: a `TypedTool` whose `Input = Value` is the identity
+    /// passthrough — any JSON deserializes, mirroring today's untyped tools.
+    struct ValueTypedTool;
+
+    impl TypedTool<()> for ValueTypedTool {
+        type Input = Value;
+
+        fn name(&self) -> &'static str {
+            "value_typed"
+        }
+
+        fn description(&self) -> &'static str {
+            "Accepts any JSON, like an untyped tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success(input.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_tool_value_input_is_identity_passthrough() -> Result<()> {
+        let adapter = TypedToolAdapter::new(ValueTypedTool);
+        let ctx = ToolContext::new(());
+
+        // Arbitrary shape — Value always "deserializes".
+        let result = Tool::execute(
+            &adapter,
+            &ctx,
+            serde_json::json!({ "anything": [1, 2, 3], "nested": { "ok": true } }),
+        )
+        .await?;
+
+        assert!(result.success);
+        Ok(())
+    }
+
+    #[test]
+    fn register_typed_exposes_tool_via_registry() -> Result<()> {
+        let mut registry = ToolRegistry::new();
+        registry.register_typed(GreetTool {
+            executed: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert_eq!(registry.len(), 1);
+        let tool = registry.get("greet").context("typed tool registered")?;
+        // The user-declared schema flows through unchanged.
+        assert_eq!(tool.input_schema()["required"][0], "name");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_tool_input_result_is_balanced_error() -> Result<()> {
+        let Err(err) = serde_json::from_str::<GreetArgs>("{}") else {
+            anyhow::bail!("empty object must fail to deserialize GreetArgs");
+        };
+        let result = invalid_tool_input_result("greet", &err);
+
+        assert!(!result.success);
+        assert!(result.output.contains("greet"));
+        assert!(result.output.contains("call the tool again"));
+        Ok(())
     }
 }
