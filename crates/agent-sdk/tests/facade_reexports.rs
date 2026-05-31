@@ -255,6 +255,22 @@ fn model_capabilities_accessible() {
     fn _assert(_mc: ModelCapabilities, _pp: PricePoint, _pr: Pricing, _ss: SourceStatus) {}
 }
 
+// ── Structured output (Phase 13 · A) ─────────────────────────────────
+
+#[test]
+fn structured_output_types_accessible() {
+    use agent_sdk::{
+        ResponseFormat, StructuredConfig, StructuredOutput, StructuredOutputError,
+        StructuredOutputSupport, run_structured,
+    };
+
+    let _fmt = ResponseFormat::new("x", serde_json::json!({"type": "object"}));
+    let _cfg = StructuredConfig::default();
+    let _ = run_structured; // function reachable from the facade
+
+    fn _assert(_o: StructuredOutput, _e: StructuredOutputError, _s: StructuredOutputSupport) {}
+}
+
 // ── Facade-owned modules ─────────────────────────────────────────────
 
 #[test]

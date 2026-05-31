@@ -26,12 +26,14 @@ pub mod refresh;
 pub mod router;
 pub mod search;
 pub mod streaming;
+pub mod structured;
 
 // Convenience re-exports — provider trait and streaming
-pub use provider::{LlmProvider, collect_stream};
+pub use provider::{LlmProvider, StructuredOutputSupport, collect_stream};
 pub use refresh::{RefreshingProvider, is_unauthorized_error};
 pub use router::{ModelRouter, ModelTier, TaskComplexity};
 pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
+pub use structured::{StructuredConfig, StructuredOutput, StructuredOutputError, run_structured};
 
 // Re-export all core LLM types so consumers can `use agent_sdk_providers::*`
 pub use agent_sdk_core::llm::*;

@@ -15,6 +15,23 @@ use crate::model_capabilities::{
 };
 use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 
+/// How a provider satisfies a [`ResponseFormat`](agent_sdk_core::llm::ResponseFormat)
+/// structured-output request.
+///
+/// The structured-output runner consults this to decide how to shape the
+/// request and where to read the final structured value from the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputSupport {
+    /// The provider applies the schema natively (JSON-mode /
+    /// structured-outputs) when it sees `request.response_format`. The final
+    /// structured value is the JSON in the assistant's text output.
+    Native,
+    /// The provider has no native JSON-schema mode. The runner injects a
+    /// single forced "respond" tool whose `input_schema` is the output schema,
+    /// and reads the structured value from that tool call's input.
+    ToolForcing,
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Non-streaming chat completion.
@@ -178,6 +195,30 @@ pub trait LlmProvider: Send + Sync {
             .or_else(|| default_max_output_tokens(self.provider(), self.model()))
             .unwrap_or(4096)
     }
+
+    /// How this provider satisfies a structured-output
+    /// ([`ResponseFormat`](agent_sdk_core::llm::ResponseFormat)) request.
+    ///
+    /// Providers with a native JSON-schema / JSON-mode wire field
+    /// (OpenAI-family, Gemini, Vertex) report
+    /// [`StructuredOutputSupport::Native`] and consume
+    /// `request.response_format` directly. Providers without one (Anthropic)
+    /// report [`StructuredOutputSupport::ToolForcing`] so the runner forces a
+    /// single "respond" tool whose schema is the output schema. The default
+    /// is the conservative [`StructuredOutputSupport::ToolForcing`], which
+    /// works for any tool-capable provider.
+    fn structured_output_support(&self) -> StructuredOutputSupport {
+        match self.provider() {
+            "openai" | "openai-responses" | "openai-codex" | "gemini" => {
+                StructuredOutputSupport::Native
+            }
+            // Vertex multiplexes Anthropic and Gemini models. Only the Gemini
+            // side has a native structured-output field; Claude-on-Vertex uses
+            // the Messages API shape, which has no `response_format`.
+            "vertex" if !self.model().starts_with("claude-") => StructuredOutputSupport::Native,
+            _ => StructuredOutputSupport::ToolForcing,
+        }
+    }
 }
 
 /// Helper function to consume a stream and collect it into a `ChatResponse`.
@@ -286,4 +327,74 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
         stop_reason,
         usage,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    struct Stub {
+        provider: &'static str,
+        model: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for Stub {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            Ok(ChatOutcome::ServerError("unused".to_owned()))
+        }
+
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        fn provider(&self) -> &'static str {
+            self.provider
+        }
+    }
+
+    fn support_for(provider: &'static str, model: &'static str) -> StructuredOutputSupport {
+        Stub { provider, model }.structured_output_support()
+    }
+
+    #[test]
+    fn native_providers_report_native_support() {
+        for provider in ["openai", "openai-responses", "openai-codex", "gemini"] {
+            assert_eq!(
+                support_for(provider, "any-model"),
+                StructuredOutputSupport::Native,
+                "{provider} should be native"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_reports_tool_forcing() {
+        assert_eq!(
+            support_for("anthropic", "claude-sonnet-4-5"),
+            StructuredOutputSupport::ToolForcing
+        );
+    }
+
+    #[test]
+    fn vertex_is_native_for_gemini_models_and_tool_forcing_for_claude() {
+        assert_eq!(
+            support_for("vertex", "gemini-3-flash-preview"),
+            StructuredOutputSupport::Native
+        );
+        assert_eq!(
+            support_for("vertex", "claude-sonnet-4-5"),
+            StructuredOutputSupport::ToolForcing
+        );
+    }
+
+    #[test]
+    fn unknown_provider_defaults_to_tool_forcing() {
+        assert_eq!(
+            support_for("some-new-provider", "x"),
+            StructuredOutputSupport::ToolForcing
+        );
+    }
 }

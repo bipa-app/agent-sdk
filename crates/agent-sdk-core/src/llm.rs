@@ -101,6 +101,58 @@ pub enum ToolChoice {
     Tool(String),
 }
 
+/// Requests that the model constrain its final answer to a JSON Schema.
+///
+/// This is the wire-level description of a structured-output request. The
+/// runtime maps it to each provider's native capability:
+///
+/// - **`OpenAI` / Gemini**: native JSON-mode / structured-outputs
+///   (`response_format` / `responseSchema`).
+/// - **Anthropic**: tool-forcing fallback — the runtime injects a single
+///   "respond" tool whose `input_schema` is [`schema`](Self::schema) and
+///   forces the model to call it.
+///
+/// The runtime validates the model's final output against [`schema`](Self::schema)
+/// and, on mismatch, bounded-re-prompts before failing with a typed error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseFormat {
+    /// Stable identifier for the schema. Surfaced to providers that require a
+    /// name (`OpenAI` `json_schema.name`, the Anthropic fallback tool name).
+    pub name: String,
+    /// The JSON Schema the final assistant output must satisfy.
+    ///
+    /// This is a raw JSON Schema document (an object), not a Rust type. Callers
+    /// that derive schemas from Rust types can plug in `schemars` upstream and
+    /// pass the resulting document here.
+    pub schema: serde_json::Value,
+    /// Whether the provider should enforce strict schema adherence when it
+    /// supports a strict mode (`OpenAI` `strict: true`). Has no effect on
+    /// providers without a strict mode.
+    pub strict: bool,
+}
+
+impl ResponseFormat {
+    /// Create a response format from a schema name and a JSON Schema document.
+    ///
+    /// Defaults to `strict = true` so providers with a strict mode enforce the
+    /// schema rather than treating it as a hint.
+    #[must_use]
+    pub fn new(name: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            strict: true,
+        }
+    }
+
+    /// Set whether strict schema adherence is requested.
+    #[must_use]
+    pub const fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,
@@ -121,6 +173,14 @@ pub struct ChatRequest {
     ///
     /// When `None` the provider's default behaviour applies (typically `auto`).
     pub tool_choice: Option<ToolChoice>,
+    /// Optional request for the final answer to be constrained to a JSON
+    /// Schema.
+    ///
+    /// When `Some`, the provider maps this to its native JSON-mode /
+    /// structured-output capability (or a tool-forcing fallback) and the
+    /// runtime validates the final output against the schema. When `None`
+    /// (default) the model responds freely.
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +211,14 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: Content::Text(text.into()),
+        }
+    }
+
+    #[must_use]
+    pub const fn assistant_with_content(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Content::Blocks(blocks),
         }
     }
 

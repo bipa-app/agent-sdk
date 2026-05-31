@@ -67,6 +67,7 @@ where
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         };
 
         match self.classifier.chat(classification_request).await? {

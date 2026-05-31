@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use data::{
     ApiContent, ApiFunctionCallingConfig, ApiGenerateContentRequest, ApiGenerateContentResponse,
     ApiGenerationConfig, ApiPart, ApiUsageMetadata, build_api_contents, build_content_blocks,
-    convert_tools_to_config, map_finish_reason, map_thinking_config,
+    convert_tools_to_config, gemini_response_schema, map_finish_reason, map_thinking_config,
 };
 use reqwest::StatusCode;
 
@@ -201,6 +201,13 @@ impl LlmProvider for GeminiProvider {
         };
 
         let thinking_config = thinking.as_ref().map(map_thinking_config);
+        let (response_mime_type, response_schema) =
+            request.response_format.as_ref().map_or((None, None), |rf| {
+                (
+                    Some("application/json"),
+                    Some(gemini_response_schema(&rf.schema)),
+                )
+            });
 
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
@@ -210,6 +217,8 @@ impl LlmProvider for GeminiProvider {
             generation_config: Some(ApiGenerationConfig {
                 max_output_tokens: Some(request.max_tokens),
                 thinking_config,
+                response_mime_type,
+                response_schema,
             }),
             cached_content: request.cached_content.as_deref(),
         };
@@ -345,6 +354,15 @@ impl LlmProvider for GeminiProvider {
             };
 
             let thinking_config = thinking.as_ref().map(map_thinking_config);
+            let (response_mime_type, response_schema) = request
+                .response_format
+                .as_ref()
+                .map_or((None, None), |rf| {
+                    (
+                        Some("application/json"),
+                        Some(gemini_response_schema(&rf.schema)),
+                    )
+                });
 
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
@@ -354,6 +372,8 @@ impl LlmProvider for GeminiProvider {
                 generation_config: Some(ApiGenerationConfig {
                     max_output_tokens: Some(request.max_tokens),
                     thinking_config,
+                    response_mime_type,
+                    response_schema,
                 }),
                 cached_content: request.cached_content.as_deref(),
             };

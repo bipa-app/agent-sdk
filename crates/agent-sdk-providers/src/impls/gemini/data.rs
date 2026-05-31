@@ -143,6 +143,14 @@ pub struct ApiGenerationConfig {
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<ApiThinkingConfig>,
+    /// Native structured-output MIME type. `"application/json"` switches
+    /// Gemini into JSON mode; paired with [`response_schema`](Self::response_schema)
+    /// the model is constrained to the schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<&'static str>,
+    /// Native structured-output schema (`responseSchema`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// Gemini thinking configuration.
@@ -193,6 +201,43 @@ pub const fn map_thinking_config(
     };
     ApiThinkingConfig {
         thinking_level: level,
+    }
+}
+
+/// Sanitize a JSON Schema document into the subset Gemini accepts for
+/// `responseSchema`.
+///
+/// Gemini's structured-output schema is OpenAPI-flavoured and rejects several
+/// JSON-Schema-isms (`$schema`, `additionalProperties`, `title`, `$id`,
+/// `definitions`/`$defs`). This strips those keys recursively while preserving
+/// the structural keywords (`type`, `properties`, `items`, `required`, `enum`).
+/// The runtime still validates the *model output* against the original,
+/// un-sanitized schema, so sanitization only relaxes what is sent on the wire.
+#[must_use]
+pub fn gemini_response_schema(schema: &serde_json::Value) -> serde_json::Value {
+    const STRIPPED: [&str; 6] = [
+        "$schema",
+        "$id",
+        "additionalProperties",
+        "title",
+        "definitions",
+        "$defs",
+    ];
+    match schema {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, value) in map {
+                if STRIPPED.contains(&key.as_str()) {
+                    continue;
+                }
+                out.insert(key.clone(), gemini_response_schema(value));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(gemini_response_schema).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -631,11 +676,14 @@ mod tests {
         let config = ApiGenerationConfig {
             max_output_tokens: Some(1024),
             thinking_config: None,
+            response_mime_type: None,
+            response_schema: None,
         };
 
         let json = serde_json::to_string(&config).unwrap_or_default();
         assert!(json.contains("\"maxOutputTokens\":1024"));
         assert!(!json.contains("thinkingConfig"));
+        assert!(!json.contains("responseSchema"));
     }
 
     #[test]
@@ -645,11 +693,52 @@ mod tests {
             thinking_config: Some(ApiThinkingConfig {
                 thinking_level: "HIGH",
             }),
+            response_mime_type: None,
+            response_schema: None,
         };
 
         let json = serde_json::to_string(&config).unwrap_or_default();
         assert!(json.contains("\"thinkingConfig\""));
         assert!(json.contains("\"thinkingLevel\":\"HIGH\""));
+    }
+
+    #[test]
+    fn test_generation_config_serializes_response_schema() {
+        let config = ApiGenerationConfig {
+            max_output_tokens: Some(1024),
+            thinking_config: None,
+            response_mime_type: Some("application/json"),
+            response_schema: Some(serde_json::json!({"type": "object"})),
+        };
+
+        let json = serde_json::to_value(&config).unwrap_or_default();
+        assert_eq!(json["responseMimeType"], "application/json");
+        assert_eq!(json["responseSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_gemini_response_schema_strips_unsupported_keys() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Person",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": { "type": "string", "title": "Name" }
+            },
+            "required": ["name"]
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+
+        assert!(sanitized.get("$schema").is_none());
+        assert!(sanitized.get("title").is_none());
+        assert!(sanitized.get("additionalProperties").is_none());
+        // Structural keywords are preserved, recursively.
+        assert_eq!(sanitized["type"], "object");
+        assert_eq!(sanitized["properties"]["name"]["type"], "string");
+        assert!(sanitized["properties"]["name"].get("title").is_none());
+        assert_eq!(sanitized["required"][0], "name");
     }
 
     #[test]
