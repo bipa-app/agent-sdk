@@ -86,6 +86,10 @@ name = "tool_round_trip"
 path = "examples/tool_round_trip.rs"
 
 [[example]]
+name = "typed_tool"
+path = "examples/typed_tool.rs"
+
+[[example]]
 name = "mcp_filesystem"
 path = "examples/mcp_filesystem.rs"
 required-features = ["mcp"]

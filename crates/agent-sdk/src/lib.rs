@@ -488,8 +488,9 @@ pub use stores::{
 };
 pub use tools::{
     AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,
-    Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
-    tool_name_to_string,
+    Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, TypedTool, TypedToolAdapter,
+    invalid_tool_input_result, stage_to_string, tool_name_from_str, tool_name_to_string,
+    validate_tool_input,
 };
 
 // agent-sdk-providers (via thin modules)
@@ -560,6 +561,7 @@ pub mod prelude {
     pub use crate::{
         AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
         InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier,
+        TypedTool,
     };
 }
 

@@ -39,7 +39,8 @@ pub use tools::{
     AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
     ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage,
     SimpleTool, SimpleToolAdapter, Tool, ToolContext, ToolName, ToolRegistry, ToolStatus,
-    stage_to_string, tool_name_from_str, tool_name_to_string,
+    TypedTool, TypedToolAdapter, invalid_tool_input_result, stage_to_string, tool_name_from_str,
+    tool_name_to_string, validate_tool_input,
 };
 
 // Core audit record re-exports for downstream convenience.
