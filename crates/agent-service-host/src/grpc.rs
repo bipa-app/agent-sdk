@@ -1012,6 +1012,16 @@ impl AgentControlService for GrpcControlService {
         &self,
         request: Request<pb::SubmitThreadWorkRequest>,
     ) -> Result<Response<pb::SubmitThreadWorkResponse>, Status> {
+        // Capture the inbound W3C `traceparent` (if the gRPC client
+        // propagated one) BEFORE `into_inner()` discards the call
+        // metadata, and stamp it on the root turn below so the daemon's
+        // `invoke_agent` span continues the caller's distributed trace.
+        let inbound_traceparent = request
+            .metadata()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let request = request.into_inner();
         require_request_id(&request.request_id)?;
         let thread_id = parse_thread_id(&request.thread_id)?;
@@ -1061,12 +1071,16 @@ impl AgentControlService for GrpcControlService {
             .map_err(internal_status(
                 "resolving root-turn definition for submission",
             ))?;
-        let task = AgentTask::new_root_turn_with_input(
+        let mut task = AgentTask::new_root_turn_with_input(
             thread_id.clone(),
             submitted_input,
             now,
             definition.policy.max_attempts,
         );
+        // The root turn's spans nest under the inbound client span (the
+        // worker rebuilds an OTel parent context from this on a fresh
+        // turn). `None` when the caller propagated no trace.
+        task.otel_traceparent = inbound_traceparent;
 
         // The idempotency claim + queue-depth cap + admission all run in
         // one store transaction so a retried (restart-surviving) request

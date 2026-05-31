@@ -263,15 +263,36 @@ where
     ) -> Result<ToolResult> {
         let seed = tool_context_seed(bootstrap)?;
 
-        self.dispatch(
+        let dispatch = self.dispatch(
             &bootstrap.tool_call.name,
             &bootstrap.tool_call.id,
             bootstrap.tool_call.effective_input.clone(),
             seed,
             collector,
             cancel,
-        )
-        .await
+        );
+
+        // Re-parent the `execute_tool` span under the turn's root
+        // `invoke_agent` span, carried on the child task's trace parent
+        // (stamped at spawn from the first attempt's ids). `with_context`
+        // propagates it per-poll so the tool-task future stays `Send`.
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::trace::FutureExt;
+            match bootstrap
+                .child_task
+                .otel_traceparent
+                .as_deref()
+                .and_then(agent_sdk::observability::loop_instrument::context_from_traceparent)
+            {
+                Some(cx) => dispatch.with_context(cx).await,
+                None => dispatch.await,
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            dispatch.await
+        }
     }
 }
 
