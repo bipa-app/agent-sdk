@@ -625,6 +625,7 @@ where
         cached_content: None,
         thinking,
         tool_choice: None,
+        response_format: None,
     })
 }
 

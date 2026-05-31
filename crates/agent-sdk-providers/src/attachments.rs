@@ -241,6 +241,7 @@ mod tests {
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         }
     }
 

@@ -499,6 +499,14 @@ pub use model_capabilities::{
     supported_model_capabilities,
 };
 
+// Schema-validated structured output (Phase 13): the [`ResponseFormat`] request
+// field, the bounded re-prompt runner, and its typed result/error.
+pub use agent_sdk_core::llm::ResponseFormat;
+pub use agent_sdk_providers::{
+    StructuredConfig, StructuredOutput, StructuredOutputError, StructuredOutputSupport,
+    run_structured,
+};
+
 // ── Advanced / server-internal contract types ───────────────────────
 /// Server- and host-facing contract types.
 ///

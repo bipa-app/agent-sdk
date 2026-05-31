@@ -427,6 +427,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         };
 
         let outcome = self

@@ -381,6 +381,10 @@ impl LlmProvider for OpenAIProvider {
             .tool_choice
             .as_ref()
             .map(ApiToolChoice::from_tool_choice);
+        let response_format = request
+            .response_format
+            .as_ref()
+            .map(ApiResponseFormat::from_response_format);
 
         let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
         let api_request = ApiChatRequest {
@@ -391,6 +395,7 @@ impl LlmProvider for OpenAIProvider {
             tools: tools.as_deref(),
             tool_choice,
             reasoning,
+            response_format,
         };
 
         log::debug!(
@@ -422,51 +427,7 @@ impl LlmProvider for OpenAIProvider {
             bytes.len()
         );
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
-        }
-
-        if status.is_server_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::error!("OpenAI server error status={status} body={body}");
-            return Ok(ChatOutcome::ServerError(body.into_owned()));
-        }
-
-        if status.is_client_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::warn!("OpenAI client error status={status} body={body}");
-            return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
-        }
-
-        let api_response: ApiChatResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no choices in response"))?;
-
-        let content = build_content_blocks(&choice.message);
-
-        let stop_reason = choice.finish_reason.as_deref().map(map_finish_reason);
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: Usage {
-                input_tokens: api_response.usage.prompt_tokens,
-                output_tokens: api_response.usage.completion_tokens,
-                cached_input_tokens: api_response
-                    .usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .map_or(0, |details| details.cached_tokens),
-                cache_creation_input_tokens: 0,
-            },
-        }))
+        decode_chat_response(status, &bytes)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -517,6 +478,10 @@ impl LlmProvider for OpenAIProvider {
                 .tool_choice
                 .as_ref()
                 .map(ApiToolChoice::from_tool_choice);
+            let response_format = request
+                .response_format
+                .as_ref()
+                .map(ApiResponseFormat::from_response_format);
 
             let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
             let include_stream_usage = use_stream_usage_options(&self.base_url);
@@ -528,6 +493,7 @@ impl LlmProvider for OpenAIProvider {
                 tools: tools.as_deref(),
                 tool_choice,
                 reasoning,
+                response_format,
                 stream_options: include_stream_usage.then_some(ApiStreamOptions {
                     include_usage: true,
                 }),
@@ -770,6 +736,55 @@ fn use_stream_usage_options(base_url: &str) -> bool {
     base_url == DEFAULT_BASE_URL || base_url.contains("api.openai.com")
 }
 
+/// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
+/// into a [`ChatResponse`].
+fn decode_chat_response(status: StatusCode, bytes: &[u8]) -> Result<ChatOutcome> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Ok(ChatOutcome::RateLimited);
+    }
+
+    if status.is_server_error() {
+        let body = String::from_utf8_lossy(bytes);
+        log::error!("OpenAI server error status={status} body={body}");
+        return Ok(ChatOutcome::ServerError(body.into_owned()));
+    }
+
+    if status.is_client_error() {
+        let body = String::from_utf8_lossy(bytes);
+        log::warn!("OpenAI client error status={status} body={body}");
+        return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
+    }
+
+    let api_response: ApiChatResponse = serde_json::from_slice(bytes)
+        .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
+
+    let choice = api_response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no choices in response"))?;
+
+    let content = build_content_blocks(&choice.message);
+    let stop_reason = choice.finish_reason.as_deref().map(map_finish_reason);
+
+    Ok(ChatOutcome::Success(ChatResponse {
+        id: api_response.id,
+        content,
+        model: api_response.model,
+        stop_reason,
+        usage: Usage {
+            input_tokens: api_response.usage.prompt_tokens,
+            output_tokens: api_response.usage.completion_tokens,
+            cached_input_tokens: api_response
+                .usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            cache_creation_input_tokens: 0,
+        },
+    }))
+}
+
 fn map_finish_reason(finish_reason: &str) -> StopReason {
     match finish_reason {
         "stop" => StopReason::EndTurn,
@@ -984,6 +999,8 @@ struct ApiChatRequest<'a> {
     tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ApiResponseFormat>,
 }
 
 #[derive(Serialize)]
@@ -1000,6 +1017,8 @@ struct ApiChatRequestStreaming<'a> {
     tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ApiResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ApiStreamOptions>,
     stream: bool,
@@ -1032,6 +1051,36 @@ impl ApiToolChoice {
             agent_sdk_core::llm::ToolChoice::Tool(name) => Self::Named {
                 choice_type: "function".to_owned(),
                 function: ApiToolChoiceFunction { name: name.clone() },
+            },
+        }
+    }
+}
+
+/// `OpenAI` `response_format` wire format for structured outputs.
+///
+/// Emits `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}`.
+#[derive(Serialize)]
+struct ApiResponseFormat {
+    #[serde(rename = "type")]
+    format_type: &'static str,
+    json_schema: ApiJsonSchema,
+}
+
+#[derive(Serialize)]
+struct ApiJsonSchema {
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
+}
+
+impl ApiResponseFormat {
+    fn from_response_format(rf: &agent_sdk_core::llm::ResponseFormat) -> Self {
+        Self {
+            format_type: "json_schema",
+            json_schema: ApiJsonSchema {
+                name: rf.name.clone(),
+                schema: rf.schema.clone(),
+                strict: rf.strict,
             },
         }
     }
@@ -1716,6 +1765,7 @@ mod tests {
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -1741,6 +1791,7 @@ mod tests {
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -2021,6 +2072,7 @@ mod tests {
             cached_content: None,
             thinking: None,
             tool_choice: None,
+            response_format: None,
         };
 
         assert!(should_use_responses_api(
@@ -2092,6 +2144,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -2116,6 +2169,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -2140,6 +2194,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
@@ -2171,6 +2226,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             stream_options: None,
             stream: true,
         };
@@ -2200,9 +2256,71 @@ mod tests {
             reasoning: Some(ApiReasoning {
                 effort: ReasoningEffort::High,
             }),
+            response_format: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"reasoning\":{\"effort\":\"high\"}"));
+    }
+
+    #[test]
+    fn test_response_format_serializes_as_json_schema() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let response_format = Some(ApiResponseFormat::from_response_format(
+            &agent_sdk_core::llm::ResponseFormat::new(
+                "person",
+                serde_json::json!({"type": "object"}),
+            ),
+        ));
+
+        let request = ApiChatRequest {
+            model: "gpt-4o",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["response_format"]["type"], "json_schema");
+        assert_eq!(json["response_format"]["json_schema"]["name"], "person");
+        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            json["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn test_response_format_omitted_when_absent() {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequest {
+            model: "gpt-4o",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("response_format"));
     }
 }
