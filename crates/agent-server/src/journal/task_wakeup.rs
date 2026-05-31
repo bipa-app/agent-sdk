@@ -1,6 +1,6 @@
 //! Task-wakeup consumer contract.
 //!
-//! Phase 8.3 (ENG-7967) builds on top of Phase 8.1's
+//! Phase 8.3 builds on top of Phase 8.1's
 //! [`crate::journal::outbox_message::TaskWakeupPayload`] and Phase 8.2's
 //! AMQP relay to close the "broker as nudge, journal as authority" loop.
 //! The broker path is a **latency optimisation**, never a source of

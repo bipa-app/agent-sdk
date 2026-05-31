@@ -4,7 +4,7 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.8.x   | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
@@ -13,7 +13,9 @@ We take security seriously. If you discover a security vulnerability in Agent SD
 ### How to Report
 
 1. **Do not** open a public GitHub issue for security vulnerabilities
-2. Email security concerns to the maintainers directly
+2. Report the issue privately using GitHub's
+   [private vulnerability reporting](https://github.com/bipa-app/agent-sdk/security/advisories/new)
+   ("Report a vulnerability" under the repository's Security tab)
 3. Include as much detail as possible:
    - Description of the vulnerability
    - Steps to reproduce

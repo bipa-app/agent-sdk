@@ -512,7 +512,8 @@ mod tests {
     /// not the checkpoint's frozen pre-compaction snapshot.
     ///
     /// The previous contract — recovery reads checkpoint.messages —
-    /// was the load-bearing bug behind ENG-8385: when the daemon
+    /// was the load-bearing bug behind the compaction-recovery
+    /// regression: when the daemon
     /// worker rewrote the projection mid-turn (a non-commit mutation
     /// driven by auto-compaction) and the turn then failed before
     /// committing, the next attempt re-read the stale checkpoint

@@ -1,25 +1,25 @@
 //! Agent-task schema, identity, status model, and invariants.
 //!
-//! This module implements the Phase 2.1 scope of ENG-7915: it defines the
+//! This module implements the Phase 2.1 scope: it defines the
 //! durable shape of an [`AgentTask`] row, the [`TaskKind`] and [`TaskStatus`]
 //! enums, the identity types ([`AgentTaskId`], [`WorkerId`], [`LeaseId`]),
 //! and the structural / state-machine invariants every persisted row must
 //! satisfy.
 //!
-//! Phase 2.2 (ENG-7916) builds directly on top of this module without
+//! Phase 2.2 builds directly on top of this module without
 //! changing any of its rows. The only new surface it adds here is the
 //! [`TaskStatus::blocks_root_admission`] predicate, which the store uses
 //! to key its partial-unique "one active root per thread" index — the
 //! queue itself lives in [`super::store`].
 //!
-//! Phase 2.3 (ENG-7917) extends [`AgentTask::touch_heartbeat`] to CAS
+//! Phase 2.3 extends [`AgentTask::touch_heartbeat`] to CAS
 //! on **both** the worker id and the lease id (a fresh
 //! [`TaskSchemaError::HeartbeatLeaseMismatch`] variant covers the
 //! lease half) and to bump `lease_expires_at` alongside the heartbeat
 //! timestamp. The acquisition / scan / sweep wiring lives in
 //! [`super::store`].
 //!
-//! Phase 2.4 (ENG-7918) replaces the Phase 2.1 untyped `state` field
+//! Phase 2.4 replaces the Phase 2.1 untyped `state` field
 //! with the strongly typed [`TaskState`] enum and reshapes the pause
 //! transitions to take their typed payload at the call site:
 //!
@@ -37,7 +37,7 @@
 //!   so a row whose status disagrees with its [`TaskState`] cannot
 //!   round-trip through the store.
 //!
-//! Phase 2.6 (ENG-7920) adds two new surfaces on top of the schema
+//! Phase 2.6 adds two new surfaces on top of the schema
 //! without changing any of the existing invariants:
 //!
 //! - [`ChildSpawnSpec`] — the per-child input struct the store's new
@@ -222,7 +222,7 @@ pub struct SuspensionPayload {
 
 /// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
 ///
-/// Phase 2.6 (ENG-7920) adds the store-level entry point that atomically
+/// Phase 2.6 adds the store-level entry point that atomically
 /// persists a batch of [`TaskKind::ToolRuntime`] children under a running
 /// parent and transitions the parent to [`TaskStatus::WaitingOnChildren`].
 /// Each child row is built from a `ChildSpawnSpec` via
@@ -840,7 +840,7 @@ impl AgentTask {
     /// `true` if this row has already used every attempt in its
     /// retry budget.
     ///
-    /// Phase 2.5 (ENG-7919) uses this predicate in
+    /// Phase 2.5 uses this predicate in
     /// [`super::recovery::classify_recovery`] to decide whether an
     /// acquisition-time or expiry-sweep classification should
     /// requeue the row or fail it closed. A row with

@@ -4,7 +4,6 @@
 |-------------|------------------------------------------------------|
 | **Status**  | Accepted                                             |
 | **Date**    | 2026-04-12                                           |
-| **Issue**   | [ENG-7988](https://linear.app/bipa/issue/ENG-7988)   |
 | **Parent**  | Track A — Concrete Durability Backends               |
 
 ## Context

@@ -1523,7 +1523,7 @@ WHERE parent_id = $1
                 Some(old_parent)
             }
         } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
-            // Phase 7.6 / ENG-8048 M5.4 follow-up: a child-thread
+            // Phase 7.6 / M5.4 follow-up: a child-thread
             // root turn has no `parent_id` but is logically linked
             // to a parent-thread `Subagent` invocation task via
             // `state.subagent_invocation.child_root_task_id`. Mirror

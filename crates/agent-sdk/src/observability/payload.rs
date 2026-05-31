@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn redacts_email_in_system_prompt() {
-        let request = empty_request("Contact support at ops@bipa.exchange.", vec![]);
+        let request = empty_request("Contact support at ops@example.com.", vec![]);
         let result = baseline_redactor()
             .convert_system_instructions(&request)
             .expect("some");
@@ -517,7 +517,7 @@ mod tests {
             text.contains("[REDACTED:email]"),
             "system prompt not redacted: {text}"
         );
-        assert!(!text.contains("ops@bipa.exchange"));
+        assert!(!text.contains("ops@example.com"));
     }
 
     #[test]
@@ -556,7 +556,7 @@ mod tests {
                 id: "c1".to_string(),
                 name: "send_pix".to_string(),
                 input: json!({
-                    "chave_pix": "ana@bipa.exchange",
+                    "chave_pix": "ana@example.com",
                     "amount_brl": 100,
                     "metadata": {
                         "recipient_cpf": "111.444.777-35",
@@ -570,7 +570,7 @@ mod tests {
         let args = result["content"][0]["arguments"].as_str().expect("args");
         assert!(args.contains("[REDACTED:email]"), "args: {args}");
         assert!(args.contains("[REDACTED:cpf]"), "args: {args}");
-        assert!(!args.contains("ana@bipa.exchange"));
+        assert!(!args.contains("ana@example.com"));
         assert!(!args.contains("111.444.777-35"));
         // Non-string leaves are preserved as-is.
         assert!(args.contains("100"));
@@ -619,7 +619,7 @@ mod tests {
             "amount": 42.5,
             "active": true,
             "items": null,
-            "email": "ana@bipa.exchange"
+            "email": "ana@example.com"
         });
         let redacted = baseline_redactor().mask_json(&input);
         assert_eq!(redacted["amount"], json!(42.5));

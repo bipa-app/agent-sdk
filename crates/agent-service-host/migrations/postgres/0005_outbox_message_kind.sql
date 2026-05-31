@@ -1,6 +1,6 @@
 -- =====================================================================
 -- 0005_outbox_message_kind.sql
--- ENG-7965: Phase 8.1 — Transactional Outbox Contract and Message Kinds
+-- Phase 8.1 — Transactional Outbox Contract and Message Kinds
 -- =====================================================================
 --
 -- Adds the logical message kind discriminator and relaxes
@@ -22,8 +22,9 @@
 -- ---------------------------------------------------------------------
 -- 1. Add the `kind` column with a temporary default so existing rows
 --    (if any) backfill cleanly to the legacy semantic — every row
---    written by ENG-7986 was logically a thread_events_available
---    message. Rewrite their payload_json into the Phase 8.1 advisory
+--    written by the original outbox layer was logically a
+--    thread_events_available message. Rewrite their payload_json into
+--    the Phase 8.1 advisory
 --    shape at the same time, then drop the default so future inserts
 --    must be explicit.
 -- ---------------------------------------------------------------------

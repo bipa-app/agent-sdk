@@ -15,7 +15,7 @@
 //!    failing the turn.
 //!
 //! These two tests guard the user-visible regression that motivated
-//! ENG-8385/M7.5: a long-running thread that crossed Anthropic's 1M
+//! M7.5: a long-running thread that crossed Anthropic's 1M
 //! cap surfaced
 //! `LLM stream error (kind=InvalidRequest): "prompt is too long: …"`
 //! to the user with no recovery path. The fixtures below use

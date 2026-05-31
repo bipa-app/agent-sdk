@@ -1420,7 +1420,7 @@ mod tests {
     #[async_trait]
     impl LlmProvider for PanicProvider {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
-            // Panic isolation (ENG-8705) catches this at the run-loop
+            // Panic isolation catches this at the run-loop
             // boundary and turns it into a structured `Error`, so the
             // parent classifies it as an agent error rather than a
             // dropped channel. The literal text is asserted on by
@@ -1715,7 +1715,7 @@ mod tests {
     async fn test_run_subagent_panic_classified_as_error_not_disconnected() -> Result<()> {
         // A subagent whose LLM provider panics must surface as a
         // structured `Error` — NOT the `Disconnected` ("ended
-        // unexpectedly") path. Before panic isolation (ENG-8705) the
+        // unexpectedly") path. Before panic isolation the
         // panic unwound the spawned run task, dropped `state_tx`, and
         // the parent saw a `RecvError` it misclassified as
         // `Disconnected`. The run-loop catch_unwind boundary now turns

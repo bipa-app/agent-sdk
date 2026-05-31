@@ -2,7 +2,7 @@
 //!
 //! Companion to `cancel_mid_tool.rs`. That test locks in the
 //! tool-boundary cancel race; this one locks in the gaps that were
-//! still open after it (Phase 10 · A / ENG-8703):
+//! still open after it (Phase 10 · A):
 //!
 //! 1. **Cancel mid-stream** — a cancel issued while the model is still
 //!    streaming stops further model events promptly (it does not wait

@@ -4,7 +4,7 @@
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
-> **Private repository**: This codebase is proprietary Bipa software. Historical public releases remain under the license they were originally published with, but the current line is private and is not published to crates.io.
+Agent SDK is open source under the [MIT License](LICENSE).
 
 ## What is an Agent?
 
@@ -43,38 +43,48 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Installation
 
-This repository is intended for internal Bipa development. Prefer consuming it from a checked-out workspace:
+Add the SDK to your project with Cargo:
+
+```bash
+cargo add agent-sdk
+cargo add tokio --features rt-multi-thread,macros
+cargo add anyhow
+```
+
+Or add it directly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = { path = "../agent-sdk/crates/agent-sdk" }
+agent-sdk = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
 
-If you need to depend on it from another repository, use an authenticated private source approved by Bipa engineering.
+The default build is lightweight — a plain `cargo add agent-sdk` enables
+only the `anthropic` provider and the core runtime, with no `sqlx`, `tonic`,
+`lapin`, `prost`, or `opentelemetry` dependencies. Everything else is opt-in
+through Cargo features, so a minimal consumer never pays for WebSocket, HTML,
+or YAML deps it does not use:
 
-Recommended patterns for internal apps:
+| Feature | Enables |
+|---------|---------|
+| `anthropic` *(default)* | Anthropic (Claude) provider |
+| `openai` | OpenAI Chat Completions provider |
+| `openai-codex` | OpenAI Codex/Responses provider |
+| `gemini` | Google Gemini provider |
+| `vertex` | Google Vertex AI provider |
+| `cloudflare` | Cloudflare Workers AI provider |
+| `web` | Web search + URL fetch tools (pulls in `html2text`) |
+| `mcp` | Model Context Protocol client |
+| `skills` | Skill/command loading from markdown (pulls in `serde_yaml_ng`) |
+| `otel` | OpenTelemetry spans (see below) |
+
+Enable the ones you need, for example:
 
 ```toml
-# Same machine / sibling checkout
 [dependencies]
-agent-sdk = { path = "../agent-sdk/crates/agent-sdk" }
+agent-sdk = { version = "0.8", features = ["openai", "gemini", "web", "mcp"] }
 ```
-
-```toml
-# Private GitHub repository, pinned to main
-[dependencies]
-agent-sdk = { git = "ssh://git@github.com/bipa-app/agent-sdk.git", branch = "main" }
-```
-
-```toml
-# Private GitHub repository, pinned to an exact commit for reproducibility
-[dependencies]
-agent-sdk = { git = "ssh://git@github.com/bipa-app/agent-sdk.git", rev = "PUT_COMMIT_SHA_HERE" }
-```
-
-For CI, prefer SSH or another authenticated Git transport controlled by Bipa. Pin to a commit SHA for production apps so builds remain reproducible.
 
 ## OpenTelemetry
 
@@ -82,7 +92,7 @@ Enable the optional `otel` feature to emit OpenTelemetry spans from the agent lo
 
 ```toml
 [dependencies]
-agent-sdk = { path = "../agent-sdk/crates/agent-sdk", features = ["otel"] }
+agent-sdk = { version = "0.8", features = ["otel"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 # Add the exporter crate that matches your backend, for example opentelemetry-otlp.
@@ -227,7 +237,7 @@ ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk-cli -- chat
 
 ## Examples
 
-From an authorized checkout, run the examples from the repository root. The
+Clone the repository and run the examples from the repository root. The
 first three are the quickstart trio referenced above:
 
 ```bash
@@ -845,12 +855,12 @@ See [SECURITY.md](SECURITY.md) for the full security policy.
 
 ## Contributing
 
-This repository is maintained internally at Bipa. See [CONTRIBUTING.md](CONTRIBUTING.md) for the internal development workflow.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow:
 
 - Development setup
 - Code quality requirements
-- Internal review process
+- Pull request process
 
 ## License
 
-This repository is proprietary and confidential. See [LICENSE](LICENSE) for the current terms.
+Licensed under the [MIT License](LICENSE). Copyright (c) 2025-2026 Bipa.

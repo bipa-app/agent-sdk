@@ -1,5 +1,4 @@
-//! Cancellation + message-lifecycle edge-case matrix (Phase 11 · C,
-//! ENG-8710).
+//! Cancellation + message-lifecycle edge-case matrix (Phase 11 · C).
 //!
 //! This file completes the cancellation/lifecycle matrix from
 //! `docs/OPEN_SOURCE_RELEASE_PLAN.md` §6.1. The already-merged Phase 10

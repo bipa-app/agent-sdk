@@ -1,4 +1,4 @@
-//! Panic-isolation integration tests (Phase 10 · C, ENG-8705).
+//! Panic-isolation integration tests (Phase 10 · C).
 //!
 //! Locks in the SDK contract that a panic inside a tool or LLM/stream
 //! future is isolated into an *observable, structured* outcome instead

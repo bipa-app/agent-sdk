@@ -680,7 +680,7 @@ async fn test_no_pii_in_spans() -> Result<()> {
     // Assistant text echoes a CPF + email so output-message redaction
     // is exercised on the same span as input redaction.
     let provider = StubProvider::new(vec![StubProvider::text_response(
-        "Customer CPF 111.444.777-35 and email ana@bipa.exchange were processed.",
+        "Customer CPF 111.444.777-35 and email ana@example.com were processed.",
     )]);
     let agent = builder::<()>()
         .provider(provider)
@@ -691,7 +691,7 @@ async fn test_no_pii_in_spans() -> Result<()> {
     let final_state = agent.run(
         thread_id.clone(),
         AgentInput::Text(
-            "My CPF is 111.444.777-35 and email ana@bipa.exchange — \
+            "My CPF is 111.444.777-35 and email ana@example.com — \
              API key sk-abcdefghijklmnopqrstuv"
                 .to_string(),
         ),
@@ -714,7 +714,7 @@ async fn test_no_pii_in_spans() -> Result<()> {
     // Raw PII never reaches the span.
     for raw in [
         "111.444.777-35",
-        "ana@bipa.exchange",
+        "ana@example.com",
         "sk-abcdefghijklmnopqrstuv",
     ] {
         assert!(

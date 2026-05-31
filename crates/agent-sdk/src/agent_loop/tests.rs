@@ -1634,7 +1634,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
 }
 
 // ===================
-// Server Boundary Tests (ENG-7908)
+// Server Boundary Tests
 // ===================
 
 #[tokio::test]
@@ -2103,7 +2103,7 @@ async fn test_run_still_works_as_convenience_wrapper() -> anyhow::Result<()> {
 }
 
 // =========================================================================
-// External tool handoff: SubmitToolResults regression tests (ENG-7911)
+// External tool handoff: SubmitToolResults regression tests
 // =========================================================================
 
 #[tokio::test]
@@ -3947,12 +3947,12 @@ async fn test_audit_external_append_failure_does_not_mark_execution_store() -> a
 }
 
 // ===================
-// TurnSummary Regression Suite (ENG-7914 — Phase 1.7)
+// TurnSummary Regression Suite (Phase 1.7)
 // ===================
 //
 // These tests close Phase 1 by exercising the full server-facing
-// `TurnSummary` contract on top of the boundary work landed by ENG-7908
-// through ENG-7913.  Each test builds an end-to-end `run_turn` call
+// `TurnSummary` contract on top of the earlier server-boundary work.
+// Each test builds an end-to-end `run_turn` call
 // with a `MockProvider` whose response fields are known, then asserts
 // the resulting `TurnSummary` carries the provenance, response id,
 // stop reason, usage, duration, tool-call count, and option flags that
@@ -4344,7 +4344,7 @@ async fn test_turn_summary_resume_after_confirmation_carries_summary() -> anyhow
     assert_eq!(summary.provenance.model, "mock-model");
     assert_eq!(summary.tool_runtime, ToolRuntime::Inline);
 
-    // Phase 1.7 regression guard (ENG-7914): the resume-side summary
+    // Phase 1.7 regression guard: the resume-side summary
     // must carry the same turn-closing LLM metadata as the pre-pause
     // summary for the same turn. These fields used to be fabricated
     // as `None` / `0` on the resume path because the handler built a
@@ -4434,7 +4434,7 @@ async fn test_turn_summary_resume_nested_confirmation_preserves_llm_metadata() -
     let (tool_call_id_2, continuation_2, nested_summary) =
         expect_awaiting_confirmation(outcome_2, "second AwaitingConfirmation");
 
-    // Phase 1.7 regression guard (ENG-7914): the nested-resume
+    // Phase 1.7 regression guard: the nested-resume
     // summary must carry the pre-pause LLM metadata that was snapshotted
     // into the continuation on the first yield.
     assert_summary_llm_metadata_matches(&nested_summary, &yield_summary_1, "nested resume");

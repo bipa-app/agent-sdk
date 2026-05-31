@@ -1,6 +1,6 @@
 -- =====================================================================
 -- 0009_idempotency.sql
--- ENG-8707 (Phase 10 · E): durable at-least-once idempotency records.
+-- Phase 10 · E: durable at-least-once idempotency records.
 -- =====================================================================
 --
 -- Clients that retry mutating control-plane calls (CreateThread,

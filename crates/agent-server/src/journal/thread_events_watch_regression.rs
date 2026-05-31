@@ -1,6 +1,6 @@
 //! Cross-instance `thread_events_available` regression suite.
 //!
-//! Proves the Phase 8.4 (ENG-7968) contract end-to-end:
+//! Proves the Phase 8.4 contract end-to-end:
 //!
 //! 1. Remote instances learn about committed events only through the
 //!    durable [`EventRepository`] — never from broker payloads.

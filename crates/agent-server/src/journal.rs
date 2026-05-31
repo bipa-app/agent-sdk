@@ -7,13 +7,13 @@
 //! - **tool-runtime child tasks** — one per tool execution spawned by a root
 //! - **subagents** — reserved for Phase 3
 //!
-//! Phase 2.1 (ENG-7915) shipped the schema layer:
+//! Phase 2.1 shipped the schema layer:
 //!
 //! - [`AgentTask`], [`TaskKind`], [`TaskStatus`], identity types, and
 //!   structural / state-machine invariants
 //! - Pure state-transition helpers every later phase can build on
 //!
-//! Phase 2.2 (ENG-7916) layered same-thread FIFO root queueing on top:
+//! Phase 2.2 layered same-thread FIFO root queueing on top:
 //!
 //! - [`AgentTaskStore::submit_root_turn`] durably admits a new root as
 //!   `Pending` when the thread's active-root slot is free, or converts
@@ -29,7 +29,7 @@
 //!   `Queued` rows do not occupy the slot and may coexist with the
 //!   blocking root.
 //!
-//! Phase 2.3 (ENG-7917) layers guarded acquisition, lease ownership,
+//! Phase 2.3 layers guarded acquisition, lease ownership,
 //! and heartbeat plumbing on top of the schema:
 //!
 //! - [`AgentTaskStore::try_acquire_task`] performs a targeted CAS
@@ -83,7 +83,7 @@
 //!    `status = running` — powers
 //!    [`AgentTaskStore::release_expired_leases`].
 //!
-//! Phase 2.4 (ENG-7918) layers typed durable pause-state on top:
+//! Phase 2.4 layers typed durable pause-state on top:
 //!
 //! - The previously-untyped `state` field on [`AgentTask`] is now a
 //!   strongly typed [`TaskState`] enum, with one variant per pause
@@ -111,7 +111,7 @@
 //!   disagrees with its status) and is round-tripped through JSON for
 //!   every variant by the schema regression suite.
 //!
-//! Phase 2.5 (ENG-7919) layers retry budget, failure handling, and the
+//! Phase 2.5 layers retry budget, failure handling, and the
 //! stale-task recovery matrix on top:
 //!
 //! - [`recovery::classify_recovery`] is a pure entry point that every
@@ -143,7 +143,7 @@
 //!   worker can never heartbeat a row that the sweep has released
 //!   back to `Pending` or failed closed.
 //!
-//! Phase 2.6 (ENG-7920) layers tool-runtime child orchestration,
+//! Phase 2.6 layers tool-runtime child orchestration,
 //! cancellation cascade, and fully journal-driven parent resume
 //! triggers on top:
 //!
@@ -177,7 +177,7 @@
 //!   outcomes, and `recompute_pending_children` re-derives the
 //!   counter from scratch on every terminal child transition.
 //!
-//! # Phase 2.7 — CAS contract, lifecycle model, and worker call sequences (ENG-7921)
+//! # Phase 2.7 — CAS contract, lifecycle model, and worker call sequences
 //!
 //! Phase 2.7 finalizes the journal API surface for worker consumption.
 //! Every mutation is now CAS-guarded — `insert` / `update` / `clear`
@@ -265,7 +265,7 @@
 //!   CAS mismatch → clean rejection
 //! ```
 //!
-//! # Phase 3.1 — Threads projection and aggregate ownership (ENG-7922)
+//! # Phase 3.1 — Threads projection and aggregate ownership
 //!
 //! Phase 3.1 adds the **threads projection** — a durable materialized
 //! aggregate view of committed conversation-level counters and status.
@@ -287,7 +287,7 @@
 //!   implementation, following the same `Arc<RwLock<Inner>>` pattern
 //!   as [`store::InMemoryAgentTaskStore`].
 //!
-//! # Phase 3.2 — Message projection and transactional `replace_history` (ENG-7923)
+//! # Phase 3.2 — Message projection and transactional `replace_history`
 //!
 //! Phase 3.2 adds the **message projection** — a durable ordered
 //! record of committed conversation messages per thread. The key
@@ -311,7 +311,7 @@
 //!   reference in-memory implementation, following the same
 //!   `Arc<RwLock<Inner>>` pattern as [`thread_store::InMemoryThreadStore`].
 //!
-//! # Phase 3.3 — Turn-attempt schema and append-only audit repository (ENG-7924)
+//! # Phase 3.3 — Turn-attempt schema and append-only audit repository
 //!
 //! Phase 3.3 adds the **turn-attempt audit table** — an append-only
 //! execution log for LLM request/response cycles. Every attempt
@@ -338,7 +338,7 @@
 //! - [`turn_attempt_store::InMemoryTurnAttemptStore`] is the
 //!   reference in-memory implementation.
 //!
-//! # Phase 3.4 — Completed-turn checkpoints and atomic commit path (ENG-7925)
+//! # Phase 3.4 — Completed-turn checkpoints and atomic commit path
 //!
 //! Phase 3.4 adds the **completed-turn checkpoint** — an immutable
 //! snapshot of conversation state at the instant a turn commits
@@ -369,7 +369,7 @@
 //! - [`commit::CompletedTurnCommit`] / [`commit::CommitOutcome`] are
 //!   the input/output types for the commit path.
 //!
-//! # Phase 3.5 — Thread-scoped checkpoint recovery and rebuild API (ENG-7926)
+//! # Phase 3.5 — Thread-scoped checkpoint recovery and rebuild API
 //!
 //! Phase 3.5 adds the **recovery loader** — given a thread, it loads
 //! the latest completed checkpoint and rebuilds the next-turn view.
@@ -396,7 +396,7 @@
 //!   the new store method that returns the highest-turn checkpoint
 //!   for a thread.
 //!
-//! # Phase 4.2 — `ExecutionContextFactory`, checkpoint-seeding, and staged stores (ENG-7935)
+//! # Phase 4.2 — `ExecutionContextFactory`, checkpoint-seeding, and staged stores
 //!
 //! Phase 4.2 adds the **staged execution model** — the root worker
 //! reconstructs trusted execution context from durable task, thread,
@@ -425,7 +425,7 @@
 //! | Subagent runtime | future |
 //! | Confirmation transport APIs | post-2.4 |
 //!
-//! # Phase 5.2 — Durable execution intent and fail-closed mutation guard (ENG-7995)
+//! # Phase 5.2 — Durable execution intent and fail-closed mutation guard
 //!
 //! Phase 5.2 adds the **execution intent** layer — a durable
 //! pre-execution record that side-effecting and resumable tools must
@@ -456,7 +456,7 @@
 //!   so retry logic can distinguish replay-safe operations from
 //!   unsafe duplicate mutation.
 //!
-//! # Phase 6.1 — Durable event committer and thread-scoped sequencing (ENG-7946)
+//! # Phase 6.1 — Durable event committer and thread-scoped sequencing
 //!
 //! Phase 6.1 adds the **event repository** — the authoritative commit
 //! surface for durable events.  Every event committed through this
@@ -489,7 +489,7 @@
 //! - [`event_repository::InMemoryEventRepository`] is the reference
 //!   in-memory implementation.
 //!
-//! # Phase 6.3 — Replay API and race-free replay-to-live handoff (ENG-7948)
+//! # Phase 6.3 — Replay API and race-free replay-to-live handoff
 //!
 //! Phase 6.3 adds the **replay surface** — the public API for
 //! reconnecting clients to resume from their last-seen sequence and
@@ -522,7 +522,7 @@
 //!   `Event(CommittedEvent)` for normal delivery, `Lagged { skipped }`
 //!   when the subscriber falls behind the broadcast buffer.
 //!
-//! # Phase 6.4 — Live tail hub, lag detection, and bounded-wait disconnect (ENG-7949)
+//! # Phase 6.4 — Live tail hub, lag detection, and bounded-wait disconnect
 //!
 //! Phase 6.4 adds the **live tail hub** — a same-process fanout surface
 //! with per-subscriber bounded buffers, lag detection, grace-period

@@ -1,12 +1,9 @@
 //! Langfuse trace input/output helpers for the agent loop.
 //!
-//! Lifts Bipa's `langfuse_trace_input` / `langfuse_trace_output`
+//! Lifts the `langfuse_trace_input` / `langfuse_trace_output`
 //! helpers (and the small `summarize_*` / `append_*` helpers they
 //! call) into the SDK so that consumers do not have to instrument
-//! `langfuse.trace.{input,output}` from outside the loop. After this
-//! module ships, Bipa's mirror copy at
-//! `bipa/master/src/features/agent.rs:1209-1436` becomes a deletion
-//! candidate (E2 cut-over).
+//! `langfuse.trace.{input,output}` from outside the loop.
 //!
 //! The module owns:
 //!
@@ -50,9 +47,8 @@ use super::langfuse::{LANGFUSE_TRACE_OUTPUT, truncate_trace_text};
 /// `max_chars` UTF-8 codepoints with a trailing ellipsis on overflow,
 /// mirroring [`super::langfuse::truncate_trace_text`].
 ///
-/// Lifted from Bipa's `langfuse_trace_input` /
-/// `summarize_langfuse_message_input` in
-/// `bipa/master/src/features/agent.rs:1209-1304`.
+/// Lifted from the prior `langfuse_trace_input` /
+/// `summarize_langfuse_message_input` implementation.
 #[must_use]
 pub fn langfuse_trace_input(input: &AgentInput, max_chars: usize) -> Option<String> {
     let text = match input {
@@ -158,8 +154,7 @@ fn summarize_message_input(blocks: &[ContentBlock]) -> Option<String> {
 ///
 /// Returns `None` for events that contribute nothing user-visible
 /// (deltas, lifecycle markers, subagent progress, …). Lifted from
-/// Bipa's `langfuse_trace_output` in
-/// `bipa/master/src/features/agent.rs:1341-1396`.
+/// the prior `langfuse_trace_output` implementation.
 #[must_use]
 pub fn langfuse_trace_output(event: &AgentEvent) -> Option<String> {
     match event {
@@ -337,9 +332,7 @@ impl RootTraceState {
     /// Append a free-form `[Error] <message>` chunk.
     ///
     /// Used by terminal error paths so a turn that fails mid-stream
-    /// still reports the failure narrative on `langfuse.trace.output`
-    /// (Bipa does this today, see
-    /// `bipa/master/src/features/agent.rs:1992-2000`).
+    /// still reports the failure narrative on `langfuse.trace.output`.
     pub fn observe_error(&self, message: &str) {
         let trimmed = message.trim();
         if trimmed.is_empty() {
