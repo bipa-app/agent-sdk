@@ -489,7 +489,7 @@ pub fn remote_parent_context(trace_id_hex: &str, span_id_hex: &str) -> Option<Co
 pub fn finish_root_turn_span(
     span: &mut BoxedSpan,
     total_turns: usize,
-    total_usage: &TokenUsage,
+    total_usage: Option<&TokenUsage>,
     outcome: &'static str,
 ) {
     Metrics::global()
@@ -499,22 +499,28 @@ pub fn finish_root_turn_span(
         attrs::SDK_TOTAL_TURNS,
         i64::try_from(total_turns).unwrap_or(0),
     ));
-    span.set_attribute(attrs::kv_i64(
-        attrs::GEN_AI_USAGE_INPUT_TOKENS,
-        i64::from(total_usage.input_tokens),
-    ));
-    span.set_attribute(attrs::kv_i64(
-        attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
-        i64::from(total_usage.output_tokens),
-    ));
-    span.set_attribute(attrs::kv_i64(
-        attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-        i64::from(total_usage.cached_input_tokens),
-    ));
-    span.set_attribute(attrs::kv_i64(
-        attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-        i64::from(total_usage.cache_creation_input_tokens),
-    ));
+    // Usage is optional: the daemon does not aggregate per-turn token
+    // usage across the suspend/resume hop, so it passes `None` and the
+    // per-call `chat` spans carry the authoritative usage. The in-process
+    // loop passes the cumulative `TokenUsage`.
+    if let Some(usage) = total_usage {
+        span.set_attribute(attrs::kv_i64(
+            attrs::GEN_AI_USAGE_INPUT_TOKENS,
+            i64::from(usage.input_tokens),
+        ));
+        span.set_attribute(attrs::kv_i64(
+            attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+            i64::from(usage.output_tokens),
+        ));
+        span.set_attribute(attrs::kv_i64(
+            attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            i64::from(usage.cached_input_tokens),
+        ));
+        span.set_attribute(attrs::kv_i64(
+            attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            i64::from(usage.cache_creation_input_tokens),
+        ));
+    }
     span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
     if outcome == "error" {
         spans::set_span_error(span, "agent_error", "agent invocation failed");
@@ -623,7 +629,7 @@ pub fn stash_root_turn_span(task_id: &str, span: BoxedSpan) {
 pub fn finalize_root_turn_span(
     task_id: &str,
     total_turns: usize,
-    total_usage: &TokenUsage,
+    total_usage: Option<&TokenUsage>,
     outcome: &'static str,
 ) {
     let stashed = LIVE_ROOT_SPANS

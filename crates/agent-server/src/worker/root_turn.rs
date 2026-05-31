@@ -324,6 +324,16 @@ pub async fn fail_root_turn(
         .commit_event(thread_id, error_event, now)
         .await;
 
+    // Finalize the root `invoke_agent` span with the error outcome and
+    // its full duration (no-op if a prior process owns the live span).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        0,
+        None,
+        "error",
+    );
+
     Ok(failed_task)
 }
 
@@ -353,10 +363,23 @@ pub async fn cancel_root_turn(
 ) -> Result<Vec<AgentTaskId>> {
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
 
-    deps.task_store
+    let cancelled = deps
+        .task_store
         .cancel_tree(task_id, now)
         .await
-        .context("cancel root turn tree")
+        .context("cancel root turn tree")?;
+
+    // Finalize the root `invoke_agent` span with the cancelled outcome
+    // (no-op if a prior process owns the live span).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        0,
+        None,
+        "cancelled",
+    );
+
+    Ok(cancelled)
 }
 
 /// Best-effort close any open (non-closed) turn attempts for a task.
@@ -459,9 +482,63 @@ async fn execute_root_turn_inner(
     //    keeps something descriptive without bloating the audit row
     //    with binary payloads.
     let audit_prompt = user_input.audit_summary();
-    let attempt = open_attempt(&inputs, definition, &audit_prompt, deps.attempt_store, now)
-        .await
-        .context("open turn attempt")?;
+
+    // Open the root `invoke_agent` span for the turn, continuing the
+    // inbound client trace when the gRPC caller propagated one (see
+    // `AgentTask::otel_traceparent`), so every `chat` call and
+    // `execute_tool` execution across the suspend/resume hop forms one
+    // coherent trace. The span's ids are persisted on the first attempt
+    // (below) so the resume path and child tool tasks re-parent under it;
+    // the live span is stashed in a process-global registry so the
+    // terminal path finalizes it with the correct full turn duration.
+    #[cfg(feature = "otel")]
+    let root_otel_ids: Option<(String, String)> = {
+        use agent_sdk::observability::loop_instrument;
+        let parent = inputs
+            .bootstrap
+            .task
+            .otel_traceparent
+            .as_deref()
+            .and_then(loop_instrument::context_from_traceparent);
+        let conversation_id = thread_id.to_string();
+        let model = provider.model().to_string();
+        let started = {
+            let _parent_guard = parent.map(opentelemetry::Context::attach);
+            loop_instrument::start_root_turn_span(loop_instrument::RootTurnSpanParams {
+                provider_id: provider.provider(),
+                model: &model,
+                conversation_id: &conversation_id,
+            })
+        };
+        let ids = (started.trace_id_hex.clone(), started.span_id_hex.clone());
+        loop_instrument::stash_root_turn_span(inputs.bootstrap.task_id.as_str(), started.span);
+        Some(ids)
+    };
+    #[cfg(not(feature = "otel"))]
+    let root_otel_ids: Option<(String, String)> = None;
+
+    let attempt = open_attempt(
+        &inputs,
+        definition,
+        &audit_prompt,
+        deps.attempt_store,
+        now,
+        root_otel_ids.clone(),
+    )
+    .await
+    .context("open turn attempt")?;
+
+    // Re-parent this task's `chat` spans (the LLM call + any retries)
+    // under the root span for the remainder of `execute_root_turn_inner`.
+    // The guard drops on return (suspend or commit). Child tool tasks and
+    // the resume path re-parent independently via the persisted ids.
+    #[cfg(feature = "otel")]
+    let _root_span_guard = root_otel_ids
+        .as_ref()
+        .and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(trace, span)
+        })
+        .map(opentelemetry::Context::attach);
 
     #[cfg(feature = "otel")]
     crate::observability::ServerMetrics::global()
@@ -716,6 +793,17 @@ async fn commit_text_only_turn(
         .await
         .context("complete root task")?;
 
+    // Text-only completion: the turn is done, so finalize the root
+    // `invoke_agent` span with its full duration + outcome. Usage is
+    // `None` (the per-call `chat` spans carry authoritative usage).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        turn_number + 1,
+        None,
+        "done",
+    );
+
     Ok(RootTurnOutcome::Completed {
         commit: Box::new(commit),
         completed_task,
@@ -773,6 +861,7 @@ async fn open_attempt(
     user_prompt: &str,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
+    otel_ids: Option<(String, String)>,
 ) -> Result<TurnAttempt> {
     let task_id = &inputs.bootstrap.task_id;
     let provenance = AuditProvenance::new(&definition.provider, &definition.model);
@@ -787,6 +876,11 @@ async fn open_attempt(
         .context("list existing attempts")?;
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
+    let (otel_trace_id, otel_span_id) = match otel_ids {
+        Some((trace_id, span_id)) => (Some(trace_id), Some(span_id)),
+        None => (None, None),
+    };
+
     attempt_store
         .open_attempt(OpenAttemptParams {
             task_id: task_id.clone(),
@@ -794,21 +888,36 @@ async fn open_attempt(
             provenance,
             request_blob,
             now,
-            // TODO(obs follow-up): root invoke_agent/agent.turn span needs
-            // cross-task trace-context propagation. The worker suspends and
-            // resumes a root turn across separate tasks, so the root span
-            // can't simply wrap an in-memory future the way the in-process
-            // loop does — its trace/span ids must be persisted here and
-            // re-attached on resume. Until that lands we capture the
-            // per-call `chat {model}` + `execute_tool` spans (see
-            // `call_llm_once` / `registry_tool_executor`) but leave the
-            // root span (and the `replay-of` link that would reference
-            // these ids on the next attempt) deferred.
-            otel_trace_id: None,
-            otel_span_id: None,
+            // The root `invoke_agent` span's ids, persisted on the first
+            // attempt so the resume path and child tool tasks can
+            // re-parent under it across the daemon's task hops (see
+            // `execute_root_turn_inner`). `None` on retry / resume
+            // attempts and when the worker runs without an OTel exporter.
+            otel_trace_id,
+            otel_span_id,
         })
         .await
         .context("open_attempt via store")
+}
+
+/// Load the root `invoke_agent` span's `(trace_id, span_id)` for a turn
+/// from its first attempt (where `execute_root_turn_inner` persisted
+/// them), so the resume path can re-parent the resumed `chat` span under
+/// the turn root across the task hop. Returns `None` when no attempt
+/// carries them (a turn that ran without an `OTel` exporter, or a
+/// pre-migration row).
+#[cfg(feature = "otel")]
+async fn load_root_span_ids(
+    attempt_store: &dyn TurnAttemptStore,
+    task_id: &AgentTaskId,
+) -> Option<(String, String)> {
+    let attempts = attempt_store.list_by_task(task_id).await.ok()?;
+    attempts
+        .into_iter()
+        .find_map(|attempt| match (attempt.otel_trace_id, attempt.otel_span_id) {
+            (Some(trace_id), Some(span_id)) => Some((trace_id, span_id)),
+            _ => None,
+        })
 }
 
 async fn build_chat_request(
@@ -1168,6 +1277,7 @@ async fn handle_recoverable_stream_error(
         attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
+        None,
     )
     .await
     .context("open retry turn attempt")
@@ -1272,6 +1382,7 @@ async fn try_recover_with_compaction(
         attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
+        None,
     )
     .await
     .context("open retry turn attempt after emergency compaction")?;
@@ -2608,9 +2719,21 @@ pub async fn resume_root_turn(
     //    "this attempt is a resume" looks like in the audit row.
     let resume_input = super::user_input::UserInput::resume();
     let resume_audit = resume_input.audit_summary();
-    let attempt = open_attempt(&inputs, definition, &resume_audit, deps.attempt_store, now)
+    let attempt = open_attempt(&inputs, definition, &resume_audit, deps.attempt_store, now, None)
         .await
         .context("open resume turn attempt")?;
+
+    // Re-parent the resumed `chat` span under the turn's root
+    // `invoke_agent` span (created on the fresh turn; ids persisted on
+    // the first attempt) so the resumed LLM call joins the same trace.
+    // The guard holds for the rest of the resume (LLM call + commit).
+    #[cfg(feature = "otel")]
+    let _root_span_guard = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
+        .await
+        .and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
+        })
+        .map(opentelemetry::Context::attach);
 
     // 2. Buffer the suspended messages (user prompt + assistant with
     //    tool calls) and tool-result messages into the staged stores.
@@ -2899,6 +3022,17 @@ async fn commit_resumed_turn(
         )
         .await
         .context("complete resumed root task")?;
+
+    // The resumed turn completed (no further tool calls) — finalize the
+    // root `invoke_agent` span with its full duration spanning the tool
+    // executions and the resume. Usage lives on the per-call `chat` spans.
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        turn_number + 1,
+        None,
+        "done",
+    );
 
     Ok(RootTurnOutcome::Completed {
         commit: Box::new(commit),
