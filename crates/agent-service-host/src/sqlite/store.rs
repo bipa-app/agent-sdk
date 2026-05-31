@@ -189,7 +189,7 @@ macro_rules! task_columns {
          submitted_input_json, caller_metadata_json, worker_id, lease_id, \
          lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts, \
          last_error, pending_child_count, spawn_index, result_payload, \
-         created_at, updated_at, completed_at"
+         otel_traceparent, created_at, updated_at, completed_at"
     };
 }
 
@@ -875,10 +875,10 @@ INSERT INTO agent_sdk_tasks (
     submitted_input_json, caller_metadata_json, worker_id, lease_id, lease_expires_at,
     last_heartbeat_at, state_json, attempt, max_attempts, last_error,
     pending_child_count, spawn_index, result_payload,
-    created_at, updated_at, completed_at
+    created_at, updated_at, completed_at, otel_traceparent
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
 )
 ",
             id,
@@ -904,6 +904,7 @@ INSERT INTO agent_sdk_tasks (
             task.created_at,
             task.updated_at,
             task.completed_at,
+            task.otel_traceparent,
         )
         .execute(&mut **tx)
         .await
@@ -938,7 +939,8 @@ UPDATE agent_sdk_tasks SET
     max_attempts = ?15, last_error = ?16, pending_child_count = ?17,
     spawn_index = ?18, result_payload = ?19,
     created_at = ?20, updated_at = ?21, completed_at = ?22,
-    caller_metadata_json = ?23
+    caller_metadata_json = ?23,
+    otel_traceparent = ?24
 WHERE id = ?1
 ",
             id,
@@ -964,6 +966,7 @@ WHERE id = ?1
             task.updated_at,
             task.completed_at,
             caller_metadata_json,
+            task.otel_traceparent,
         )
         .execute(&mut **tx)
         .await
@@ -4107,6 +4110,7 @@ struct TaskRecord {
     pending_child_count: i64,
     spawn_index: Option<i64>,
     result_payload: Option<serde_json::Value>,
+    otel_traceparent: Option<String>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
@@ -4139,6 +4143,7 @@ impl TryFrom<TaskRecord> for AgentTask {
                 .map(|v| u32_from_i64(v, "task spawn_index"))
                 .transpose()?,
             result_payload: r.result_payload,
+            otel_traceparent: r.otel_traceparent,
             created_at: r.created_at,
             updated_at: r.updated_at,
             completed_at: r.completed_at,

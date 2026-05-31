@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "thread_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "thread_id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "history_json",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "history_json"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "draft_messages_json",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "draft_messages_json"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "version",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "updated_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_message_heads",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {
