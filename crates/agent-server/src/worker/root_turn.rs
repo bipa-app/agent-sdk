@@ -794,9 +794,16 @@ async fn open_attempt(
             provenance,
             request_blob,
             now,
-            // TODO: once `agent-server` opts into OpenTelemetry, capture
-            // the live span context here so `call_llm_with_retry` can attach
-            // a `replay-of` link on the next attempt.
+            // TODO(obs follow-up): root invoke_agent/agent.turn span needs
+            // cross-task trace-context propagation. The worker suspends and
+            // resumes a root turn across separate tasks, so the root span
+            // can't simply wrap an in-memory future the way the in-process
+            // loop does — its trace/span ids must be persisted here and
+            // re-attached on resume. Until that lands we capture the
+            // per-call `chat {model}` + `execute_tool` spans (see
+            // `call_llm_once` / `registry_tool_executor`) but leave the
+            // root span (and the `replay-of` link that would reference
+            // these ids on the next attempt) deferred.
             otel_trace_id: None,
             otel_span_id: None,
         })
@@ -1378,7 +1385,126 @@ async fn emit_auto_retry_end(
 /// (the retry wrapper [`call_llm_with_retry`] handles backoff +
 /// re-attempt) and [`StreamAttemptError::Fatal`] for caller-side
 /// errors that no retry can fix.
+///
+/// ## Observability
+///
+/// This is the daemon-hosted equivalent of the in-process loop's
+/// `agent_loop::turn::request_llm_response`, so it opens the same
+/// `chat {model}` CLIENT span and records the same
+/// `gen_ai.client.token.usage` / `gen_ai.client.operation.duration`
+/// metrics — via the shared
+/// [`agent_sdk::observability::loop_instrument`] helpers — when the
+/// `otel` feature is on. The streaming/journal/retry logic lives in
+/// [`call_llm_once_inner`]; this wrapper only brackets it with the
+/// span so dashboards built against the in-process loop light up
+/// unchanged on the daemon path.
 async fn call_llm_once(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    now: OffsetDateTime,
+) -> Result<OnceOutcome, StreamAttemptError> {
+    #[cfg(feature = "otel")]
+    {
+        call_llm_once_instrumented(provider, request, attempt, deps, thread_id, now).await
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await
+    }
+}
+
+/// Bracket [`call_llm_once_inner`] with the `chat {model}` CLIENT span
+/// + `gen_ai.client.*` metrics, reusing the shared SDK helpers.
+///
+/// This is the daemon-hosted analogue of the in-process loop's
+/// `agent_loop::turn::request_llm_response` instrumentation: same span
+/// name, same `gen_ai.*` attribute set, same token-usage /
+/// operation-duration metrics under the `agent-sdk` meter scope.
+#[cfg(feature = "otel")]
+async fn call_llm_once_instrumented(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    now: OffsetDateTime,
+) -> Result<OnceOutcome, StreamAttemptError> {
+    use agent_sdk::observability::loop_instrument;
+
+    // Mirror the in-process loop, which only stamps
+    // `gen_ai.request.max_output_tokens` when the caller explicitly
+    // configured a cap (`config.max_tokens.is_some()`). The worker's
+    // `ChatRequest::max_tokens` is always populated with a resolved
+    // default, so gate on `max_tokens_explicit` to avoid emitting a
+    // synthetic value the in-process span would omit.
+    let max_tokens = request.max_tokens_explicit.then_some(request.max_tokens);
+    let request_model = provider.model().to_string();
+    let provider_id = provider.provider();
+    let mut span = loop_instrument::build_chat_span(loop_instrument::ChatSpanParams {
+        provider_id,
+        model: &request_model,
+        // The worker only ever drives the streaming API
+        // (`provider.chat_stream`), so this span always reflects a
+        // streaming call.
+        streaming: true,
+        max_tokens,
+    });
+
+    let started_at = std::time::Instant::now();
+    let result = call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await;
+    let elapsed = started_at.elapsed().as_secs_f64();
+
+    match &result {
+        Ok(outcome) => {
+            loop_instrument::finish_chat_span_success(
+                &mut span,
+                &outcome.response,
+                elapsed,
+                provider_id,
+                &request_model,
+            );
+        }
+        Err(error) => {
+            let (error_type, message) = match error {
+                StreamAttemptError::Recoverable { kind, message } => {
+                    (stream_error_kind_type(*kind), message.as_str())
+                }
+                StreamAttemptError::Fatal { message } => ("invalid_request", message.as_str()),
+            };
+            loop_instrument::finish_chat_span_error(
+                &mut span,
+                error_type,
+                message,
+                elapsed,
+                provider_id,
+                &request_model,
+            );
+        }
+    }
+
+    result
+}
+
+/// Map a [`StreamErrorKind`] to the stable `error.type` attribute /
+/// metric label, matching the vocabulary
+/// `agent_sdk::observability::loop_instrument::classify_llm_error`
+/// produces for the in-process loop.
+#[cfg(feature = "otel")]
+const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
+    match kind {
+        StreamErrorKind::RateLimited => "rate_limited",
+        StreamErrorKind::ServerError => "server_error",
+        StreamErrorKind::InvalidRequest => "invalid_request",
+    }
+}
+
+/// Streaming/journal/retry body of [`call_llm_once`]. Carries the
+/// entire LLM-stream loop unchanged; the `chat {model}` span lives in
+/// the [`call_llm_once`] wrapper.
+async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,

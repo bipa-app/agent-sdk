@@ -145,6 +145,143 @@ impl Metrics {
         *guard = None;
     }
 
+    /// Record the `gen_ai.client.token.usage` histogram for a chat
+    /// response, splitting one data point per non-zero token type
+    /// (`input` / `output` / `cache_read` / `cache_creation`).
+    ///
+    /// This is the single source of truth for the token-usage label
+    /// set so the in-process `agent_loop` and the
+    /// daemon-hosted `agent-server` worker emit byte-identical labels.
+    /// Splitting by type keeps the histogram aggregatable in
+    /// Prometheus / Grafana — collapsing the four types into one
+    /// record would erase the cache-hit-ratio dimension dashboards
+    /// care about most.
+    pub fn record_chat_token_usage(
+        &self,
+        usage: &crate::llm::Usage,
+        provider_name: &'static str,
+        request_model: &str,
+        response_model: &str,
+    ) {
+        use opentelemetry::KeyValue;
+
+        let entries: [(u32, &'static str); 4] = [
+            (usage.input_tokens, "input"),
+            (usage.output_tokens, "output"),
+            (usage.cached_input_tokens, "cache_read"),
+            (usage.cache_creation_input_tokens, "cache_creation"),
+        ];
+
+        for (count, token_type) in entries {
+            if count == 0 {
+                continue;
+            }
+            self.token_usage.record(
+                u64::from(count),
+                &[
+                    KeyValue::new(super::attrs::GEN_AI_OPERATION_NAME, "chat"),
+                    KeyValue::new(super::attrs::GEN_AI_PROVIDER_NAME, provider_name),
+                    KeyValue::new("gen_ai.token.type", token_type),
+                    KeyValue::new(
+                        super::attrs::GEN_AI_REQUEST_MODEL,
+                        request_model.to_string(),
+                    ),
+                    KeyValue::new(
+                        super::attrs::GEN_AI_RESPONSE_MODEL,
+                        response_model.to_string(),
+                    ),
+                ],
+            );
+        }
+    }
+
+    /// Record a `gen_ai.client.operation.duration` sample for a
+    /// successful chat call. The label set mirrors the success arm of
+    /// the in-process loop so both code paths land in the same series.
+    pub fn record_chat_operation_duration_success(
+        &self,
+        elapsed_secs: f64,
+        provider_name: &'static str,
+        request_model: &str,
+        response_model: &str,
+    ) {
+        use opentelemetry::KeyValue;
+
+        self.operation_duration.record(
+            elapsed_secs,
+            &[
+                KeyValue::new(super::attrs::GEN_AI_OPERATION_NAME, "chat"),
+                KeyValue::new(super::attrs::GEN_AI_PROVIDER_NAME, provider_name),
+                KeyValue::new(
+                    super::attrs::GEN_AI_REQUEST_MODEL,
+                    request_model.to_string(),
+                ),
+                KeyValue::new(
+                    super::attrs::GEN_AI_RESPONSE_MODEL,
+                    response_model.to_string(),
+                ),
+            ],
+        );
+    }
+
+    /// Record a `gen_ai.client.operation.duration` sample for a failed
+    /// chat call, carrying the stable `error.type` label in place of
+    /// the response model. Mirrors the error arm of the in-process
+    /// loop.
+    pub fn record_chat_operation_duration_error(
+        &self,
+        elapsed_secs: f64,
+        provider_name: &'static str,
+        request_model: &str,
+        error_type: &'static str,
+    ) {
+        use opentelemetry::KeyValue;
+
+        self.operation_duration.record(
+            elapsed_secs,
+            &[
+                KeyValue::new(super::attrs::GEN_AI_OPERATION_NAME, "chat"),
+                KeyValue::new(super::attrs::GEN_AI_PROVIDER_NAME, provider_name),
+                KeyValue::new(
+                    super::attrs::GEN_AI_REQUEST_MODEL,
+                    request_model.to_string(),
+                ),
+                KeyValue::new(super::attrs::ERROR_TYPE, error_type),
+            ],
+        );
+    }
+
+    /// Record the `agent_sdk.tools.execution.count` counter and, when a
+    /// duration is known, the `agent_sdk.tools.execution.duration`
+    /// histogram for a single tool invocation.
+    ///
+    /// `outcome` is one of the stable strings emitted by the loop
+    /// (`success` / `error` / `blocked` / `rejected` /
+    /// `awaiting_confirmation`). Both instruments share the same three
+    /// labels (`gen_ai.tool.name`, `agent_sdk.tool.kind`,
+    /// `agent_sdk.tool.outcome`) so a dashboard can join the count and
+    /// the duration without translation.
+    pub fn record_tool_execution(
+        &self,
+        tool_name: &str,
+        tool_kind: &'static str,
+        outcome: &'static str,
+        duration_ms: Option<u64>,
+    ) {
+        use opentelemetry::KeyValue;
+
+        let metric_attrs = [
+            KeyValue::new(super::attrs::GEN_AI_TOOL_NAME, tool_name.to_string()),
+            KeyValue::new(super::attrs::SDK_TOOL_KIND, tool_kind),
+            KeyValue::new(super::attrs::SDK_TOOL_OUTCOME, outcome),
+        ];
+        self.tools_execution_count.add(1, &metric_attrs);
+        if let Some(ms) = duration_ms {
+            self.tools_execution_duration
+                .record(tool_duration_ms_to_f64(ms), &metric_attrs);
+        }
+    }
+
     fn build(scope: &'static str) -> Self {
         let meter = global::meter(scope);
 
@@ -238,6 +375,23 @@ impl Metrics {
             llm_retries,
         }
     }
+}
+
+/// Convert a `ToolResult::duration_ms` value (`u64` milliseconds)
+/// into a histogram-friendly `f64`.
+///
+/// Bounding through `u32` keeps the conversion lossless because
+/// `u32::MAX` ≈ 49.7 days — far above the histogram's 5-minute top
+/// bucket, so any clamped value still falls in the overflow bucket
+/// dashboards expect. The clamp path also emits a `warn!` so a real
+/// runaway duration is investigable rather than silently swallowed.
+#[must_use]
+pub fn tool_duration_ms_to_f64(ms: u64) -> f64 {
+    if let Ok(v) = u32::try_from(ms) {
+        return f64::from(v);
+    }
+    log::warn!("tool duration {ms}ms exceeds u32::MAX; clamping for histogram");
+    f64::from(u32::MAX)
 }
 
 fn read_cached() -> Option<Arc<Metrics>> {

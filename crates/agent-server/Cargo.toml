@@ -34,8 +34,12 @@ fail = { workspace = true, optional = true }
 # to downstream `[dev-dependencies]`.  Never enable on a release build.
 test-support = []
 # Compiles the `observability` module and wires every metric emit-site.
-# Default builds remain dependency-free.
-otel = ["dep:opentelemetry"]
+# Also enables `agent-sdk`'s `otel` feature so the worker's
+# `chat {model}` LLM span + `gen_ai.client.*` metrics can reuse the SDK's
+# `observability::loop_instrument` helpers (same span names, attribute
+# keys, and meter scope as the in-process loop). Default builds remain
+# dependency-free.
+otel = ["dep:opentelemetry", "agent-sdk/otel"]
 # Crash-injection failpoints (tikv `fail-rs`). When OFF (the default), the
 # `fail_point!` call sites in the durable commit path compile to nothing and
 # `fail-rs` is not even a dependency — production builds are zero-cost. When

@@ -25,6 +25,11 @@ otel = [
     "dep:http",
     "dep:agent-sdk-otel",
     "agent-server/otel",
+    # `registry_tool_executor` brackets tool dispatch with the SDK's
+    # `execute_tool` span + `agent_sdk.tools.*` metrics via
+    # `agent_sdk::observability::loop_instrument`, which is gated behind
+    # `agent-sdk`'s own `otel` feature.
+    "agent-sdk/otel",
 ]
 # Crash-injection failpoints. Forwards to `agent-server`'s `failpoints`
 # feature so the `agent_server::fail_point!` macro is wired to the live
