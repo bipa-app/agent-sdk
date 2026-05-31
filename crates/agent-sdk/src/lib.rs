@@ -488,10 +488,140 @@ pub use stores::{
 };
 pub use tools::{
     AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,
-    Tool, ToolContext, ToolName, ToolRegistry, ToolStatus, TypedTool, TypedToolAdapter,
+    Tool, ToolContext, ToolLogic, ToolName, ToolRegistry, ToolStatus, TypedTool, TypedToolAdapter,
     invalid_tool_input_result, stage_to_string, tool_name_from_str, tool_name_to_string,
     validate_tool_input,
 };
+
+// ── Ergonomics macros (Phase 13·E) ───────────────────────────────────
+// `#[derive(Tool)]`, `#[derive(TypedTool)]`, and `#[derive(ToolName)]` are
+// re-exported from the proc-macro crate so a user writes
+// `use agent_sdk::Tool;` for both the trait and its derive (the trait/derive
+// share a name, which is idiomatic — cf. `serde::Serialize`). The generated
+// code refers to `::agent_sdk::…` paths and the `__macro_support` module
+// below, so consumers never depend on `agent-sdk-macros` directly. The
+// declarative `tool!` macro is defined in this crate (see the macro
+// definition further down).
+#[doc(inline)]
+pub use agent_sdk_macros::{Tool, ToolName, TypedTool};
+
+/// Re-exports the macros need at their expansion site. **Not** part of the
+/// stable public API — do not depend on it directly. It exists only so the
+/// `#[derive(...)]` output can name `serde_json`/`serde`/`anyhow`/`schemars`
+/// items through a single `::agent_sdk::__macro_support::…` path, regardless of
+/// which of those crates the consumer has in scope.
+#[doc(hidden)]
+pub mod __macro_support {
+    pub use anyhow::Result;
+    pub use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub use serde_json::{Value, json, to_value};
+    // Re-export `serde` itself so the generated `#[serde(crate = "...")]`
+    // attribute on the `ToolName` mirror enum resolves without the consumer
+    // having `serde` in their dependency tree under that exact name.
+    pub use serde;
+
+    /// `schemars::schema_for` shim for `#[tool(schema = "derive")]`.
+    ///
+    /// Only present under the `macros-schema` feature; the macro emits a
+    /// `compile_error!` (not a missing-path error) when the feature is off, so
+    /// this absence is never the diagnostic a user sees.
+    #[cfg(feature = "macros-schema")]
+    #[must_use]
+    pub fn schema_for<T: schemars::JsonSchema>() -> schemars::Schema {
+        schemars::schema_for!(T)
+    }
+}
+
+/// Define a tool inline, expanding to a fresh zero-sized struct plus a
+/// [`SimpleTool`] impl — the lowest-ceremony way to add a one-off tool in an
+/// example, test, or script.
+///
+/// This is the declarative counterpart to [`derive@Tool`]: use the derive when
+/// you want a named, reusable tool type; reach for `tool!` when you just need a
+/// closure-like tool right where you register it.
+///
+/// The application context type defaults to `()`; pass `context: MyCtx,` before
+/// the closure to use a different one. The closure receives
+/// `&ToolContext<Ctx>` and the raw `serde_json::Value` arguments and must
+/// return a future resolving to `anyhow::Result<ToolResult>`.
+///
+/// # Example
+///
+/// ```
+/// use agent_sdk::{tool, ToolResult, ToolRegistry};
+/// use serde_json::json;
+///
+/// let weather = tool! {
+///     name: "get_weather",
+///     description: "Get the current weather for a city",
+///     schema: json!({
+///         "type": "object",
+///         "properties": { "city": { "type": "string" } },
+///         "required": ["city"],
+///     }),
+///     |_ctx, input| async move {
+///         let city = input["city"].as_str().unwrap_or("Unknown");
+///         Ok(ToolResult::success(format!("Weather in {city}: Sunny")))
+///     }
+/// };
+///
+/// let mut registry: ToolRegistry<()> = ToolRegistry::new();
+/// registry.register_simple(weather);
+/// ```
+#[macro_export]
+macro_rules! tool {
+    // Default context = ().
+    (
+        name: $name:expr,
+        description: $description:expr,
+        schema: $schema:expr,
+        | $ctx:ident , $input:ident | $body:expr $(,)?
+    ) => {
+        $crate::tool! {
+            name: $name,
+            description: $description,
+            schema: $schema,
+            context: (),
+            |$ctx, $input| $body
+        }
+    };
+    // Explicit context type.
+    (
+        name: $name:expr,
+        description: $description:expr,
+        schema: $schema:expr,
+        context: $ctxty:ty,
+        | $ctx:ident , $input:ident | $body:expr $(,)?
+    ) => {{
+        struct __InlineTool;
+
+        impl $crate::SimpleTool<$ctxty> for __InlineTool {
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            fn description(&self) -> &'static str {
+                $description
+            }
+
+            fn input_schema(&self) -> $crate::__macro_support::Value {
+                $schema
+            }
+
+            fn execute(
+                &self,
+                $ctx: &$crate::ToolContext<$ctxty>,
+                $input: $crate::__macro_support::Value,
+            ) -> impl ::core::future::Future<
+                Output = $crate::__macro_support::Result<$crate::ToolResult>,
+            > + ::core::marker::Send {
+                $body
+            }
+        }
+
+        __InlineTool
+    }};
+}
 
 // agent-sdk-providers (via thin modules)
 pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
@@ -558,10 +688,14 @@ pub mod advanced {
 pub mod prelude {
     pub use crate::builder;
     pub use crate::providers::AnthropicProvider;
+    // `tool!` (declarative) plus the `Tool` / `TypedTool` / `ToolName` derives
+    // ride along on the same-named trait re-exports below — importing the trait
+    // also imports the derive macro (cf. `serde::Serialize`).
+    pub use crate::tool;
     pub use crate::{
         AgentConfig, AgentEvent, AgentInput, CancellationToken, DynamicToolName,
-        InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolRegistry, ToolResult, ToolTier,
-        TypedTool,
+        InMemoryEventStore, SimpleTool, Tool, ToolContext, ToolName, ToolRegistry, ToolResult,
+        ToolTier, TypedTool,
     };
 }
 

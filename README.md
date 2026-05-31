@@ -343,6 +343,109 @@ let agent = builder::<()>()
     .build();
 ```
 
+## Tools with Less Boilerplate (Derive Macros)
+
+Hand-writing the `name` / `description` / `input_schema` / `tier` methods gets
+repetitive. The `#[derive(Tool)]` and `#[derive(TypedTool)]` macros derive that
+metadata from a `#[tool(...)]` attribute — you implement only `ToolLogic`
+(the `execute` body). These are purely additive sugar: every hand-written tool
+above keeps compiling unchanged.
+
+```rust
+use agent_sdk::{Tool, ToolContext, ToolLogic, ToolResult, ToolRegistry};
+use serde_json::{json, Value};
+
+#[derive(Tool)]
+#[tool(
+    name = "get_weather",
+    description = "Get the current weather for a city",
+    schema = json!({
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+    }),
+)]
+struct WeatherTool;
+
+impl ToolLogic<()> for WeatherTool {
+    type Input = Value; // untyped, Value-in (the baseline)
+
+    async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> anyhow::Result<ToolResult> {
+        let city = input["city"].as_str().unwrap_or("Unknown");
+        Ok(ToolResult::success(format!("Weather in {city}: Sunny")))
+    }
+}
+
+let mut tools = ToolRegistry::<()>::new();
+tools.register_simple(WeatherTool);
+```
+
+### Typed args + auto-derived schema
+
+`#[derive(TypedTool)]` gives you the typed-`Input` validation from the
+`TypedTool` API (a malformed model call becomes a self-correction `tool_result`
+before `execute` runs). With the `macros-schema` feature you can also drop the
+hand-written JSON schema and derive it from the `Input` type via `schemars`
+(`schema = "derive"`):
+
+```rust,ignore
+use agent_sdk::{TypedTool, ToolContext, ToolLogic, ToolResult};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+struct WeatherArgs { city: String }
+
+#[derive(TypedTool)]
+#[tool(name = "get_weather", description = "Weather", input = WeatherArgs, schema = "derive")]
+struct WeatherTool;
+
+impl ToolLogic<()> for WeatherTool {
+    type Input = WeatherArgs;
+
+    async fn execute(&self, _ctx: &ToolContext<()>, input: WeatherArgs) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult::success(format!("Weather in {}: Sunny", input.city)))
+    }
+}
+```
+
+### Inline tools and tool-name enums
+
+For a one-off tool, the `tool!` macro skips the named struct entirely:
+
+```rust
+use agent_sdk::{tool, ToolResult, ToolRegistry};
+use serde_json::json;
+
+let weather = tool! {
+    name: "get_weather",
+    description: "Get the current weather for a city",
+    schema: json!({ "type": "object", "properties": { "city": { "type": "string" } } }),
+    |_ctx, input| async move {
+        let city = input["city"].as_str().unwrap_or("Unknown");
+        Ok(ToolResult::success(format!("Weather in {city}: Sunny")))
+    }
+};
+
+let mut tools = ToolRegistry::<()>::new();
+tools.register_simple(weather);
+```
+
+And `#[derive(ToolName)]` collapses the strongly-typed tool-name enum
+boilerplate (`#[derive(Serialize, Deserialize)] #[serde(rename_all = "snake_case")]`
+plus `impl ToolName`) into one derive:
+
+```rust
+use agent_sdk::ToolName;
+
+#[derive(Clone, Copy, PartialEq, Eq, ToolName)]
+enum MyToolName {
+    ReadFile,  // serializes as "read_file"
+    WriteFile, // serializes as "write_file"
+}
+```
+
+See `examples/derive_tool.rs` for all four macros in one agent.
+
 ## Async Tools (Long-Running Operations)
 
 For operations that take time (API calls, file processing, etc.), implement `AsyncTool`:

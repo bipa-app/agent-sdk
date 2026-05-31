@@ -10,6 +10,12 @@ license = "MIT"
 [workspace.dependencies]
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
 agent-sdk-tools = { path = "crates/agent-sdk-tools", version = "0.8.0" }
+# Phase 13·E ergonomics macros (`#[derive(Tool)]` / `#[derive(TypedTool)]`,
+# `tool!`, `#[derive(ToolName)]`). Re-exported from the `agent-sdk` façade so
+# consumers never depend on this crate directly. COORDINATION (13·D): this is
+# a new workspace member + manifest; 13·D edits packaging/CI metadata — both
+# are additive and reconcile at merge.
+agent-sdk-macros = { path = "crates/agent-sdk-macros", version = "0.8.0" }
 # `default-features = false` here lets each consumer (notably the `agent-sdk`
 # façade) decide which provider impls compile. Crates that only use the
 # `LlmProvider` trait / streaming types pull no concrete provider at all.
@@ -70,6 +76,20 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 lapin = { version = "4.4.0", default-features = false, features = ["rustls", "tokio"] }
 clap = { version = "4", features = ["derive"] }
 
+# Proc-macro toolchain for the Phase 13·E ergonomics crate
+# (`agent-sdk-macros`). `syn` pulls the full grammar so derives can read
+# generics, where-clauses, and attribute exprs; `#[tool(...)]` attributes are
+# parsed by hand with `syn` (rather than a third-party attribute-derive crate
+# whose generated code trips the workspace's `-D warnings` clippy lints).
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+# Optional JSON-Schema derivation from a typed `Input` — the opt-in sugar over
+# 13·B's user-declared-JSON baseline (`#[tool(schema = "derive")]`). Kept
+# behind the macro crate's `schema-derive` feature so the baseline pulls no
+# extra deps.
+schemars = "1"
+
 # dev
 tempfile = "3"
 env_logger = "0.11"
@@ -86,6 +106,9 @@ loom = "0.7"
 # agnostic (it is just a server), so it composes with the SDK's
 # `reqwest 0.13` provider clients without a second reqwest in the tree.
 wiremock = "0.6"
+# Compile-fail / UI tests for the proc-macros: asserts that a derive with a
+# missing required attribute fails to compile with a helpful diagnostic.
+trybuild = "1"
 
 # Crash-injection failpoints (tikv `fail-rs`). Kept out of the default
 # feature set on every crate so production builds never compile it in;
