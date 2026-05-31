@@ -922,6 +922,7 @@ pub trait AgentTaskStore: Send + Sync {
     ///   spawn.
     /// - Schema errors from [`AgentTask::new_child`],
     ///   [`AgentTask::wait_on_children`], or [`AgentTask::validate`].
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
@@ -2695,6 +2696,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(paused)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
@@ -2764,7 +2766,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             // Re-parent the child's spans under the turn's root
             // `invoke_agent` span (not the inherited inbound client span)
             // so its `execute_tool` span nests under the turn.
-            child.otel_traceparent = child_otel_traceparent.clone();
+            child.otel_traceparent.clone_from(&child_otel_traceparent);
             if inner.by_id.contains_key(&child.id)
                 || children.iter().any(|existing| existing.id == child.id)
             {
@@ -7060,6 +7062,7 @@ mod tests {
                     continuation: sample_continuation("t-spawn"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -7124,6 +7127,7 @@ mod tests {
                     continuation: sample_continuation("t-spawn-cas"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -7143,6 +7147,7 @@ mod tests {
                     continuation: sample_continuation("t-spawn-cas"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(3),
             )
             .await
@@ -7735,6 +7740,7 @@ mod tests {
                     continuation: sample_continuation("t-spawn-pending"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(1),
             )
             .await
@@ -7767,6 +7773,7 @@ mod tests {
                     continuation: sample_continuation("t-leaf"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -7799,6 +7806,7 @@ mod tests {
                     continuation: sample_continuation("t-leaf"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(4),
             )
             .await
@@ -7826,6 +7834,7 @@ mod tests {
                     continuation: sample_continuation("t-empty"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -7865,6 +7874,7 @@ mod tests {
                     continuation: sample_continuation("t-scan-children"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(10),
             )
             .await
@@ -7925,6 +7935,7 @@ mod tests {
                     continuation: sample_continuation("t-complete"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8020,6 +8031,7 @@ mod tests {
                     continuation: sample_continuation(thread_name),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8211,6 +8223,7 @@ mod tests {
                     continuation: sample_continuation("t-resume-budget"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8294,6 +8307,7 @@ mod tests {
                     continuation: sample_continuation("t-partial"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8355,6 +8369,7 @@ mod tests {
                     continuation: sample_continuation("t-recompute"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8423,6 +8438,7 @@ mod tests {
                     continuation: sample_continuation("t-cc-cas"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8500,6 +8516,7 @@ mod tests {
                     continuation: sample_continuation("t-fail"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8588,6 +8605,7 @@ mod tests {
                     continuation: sample_continuation("t-mixed"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8670,6 +8688,7 @@ mod tests {
                     continuation: sample_continuation("t-late-complete"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8748,6 +8767,7 @@ mod tests {
                     continuation: sample_continuation("t-tree"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8823,6 +8843,7 @@ mod tests {
                     continuation: sample_continuation("t-tree-live"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8907,6 +8928,7 @@ mod tests {
                     continuation: sample_continuation("t-tree-idem"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -8947,6 +8969,7 @@ mod tests {
                     continuation: sample_continuation("t-tree-waiting"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -9376,6 +9399,7 @@ mod tests {
                     continuation: sample_continuation("t-journal"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -9492,6 +9516,7 @@ mod tests {
                     continuation: sample_continuation("t-empty-counter"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -9895,6 +9920,7 @@ mod tests {
                     continuation: sample_continuation("t-conc-batch"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await
@@ -9963,6 +9989,7 @@ mod tests {
                     continuation: sample_continuation("t-conc-mix"),
                     suspended_messages: Vec::new(),
                 },
+                None,
                 t_plus(2),
             )
             .await

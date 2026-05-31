@@ -290,6 +290,7 @@ mod in_memory_bundle {
                 )
                 .await
         }
+        #[allow(clippy::too_many_arguments)]
         async fn spawn_tool_children(
             &self,
             parent_id: &AgentTaskId,

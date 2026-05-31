@@ -466,6 +466,7 @@ pub async fn execute_root_turn(
 /// Inner body of [`execute_root_turn`].  Kept separate so the outer
 /// function can wrap the entire call in a metric-recording shim
 /// without having to thread a stopwatch through every early return.
+#[allow(clippy::too_many_lines)]
 async fn execute_root_turn_inner(
     inputs: RootWorkerInputs,
     user_input: super::user_input::UserInput,
@@ -2721,6 +2722,7 @@ struct ResumeContext<'a> {
 ///
 /// [`AgentContinuation`]: agent_sdk_core::AgentContinuation
 /// [`TaskState::ReadyToResume`]: crate::journal::task_state::TaskState::ReadyToResume
+#[allow(clippy::too_many_lines)]
 pub async fn resume_root_turn(
     inputs: RootWorkerInputs,
     continuation: AgentContinuation,

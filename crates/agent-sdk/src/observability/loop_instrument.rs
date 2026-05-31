@@ -434,7 +434,7 @@ pub struct StartedRootTurnSpan {
 /// and tags the same Langfuse `agent` observation. Pair a text-only
 /// terminal with [`finish_root_turn_span`]; on the tool-suspend path the
 /// span ends when dropped — its duration then covers the fresh segment
-/// only, because the OTel 0.32 `SpanBuilder` exposes no way to assign a
+/// only, because the `OTel` 0.32 `SpanBuilder` exposes no way to assign a
 /// span id, so a single span cannot be reopened on resume to span the
 /// whole turn. The persisted ids still re-parent every later span, so
 /// the turn remains one coherent trace tree.
@@ -589,7 +589,7 @@ pub fn traceparent_from_ids(trace_id_hex: &str, span_id_hex: &str) -> Option<Str
 /// opens it and the (possibly later) task that finalizes it.
 ///
 /// The daemon drives one turn across several tokio tasks
-/// (execute → suspend at the tool boundary → resume), and OTel 0.32
+/// (execute → suspend at the tool boundary → resume), and `OTel` 0.32
 /// offers no way to assign a span id, so a root span cannot be re-minted
 /// on resume to cover the whole turn. Instead the worker stashes the
 /// *live* `invoke_agent` span here at the fresh turn and finalizes it at
@@ -608,7 +608,7 @@ static LIVE_ROOT_SPANS: LazyLock<Mutex<HashMap<String, BoxedSpan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Stash the live root-turn `span` under `task_id` so a later task can
-/// finalize it with the correct full duration (see [`LIVE_ROOT_SPANS`]).
+/// finalize it with the correct full duration (see `LIVE_ROOT_SPANS`).
 ///
 /// First write wins: a retry that re-opens the same turn keeps the
 /// original span (and its start time) rather than resetting the clock.
@@ -655,5 +655,51 @@ pub fn finalize_root_turn_span(
 pub fn discard_root_turn_span(task_id: &str) {
     if let Ok(mut spans) = LIVE_ROOT_SPANS.lock() {
         drop(spans.remove(task_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        discard_root_turn_span, finalize_root_turn_span, spans, stash_root_turn_span,
+        traceparent_from_ids,
+    };
+
+    // W3C example ids (RFC trace-context), both non-zero / valid.
+    const TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN_HEX: &str = "00f067aa0ba902b7";
+
+    #[test]
+    fn traceparent_from_valid_ids_is_w3c_sampled() {
+        let traceparent = traceparent_from_ids(TRACE_HEX, SPAN_HEX).expect("valid ids");
+        assert_eq!(traceparent, format!("00-{TRACE_HEX}-{SPAN_HEX}-01"));
+    }
+
+    #[test]
+    fn traceparent_from_malformed_or_zero_ids_is_none() {
+        assert!(traceparent_from_ids("not-hex", SPAN_HEX).is_none());
+        assert!(traceparent_from_ids(TRACE_HEX, "tooshort").is_none());
+        // All-zero ids are rejected by `SpanContext::is_valid`.
+        assert!(traceparent_from_ids(&"0".repeat(32), &"0".repeat(16)).is_none());
+    }
+
+    #[test]
+    fn live_root_span_registry_finalize_is_idempotent() {
+        // No provider installed → a no-op span, but the registry's map
+        // management (stash → finalize removes the entry) is exercised
+        // regardless, and a second finalize must not panic.
+        let task_id = "registry-roundtrip-task";
+        stash_root_turn_span(task_id, spans::start_internal_span("test", Vec::new()));
+        finalize_root_turn_span(task_id, 1, None, "done");
+        finalize_root_turn_span(task_id, 1, None, "done");
+    }
+
+    #[test]
+    fn discard_removes_stashed_span_without_finalize() {
+        let task_id = "registry-discard-task";
+        stash_root_turn_span(task_id, spans::start_internal_span("test", Vec::new()));
+        discard_root_turn_span(task_id);
+        // Finalize after discard is a no-op (entry already gone).
+        finalize_root_turn_span(task_id, 0, None, "cancelled");
     }
 }

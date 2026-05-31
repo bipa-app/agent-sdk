@@ -2417,6 +2417,7 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(paused)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
@@ -2443,7 +2444,7 @@ impl AgentTaskStore for SqliteDurableStore {
                     .context("spawn rejected: new_child failed")?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
-            child.otel_traceparent = child_otel_traceparent.clone();
+            child.otel_traceparent.clone_from(&child_otel_traceparent);
             let existing = Self::load_task_tx(&mut tx, &child.id).await?;
             if existing.is_some() || children.iter().any(|e: &AgentTask| e.id == child.id) {
                 return Err(anyhow!(

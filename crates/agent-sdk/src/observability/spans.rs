@@ -143,7 +143,7 @@ pub fn link_to_parent_turn(span: &mut BoxedSpan, parent_trace_id: &str, parent_s
 /// parent context from them via this helper so resumed `chat` calls and
 /// child-task `execute_tool` calls nest under the turn root. Returns
 /// `None` for malformed / zero ids (treated as "no parent"). Thin public
-/// wrapper over [`parse_span_context`].
+/// wrapper over `parse_span_context`.
 #[must_use]
 pub fn remote_span_context(trace_hex: &str, span_hex: &str) -> Option<SpanContext> {
     parse_span_context(trace_hex, span_hex)

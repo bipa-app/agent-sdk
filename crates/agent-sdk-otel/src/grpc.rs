@@ -4,7 +4,7 @@
 //! into outgoing call metadata and a gRPC **server** extract it to
 //! continue the distributed trace — the same pattern Bipa's main gRPC
 //! server and mobile apps use, built on the globally-installed
-//! [`TraceContextPropagator`] (see [`crate::install_global_provider`]).
+//! `TraceContextPropagator` (see [`crate::install_global_provider`]).
 //!
 //! # How to propagate trace context to the bip daemon
 //!
@@ -65,9 +65,11 @@ use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 
-/// Adapts a tonic [`MetadataMap`] as an `OTel` [`Injector`] so a
+/// Adapts a tonic [`MetadataMap`] as an `OTel` [`Injector`].
+///
+/// Lets a
 /// [`TextMapPropagator`](opentelemetry::propagation::TextMapPropagator)
-/// can write `traceparent` / `tracestate` / `baggage` into outgoing gRPC
+/// write `traceparent` / `tracestate` / `baggage` into outgoing gRPC
 /// metadata. Non-ASCII keys / values are silently skipped (W3C headers
 /// are always ASCII).
 pub struct MetadataInjector<'a>(pub &'a mut MetadataMap);
@@ -122,7 +124,7 @@ pub fn extract_context(metadata: &MetadataMap) -> Context {
     global::get_text_map_propagator(|propagator| propagator.extract(&MetadataExtractor(metadata)))
 }
 
-/// A tonic client interceptor that injects the **current** OTel context
+/// A tonic client interceptor that injects the **current** `OTel` context
 /// (`traceparent` + allow-listed baggage) into every outgoing request.
 ///
 /// Pass to `Client::with_interceptor(channel, trace_context_interceptor())`.
