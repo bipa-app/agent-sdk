@@ -1,0 +1,67 @@
+# release-plz configuration.
+#
+# release-plz automates the release flow for this workspace: it opens a
+# "release PR" that bumps versions + updates changelogs from conventional
+# commits, and (on merge, in a separate, human-gated workflow) publishes the
+# crates to crates.io in dependency order.
+#
+# IMPORTANT: the actual crates.io publish + git tag are HITL. This config
+# makes the workspace release-ready; wiring an auto-publish workflow with a
+# CARGO_REGISTRY_TOKEN is a deliberate later step (see the commented workflow
+# stub in .github/workflows/). Nothing here publishes on its own.
+
+[workspace]
+# A single PR/changelog for the whole SDK keeps the version line in lockstep
+# across the published crates (they share `version = "0.8.0"`).
+changelog_update = true
+# Dependent crates get their intra-workspace dependency bumped when a
+# dependency releases.
+dependencies_update = true
+# Verify each package builds before proposing a release.
+publish_no_verify = false
+# Conventional-commit-driven changelog.
+git_release_enable = true
+# Do NOT auto-publish; the publish step is gated to a manual/HITL workflow.
+publish = false
+
+# ── Publishable crates ────────────────────────────────────────────────
+# These are the only crates release-plz manages. Versions are kept in lockstep.
+
+[[package]]
+name = "agent-sdk-core"
+publish = true
+
+[[package]]
+name = "agent-sdk-tools"
+publish = true
+
+[[package]]
+name = "agent-sdk-providers"
+publish = true
+
+[[package]]
+name = "agent-sdk"
+publish = true
+
+[[package]]
+name = "agent-sdk-otel"
+publish = true
+
+[[package]]
+name = "agent-sdk-cli"
+publish = true
+
+# ── Internal crates — never released ──────────────────────────────────
+# Mirrors `publish = false` in their manifests; release-plz also skips them.
+
+[[package]]
+name = "agent-server"
+release = false
+
+[[package]]
+name = "agent-server-loom"
+release = false
+
+[[package]]
+name = "agent-service-host"
+release = false

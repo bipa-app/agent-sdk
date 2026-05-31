@@ -26,6 +26,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features
 
+  # Cross-platform portability gate for the *published* surface. The internal
+  # agent-service-host (Postgres/AMQP/sqlx) is Linux-first and excluded here;
+  # what ships via `cargo add agent-sdk` must build + test on macOS and
+  # Windows too.
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Check publishable crates (all features)
+        run: >-
+          cargo check --all-targets --all-features
+          -p agent-sdk-core -p agent-sdk-tools -p agent-sdk-providers
+          -p agent-sdk -p agent-sdk-otel -p agent-sdk-cli
+      - name: Test publishable crates (no live network / keys)
+        run: >-
+          cargo nextest run --profile ci --all-features
+          -p agent-sdk-core -p agent-sdk-tools -p agent-sdk-providers
+          -p agent-sdk -p agent-sdk-otel
+
   test:
     name: Test (nextest)
     runs-on: ubuntu-latest

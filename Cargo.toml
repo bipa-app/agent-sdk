@@ -6,6 +6,24 @@ exclude = ["crates/agent-service-proto"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
+# Minimum Supported Rust Version, pinned so `cargo`, the pinned-toolchain CI
+# job, and crates.io all enforce/record it. Bumping it is a semver-relevant
+# change.
+#
+# NOTE: the Phase-13 card nominated 1.85 (the 2024-edition floor), but the
+# *actual* buildable floor is higher and verified empirically:
+#   * the merged 13·C MCP transport uses `Duration::from_mins(..)` in a
+#     `const`, which only became a const fn in Rust 1.91;
+#   * dependency floors (`time 0.3.47`, `tonic 0.14.5`) already require ≥1.88.
+# 1.90 fails to compile `agent-sdk`; 1.91 builds the whole publishable set
+# clean. We pin the honest, green floor rather than an aspirational 1.85 that
+# the code can no longer meet. Lowering it back toward 1.85 would mean
+# refactoring the 13·C `const` and pinning older dep releases — tracked as a
+# follow-up if a lower MSRV becomes a requirement.
+rust-version = "1.91"
+repository = "https://github.com/bipa-app/agent-sdk"
+homepage = "https://github.com/bipa-app/agent-sdk"
+authors = ["Bipa <engineering@bipa.app>"]
 
 [workspace.dependencies]
 agent-sdk-core = { path = "crates/agent-sdk-core", version = "0.8.0" }
@@ -99,7 +117,11 @@ unsafe_code = "forbid"
 # scoped concurrency models in the `agent-server-loom` crate. Declared
 # here so a normal build does not warn (and `-D warnings` does not error)
 # on the `#![cfg(loom)]` gate in that crate's loom test.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+# `docsrs` is set only by docs.rs (and our `cargo doc` gate) to switch on the
+# nightly `doc(cfg(...))` feature badges. Declared here so a normal build does
+# not warn (and `-D warnings` does not error) on the `#![cfg_attr(docsrs, …)]`
+# gates in the feature-gated crates.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
 
 [workspace.lints.clippy]
 all = "warn"

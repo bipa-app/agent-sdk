@@ -410,6 +410,11 @@
 //! operations, and context compaction. See the `observability` module for details.
 
 #![forbid(unsafe_code)]
+// Enable the `doc(cfg(...))` feature-badge annotations on docs.rs (which
+// builds with `--cfg docsrs` on nightly — see `[package.metadata.docs.rs]`).
+// A regular stable build never sets `docsrs`, so this nightly-only feature
+// flag is inert outside docs.rs.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 // ── Private modules (owned by this crate) ────────────────────────────
 mod agent_loop;
@@ -425,13 +430,17 @@ pub mod user_interaction;
 
 // ── Feature-gated tool modules (opt-in, pull extra deps) ──────────────
 #[cfg(feature = "mcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mcp")))]
 pub mod mcp;
 #[cfg(feature = "skills")]
+#[cfg_attr(docsrs, doc(cfg(feature = "skills")))]
 pub mod skills;
 #[cfg(feature = "web")]
+#[cfg_attr(docsrs, doc(cfg(feature = "web")))]
 pub mod web;
 
 #[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
 pub mod observability;
 
 // ── Re-export modules from workspace crates ──────────────────────────
@@ -580,6 +589,7 @@ pub use user_interaction::{
 };
 
 #[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
 pub use observability::{
     CaptureDecision, CaptureKind, CaptureResult, ObservabilityStore, PayloadBundle,
 };
