@@ -43,6 +43,16 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Installation
 
+> **Note:** the published crates.io release currently lags this repository — a
+> newer release has not been cut yet. For the latest code, depend on it via git;
+> a plain `cargo add agent-sdk` installs the most recent *published* version,
+> which may not include everything documented here:
+>
+> ```toml
+> [dependencies]
+> agent-sdk = { git = "https://github.com/bipa-app/agent-sdk" }
+> ```
+
 Add the SDK to your project with Cargo:
 
 ```bash

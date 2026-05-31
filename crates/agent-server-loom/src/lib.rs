@@ -1,5 +1,5 @@
 //! Internal, test-only crate hosting scoped `loom` concurrency models
-//! for `agent-server`'s lock-free journal hot spots (Phase 11 · D).
+//! for `agent-server`'s lock-free journal hot spots.
 //!
 //! The crate has no public surface. Its sole purpose is to compile and
 //! run the `loom` models in `tests/loom_models.rs` under

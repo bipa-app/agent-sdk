@@ -106,7 +106,7 @@ pub struct ServiceHost {
     health: Arc<HealthSurface>,
     metrics: Arc<dyn MetricsRecorder>,
     shutdown: CancellationToken,
-    /// Phase 9 · E1: hold the `db.pool.connections.{active,idle}`
+    /// Hold the `db.pool.connections.{active,idle}`
     /// `ObservableGauge` handles for the host's lifetime so the
     /// callback registrations are not dropped early.  Empty unless
     /// the host was built with `--features otel` *and* the registry

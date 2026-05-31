@@ -69,7 +69,7 @@ env_logger = "0.11"
 proptest = "1"
 proptest-state-machine = "0.4"
 insta = { version = "1", features = ["json"] }
-# Exhaustive concurrency-permutation model checker (Phase 11 · D). Only
+# Exhaustive concurrency-permutation model checker. Only
 # compiled under `RUSTFLAGS="--cfg loom"`; never part of a normal build.
 loom = "0.7"
 # Provider Tier-B deterministic integration tests: a local HTTP server

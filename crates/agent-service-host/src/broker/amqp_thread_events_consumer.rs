@@ -355,8 +355,8 @@ impl AmqpThreadEventsConsumer {
         let routing_key = delivery.routing_key.as_str().to_owned();
         let delivery_tag = delivery.delivery_tag;
 
-        // Phase 9 · B5: time delivery → ack/nack so dashboards can
-        // see watch-side latency the same way they see wakeup-side.
+        // Time delivery → ack/nack so dashboards can see watch-side
+        // latency the same way they see wakeup-side.
         #[cfg(feature = "otel")]
         let started_at = std::time::Instant::now();
 

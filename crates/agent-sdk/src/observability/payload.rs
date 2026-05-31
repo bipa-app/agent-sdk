@@ -19,8 +19,8 @@
 //! Callers that do not need redaction — including existing call sites
 //! that have not adopted the detector yet — should use
 //! [`PayloadRedactor::noop`] (or the module-level free functions,
-//! which delegate to it). Bipa and other financial integrations
-//! should construct a redactor with
+//! which delegate to it). Financial and other PII-sensitive
+//! integrations should construct a redactor with
 //! [`agent_sdk_core::privacy::BaselineDetector`] or a custom
 //! detector.
 

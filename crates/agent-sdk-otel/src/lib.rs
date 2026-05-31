@@ -113,9 +113,9 @@ impl Drop for OtelGuard {
 /// Returns an error if the OTLP exporter cannot be built — the most
 /// common cause is a malformed endpoint URL.
 pub fn install_global_provider(cfg: &OtelConfig) -> Result<OtelGuard> {
-    // Phase 9 · C2: flip the SDK's process-wide payload-capture
-    // gate to match the operator's choice.  The gate defaults to
-    // closed; flipping it open still requires every store to
+    // Flip the SDK's process-wide payload-capture gate to match the
+    // operator's choice.  The gate defaults to closed; flipping it
+    // open still requires every store to
     // override `ObservabilityStore::acknowledge_pii_redaction()` to
     // return true before any payload reaches a span inline.
     agent_sdk::observability::set_payload_capture_enabled(cfg.capture_payloads);
@@ -151,8 +151,8 @@ pub fn install_global_provider(cfg: &OtelConfig) -> Result<OtelGuard> {
     global::set_tracer_provider(tracer_provider.clone());
     global::set_meter_provider(meter_provider.clone());
 
-    // Phase 9 · C3: wrap the upstream `BaggagePropagator` with an
-    // exact-match allow-list so non-allow-listed baggage entries
+    // Wrap the upstream `BaggagePropagator` with an exact-match
+    // allow-list so non-allow-listed baggage entries
     // never leave the process. An empty
     // `cfg.propagated_baggage_keys` falls back to the SDK baseline
     // (the five keys from `agent_sdk::observability::baggage`).

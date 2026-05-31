@@ -1074,7 +1074,7 @@ pub struct TurnOptions {
 /// let opts = RunOptions {
 ///     session_id: Some("thread-42".to_string()),
 ///     user_id: Some("user-7".to_string()),
-///     trace_name: Some("bipa.assistant.android".to_string()),
+///     trace_name: Some("myapp.assistant.mobile".to_string()),
 ///     trace_tags: vec!["mobile.android".to_string()],
 ///     trace_metadata: json!({"version": "1.2.3"})
 ///         .as_object()

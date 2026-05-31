@@ -357,8 +357,8 @@ impl AmqpTaskWakeupConsumer {
         let routing_key = delivery.routing_key.as_str().to_owned();
         let delivery_tag = delivery.delivery_tag;
 
-        // Phase 9 · B5: time delivery → ack/nack. Recorded once per
-        // delivery so the histogram reflects total round-trip cost
+        // Time delivery → ack/nack. Recorded once per delivery so
+        // the histogram reflects total round-trip cost
         // including handler work.
         #[cfg(feature = "otel")]
         let started_at = std::time::Instant::now();

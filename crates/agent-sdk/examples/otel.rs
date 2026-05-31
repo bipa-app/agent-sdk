@@ -73,7 +73,7 @@ impl ObservabilityStore for InlinePayloadStore {
         })
     }
 
-    // PRIVACY (Phase 9 · C2): this demo store does NOT override
+    // PRIVACY: this demo store does NOT override
     // `acknowledge_pii_redaction`, so the SDK forces every `Inline`
     // decision above down to `Omit` regardless of what `capture()`
     // returns. To actually capture payloads on spans:

@@ -1,4 +1,4 @@
-//! Process-wide payload-capture gate (Phase 9 · C2).
+//! Process-wide payload-capture gate.
 //!
 //! [`ObservabilityStore::capture`] may say
 //! [`CaptureDecision::Inline`] all it wants, but the SDK forces

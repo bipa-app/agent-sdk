@@ -57,13 +57,14 @@ A trace named `agent-sdk.otel-example` should appear in Langfuse within
 
 Set `OTEL_AGENT_SDK_CAPTURE_PAYLOADS=true` only if your `ObservabilityStore`
 implements `acknowledge_pii_redaction` — the SDK forces every `Inline`
-decision down to `Omit` otherwise. See [Phase 9 · C2](./PHASE_9_INVENTORY.md)
-for the gate.
+decision down to `Omit` otherwise. See the default-deny payload-capture gate
+described in [`OBSERVABILITY_INVENTORY.md`](./OBSERVABILITY_INVENTORY.md).
 
 ## 3. Where to go next
 
-- [`PHASE_9_INVENTORY.md`](./PHASE_9_INVENTORY.md) — every span / attribute /
-  metric the SDK emits today, plus the open gaps each Phase 9 card closes.
+- [`OBSERVABILITY_INVENTORY.md`](./OBSERVABILITY_INVENTORY.md) — every span /
+  attribute / metric the SDK emits today, plus the open gaps each work item
+  closes.
 - **A4 — Langfuse helpers.** Stamps `langfuse.observation.type` (`agent`,
   `generation`, `tool`, `chain`) on the right spans so the Langfuse UI groups
   them correctly.
@@ -122,7 +123,7 @@ into the SDK at the rev you installed.
 
 Once your binary calls
 `agent_sdk_otel::install_global_provider(OtelConfig::from_env()?)?` at
-startup (Phase 9 · E1), pointing it at the local collector is a single
+startup, pointing it at the local collector is a single
 env var:
 
 ```bash
@@ -131,8 +132,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p <your-binary>
 
 ## 6. Troubleshooting
 
-- **Port `4000`, `4317`, or `4318` already bound.** A parallel Bipa stack
-  (`bipa-langfuse`) or another collector probably has the port. Run
+- **Port `4000`, `4317`, or `4318` already bound.** Another Langfuse stack
+  or collector probably has the port. Run
   `docker compose ls` to confirm — the Compose project name is
   `agent-sdk-langfuse`. Stop the conflicting stack or remap the host ports
   in `docker-compose.yml`.
@@ -147,7 +148,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p <your-binary>
 - **ClickHouse takes a while to boot.** Especially on Apple silicon. The
   worker keeps retrying its migrations; give it 60 s before assuming
   something is wrong.
-- **Stack collides with Bipa's identical stack.** It shouldn't — the
-  Compose project name and named volumes are both prefixed `agent-sdk-`. If
-  `docker volume ls` shows both `langfuse_postgres` and
+- **Stack collides with another identical Langfuse stack.** It shouldn't —
+  the Compose project name and named volumes are both prefixed `agent-sdk-`.
+  If `docker volume ls` shows both `langfuse_postgres` and
   `agent_sdk_langfuse_postgres`, you're fine.

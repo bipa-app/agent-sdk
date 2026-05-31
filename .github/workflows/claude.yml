@@ -4,9 +4,15 @@ on:
     types: [created]
 jobs:
   claude-review:
+    # Public-repo safety: only run (and only expose secrets) for trusted actors.
+    # On a public repo anyone can comment, so gate on author_association before
+    # the OAuth token is ever available to the job.
     if: |
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/review')
+      contains(github.event.comment.body, '/review') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -42,10 +48,16 @@ jobs:
             Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
           claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
   claude-code:
+    # Public-repo safety: this job has write perms + checks out the (untrusted)
+    # PR head, so it must only run for trusted actors. Gate on author_association
+    # before the OAuth token / write permissions are exposed.
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@claude') &&
-      !contains(github.event.comment.body, '/review')
+      !contains(github.event.comment.body, '/review') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write

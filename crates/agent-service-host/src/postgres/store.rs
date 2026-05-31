@@ -112,7 +112,7 @@ impl PostgresDurableStore {
             pool_options = pool_options.after_connect(move |conn, _meta| {
                 let schema_name = schema_name.clone();
                 Box::pin(async move {
-                    // Phase 9 · B5: time the per-connection setup
+                    // Time the per-connection setup
                     // (search_path config) so the host can publish
                     // `db.client.connections.create_time`. sqlx 0.8
                     // does not expose a true `before_connect` hook;

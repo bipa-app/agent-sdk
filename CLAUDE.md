@@ -170,7 +170,7 @@ pub trait DataFetcher {
 1. **Use `anyhow::Result`** for all fallible functions
 2. **Use `time` crate** (not `chrono`) for datetime handling
 3. **Use `log`** for logging (with `kv_std` structured fields; matches the
-   pattern used in the Bipa monorepo where this SDK is integrated)
+   pattern used in the host application it integrates with)
 4. **Prefer inline full paths** for clarity: `llm::Message::user("hi")`
 5. **No unsafe code** - `#[forbid(unsafe_code)]` is enforced
 6. **Never use `unwrap()` or `expect()`** - Always propagate errors with `?` and add context:

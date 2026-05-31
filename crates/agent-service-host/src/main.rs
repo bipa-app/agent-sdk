@@ -69,8 +69,8 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?
         .block_on(async move {
-            // Phase 9 · E1: install the global OTel tracer + meter
-            // providers as soon as we are inside the runtime. Batch
+            // Install the global OTel tracer + meter providers as
+            // soon as we are inside the runtime. Batch
             // span / periodic metric exporters need a tokio runtime
             // for their flush tasks, so we deliberately stay inside
             // `block_on` rather than installing in `fn main`. The

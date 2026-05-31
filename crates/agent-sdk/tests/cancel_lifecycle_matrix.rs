@@ -1,7 +1,7 @@
 //! Cancellation + message-lifecycle edge-case matrix (Phase 11 · C).
 //!
-//! This file completes the cancellation/lifecycle matrix from
-//! `docs/OPEN_SOURCE_RELEASE_PLAN.md` §6.1. The already-merged Phase 10
+//! This file completes the cancellation + message-lifecycle edge-case
+//! matrix for Phase 11 · C. The already-merged Phase 10
 //! cards each landed one or two targeted regression tests
 //! (`cancel_mid_tool.rs`, `cancel_llm_streaming.rs`,
 //! `cancel_async_listen_timeout.rs`, `panic_isolation.rs`); this file

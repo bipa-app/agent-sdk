@@ -794,10 +794,9 @@ async fn open_attempt(
             provenance,
             request_blob,
             now,
-            // TODO(ENG-Phase-9-E1): once `agent-server` opts into
-            // OpenTelemetry, capture the live span context here so
-            // `call_llm_with_retry` can attach a `replay-of` link on
-            // the next attempt.  See A7 acceptance criteria.
+            // TODO: once `agent-server` opts into OpenTelemetry, capture
+            // the live span context here so `call_llm_with_retry` can attach
+            // a `replay-of` link on the next attempt.
             otel_trace_id: None,
             otel_span_id: None,
         })

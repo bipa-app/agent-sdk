@@ -204,7 +204,7 @@ impl ObservabilityStore for InlinePayloadStore {
     }
 }
 
-/// Phase 9 · C2 test double: same `Inline` decisions as
+/// Payload-capture-gate test double: same `Inline` decisions as
 /// [`InlinePayloadStore`] but with the PII attestation flipped to
 /// `true`. Used to prove the gate's two-prong AND semantics.
 struct AttestingInlinePayloadStore;
@@ -224,7 +224,7 @@ impl ObservabilityStore for AttestingInlinePayloadStore {
     }
 }
 
-/// Phase 9 · C2 test double: returns `Reference` for every
+/// Payload-capture-gate test double: returns `Reference` for every
 /// artifact. Confirms that externalized payloads pass through the
 /// gate untouched.
 struct ReferencingPayloadStore;
@@ -792,8 +792,8 @@ async fn turn_span_emits_cached_token_attributes() -> Result<()> {
 
 #[tokio::test]
 async fn inline_payload_store_without_attestation_records_no_payload_attributes() -> Result<()> {
-    // Phase 9 · C2: a store that returns `Inline` for everything
-    // but does not override `acknowledge_pii_redaction()` should
+    // A store that returns `Inline` for everything but does not
+    // override `acknowledge_pii_redaction()` should
     // see all of its decisions downgraded to `Omit` by the
     // process-wide payload-capture gate. This is the privacy
     // default-deny — the SDK never trusts an opt-in store unless

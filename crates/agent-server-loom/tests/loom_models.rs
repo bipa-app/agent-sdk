@@ -1,4 +1,4 @@
-//! Scoped `loom` models for the journal's lock-free hot spots (Phase 11 · D).
+//! Scoped `loom` models for the journal's lock-free hot spots.
 //!
 //! `loom` exhaustively permutes every legal thread interleaving and
 //! memory ordering for the code under test, catching atomicity bugs that
