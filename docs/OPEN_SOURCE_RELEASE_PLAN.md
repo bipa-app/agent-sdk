@@ -1,6 +1,6 @@
 # Agent SDK — Open-Source Release Plan & Execution Log
 
-**Status:** Active · **Last updated:** 2026-05-30 · **Linear project:** [Server SDK](https://linear.app/bipa/project/server-sdk-1f17d8469d74)
+**Status:** Active · **Last updated:** 2026-05-30 · **Tracker:** Server SDK (internal)
 
 This is the plan of record **and** the running execution log for re-open-sourcing the Agent SDK. It is the document an engineer or coding agent reads to pick up any task cold, and the document they update when work lands.
 

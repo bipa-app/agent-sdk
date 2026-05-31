@@ -1,6 +1,6 @@
 -- =====================================================================
 -- 0002_event_journal_outbox.sql
--- Event Journal and Transactional Outbox Storage Extensions
+-- ENG-7986: Event Journal and Transactional Outbox Storage Extensions
 -- =====================================================================
 --
 -- Extends the durable core with three new surfaces:
