@@ -297,10 +297,19 @@ mod in_memory_bundle {
             lease: &LeaseId,
             specs: Vec<ChildSpawnSpec>,
             payload: SuspensionPayload,
+            child_otel_traceparent: Option<String>,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, Vec<AgentTask>)> {
             self.task
-                .spawn_tool_children(parent_id, worker, lease, specs, payload, now)
+                .spawn_tool_children(
+                    parent_id,
+                    worker,
+                    lease,
+                    specs,
+                    payload,
+                    child_otel_traceparent,
+                    now,
+                )
                 .await
         }
         async fn spawn_subagent_invocation(
@@ -1004,6 +1013,7 @@ async fn case_delete_cascades_main_to_subkeys<S: JournalStore>(store: &S) -> Res
             ChildSpawnSpec { max_attempts: 3 },
         ],
         empty_suspension(&thread),
+        None,
         t_plus(3),
     )
     .await?;
@@ -1088,6 +1098,7 @@ async fn case_subkey_vs_main_count_separation<S: JournalStore>(store: &S) -> Res
             ChildSpawnSpec { max_attempts: 3 },
         ],
         empty_suspension(&thread),
+        None,
         t_plus(3),
     )
     .await?;

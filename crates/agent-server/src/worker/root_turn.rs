@@ -528,18 +528,6 @@ async fn execute_root_turn_inner(
     .await
     .context("open turn attempt")?;
 
-    // Re-parent this task's `chat` spans (the LLM call + any retries)
-    // under the root span for the remainder of `execute_root_turn_inner`.
-    // The guard drops on return (suspend or commit). Child tool tasks and
-    // the resume path re-parent independently via the persisted ids.
-    #[cfg(feature = "otel")]
-    let _root_span_guard = root_otel_ids
-        .as_ref()
-        .and_then(|(trace, span)| {
-            agent_sdk::observability::loop_instrument::remote_parent_context(trace, span)
-        })
-        .map(opentelemetry::Context::attach);
-
     #[cfg(feature = "otel")]
     crate::observability::ServerMetrics::global()
         .record_task_acquired(crate::observability::attrs::KIND_ROOT);
@@ -624,11 +612,7 @@ async fn execute_root_turn_inner(
     .await
     .context("build chat request")?;
 
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = call_llm_with_retry(LlmRetryParams {
+    let llm_call = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
         user_input: &user_input,
@@ -639,8 +623,31 @@ async fn execute_root_turn_inner(
         deps,
         thread_id,
         now,
-    })
-    .await?;
+    });
+    // Re-parent the turn's `chat` span(s) under the root `invoke_agent`
+    // span. `with_context` propagates the parent per-poll — a held
+    // `ContextGuard` across this `.await` would make the worker future
+    // `!Send` and unspawnable.
+    #[cfg(feature = "otel")]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = {
+        use opentelemetry::trace::FutureExt;
+        match root_otel_ids.as_ref().and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(trace, span)
+        }) {
+            Some(cx) => llm_call.with_context(cx).await?,
+            None => llm_call.await?,
+        }
+    };
+    #[cfg(not(feature = "otel"))]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = llm_call.await?;
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
@@ -2418,18 +2425,32 @@ async fn apply_batch_routing(
             Ok((batch.parent_task, invocation_tasks))
         }
         super::subagent_spawn_selector::BatchRouting::AllTools
-        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
-            .task_store
-            .spawn_tool_children(
-                task_id,
-                &inputs.bootstrap.worker_id,
-                &inputs.bootstrap.lease_id,
-                specs,
-                payload,
-                now,
-            )
-            .await
-            .context(tool_children_context),
+        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => {
+            // Stamp each child tool task with the turn's root
+            // `invoke_agent` span as its trace parent (loaded from the
+            // first attempt) so the child's `execute_tool` span nests
+            // under the turn root rather than the inbound client span.
+            #[cfg(feature = "otel")]
+            let child_otel_traceparent = load_root_span_ids(deps.attempt_store, task_id)
+                .await
+                .and_then(|(trace, span)| {
+                    agent_sdk::observability::loop_instrument::traceparent_from_ids(&trace, &span)
+                });
+            #[cfg(not(feature = "otel"))]
+            let child_otel_traceparent: Option<String> = None;
+            deps.task_store
+                .spawn_tool_children(
+                    task_id,
+                    &inputs.bootstrap.worker_id,
+                    &inputs.bootstrap.lease_id,
+                    specs,
+                    payload,
+                    child_otel_traceparent,
+                    now,
+                )
+                .await
+                .context(tool_children_context)
+        }
     }
 }
 
@@ -2723,17 +2744,17 @@ pub async fn resume_root_turn(
         .await
         .context("open resume turn attempt")?;
 
-    // Re-parent the resumed `chat` span under the turn's root
-    // `invoke_agent` span (created on the fresh turn; ids persisted on
-    // the first attempt) so the resumed LLM call joins the same trace.
-    // The guard holds for the rest of the resume (LLM call + commit).
+    // Load the turn's root `invoke_agent` span context (created on the
+    // fresh turn; ids persisted on the first attempt) so the resumed LLM
+    // call's `chat` span joins the same trace. Applied via `with_context`
+    // on the call future below — never a held `ContextGuard`, which would
+    // make this future `!Send`.
     #[cfg(feature = "otel")]
-    let _root_span_guard = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
+    let resume_root_cx = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
         .await
         .and_then(|(trace, span)| {
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
-        })
-        .map(opentelemetry::Context::attach);
+        });
 
     // 2. Buffer the suspended messages (user prompt + assistant with
     //    tool calls) and tool-result messages into the staged stores.
@@ -2788,11 +2809,7 @@ pub async fn resume_root_turn(
     //    IDs lazily during streaming so the per-delta TextDelta /
     //    ThinkingDelta events match the consolidated `Text` /
     //    `Thinking` events committed at turn close.
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = call_llm_with_retry(LlmRetryParams {
+    let llm_call = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
         user_input: &resume_input,
@@ -2803,8 +2820,25 @@ pub async fn resume_root_turn(
         deps,
         thread_id,
         now,
-    })
-    .await?;
+    });
+    #[cfg(feature = "otel")]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = {
+        use opentelemetry::trace::FutureExt;
+        match resume_root_cx {
+            Some(cx) => llm_call.with_context(cx).await?,
+            None => llm_call.await?,
+        }
+    };
+    #[cfg(not(feature = "otel"))]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = llm_call.await?;
     let commit_now = OffsetDateTime::now_utc();
 
     let prior = ResumeContext {

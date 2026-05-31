@@ -929,6 +929,7 @@ pub trait AgentTaskStore: Send + Sync {
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
+        child_otel_traceparent: Option<String>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)>;
 
@@ -2701,6 +2702,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
+        child_otel_traceparent: Option<String>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -2759,6 +2761,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                     .context("spawn rejected: new_child failed")?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
+            // Re-parent the child's spans under the turn's root
+            // `invoke_agent` span (not the inherited inbound client span)
+            // so its `execute_tool` span nests under the turn.
+            child.otel_traceparent = child_otel_traceparent.clone();
             if inner.by_id.contains_key(&child.id)
                 || children.iter().any(|existing| existing.id == child.id)
             {

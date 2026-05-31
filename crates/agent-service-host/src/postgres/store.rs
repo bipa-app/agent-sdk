@@ -2826,6 +2826,7 @@ FOR UPDATE SKIP LOCKED
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
+        child_otel_traceparent: Option<String>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -2845,6 +2846,7 @@ FOR UPDATE SKIP LOCKED
                     .context("spawn rejected: new_child failed")?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
+            child.otel_traceparent = child_otel_traceparent.clone();
             let existing = Self::load_task_tx(&mut tx, &child.id, false).await?;
             if existing.is_some()
                 || children
