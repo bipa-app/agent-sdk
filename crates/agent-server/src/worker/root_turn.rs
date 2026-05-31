@@ -919,12 +919,12 @@ async fn load_root_span_ids(
     task_id: &AgentTaskId,
 ) -> Option<(String, String)> {
     let attempts = attempt_store.list_by_task(task_id).await.ok()?;
-    attempts
-        .into_iter()
-        .find_map(|attempt| match (attempt.otel_trace_id, attempt.otel_span_id) {
+    attempts.into_iter().find_map(
+        |attempt| match (attempt.otel_trace_id, attempt.otel_span_id) {
             (Some(trace_id), Some(span_id)) => Some((trace_id, span_id)),
             _ => None,
-        })
+        },
+    )
 }
 
 async fn build_chat_request(
@@ -2740,9 +2740,16 @@ pub async fn resume_root_turn(
     //    "this attempt is a resume" looks like in the audit row.
     let resume_input = super::user_input::UserInput::resume();
     let resume_audit = resume_input.audit_summary();
-    let attempt = open_attempt(&inputs, definition, &resume_audit, deps.attempt_store, now, None)
-        .await
-        .context("open resume turn attempt")?;
+    let attempt = open_attempt(
+        &inputs,
+        definition,
+        &resume_audit,
+        deps.attempt_store,
+        now,
+        None,
+    )
+    .await
+    .context("open resume turn attempt")?;
 
     // Load the turn's root `invoke_agent` span context (created on the
     // fresh turn; ids persisted on the first attempt) so the resumed LLM
