@@ -243,7 +243,7 @@ impl ChatRequest {
 
     /// Set the extended-thinking configuration.
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
@@ -550,7 +550,10 @@ mod tests {
         let req = req
             .with_max_tokens(1234)
             .with_tool_choice(ToolChoice::Auto)
-            .with_response_format(ResponseFormat::new("r", serde_json::json!({"type": "object"})))
+            .with_response_format(ResponseFormat::new(
+                "r",
+                serde_json::json!({"type": "object"}),
+            ))
             .with_session_id("s-1");
         assert_eq!(req.max_tokens, 1234);
         assert!(req.max_tokens_explicit);

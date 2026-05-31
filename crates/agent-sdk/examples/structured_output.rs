@@ -35,7 +35,17 @@ struct Person {
 /// A stub provider that replies with a forced `respond` tool-call carrying a
 /// schema-valid object. Reports `ToolForcing` support (the default), so the
 /// structured runner reads the value out of the tool call.
-struct StubProvider;
+struct StubProvider {
+    model: String,
+}
+
+impl StubProvider {
+    fn new() -> Self {
+        Self {
+            model: "stub-model".to_string(),
+        }
+    }
+}
 
 #[async_trait]
 impl LlmProvider for StubProvider {
@@ -66,7 +76,7 @@ impl LlmProvider for StubProvider {
         }))
     }
     fn model(&self) -> &str {
-        "stub-model"
+        &self.model
     }
     fn provider(&self) -> &'static str {
         "stub"
@@ -93,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_response_format(ResponseFormat::new("person", schema));
 
-    let out = run_structured(&StubProvider, request, StructuredConfig::default()).await?;
+    let out = run_structured(&StubProvider::new(), request, StructuredConfig::default()).await?;
 
     // `out.value` is guaranteed schema-valid; deserialize into the Rust type.
     let person: Person = serde_json::from_value(out.value.clone())?;
