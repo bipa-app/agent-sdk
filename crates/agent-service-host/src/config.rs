@@ -400,7 +400,7 @@ impl Default for TransportConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Admission back-pressure + input limits (Phase 10 · E)
+// Admission back-pressure + input limits
 // ─────────────────────────────────────────────────────────────────────
 
 /// gRPC admission back-pressure and input-size limits.
@@ -453,7 +453,7 @@ impl Default for AdmissionConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Relay (Phase 8.2: AMQP outbox relay)
+// Relay (AMQP outbox relay)
 // ─────────────────────────────────────────────────────────────────────
 
 /// Outbox relay and broker configuration.
@@ -596,7 +596,7 @@ impl RetentionConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Observability (Phase 9 · E1)
+// Observability
 // ─────────────────────────────────────────────────────────────────────
 
 /// `OpenTelemetry` configuration for the host binary.
@@ -662,12 +662,11 @@ pub struct ObservabilityConfig {
     pub sample_ratio: Option<f64>,
     /// Baggage keys allowed to leave the process via the W3C baggage
     /// propagator.  Empty falls back to
-    /// `AllowListBaggagePropagator::baseline_allow_list()` (Phase 9 ·
-    /// C3).
+    /// `AllowListBaggagePropagator::baseline_allow_list()`.
     #[serde(default)]
     pub propagated_baggage_keys: Vec<String>,
     /// Whether `gen_ai.input.messages` / `gen_ai.output.messages` may
-    /// be captured as span attributes.  Default-deny per Phase 9 · C2.
+    /// be captured as span attributes.  Default-deny.
     pub capture_payloads: bool,
 }
 
@@ -1075,9 +1074,9 @@ watch:
         Ok(())
     }
 
-    // ── Phase 9 · E1: observability ─────────────────────────────────
+    // ── observability ───────────────────────────────────────────────
 
-    // ── Phase 10 · E: admission back-pressure + input limits ────────
+    // ── admission back-pressure + input limits ──────────────────────
 
     #[test]
     fn admission_defaults_are_finite_but_generous() {

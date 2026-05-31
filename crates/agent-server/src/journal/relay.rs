@@ -1,6 +1,6 @@
 //! Outbox relay: publisher and worker abstractions.
 //!
-//! Phase 8.1 splits the relay path into the four trait layers shown in
+//! The relay path is split into the four trait layers shown in
 //! [`super::broker`].  This module owns the middle two:
 //!
 //! - [`Publisher`] decodes a row's advisory payload and forwards it to
@@ -12,9 +12,8 @@
 //! [`super::event_outbox_transaction::AtomicEventOutboxCommitter`] for
 //! task-journal mutations:
 //! same-transaction insertion of a `task_wakeup` row when a task
-//! becomes runnable.  The trait ships in 8.1; durable backends will
-//! implement it in subsequent phases as the task journal acquires the
-//! necessary commit hooks.
+//! becomes runnable.  Durable backends implement it as the task
+//! journal acquires the necessary commit hooks.
 //!
 //! # Why these abstractions are traits
 //!
@@ -30,8 +29,8 @@
 //!
 //! `OutboxRelayWorker::tick` retries failures with a caller-provided
 //! [`RetryBackoff`] strategy.  The default
-//! [`RetryBackoff::fixed_seconds`] keeps things simple; downstream
-//! Phase 8.2 work will switch to exponential backoff once production
+//! [`RetryBackoff::fixed_seconds`] keeps things simple; a later
+//! iteration may switch to exponential backoff once production
 //! data shapes are known.
 
 use std::sync::Arc;
@@ -52,8 +51,8 @@ use super::outbox_message::{OutboxMessage, OutboxMessageKind};
 /// Backoff strategy used to compute the next attempt timestamp for a
 /// failed outbox row.
 ///
-/// Kept intentionally simple in 8.1; Phase 8.2 will likely replace this
-/// with an exponential or jittered variant.
+/// Kept intentionally simple for now; a later iteration may replace
+/// this with an exponential or jittered variant.
 #[derive(Clone, Copy, Debug)]
 pub enum RetryBackoff {
     /// Wait the same amount of wall-clock time after every failure.
@@ -277,11 +276,11 @@ pub const TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS: u32 = 3;
 /// If the surrounding transaction rolls back, the wakeup row MUST NOT
 /// become visible.
 ///
-/// Phase 8.1 ships only the trait and the in-memory implementation.
+/// Currently only the trait and the in-memory implementation ship.
 /// Durable backends (`Postgres`, `SQLite`) will gain implementations
-/// as the task-journal commit hooks are extended in subsequent
-/// phases — at which point the worker code that admits / promotes
-/// tasks calls this emitter inside the same transaction.
+/// as the task-journal commit hooks are extended — at which point the
+/// worker code that admits / promotes tasks calls this emitter inside
+/// the same transaction.
 #[async_trait]
 pub trait TaskWakeupEmitter: Send + Sync {
     async fn emit_in_transaction(&self, trigger: TaskWakeupTrigger) -> Result<OutboxRowId>;

@@ -1,4 +1,4 @@
-//! Phase 9 · C3 — integration tests for the global baggage allow-list.
+//! Integration tests for the global baggage allow-list.
 //!
 //! Drives [`agent_sdk_otel::install_global_provider`] end-to-end and
 //! exercises the resulting global propagator against a `HashMap`

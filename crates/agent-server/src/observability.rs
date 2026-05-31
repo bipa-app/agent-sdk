@@ -21,14 +21,14 @@
 //! Every instrument is namespaced under `agent_server.*` so
 //! dashboards and alerts can correlate a metric with the durable
 //! `agent-server` codepaths without translation. The `gen_ai.*`
-//! namespace is reserved for the LLM client (B1) and is never
+//! namespace is reserved for the LLM client and is never
 //! touched here.
 //!
 //! ## Workers and the host boundary
 //!
 //! `agent-server` does not own a worker pool — the actual worker
 //! lifecycle (spawn, register, shutdown) lives in the
-//! `agent-service-host` crate (E1) and Bipa's host shim. The
+//! `agent-service-host` crate and the host application's shim. The
 //! [`ServerMetrics::worker_started`] and [`ServerMetrics::worker_stopped`]
 //! helpers are exposed here so those host crates can adjust the
 //! shared `agent_server.workers.active` `UpDownCounter` without
@@ -45,8 +45,8 @@
 //! responsible for any TTL caching needed to keep durable backends
 //! (typically Postgres) from being stampeded by the meter export
 //! interval. The in-memory test path uses a trivial closure over a
-//! `HashMap` walk; B5 will pass a Postgres-backed closure with the
-//! 5 s TTL the card calls for.
+//! `HashMap` walk; the host wiring passes a Postgres-backed closure
+//! with a short TTL.
 
 use std::sync::{Arc, RwLock};
 
@@ -88,7 +88,7 @@ const WATCH_LAG_BUCKETS_MS: &[f64] = &[1.0, 5.0, 25.0, 100.0, 500.0, 2_000.0, 10
 /// Stable string keys and values used as metric attributes.
 ///
 /// Centralised here so the dashboard / alert configuration in the
-/// `agent-service-host` and Bipa repos can reference the same
+/// `agent-service-host` crate and the host application can reference the same
 /// constants instead of re-typing magic strings.
 pub mod attrs {
     /// Task kind: `root` / `subagent` / `tool` / `listen`.

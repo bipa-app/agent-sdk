@@ -1,5 +1,5 @@
-//! Phase 4–5 workers: agent-definition resolution, root-task
-//! bootstrapping, and tool-runtime child-task execution.
+//! Workers: agent-definition resolution, root-task bootstrapping, and
+//! tool-runtime child-task execution.
 //!
 //! This module defines the server-owned [`AgentDefinition`] that replaces
 //! the SDK-local [`AgentConfig`](agent_sdk_core::AgentConfig) for the
@@ -11,9 +11,9 @@
 //! [`resolve_bootstrap_context`] is the single function a worker calls
 //! after acquiring a root-turn task. It validates the task, resolves
 //! its definition from the registry, and produces a
-//! [`WorkerBootstrapContext`] that later Phase 4 slices consume.
+//! [`WorkerBootstrapContext`] that later worker stages consume.
 //!
-//! # Tool-runtime entry point (Phase 5.1)
+//! # Tool-runtime entry point
 //!
 //! [`resolve_tool_bootstrap`] is the corresponding function for
 //! tool-runtime child tasks. It reads the parent task's durable state
@@ -21,7 +21,7 @@
 //! [`execute_tool_task`] drives the child to completion or failure
 //! through the journal.
 //!
-//! # Guarded execution (Phase 5.2)
+//! # Guarded execution
 //!
 //! [`guarded_tool_execution`] wraps [`execute_tool_task`] with the
 //! durable execution-intent guard. Side-effecting and resumable tools
@@ -30,7 +30,7 @@
 //! The [`classify_tool_effect`] helper determines a tool's
 //! [`ToolEffectClass`] from its [`PendingToolCallInfo`] metadata.
 //!
-//! # Confirmation pause/resume (Phase 5.3)
+//! # Confirmation pause/resume
 //!
 //! [`pause_tool_for_confirmation`] pauses a running tool-runtime
 //! child task for user confirmation. [`apply_confirmation_decision`]
@@ -38,7 +38,7 @@
 //! [`resume_confirmed_tool`] re-checks authoritative policy via
 //! [`ConfirmationPolicy`] before executing through the guarded path.
 //!
-//! # Parent resume from durable child outcomes (Phase 5.4)
+//! # Parent resume from durable child outcomes
 //!
 //! [`aggregate_child_outcomes`] reads child task rows from the
 //! journal and maps each terminal child to a deterministic
@@ -47,17 +47,17 @@
 //! entry point for journal-driven parent resume after all child
 //! tool tasks reach terminal states.
 //!
-//! # Durable subagent spawn contract (Phase 7.1)
+//! # Durable subagent spawn contract
 //!
 //! [`resolve_subagent_spec`] is the server-authoritative entry point
 //! for durable subagent spawn resolution. It takes a typed
 //! [`SubagentSpawnRequest`], narrows it through inherited parent
 //! constraints plus a [`SubagentSpawnPolicy`], and returns exactly one
-//! [`EffectiveSubagentSpec`] that later phases can use when creating
+//! [`EffectiveSubagentSpec`] that later stages can use when creating
 //! child threads and invocation tasks.
 //!
-//! Phase 7.2 adds [`spawn_subagent_invocation`], which turns that
-//! authoritative spec into durable task/thread records.
+//! [`spawn_subagent_invocation`] turns that authoritative spec into
+//! durable task/thread records.
 //!
 //! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
 //!
@@ -156,14 +156,14 @@ pub use tool_task::{
 };
 pub use user_input::{UserInput, user_input_from_submitted};
 
-// Phase 5.2: re-export durable execution intent from journal.
+// Re-export durable execution intent from journal.
 pub use crate::journal::execution_intent::{
     ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
     RetryDecision, ToolEffectClass, check_retry_safety, classify_tool_effect,
     guarded_tool_execution,
 };
 
-// Phase 5.3: re-export confirmation types and functions.
+// Re-export confirmation types and functions.
 pub use confirmation::{
     CONFIRMATION_POLICY_DENIED_PREFIX, CONFIRMATION_REJECTED_PREFIX, CONFIRMATION_TIMEOUT_PREFIX,
     ConfirmationDecision, ConfirmationDecisionOutcome, ConfirmationPolicy,

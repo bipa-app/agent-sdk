@@ -57,11 +57,12 @@ should see the `invoke_agent` root span with its `chat <model>`,
 
 In Grafana → **Explore** → **Prometheus**, query
 `agent_sdk_gen_ai_client_token_usage_count` (or any other metric the
-SDK emits — see [`PHASE_9_INVENTORY.md`](./PHASE_9_INVENTORY.md) §4) to
-confirm the histogram landed.
+SDK emits — see [`OBSERVABILITY_INVENTORY.md`](./OBSERVABILITY_INVENTORY.md)
+§4) to confirm the histogram landed.
 
 The starter dashboard for token usage / operation duration / tool
-outcomes lands in [Phase 9 · D3](./PHASE_9_INVENTORY.md). Until then
+outcomes lands in work item D3 (see
+[`OBSERVABILITY_INVENTORY.md`](./OBSERVABILITY_INVENTORY.md)). Until then
 the **Agent SDK** folder in Grafana will be empty.
 
 ## 3. Run both stacks together

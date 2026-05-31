@@ -186,8 +186,7 @@ pub fn langfuse_trace_output(event: &AgentEvent) -> Option<String> {
 }
 
 /// Label used to group an event chunk inside the accumulator buffer
-/// (`[Assistant]`, `[Tool Result]`, …). Lifted from Bipa's
-/// `langfuse_trace_event_label`.
+/// (`[Assistant]`, `[Tool Result]`, …).
 #[must_use]
 pub const fn langfuse_trace_event_label(event: &AgentEvent) -> &'static str {
     match event {

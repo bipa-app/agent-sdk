@@ -288,7 +288,7 @@ impl BrokerAdapter for AmqpBrokerAdapter {
             // to disk before acking when the target queue is durable.
             .with_delivery_mode(2);
 
-        // Phase 9 · B5: time the publish + confirm round-trip and
+        // Time the publish + confirm round-trip and
         // record `agent_service_host.amqp.publish.duration` with an
         // `outcome` attribute. The metric is feature-gated; default
         // builds elide the timer entirely.

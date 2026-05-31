@@ -89,7 +89,7 @@ async fn install_with_grpc_endpoint_succeeds() -> Result<()> {
     Ok(())
 }
 
-/// Phase 9 · C2: `install_global_provider` must propagate the
+/// `install_global_provider` must propagate the
 /// operator-level `capture_payloads` flag onto the SDK's
 /// process-wide gate so `agent_sdk::observability` knows whether
 /// `Inline` payload decisions can land on spans. The gate is OFF

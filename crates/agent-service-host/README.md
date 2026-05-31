@@ -75,7 +75,7 @@ storage even if an operator replays or exports audit history.
 
 ## Run with observability
 
-Phase 9 · E1 wires the
+The host wires the
 [`agent-sdk-otel`](../agent-sdk-otel) bootstrap helper into the host
 binary so a single config section turns on traces + metrics.
 
@@ -128,8 +128,8 @@ first batch of metrics.
 | `observability.otlp_headers`              | `OTEL_EXPORTER_OTLP_HEADERS`        | empty                                         |
 | `observability.sampler`                   | `OTEL_TRACES_SAMPLER`               | `parentbased_traceidratio`                    |
 | `observability.sample_ratio`              | `OTEL_TRACES_SAMPLER_ARG`           | `1.0`                                         |
-| `observability.propagated_baggage_keys`   | —                                   | baseline allow-list (Phase 9 · C3)            |
-| `observability.capture_payloads`          | —                                   | `false` (default-deny per Phase 9 · C2)       |
+| `observability.propagated_baggage_keys`   | —                                   | baseline allow-list                           |
+| `observability.capture_payloads`          | —                                   | `false` (default-deny)                        |
 
 Resolution order: env vars are read first, then YAML overrides any
 field that is set explicitly. This keeps containerised deploys

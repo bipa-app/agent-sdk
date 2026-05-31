@@ -896,8 +896,8 @@ async fn capture_llm_payloads<P>(
 
     match observability_store.capture(&bundle).await {
         Ok(result) => {
-            // Phase 9 · C2: enforce the default-deny privacy gate
-            // before any payload reaches the span.  `Inline`
+            // Enforce the default-deny privacy gate before any
+            // payload reaches the span.  `Inline`
             // decisions only land when *both* the operator-level
             // capture flag is on (via `OtelConfig::capture_payloads`)
             // *and* the store has explicitly attested PII safety

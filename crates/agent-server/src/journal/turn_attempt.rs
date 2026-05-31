@@ -243,7 +243,7 @@ pub struct TurnAttempt {
     /// Wall-clock duration in milliseconds. `None` while open.
     pub duration_ms: Option<u64>,
 
-    // ── OTel correlation (Phase 9 · A7) ─────────────────────────
+    // ── OTel correlation ────────────────────────────────────────
     /// Hex-encoded `OTel` `TraceId` of the live span at attempt-open.
     ///
     /// Captured from `Context::current().span().span_context()` when
@@ -845,7 +845,7 @@ mod tests {
         Ok(())
     }
 
-    // ── OTel correlation (Phase 9 · A7) ──────────────────────────
+    // ── OTel correlation ─────────────────────────────────────────
 
     #[test]
     fn open_attempt_defaults_otel_ids_to_none() {

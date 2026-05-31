@@ -38,8 +38,8 @@
 //! `claim_pending → publish → mark_delivered` sequence.  If the worker
 //! crashes between the broker ack and the `mark_delivered` write, the
 //! row stays in `Claimed` forever unless someone reclaims it.  That is
-//! what [`OutboxStore::reclaim_expired_claims`] — added in Phase 8.2 —
-//! does, and it runs here under two triggers:
+//! what [`OutboxStore::reclaim_expired_claims`] does, and it runs here
+//! under two triggers:
 //!
 //! 1. **On startup**, with the configured `claim_lease`, so rows
 //!    abandoned by a previously-crashed worker are reclaimed before
@@ -97,8 +97,7 @@ pub struct RelaySchedulerConfig {
     /// Interval between periodic claim-reclaim sweeps.
     pub reclaim_interval: StdDuration,
     /// Backoff applied to failed publishes.  Uses fixed delay by
-    /// default to match Phase 8.1's semantics; Phase 8.3 may upgrade
-    /// to exponential.
+    /// default; a later iteration may upgrade to exponential.
     pub retry_backoff: RetryBackoff,
 }
 
@@ -184,7 +183,7 @@ impl RelayScheduler {
     ///
     /// Internally wraps the adapter in the default [`BrokerPublisher`]
     /// and the default [`OutboxRelayWorker`] so callers never need to
-    /// compose the four Phase 8.1 layers by hand.
+    /// compose the four relay layers by hand.
     #[must_use]
     pub fn new(
         store: Arc<dyn OutboxStore>,

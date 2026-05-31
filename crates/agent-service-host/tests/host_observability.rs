@@ -1,4 +1,4 @@
-//! Integration coverage for Phase 9 · E1: the host's adoption of
+//! Integration coverage for the host's adoption of
 //! [`agent_sdk_otel::install_global_provider`] plus the
 //! `db.pool.connections.{active,idle}` gauge wiring through
 //! [`ServiceHost::new`].

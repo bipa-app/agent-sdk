@@ -74,9 +74,9 @@ impl AllowListBaggagePropagator {
     /// The five baseline keys the SDK considers safe to propagate by
     /// default.
     ///
-    /// Mirrors `agent_sdk::observability::baggage::PROPAGATED_KEYS`
-    /// (Track A3). Keep these two lists in lockstep when widening the
-    /// contract — see `PHASE_9_INVENTORY.md`.
+    /// Mirrors `agent_sdk::observability::baggage::PROPAGATED_KEYS`.
+    /// Keep these two lists in lockstep when widening the
+    /// contract — see `OBSERVABILITY_INVENTORY.md`.
     #[must_use]
     pub fn baseline_allow_list() -> Vec<String> {
         vec![

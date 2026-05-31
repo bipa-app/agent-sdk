@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — Default-deny payload capture (Phase 9 · C2).**
+- **BREAKING — Default-deny payload capture.**
   `ObservabilityStore::capture(...) -> CaptureDecision::Inline` no longer
   unconditionally lands payloads on the LLM span. The SDK now forces every
   `Inline` decision down to `Omit` unless **both** of these are true:

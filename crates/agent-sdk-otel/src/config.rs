@@ -67,15 +67,14 @@ pub struct OtelConfig {
     /// `ParentBasedTraceIdRatio`). Ignored otherwise.
     pub sample_ratio: f64,
     /// Baggage keys the propagator is allowed to forward across
-    /// process boundaries. The bootstrap helper currently installs the
-    /// upstream `BaggagePropagator` unfiltered; Track A3/C3 will wrap it
-    /// with an allow-list using these keys.
+    /// process boundaries. The bootstrap helper wraps the upstream
+    /// `BaggagePropagator` with an allow-list built from these keys.
     pub propagated_baggage_keys: Vec<String>,
     /// Whether `gen_ai.input.messages` / `gen_ai.output.messages` /
     /// `gen_ai.system_instructions` payloads may be captured on spans.
     /// The bootstrap helper itself does not consult this — it simply
     /// surfaces the flag so the rest of the SDK can read a single source
-    /// of truth. See Track C2.
+    /// of truth. See the default-deny payload-capture gate.
     pub capture_payloads: bool,
     /// Extra `Resource` attributes appended after the SDK defaults.
     /// Useful for `OTEL_RESOURCE_ATTRIBUTES` parity.

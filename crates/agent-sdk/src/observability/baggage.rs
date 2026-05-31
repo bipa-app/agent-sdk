@@ -38,7 +38,7 @@ pub const BAGGAGE_DEPLOYMENT_ENVIRONMENT: &str = "deployment.environment";
 /// Allow-list of baggage keys copied to every SDK-emitted span.
 ///
 /// Stays small on purpose. Adding new keys means widening the contract
-/// reviewers verify against the inventory in `PHASE_9_INVENTORY.md`.
+/// reviewers verify against the inventory in `OBSERVABILITY_INVENTORY.md`.
 const PROPAGATED_KEYS: &[&str] = &[
     BAGGAGE_USER_ID,
     BAGGAGE_SESSION_ID,

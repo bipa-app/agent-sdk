@@ -23,7 +23,7 @@ name: agent-sdk-langfuse
 # without any post-install steps.
 #
 # Compose project name `agent-sdk-langfuse` keeps this stack distinct
-# from the parallel Bipa stack (`bipa-langfuse`); the volumes are
+# from any other Langfuse stack you may run; the volumes are
 # prefixed `agent_sdk_langfuse_*` for the same reason.
 
 x-langfuse-env: &langfuse-env

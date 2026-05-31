@@ -1642,8 +1642,8 @@ impl GrpcTransport {
             }
         });
 
-        // Phase 9 · B5: stamp `rpc.server.duration` on every
-        // inbound call when the `otel` feature is on. The cfg
+        // Stamp `rpc.server.duration` on every inbound call when
+        // the `otel` feature is on. The cfg
         // gate keeps the default build dependency-free; the layer
         // call is identical in either case.
         #[cfg(feature = "otel")]

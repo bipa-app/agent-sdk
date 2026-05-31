@@ -99,8 +99,9 @@ pub const LANGFUSE_OBSERVATION_METADATA_PREFIX: &str = "langfuse.observation.met
 
 /// Default character ceiling for trace-level free-text attributes.
 ///
-/// Mirrors Bipa's `truncate_langfuse_trace_text` so that the SDK and
-/// Bipa converge on the same number when E2 deletes the Bipa helper.
+/// Keeps trace-level free text bounded so a single attribute can't bloat a
+/// span; downstream hosts that truncate independently should converge on the
+/// same number.
 pub const DEFAULT_TRACE_TEXT_MAX_CHARS: usize = 10_000;
 
 // ── ObservationType ──────────────────────────────────────────────────
@@ -234,9 +235,6 @@ pub fn set_trace_tags(span: &mut BoxedSpan, tags: &[String]) {
 ///   unchanged.
 /// * `(s, 1)` for an over-long input returns `"…"`.
 /// * Otherwise the result is `s.chars().take(n - 1).collect::<String>() + "…"`.
-///
-/// This mirrors Bipa's `truncate_langfuse_trace_text` helper so the
-/// Bipa-side function becomes a deletion candidate in E2.
 #[must_use]
 pub fn truncate_trace_text(text: &str, max_chars: usize) -> String {
     if text.is_empty() || max_chars == 0 {

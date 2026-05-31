@@ -505,7 +505,7 @@ impl StoreRegistry {
     /// registry is backed by Postgres.
     ///
     /// Returns `None` for in-memory and `SQLite` backends. Used by
-    /// the host's observability bootstrap (Phase 9 · B5) to install
+    /// the host's observability bootstrap to install
     /// `db.pool.connections.{active,idle}` gauges. Default builds
     /// (without `feature = "otel"`) never need to call this — the
     /// accessor is feature-gated to avoid leaking the sqlx type

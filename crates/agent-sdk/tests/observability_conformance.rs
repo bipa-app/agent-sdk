@@ -1,6 +1,6 @@
-//! Phase 9 · F1 — Conformance + privacy integration tests.
+//! Conformance + privacy integration tests.
 //!
-//! Single-file, top-down assertion of the Track A/B/C contract:
+//! Single-file, top-down assertion of the observability contract:
 //!
 //! 1. **Span shape** — every SDK boundary emits the documented span
 //!    name + attributes + Langfuse `observation.type`.

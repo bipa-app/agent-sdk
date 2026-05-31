@@ -1,15 +1,14 @@
-# Phase 9 Observability Inventory
+# Observability Inventory
 
-> **Status:** Phase 9 · A1 — baseline inventory of what `agent-sdk` emits today
-> and the concrete gaps each Phase 9 child card has to close.
+> **Purpose:** A baseline inventory of what `agent-sdk` emits today and the
+> concrete gaps that remain to close. Use this doc to verify that an
+> instrumentation change actually fills the gap it claims to fill — tick the
+> inventory rather than re-deriving it from the source.
 >
-> **Audience:** Reviewers of every Phase 9 PR. Use this doc to verify that an
-> implementation card actually fills the gap it claims to fill — tick the
-> inventory rather than re-deriving it from the Bipa codebase.
->
-> **Scope:** SDK-side instrumentation only. Bipa-side gaps are tagged
-> `[bipa-only-but-should-move]` so the cut-over plan (E2) knows what the SDK
-> still has to grow before Bipa can drop its private overrides.
+> **Scope:** SDK-side instrumentation. A few attributes are tagged
+> `[host-only-but-should-move]` where the host application sets them today but
+> the helper should eventually ship from the SDK so the host can drop its
+> override.
 >
 > **Spec references:**
 > - OTel GenAI spans — <https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/>
@@ -43,8 +42,8 @@ version pulled from `CARGO_PKG_NAME` / `CARGO_PKG_VERSION` in
 1. `agent.turn` and the subagent `invoke_agent` are emitted **post-hoc** —
    started and ended in `record_turn_span` / `emit_subagent_observability`
    *after* the work has completed. They therefore record a near-zero duration
-   and have no live parent stack while the work runs. Track-A6 (span events)
-   or A7 (links) should restructure these to wrap their work properly.
+   and have no live parent stack while the work runs. Work item A6 (span
+   events) or A7 (links) should restructure these to wrap their work properly.
 2. The subagent `invoke_agent` span does **not** declare a parent link back to
    the caller's root `invoke_agent`, even though `subagent.rs` runs inside the
    parent's tokio task. Without an explicit
@@ -81,8 +80,8 @@ a pointer back into `attrs.rs`.
 ### Inline attributes set *outside* `attrs.rs`
 
 Three keys are set inline in [`crates/agent-sdk/src/mcp/client.rs`][mcp-client]
-without a constant in `attrs.rs`. Track-A6 should lift these into `attrs.rs`
-so all attribute keys live in one place:
+without a constant in `attrs.rs`. Work item A6 should lift these into
+`attrs.rs` so all attribute keys live in one place:
 
 - `mcp.server.name` — every MCP span.
 - `mcp.tools.count` — `mcp.tools/list` only, after success.
@@ -107,7 +106,7 @@ attributes by default, regardless of the `otel` feature flag.
 ## 3. Attributes we owe (per OTel GenAI semconv & Langfuse mapping)
 
 Each row identifies one missing attribute, the spans where it should appear,
-which Phase 9 card resolves it, and where the fix lives.
+which work item resolves it, and where the fix lives.
 
 | Missing attribute | Affected spans | Why we owe it | Fix lives in | Card |
 | --- | --- | --- | --- | --- |
@@ -131,15 +130,15 @@ which Phase 9 card resolves it, and where the fix lives.
 | `gen_ai.request.choice.count` | `chat <model>` | same | `[SDK]` | A6 |
 | `gen_ai.request.stream` (boolean) | `chat <model>` | We have `agent_sdk.llm.streaming`; spec wants the canonical `gen_ai.request.stream`. | `[SDK]` | A6 |
 | `error.type` on root span error outcome | `invoke_agent` (root) | `instrument::end_root_span` calls `set_span_error("agent_error", …)` only when `outcome=="error"`; the typed-error vocabulary does not match the spec's bucketed values (`timeout`, `rate_limit`, `cancelled`, `tool_failure`, …). | `[SDK]` | A6 |
-| `langfuse.observation.type` (`agent`, `generation`, `tool`, `chain`) | every span | Langfuse routes by this hint; today only Bipa sets it via custom processors. | `[SDK]` | A4 (Langfuse helpers) |
-| `langfuse.trace.name` | root `invoke_agent` | Set by Bipa today. Should ship from the SDK so Bipa can drop the override. | `[bipa-only-but-should-move]` → `[SDK]` | A5 (`RunOptions`) + A4 |
-| `langfuse.trace.input` | root `invoke_agent` | same | `[bipa-only-but-should-move]` → `[SDK]` | A5 + A4 |
-| `langfuse.trace.output` | root `invoke_agent` | same | `[bipa-only-but-should-move]` → `[SDK]` | A5 + A4 |
-| `langfuse.trace.tags` | root `invoke_agent` | same | `[bipa-only-but-should-move]` → `[SDK]` | A5 + A4 |
-| `langfuse.trace.public` | root `invoke_agent` | same | `[bipa-only-but-should-move]` → `[SDK]` | A5 + A4 |
-| `langfuse.trace.metadata.*` | root `invoke_agent` | same | `[bipa-only-but-should-move]` → `[SDK]` | A5 + A4 |
-| `langfuse.session.id` (via baggage) | every span | Bipa lifts `langfuse.session.id` out of `OTel` baggage today. The helper itself should live in the SDK. | `[bipa-only-but-should-move]` → `[SDK]` | A3 (baggage) + A4 |
-| `langfuse.user.id` (via baggage) | every span | same | `[bipa-only-but-should-move]` → `[SDK]` | A3 + A4 |
+| `langfuse.observation.type` (`agent`, `generation`, `tool`, `chain`) | every span | Langfuse routes by this hint; today it is only set by a host application via custom processors. | `[SDK]` | A4 (Langfuse helpers) |
+| `langfuse.trace.name` | root `invoke_agent` | Set by the host application today. Should ship from the SDK so the host can drop the override. | `[host-only-but-should-move]` → `[SDK]` | A5 (`RunOptions`) + A4 |
+| `langfuse.trace.input` | root `invoke_agent` | same | `[host-only-but-should-move]` → `[SDK]` | A5 + A4 |
+| `langfuse.trace.output` | root `invoke_agent` | same | `[host-only-but-should-move]` → `[SDK]` | A5 + A4 |
+| `langfuse.trace.tags` | root `invoke_agent` | same | `[host-only-but-should-move]` → `[SDK]` | A5 + A4 |
+| `langfuse.trace.public` | root `invoke_agent` | same | `[host-only-but-should-move]` → `[SDK]` | A5 + A4 |
+| `langfuse.trace.metadata.*` | root `invoke_agent` | same | `[host-only-but-should-move]` → `[SDK]` | A5 + A4 |
+| `langfuse.session.id` (via baggage) | every span | A host application lifts `langfuse.session.id` out of `OTel` baggage today. The helper itself should live in the SDK. | `[host-only-but-should-move]` → `[SDK]` | A3 (baggage) + A4 |
+| `langfuse.user.id` (via baggage) | every span | same | `[host-only-but-should-move]` → `[SDK]` | A3 + A4 |
 | `langfuse.observation.level` | every span | Spec: `DEBUG` / `DEFAULT` / `WARNING` / `ERROR`. | `[SDK]` | A4 |
 | `langfuse.observation.status_message` | every span | Free-form failure context for Langfuse status panels. | `[SDK]` | A4 |
 | `langfuse.observation.usage_details` | `chat <model>`, root `invoke_agent` | Required for Langfuse cost tables. | `[SDK]` | A4 |
@@ -183,7 +182,7 @@ and a new wiring site.
 ### 4.3 Agent-server metrics
 
 These live in the host crate (`agent-server`) but are listed here so the
-inventory covers the whole Phase 9 surface.
+inventory covers the whole observability surface.
 
 | Instrument | Type | Attributes | Fix lives in | Card |
 | --- | --- | --- | --- | --- |
@@ -212,7 +211,7 @@ inventory covers the whole Phase 9 surface.
 
 ---
 
-## 5. Phase 9 card map
+## 5. Work item map
 
 | Gap | Resolved by | Type |
 | --- | --- | --- |
@@ -234,14 +233,14 @@ inventory covers the whole Phase 9 surface.
 | Grafana stack | D2 | Dev env |
 | Starter dashboard JSON | D3 | Dev env |
 | Host adoption (`agent-service-host` wiring) | E1 | Adoption |
-| Bipa cut-over | E2 | Adoption (separate repo) |
+| Downstream host cut-over to SDK-shipped helpers | E2 | Adoption |
 | Tests | F1 | Tests |
 | Examples | F2 | Examples |
 | Docs | F3 | Docs |
 
-Every gap row in §3 and §4 ends in a card ID from this table, so a Track-B
-reviewer can read this doc once and verify their PR is complete by ticking
-off the rows tagged with their card.
+Every gap row in §3 and §4 ends in a work-item ID from this table, so a
+reviewer can read this doc once and verify a change is complete by ticking
+off the rows tagged with that work item.
 
 ---
 
