@@ -5,6 +5,8 @@
 //! Grafana, dashboards, eval helpers) plug in alongside it.
 //!
 //! ```bash
+//! agent-sdk run "What is the capital of France?"
+//! agent-sdk chat
 //! agent-sdk local-langfuse init
 //! agent-sdk local-langfuse up
 //! agent-sdk doctor
@@ -16,7 +18,7 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod embed;
 
-use commands::{doctor, local_langfuse};
+use commands::{agent, doctor, local_langfuse};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,6 +38,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run a single prompt against an LLM-backed agent and stream the reply to
+    /// stdout. Pick a backend with `--provider` (default `anthropic`); reads
+    /// that provider's credentials from the environment.
+    Run(agent::RunArgs),
+    /// Interactive chat with an LLM-backed agent; streams replies and keeps
+    /// conversation history for the session. Pick a backend with `--provider`
+    /// (default `anthropic`); reads that provider's credentials from the env.
+    Chat(agent::ChatArgs),
     /// Manage the local Langfuse + `OTel` collector dev stack.
     LocalLangfuse {
         #[command(subcommand)]
@@ -48,6 +58,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Run(args) => agent::run(args),
+        Command::Chat(args) => agent::chat(args),
         Command::LocalLangfuse { action } => local_langfuse::run(action),
         Command::Doctor(args) => doctor::run(args),
     }

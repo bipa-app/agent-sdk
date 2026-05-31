@@ -13,8 +13,11 @@ name = "agent-sdk"
 path = "src/main.rs"
 
 [dependencies]
+agent-sdk = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
