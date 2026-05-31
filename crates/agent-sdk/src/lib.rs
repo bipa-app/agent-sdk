@@ -8,6 +8,13 @@
 //! - Persist turn events for downstream consumers and UIs
 //! - Persist conversation history and state
 //!
+//! For task-oriented recipes — tools, typed tools, structured output,
+//! streaming, MCP (local + remote HTTP), durable serving, and
+//! human-in-the-loop — see the
+//! [cookbook](https://github.com/bipa-app/agent-sdk/blob/main/crates/agent-sdk/COOKBOOK.md)
+//! and the runnable
+//! [`examples/`](https://github.com/bipa-app/agent-sdk/tree/main/crates/agent-sdk/examples).
+//!
 //! ## Quick Start
 //!
 //! Ask a question and print the answer — the whole 30-second path:

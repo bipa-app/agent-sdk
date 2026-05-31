@@ -171,6 +171,14 @@ agent-sdk doctor                              # checks docker, ports, dest writa
 See `crates/agent-sdk/docs/observability/LANGFUSE.md` for the full
 setup walkthrough.
 
+## Cookbook
+
+Task-oriented recipes for every building block — tools, typed tools
+(`TypedTool`), structured output, streaming, MCP (local stdio + remote HTTP),
+durable serving, human-in-the-loop — live in
+[`crates/agent-sdk/COOKBOOK.md`](crates/agent-sdk/COOKBOOK.md), each backed by a
+runnable example under [`crates/agent-sdk/examples/`](crates/agent-sdk/examples).
+
 ## Quick Start
 
 Build an agent, run a prompt, and read the reply from the agent's event store.

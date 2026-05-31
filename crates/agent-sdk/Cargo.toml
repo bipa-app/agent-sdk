@@ -100,6 +100,10 @@ name = "typed_tool"
 path = "examples/typed_tool.rs"
 
 [[example]]
+name = "structured_output"
+path = "examples/structured_output.rs"
+
+[[example]]
 name = "mcp_filesystem"
 path = "examples/mcp_filesystem.rs"
 required-features = ["mcp"]
