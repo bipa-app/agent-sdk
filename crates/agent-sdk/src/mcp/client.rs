@@ -6,13 +6,19 @@ use std::sync::Arc;
 
 use super::protocol::JsonRpcRequest;
 use super::protocol::{
-    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, McpToolCallResult,
-    McpToolDefinition, ToolCallParams, ToolsListResult,
+    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, McpPrompt, McpResource,
+    McpToolCallResult, McpToolDefinition, PREFERRED_PROTOCOL_VERSION, PromptGetParams,
+    PromptGetResult, PromptsListResult, ResourceReadParams, ResourceReadResult,
+    ResourcesListResult, ToolCallParams, ToolsListResult, is_known_protocol_version,
 };
 use super::transport::McpTransport;
 
-/// MCP protocol version.
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP protocol revision this client advertises during `initialize`.
+///
+/// Retained as a public alias of [`PREFERRED_PROTOCOL_VERSION`] for backwards
+/// compatibility. The revision actually used for a connection is whatever the
+/// server selects during the handshake — see [`McpClient::protocol_version`].
+pub const MCP_PROTOCOL_VERSION: &str = PREFERRED_PROTOCOL_VERSION;
 
 /// MCP client for communicating with MCP servers.
 ///
@@ -38,6 +44,8 @@ pub struct McpClient<T: McpTransport> {
     transport: Arc<T>,
     server_name: String,
     server_info: Option<InitializeResult>,
+    /// Protocol revision selected by the server during `initialize`.
+    negotiated_version: Option<String>,
 }
 
 impl<T: McpTransport> McpClient<T> {
@@ -56,6 +64,7 @@ impl<T: McpTransport> McpClient<T> {
             transport,
             server_name,
             server_info: None,
+            negotiated_version: None,
         };
 
         client.initialize().await?;
@@ -72,6 +81,7 @@ impl<T: McpTransport> McpClient<T> {
             transport,
             server_name,
             server_info: None,
+            negotiated_version: None,
         }
     }
 
@@ -113,7 +123,7 @@ impl<T: McpTransport> McpClient<T> {
 
     async fn initialize_inner(&mut self) -> Result<()> {
         let params = InitializeParams {
-            protocol_version: MCP_PROTOCOL_VERSION.to_string(),
+            protocol_version: PREFERRED_PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
             client_info: ClientInfo {
                 name: "agent-sdk".to_string(),
@@ -131,6 +141,23 @@ impl<T: McpTransport> McpClient<T> {
             .transpose()
             .context("Failed to parse initialize response")?
             .context("Initialize response missing result")?;
+
+        // Honour the revision the server actually selected. The server may
+        // downgrade to an older revision (e.g. a legacy `2024-11-05` server);
+        // we adapt to its choice rather than insisting on our preference. An
+        // unrecognised revision is not fatal — proceed but log it.
+        let negotiated = result.protocol_version.clone();
+        if !is_known_protocol_version(&negotiated) {
+            log::warn!(
+                "MCP server '{}' negotiated unknown protocol revision '{}' (advertised '{}')",
+                self.server_name,
+                negotiated,
+                PREFERRED_PROTOCOL_VERSION,
+            );
+        }
+        // Inform the transport so out-of-band carriers (HTTP header) can use it.
+        self.transport.set_protocol_version(&negotiated).await;
+        self.negotiated_version = Some(negotiated);
 
         // Send initialized notification (fire-and-forget)
         let notification = JsonRpcRequest::new("notifications/initialized", None, 0);
@@ -150,6 +177,16 @@ impl<T: McpTransport> McpClient<T> {
     #[must_use]
     pub const fn server_info(&self) -> Option<&InitializeResult> {
         self.server_info.as_ref()
+    }
+
+    /// The MCP protocol revision negotiated with the server.
+    ///
+    /// Returns `None` until [`McpClient::initialize`] has completed. This is
+    /// the revision the *server* selected, which may be older than
+    /// [`PREFERRED_PROTOCOL_VERSION`] if the server is on a legacy build.
+    #[must_use]
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.negotiated_version.as_deref()
     }
 
     /// List available tools from the server.
@@ -290,6 +327,224 @@ impl<T: McpTransport> McpClient<T> {
     ) -> Result<McpToolCallResult> {
         let args = arguments.unwrap_or_else(|| json!({}));
         self.call_tool(name, args).await
+    }
+
+    /// List resources exposed by the server (`resources/list`).
+    ///
+    /// Resources are addressable data (files, database rows, API payloads) the
+    /// server makes available for reading. Returns an empty list if the server
+    /// did not advertise the `resources` capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>> {
+        if !self.supports_resources() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.resources/list", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
+
+        let result = self.list_resources_inner().await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_span(
+            &mut span,
+            &result,
+            "resources/list",
+            &self.server_name,
+            started_at,
+        );
+
+        result
+    }
+
+    async fn list_resources_inner(&self) -> Result<Vec<McpResource>> {
+        let request = JsonRpcRequest::new("resources/list", None, 0);
+        let response = self.transport.send(request).await?;
+        let result: ResourcesListResult = response
+            .result
+            .map(serde_json::from_value)
+            .transpose()
+            .context("Failed to parse resources/list response")?
+            .context("resources/list response missing result")?;
+        Ok(result.resources)
+    }
+
+    /// Read a resource by URI (`resources/read`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourceReadResult> {
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.resources/read", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
+
+        let result = self.read_resource_inner(uri).await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_span(
+            &mut span,
+            &result,
+            "resources/read",
+            &self.server_name,
+            started_at,
+        );
+
+        result
+    }
+
+    async fn read_resource_inner(&self, uri: &str) -> Result<ResourceReadResult> {
+        let params = ResourceReadParams {
+            uri: uri.to_string(),
+        };
+        let request =
+            JsonRpcRequest::new("resources/read", Some(serde_json::to_value(&params)?), 0);
+        let response = self.transport.send(request).await?;
+        let result: ResourceReadResult = response
+            .result
+            .map(serde_json::from_value)
+            .transpose()
+            .context("Failed to parse resources/read response")?
+            .context("resources/read response missing result")?;
+        Ok(result)
+    }
+
+    /// List prompts exposed by the server (`prompts/list`).
+    ///
+    /// Returns an empty list if the server did not advertise the `prompts`
+    /// capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
+        if !self.supports_prompts() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.prompts/list", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
+
+        let result = self.list_prompts_inner().await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_span(
+            &mut span,
+            &result,
+            "prompts/list",
+            &self.server_name,
+            started_at,
+        );
+
+        result
+    }
+
+    async fn list_prompts_inner(&self) -> Result<Vec<McpPrompt>> {
+        let request = JsonRpcRequest::new("prompts/list", None, 0);
+        let response = self.transport.send(request).await?;
+        let result: PromptsListResult = response
+            .result
+            .map(serde_json::from_value)
+            .transpose()
+            .context("Failed to parse prompts/list response")?
+            .context("prompts/list response missing result")?;
+        Ok(result.prompts)
+    }
+
+    /// Fetch and render a prompt by name (`prompts/get`).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Prompt name to fetch.
+    /// * `arguments` - Optional arguments to interpolate into the template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<PromptGetResult> {
+        #[cfg(feature = "otel")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "otel")]
+        let mut span = {
+            use crate::observability::langfuse;
+            let mut span = start_mcp_span("mcp.prompts/get", &self.server_name);
+            langfuse::tag_observation(&mut span, langfuse::ObservationType::Chain);
+            span
+        };
+
+        let result = self.get_prompt_inner(name, arguments).await;
+
+        #[cfg(feature = "otel")]
+        finish_mcp_span(
+            &mut span,
+            &result,
+            "prompts/get",
+            &self.server_name,
+            started_at,
+        );
+
+        result
+    }
+
+    async fn get_prompt_inner(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<PromptGetResult> {
+        let params = PromptGetParams {
+            name: name.to_string(),
+            arguments,
+        };
+        let request = JsonRpcRequest::new("prompts/get", Some(serde_json::to_value(&params)?), 0);
+        let response = self.transport.send(request).await?;
+        let result: PromptGetResult = response
+            .result
+            .map(serde_json::from_value)
+            .transpose()
+            .context("Failed to parse prompts/get response")?
+            .context("prompts/get response missing result")?;
+        Ok(result)
+    }
+
+    /// Whether the server advertised the `resources` capability.
+    #[must_use]
+    pub fn supports_resources(&self) -> bool {
+        self.server_info
+            .as_ref()
+            .is_some_and(|info| info.capabilities.resources.is_some())
+    }
+
+    /// Whether the server advertised the `prompts` capability.
+    #[must_use]
+    pub fn supports_prompts(&self) -> bool {
+        self.server_info
+            .as_ref()
+            .is_some_and(|info| info.capabilities.prompts.is_some())
     }
 
     /// Close the client connection.

@@ -95,6 +95,11 @@ path = "examples/mcp_filesystem.rs"
 required-features = ["mcp"]
 
 [[example]]
+name = "mcp_http_remote"
+path = "examples/mcp_http_remote.rs"
+required-features = ["mcp"]
+
+[[example]]
 name = "custom_tool"
 path = "examples/custom_tool.rs"
 
