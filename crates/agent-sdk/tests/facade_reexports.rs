@@ -113,6 +113,49 @@ fn tool_traits_and_registry() {
 }
 
 #[test]
+fn ergonomics_macros_are_reexported() {
+    // Phase 13·E: the derives + `tool!` must be reachable straight from the
+    // façade (same-named trait + derive, cf. `serde::Serialize`).
+    use agent_sdk::{SimpleTool, ToolContext, ToolLogic, ToolName, ToolResult, tool};
+    use serde_json::{Value, json};
+
+    #[derive(agent_sdk::Tool)]
+    #[tool(name = "noop", description = "noop")]
+    struct DerivedNoop;
+
+    impl ToolLogic<()> for DerivedNoop {
+        type Input = Value;
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            _input: Value,
+        ) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::success("ok"))
+        }
+    }
+
+    #[derive(agent_sdk::ToolName)]
+    enum DerivedName {
+        Noop,
+    }
+
+    fn _assert_simple<T: SimpleTool<()>>() {}
+    fn _assert_name<T: ToolName>() {}
+    _assert_simple::<DerivedNoop>();
+    _assert_name::<DerivedName>();
+
+    let inline = tool! {
+        name: "inline",
+        description: "inline",
+        schema: json!({ "type": "object" }),
+        |_ctx, _input| async move { Ok(ToolResult::success("ok")) }
+    };
+    fn _assert_inline<T: SimpleTool<()>>(_t: T) {}
+    _assert_inline(inline);
+}
+
+#[test]
 fn hooks_and_stores() {
     use agent_sdk::{
         AgentHooks, AllowAllHooks, DefaultHooks, EventStore, InMemoryEventStore,

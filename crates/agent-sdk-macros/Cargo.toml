@@ -1,0 +1,32 @@
+[package]
+name = "agent-sdk-macros"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Ergonomic derive/declarative macros for the Agent SDK (#[derive(Tool)], #[derive(TypedTool)], tool!, #[derive(ToolName)])"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+
+[features]
+# Auto-derive a tool's JSON `input_schema` from its typed `Input` via
+# `schemars` (the opt-in `#[tool(schema = "derive")]` sugar). Off by default
+# so the baseline derive pulls no schema-generation deps; the `agent-sdk`
+# façade turns it on through its own `macros-schema` feature.
+default = []
+schema-derive = []
+
+[lints]
+workspace = true
+
+# Macros are exercised end-to-end against the real traits in the `agent-sdk`
+# façade (a proc-macro crate cannot depend on the crate that re-exports it),
+# so this crate has no test targets of its own. The integration tests, the
+# `derive_tool` example, and the `trybuild` compile-fail UI tests all live in
+# `crates/agent-sdk`.

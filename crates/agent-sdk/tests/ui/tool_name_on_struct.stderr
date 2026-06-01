@@ -1,0 +1,5 @@
+error: #[derive(ToolName)] can only be applied to enums
+ --> tests/ui/tool_name_on_struct.rs:4:8
+  |
+4 | struct NotAnEnum;
+  |        ^^^^^^^^^

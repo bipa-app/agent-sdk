@@ -26,6 +26,14 @@ agent-sdk-tools = { workspace = true }
 # level) so this crate's own feature flags decide which provider impls
 # (and their deps) compile.
 agent-sdk-providers = { workspace = true }
+# Phase 13·E ergonomics macros (`#[derive(Tool)]` etc.). Re-exported below so
+# consumers get them straight from the façade. The generated code refers to
+# `::agent_sdk::…` paths, including a small `__macro_support` re-export module.
+agent-sdk-macros = { workspace = true }
+# `schemars` backs the optional `#[tool(schema = "derive")]` sugar; only pulled
+# in (and re-exported through `__macro_support`) under the `macros-schema`
+# feature.
+schemars = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -76,12 +84,27 @@ skills = ["dep:serde_yaml_ng"]
 # ── Observability (unchanged) ──────────────────────────────────────────
 otel = ["opentelemetry"]
 
+# ── Macro ergonomics (Phase 13·E) ──────────────────────────────────────
+# Opt-in JSON-schema derivation for `#[tool(schema = "derive")]`. Turns on the
+# macro crate's codegen path and pulls in `schemars`. The `#[derive(Tool)]` /
+# `#[derive(TypedTool)]` / `#[derive(ToolName)]` derives themselves are always
+# available (no feature needed) — only the schema-from-Input sugar is gated.
+macros-schema = ["dep:schemars", "agent-sdk-macros/schema-derive"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 env_logger = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 agent-sdk-otel = { workspace = true }
+# Compile-fail UI tests for the Phase 13·E derive macros. Lives here (not in
+# the proc-macro crate) because the generated code resolves `::agent_sdk::…`
+# paths, which only this crate can provide.
+trybuild = { workspace = true }
+# Exercises `#[tool(schema = "derive")]` in the macro integration tests; only
+# needed when the `macros-schema` feature is on, but dev-deps aren't
+# feature-gated, so it's always available to test code.
+schemars = { workspace = true }
 
 [[example]]
 name = "basic_agent"
@@ -116,6 +139,10 @@ required-features = ["mcp"]
 [[example]]
 name = "custom_tool"
 path = "examples/custom_tool.rs"
+
+[[example]]
+name = "derive_tool"
+path = "examples/derive_tool.rs"
 
 [[example]]
 name = "custom_hooks"

@@ -783,6 +783,59 @@ where
 }
 
 // ============================================================================
+// ToolLogic Trait (execute-only companion for the derive macros)
+// ============================================================================
+
+/// The `execute`-only half of a tool, used as the target of the
+/// `#[derive(Tool)]` / `#[derive(TypedTool)]` ergonomics macros.
+///
+/// The derives generate everything *except* the behaviour — `name`,
+/// `description`, `input_schema`, `tier` come from `#[tool(...)]` attributes —
+/// and delegate execution to this trait. You implement `ToolLogic` to supply
+/// the one thing a macro cannot: the `execute` body.
+///
+/// It is deliberately a **trait** (not an inherent method): a trait-method
+/// `async fn` that performs no `await` is fine, whereas an inherent one trips
+/// `clippy::unused_async`. Writing the body here keeps trivial, fully
+/// synchronous tools lint-clean without an `#[allow]`.
+///
+/// You rarely name this trait in prose — the derive docs show it in context —
+/// but the shape is:
+///
+/// ```
+/// use agent_sdk_tools::tools::{ToolLogic, ToolContext};
+/// use agent_sdk_core::types::ToolResult;
+/// use serde_json::Value;
+///
+/// struct MyTool;
+///
+/// impl ToolLogic<()> for MyTool {
+///     type Input = Value; // typed tools set this to their `Input` struct
+///
+///     async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> anyhow::Result<ToolResult> {
+///         Ok(ToolResult::success(format!("got {input}")))
+///     }
+/// }
+/// ```
+pub trait ToolLogic<Ctx>: Send + Sync {
+    /// The input the tool's `execute` receives. For `#[derive(Tool)]` this is
+    /// [`serde_json::Value`]; for `#[derive(TypedTool)]` it is the typed
+    /// `Input` (validated before `execute` runs).
+    type Input;
+
+    /// The tool's behaviour. Receives the (already-validated, for typed tools)
+    /// input.
+    ///
+    /// # Errors
+    /// Returns an error if tool execution fails.
+    fn execute(
+        &self,
+        ctx: &ToolContext<Ctx>,
+        input: Self::Input,
+    ) -> impl Future<Output = Result<ToolResult>> + Send;
+}
+
+// ============================================================================
 // SimpleTool Trait
 // ============================================================================
 

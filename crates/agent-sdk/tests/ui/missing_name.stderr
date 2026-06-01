@@ -1,0 +1,5 @@
+error: #[tool(...)] is missing the required `name = "..."`
+ --> tests/ui/missing_name.rs:8:8
+  |
+8 | struct BadTool;
+  |        ^^^^^^^
