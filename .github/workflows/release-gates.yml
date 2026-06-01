@@ -38,13 +38,20 @@ jobs:
       - run: cargo audit
 
   # cargo-semver-checks: guards the published crates against accidental
-  # API-breaking changes. It diffs each publishable crate against its
-  # crates.io baseline. While the current release line is 0.x prereleases
-  # (no comparable baseline yet), this is allowed to soft-fail; flip
-  # `continue-on-error` off once the first 0.8.x release is published.
+  # API-breaking changes by diffing each publishable crate against its
+  # crates.io baseline. That baseline does not exist until the (deliberately
+  # deferred) first publish, so the check can only error today — running it on
+  # every PR would be permanent red noise for a gate that is, by definition,
+  # premature pre-publish.
+  #
+  # It therefore runs on-demand only (workflow_dispatch) — invoke it as part of
+  # release preparation once a published baseline exists. At that point, remove
+  # the `if:` guard (and `continue-on-error`) to make it a hard per-PR/release
+  # gate. See ENG-8728 / the COOKBOOK release section.
   semver-checks:
     name: cargo-semver-checks (public API)
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
