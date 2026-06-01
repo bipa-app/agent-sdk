@@ -32,7 +32,7 @@ jobs:
   # Windows. macOS additionally runs the full test suite. The Windows job is
   # build/check only for now: the filesystem primitive tools (glob/edit/grep)
   # have known runtime path bugs on Windows (separator/escape/CRLF handling)
-  # tracked for a dedicated portability pass — see the Phase 13 follow-up card.
+  # tracked for a dedicated portability pass — see ENG-8731 (Phase 13·F).
   cross-platform:
     name: Cross-platform (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
