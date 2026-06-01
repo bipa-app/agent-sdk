@@ -23,7 +23,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMete
 use tokio::sync::{Mutex, MutexGuard};
 use tower::{Layer, Service};
 
-use agent_service_host::observability::grpc_layer::MetricsLayer;
+use agent_service_host::observability::grpc_layer::TelemetryLayer;
 use agent_service_host::observability::{HostMetrics, attrs, parse_grpc_path};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ fn parse_grpc_path_rejects_garbage_paths() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 2. MetricsLayer records rpc.server.duration with full attribute set
+// 2. TelemetryLayer records rpc.server.duration with full attribute set
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -199,7 +199,7 @@ async fn metrics_layer_records_rpc_server_duration_with_ok_status() -> Result<()
     // layer touches it.
     let _ = HostMetrics::global();
 
-    let layer = MetricsLayer::new();
+    let layer = TelemetryLayer::new();
     let mut svc = layer.layer(MockService::ok());
     let response = svc
         .call(build_request(
@@ -233,7 +233,7 @@ async fn metrics_layer_propagates_grpc_status_from_response_headers() -> Result<
     let (provider, exporter) = setup_meter();
     let _ = HostMetrics::global();
 
-    let layer = MetricsLayer::new();
+    let layer = TelemetryLayer::new();
     // 3 = INVALID_ARGUMENT
     let mut svc = layer.layer(MockService::header_status(3));
     let _ = svc
@@ -265,7 +265,7 @@ async fn metrics_layer_skips_paths_without_service_and_method() -> Result<()> {
     let (provider, exporter) = setup_meter();
     let _ = HostMetrics::global();
 
-    let layer = MetricsLayer::new();
+    let layer = TelemetryLayer::new();
     let mut svc = layer.layer(MockService::ok());
     // A bare `/` cannot be parsed into service/method — the layer
     // must skip rather than recording an empty-attribute sample.

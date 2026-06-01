@@ -1665,7 +1665,7 @@ impl GrpcTransport {
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
             .tcp_keepalive(Some(std::time::Duration::from_mins(1)))
-            .layer(crate::observability::grpc_layer::MetricsLayer::new());
+            .layer(crate::observability::grpc_layer::TelemetryLayer::new());
         #[cfg(not(feature = "otel"))]
         let mut server = Server::builder()
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
