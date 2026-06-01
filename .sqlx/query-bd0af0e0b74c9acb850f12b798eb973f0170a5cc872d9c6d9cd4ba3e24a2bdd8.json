@@ -6,47 +6,101 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "thread_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "thread_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "turn_number",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "turn_number"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "task_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "task_id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "messages_json",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "messages_json"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "agent_state_snapshot",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "agent_state_snapshot"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "turn_input_tokens",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "turn_input_tokens"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "turn_output_tokens",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "turn_output_tokens"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_checkpoints",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

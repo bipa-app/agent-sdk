@@ -187,6 +187,7 @@ fn make_bootstrap(
         pending_child_count: 1,
         spawn_index: None,
         result_payload: None,
+        otel_traceparent: None,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
         completed_at: None,

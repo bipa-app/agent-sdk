@@ -29,6 +29,7 @@
 //! `agent-sdk-otel`.
 
 mod config;
+pub mod grpc;
 mod propagator;
 mod resource;
 mod sampler;

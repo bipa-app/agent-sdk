@@ -802,6 +802,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -838,6 +839,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -878,6 +880,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -921,6 +924,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -1117,12 +1121,13 @@ INSERT INTO agent_sdk_tasks (
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
 )
 ",
             task.id.as_str(),
@@ -1145,6 +1150,7 @@ INSERT INTO agent_sdk_tasks (
             i64::from(task.pending_child_count),
             task.spawn_index.map(i64::from),
             task.result_payload.clone(),
+            task.otel_traceparent.clone(),
             task.created_at,
             task.updated_at,
             task.completed_at,
@@ -1181,7 +1187,8 @@ SET
     created_at = $20,
     updated_at = $21,
     completed_at = $22,
-    caller_metadata_json = $23
+    caller_metadata_json = $23,
+    otel_traceparent = $24
 WHERE id = $1
 ",
             task.id.as_str(),
@@ -1207,6 +1214,7 @@ WHERE id = $1
             task.updated_at,
             task.completed_at,
             task.caller_metadata.clone(),
+            task.otel_traceparent.clone(),
         )
         .execute(&mut **tx)
         .await
@@ -1590,6 +1598,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -1646,6 +1655,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2198,6 +2208,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2238,6 +2249,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2279,6 +2291,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2319,6 +2332,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2362,6 +2376,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2432,6 +2447,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2544,6 +2560,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2664,6 +2681,7 @@ SELECT
     pending_child_count,
     spawn_index,
     result_payload,
+    otel_traceparent,
     created_at,
     updated_at,
     completed_at
@@ -2801,6 +2819,7 @@ FOR UPDATE SKIP LOCKED
         Ok(paused)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_tool_children(
         &self,
         parent_id: &AgentTaskId,
@@ -2808,6 +2827,7 @@ FOR UPDATE SKIP LOCKED
         lease: &LeaseId,
         specs: Vec<ChildSpawnSpec>,
         payload: SuspensionPayload,
+        child_otel_traceparent: Option<String>,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Vec<AgentTask>)> {
         if specs.is_empty() {
@@ -2827,6 +2847,7 @@ FOR UPDATE SKIP LOCKED
                     .context("spawn rejected: new_child failed")?;
             child.spawn_index =
                 Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
+            child.otel_traceparent.clone_from(&child_otel_traceparent);
             let existing = Self::load_task_tx(&mut tx, &child.id, false).await?;
             if existing.is_some()
                 || children
@@ -4805,6 +4826,7 @@ struct TaskRecord {
     pending_child_count: i64,
     spawn_index: Option<i64>,
     result_payload: Option<serde_json::Value>,
+    otel_traceparent: Option<String>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
@@ -4844,6 +4866,7 @@ impl TryFrom<TaskRecord> for AgentTask {
                 .map(|value| u32_from_i64(value, "task spawn_index"))
                 .transpose()?,
             result_payload: record.result_payload,
+            otel_traceparent: record.otel_traceparent,
             created_at: record.created_at,
             updated_at: record.updated_at,
             completed_at: record.completed_at,

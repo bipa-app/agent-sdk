@@ -132,6 +132,23 @@ pub fn link_to_parent_turn(span: &mut BoxedSpan, parent_trace_id: &str, parent_s
     add_link(span, target, vec![]);
 }
 
+/// Build a remote `SpanContext` from hex-encoded trace + span ids, for
+/// re-parenting spans under a span that is no longer live in the
+/// current task.
+///
+/// The daemon-hosted worker drives a turn across multiple tasks
+/// (execute → suspend at the tool boundary → resume), so its root
+/// `invoke_agent` span cannot stay live for the whole turn. The worker
+/// persists the root span's `(trace_id, span_id)` and rebuilds a remote
+/// parent context from them via this helper so resumed `chat` calls and
+/// child-task `execute_tool` calls nest under the turn root. Returns
+/// `None` for malformed / zero ids (treated as "no parent"). Thin public
+/// wrapper over `parse_span_context`.
+#[must_use]
+pub fn remote_span_context(trace_hex: &str, span_hex: &str) -> Option<SpanContext> {
+    parse_span_context(trace_hex, span_hex)
+}
+
 /// Build a `SpanContext` from hex-encoded trace + span ids.
 ///
 /// Returns `None` when either id is malformed or zero (`TraceId::INVALID`

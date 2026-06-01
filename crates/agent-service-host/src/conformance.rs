@@ -318,7 +318,15 @@ mod tests {
             suspended_messages: vec![],
         };
         let (parent, children) = task_store
-            .spawn_tool_children(&root.id, &worker, &lease, vec![spec], payload, t_plus(62))
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![spec],
+                payload,
+                None,
+                t_plus(62),
+            )
             .await?;
         assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
         assert_eq!(children.len(), 1);
@@ -465,6 +473,7 @@ mod tests {
                 &pl,
                 vec![ChildSpawnSpec { max_attempts: 1 }],
                 payload,
+                None,
                 t_plus(202),
             )
             .await?;
@@ -540,7 +549,15 @@ mod tests {
             suspended_messages: vec![],
         };
         let (_parent, children) = task_store
-            .spawn_tool_children(&root.id, &worker, &lease, vec![spec], payload, t_plus(102))
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![spec],
+                payload,
+                None,
+                t_plus(102),
+            )
             .await?;
         assert_eq!(children.len(), 1);
 
