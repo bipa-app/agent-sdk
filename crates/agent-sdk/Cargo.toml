@@ -3,11 +3,21 @@ name = "agent-sdk"
 version = "0.8.0"
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Rust Agent SDK for building LLM agents"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "anthropic", "tools"]
 categories = ["api-bindings", "asynchronous"]
+
+# docs.rs builds with every feature so the provider impls, MCP, web, skills,
+# and otel surfaces all render. `--cfg docsrs` turns on the `doc_cfg`
+# feature-badge annotations below.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk-core = { workspace = true }
@@ -88,6 +98,10 @@ path = "examples/tool_round_trip.rs"
 [[example]]
 name = "typed_tool"
 path = "examples/typed_tool.rs"
+
+[[example]]
+name = "structured_output"
+path = "examples/structured_output.rs"
 
 [[example]]
 name = "mcp_filesystem"

@@ -3,8 +3,17 @@ name = "agent-sdk-providers"
 version = "0.8.0"
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "LLM provider trait, streaming primitives, and first-party provider implementations for the Agent SDK"
+keywords = ["agent", "llm", "anthropic", "openai", "gemini"]
+categories = ["api-bindings", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk-core = { workspace = true }

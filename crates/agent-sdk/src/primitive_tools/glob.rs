@@ -69,12 +69,22 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
         let input: GlobInput =
             serde_json::from_value(input).context("Invalid input for glob tool")?;
 
-        // Build the full pattern
+        // Build the full pattern. The base directory is a literal filesystem
+        // path, but `glob` uses `/` as its separator on every platform and
+        // treats `\` as an escape character — so a Windows base such as
+        // `C:\Users\…` would be parsed as escape sequences. Normalise the
+        // base's separators to `/` before joining (a no-op on Unix, where the
+        // base never contains a backslash); the user's `pattern` is left as-is
+        // so its glob metacharacters keep their meaning.
         let pattern = if let Some(ref base_path) = input.path {
-            let base = self.ctx.environment.resolve_path(base_path);
+            let base = self
+                .ctx
+                .environment
+                .resolve_path(base_path)
+                .replace('\\', "/");
             format!("{}/{}", base.trim_end_matches('/'), input.pattern)
         } else {
-            let root = self.ctx.environment.root();
+            let root = self.ctx.environment.root().replace('\\', "/");
             format!("{}/{}", root.trim_end_matches('/'), input.pattern)
         };
 

@@ -1,0 +1,85 @@
+# cargo-deny configuration — supply-chain gates for the Agent SDK workspace.
+#
+# Run locally with `cargo deny check`. CI runs the same in the
+# `supply-chain` job (see .github/workflows/release-gates.yml), installing
+# the current cargo-deny so this file targets the modern (v2) schema.
+#
+# Checks: advisories (RustSec), licenses (SPDX allow-list), bans (duplicate /
+# banned crates), sources (only crates.io + the repo itself).
+
+[graph]
+# Check the platforms we actually ship CI for. Restricting the target set
+# keeps platform-specific transitive crates (e.g. windows-sys, the various
+# *-apple-* shims) from tripping duplicate-version or advisory noise on hosts
+# that never build them.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# Pull the RustSec advisory DB and fail on any unignored vulnerability.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked crates fail the build so a release never depends on one.
+yanked = "deny"
+ignore = [
+    # `serde_yaml` (0.9.34+deprecated) is unmaintained (RUSTSEC-2024-0320).
+    # It is NOT in the published `agent-sdk` tree — it remains only in the
+    # internal, unpublished `agent-service-host` config plumbing (see the
+    # note in the workspace Cargo.toml). The public surface uses the
+    # maintained `serde_yaml_ng` fork. Tracked for removal as a follow-up.
+    "RUSTSEC-2024-0320",
+]
+
+[licenses]
+# SPDX identifiers we accept. All permissive / weak-copyleft licenses common
+# in the Rust ecosystem. A dependency outside this set fails the check and
+# must be reviewed before being added.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+    "OpenSSL",
+    "BSL-1.0",
+    # `webpki-roots` ships the Mozilla CA root bundle (the *data*, not code)
+    # under CDLA-Permissive-2.0. It is permissive and OSI-recognised as a
+    # data-sharing licence; pulled transitively via sqlx and tokio-tungstenite.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# Crates whose license metadata needs a manual clarification can be added
+# here as `exceptions`/`clarify` entries when encountered.
+
+[bans]
+# Duplicate versions are a warning, not an error: a large transitive graph
+# (tonic, sqlx, reqwest, opentelemetry) routinely pulls two minor versions of
+# low-level crates. We surface them without blocking the release gate.
+multiple-versions = "warn"
+wildcards = "deny"
+# `*` version requirements are banned in our own manifests (we use workspace
+# pins); this catches an accidental wildcard slipping in. Internal path deps
+# between unpublished crates (e.g. agent-service-host -> agent-service-proto)
+# legitimately carry no version requirement, so allow path-based wildcards.
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io and first-party git are allowed as crate sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+github = ["bipa-app"]

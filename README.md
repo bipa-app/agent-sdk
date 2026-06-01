@@ -1,6 +1,9 @@
 # Agent SDK
 
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![crates.io](https://img.shields.io/crates/v/agent-sdk.svg)](https://crates.io/crates/agent-sdk)
+[![docs.rs](https://img.shields.io/docsrs/agent-sdk)](https://docs.rs/agent-sdk)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Rust SDK for building AI agents powered by large language models (LLMs). Create agents that can reason, use tools, and take actions through a streaming, event-driven architecture.
 
@@ -38,15 +41,13 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Requirements
 
-- Rust 1.85+ (2024 edition)
+- Rust 1.91+ (2024 edition; MSRV verified by CI)
 - An API key for your chosen LLM provider
 
 ## Installation
 
-> **Note:** the published crates.io release currently lags this repository — a
-> newer release has not been cut yet. For the latest code, depend on it via git;
-> a plain `cargo add agent-sdk` installs the most recent *published* version,
-> which may not include everything documented here:
+> **Note:** a fresh crates.io release on the current API is being cut. Until it
+> lands you can depend on the repository directly:
 >
 > ```toml
 > [dependencies]
@@ -169,6 +170,14 @@ agent-sdk doctor                              # checks docker, ports, dest writa
 
 See `crates/agent-sdk/docs/observability/LANGFUSE.md` for the full
 setup walkthrough.
+
+## Cookbook
+
+Task-oriented recipes for every building block — tools, typed tools
+(`TypedTool`), structured output, streaming, MCP (local stdio + remote HTTP),
+durable serving, human-in-the-loop — live in
+[`crates/agent-sdk/COOKBOOK.md`](crates/agent-sdk/COOKBOOK.md), each backed by a
+runnable example under [`crates/agent-sdk/examples/`](crates/agent-sdk/examples).
 
 ## Quick Start
 

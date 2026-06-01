@@ -1,0 +1,116 @@
+name: Release gates
+
+# Supply-chain + release-readiness gates that run on every PR/push and
+# nightly. These are the checks the crates.io publish (a later, human-gated
+# step) depends on: a clean advisory DB, an allowed-license set, an MSRV that
+# actually builds, and no accidental public-API breakage.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # cargo-deny: licenses + advisories + bans + sources, per deny.toml.
+  cargo-deny:
+    name: cargo-deny (licenses + advisories + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+
+  # cargo-audit: RustSec vulnerability scan against the committed Cargo.lock.
+  cargo-audit:
+    name: cargo-audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  # cargo-semver-checks: guards the published crates against accidental
+  # API-breaking changes by diffing each publishable crate against its
+  # crates.io baseline. That baseline does not exist until the (deliberately
+  # deferred) first publish, so the check can only error today — running it on
+  # every PR would be permanent red noise for a gate that is, by definition,
+  # premature pre-publish.
+  #
+  # It therefore runs on-demand only (workflow_dispatch) — invoke it as part of
+  # release preparation once a published baseline exists. At that point, remove
+  # the `if:` guard (and `continue-on-error`) to make it a hard per-PR/release
+  # gate. See ENG-8728 / the COOKBOOK release section.
+  semver-checks:
+    name: cargo-semver-checks (public API)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # Only the publishable crates are checked; the internal server/host
+      # crates carry no semver contract.
+      - run: >-
+          cargo semver-checks check-release
+          --package agent-sdk-core
+          --package agent-sdk-tools
+          --package agent-sdk-providers
+          --package agent-sdk
+          --package agent-sdk-otel
+          --package agent-sdk-cli
+
+  # MSRV: the published crates must build on the pinned minimum toolchain
+  # declared in [workspace.package] rust-version. The internal
+  # agent-service-host (sqlx ≥ 1.94) is intentionally excluded — it is not
+  # published and carries no MSRV contract.
+  msrv:
+    name: MSRV (pinned toolchain ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: ["1.91"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build publishable crates on MSRV
+        run: >-
+          cargo +${{ matrix.rust }} check --all-features
+          --package agent-sdk-core
+          --package agent-sdk-tools
+          --package agent-sdk-providers
+          --package agent-sdk
+          --package agent-sdk-otel
+          --package agent-sdk-cli
+
+  # Packaging dry-run: proves every publishable crate produces a valid
+  # `.crate` (manifest + included files). Leaf crates verify fully; dependent
+  # crates use --no-verify because their dependencies are not on crates.io
+  # until the (human-gated) ordered publish happens.
+  package-dry-run:
+    name: cargo package (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package leaf crate (full verify)
+        run: cargo package --package agent-sdk-core
+      - name: Validate dependent crate manifests pack
+        run: |
+          for crate in agent-sdk-tools agent-sdk-providers agent-sdk agent-sdk-otel agent-sdk-cli; do
+            echo "::group::cargo package --list -p $crate"
+            cargo package --list --package "$crate"
+            echo "::endgroup::"
+          done

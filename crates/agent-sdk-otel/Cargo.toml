@@ -3,10 +3,17 @@ name = "agent-sdk-otel"
 version = "0.8.0"
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "OpenTelemetry bootstrap helpers for the Agent SDK (OTLP exporter wiring + propagators)"
 keywords = ["agent", "llm", "opentelemetry", "otlp", "observability"]
 categories = ["development-tools::profiling"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 agent-sdk = { workspace = true, features = ["otel"] }
