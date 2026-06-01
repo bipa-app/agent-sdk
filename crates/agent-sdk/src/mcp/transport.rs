@@ -428,9 +428,11 @@ mod tests {
     /// to `/dev/null` and never writes to stdout, so every `send` hits the
     /// timeout branch. After N timed-out requests the pending map must be empty
     /// — without the [`PendingGuard`] it would hold N stale senders and grow
-    /// without bound, eventually OOMing a long-lived host.
+    /// without bound, eventually exhausting the memory of a long-lived host.
     #[tokio::test]
     async fn timed_out_requests_do_not_leak_pending_entries() -> Result<()> {
+        const N: usize = 8;
+
         // `cat > /dev/null` accepts everything written to stdin and emits
         // nothing on stdout, guaranteeing a timeout on every request.
         let transport = StdioTransport::spawn_with_timeout(
@@ -444,7 +446,6 @@ mod tests {
             "pending map should start empty"
         );
 
-        const N: usize = 8;
         for _ in 0..N {
             let request = JsonRpcRequest::new("tools/list", None, 0);
             let result = transport.send(request).await;
