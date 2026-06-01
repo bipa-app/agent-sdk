@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 /// Decision returned by pre-tool hooks
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ToolDecision {
     /// Allow the tool to execute
     Allow,

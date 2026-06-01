@@ -171,6 +171,9 @@ pub const fn finish_reason_str(reason: crate::llm::StopReason) -> &'static str {
         crate::llm::StopReason::StopSequence => "stop_sequence",
         crate::llm::StopReason::Refusal => "refusal",
         crate::llm::StopReason::ModelContextWindowExceeded => "model_context_window_exceeded",
+        // `StopReason` is `#[non_exhaustive]`; `Unknown` and any future variant
+        // report a stable generic `finish_reason`.
+        _ => "unknown",
     }
 }
 

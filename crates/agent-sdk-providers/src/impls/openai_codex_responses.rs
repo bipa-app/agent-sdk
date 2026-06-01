@@ -1343,6 +1343,11 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                                 ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
                             ));
                         }
+                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
+                        // SDK version cannot represent on the wire is skipped.
+                        _ => {
+                            log::warn!("Skipping unrecognized OpenAI Responses content block");
+                        }
                     }
                 }
 

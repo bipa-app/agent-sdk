@@ -59,11 +59,10 @@ pub(crate) fn collect_attachments(request: &ChatRequest) -> Vec<AttachmentRef<'_
                         data: &source.data,
                         kind: AttachmentKind::Document,
                     }),
-                    ContentBlock::Text { .. }
-                    | ContentBlock::Thinking { .. }
-                    | ContentBlock::RedactedThinking { .. }
-                    | ContentBlock::ToolUse { .. }
-                    | ContentBlock::ToolResult { .. } => {}
+                    // Non-attachment blocks contribute nothing here, and the
+                    // `_` arm covers future `#[non_exhaustive]` variants, which
+                    // by definition carry no image/document attachment.
+                    _ => {}
                 }
             }
         }

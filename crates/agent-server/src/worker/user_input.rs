@@ -166,10 +166,10 @@ impl UserInput {
                 ContentBlock::Image { source } | ContentBlock::Document { source } => {
                     Some(format!("[{} attachment]", source.media_type))
                 }
-                ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
-                | ContentBlock::ToolUse { .. }
-                | ContentBlock::ToolResult { .. } => None,
+                // Non-text/attachment blocks contribute nothing to the audit
+                // summary, and the `_` arm covers future `#[non_exhaustive]`
+                // block kinds.
+                _ => None,
             })
             .collect();
         parts.join("\n")

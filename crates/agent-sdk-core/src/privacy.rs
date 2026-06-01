@@ -87,6 +87,7 @@ pub use redaction::{
 /// masking and audit logic can preserve type information.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PiiCategory {
     /// Credential or secret (API key, bearer token, password-shaped value).
     Secret,

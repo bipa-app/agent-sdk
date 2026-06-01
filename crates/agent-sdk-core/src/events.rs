@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 /// These are streamed to the client for real-time UI updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentEvent {
     /// Agent loop has started
     Start { thread_id: ThreadId, turn: usize },

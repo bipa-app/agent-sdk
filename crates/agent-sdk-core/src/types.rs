@@ -304,6 +304,7 @@ impl std::error::Error for AgentError {}
 
 /// Outcome of running the agent loop.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AgentRunState {
     /// Agent completed successfully.
     Done {

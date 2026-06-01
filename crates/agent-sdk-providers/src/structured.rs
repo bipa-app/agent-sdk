@@ -167,6 +167,13 @@ pub async fn run_structured(
                     "server error: {msg}"
                 )));
             }
+            // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome is
+            // surfaced as a provider failure rather than silently retried.
+            _ => {
+                return Err(StructuredOutputError::ProviderOutcome(
+                    "unrecognized provider outcome".to_owned(),
+                ));
+            }
         };
 
         let candidate = extract_candidate(&response, support);

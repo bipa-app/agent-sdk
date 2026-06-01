@@ -122,12 +122,6 @@ pub(super) fn extract_content(response: &ChatResponse) -> ExtractedContent {
             ContentBlock::Thinking { thinking, .. } => {
                 thinking_parts.push(thinking.clone());
             }
-            ContentBlock::RedactedThinking { .. }
-            | ContentBlock::ToolResult { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::Document { .. } => {
-                // These blocks don't produce extractable content
-            }
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
@@ -138,6 +132,9 @@ pub(super) fn extract_content(response: &ChatResponse) -> ExtractedContent {
                 };
                 tool_uses.push((id.clone(), name.clone(), input.clone()));
             }
+            // Remaining blocks (and future `#[non_exhaustive]` variants) yield
+            // no thinking/text/tool-use content, so they are skipped.
+            _ => {}
         }
     }
 
@@ -233,11 +230,6 @@ pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::RedactedThinking { data } => {
                 blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
             }
-            ContentBlock::ToolResult { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::Document { .. } => {
-                // These blocks shouldn't appear in assistant responses
-            }
             ContentBlock::ToolUse {
                 id,
                 name,
@@ -251,6 +243,10 @@ pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {
                     thought_signature: thought_signature.clone(),
                 });
             }
+            // Tool-result/image/document blocks shouldn't appear in assistant
+            // responses; this also drops unrecognized future
+            // `#[non_exhaustive]` block kinds rather than echoing them back.
+            _ => {}
         }
     }
 

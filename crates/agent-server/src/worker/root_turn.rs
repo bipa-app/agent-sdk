@@ -1617,6 +1617,9 @@ const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
         StreamErrorKind::RateLimited => "rate_limited",
         StreamErrorKind::ServerError => "server_error",
         StreamErrorKind::InvalidRequest => "invalid_request",
+        // `StreamErrorKind` is #[non_exhaustive]; `Unknown` and any future
+        // variant map to the same stable label the in-process loop uses.
+        _ => "unknown",
     }
 }
 
@@ -1707,8 +1710,12 @@ async fn call_llm_once_inner(
                 // recorded as `InvalidRequest` (not `ServerError`).
                 let outcome = match kind {
                     StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
-                    StreamErrorKind::ServerError => TurnAttemptOutcome::ServerError,
                     StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
+                    // `StreamErrorKind::ServerError`, plus the
+                    // `#[non_exhaustive]` catch-all (`Unknown` / future kinds):
+                    // audited as a server error, the most conservative
+                    // non-rate-limit category.
+                    _ => TurnAttemptOutcome::ServerError,
                 };
                 close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
                 let message = message.clone();
@@ -1722,13 +1729,10 @@ async fn call_llm_once_inner(
             }
             // Done / Usage / ToolUseStart / ToolInputDelta /
             // SignatureDelta / RedactedThinking are handled by the
-            // accumulator and don't need to be re-emitted as events.
-            StreamDelta::Done { .. }
-            | StreamDelta::Usage(_)
-            | StreamDelta::ToolUseStart { .. }
-            | StreamDelta::ToolInputDelta { .. }
-            | StreamDelta::SignatureDelta { .. }
-            | StreamDelta::RedactedThinking { .. } => {}
+            // accumulator and don't need to be re-emitted as events. The
+            // catch-all also covers future `#[non_exhaustive]` deltas, which
+            // the accumulator likewise consumes.
+            _ => {}
         }
     }
 
