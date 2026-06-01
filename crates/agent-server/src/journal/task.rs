@@ -639,6 +639,24 @@ pub struct AgentTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_payload: Option<serde_json::Value>,
 
+    // ── otel trace parent ───────────────────────────────────
+    /// W3C `traceparent` of the span this task's `OTel` spans nest
+    /// under, or `None` when the task runs outside any trace.
+    ///
+    /// For a **root-turn** task it is the inbound client span extracted
+    /// from the submitting gRPC call's metadata, so the daemon's
+    /// `invoke_agent` span continues the caller's distributed trace.
+    /// For a **child tool** task it is stamped at spawn from the root
+    /// turn's `invoke_agent` span ids (persisted on the turn attempt) so
+    /// the child's `execute_tool` span nests under the turn root.
+    ///
+    /// Nullable on purpose: absent means "no trace context" and
+    /// pre-migration rows / workers without an exporter keep it `None`.
+    /// Carried purely as correlation metadata — the SDK never interprets
+    /// it beyond rebuilding an `OTel` parent context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_traceparent: Option<String>,
+
     // ── timestamps ──────────────────────────────────────────
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -691,6 +709,7 @@ impl AgentTask {
             pending_child_count: 0,
             spawn_index: None,
             result_payload: None,
+            otel_traceparent: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -770,6 +789,11 @@ impl AgentTask {
             pending_child_count: 0,
             spawn_index: None,
             result_payload: None,
+            // Inherited from the parent by default; the tool-boundary
+            // spawn path overrides this with the root turn's
+            // `invoke_agent` span so child `execute_tool` spans nest
+            // under the turn root rather than the inbound client span.
+            otel_traceparent: parent.otel_traceparent.clone(),
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -823,6 +847,10 @@ impl AgentTask {
             pending_child_count: 1,
             spawn_index: Some(spawn_index),
             result_payload: None,
+            // A subagent invocation runs its own root turn on the child
+            // thread; inherit the parent's trace parent so the spawned
+            // work stays in the same distributed trace.
+            otel_traceparent: parent.otel_traceparent.clone(),
             created_at: now,
             updated_at: now,
             completed_at: None,

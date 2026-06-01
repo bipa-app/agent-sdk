@@ -1,0 +1,5 @@
+# Generated gRPC stubs (regenerate with ./generate_stubs.sh).
+agent_sdk_client/_generated/
+__pycache__/
+*.pyc
+.venv/

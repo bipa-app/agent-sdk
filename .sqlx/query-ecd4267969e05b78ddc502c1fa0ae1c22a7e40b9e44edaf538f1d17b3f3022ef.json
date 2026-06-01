@@ -6,7 +6,13 @@
       {
         "name": "retention_floor",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_retention_cursors",
+            "name": "retention_floor"
+          }
+        }
       }
     ],
     "parameters": {

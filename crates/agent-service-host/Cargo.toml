@@ -3,6 +3,10 @@ name = "agent-service-host"
 version = "0.8.0"
 edition.workspace = true
 license.workspace = true
+# Internal: the gRPC durable-serving host is a deployable binary, not a
+# library API. It is built and run from this repo; it is not published to
+# crates.io. (Bindings target this host's gRPC API — see the binding spike
+# under `bindings/`.)
 publish = false
 
 [[bin]]
@@ -25,6 +29,11 @@ otel = [
     "dep:http",
     "dep:agent-sdk-otel",
     "agent-server/otel",
+    # `registry_tool_executor` brackets tool dispatch with the SDK's
+    # `execute_tool` span + `agent_sdk.tools.*` metrics via
+    # `agent_sdk::observability::loop_instrument`, which is gated behind
+    # `agent-sdk`'s own `otel` feature.
+    "agent-sdk/otel",
 ]
 # Crash-injection failpoints. Forwards to `agent-server`'s `failpoints`
 # feature so the `agent_server::fail_point!` macro is wired to the live

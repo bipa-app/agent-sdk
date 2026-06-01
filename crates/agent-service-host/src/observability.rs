@@ -11,7 +11,7 @@
 //!
 //! | Metric | Why |
 //! |--------|-----|
-//! | `rpc.server.duration` (`Histogram`, `s`) | `OTel` RPC semconv. Driven by [`grpc_layer::MetricsLayer`]. |
+//! | `rpc.server.duration` (`Histogram`, `s`) | `OTel` RPC semconv. Driven by [`grpc_layer::TelemetryLayer`]. |
 //! | `db.client.connections.create_time` (`Histogram`, `s`) | `sqlx` pool connection establishment latency. |
 //! | `db.pool.connections.active` (`ObservableGauge`, `u64`) | Pool busy connection count. |
 //! | `db.pool.connections.idle` (`ObservableGauge`, `u64`) | Pool idle connection count. |
@@ -392,47 +392,71 @@ pub fn parse_grpc_path(path: &str) -> Option<(&str, &str)> {
 // ─────────────────────────────────────────────────────────────────────
 
 pub mod grpc_layer {
-    //! Tower middleware that records `rpc.server.duration` for every
-    //! gRPC call processed by a tonic server.
+    //! The daemon's gRPC server-side traces + logs + metrics in one layer.
+    //!
+    //! For every call it opens a `SpanKind::Server` span continuing the
+    //! inbound W3C trace (so the turn's `invoke_agent` span and the
+    //! handler's work nest under it), emits a structured per-RPC
+    //! completion log, and records `rpc.server.duration`.
 
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Instant;
 
-    use http::HeaderMap;
+    use http::{HeaderMap, HeaderName};
+    use opentelemetry::propagation::Extractor;
+    use opentelemetry::trace::{FutureExt, SpanKind, Status, TraceContextExt, Tracer};
+    use opentelemetry::{Context as OtelContext, KeyValue, global};
     use tower::{Layer, Service};
 
     use super::{HostMetrics, parse_grpc_path};
 
-    /// Layer that wraps a tonic `Service` with
-    /// [`MetricsService`].
-    #[derive(Clone, Debug, Default)]
-    pub struct MetricsLayer;
+    /// Extracts W3C trace context (`traceparent` / `tracestate` /
+    /// `baggage`) from inbound HTTP/2 headers so the per-RPC server span
+    /// continues the caller's distributed trace.
+    struct HeaderMapExtractor<'a>(&'a HeaderMap);
 
-    impl MetricsLayer {
+    impl Extractor for HeaderMapExtractor<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).and_then(|value| value.to_str().ok())
+        }
+
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(HeaderName::as_str).collect()
+        }
+    }
+
+    /// Layer that wraps a tonic `Service` with [`TelemetryService`].
+    #[derive(Clone, Debug, Default)]
+    pub struct TelemetryLayer;
+
+    impl TelemetryLayer {
         #[must_use]
         pub const fn new() -> Self {
             Self
         }
     }
 
-    impl<S> Layer<S> for MetricsLayer {
-        type Service = MetricsService<S>;
+    impl<S> Layer<S> for TelemetryLayer {
+        type Service = TelemetryService<S>;
 
         fn layer(&self, inner: S) -> Self::Service {
-            MetricsService { inner }
+            TelemetryService { inner }
         }
     }
 
-    /// `tower::Service` wrapper that captures request method + status
-    /// code and records `rpc.server.duration`.
+    /// The daemon's server-side traces + logs + metrics, per gRPC call.
+    ///
+    /// Opens a `SpanKind::Server` span continuing the inbound W3C trace,
+    /// emits a structured completion log, and records
+    /// `rpc.server.duration`.
     #[derive(Clone, Debug)]
-    pub struct MetricsService<S> {
+    pub struct TelemetryService<S> {
         inner: S,
     }
 
-    impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for MetricsService<S>
+    impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for TelemetryService<S>
     where
         S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>>
             + Clone
@@ -451,26 +475,80 @@ pub mod grpc_layer {
         }
 
         fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
-            // The `Clone` + `mem::replace` dance is the standard
-            // tower pattern for forwarding under a possibly-not-Ready
-            // `inner`: we hand the future the ready clone we just
-            // poll_readied above.
+            // The `Clone` + `mem::replace` dance is the standard tower
+            // pattern for forwarding under a possibly-not-Ready `inner`:
+            // we hand the future the ready clone we just poll_readied.
             let clone = self.inner.clone();
             let mut inner = std::mem::replace(&mut self.inner, clone);
 
             let path = req.uri().path().to_owned();
+            let (service, method) = parse_grpc_path(&path).map_or_else(
+                || (String::new(), String::new()),
+                |(service, method)| (service.to_owned(), method.to_owned()),
+            );
             let started_at = Instant::now();
 
-            Box::pin(async move {
-                let response = inner.call(req).await?;
-                let status_code = grpc_status_from_headers(response.headers());
+            // Open the per-RPC server span, continuing the caller's trace
+            // (extracted from the inbound HTTP/2 headers). It ends when
+            // the owning context drops at the close of the async block;
+            // `with_context` nests the handler's spans under it.
+            let parent_cx =
+                global::get_text_map_propagator(|p| p.extract(&HeaderMapExtractor(req.headers())));
+            let tracer = global::tracer("agent-service-host");
+            let span = tracer
+                .span_builder(path)
+                .with_kind(SpanKind::Server)
+                .with_attributes([
+                    KeyValue::new("rpc.system", "grpc"),
+                    KeyValue::new("rpc.service", service.clone()),
+                    KeyValue::new("rpc.method", method.clone()),
+                ])
+                .start_with_context(&tracer, &parent_cx);
+            let cx = OtelContext::current_with_span(span);
 
-                if let Some((service, method)) = parse_grpc_path(&path) {
+            Box::pin(async move {
+                let response = inner.call(req).with_context(cx.clone()).await?;
+                let status_code = grpc_status_from_headers(response.headers());
+                let latency = started_at.elapsed();
+                let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+
+                // Stamp the server span's outcome. It ends when `cx`
+                // drops at the close of this block.
+                cx.span().set_attribute(KeyValue::new(
+                    "rpc.grpc.status_code",
+                    i64::from(status_code),
+                ));
+                if status_code != 0 {
+                    cx.span()
+                        .set_status(Status::error(format!("grpc status {status_code}")));
+                }
+
+                // Structured per-RPC completion log, trace-correlated
+                // when a tracing→OTel bridge is installed.
+                if status_code == 0 {
+                    tracing::info!(
+                        rpc.service = %service,
+                        rpc.method = %method,
+                        rpc.grpc.status_code = status_code,
+                        latency_ms,
+                        "grpc request completed"
+                    );
+                } else {
+                    tracing::warn!(
+                        rpc.service = %service,
+                        rpc.method = %method,
+                        rpc.grpc.status_code = status_code,
+                        latency_ms,
+                        "grpc request failed"
+                    );
+                }
+
+                if !service.is_empty() {
                     HostMetrics::global().record_rpc_server_duration(
-                        service,
-                        method,
+                        &service,
+                        &method,
                         status_code,
-                        started_at.elapsed().as_secs_f64(),
+                        latency.as_secs_f64(),
                     );
                 }
 

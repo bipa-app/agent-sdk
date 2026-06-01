@@ -250,6 +250,7 @@ mod tests {
                 &lease,
                 vec![ChildSpawnSpec { max_attempts: 3 }],
                 suspension_payload(thread),
+                None,
                 t_plus(12),
             )
             .await

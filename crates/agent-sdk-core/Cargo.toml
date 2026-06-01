@@ -3,10 +3,17 @@ name = "agent-sdk-core"
 version = "0.8.0"
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Shared contract types for the Agent SDK (IDs, events, LLM messages, turn outcomes)"
 keywords = ["agent", "llm", "ai", "types"]
 categories = ["data-structures"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 regex = { workspace = true }

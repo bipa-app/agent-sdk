@@ -183,6 +183,87 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
 }
 
+impl ChatRequest {
+    /// Default token budget used by [`ChatRequest::new`] when the caller does
+    /// not set one explicitly. Providers clamp this to their own ceiling.
+    pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+    /// Build a request from a system prompt and a message list, leaving every
+    /// optional knob at its default.
+    ///
+    /// This is the ergonomic counterpart to the (still-public) struct literal:
+    /// the common case only needs `system` + `messages`, so callers no longer
+    /// have to spell out the eight `None`/default fields. Layer optional
+    /// settings on with the chainable `with_*` setters:
+    ///
+    /// ```
+    /// use agent_sdk_core::llm::{ChatRequest, Message, ToolChoice};
+    ///
+    /// let req = ChatRequest::new("You are helpful.", vec![Message::user("Hi")])
+    ///     .with_max_tokens(1024)
+    ///     .with_tool_choice(ToolChoice::Auto);
+    /// ```
+    #[must_use]
+    pub fn new(system: impl Into<String>, messages: Vec<Message>) -> Self {
+        Self {
+            system: system.into(),
+            messages,
+            tools: None,
+            max_tokens: Self::DEFAULT_MAX_TOKENS,
+            max_tokens_explicit: false,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    /// Set the tool list the model may call.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set the maximum output-token budget (marks it as explicitly configured).
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self.max_tokens_explicit = true;
+        self
+    }
+
+    /// Set the session identifier (provider-side prompt caching / routing).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Set the extended-thinking configuration.
+    #[must_use]
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    /// Constrain tool usage (defaults to the provider's `auto` when unset).
+    #[must_use]
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Request the final answer be constrained to the given JSON-Schema
+    /// [`ResponseFormat`] (structured output).
+    #[must_use]
+    pub fn with_response_format(mut self, response_format: ResponseFormat) -> Self {
+        self.response_format = Some(response_format);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -449,4 +530,35 @@ pub enum ChatOutcome {
     RateLimited,
     InvalidRequest(String),
     ServerError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_new_defaults_then_setters() {
+        let req = ChatRequest::new("sys", vec![Message::user("hi")]);
+        assert_eq!(req.system, "sys");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.max_tokens, ChatRequest::DEFAULT_MAX_TOKENS);
+        assert!(!req.max_tokens_explicit);
+        assert!(req.tools.is_none());
+        assert!(req.tool_choice.is_none());
+        assert!(req.response_format.is_none());
+
+        let req = req
+            .with_max_tokens(1234)
+            .with_tool_choice(ToolChoice::Auto)
+            .with_response_format(ResponseFormat::new(
+                "r",
+                serde_json::json!({"type": "object"}),
+            ))
+            .with_session_id("s-1");
+        assert_eq!(req.max_tokens, 1234);
+        assert!(req.max_tokens_explicit);
+        assert!(matches!(req.tool_choice, Some(ToolChoice::Auto)));
+        assert!(req.response_format.is_some());
+        assert_eq!(req.session_id.as_deref(), Some("s-1"));
+    }
 }

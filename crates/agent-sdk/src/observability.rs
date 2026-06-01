@@ -9,6 +9,7 @@ pub mod baggage;
 pub mod context;
 pub mod instrument;
 pub mod langfuse;
+pub mod loop_instrument;
 pub mod metrics;
 pub mod payload;
 pub mod payload_capture;

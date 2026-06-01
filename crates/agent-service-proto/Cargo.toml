@@ -3,6 +3,11 @@ name = "agent-service-proto"
 version = "0.8.0"
 edition = "2024"
 license = "MIT"
+# Internal: generated tonic/prost bindings for the host's gRPC contract.
+# Excluded from the workspace (see root Cargo.toml `exclude`) because its
+# build script invokes `protoc`; it is consumed only by `agent-service-host`
+# and is intentionally not published. A future published gRPC-client binding
+# would vendor or regenerate these from the `.proto` files directly.
 publish = false
 build = "build.rs"
 

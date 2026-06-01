@@ -324,6 +324,16 @@ pub async fn fail_root_turn(
         .commit_event(thread_id, error_event, now)
         .await;
 
+    // Finalize the root `invoke_agent` span with the error outcome and
+    // its full duration (no-op if a prior process owns the live span).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        0,
+        None,
+        "error",
+    );
+
     Ok(failed_task)
 }
 
@@ -353,10 +363,23 @@ pub async fn cancel_root_turn(
 ) -> Result<Vec<AgentTaskId>> {
     best_effort_close_open_attempts(task_id, deps.attempt_store, now).await;
 
-    deps.task_store
+    let cancelled = deps
+        .task_store
         .cancel_tree(task_id, now)
         .await
-        .context("cancel root turn tree")
+        .context("cancel root turn tree")?;
+
+    // Finalize the root `invoke_agent` span with the cancelled outcome
+    // (no-op if a prior process owns the live span).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        0,
+        None,
+        "cancelled",
+    );
+
+    Ok(cancelled)
 }
 
 /// Best-effort close any open (non-closed) turn attempts for a task.
@@ -443,6 +466,7 @@ pub async fn execute_root_turn(
 /// Inner body of [`execute_root_turn`].  Kept separate so the outer
 /// function can wrap the entire call in a metric-recording shim
 /// without having to thread a stopwatch through every early return.
+#[allow(clippy::too_many_lines)]
 async fn execute_root_turn_inner(
     inputs: RootWorkerInputs,
     user_input: super::user_input::UserInput,
@@ -459,9 +483,51 @@ async fn execute_root_turn_inner(
     //    keeps something descriptive without bloating the audit row
     //    with binary payloads.
     let audit_prompt = user_input.audit_summary();
-    let attempt = open_attempt(&inputs, definition, &audit_prompt, deps.attempt_store, now)
-        .await
-        .context("open turn attempt")?;
+
+    // Open the root `invoke_agent` span for the turn, continuing the
+    // inbound client trace when the gRPC caller propagated one (see
+    // `AgentTask::otel_traceparent`), so every `chat` call and
+    // `execute_tool` execution across the suspend/resume hop forms one
+    // coherent trace. The span's ids are persisted on the first attempt
+    // (below) so the resume path and child tool tasks re-parent under it;
+    // the live span is stashed in a process-global registry so the
+    // terminal path finalizes it with the correct full turn duration.
+    #[cfg(feature = "otel")]
+    let root_otel_ids: Option<(String, String)> = {
+        use agent_sdk::observability::loop_instrument;
+        let parent = inputs
+            .bootstrap
+            .task
+            .otel_traceparent
+            .as_deref()
+            .and_then(loop_instrument::context_from_traceparent);
+        let conversation_id = thread_id.to_string();
+        let model = provider.model().to_string();
+        let started = {
+            let _parent_guard = parent.map(opentelemetry::Context::attach);
+            loop_instrument::start_root_turn_span(loop_instrument::RootTurnSpanParams {
+                provider_id: provider.provider(),
+                model: &model,
+                conversation_id: &conversation_id,
+            })
+        };
+        let ids = (started.trace_id_hex.clone(), started.span_id_hex.clone());
+        loop_instrument::stash_root_turn_span(inputs.bootstrap.task_id.as_str(), started.span);
+        Some(ids)
+    };
+    #[cfg(not(feature = "otel"))]
+    let root_otel_ids: Option<(String, String)> = None;
+
+    let attempt = open_attempt(
+        &inputs,
+        definition,
+        &audit_prompt,
+        deps.attempt_store,
+        now,
+        root_otel_ids.clone(),
+    )
+    .await
+    .context("open turn attempt")?;
 
     #[cfg(feature = "otel")]
     crate::observability::ServerMetrics::global()
@@ -547,11 +613,7 @@ async fn execute_root_turn_inner(
     .await
     .context("build chat request")?;
 
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = call_llm_with_retry(LlmRetryParams {
+    let llm_call = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
         user_input: &user_input,
@@ -562,8 +624,31 @@ async fn execute_root_turn_inner(
         deps,
         thread_id,
         now,
-    })
-    .await?;
+    });
+    // Re-parent the turn's `chat` span(s) under the root `invoke_agent`
+    // span. `with_context` propagates the parent per-poll — a held
+    // `ContextGuard` across this `.await` would make the worker future
+    // `!Send` and unspawnable.
+    #[cfg(feature = "otel")]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = {
+        use opentelemetry::trace::FutureExt;
+        match root_otel_ids.as_ref().and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(trace, span)
+        }) {
+            Some(cx) => llm_call.with_context(cx).await?,
+            None => llm_call.await?,
+        }
+    };
+    #[cfg(not(feature = "otel"))]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = llm_call.await?;
 
     // Capture a post-LLM timestamp so the turn attempt's duration_ms
     // reflects actual wall-clock latency instead of always being 0.
@@ -716,6 +801,17 @@ async fn commit_text_only_turn(
         .await
         .context("complete root task")?;
 
+    // Text-only completion: the turn is done, so finalize the root
+    // `invoke_agent` span with its full duration + outcome. Usage is
+    // `None` (the per-call `chat` spans carry authoritative usage).
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        turn_number + 1,
+        None,
+        "done",
+    );
+
     Ok(RootTurnOutcome::Completed {
         commit: Box::new(commit),
         completed_task,
@@ -773,6 +869,7 @@ async fn open_attempt(
     user_prompt: &str,
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
+    otel_ids: Option<(String, String)>,
 ) -> Result<TurnAttempt> {
     let task_id = &inputs.bootstrap.task_id;
     let provenance = AuditProvenance::new(&definition.provider, &definition.model);
@@ -787,6 +884,11 @@ async fn open_attempt(
         .context("list existing attempts")?;
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
+    let (otel_trace_id, otel_span_id) = match otel_ids {
+        Some((trace_id, span_id)) => (Some(trace_id), Some(span_id)),
+        None => (None, None),
+    };
+
     attempt_store
         .open_attempt(OpenAttemptParams {
             task_id: task_id.clone(),
@@ -794,14 +896,36 @@ async fn open_attempt(
             provenance,
             request_blob,
             now,
-            // TODO: once `agent-server` opts into OpenTelemetry, capture
-            // the live span context here so `call_llm_with_retry` can attach
-            // a `replay-of` link on the next attempt.
-            otel_trace_id: None,
-            otel_span_id: None,
+            // The root `invoke_agent` span's ids, persisted on the first
+            // attempt so the resume path and child tool tasks can
+            // re-parent under it across the daemon's task hops (see
+            // `execute_root_turn_inner`). `None` on retry / resume
+            // attempts and when the worker runs without an OTel exporter.
+            otel_trace_id,
+            otel_span_id,
         })
         .await
         .context("open_attempt via store")
+}
+
+/// Load the root `invoke_agent` span's `(trace_id, span_id)` for a turn
+/// from its first attempt (where `execute_root_turn_inner` persisted
+/// them), so the resume path can re-parent the resumed `chat` span under
+/// the turn root across the task hop. Returns `None` when no attempt
+/// carries them (a turn that ran without an `OTel` exporter, or a
+/// pre-migration row).
+#[cfg(feature = "otel")]
+async fn load_root_span_ids(
+    attempt_store: &dyn TurnAttemptStore,
+    task_id: &AgentTaskId,
+) -> Option<(String, String)> {
+    let attempts = attempt_store.list_by_task(task_id).await.ok()?;
+    attempts.into_iter().find_map(
+        |attempt| match (attempt.otel_trace_id, attempt.otel_span_id) {
+            (Some(trace_id), Some(span_id)) => Some((trace_id, span_id)),
+            _ => None,
+        },
+    )
 }
 
 async fn build_chat_request(
@@ -1161,6 +1285,7 @@ async fn handle_recoverable_stream_error(
         attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
+        None,
     )
     .await
     .context("open retry turn attempt")
@@ -1265,6 +1390,7 @@ async fn try_recover_with_compaction(
         attempt_audit_prompt,
         deps.attempt_store,
         OffsetDateTime::now_utc(),
+        None,
     )
     .await
     .context("open retry turn attempt after emergency compaction")?;
@@ -1378,7 +1504,126 @@ async fn emit_auto_retry_end(
 /// (the retry wrapper [`call_llm_with_retry`] handles backoff +
 /// re-attempt) and [`StreamAttemptError::Fatal`] for caller-side
 /// errors that no retry can fix.
+///
+/// ## Observability
+///
+/// This is the daemon-hosted equivalent of the in-process loop's
+/// `agent_loop::turn::request_llm_response`, so it opens the same
+/// `chat {model}` CLIENT span and records the same
+/// `gen_ai.client.token.usage` / `gen_ai.client.operation.duration`
+/// metrics — via the shared
+/// [`agent_sdk::observability::loop_instrument`] helpers — when the
+/// `otel` feature is on. The streaming/journal/retry logic lives in
+/// [`call_llm_once_inner`]; this wrapper only brackets it with the
+/// span so dashboards built against the in-process loop light up
+/// unchanged on the daemon path.
 async fn call_llm_once(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    now: OffsetDateTime,
+) -> Result<OnceOutcome, StreamAttemptError> {
+    #[cfg(feature = "otel")]
+    {
+        call_llm_once_instrumented(provider, request, attempt, deps, thread_id, now).await
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await
+    }
+}
+
+/// Bracket [`call_llm_once_inner`] with the `chat {model}` CLIENT span
+/// + `gen_ai.client.*` metrics, reusing the shared SDK helpers.
+///
+/// This is the daemon-hosted analogue of the in-process loop's
+/// `agent_loop::turn::request_llm_response` instrumentation: same span
+/// name, same `gen_ai.*` attribute set, same token-usage /
+/// operation-duration metrics under the `agent-sdk` meter scope.
+#[cfg(feature = "otel")]
+async fn call_llm_once_instrumented(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_core::ThreadId,
+    now: OffsetDateTime,
+) -> Result<OnceOutcome, StreamAttemptError> {
+    use agent_sdk::observability::loop_instrument;
+
+    // Mirror the in-process loop, which only stamps
+    // `gen_ai.request.max_output_tokens` when the caller explicitly
+    // configured a cap (`config.max_tokens.is_some()`). The worker's
+    // `ChatRequest::max_tokens` is always populated with a resolved
+    // default, so gate on `max_tokens_explicit` to avoid emitting a
+    // synthetic value the in-process span would omit.
+    let max_tokens = request.max_tokens_explicit.then_some(request.max_tokens);
+    let request_model = provider.model().to_string();
+    let provider_id = provider.provider();
+    let mut span = loop_instrument::build_chat_span(loop_instrument::ChatSpanParams {
+        provider_id,
+        model: &request_model,
+        // The worker only ever drives the streaming API
+        // (`provider.chat_stream`), so this span always reflects a
+        // streaming call.
+        streaming: true,
+        max_tokens,
+    });
+
+    let started_at = std::time::Instant::now();
+    let result = call_llm_once_inner(provider, request, attempt, deps, thread_id, now).await;
+    let elapsed = started_at.elapsed().as_secs_f64();
+
+    match &result {
+        Ok(outcome) => {
+            loop_instrument::finish_chat_span_success(
+                &mut span,
+                &outcome.response,
+                elapsed,
+                provider_id,
+                &request_model,
+            );
+        }
+        Err(error) => {
+            let (error_type, message) = match error {
+                StreamAttemptError::Recoverable { kind, message } => {
+                    (stream_error_kind_type(*kind), message.as_str())
+                }
+                StreamAttemptError::Fatal { message } => ("invalid_request", message.as_str()),
+            };
+            loop_instrument::finish_chat_span_error(
+                &mut span,
+                error_type,
+                message,
+                elapsed,
+                provider_id,
+                &request_model,
+            );
+        }
+    }
+
+    result
+}
+
+/// Map a [`StreamErrorKind`] to the stable `error.type` attribute /
+/// metric label, matching the vocabulary
+/// `agent_sdk::observability::loop_instrument::classify_llm_error`
+/// produces for the in-process loop.
+#[cfg(feature = "otel")]
+const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
+    match kind {
+        StreamErrorKind::RateLimited => "rate_limited",
+        StreamErrorKind::ServerError => "server_error",
+        StreamErrorKind::InvalidRequest => "invalid_request",
+    }
+}
+
+/// Streaming/journal/retry body of [`call_llm_once`]. Carries the
+/// entire LLM-stream loop unchanged; the `chat {model}` span lives in
+/// the [`call_llm_once`] wrapper.
+async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
     attempt: &TurnAttempt,
@@ -2181,18 +2426,32 @@ async fn apply_batch_routing(
             Ok((batch.parent_task, invocation_tasks))
         }
         super::subagent_spawn_selector::BatchRouting::AllTools
-        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => deps
-            .task_store
-            .spawn_tool_children(
-                task_id,
-                &inputs.bootstrap.worker_id,
-                &inputs.bootstrap.lease_id,
-                specs,
-                payload,
-                now,
-            )
-            .await
-            .context(tool_children_context),
+        | super::subagent_spawn_selector::BatchRouting::UnsupportedMixedBatch => {
+            // Stamp each child tool task with the turn's root
+            // `invoke_agent` span as its trace parent (loaded from the
+            // first attempt) so the child's `execute_tool` span nests
+            // under the turn root rather than the inbound client span.
+            #[cfg(feature = "otel")]
+            let child_otel_traceparent = load_root_span_ids(deps.attempt_store, task_id)
+                .await
+                .and_then(|(trace, span)| {
+                    agent_sdk::observability::loop_instrument::traceparent_from_ids(&trace, &span)
+                });
+            #[cfg(not(feature = "otel"))]
+            let child_otel_traceparent: Option<String> = None;
+            deps.task_store
+                .spawn_tool_children(
+                    task_id,
+                    &inputs.bootstrap.worker_id,
+                    &inputs.bootstrap.lease_id,
+                    specs,
+                    payload,
+                    child_otel_traceparent,
+                    now,
+                )
+                .await
+                .context(tool_children_context)
+        }
     }
 }
 
@@ -2463,6 +2722,7 @@ struct ResumeContext<'a> {
 ///
 /// [`AgentContinuation`]: agent_sdk_core::AgentContinuation
 /// [`TaskState::ReadyToResume`]: crate::journal::task_state::TaskState::ReadyToResume
+#[allow(clippy::too_many_lines)]
 pub async fn resume_root_turn(
     inputs: RootWorkerInputs,
     continuation: AgentContinuation,
@@ -2482,9 +2742,28 @@ pub async fn resume_root_turn(
     //    "this attempt is a resume" looks like in the audit row.
     let resume_input = super::user_input::UserInput::resume();
     let resume_audit = resume_input.audit_summary();
-    let attempt = open_attempt(&inputs, definition, &resume_audit, deps.attempt_store, now)
+    let attempt = open_attempt(
+        &inputs,
+        definition,
+        &resume_audit,
+        deps.attempt_store,
+        now,
+        None,
+    )
+    .await
+    .context("open resume turn attempt")?;
+
+    // Load the turn's root `invoke_agent` span context (created on the
+    // fresh turn; ids persisted on the first attempt) so the resumed LLM
+    // call's `chat` span joins the same trace. Applied via `with_context`
+    // on the call future below — never a held `ContextGuard`, which would
+    // make this future `!Send`.
+    #[cfg(feature = "otel")]
+    let resume_root_cx = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
         .await
-        .context("open resume turn attempt")?;
+        .and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
+        });
 
     // 2. Buffer the suspended messages (user prompt + assistant with
     //    tool calls) and tool-result messages into the staged stores.
@@ -2539,11 +2818,7 @@ pub async fn resume_root_turn(
     //    IDs lazily during streaming so the per-delta TextDelta /
     //    ThinkingDelta events match the consolidated `Text` /
     //    `Thinking` events committed at turn close.
-    let StreamedTurn {
-        response,
-        content_ids,
-        attempt,
-    } = call_llm_with_retry(LlmRetryParams {
+    let llm_call = call_llm_with_retry(LlmRetryParams {
         inputs: &inputs,
         definition,
         user_input: &resume_input,
@@ -2554,8 +2829,25 @@ pub async fn resume_root_turn(
         deps,
         thread_id,
         now,
-    })
-    .await?;
+    });
+    #[cfg(feature = "otel")]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = {
+        use opentelemetry::trace::FutureExt;
+        match resume_root_cx {
+            Some(cx) => llm_call.with_context(cx).await?,
+            None => llm_call.await?,
+        }
+    };
+    #[cfg(not(feature = "otel"))]
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = llm_call.await?;
     let commit_now = OffsetDateTime::now_utc();
 
     let prior = ResumeContext {
@@ -2773,6 +3065,17 @@ async fn commit_resumed_turn(
         )
         .await
         .context("complete resumed root task")?;
+
+    // The resumed turn completed (no further tool calls) — finalize the
+    // root `invoke_agent` span with its full duration spanning the tool
+    // executions and the resume. Usage lives on the per-call `chat` spans.
+    #[cfg(feature = "otel")]
+    agent_sdk::observability::loop_instrument::finalize_root_turn_span(
+        task_id.as_str(),
+        turn_number + 1,
+        None,
+        "done",
+    );
 
     Ok(RootTurnOutcome::Completed {
         commit: Box::new(commit),

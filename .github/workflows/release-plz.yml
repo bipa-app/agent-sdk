@@ -1,0 +1,62 @@
+name: release-plz
+
+# Automates the *preparation* of releases only. On every push to `main`,
+# release-plz opens/updates a "release PR" that bumps versions and updates
+# CHANGELOG.md from conventional commits. Merging that PR is a human decision.
+#
+# DELIBERATELY NOT ENABLED HERE: the actual `cargo publish` + git tag. That
+# `release-plz release` step (which needs a CARGO_REGISTRY_TOKEN secret) is
+# left commented out below. Turning it on — and cutting the first crates.io
+# release in dependency order — is the human-gated go-live step.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Never run two release flows concurrently.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: Open/update release PR
+    runs-on: ubuntu-latest
+    # Skip on forks: no write token there.
+    if: github.repository == 'bipa-app/agent-sdk'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz (release-pr only)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────────────
+  # HITL GO-LIVE (intentionally disabled). Uncomment and add the
+  # CARGO_REGISTRY_TOKEN secret to enable automated, dependency-ordered
+  # publishing once the owner approves the first release.
+  #
+  # release:
+  #   name: Publish to crates.io (HITL — disabled)
+  #   runs-on: ubuntu-latest
+  #   if: github.repository == 'bipa-app/agent-sdk'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - name: Run release-plz (publish)
+  #       uses: release-plz/action@v0.5
+  #       with:
+  #         command: release
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

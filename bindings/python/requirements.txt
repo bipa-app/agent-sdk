@@ -1,0 +1,4 @@
+# Python binding spike — gRPC client over agent-service-host.
+# Pin to current majors; the spike is not published to PyPI.
+grpcio>=1.60
+grpcio-tools>=1.60

@@ -227,37 +227,12 @@ fn finish_tool_span(
         }
     };
 
-    let metric_attrs = [
-        KeyValue::new(attrs::GEN_AI_TOOL_NAME, tool_name.to_string()),
-        KeyValue::new(attrs::SDK_TOOL_KIND, tool_kind),
-        KeyValue::new(attrs::SDK_TOOL_OUTCOME, outcome_str),
-    ];
-    metrics_handle.tools_execution_count.add(1, &metric_attrs);
-    if let Some(ms) = duration_ms {
-        let ms_f = tool_duration_ms_to_f64(ms);
-        metrics_handle
-            .tools_execution_duration
-            .record(ms_f, &metric_attrs);
-    }
+    // Delegate metric emission to the shared recorder so the
+    // daemon-hosted worker lands in the same series with the same
+    // labels.
+    metrics_handle.record_tool_execution(tool_name, tool_kind, outcome_str, duration_ms);
 
     span.end();
-}
-
-/// Convert a `ToolResult::duration_ms` value (`u64` milliseconds)
-/// into a histogram-friendly `f64`.
-///
-/// Bounding through `u32` keeps the conversion lossless because
-/// `u32::MAX` ≈ 49.7 days — far above the histogram's 5-minute top
-/// bucket, so any clamped value still falls in the overflow bucket
-/// dashboards expect. The clamp path also emits a `warn!` so a real
-/// runaway duration is investigable rather than silently swallowed.
-#[cfg(feature = "otel")]
-fn tool_duration_ms_to_f64(ms: u64) -> f64 {
-    if let Ok(v) = u32::try_from(ms) {
-        return f64::from(v);
-    }
-    log::warn!("tool duration {ms}ms exceeds u32::MAX; clamping for histogram");
-    f64::from(u32::MAX)
 }
 
 async fn execute_tool_call_inner<Ctx, H>(

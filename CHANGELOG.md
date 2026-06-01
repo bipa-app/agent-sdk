@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **crates.io packaging readiness.** The SDK-surface crates (`agent-sdk-core`,
+  `agent-sdk-tools`, `agent-sdk-providers`, `agent-sdk`, `agent-sdk-otel`,
+  `agent-sdk-cli`) are now publishable: package metadata
+  (repository/homepage/authors/keywords/categories), `rust-version`,
+  `[package.metadata.docs.rs]` + `docsrs` feature badges, a crate-local
+  `agent-sdk` README, and a committed `Cargo.lock`. The internal
+  server/host/loom/proto crates stay `publish = false`.
+- **Release automation.** `release-plz` config + workflow (release-PR only;
+  publish is HITL-gated), `deny.toml` (cargo-deny), and a `release-gates`
+  CI workflow running cargo-deny / cargo-audit / cargo-semver-checks, an MSRV
+  pinned-toolchain job, and a packaging dry-run. CI gains a Windows + macOS
+  cross-platform matrix over the published crates.
+- **`ChatRequest::new` + `with_*` builder setters** — an ergonomic alternative
+  to the (still-public) struct literal for the common system + messages case.
+- **Cookbook** (`crates/agent-sdk/COOKBOOK.md`) and a runnable, offline
+  `structured_output` example.
+- **Python binding spike** (`bindings/`) — a thin gRPC client over the durable
+  `agent-service-host`, with a written feasibility recommendation.
+
 ### Changed
+
+- MSRV pinned to **1.91** (the verified buildable floor for the published
+  crates; the merged MCP transport uses `const Duration::from_mins`).
 
 - **BREAKING — Default-deny payload capture.**
   `ObservabilityStore::capture(...) -> CaptureDecision::Inline` no longer
