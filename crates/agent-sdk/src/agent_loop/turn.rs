@@ -1047,15 +1047,20 @@ fn stamp_llm_success(
         response.first_thinking().is_some(),
     ));
 
-    record_chat_token_usage(metrics_handle, response, provider_name, request_model);
-    metrics_handle.operation_duration.record(
+    // Delegate the metric emission to the shared recorders so the
+    // daemon-hosted worker (`observability::loop_instrument`) lands in
+    // exactly the same series with the same labels.
+    metrics_handle.record_chat_token_usage(
+        &response.usage,
+        provider_name,
+        request_model,
+        &response.model,
+    );
+    metrics_handle.record_chat_operation_duration_success(
         elapsed_secs,
-        &[
-            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
-            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
-            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
-            KeyValue::new(attrs::GEN_AI_RESPONSE_MODEL, response.model.clone()),
-        ],
+        provider_name,
+        request_model,
+        &response.model,
     );
 }
 
@@ -1070,20 +1075,16 @@ fn stamp_llm_error(
     provider_name: &'static str,
     request_model: &str,
 ) {
-    use crate::observability::{attrs, spans};
-    use opentelemetry::KeyValue;
+    use crate::observability::spans;
 
     let error_type = classify_llm_error(&err.message);
     spans::set_span_error(span, error_type, &err.message);
 
-    metrics_handle.operation_duration.record(
+    metrics_handle.record_chat_operation_duration_error(
         elapsed_secs,
-        &[
-            KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
-            KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
-            KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
-            KeyValue::new(attrs::ERROR_TYPE, error_type),
-        ],
+        provider_name,
+        request_model,
+        error_type,
     );
 }
 
@@ -1102,45 +1103,6 @@ fn classify_llm_error(msg: &str) -> &'static str {
         "stream_error"
     } else {
         "_OTHER"
-    }
-}
-
-/// Record one `gen_ai.client.token.usage` data point per non-zero
-/// token type. Splitting by type keeps the histogram aggregatable in
-/// Prometheus / Grafana — combining input + output + cache tokens
-/// into a single record would erase the dimension a dashboard cares
-/// about most (cache-hit ratio).
-#[cfg(feature = "otel")]
-fn record_chat_token_usage(
-    metrics: &crate::observability::metrics::Metrics,
-    response: &ChatResponse,
-    provider_name: &'static str,
-    request_model: &str,
-) {
-    use crate::observability::attrs;
-    use opentelemetry::KeyValue;
-
-    let entries: [(u32, &'static str); 4] = [
-        (response.usage.input_tokens, "input"),
-        (response.usage.output_tokens, "output"),
-        (response.usage.cached_input_tokens, "cache_read"),
-        (response.usage.cache_creation_input_tokens, "cache_creation"),
-    ];
-
-    for (count, token_type) in entries {
-        if count == 0 {
-            continue;
-        }
-        metrics.token_usage.record(
-            u64::from(count),
-            &[
-                KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
-                KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
-                KeyValue::new("gen_ai.token.type", token_type),
-                KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, request_model.to_string()),
-                KeyValue::new(attrs::GEN_AI_RESPONSE_MODEL, response.model.clone()),
-            ],
-        );
     }
 }
 

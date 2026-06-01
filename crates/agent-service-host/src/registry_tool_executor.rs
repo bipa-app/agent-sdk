@@ -106,6 +106,33 @@ where
     async fn dispatch(
         &self,
         tool_name: &str,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        seed: ToolContextSeed,
+        collector: ToolEventCollector,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult> {
+        #[cfg(feature = "otel")]
+        {
+            self.dispatch_instrumented(tool_name, tool_call_id, input, seed, collector, cancel)
+                .await
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            // Only the `execute_tool` span (otel path) consumes the id.
+            let _ = tool_call_id;
+            self.dispatch_inner(tool_name, input, seed, collector, cancel)
+                .await
+        }
+    }
+
+    /// Tool lookup, context reconstruction, and execution. The
+    /// `execute_tool` span + `agent_sdk.tools.*` metrics live in
+    /// [`Self::dispatch_instrumented`] (under `feature = "otel"`); this
+    /// is the dispatch logic itself, unchanged.
+    async fn dispatch_inner(
+        &self,
+        tool_name: &str,
         input: serde_json::Value,
         seed: ToolContextSeed,
         collector: ToolEventCollector,
@@ -126,6 +153,101 @@ where
 
         tool.execute(&ctx, input).await
     }
+
+    /// Bracket [`Self::dispatch_inner`] with the SDK's `execute_tool`
+    /// INTERNAL span and `agent_sdk.tools.execution.{count,duration}`
+    /// metrics.
+    ///
+    /// This is the daemon-hosted equivalent of the in-process loop's
+    /// `agent_loop::tool_execution::execute_tool_call`. It reuses the
+    /// shared [`agent_sdk::observability::loop_instrument`] helpers so
+    /// the span name, attribute keys, and metric labels match the
+    /// in-process loop exactly — there is no second tracer/meter scope
+    /// and no duplicated attribute set. The host runtime dispatches
+    /// every tool through `ToolRegistry::get` (synchronous
+    /// `Tool::execute`), so the span's `agent_sdk.tool.kind` is always
+    /// `sync`; async / listen tool kinds are not reachable on this
+    /// path.
+    #[cfg(feature = "otel")]
+    async fn dispatch_instrumented(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        seed: ToolContextSeed,
+        collector: ToolEventCollector,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult> {
+        use agent_sdk::observability::loop_instrument::{
+            ToolSpanOutcome, ToolSpanParams, build_tool_span, finish_tool_span,
+        };
+
+        // Resolve the tool first so the span carries the real tier /
+        // kind. A miss is recorded with `kind = unknown` +
+        // `error.type = unknown_tool`, mirroring the in-process loop's
+        // unknown-tool span.
+        let tool = self.registry.get(tool_name);
+        let (tier, kind) = tool.map_or((None, "unknown"), |tool| (Some(tool.tier()), "sync"));
+        let display_name = tool.map_or("", |tool| tool.display_name());
+
+        // `tool_call_id` is the LLM-assigned id resolved from the
+        // parent's continuation (`bootstrap.tool_call.id`), threaded down
+        // here so the span's `gen_ai.tool.call.id` matches the in-process
+        // loop's `execute_tool` span.
+        let mut span = build_tool_span(ToolSpanParams {
+            tool_name,
+            tool_call_id,
+            display_name,
+            tier,
+            kind,
+        });
+
+        let started_at = std::time::Instant::now();
+        let result = self
+            .dispatch_inner(tool_name, input, seed, collector, cancel)
+            .await;
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).ok();
+
+        match &result {
+            Ok(tool_result) => {
+                finish_tool_span(
+                    &mut span,
+                    tool_name,
+                    kind,
+                    &ToolSpanOutcome::Completed {
+                        output: &tool_result.output,
+                        success: tool_result.success,
+                        duration_ms: tool_result.duration_ms.or(duration_ms),
+                    },
+                );
+            }
+            Err(error) => {
+                // A dispatch-level `Err` (e.g. unknown tool, context
+                // build failure) never produced a `ToolResult`. Record
+                // it as an errored execution so the count/duration
+                // series stays complete. The `unknown tool` message is
+                // shaped to hit the in-process loop's `Unknown tool:`
+                // sentinel so both paths bucket it identically.
+                let message = if kind == "unknown" {
+                    format!("Unknown tool: {tool_name}")
+                } else {
+                    format!("Tool error: {error:#}")
+                };
+                finish_tool_span(
+                    &mut span,
+                    tool_name,
+                    kind,
+                    &ToolSpanOutcome::Completed {
+                        output: &message,
+                        success: false,
+                        duration_ms,
+                    },
+                );
+            }
+        }
+
+        result
+    }
 }
 
 #[async_trait]
@@ -143,6 +265,7 @@ where
 
         self.dispatch(
             &bootstrap.tool_call.name,
+            &bootstrap.tool_call.id,
             bootstrap.tool_call.effective_input.clone(),
             seed,
             collector,
@@ -237,6 +360,7 @@ mod tests {
         let result = executor
             .dispatch(
                 "echo",
+                "call-echo-1",
                 json!({"text": "hello"}),
                 ToolContextSeed {
                     thread_id: ThreadId::from_string("t-dispatch"),
@@ -263,6 +387,7 @@ mod tests {
         executor
             .dispatch(
                 "echo",
+                "call-echo-2",
                 json!({"text": "x"}),
                 ToolContextSeed {
                     thread_id: ThreadId::from_string("t-progress"),
@@ -290,6 +415,7 @@ mod tests {
         let err = executor
             .dispatch(
                 "not_registered",
+                "call-unknown",
                 json!({}),
                 ToolContextSeed {
                     thread_id: ThreadId::from_string("t-unknown"),
