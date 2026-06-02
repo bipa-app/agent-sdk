@@ -13,8 +13,8 @@
 //! event and is enforced by the
 //! [`EventRepository`](super::event_repository::EventRepository).
 
-use agent_sdk_core::ThreadId;
-use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope};
+use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::events::{AgentEvent, AgentEventEnvelope};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

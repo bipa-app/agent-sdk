@@ -44,7 +44,7 @@ otel = [
 failpoints = ["agent-server/failpoints"]
 
 [dependencies]
-agent-sdk-core.workspace = true
+agent-sdk-foundation.workspace = true
 agent-sdk-tools.workspace = true
 agent-sdk-providers.workspace = true
 # Pulled in for `agent_sdk::context::CompactionConfig`, the auto-compaction

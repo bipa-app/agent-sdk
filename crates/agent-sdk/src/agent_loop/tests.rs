@@ -2987,7 +2987,7 @@ async fn test_effective_input_defaults_to_requested() -> anyhow::Result<()> {
 // failure.
 // ==========================================================================
 
-use agent_sdk_core::audit::{ToolAuditOutcome, ToolAuditRecord};
+use agent_sdk_foundation::audit::{ToolAuditOutcome, ToolAuditRecord};
 use tokio::sync::Mutex;
 
 /// Test-only audit sink that captures every record in memory.

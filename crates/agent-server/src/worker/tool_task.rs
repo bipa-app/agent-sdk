@@ -18,7 +18,7 @@
 //! # Positional mapping
 //!
 //! Child tasks are spawned in the same order as the parent's
-//! [`AgentContinuation::pending_tool_calls`](agent_sdk_core::AgentContinuation::pending_tool_calls) array. Each child
+//! [`AgentContinuation::pending_tool_calls`](agent_sdk_foundation::AgentContinuation::pending_tool_calls) array. Each child
 //! carries a `spawn_index` field set during
 //! [`AgentTaskStore::spawn_tool_children`] that records its position
 //! within the batch. The bootstrap step reads this index directly
@@ -40,8 +40,8 @@
 //! `complete_task` / `fail_task`.
 //!
 //! [`TaskState`]: crate::journal::task_state::TaskState
-//! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
-//! [`AgentContinuation`]: agent_sdk_core::AgentContinuation
+//! [`PendingToolCallInfo`]: agent_sdk_foundation::PendingToolCallInfo
+//! [`AgentContinuation`]: agent_sdk_foundation::AgentContinuation
 //! [`AgentTaskStore::spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
 //! [`AgentTaskStore::cancel_tree`]: crate::journal::store::AgentTaskStore::cancel_tree
 //! [`CancellationToken`]: tokio_util::sync::CancellationToken
@@ -49,8 +49,8 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{PendingToolCallInfo, ThreadId, ToolResult};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{PendingToolCallInfo, ThreadId, ToolResult};
 use anyhow::{Context, bail, ensure};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;

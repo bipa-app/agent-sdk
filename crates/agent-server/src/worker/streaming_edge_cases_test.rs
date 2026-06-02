@@ -36,9 +36,9 @@ use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{StopReason, Tool};
-use agent_sdk_core::{ThreadId, ToolTier};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::{StopReason, Tool};
+use agent_sdk_foundation::{ThreadId, ToolTier};
 use agent_sdk_providers::streaming::{StreamDelta, StreamErrorKind};
 use anyhow::{Context, Result};
 use time::Duration;
@@ -243,7 +243,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
             delta: r#"{"city":"Porto"}"#.into(),
             block_index: 2,
         },
-        StreamDelta::Usage(agent_sdk_core::llm::Usage {
+        StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
             input_tokens: 30,
             output_tokens: 20,
             cached_input_tokens: 0,
@@ -457,7 +457,7 @@ async fn stream_ends_without_done_still_commits_text_turn() -> Result<()> {
             delta: "no done marker".into(),
             block_index: 0,
         },
-        StreamDelta::Usage(agent_sdk_core::llm::Usage {
+        StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
             input_tokens: 5,
             output_tokens: 4,
             cached_input_tokens: 0,

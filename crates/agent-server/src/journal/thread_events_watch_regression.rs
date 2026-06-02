@@ -24,8 +24,8 @@ mod tests {
         NotifierThreadEventsWatchHandler, ThreadEventsWatchHandler, ThreadEventsWatchOutcome,
     };
 
-    use agent_sdk_core::ThreadId;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::ThreadId;
+    use agent_sdk_foundation::events::AgentEvent;
     use anyhow::{Context, Result};
     use std::sync::Arc;
     use std::time::Duration as StdDuration;

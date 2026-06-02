@@ -28,8 +28,8 @@
 //! function of its inputs plus store state. No wall clock, no RNG, no
 //! ordering nondeterminism.
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result};
 use time::{Duration, OffsetDateTime};
 
@@ -109,7 +109,7 @@ impl ReplayStores {
             .open_attempt(OpenAttemptParams {
                 task_id: turn.task_id.clone(),
                 attempt_number,
-                provenance: agent_sdk_core::audit::AuditProvenance::new(
+                provenance: agent_sdk_foundation::audit::AuditProvenance::new(
                     "anthropic",
                     "claude-sonnet-4-5-20250929",
                 ),

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use agent_sdk::context::CompactionConfig;
-use agent_sdk_core::{PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::{PendingToolCallInfo, ToolResult};
 use agent_sdk_providers::LlmProvider;
 use agent_server::worker::{
     AgentDefinition, ConfirmationPolicy, NoopSubagentSpawnSelector, PolicyVerdict,

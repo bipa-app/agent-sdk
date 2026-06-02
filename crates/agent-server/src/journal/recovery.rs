@@ -91,7 +91,7 @@
 //! intermediate state.
 //!
 //! [`TaskState::AwaitingConfirmation`]: super::TaskState::AwaitingConfirmation
-//! [`ListenExecutionContext`]: agent_sdk_core::ListenExecutionContext
+//! [`ListenExecutionContext`]: agent_sdk_foundation::ListenExecutionContext
 //! [`TaskKind`]: super::TaskKind
 //! [`TaskStatus`]: super::TaskStatus
 
@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use crate::journal::task::{LeaseId, SuspensionPayload, WorkerId};
     use crate::journal::task_state::TaskState;
-    use agent_sdk_core::{
+    use agent_sdk_foundation::{
         AgentContinuation, AgentState, ContinuationEnvelope, ListenExecutionContext, ThreadId,
         TokenUsage,
     };

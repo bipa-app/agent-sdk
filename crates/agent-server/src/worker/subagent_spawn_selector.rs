@@ -63,7 +63,7 @@
 //! don't opt in (every existing test, every legacy host) keep
 //! today's exact behavior.
 
-use agent_sdk_core::{PendingToolCallInfo, ThreadId};
+use agent_sdk_foundation::{PendingToolCallInfo, ThreadId};
 use async_trait::async_trait;
 
 use super::subagent::{EffectiveSubagentSpec, SubagentSpawnRequest};
@@ -298,7 +298,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
-    use agent_sdk_core::ToolTier;
+    use agent_sdk_foundation::ToolTier;
     use serde_json::json;
 
     use super::super::subagent::{

@@ -7,7 +7,7 @@
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
 };
@@ -1285,8 +1285,8 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
             Content::Text(text) => {
                 items.push(ApiInputItem::Message(ApiMessage {
                     role: match msg.role {
-                        agent_sdk_core::llm::Role::User => ApiRole::User,
-                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
+                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
                     },
                     content: ApiMessageContent::Text(text.clone()),
                 }));
@@ -1298,10 +1298,10 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                     match block {
                         ContentBlock::Text { text } => {
                             let part = match msg.role {
-                                agent_sdk_core::llm::Role::Assistant => {
+                                agent_sdk_foundation::llm::Role::Assistant => {
                                     ApiInputContent::OutputText { text: text.clone() }
                                 }
-                                agent_sdk_core::llm::Role::User => {
+                                agent_sdk_foundation::llm::Role::User => {
                                     ApiInputContent::InputText { text: text.clone() }
                                 }
                             };
@@ -1354,8 +1354,8 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 if !content_parts.is_empty() {
                     items.push(ApiInputItem::Message(ApiMessage {
                         role: match msg.role {
-                            agent_sdk_core::llm::Role::User => ApiRole::User,
-                            agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
+                            agent_sdk_foundation::llm::Role::User => ApiRole::User,
+                            agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
                         },
                         content: ApiMessageContent::Parts(content_parts),
                     }));
@@ -1422,7 +1422,7 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
     }
 }
 
-fn convert_tool(tool: agent_sdk_core::llm::Tool) -> ApiTool {
+fn convert_tool(tool: agent_sdk_foundation::llm::Tool) -> ApiTool {
     // The Responses API with strict: true requires:
     // 1. additionalProperties: false on all object schemas
     // 2. All properties must be in the required array
@@ -2452,11 +2452,11 @@ mod tests {
         let request = ChatRequest {
             system: "system".to_string(),
             messages: vec![
-                agent_sdk_core::llm::Message::user_with_content(vec![ContentBlock::Text {
+                agent_sdk_foundation::llm::Message::user_with_content(vec![ContentBlock::Text {
                     text: "question".to_string(),
                 }]),
-                agent_sdk_core::llm::Message {
-                    role: agent_sdk_core::llm::Role::Assistant,
+                agent_sdk_foundation::llm::Message {
+                    role: agent_sdk_foundation::llm::Role::Assistant,
                     content: Content::Blocks(vec![ContentBlock::Text {
                         text: "answer".to_string(),
                     }]),

@@ -48,7 +48,7 @@ jobs:
       - name: Check publishable crates (all features)
         run: >-
           cargo check --all-targets --all-features
-          -p agent-sdk-core -p agent-sdk-tools -p agent-sdk-providers
+          -p agent-sdk-foundation -p agent-sdk-tools -p agent-sdk-providers
           -p agent-sdk -p agent-sdk-otel -p agent-sdk-cli
       # Windows is build/check only until the primitive-tools Windows
       # portability pass lands (tracked follow-up); macOS runs the full suite.
@@ -56,7 +56,7 @@ jobs:
         if: runner.os != 'Windows'
         run: >-
           cargo nextest run --profile ci --all-features
-          -p agent-sdk-core -p agent-sdk-tools -p agent-sdk-providers
+          -p agent-sdk-foundation -p agent-sdk-tools -p agent-sdk-providers
           -p agent-sdk -p agent-sdk-otel
 
   test:

@@ -37,10 +37,10 @@ use agent_sdk::{
     AgentCapabilities, DynamicToolName, Environment, InMemoryFileSystem, Tool, ToolContext,
     ToolRegistry, ToolResult,
 };
-use agent_sdk_core::types::{
+use agent_sdk_foundation::types::{
     AgentContinuation, AgentState, PendingToolCallInfo, TokenUsage, ToolTier,
 };
-use agent_sdk_core::{ContinuationEnvelope, ThreadId};
+use agent_sdk_foundation::{ContinuationEnvelope, ThreadId};
 use agent_server::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
 use agent_server::worker::{ToolEventCollector, ToolTaskBootstrap};
 use agent_server::{TaskKind, TaskState, TaskStatus};

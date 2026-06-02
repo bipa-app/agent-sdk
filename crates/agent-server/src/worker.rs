@@ -2,7 +2,7 @@
 //! tool-runtime child-task execution.
 //!
 //! This module defines the server-owned [`AgentDefinition`] that replaces
-//! the SDK-local [`AgentConfig`](agent_sdk_core::AgentConfig) for the
+//! the SDK-local [`AgentConfig`](agent_sdk_foundation::AgentConfig) for the
 //! server execution path. The [`AgentDefinitionRegistry`] trait provides
 //! the lookup surface for deterministic, durable-task-driven resolution.
 //!
@@ -59,7 +59,7 @@
 //! [`spawn_subagent_invocation`] turns that authoritative spec into
 //! durable task/thread records.
 //!
-//! [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
+//! [`PendingToolCallInfo`]: agent_sdk_foundation::PendingToolCallInfo
 //!
 //! ```ignore
 //! use agent_server::worker::*;

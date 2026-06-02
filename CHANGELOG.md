@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **crates.io packaging readiness.** The SDK-surface crates (`agent-sdk-core`,
+- **crates.io packaging readiness.** The SDK-surface crates (`agent-sdk-foundation`,
   `agent-sdk-tools`, `agent-sdk-providers`, `agent-sdk`, `agent-sdk-otel`,
   `agent-sdk-cli`) are now publishable: package metadata
   (repository/homepage/authors/keywords/categories), `rust-version`,

@@ -11,8 +11,8 @@
 //! - The slice is verifiable with root-task-driven worker bootstrapping
 //!   tests.
 
-use agent_sdk_core::llm::{Effort, Tool};
-use agent_sdk_core::{ThreadId, ToolRuntime};
+use agent_sdk_foundation::llm::{Effort, Tool};
+use agent_sdk_foundation::{ThreadId, ToolRuntime};
 use time::{Duration, OffsetDateTime};
 
 use super::bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
@@ -49,7 +49,7 @@ fn sample_tools() -> Vec<Tool> {
                 "required": ["path"]
             }),
             display_name: "Read File".into(),
-            tier: agent_sdk_core::ToolTier::Observe,
+            tier: agent_sdk_foundation::ToolTier::Observe,
         },
         Tool {
             name: "write_file".into(),
@@ -63,7 +63,7 @@ fn sample_tools() -> Vec<Tool> {
                 "required": ["path", "content"]
             }),
             display_name: "Write File".into(),
-            tier: agent_sdk_core::ToolTier::Confirm,
+            tier: agent_sdk_foundation::ToolTier::Confirm,
         },
     ]
 }

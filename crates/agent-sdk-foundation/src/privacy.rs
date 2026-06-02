@@ -45,7 +45,7 @@
 //! # Usage
 //!
 //! ```
-//! use agent_sdk_core::privacy::{BaselineDetector, PiiDetector, mask_spans};
+//! use agent_sdk_foundation::privacy::{BaselineDetector, PiiDetector, mask_spans};
 //!
 //! let detector = BaselineDetector::new()?;
 //! let text = "Pay Pix to CPF 111.444.777-35 or card 4111 1111 1111 1111.";

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
 

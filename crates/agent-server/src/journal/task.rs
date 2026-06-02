@@ -24,11 +24,11 @@
 //! transitions to take their typed payload at the call site:
 //!
 //! - [`AgentTask::wait_on_children`] now takes a
-//!   [`agent_sdk_core::ContinuationEnvelope`] alongside the child
+//!   [`agent_sdk_foundation::ContinuationEnvelope`] alongside the child
 //!   count, so a parent that pauses on children can never lose the
 //!   continuation it needs to resume.
 //! - [`AgentTask::await_confirmation`] now takes the same envelope and
-//!   an optional [`agent_sdk_core::ListenExecutionContext`] for
+//!   an optional [`agent_sdk_foundation::ListenExecutionContext`] for
 //!   prepared listen/execute operations.
 //! - [`AgentTask::child_resolved`] and
 //!   [`AgentTask::resume_from_confirmation`] clear the typed payload
@@ -71,7 +71,7 @@
 //! narrow input struct, and leaves cross-row orchestration to the
 //! store.
 
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
+use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::OffsetDateTime;
@@ -217,7 +217,7 @@ impl fmt::Display for LeaseId {
 #[derive(Clone, Debug)]
 pub struct SuspensionPayload {
     pub continuation: ContinuationEnvelope,
-    pub suspended_messages: Vec<agent_sdk_core::llm::Message>,
+    pub suspended_messages: Vec<agent_sdk_foundation::llm::Message>,
 }
 
 /// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
@@ -529,7 +529,7 @@ pub enum SubmittedInputItem {
 ///
 /// `AgentTask` deliberately does **not** derive `PartialEq` / `Eq`:
 /// the [`TaskState`] payload it carries embeds upstream
-/// `agent-sdk-core` types that do not impl `PartialEq`, and the
+/// `agent-sdk-foundation` types that do not impl `PartialEq`, and the
 /// canonical equality contract for a durable row is its serialized
 /// JSON form. Tests use [`serde_json::to_value`] for round-trip
 /// comparisons.
@@ -1662,7 +1662,7 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
+    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use anyhow::{Context, Result};
     use std::collections::BTreeSet;
     use time::Duration;
@@ -1779,7 +1779,7 @@ mod tests {
                     mcp: crate::worker::subagent::EffectiveSubagentMcpPolicy {
                         allowed_servers: set(&["docs"]),
                     },
-                    audit_provenance: Some(agent_sdk_core::audit::AuditProvenance::new(
+                    audit_provenance: Some(agent_sdk_foundation::audit::AuditProvenance::new(
                         "anthropic",
                         "claude-sonnet-4-5-20250929",
                     )),

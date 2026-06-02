@@ -53,7 +53,7 @@
 //! match every other journal type. `draft_messages` defaults to an
 //! empty list so older serialized rows still deserialize cleanly.
 
-use agent_sdk_core::{ThreadId, llm};
+use agent_sdk_foundation::{ThreadId, llm};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

@@ -44,8 +44,8 @@ mod tests {
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
-    use agent_sdk_core::audit::AuditProvenance;
-    use agent_sdk_core::{ThreadId, TokenUsage};
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::{ThreadId, TokenUsage};
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::event_repository::EventRepository;
@@ -242,13 +242,13 @@ mod tests {
                     response_blob: serde_json::json!({"id": "msg_conf_1"}),
                     response_id: Some("msg_conf_1".into()),
                     response_model: Some("claude-sonnet-4-5-20250929".into()),
-                    stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+                    stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
                     outcome: TurnAttemptOutcome::Success,
                     input_tokens: 100,
                     output_tokens: 50,
                     cached_input_tokens: 0,
                 },
-                messages: vec![agent_sdk_core::llm::Message::assistant("test response")],
+                messages: vec![agent_sdk_foundation::llm::Message::assistant("test response")],
                 turn_usage,
                 agent_state_snapshot: serde_json::json!({}),
                 events: vec![],
@@ -292,8 +292,8 @@ mod tests {
 
         let spec = ChildSpawnSpec { max_attempts: 3 };
         let payload = SuspensionPayload {
-            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                agent_sdk_core::AgentContinuation {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
                     thread_id: thread_id("conformance-children"),
                     turn: 1,
                     total_usage: TokenUsage {
@@ -309,7 +309,7 @@ mod tests {
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
                     completed_results: vec![],
-                    state: agent_sdk_core::AgentState::new(thread_id("conformance-children")),
+                    state: agent_sdk_foundation::AgentState::new(thread_id("conformance-children")),
                     response_id: None,
                     stop_reason: None,
                     response_content: vec![],
@@ -441,8 +441,8 @@ mod tests {
         // Spawn a single child with max_attempts=1 so its first lease
         // expiry fail-closes it.
         let payload = SuspensionPayload {
-            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                agent_sdk_core::AgentContinuation {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
                     thread_id: thread_id("conformance-orphan"),
                     turn: 1,
                     total_usage: TokenUsage {
@@ -458,7 +458,7 @@ mod tests {
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
                     completed_results: vec![],
-                    state: agent_sdk_core::AgentState::new(thread_id("conformance-orphan")),
+                    state: agent_sdk_foundation::AgentState::new(thread_id("conformance-orphan")),
                     response_id: None,
                     stop_reason: None,
                     response_content: vec![],
@@ -523,8 +523,8 @@ mod tests {
 
         let spec = ChildSpawnSpec { max_attempts: 3 };
         let payload = SuspensionPayload {
-            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                agent_sdk_core::AgentContinuation {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
                     thread_id: thread_id("conformance-clear"),
                     turn: 1,
                     total_usage: TokenUsage {
@@ -540,7 +540,7 @@ mod tests {
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
                     completed_results: vec![],
-                    state: agent_sdk_core::AgentState::new(thread_id("conformance-clear")),
+                    state: agent_sdk_foundation::AgentState::new(thread_id("conformance-clear")),
                     response_id: None,
                     stop_reason: None,
                     response_content: vec![],

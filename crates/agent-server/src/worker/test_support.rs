@@ -30,7 +30,7 @@
 //!
 //! No production code lives here; the module is `#[cfg(test)]`.
 
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Usage};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Usage};
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 use anyhow::{Result, anyhow};

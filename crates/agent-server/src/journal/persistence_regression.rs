@@ -33,8 +33,8 @@ mod tests {
     };
     use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 
-    use agent_sdk_core::audit::AuditProvenance;
-    use agent_sdk_core::{ThreadId, TokenUsage, llm};
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 

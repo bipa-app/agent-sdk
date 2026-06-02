@@ -1,7 +1,7 @@
 //! # Agent Server
 //!
 //! Server-side agent orchestration, built on the narrow SDK crates
-//! ([`agent_sdk_core`], [`agent_sdk_tools`], [`agent_sdk_providers`])
+//! ([`agent_sdk_foundation`], [`agent_sdk_tools`], [`agent_sdk_providers`])
 //! rather than the public-facing façade.
 //!
 //! This crate is the first real *consumer* of the split SDK boundary and
@@ -21,7 +21,7 @@
 //!   crash at any point can be recovered.
 //!
 //! ```ignore
-//! use agent_sdk_core::{TurnOptions, ToolRuntime};
+//! use agent_sdk_foundation::{TurnOptions, ToolRuntime};
 //!
 //! let server_options = TurnOptions {
 //!     tool_runtime: ToolRuntime::External,
@@ -91,8 +91,8 @@
 //! | Event sequencing | [`LocalEventAuthority`] seeded with the last offset via [`LocalEventAuthority::with_offset`] | Fresh counter per `run_turn` |
 //! | Tool execution | [`ToolRuntime::External`] — caller schedules tasks | [`ToolRuntime::Inline`] — SDK runs tools directly |
 //! | Durability | `strict_durability: true`, checkpoint on every boundary | `strict_durability: false`, best-effort checkpoints |
-//! | Continuation payload | Versioned [`agent_sdk_core::ContinuationEnvelope`] persisted by the server | Passed back in memory |
-//! | Tool audit | [`agent_sdk_tools::ToolAuditSink`] producing [`ToolAuditRecord`](agent_sdk_core::ToolAuditRecord) | `NoopAuditSink` |
+//! | Continuation payload | Versioned [`agent_sdk_foundation::ContinuationEnvelope`] persisted by the server | Passed back in memory |
+//! | Tool audit | [`agent_sdk_tools::ToolAuditSink`] producing [`ToolAuditRecord`](agent_sdk_foundation::ToolAuditRecord) | `NoopAuditSink` |
 //!
 //! Anything in the "Authoritative" column is part of the server-facing
 //! Phase 1 contract and later phases (`journal`, `workers`, `transport`,
@@ -169,7 +169,7 @@ pub use journal::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, 
 // fails to compile — exactly the early-warning signal we want.
 
 /// Core contract types (IDs, events, LLM messages, turn outcomes).
-pub use agent_sdk_core;
+pub use agent_sdk_foundation;
 
 /// Tool traits, registry, hooks, and store contracts.
 pub use agent_sdk_tools;
@@ -178,7 +178,7 @@ pub use agent_sdk_tools;
 pub use agent_sdk_providers;
 
 /// Convenience re-export of the server execution options and event-store types.
-pub use agent_sdk_core::{
+pub use agent_sdk_foundation::{
     AuditProvenance, ExternalToolResult, StopReason, ToolRuntime, TurnOptions, TurnOutcome,
     TurnSummary,
 };
@@ -218,7 +218,7 @@ pub use worker::{
 mod tests {
     use std::collections::HashMap;
 
-    use agent_sdk_core::{
+    use agent_sdk_foundation::{
         AgentConfig, AgentEvent, Message, Role, ThreadId, ToolRuntime, TurnOptions, TurnOutcome,
     };
     use agent_sdk_providers::LlmProvider;
@@ -274,7 +274,7 @@ mod tests {
     /// crate and round-trip through JSON for durable persistence.
     #[test]
     fn external_tool_handoff_types_are_reachable_and_serializable() -> anyhow::Result<()> {
-        use agent_sdk_core::{
+        use agent_sdk_foundation::{
             AgentContinuation, AgentState, ExternalToolResult, PendingToolCallInfo, TokenUsage,
             ToolResult,
         };
@@ -299,7 +299,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "read_file".into(),
                     display_name: "Read File".into(),
-                    tier: agent_sdk_core::types::ToolTier::Observe,
+                    tier: agent_sdk_foundation::types::ToolTier::Observe,
                     input: serde_json::json!({"path": "/tmp/foo.txt"}),
                     effective_input: serde_json::json!({"path": "/tmp/foo.txt"}),
                     listen_context: None,
@@ -308,7 +308,7 @@ mod tests {
                     id: "call_2".into(),
                     name: "write_file".into(),
                     display_name: "Write File".into(),
-                    tier: agent_sdk_core::types::ToolTier::Confirm,
+                    tier: agent_sdk_foundation::types::ToolTier::Confirm,
                     input: serde_json::json!({"path": "/tmp/bar.txt", "content": "hello"}),
                     effective_input: serde_json::json!({"path": "/tmp/bar.txt", "content": "hello"}),
                     listen_context: None,
@@ -524,7 +524,7 @@ mod tests {
     /// and validates version at unwrap time.
     #[test]
     fn continuation_envelope_round_trip_and_version_check() -> anyhow::Result<()> {
-        use agent_sdk_core::{
+        use agent_sdk_foundation::{
             AgentContinuation, AgentState, CONTINUATION_VERSION, ContinuationEnvelope,
             PendingToolCallInfo, TokenUsage,
         };
@@ -547,7 +547,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 display_name: "Read File".into(),
-                tier: agent_sdk_core::types::ToolTier::Observe,
+                tier: agent_sdk_foundation::types::ToolTier::Observe,
                 input: serde_json::json!({"path": "/tmp/foo.txt"}),
                 effective_input: serde_json::json!({"path": "/tmp/foo.txt"}),
                 listen_context: None,
@@ -592,13 +592,13 @@ mod tests {
     /// Verify that `effective_input` is preserved through serialization.
     #[test]
     fn effective_input_survives_serialization() -> anyhow::Result<()> {
-        use agent_sdk_core::PendingToolCallInfo;
+        use agent_sdk_foundation::PendingToolCallInfo;
 
         let info = PendingToolCallInfo {
             id: "call_1".into(),
             name: "tool".into(),
             display_name: "Tool".into(),
-            tier: agent_sdk_core::types::ToolTier::Observe,
+            tier: agent_sdk_foundation::types::ToolTier::Observe,
             input: serde_json::json!({"raw": true}),
             effective_input: serde_json::json!({"raw": true, "enriched": "yes"}),
             listen_context: None,
@@ -651,8 +651,8 @@ mod tests {
         }
     }
 
-    fn sample_turn_summary() -> agent_sdk_core::TurnSummary {
-        use agent_sdk_core::{
+    fn sample_turn_summary() -> agent_sdk_foundation::TurnSummary {
+        use agent_sdk_foundation::{
             AuditProvenance, StopReason, ThreadId, TokenUsage, ToolRuntime, TurnSummary,
         };
 
@@ -685,7 +685,7 @@ mod tests {
     /// future server phases can persist summaries directly.
     #[test]
     fn turn_summary_round_trips_through_json_from_server_crate() -> anyhow::Result<()> {
-        use agent_sdk_core::TurnSummary;
+        use agent_sdk_foundation::TurnSummary;
 
         let original = sample_turn_summary();
         let json = serde_json::to_string(&original)?;
@@ -750,7 +750,7 @@ mod tests {
     /// variant shape is stable.
     #[test]
     fn server_can_pattern_match_summary_off_done_outcome() {
-        use agent_sdk_core::{TokenUsage, TurnOutcome};
+        use agent_sdk_foundation::{TokenUsage, TurnOutcome};
 
         let summary = sample_turn_summary();
         let outcome = TurnOutcome::Done {
@@ -782,7 +782,7 @@ mod tests {
     /// fields.
     #[test]
     fn server_can_construct_turn_summary_via_new() {
-        use agent_sdk_core::{AuditProvenance, ThreadId, ToolRuntime, TurnOptions, TurnSummary};
+        use agent_sdk_foundation::{AuditProvenance, ThreadId, ToolRuntime, TurnOptions, TurnSummary};
 
         let options = TurnOptions {
             tool_runtime: ToolRuntime::External,
@@ -800,7 +800,7 @@ mod tests {
     /// accidental variant additions by explicitly matching each one.
     #[test]
     fn every_terminal_variant_carries_a_summary() {
-        use agent_sdk_core::{
+        use agent_sdk_foundation::{
             AgentContinuation, AgentError, AgentState, ContinuationEnvelope, ThreadId, TokenUsage,
             TurnOutcome,
         };

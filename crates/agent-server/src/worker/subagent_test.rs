@@ -10,9 +10,9 @@ use crate::journal::{
     AgentTask, AgentTaskStore, InMemoryAgentTaskStore, InMemoryThreadStore, LeaseId,
     SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, ThreadStore, WorkerId,
 };
-use agent_sdk_core::ToolTier;
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::events::AgentEvent;
+use agent_sdk_foundation::ToolTier;
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::events::AgentEvent;
 use time::{Duration, OffsetDateTime};
 
 use super::subagent::{
@@ -38,7 +38,7 @@ struct FailingEventRepository;
 impl EventRepository for FailingEventRepository {
     async fn commit_event(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
         _event: AgentEvent,
         _now: OffsetDateTime,
     ) -> Result<crate::journal::CommittedEvent> {
@@ -47,27 +47,27 @@ impl EventRepository for FailingEventRepository {
 
     async fn commit_event_batch(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
         _events: Vec<AgentEvent>,
         _now: OffsetDateTime,
     ) -> Result<Vec<crate::journal::CommittedEvent>> {
         anyhow::bail!("synthetic event batch commit failure");
     }
 
-    async fn next_sequence(&self, _thread_id: &agent_sdk_core::ThreadId) -> Result<u64> {
+    async fn next_sequence(&self, _thread_id: &agent_sdk_foundation::ThreadId) -> Result<u64> {
         Ok(0)
     }
 
     async fn get_events(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
     ) -> Result<Vec<crate::journal::CommittedEvent>> {
         Ok(Vec::new())
     }
 
     async fn get_events_in_range(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
         _after_sequence: u64,
         _up_to_sequence: u64,
     ) -> Result<Vec<crate::journal::CommittedEvent>> {
@@ -78,13 +78,13 @@ impl EventRepository for FailingEventRepository {
         &self,
         _cutoff: OffsetDateTime,
         _limit: u32,
-    ) -> Result<Vec<agent_sdk_core::ThreadId>> {
+    ) -> Result<Vec<agent_sdk_foundation::ThreadId>> {
         Ok(Vec::new())
     }
 
     async fn max_sequence_before(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
         _cutoff: OffsetDateTime,
     ) -> Result<Option<u64>> {
         Ok(None)
@@ -92,7 +92,7 @@ impl EventRepository for FailingEventRepository {
 
     async fn min_sequence_at_or_after(
         &self,
-        _thread_id: &agent_sdk_core::ThreadId,
+        _thread_id: &agent_sdk_foundation::ThreadId,
         _cutoff: OffsetDateTime,
     ) -> Result<Option<u64>> {
         Ok(None)
@@ -777,7 +777,7 @@ async fn running_parent_root(
     task_store: &InMemoryAgentTaskStore,
 ) -> Result<(AgentTask, WorkerId, LeaseId)> {
     let root = AgentTask::new_root_turn(
-        agent_sdk_core::ThreadId::from_string("t-parent-subagent"),
+        agent_sdk_foundation::ThreadId::from_string("t-parent-subagent"),
         t0(),
         3,
     );
@@ -805,18 +805,18 @@ fn child_root_input(task: &str) -> Vec<crate::journal::task::SubmittedInputItem>
 }
 
 fn parent_suspension_payload(
-    parent_thread_id: &agent_sdk_core::ThreadId,
+    parent_thread_id: &agent_sdk_foundation::ThreadId,
     task: &str,
 ) -> SuspensionPayload {
     parent_suspension_payload_with_tier(parent_thread_id, task, ToolTier::Confirm)
 }
 
 fn parent_suspension_payload_with_tier(
-    parent_thread_id: &agent_sdk_core::ThreadId,
+    parent_thread_id: &agent_sdk_foundation::ThreadId,
     task: &str,
     tier: ToolTier,
 ) -> SuspensionPayload {
-    let tool_call = agent_sdk_core::PendingToolCallInfo {
+    let tool_call = agent_sdk_foundation::PendingToolCallInfo {
         id: "call_subagent".into(),
         name: "subagent_researcher".into(),
         display_name: "Subagent: Researcher".into(),
@@ -826,16 +826,16 @@ fn parent_suspension_payload_with_tier(
         listen_context: None,
     };
     SuspensionPayload {
-        continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-            agent_sdk_core::AgentContinuation {
+        continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+            agent_sdk_foundation::AgentContinuation {
                 thread_id: parent_thread_id.clone(),
                 turn: 1,
-                total_usage: agent_sdk_core::TokenUsage::default(),
-                turn_usage: agent_sdk_core::TokenUsage::default(),
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
                 pending_tool_calls: vec![tool_call],
                 awaiting_index: 0,
                 completed_results: Vec::new(),
-                state: agent_sdk_core::AgentState::new(parent_thread_id.clone()),
+                state: agent_sdk_foundation::AgentState::new(parent_thread_id.clone()),
                 response_id: None,
                 stop_reason: None,
                 response_content: Vec::new(),
@@ -919,13 +919,13 @@ async fn assert_spawned_invocation_contract(
 /// fan-out spawn helper, which validates each entry's `spawn_index`
 /// against the shared envelope.
 fn parent_suspension_payload_with_tools(
-    parent_thread_id: &agent_sdk_core::ThreadId,
+    parent_thread_id: &agent_sdk_foundation::ThreadId,
     tasks: &[&str],
 ) -> SuspensionPayload {
     let pending_tool_calls = tasks
         .iter()
         .enumerate()
-        .map(|(idx, task)| agent_sdk_core::PendingToolCallInfo {
+        .map(|(idx, task)| agent_sdk_foundation::PendingToolCallInfo {
             id: format!("call_subagent_{idx}"),
             name: format!("subagent_researcher_{idx}"),
             display_name: format!("Subagent: Researcher {idx}"),
@@ -936,16 +936,16 @@ fn parent_suspension_payload_with_tools(
         })
         .collect();
     SuspensionPayload {
-        continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-            agent_sdk_core::AgentContinuation {
+        continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+            agent_sdk_foundation::AgentContinuation {
                 thread_id: parent_thread_id.clone(),
                 turn: 1,
-                total_usage: agent_sdk_core::TokenUsage::default(),
-                turn_usage: agent_sdk_core::TokenUsage::default(),
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
                 pending_tool_calls,
                 awaiting_index: 0,
                 completed_results: Vec::new(),
-                state: agent_sdk_core::AgentState::new(parent_thread_id.clone()),
+                state: agent_sdk_foundation::AgentState::new(parent_thread_id.clone()),
                 response_id: None,
                 stop_reason: None,
                 response_content: Vec::new(),
@@ -972,7 +972,7 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
         .iter()
         .enumerate()
         .map(|(idx, task)| SubagentInvocationSpawn {
-            child_thread_id: agent_sdk_core::ThreadId::new(),
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: u32::try_from(idx).expect("test idx fits in u32"),
@@ -1079,14 +1079,14 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
 
     let spawns = vec![
         SubagentInvocationSpawn {
-            child_thread_id: agent_sdk_core::ThreadId::new(),
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec("A"),
             child_root_input: child_root_input("A"),
             spawn_index: 0,
             payload: payload.clone(),
         },
         SubagentInvocationSpawn {
-            child_thread_id: agent_sdk_core::ThreadId::new(),
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec("ghost"),
             child_root_input: child_root_input("ghost"),
             spawn_index: 5, // out of bounds — only 2 pending tool calls
@@ -1125,7 +1125,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
     let task = "Inspect durable linkage";
     let spec = sample_spec(task);
 
-    let child_thread_id = agent_sdk_core::ThreadId::new();
+    let child_thread_id = agent_sdk_foundation::ThreadId::new();
     let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
         &parent.id,
         &worker,
@@ -1210,7 +1210,7 @@ async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
     let task = "Inspect durable linkage";
     let spec = sample_spec(task);
 
-    let child_thread_id = agent_sdk_core::ThreadId::new();
+    let child_thread_id = agent_sdk_foundation::ThreadId::new();
     let created: SpawnedSubagentInvocation = spawn_subagent_invocation(
         &parent.id,
         &worker,
@@ -1375,7 +1375,7 @@ async fn spawn_flow_rejects_non_confirm_tier_subagent_tools() -> Result<()> {
         &worker,
         &lease,
         SubagentInvocationSpawn {
-            child_thread_id: agent_sdk_core::ThreadId::new(),
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: 0,

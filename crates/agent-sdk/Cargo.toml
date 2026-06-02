@@ -20,7 +20,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-agent-sdk-core = { workspace = true }
+agent-sdk-foundation = { workspace = true }
 agent-sdk-tools = { workspace = true }
 # Providers are pulled in with no default features (set at the workspace
 # level) so this crate's own feature flags decide which provider impls

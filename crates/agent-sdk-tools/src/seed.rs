@@ -24,7 +24,7 @@
 //! server never has to infer context shape from SDK internals.
 
 use crate::stores::EventStore;
-use agent_sdk_core::types::ThreadId;
+use agent_sdk_foundation::types::ThreadId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

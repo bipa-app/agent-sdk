@@ -238,8 +238,8 @@ mod tests {
     use crate::journal::event_repository::InMemoryEventRepository;
     use crate::journal::outbox::InMemoryOutboxStore;
     use crate::journal::retention::InMemoryRetentionStore;
-    use agent_sdk_core::ThreadId;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::ThreadId;
+    use agent_sdk_foundation::events::AgentEvent;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {
@@ -422,7 +422,7 @@ mod tests {
         use crate::journal::checkpoint::NewCheckpointParams;
         use crate::journal::checkpoint_store::CheckpointStore;
         use crate::journal::task::AgentTaskId;
-        use agent_sdk_core::{TokenUsage, llm};
+        use agent_sdk_foundation::{TokenUsage, llm};
 
         let events = InMemoryEventRepository::new();
         let retention = InMemoryRetentionStore::new();
@@ -473,7 +473,7 @@ mod tests {
         use crate::journal::checkpoint::NewCheckpointParams;
         use crate::journal::checkpoint_store::CheckpointStore;
         use crate::journal::task::AgentTaskId;
-        use agent_sdk_core::{TokenUsage, llm};
+        use agent_sdk_foundation::{TokenUsage, llm};
 
         let events = InMemoryEventRepository::new();
         let retention = InMemoryRetentionStore::new();
@@ -575,7 +575,7 @@ mod tests {
         use crate::journal::checkpoint::NewCheckpointParams;
         use crate::journal::checkpoint_store::CheckpointStore;
         use crate::journal::task::AgentTaskId;
-        use agent_sdk_core::{TokenUsage, llm};
+        use agent_sdk_foundation::{TokenUsage, llm};
 
         // Two disjoint populations:
         //   - thread_a: has expired events (Pass 1 eligible).
@@ -749,7 +749,7 @@ mod tests {
         use crate::journal::outbox::{NewOutboxRow, OutboxStore};
         use crate::journal::outbox_message::OutboxMessageKind;
         use crate::journal::task::AgentTaskId;
-        use agent_sdk_core::{TokenUsage, llm};
+        use agent_sdk_foundation::{TokenUsage, llm};
 
         // Regression: a Pass 1 thread whose floor cannot advance (the
         // outbox pins `safe_floor <= current_floor`) must NOT burn
@@ -827,7 +827,7 @@ mod tests {
         use crate::journal::checkpoint::NewCheckpointParams;
         use crate::journal::checkpoint_store::CheckpointStore;
         use crate::journal::task::AgentTaskId;
-        use agent_sdk_core::{TokenUsage, llm};
+        use agent_sdk_foundation::{TokenUsage, llm};
 
         let events = InMemoryEventRepository::new();
         let retention = InMemoryRetentionStore::new();

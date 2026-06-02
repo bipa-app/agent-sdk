@@ -40,7 +40,7 @@
 //! never stalls the producer.
 
 use super::committed_event::CommittedEvent;
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -393,7 +393,7 @@ impl Default for LiveTailHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::events::AgentEvent;
     use time::OffsetDateTime;
 
     fn t0() -> OffsetDateTime {

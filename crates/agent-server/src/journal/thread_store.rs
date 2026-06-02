@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_sdk_core::{ThreadId, TokenUsage};
+use agent_sdk_foundation::{ThreadId, TokenUsage};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;

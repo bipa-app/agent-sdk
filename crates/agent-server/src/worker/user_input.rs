@@ -38,7 +38,7 @@
 //! examines the audit row sees something descriptive without needing
 //! to round-trip the bytes.
 
-use agent_sdk_core::llm::{ContentBlock, ContentSource, Message};
+use agent_sdk_foundation::llm::{ContentBlock, ContentSource, Message};
 
 use crate::journal::task::SubmittedInputItem;
 
@@ -259,7 +259,7 @@ mod tests {
         let msg = input.into_message().expect("text input has a message");
         assert!(matches!(
             msg.content,
-            agent_sdk_core::llm::Content::Blocks(_)
+            agent_sdk_foundation::llm::Content::Blocks(_)
         ));
     }
 

@@ -3,7 +3,7 @@
 //! This file is intentionally small: it exists to prove that each new
 //! testing tool compiles and runs in the workspace, and to give the
 //! rest of Phase 11 a copy-paste-able pattern for each. It asserts only
-//! framework-level invariants of `agent-sdk-core` types — no runtime
+//! framework-level invariants of `agent-sdk-foundation` types — no runtime
 //! behaviour is exercised or changed.
 //!
 //! Tools demonstrated:
@@ -19,7 +19,7 @@
 //! `agent-service-host` scheduling/lease tests (extended in Phase 11·D) rather
 //! than demonstrated here against bare `tokio` primitives.
 
-use agent_sdk_core::{AgentEvent, SequenceCounter, ThreadId};
+use agent_sdk_foundation::{AgentEvent, SequenceCounter, ThreadId};
 
 // ── proptest: property-based fuzzing ─────────────────────────────────
 //
@@ -52,7 +52,7 @@ proptest::proptest! {
 // current value, then both advance by one".
 
 mod state_machine {
-    use agent_sdk_core::SequenceCounter;
+    use agent_sdk_foundation::SequenceCounter;
     use proptest::prelude::*;
     use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 

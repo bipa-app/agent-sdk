@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -326,7 +326,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
 mod tests {
     use super::super::task::AgentTaskId;
     use super::*;
-    use agent_sdk_core::{TokenUsage, llm};
+    use agent_sdk_foundation::{TokenUsage, llm};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 

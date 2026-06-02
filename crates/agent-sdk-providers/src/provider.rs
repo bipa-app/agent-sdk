@@ -3,7 +3,7 @@
 //! This module defines the [`LlmProvider`] trait that all LLM backends implement,
 //! as well as the [`collect_stream`] helper for consuming a streaming response.
 
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
@@ -15,7 +15,7 @@ use crate::model_capabilities::{
 };
 use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 
-/// How a provider satisfies a [`ResponseFormat`](agent_sdk_core::llm::ResponseFormat)
+/// How a provider satisfies a [`ResponseFormat`](agent_sdk_foundation::llm::ResponseFormat)
 /// structured-output request.
 ///
 /// The structured-output runner consults this to decide how to shape the
@@ -214,7 +214,7 @@ pub trait LlmProvider: Send + Sync {
     }
 
     /// How this provider satisfies a structured-output
-    /// ([`ResponseFormat`](agent_sdk_core::llm::ResponseFormat)) request.
+    /// ([`ResponseFormat`](agent_sdk_foundation::llm::ResponseFormat)) request.
     ///
     /// Providers with a native JSON-schema / JSON-mode wire field
     /// (OpenAI-family, Gemini, Vertex) report

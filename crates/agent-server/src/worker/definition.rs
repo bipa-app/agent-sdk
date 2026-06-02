@@ -1,7 +1,7 @@
 //! Server-owned agent definition and runtime policy types.
 //!
 //! [`AgentDefinition`] is the server-side replacement for the SDK-local
-//! [`AgentConfig`](agent_sdk_core::AgentConfig). Every field is resolved
+//! [`AgentConfig`](agent_sdk_foundation::AgentConfig). Every field is resolved
 //! from durable task identity by the registry — no SDK-local defaults
 //! leak into this structure.
 //!
@@ -10,14 +10,14 @@
 //! and streaming preference.
 //!
 //! [`ThinkingPolicy`] is a serde-stable representation of the extended
-//! thinking configuration. The SDK's [`ThinkingConfig`](agent_sdk_core::llm::ThinkingConfig)
+//! thinking configuration. The SDK's [`ThinkingConfig`](agent_sdk_foundation::llm::ThinkingConfig)
 //! does not implement `Serialize`/`Deserialize`, so the server defines
 //! its own enum to ensure round-trip durability.
 
 use std::sync::Arc;
 
-use agent_sdk_core::ToolRuntime;
-use agent_sdk_core::llm::{Effort, Tool};
+use agent_sdk_foundation::ToolRuntime;
+use agent_sdk_foundation::llm::{Effort, Tool};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ impl Default for RuntimePolicy {
 
 /// The fully-resolved, server-owned definition of an agent.
 ///
-/// This replaces [`AgentConfig`](agent_sdk_core::AgentConfig) for the
+/// This replaces [`AgentConfig`](agent_sdk_foundation::AgentConfig) for the
 /// server execution path. Every field is deterministically resolved from
 /// durable task identity by the [`AgentDefinitionRegistry`](super::registry::AgentDefinitionRegistry) —
 /// no SDK-local defaults participate in the resolution.
@@ -237,7 +237,7 @@ impl AgentDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::ToolTier;
+    use agent_sdk_foundation::ToolTier;
 
     fn tool(name: &str) -> Tool {
         Tool {

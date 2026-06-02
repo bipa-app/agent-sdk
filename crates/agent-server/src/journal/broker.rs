@@ -120,7 +120,7 @@ mod tests {
     use super::*;
     use crate::journal::outbox_message::{TaskWakeupPayload, ThreadEventsAvailablePayload};
     use crate::journal::task::AgentTaskId;
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
 
     fn thread_a() -> ThreadId {
         ThreadId::from_string("t-broker-a")

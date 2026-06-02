@@ -28,11 +28,11 @@
 //!
 //! # Trait shape
 //!
-//! The record shape lives in [`agent_sdk_core::audit`] so it stays
-//! data-only; the async trait lives here so `agent-sdk-core` does not
+//! The record shape lives in [`agent_sdk_foundation::audit`] so it stays
+//! data-only; the async trait lives here so `agent-sdk-foundation` does not
 //! need to depend on `async-trait`.
 
-use agent_sdk_core::audit::ToolAuditRecord;
+use agent_sdk_foundation::audit::ToolAuditRecord;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -84,8 +84,8 @@ impl<S: ToolAuditSink + ?Sized> ToolAuditSink for Arc<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
-    use agent_sdk_core::types::{ToolResult, ToolTier};
+    use agent_sdk_foundation::audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord};
+    use agent_sdk_foundation::types::{ToolResult, ToolTier};
     use tokio::sync::Mutex;
 
     /// A test sink that captures every record it receives.
@@ -106,7 +106,7 @@ mod tests {
     }
 
     fn sample_record(outcome: ToolAuditOutcome) -> ToolAuditRecord {
-        ToolAuditRecord::new(agent_sdk_core::audit::ToolAuditRecordParams {
+        ToolAuditRecord::new(agent_sdk_foundation::audit::ToolAuditRecordParams {
             tool_call_id: "call_x".into(),
             tool_name: "tool_x".into(),
             display_name: "Tool X".into(),

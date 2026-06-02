@@ -67,7 +67,7 @@
 //! # Usage
 //!
 //! ```
-//! use agent_sdk_core::privacy::{RedactionPolicy, redact_value};
+//! use agent_sdk_foundation::privacy::{RedactionPolicy, redact_value};
 //!
 //! let policy = RedactionPolicy::baseline();
 //! let input = serde_json::json!({
@@ -241,7 +241,7 @@ impl RedactionPolicy {
     /// case-insensitive matching contract intact.
     ///
     /// ```
-    /// use agent_sdk_core::privacy::RedactionPolicy;
+    /// use agent_sdk_foundation::privacy::RedactionPolicy;
     /// let policy = RedactionPolicy::with_keys(["chave_pix".to_owned()]);
     /// assert!(policy.sensitive_key_patterns.iter().any(|p| p == "password"));
     /// assert!(policy.sensitive_key_patterns.iter().any(|p| p == "chave_pix"));

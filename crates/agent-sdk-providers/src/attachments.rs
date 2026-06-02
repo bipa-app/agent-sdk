@@ -1,4 +1,4 @@
-use agent_sdk_core::llm::{ChatRequest, Content, ContentBlock};
+use agent_sdk_foundation::llm::{ChatRequest, Content, ContentBlock};
 use anyhow::{Result, bail};
 use base64::Engine;
 
@@ -224,7 +224,7 @@ fn validate_openai_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::llm::{ContentSource, Message, Role};
+    use agent_sdk_foundation::llm::{ContentSource, Message, Role};
 
     fn request_with_blocks(blocks: Vec<ContentBlock>) -> ChatRequest {
         ChatRequest {

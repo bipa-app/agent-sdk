@@ -27,10 +27,10 @@ use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_core::{ThreadId, ToolResult, ToolTier};
+use agent_sdk_foundation::{ThreadId, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result};
 use async_trait::async_trait;

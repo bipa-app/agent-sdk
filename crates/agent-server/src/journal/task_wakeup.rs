@@ -519,7 +519,7 @@ mod tests {
     use super::*;
     use crate::journal::store::InMemoryAgentTaskStore;
     use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
     use time::Duration as TimeDuration;

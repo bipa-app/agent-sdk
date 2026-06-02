@@ -76,12 +76,12 @@
 //! requires — the resume path trusts the journal and the policy,
 //! not the replay of a previously approved decision.
 //!
-//! [`ListenExecutionContext`]: agent_sdk_core::ListenExecutionContext
+//! [`ListenExecutionContext`]: agent_sdk_foundation::ListenExecutionContext
 //! [`TaskState::AwaitingConfirmation`]: crate::journal::task_state::TaskState::AwaitingConfirmation
-//! [`PendingToolCallInfo::listen_context`]: agent_sdk_core::PendingToolCallInfo
+//! [`PendingToolCallInfo::listen_context`]: agent_sdk_foundation::PendingToolCallInfo
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ListenExecutionContext, PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ListenExecutionContext, PendingToolCallInfo, ToolResult};
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

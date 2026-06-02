@@ -444,7 +444,7 @@ async fn tier_c_live_completion_and_stream_and_tool() -> anyhow::Result<()> {
             "required": ["city"],
         }),
         display_name: "Weather".into(),
-        tier: agent_sdk_core::ToolTier::Observe,
+        tier: agent_sdk_foundation::ToolTier::Observe,
     };
     let (tool_blocks, _raw, _stop) = drain(
         &provider,

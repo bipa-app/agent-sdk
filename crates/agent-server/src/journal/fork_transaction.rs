@@ -29,8 +29,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 
 use super::checkpoint::NewCheckpointParams;
 

@@ -49,12 +49,12 @@ use std::sync::Arc;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_core::{
+use agent_sdk_foundation::{
     AgentContinuation, AgentState, PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, ToolTier,
     llm,
 };
@@ -366,7 +366,7 @@ fn parent_suspension_payload(parent_thread: &ThreadId, tool_id: &str) -> Suspens
         listen_context: None,
     };
     SuspensionPayload {
-        continuation: agent_sdk_core::ContinuationEnvelope::wrap(AgentContinuation {
+        continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(AgentContinuation {
             thread_id: parent_thread.clone(),
             turn: 1,
             total_usage: TokenUsage::default(),

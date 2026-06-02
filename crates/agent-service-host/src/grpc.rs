@@ -5,9 +5,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{self, ContentBlock, ContentSource};
-use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::{self, ContentBlock, ContentSource};
+use agent_sdk_foundation::{ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
@@ -1871,9 +1871,9 @@ fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
 /// than reset it — the agent-server's commit pipeline always emits
 /// the `Done` last, so any non-`Done` event seen at sequence S
 /// belongs to a turn whose `Done` is at some sequence `>= S`.
-const fn turn_number_for_event(event: &agent_sdk_core::events::AgentEvent) -> Option<u64> {
+const fn turn_number_for_event(event: &agent_sdk_foundation::events::AgentEvent) -> Option<u64> {
     match event {
-        agent_sdk_core::events::AgentEvent::Done { total_turns, .. } => Some(*total_turns as u64),
+        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. } => Some(*total_turns as u64),
         _ => None,
     }
 }
@@ -1896,7 +1896,7 @@ const fn turn_number_for_event(event: &agent_sdk_core::events::AgentEvent) -> Op
 /// `agent_state_snapshot` JSON value.
 ///
 /// The snapshot is whatever
-/// [`agent_sdk_core::AgentState`] serializes to — the relevant
+/// [`agent_sdk_foundation::AgentState`] serializes to — the relevant
 /// shape is `{ "thread_id": ..., "turn_count": ...,
 /// "total_usage": { "input_tokens": N, "output_tokens": M, … },
 /// "metadata": ..., "created_at": ... }`. The fork uses this
@@ -1915,16 +1915,16 @@ const fn turn_number_for_event(event: &agent_sdk_core::events::AgentEvent) -> Op
 ///   silently land a fork with the wrong total.
 fn total_usage_from_state_snapshot(
     snapshot: &serde_json::Value,
-) -> anyhow::Result<agent_sdk_core::TokenUsage> {
+) -> anyhow::Result<agent_sdk_foundation::TokenUsage> {
     use anyhow::Context as _;
     if snapshot.is_null() {
-        return Ok(agent_sdk_core::TokenUsage::default());
+        return Ok(agent_sdk_foundation::TokenUsage::default());
     }
     let object = snapshot
         .as_object()
         .context("agent_state_snapshot is not a JSON object")?;
     let Some(value) = object.get("total_usage") else {
-        return Ok(agent_sdk_core::TokenUsage::default());
+        return Ok(agent_sdk_foundation::TokenUsage::default());
     };
     serde_json::from_value(value.clone()).context("agent_state_snapshot.total_usage is malformed")
 }
@@ -2084,7 +2084,7 @@ fn map_tool_result(result: &ToolResult) -> RpcResult<pb::ToolResult> {
 }
 
 fn map_prepared_operation(
-    operation: &agent_sdk_core::ListenExecutionContext,
+    operation: &agent_sdk_foundation::ListenExecutionContext,
 ) -> RpcResult<pb::PreparedOperation> {
     Ok(pb::PreparedOperation {
         operation_id: operation.operation_id.clone(),
@@ -2488,8 +2488,8 @@ mod tests {
         ToolCallExecutor,
     };
     #[cfg(feature = "postgres")]
-    use agent_sdk_core::ThreadId;
-    use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
+    use agent_sdk_foundation::ThreadId;
+    use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;

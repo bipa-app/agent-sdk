@@ -22,8 +22,8 @@
 //! This hook follows the same pattern as
 //! [`AtomicCompletedTurnCommitter`](super::completed_turn_transaction::AtomicCompletedTurnCommitter).
 
-use agent_sdk_core::ThreadId;
-use agent_sdk_core::events::AgentEvent;
+use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::events::AgentEvent;
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;

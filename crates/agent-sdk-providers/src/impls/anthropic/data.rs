@@ -5,7 +5,7 @@
 //! request/response format.
 
 use crate::streaming::StreamDelta;
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, Usage,
 };
 use serde::{Deserialize, Serialize};
@@ -48,13 +48,13 @@ pub struct ApiToolChoice {
 }
 
 impl ApiToolChoice {
-    pub fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+    pub fn from_tool_choice(tc: &agent_sdk_foundation::llm::ToolChoice) -> Self {
         match tc {
-            agent_sdk_core::llm::ToolChoice::Auto => Self {
+            agent_sdk_foundation::llm::ToolChoice::Auto => Self {
                 choice_type: "auto".to_owned(),
                 name: None,
             },
-            agent_sdk_core::llm::ToolChoice::Tool(name) => Self {
+            agent_sdk_foundation::llm::ToolChoice::Tool(name) => Self {
                 choice_type: "tool".to_owned(),
                 name: Some(name.clone()),
             },
@@ -114,14 +114,14 @@ pub enum ApiThinkingConfig {
 }
 
 impl ApiThinkingConfig {
-    pub const fn from_thinking_config(config: &agent_sdk_core::llm::ThinkingConfig) -> Self {
+    pub const fn from_thinking_config(config: &agent_sdk_foundation::llm::ThinkingConfig) -> Self {
         match &config.mode {
-            agent_sdk_core::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
+            agent_sdk_foundation::llm::ThinkingMode::Enabled { budget_tokens } => Self::Enabled {
                 config_type: "enabled",
                 budget_tokens: *budget_tokens,
                 display: "omitted",
             },
-            agent_sdk_core::llm::ThinkingMode::Adaptive => Self::Adaptive {
+            agent_sdk_foundation::llm::ThinkingMode::Adaptive => Self::Adaptive {
                 config_type: "adaptive",
                 display: "omitted",
             },
@@ -132,7 +132,7 @@ impl ApiThinkingConfig {
 /// Output configuration for effort level.
 #[derive(Serialize)]
 pub struct ApiOutputConfig {
-    pub effort: agent_sdk_core::llm::Effort,
+    pub effort: agent_sdk_foundation::llm::Effort,
 }
 
 #[derive(Serialize)]

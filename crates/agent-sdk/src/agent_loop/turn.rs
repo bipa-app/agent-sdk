@@ -21,7 +21,7 @@ use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
     ToolResult, ToolRuntime, ToolTier, TurnOptions,
 };
-use agent_sdk_core::audit::AuditProvenance;
+use agent_sdk_foundation::audit::AuditProvenance;
 
 use log::{debug, info, warn};
 use std::sync::Arc;
@@ -1122,7 +1122,7 @@ pub(super) fn apply_turn_usage(ctx: &mut TurnContext, response: &ChatResponse) -
     ctx.state.total_usage = ctx.total_usage.clone();
 
     // Capture provider-level provenance into the turn context so that
-    // the [`agent_sdk_core::TurnSummary`] emitted at outcome time
+    // the [`agent_sdk_foundation::TurnSummary`] emitted at outcome time
     // reflects the real response metadata rather than the defaults.
     //
     // Response IDs are only recorded when the provider actually

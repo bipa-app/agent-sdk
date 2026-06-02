@@ -41,7 +41,7 @@
 //!    LLM response, the `buffer_turn_messages` fresh user prompt,
 //!    etc.) rather than blindly re-appending the whole compacted
 //!    history.
-//! 3. A [`agent_sdk_core::events::AgentEvent::ContextCompacted`] event
+//! 3. A [`agent_sdk_foundation::events::AgentEvent::ContextCompacted`] event
 //!    is committed to the durable event repository so subscribers
 //!    (TUI, desktop, observability) can surface the compaction in
 //!    their transcripts. The event uses the same shape the legacy
@@ -56,7 +56,7 @@
 use std::sync::Arc;
 
 use agent_sdk::context::{ContextCompactor, LlmContextCompactor};
-use agent_sdk_core::events::AgentEvent;
+use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
@@ -98,7 +98,7 @@ use super::root_turn::RootTurnDeps;
 pub async fn maybe_compact_staged_history(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<()> {
     let Some(cfg) = deps.compaction_config else {
@@ -157,7 +157,7 @@ pub async fn maybe_compact_staged_history(
 pub async fn compact_after_overflow(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<bool> {
     let Some(cfg) = deps.compaction_config else {
@@ -199,8 +199,8 @@ async fn apply_compaction(
     deps: &RootTurnDeps<'_>,
     staged_messages: &StagedMessageStore,
     compactor: &LlmContextCompactor<dyn LlmProvider>,
-    history: Vec<agent_sdk_core::llm::Message>,
-    thread_id: &agent_sdk_core::ThreadId,
+    history: Vec<agent_sdk_foundation::llm::Message>,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<()> {
     let result = compactor

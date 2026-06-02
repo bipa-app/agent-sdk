@@ -48,7 +48,7 @@
 //! stored as a separate column on the outbox row so the relay worker
 //! can route without parsing the payload first.
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 

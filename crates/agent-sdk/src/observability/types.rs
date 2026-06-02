@@ -116,7 +116,7 @@ pub trait ObservabilityStore: Send + Sync {
     /// PII-aware redaction (recommended for financial / regulated
     /// workloads) should override this with a
     /// [`PayloadRedactor`] wrapping a detector such as
-    /// [`agent_sdk_core::privacy::BaselineDetector`].
+    /// [`agent_sdk_foundation::privacy::BaselineDetector`].
     fn redactor(&self) -> &PayloadRedactor {
         &NOOP_REDACTOR
     }
@@ -145,8 +145,8 @@ pub trait ObservabilityStore: Send + Sync {
 mod tests {
     use super::*;
     use crate::llm::Message;
-    use agent_sdk_core::ChatRequest;
-    use agent_sdk_core::privacy::BaselineDetector;
+    use agent_sdk_foundation::ChatRequest;
+    use agent_sdk_foundation::privacy::BaselineDetector;
     use std::sync::Arc;
 
     struct NoopStore;

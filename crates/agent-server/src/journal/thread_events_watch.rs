@@ -64,7 +64,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
@@ -483,7 +483,7 @@ pub use test_support::CapturingThreadEventsWatchHandler;
 mod tests {
     use super::*;
     use crate::journal::event_repository::InMemoryEventRepository;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::events::AgentEvent;
     use std::time::Duration as StdDuration;
     use time::{Duration as TimeDuration, OffsetDateTime};
 

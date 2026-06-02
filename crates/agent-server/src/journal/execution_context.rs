@@ -34,7 +34,7 @@
 //! - Commit orchestration (Phase 3.4).
 //! - Turn-attempt audit lifecycle (Phase 3.3).
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
@@ -181,8 +181,8 @@ mod tests {
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
     use crate::worker::definition::{RuntimePolicy, ThinkingPolicy};
-    use agent_sdk_core::audit::AuditProvenance;
-    use agent_sdk_core::{TokenUsage, llm};
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::{TokenUsage, llm};
     use agent_sdk_tools::stores::{MessageStore, StateStore};
     use time::Duration;
 
@@ -366,7 +366,7 @@ mod tests {
         let prior_task = AgentTaskId::from_string("task_prior");
 
         // Commit two turns so the thread has a checkpoint.
-        let state_snapshot = serde_json::to_value(&agent_sdk_core::AgentState {
+        let state_snapshot = serde_json::to_value(&agent_sdk_foundation::AgentState {
             thread_id: thread_a(),
             turn_count: 2,
             total_usage: usage(200, 100),
@@ -439,7 +439,7 @@ mod tests {
         let s = Stores::new();
         let prior_task = AgentTaskId::from_string("task_prior");
 
-        let snapshot = serde_json::to_value(&agent_sdk_core::AgentState {
+        let snapshot = serde_json::to_value(&agent_sdk_foundation::AgentState {
             thread_id: thread_a(),
             turn_count: 1,
             total_usage: usage(100, 50),
@@ -475,7 +475,7 @@ mod tests {
             .messages
             .append(&thread_a(), llm::Message::assistant("buffered"))
             .await?;
-        let mut new_state = agent_sdk_core::AgentState::new(thread_a());
+        let mut new_state = agent_sdk_foundation::AgentState::new(thread_a());
         new_state.turn_count = 99;
         inputs.staged_stores.state.save(&new_state).await?;
 
@@ -523,7 +523,7 @@ mod tests {
             .append(&thread_a(), llm::Message::assistant("hi"))
             .await?;
 
-        let mut state = agent_sdk_core::AgentState::new(thread_a());
+        let mut state = agent_sdk_foundation::AgentState::new(thread_a());
         state.turn_count = 1;
         inputs.staged_stores.state.save(&state).await?;
 

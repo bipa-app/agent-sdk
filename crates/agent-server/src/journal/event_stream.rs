@@ -46,7 +46,7 @@ use super::committed_event::CommittedEvent;
 use super::event_notifier::{EventNotifier, EventReceiver};
 use super::event_repository::EventRepository;
 use super::retention::RetentionStore;
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 
@@ -315,7 +315,7 @@ mod tests {
     use super::super::event_repository::InMemoryEventRepository;
     use super::super::retention::InMemoryRetentionStore;
     use super::*;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::events::AgentEvent;
     use time::{Duration, OffsetDateTime};
 
     fn t0() -> OffsetDateTime {
@@ -841,14 +841,14 @@ mod tests {
         impl RetentionStore for RacingRetention {
             async fn get_cursor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<Option<RetentionCursor>> {
                 self.inner.get_cursor(thread_id).await
             }
 
             async fn advance_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
                 new_floor: u64,
                 now: OffsetDateTime,
             ) -> anyhow::Result<RetentionCursor> {
@@ -857,7 +857,7 @@ mod tests {
 
             async fn effective_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<u64> {
                 let call = self.reads.fetch_add(1, Ordering::SeqCst);
                 if call == 1 {
@@ -977,14 +977,14 @@ mod tests {
         impl RetentionStore for RacingRetention {
             async fn get_cursor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<Option<RetentionCursor>> {
                 self.inner.get_cursor(thread_id).await
             }
 
             async fn advance_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
                 new_floor: u64,
                 now: OffsetDateTime,
             ) -> anyhow::Result<RetentionCursor> {
@@ -993,7 +993,7 @@ mod tests {
 
             async fn effective_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<u64> {
                 let call = self.reads.fetch_add(1, Ordering::SeqCst);
                 if call == 1 {
@@ -1063,14 +1063,14 @@ mod tests {
         impl RetentionStore for RacingRetention {
             async fn get_cursor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<Option<RetentionCursor>> {
                 self.inner.get_cursor(thread_id).await
             }
 
             async fn advance_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
                 new_floor: u64,
                 now: OffsetDateTime,
             ) -> anyhow::Result<RetentionCursor> {
@@ -1079,7 +1079,7 @@ mod tests {
 
             async fn effective_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<u64> {
                 let call = self.reads.fetch_add(1, Ordering::SeqCst);
                 if call == 1 {
@@ -1169,14 +1169,14 @@ mod tests {
         impl RetentionStore for RacingRetention {
             async fn get_cursor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<Option<RetentionCursor>> {
                 self.inner.get_cursor(thread_id).await
             }
 
             async fn advance_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
                 new_floor: u64,
                 now: OffsetDateTime,
             ) -> anyhow::Result<RetentionCursor> {
@@ -1185,7 +1185,7 @@ mod tests {
 
             async fn effective_floor(
                 &self,
-                thread_id: &agent_sdk_core::ThreadId,
+                thread_id: &agent_sdk_foundation::ThreadId,
             ) -> anyhow::Result<u64> {
                 let call = self.reads.fetch_add(1, Ordering::SeqCst);
                 if call == 1 {

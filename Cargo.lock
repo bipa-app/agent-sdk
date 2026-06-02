@@ -23,7 +23,7 @@ dependencies = [
 name = "agent-sdk"
 version = "0.9.0"
 dependencies = [
- "agent-sdk-core",
+ "agent-sdk-foundation",
  "agent-sdk-macros",
  "agent-sdk-otel",
  "agent-sdk-providers",
@@ -70,7 +70,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-sdk-core"
+name = "agent-sdk-foundation"
 version = "0.9.0"
 dependencies = [
  "insta",
@@ -112,7 +112,7 @@ dependencies = [
 name = "agent-sdk-providers"
 version = "0.9.0"
 dependencies = [
- "agent-sdk-core",
+ "agent-sdk-foundation",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -137,7 +137,7 @@ dependencies = [
 name = "agent-sdk-tools"
 version = "0.9.0"
 dependencies = [
- "agent-sdk-core",
+ "agent-sdk-foundation",
  "anyhow",
  "async-trait",
  "futures",
@@ -155,7 +155,7 @@ name = "agent-server"
 version = "0.8.0"
 dependencies = [
  "agent-sdk",
- "agent-sdk-core",
+ "agent-sdk-foundation",
  "agent-sdk-providers",
  "agent-sdk-tools",
  "anyhow",
@@ -187,7 +187,7 @@ name = "agent-service-host"
 version = "0.8.0"
 dependencies = [
  "agent-sdk",
- "agent-sdk-core",
+ "agent-sdk-foundation",
  "agent-sdk-otel",
  "agent-sdk-providers",
  "agent-sdk-tools",

@@ -27,9 +27,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_sdk::context::CompactionConfig;
-use agent_sdk_core::ThreadId;
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, StopReason, Usage,
 };
 use agent_sdk_providers::LlmProvider;

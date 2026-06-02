@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-agent-sdk-core = { workspace = true }
+agent-sdk-foundation = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -57,7 +57,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 wiremock = { workspace = true }
 # Tier-C live smoke constructs a `Tool` whose `tier` is the core
 # `ToolTier` enum (not re-exported through the `llm` glob).
-agent-sdk-core = { workspace = true }
+agent-sdk-foundation = { workspace = true }
 
 [lints]
 workspace = true

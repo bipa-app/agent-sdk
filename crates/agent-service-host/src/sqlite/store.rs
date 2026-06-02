@@ -14,8 +14,8 @@
 //! - **TEXT for timestamps and JSON.** `SQLite` stores `OffsetDateTime`
 //!   as ISO 8601 TEXT and JSON values as TEXT.
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -4546,7 +4546,7 @@ mod tests {
     use anyhow::{Context, Result};
     use time::Duration;
 
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
     use agent_server::journal::execution_intent::{
         ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
     };
@@ -5011,8 +5011,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_events_with_outbox_emits_one_thread_events_advisory_per_batch() -> Result<()> {
-        use agent_sdk_core::ThreadId;
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::ThreadId;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5071,7 +5071,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_insert_batch_accepts_task_wakeup_with_null_event_refs() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::outbox::{NewOutboxRow, OutboxStore};
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, TaskWakeupPayload,
@@ -5121,7 +5121,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_insert_batch_rejects_thread_events_without_sequence() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::outbox::{NewOutboxRow, OutboxStore};
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
@@ -5160,7 +5160,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_mark_delivered_is_noop_when_row_was_cascade_deleted() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5196,7 +5196,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_mark_failed_is_noop_when_row_was_cascade_deleted() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5232,7 +5232,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_sequence_does_not_regress_after_full_retention_purge() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::retention::RetentionStore;
         use agent_server::journal::thread_store::ThreadStore;
@@ -5278,7 +5278,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_list_by_thread_orders_task_wakeups_after_thread_events() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5340,7 +5340,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_reclaim_returns_stale_claimed_rows_to_pending() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5388,7 +5388,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_reclaim_skips_live_claims() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
+        use agent_sdk_foundation::events::AgentEvent;
         use agent_server::journal::event_outbox_transaction::{
             AtomicEventOutboxCommitter, EventOutboxCommit,
         };
@@ -5430,8 +5430,8 @@ mod tests {
     /// draft duplicated.
     #[tokio::test]
     async fn draft_messages_persist_until_atomic_commit_clears_them() -> Result<()> {
-        use agent_sdk_core::llm;
-        use agent_sdk_core::{TokenUsage, audit::AuditProvenance};
+        use agent_sdk_foundation::llm;
+        use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::message_store::MessageProjectionStore;
@@ -5506,7 +5506,7 @@ mod tests {
                     response_blob: serde_json::json!({"id": "msg_01"}),
                     response_id: Some("msg_01".into()),
                     response_model: Some("claude-sonnet-4-5-20250929".into()),
-                    stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+                    stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
                     outcome: TurnAttemptOutcome::Success,
                     input_tokens: 10,
                     output_tokens: 20,
@@ -5552,9 +5552,9 @@ mod tests {
     /// advisory row.
     #[tokio::test]
     async fn events_and_outbox_commit_atomically_with_turn_sqlite() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
-        use agent_sdk_core::llm;
-        use agent_sdk_core::{TokenUsage, audit::AuditProvenance};
+        use agent_sdk_foundation::events::AgentEvent;
+        use agent_sdk_foundation::llm;
+        use agent_sdk_foundation::{TokenUsage, audit::AuditProvenance};
         use agent_server::journal::commit::CompletedTurnCommit;
         use agent_server::journal::completed_turn_transaction::AtomicCompletedTurnCommitter;
         use agent_server::journal::event_repository::EventRepository;
@@ -5611,7 +5611,7 @@ mod tests {
                     response_blob: serde_json::json!({"id": "msg_01"}),
                     response_id: Some("msg_01".into()),
                     response_model: Some("claude-sonnet-4-5-20250929".into()),
-                    stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+                    stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
                     outcome: TurnAttemptOutcome::Success,
                     input_tokens: 10,
                     output_tokens: 20,
@@ -5783,8 +5783,8 @@ mod tests {
     /// fork state after a single `commit_fork_atomic` call.
     #[tokio::test]
     async fn fork_atomic_commits_full_state_in_one_transaction() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
-        use agent_sdk_core::llm::Message;
+        use agent_sdk_foundation::events::AgentEvent;
+        use agent_sdk_foundation::llm::Message;
         use agent_server::journal::checkpoint::NewCheckpointParams;
         use agent_server::journal::checkpoint_store::CheckpointStore;
         use agent_server::journal::event_repository::EventRepository;
@@ -5817,7 +5817,7 @@ mod tests {
             AgentEvent::done(
                 source_thread_id.clone(),
                 1,
-                agent_sdk_core::TokenUsage::default(),
+                agent_sdk_foundation::TokenUsage::default(),
                 std::time::Duration::from_secs(1),
             ),
         ];
@@ -5825,7 +5825,7 @@ mod tests {
             new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
-            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
+            cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: messages.clone(),
             checkpoint: Some(NewCheckpointParams {
                 thread_id: new_thread_id.clone(),
@@ -5835,11 +5835,11 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({
                     "thread_id": new_thread_id.0.clone(),
                     "turn_count": 1,
-                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "total_usage": agent_sdk_foundation::TokenUsage::default(),
                     "metadata": {},
                     "created_at": "2023-11-14T00:00:00Z",
                 }),
-                turn_usage: agent_sdk_core::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
                 now,
             }),
             events: events.clone(),
@@ -5880,8 +5880,8 @@ mod tests {
     /// fork's running total ends at exactly `cumulative_total_usage`.
     #[tokio::test]
     async fn fork_atomic_carries_cumulative_total_usage() -> Result<()> {
-        use agent_sdk_core::TokenUsage;
-        use agent_sdk_core::llm::Message;
+        use agent_sdk_foundation::TokenUsage;
+        use agent_sdk_foundation::llm::Message;
         use agent_server::journal::checkpoint::NewCheckpointParams;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
         use agent_server::journal::store::AgentTaskStore;
@@ -5951,8 +5951,8 @@ mod tests {
     /// destination must come up empty.
     #[tokio::test]
     async fn fork_atomic_rolls_back_on_failure() -> Result<()> {
-        use agent_sdk_core::events::AgentEvent;
-        use agent_sdk_core::llm::Message;
+        use agent_sdk_foundation::events::AgentEvent;
+        use agent_sdk_foundation::llm::Message;
         use agent_server::journal::checkpoint::NewCheckpointParams;
         use agent_server::journal::event_repository::EventRepository;
         use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
@@ -5996,11 +5996,11 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({
                     "thread_id": new_thread_id.0.clone(),
                     "turn_count": 0,
-                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "total_usage": agent_sdk_foundation::TokenUsage::default(),
                     "metadata": {},
                     "created_at": "2023-11-14T00:00:00Z",
                 }),
-                turn_usage: agent_sdk_core::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
                 now,
             },
         )
@@ -6013,7 +6013,7 @@ mod tests {
             new_thread_id: new_thread_id.clone(),
             now,
             committed_turns: 1,
-            cumulative_total_usage: agent_sdk_core::TokenUsage::default(),
+            cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
             messages: fresh_messages.clone(),
             checkpoint: Some(NewCheckpointParams {
                 thread_id: new_thread_id.clone(),
@@ -6023,11 +6023,11 @@ mod tests {
                 agent_state_snapshot: serde_json::json!({
                     "thread_id": new_thread_id.0.clone(),
                     "turn_count": 1,
-                    "total_usage": agent_sdk_core::TokenUsage::default(),
+                    "total_usage": agent_sdk_foundation::TokenUsage::default(),
                     "metadata": {},
                     "created_at": "2023-11-14T00:00:00Z",
                 }),
-                turn_usage: agent_sdk_core::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
                 now,
             }),
             events: vec![AgentEvent::start(source_thread_id.clone(), 1)],

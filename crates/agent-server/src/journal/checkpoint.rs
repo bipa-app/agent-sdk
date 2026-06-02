@@ -25,7 +25,7 @@
 //! - Turn-attempt audit records → [`super::turn_attempt::TurnAttempt`]
 //! - Recovery loaders → [`super::thread_recover`]
 
-use agent_sdk_core::{ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::OffsetDateTime;
