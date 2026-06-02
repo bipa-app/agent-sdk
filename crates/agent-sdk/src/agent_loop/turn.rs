@@ -694,6 +694,11 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                                 source.media_type
                             );
                         }
+                        // `ContentBlock` is `#[non_exhaustive]`; log unknown
+                        // future block kinds generically.
+                        _ => {
+                            debug!("    block[{block_idx}]: <unrecognized block kind>");
+                        }
                     }
                 }
             }
@@ -1700,18 +1705,22 @@ where
             info!("Stop sequence hit (turn={})", ctx.turn);
             InternalTurnResult::Done
         }
-        None => {
+        // `StopReason` is `#[non_exhaustive]`; `StopReason::Unknown` (an
+        // unrecognized provider value, via `#[serde(other)]`), any future
+        // variant (`Some(_)`), and a missing stop reason (`None`) are all
+        // treated the same — fall back to the alternation-preserving logic.
+        Some(_) | None => {
             // Unknown/missing stop reason. Only continue if tool results were
             // appended (preserving message alternation).
             if had_tool_calls {
                 warn!(
-                    "No stop reason with tool calls (turn={}), continuing",
+                    "No usable stop reason with tool calls (turn={}), continuing",
                     ctx.turn
                 );
                 InternalTurnResult::Continue { turn_usage }
             } else {
                 warn!(
-                    "No stop reason and no tool calls (turn={}), stopping",
+                    "No usable stop reason and no tool calls (turn={}), stopping",
                     ctx.turn
                 );
                 InternalTurnResult::Done

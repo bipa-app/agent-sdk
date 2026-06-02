@@ -906,6 +906,11 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                                 tool_call_id: Some(tool_use_id.clone()),
                             });
                         }
+                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
+                        // SDK version cannot represent is not sent to OpenAI.
+                        _ => {
+                            log::warn!("Skipping unrecognized OpenAI content block");
+                        }
                     }
                 }
 

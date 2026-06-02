@@ -407,6 +407,9 @@ pub(crate) const fn run_state_outcome(state: &crate::types::AgentRunState) -> &'
         crate::types::AgentRunState::AwaitingConfirmation { .. } => "awaiting_confirmation",
         crate::types::AgentRunState::Cancelled { .. } => "cancelled",
         crate::types::AgentRunState::Error(_) => "error",
+        // `AgentRunState` is `#[non_exhaustive]`; an unrecognized future state
+        // reports a stable generic outcome.
+        _ => "unknown",
     }
 }
 

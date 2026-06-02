@@ -395,6 +395,11 @@ pub fn build_api_contents(messages: &[agent_sdk_core::llm::Message]) -> Vec<ApiC
                                 },
                             });
                         }
+                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
+                        // SDK version cannot map to a Gemini part is skipped.
+                        _ => {
+                            log::warn!("Skipping unrecognized Gemini content block");
+                        }
                     }
                 }
                 parts

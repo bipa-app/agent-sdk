@@ -14,6 +14,7 @@ use std::pin::Pin;
 /// Each variant represents a different type of event that can occur
 /// during a streaming response from an LLM provider.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamDelta {
     /// A text delta for streaming text content.
     TextDelta {
@@ -99,6 +100,7 @@ pub enum StreamDelta {
 /// validation failure, mid-stream disconnect) directly onto one of
 /// these categories at the construction site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamErrorKind {
     /// Provider returned HTTP 429 / explicit rate-limit signal.
     RateLimited,
@@ -108,6 +110,16 @@ pub enum StreamErrorKind {
     /// Caller-side error: validation failure before dispatch, HTTP
     /// 4xx other than 429, or a non-retriable provider rejection.
     InvalidRequest,
+    /// Escape hatch for a streaming error a provider could not classify
+    /// into one of the categories above.
+    ///
+    /// Producers should prefer a specific variant whenever the
+    /// underlying signal (HTTP status, validation failure, mid-stream
+    /// disconnect) allows it; `Unknown` exists so future error sources
+    /// and providers can be added without a breaking change. It is
+    /// treated as non-recoverable by [`StreamErrorKind::is_recoverable`]
+    /// (callers should not blindly retry an unclassified failure).
+    Unknown,
 }
 
 impl StreamErrorKind {

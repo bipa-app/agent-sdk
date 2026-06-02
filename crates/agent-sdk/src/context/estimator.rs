@@ -82,6 +82,9 @@ impl TokenEstimator {
                 // Rough estimate: base64 data is ~4/3 of original, 1 token per 4 chars
                 source.data.len() / 4 + Self::MESSAGE_OVERHEAD
             }
+            // `ContentBlock` is `#[non_exhaustive]`; charge an unknown future
+            // block kind the per-message overhead as a conservative floor.
+            _ => Self::MESSAGE_OVERHEAD,
         }
     }
 

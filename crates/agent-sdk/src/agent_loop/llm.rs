@@ -232,6 +232,13 @@ where
                 msg.clone(),
                 format!("Server error after {max_retries} retries: {msg}"),
             ),
+            // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome is
+            // handled like a server error (retry, then surface a clear failure).
+            _ => (
+                "server_error",
+                "Unrecognized provider outcome".to_string(),
+                format!("Unrecognized provider outcome after {max_retries} retries"),
+            ),
         };
 
         attempt += 1;
@@ -681,13 +688,10 @@ where
                 StreamError::Fatal(message.clone())
             });
         }
-        // These are handled by the accumulator or not needed as events
-        StreamDelta::Done { .. }
-        | StreamDelta::Usage(_)
-        | StreamDelta::ToolUseStart { .. }
-        | StreamDelta::ToolInputDelta { .. }
-        | StreamDelta::SignatureDelta { .. }
-        | StreamDelta::RedactedThinking { .. } => {}
+        // These are handled by the accumulator or not needed as events. The
+        // catch-all also covers future `#[non_exhaustive]` deltas, which the
+        // accumulator likewise consumes without emitting an event here.
+        _ => {}
     }
     None
 }
@@ -699,6 +703,9 @@ const fn stream_error_kind_attr(kind: crate::llm::StreamErrorKind) -> &'static s
         crate::llm::StreamErrorKind::RateLimited => "rate_limited",
         crate::llm::StreamErrorKind::ServerError => "server_error",
         crate::llm::StreamErrorKind::InvalidRequest => "invalid_request",
+        // `StreamErrorKind` is `#[non_exhaustive]`; `Unknown` and any future
+        // kind map to a stable generic attribute value.
+        _ => "unknown",
     }
 }
 

@@ -387,6 +387,18 @@ where
         ToolDecision::RequiresConfirmation(description) => {
             handle_listen_tool_confirmation(pending, ctx, ready, description).await
         }
+        // `ToolDecision` is `#[non_exhaustive]`; an unrecognized decision is
+        // fail-safe: block the tool rather than executing it.
+        _ => {
+            handle_listen_tool_block(
+                pending,
+                listen_tool,
+                ctx,
+                &ready,
+                "unrecognized tool decision".to_string(),
+            )
+            .await
+        }
     }
 }
 pub(super) async fn finish_listen_ready_failure<Ctx, H>(
@@ -1237,6 +1249,9 @@ where
         ToolDecision::RequiresConfirmation(description) => {
             require_tool_confirmation(pending, ctx, tier, description).await
         }
+        // `ToolDecision` is `#[non_exhaustive]`; an unrecognized decision is
+        // fail-safe: block the tool rather than executing it.
+        _ => block_tool_call(pending, ctx, tier, "unrecognized tool decision".to_string()).await,
     }
 }
 
@@ -1276,6 +1291,9 @@ where
         ToolDecision::RequiresConfirmation(description) => {
             require_tool_confirmation(pending, ctx, tier, description).await
         }
+        // `ToolDecision` is `#[non_exhaustive]`; an unrecognized decision is
+        // fail-safe: block the tool rather than executing it.
+        _ => block_tool_call(pending, ctx, tier, "unrecognized tool decision".to_string()).await,
     }
 }
 

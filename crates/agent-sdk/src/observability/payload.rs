@@ -139,7 +139,6 @@ impl PayloadRedactor {
                 "type": "reasoning",
                 "text": self.mask_str(thinking),
             })),
-            ContentBlock::RedactedThinking { .. } => None,
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
@@ -183,6 +182,10 @@ impl PayloadRedactor {
                 }
                 Some(part)
             }
+            // Redacted-thinking blocks carry nothing to surface; this also
+            // omits unknown future `#[non_exhaustive]` block kinds from the
+            // observability payload.
+            _ => None,
         }
     }
 

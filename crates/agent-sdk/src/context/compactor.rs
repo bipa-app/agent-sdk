@@ -382,6 +382,11 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
                             ContentBlock::Document { source } => {
                                 let _ = writeln!(output, "[Document: {}]", source.media_type);
                             }
+                            // `ContentBlock` is `#[non_exhaustive]`; render an
+                            // unknown future block kind with a generic marker.
+                            _ => {
+                                let _ = writeln!(output, "[Unrecognized content block]");
+                            }
                         }
                     }
                 }
@@ -449,6 +454,11 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             }
             ChatOutcome::ServerError(msg) => {
                 bail!("Server error during summarization: {msg}")
+            }
+            // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome
+            // fails the summarization rather than returning an empty summary.
+            _ => {
+                bail!("Unrecognized provider outcome during summarization")
             }
         }
     }

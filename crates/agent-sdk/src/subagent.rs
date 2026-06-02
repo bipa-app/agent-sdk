@@ -571,6 +571,13 @@ fn classify_subagent_wait_result(wait_result: Option<&SubagentWaitResult>) -> Su
         Some(Ok(Ok(crate::types::AgentRunState::Error(error)))) => {
             SubagentWaitOutcome::Error(error.clone())
         }
+        // `AgentRunState` is `#[non_exhaustive]`; an unrecognized future run
+        // state is surfaced as an error so the subagent failure is not
+        // silently treated as a successful replay.
+        Some(Ok(Ok(_))) => SubagentWaitOutcome::Error(crate::types::AgentError::new(
+            "subagent returned an unrecognized run state".to_string(),
+            false,
+        )),
         Some(Ok(Err(_))) => SubagentWaitOutcome::Disconnected,
         None | Some(Err(_)) => SubagentWaitOutcome::TimedOut,
     }

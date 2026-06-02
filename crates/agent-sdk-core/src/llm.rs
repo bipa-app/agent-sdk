@@ -389,6 +389,7 @@ impl ContentSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
@@ -486,6 +487,7 @@ impl ChatResponse {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StopReason {
     EndTurn,
     ToolUse,
@@ -493,6 +495,16 @@ pub enum StopReason {
     StopSequence,
     Refusal,
     ModelContextWindowExceeded,
+    /// A stop reason this version of the SDK does not recognize.
+    ///
+    /// Providers may introduce new stop reasons at any time. Rather than
+    /// failing deserialization of an otherwise-valid response (or a
+    /// persisted/replayed audit row), unknown values map here via
+    /// `#[serde(other)]`. Consumers should treat it like
+    /// [`StopReason::EndTurn`] (turn finished, nothing actionable) unless
+    /// they have a more specific fallback.
+    #[serde(other)]
+    Unknown,
 }
 
 impl StopReason {
@@ -507,6 +519,7 @@ impl StopReason {
             Self::StopSequence => "stop_sequence",
             Self::Refusal => "refusal",
             Self::ModelContextWindowExceeded => "model_context_window_exceeded",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -525,6 +538,7 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ChatOutcome {
     Success(ChatResponse),
     RateLimited,
@@ -560,5 +574,41 @@ mod tests {
         assert!(matches!(req.tool_choice, Some(ToolChoice::Auto)));
         assert!(req.response_format.is_some());
         assert_eq!(req.session_id.as_deref(), Some("s-1"));
+    }
+
+    #[test]
+    fn stop_reason_known_values_round_trip() -> Result<(), serde_json::Error> {
+        for (json, expected) in [
+            ("\"end_turn\"", StopReason::EndTurn),
+            ("\"tool_use\"", StopReason::ToolUse),
+            ("\"max_tokens\"", StopReason::MaxTokens),
+            ("\"stop_sequence\"", StopReason::StopSequence),
+            ("\"refusal\"", StopReason::Refusal),
+            (
+                "\"model_context_window_exceeded\"",
+                StopReason::ModelContextWindowExceeded,
+            ),
+        ] {
+            let parsed: StopReason = serde_json::from_str(json)?;
+            assert_eq!(parsed, expected);
+            assert_eq!(serde_json::to_string(&parsed)?, json);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stop_reason_unknown_value_deserializes_to_unknown() -> Result<(), serde_json::Error> {
+        // An unrecognized provider stop reason must not fail deserialization;
+        // `#[serde(other)]` routes it to `StopReason::Unknown`.
+        let parsed: StopReason = serde_json::from_str("\"some_future_reason\"")?;
+        assert_eq!(parsed, StopReason::Unknown);
+        assert_eq!(parsed.as_str(), "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn stop_reason_unknown_serializes_to_unknown() -> Result<(), serde_json::Error> {
+        assert_eq!(serde_json::to_string(&StopReason::Unknown)?, "\"unknown\"");
+        Ok(())
     }
 }

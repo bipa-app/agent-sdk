@@ -2156,6 +2156,15 @@ fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentB
         ContentBlock::Document { source } => {
             pb::conversation_content_block::Block::Document(map_binary_attachment(source)?)
         }
+        // `ContentBlock` is `#[non_exhaustive]`; a block kind this service
+        // version cannot project onto the wire protocol is a hard error
+        // rather than a silently dropped block.
+        _ => {
+            return Err(Status::internal(
+                "unrecognized content block kind in conversation message",
+            )
+            .into());
+        }
     };
 
     Ok(pb::ConversationContentBlock { block: Some(block) })

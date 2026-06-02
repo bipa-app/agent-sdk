@@ -275,6 +275,12 @@ pub enum ApiStopReason {
     PauseTurn,
     /// Content flagged by safety filters.
     Sensitive,
+    /// A stop reason Anthropic introduced that this SDK version does not
+    /// model yet. Captured via `#[serde(other)]` so a single unknown
+    /// value does not fail deserialization of the whole response; mapped
+    /// to [`StopReason::Unknown`] by [`map_stop_reason`].
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -510,6 +516,12 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
             source: ApiSource::from_content_source(source),
             cache_control: None,
         }),
+        // `ContentBlock` is `#[non_exhaustive]`; a block kind this SDK version
+        // cannot represent on the wire is dropped from the outbound request.
+        _ => {
+            log::warn!("Skipping unrecognized Anthropic {role_label} content block");
+            None
+        }
     }
 }
 
@@ -645,6 +657,8 @@ pub const fn map_stop_reason(reason: &ApiStopReason) -> StopReason {
         // Content flagged by safety filters – surface as refusal.
         ApiStopReason::Refusal | ApiStopReason::Sensitive => StopReason::Refusal,
         ApiStopReason::ModelContextWindowExceeded => StopReason::ModelContextWindowExceeded,
+        // Unknown future stop reasons surface as the tolerant catch-all.
+        ApiStopReason::Unknown => StopReason::Unknown,
     }
 }
 
@@ -1203,6 +1217,17 @@ mod tests {
             ctx_exceeded,
             ApiStopReason::ModelContextWindowExceeded
         ));
+    }
+
+    #[test]
+    fn test_api_stop_reason_unknown_value_maps_to_unknown() -> anyhow::Result<()> {
+        // A stop reason Anthropic might add later must not break
+        // deserialization of the whole response; it lands on `Unknown` and
+        // maps to the public `StopReason::Unknown`.
+        let unknown: ApiStopReason = serde_json::from_str("\"a_brand_new_reason\"")?;
+        assert!(matches!(unknown, ApiStopReason::Unknown));
+        assert_eq!(map_stop_reason(&unknown), StopReason::Unknown);
+        Ok(())
     }
 
     #[test]

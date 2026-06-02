@@ -92,6 +92,12 @@ where
                 log::error!("Classifier server error: {e}, defaulting to Complex");
                 Ok(TaskComplexity::Complex)
             }
+            // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome
+            // takes the same conservative fallback as the error variants.
+            _ => {
+                log::error!("Classifier returned unrecognized outcome, defaulting to Complex");
+                Ok(TaskComplexity::Complex)
+            }
         }
     }
 

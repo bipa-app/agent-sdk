@@ -75,6 +75,7 @@ impl AuditProvenance {
 /// lookup → execution → post-execution persistence.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolAuditOutcome {
     /// The policy hook rejected the tool call.
     ///

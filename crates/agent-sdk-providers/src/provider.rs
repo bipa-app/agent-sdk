@@ -82,6 +82,14 @@ pub trait LlmProvider: Send + Sync {
                                         block_index: idx,
                                     });
                                 }
+                                // `ContentBlock` is `#[non_exhaustive]`; a future
+                                // block kind we cannot stream is skipped rather than
+                                // panicking the default fallback.
+                                _ => {
+                                    log::warn!(
+                                        "chat_stream fallback skipping unrecognized content block at index {idx}"
+                                    );
+                                }
                             }
                         }
                         yield Ok(StreamDelta::Usage(response.usage));
@@ -105,6 +113,15 @@ pub trait LlmProvider: Send + Sync {
                         yield Ok(StreamDelta::Error {
                             message: msg,
                             kind: StreamErrorKind::ServerError,
+                        });
+                    }
+                    // `ChatOutcome` is `#[non_exhaustive]`; an outcome this SDK
+                    // version does not model is surfaced as an unclassified
+                    // (non-recoverable) stream error rather than dropped.
+                    _ => {
+                        yield Ok(StreamDelta::Error {
+                            message: "Unrecognized chat outcome".to_string(),
+                            kind: StreamErrorKind::Unknown,
                         });
                     }
                 },
@@ -252,8 +269,12 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
     if let Some((message, kind)) = last_error {
         return Ok(match kind {
             StreamErrorKind::RateLimited => ChatOutcome::RateLimited,
-            StreamErrorKind::ServerError => ChatOutcome::ServerError(message),
             StreamErrorKind::InvalidRequest => ChatOutcome::InvalidRequest(message),
+            // `StreamErrorKind::ServerError`, plus the `#[non_exhaustive]`
+            // catch-all (`Unknown` / future kinds): an unclassified error is
+            // treated as a (non-recoverable) server error so the caller still
+            // surfaces the failure rather than silently succeeding.
+            _ => ChatOutcome::ServerError(message),
         });
     }
 
@@ -316,6 +337,11 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
                     "  content_block[{i}]: Document media_type={}",
                     source.media_type
                 );
+            }
+            // `ContentBlock` is `#[non_exhaustive]`; log unknown future block
+            // kinds generically so the debug dump stays exhaustive.
+            _ => {
+                log::debug!("  content_block[{i}]: <unrecognized block kind>");
             }
         }
     }

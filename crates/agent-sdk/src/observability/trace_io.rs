@@ -108,17 +108,15 @@ fn summarize_message_input(blocks: &[ContentBlock]) -> Option<String> {
 
     for block in blocks.iter().skip(usize::from(first_block_is_text)) {
         match block {
-            ContentBlock::Text { text } => {
-                if !text.trim().is_empty() {
-                    text_attachment_count += 1;
-                }
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                text_attachment_count += 1;
             }
             ContentBlock::Image { .. } => image_count += 1,
             ContentBlock::Document { .. } => document_count += 1,
-            ContentBlock::Thinking { .. }
-            | ContentBlock::RedactedThinking { .. }
-            | ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. } => {}
+            // Empty text plus non-attachment blocks contribute no count here,
+            // and the `_` arm covers future `#[non_exhaustive]` block kinds,
+            // which likewise carry no countable attachment.
+            _ => {}
         }
     }
 
@@ -169,19 +167,10 @@ pub fn langfuse_trace_output(event: &AgentEvent) -> Option<String> {
         AgentEvent::ToolRequiresConfirmation { description, .. } => non_empty(description),
         AgentEvent::Error { message, .. } => non_empty(message),
         AgentEvent::Refusal { text, .. } => text.as_deref().and_then(non_empty),
-        AgentEvent::Start { .. }
-        | AgentEvent::UserInput { .. }
-        | AgentEvent::Thinking { .. }
-        | AgentEvent::ThinkingDelta { .. }
-        | AgentEvent::TextDelta { .. }
-        | AgentEvent::ToolProgress { .. }
-        | AgentEvent::TurnComplete { .. }
-        | AgentEvent::Done { .. }
-        | AgentEvent::Cancelled { .. }
-        | AgentEvent::AutoRetryStart { .. }
-        | AgentEvent::AutoRetryEnd { .. }
-        | AgentEvent::ContextCompacted { .. }
-        | AgentEvent::SubagentProgress { .. } => None,
+        // These events contribute nothing user-visible to the trace output.
+        // The `_` arm also covers future `#[non_exhaustive]` events, which are
+        // omitted until the SDK knows how to render them.
+        _ => None,
     }
 }
 
@@ -198,17 +187,9 @@ pub const fn langfuse_trace_event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::Refusal { .. } => "Refusal",
         AgentEvent::Cancelled { .. } => "Cancelled",
         AgentEvent::UserInput { .. } => "User",
-        AgentEvent::Start { .. }
-        | AgentEvent::Thinking { .. }
-        | AgentEvent::ThinkingDelta { .. }
-        | AgentEvent::TextDelta { .. }
-        | AgentEvent::ToolProgress { .. }
-        | AgentEvent::TurnComplete { .. }
-        | AgentEvent::Done { .. }
-        | AgentEvent::AutoRetryStart { .. }
-        | AgentEvent::AutoRetryEnd { .. }
-        | AgentEvent::ContextCompacted { .. }
-        | AgentEvent::SubagentProgress { .. } => "Event",
+        // Everything else groups under the generic label. The `_` arm also
+        // covers future `#[non_exhaustive]` events.
+        _ => "Event",
     }
 }
 
