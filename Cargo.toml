@@ -38,7 +38,7 @@ agent-sdk-macros = { path = "crates/agent-sdk-macros", version = "0.8.0" }
 # façade) decide which provider impls compile. Crates that only use the
 # `LlmProvider` trait / streaming types pull no concrete provider at all.
 agent-sdk-providers = { path = "crates/agent-sdk-providers", version = "0.8.0", default-features = false }
-agent-sdk = { path = "crates/agent-sdk", version = "0.8.0" }
+agent-sdk = { path = "crates/agent-sdk", version = "0.9.0" }
 agent-sdk-otel = { path = "crates/agent-sdk-otel", version = "0.8.0" }
 agent-server = { path = "crates/agent-server", version = "0.8.0" }
 agent-service-host = { path = "crates/agent-service-host", version = "0.8.0" }
