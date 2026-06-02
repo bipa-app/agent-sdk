@@ -25,37 +25,49 @@ git_release_enable = true
 publish = false
 
 # ── Publishable crates ────────────────────────────────────────────────
-# These are the only crates release-plz manages. Versions are kept in lockstep.
+# These are the only crates release-plz manages. They all share
+# `version_group = "agent-sdk"`, so release-plz assigns every one of them the
+# SAME version — the highest next version across the group. This keeps the
+# published SDK on a single version line: all crates release as 0.9.0 together,
+# rather than `agent-sdk` bumping to 0.9.0 while the first-publish sub-crates
+# stay at 0.8.0.
 
 [[package]]
 name = "agent-sdk-core"
 publish = true
+version_group = "agent-sdk"
 
 [[package]]
 name = "agent-sdk-tools"
 publish = true
+version_group = "agent-sdk"
 
 # Proc-macro crate. `agent-sdk` depends on it, so it must publish (in
 # dependency order, before `agent-sdk`).
 [[package]]
 name = "agent-sdk-macros"
 publish = true
+version_group = "agent-sdk"
 
 [[package]]
 name = "agent-sdk-providers"
 publish = true
+version_group = "agent-sdk"
 
 [[package]]
 name = "agent-sdk"
 publish = true
+version_group = "agent-sdk"
 
 [[package]]
 name = "agent-sdk-otel"
 publish = true
+version_group = "agent-sdk"
 
 [[package]]
 name = "agent-sdk-cli"
 publish = true
+version_group = "agent-sdk"
 
 # ── Internal crates — never released ──────────────────────────────────
 # Mirrors `publish = false` in their manifests; release-plz also skips them.
