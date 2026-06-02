@@ -41,7 +41,11 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PAT (RELEASE_GITHUB_TOKEN), not the default GITHUB_TOKEN: GitHub
+          # suppresses workflow runs for events created with GITHUB_TOKEN, so a
+          # PR opened with it gets no CI. The PAT (Contents:RW + Pull
+          # requests:RW) makes the release PR trigger ci.yml + release-gates.yml.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
 
   # HITL GO-LIVE. Runs ONLY on manual workflow_dispatch — never on push — so a
   # publish is always a deliberate human action. `release-plz release`
@@ -63,5 +67,7 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same PAT for the git tag + GitHub Release (Contents:RW). crates.io
+          # upload uses the separate CARGO_REGISTRY_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
