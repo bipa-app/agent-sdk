@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-sdk-core",
  "agent-sdk-macros",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "insta",
  "proptest",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-sdk-core",
  "anyhow",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agent-sdk-core",
  "anyhow",
@@ -673,9 +673,9 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 dependencies = [
  "serde_core",
 ]
@@ -1554,9 +1554,9 @@ dependencies = [
 
 [[package]]
 name = "generator"
-version = "0.8.8"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f04ae4152da20c76fe800fa48659201d5cf627c5149ca0b707b69d7eef6cf9"
+checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
 dependencies = [
  "cc",
  "cfg-if",
@@ -2321,9 +2321,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
 dependencies = [
  "value-bag",
 ]
@@ -3506,9 +3506,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
+checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
