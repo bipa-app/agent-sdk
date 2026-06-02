@@ -12,7 +12,7 @@
     clippy::used_underscore_items
 )]
 
-// ── Core contract types (from agent-sdk-core) ────────────────────────
+// ── Core contract types (from agent-sdk-foundation) ────────────────────────
 
 #[test]
 fn core_ids_and_config() {

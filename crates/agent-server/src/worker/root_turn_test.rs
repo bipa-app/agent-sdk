@@ -24,8 +24,8 @@ use crate::journal::turn_attempt::TurnAttempt;
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
-use agent_sdk_core::ThreadId;
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
 use agent_sdk_providers::LlmProvider;
@@ -183,7 +183,7 @@ fn sample_definition_with_tools() -> AgentDefinition {
             description: "Run a shell command".into(),
             input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
             display_name: "Bash".into(),
-            tier: agent_sdk_core::ToolTier::Observe,
+            tier: agent_sdk_foundation::ToolTier::Observe,
         }],
         ..sample_definition()
     }
@@ -216,8 +216,8 @@ fn sample_bootstrap_with_tools(task: AgentTask) -> WorkerBootstrapContext {
 }
 
 fn tool_result_message(
-    child_results: &[(String, agent_sdk_core::ToolResult)],
-) -> agent_sdk_core::llm::Message {
+    child_results: &[(String, agent_sdk_foundation::ToolResult)],
+) -> agent_sdk_foundation::llm::Message {
     let blocks = child_results
         .iter()
         .map(|(tool_use_id, result)| ContentBlock::ToolResult {
@@ -226,17 +226,17 @@ fn tool_result_message(
             is_error: if result.success { None } else { Some(true) },
         })
         .collect();
-    agent_sdk_core::llm::Message::user_with_content(blocks)
+    agent_sdk_foundation::llm::Message::user_with_content(blocks)
 }
 
 fn assert_tool_results_follow_tool_use(
-    messages: &[agent_sdk_core::llm::Message],
+    messages: &[agent_sdk_foundation::llm::Message],
     tool_use_id: &str,
 ) {
     let tool_use_index = messages.iter().position(|message| {
         matches!(
             &message.content,
-            agent_sdk_core::llm::Content::Blocks(blocks)
+            agent_sdk_foundation::llm::Content::Blocks(blocks)
                 if blocks.iter().any(|block| matches!(
                     block,
                     ContentBlock::ToolUse { id, .. } if id == tool_use_id
@@ -254,7 +254,7 @@ fn assert_tool_results_follow_tool_use(
 
     let has_matching_result = matches!(
         &next_message.content,
-        agent_sdk_core::llm::Content::Blocks(blocks)
+        agent_sdk_foundation::llm::Content::Blocks(blocks)
             if blocks.iter().any(|block| matches!(
                 block,
                 ContentBlock::ToolResult { tool_use_id: result_id, .. }
@@ -475,7 +475,7 @@ async fn checkpoint_contains_correct_agent_state() -> Result<()> {
         .await?
         .context("checkpoint")?;
 
-    let state: agent_sdk_core::AgentState =
+    let state: agent_sdk_foundation::AgentState =
         serde_json::from_value(checkpoint.agent_state_snapshot)?;
     assert_eq!(state.turn_count, 1);
     assert_eq!(state.total_usage.input_tokens, 100);
@@ -812,7 +812,7 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     // "bash" is in the definition with Observe tier and "Bash" display name.
     assert_eq!(
         payload.pending_tool_calls[0].tier,
-        agent_sdk_core::ToolTier::Observe
+        agent_sdk_foundation::ToolTier::Observe
     );
     assert_eq!(payload.pending_tool_calls[0].display_name, "Bash");
 
@@ -821,7 +821,7 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     // "read_file" is NOT in the definition — falls back to Confirm.
     assert_eq!(
         payload.pending_tool_calls[1].tier,
-        agent_sdk_core::ToolTier::Confirm
+        agent_sdk_foundation::ToolTier::Confirm
     );
 
     // No completed results yet (tools haven't run).
@@ -900,11 +900,11 @@ async fn tool_suspension_children_are_runnable() -> Result<()> {
 async fn suspend_and_complete_children(
     stores: &TestStores,
     tool_calls: Vec<(String, String, serde_json::Value)>,
-    _child_results: &[(String, agent_sdk_core::ToolResult)],
+    _child_results: &[(String, agent_sdk_foundation::ToolResult)],
 ) -> Result<(
     AgentTask,
-    agent_sdk_core::AgentContinuation,
-    Vec<agent_sdk_core::llm::Message>,
+    agent_sdk_foundation::AgentContinuation,
+    Vec<agent_sdk_foundation::llm::Message>,
 )> {
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
@@ -991,7 +991,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
     // Phase 4.4: suspend with a single tool call.
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "file1.txt\nfile2.txt".to_owned(),
             data: None,
@@ -1102,7 +1102,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "done".to_owned(),
             data: None,
@@ -1163,7 +1163,7 @@ async fn resume_checkpoint_contains_correct_agent_state() -> Result<()> {
         .await?
         .context("checkpoint")?;
 
-    let state: agent_sdk_core::AgentState =
+    let state: agent_sdk_foundation::AgentState =
         serde_json::from_value(checkpoint.agent_state_snapshot)?;
 
     // turn_count was set at suspension time (1) and should NOT be
@@ -1184,7 +1184,7 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "result".to_owned(),
             data: None,
@@ -1298,7 +1298,7 @@ async fn resume_with_failed_tool_result() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: false,
             output: "permission denied".to_owned(),
             data: None,
@@ -1367,7 +1367,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
     let child_results = vec![
         (
             "call_a".to_owned(),
-            agent_sdk_core::ToolResult {
+            agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "/home/user".to_owned(),
                 data: None,
@@ -1377,7 +1377,7 @@ async fn resume_multiple_tool_results() -> Result<()> {
         ),
         (
             "call_b".to_owned(),
-            agent_sdk_core::ToolResult {
+            agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "contents of /x".to_owned(),
                 data: None,
@@ -1492,15 +1492,15 @@ async fn suspension_captures_messages_for_resume() -> Result<()> {
     assert_eq!(messages.len(), 2);
 
     // First message is the user prompt.
-    assert_eq!(messages[0].role, agent_sdk_core::llm::Role::User);
+    assert_eq!(messages[0].role, agent_sdk_foundation::llm::Role::User);
 
     // Second message is the assistant response with tool-use blocks.
-    assert_eq!(messages[1].role, agent_sdk_core::llm::Role::Assistant);
+    assert_eq!(messages[1].role, agent_sdk_foundation::llm::Role::Assistant);
     let has_tool_use = match &messages[1].content {
-        agent_sdk_core::llm::Content::Blocks(blocks) => blocks
+        agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks
             .iter()
-            .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. })),
-        agent_sdk_core::llm::Content::Text(_) => false,
+            .any(|b| matches!(b, agent_sdk_foundation::llm::ContentBlock::ToolUse { .. })),
+        agent_sdk_foundation::llm::Content::Text(_) => false,
     };
     assert!(
         has_tool_use,
@@ -1516,7 +1516,7 @@ async fn ready_to_resume_state_survives_acquisition() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
             data: None,
@@ -1704,7 +1704,7 @@ async fn failed_resumed_turn_does_not_leak_continuation() -> Result<()> {
     // Phase 4.4: suspend with a single tool call.
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
             data: None,
@@ -1825,7 +1825,7 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
     // Suspend with a single tool call and run the child to completion.
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
             data: None,
@@ -1932,12 +1932,13 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
     assert!(failed.state.is_none());
 
     // Helper: structural compare for `llm::Message` (no PartialEq).
-    let msgs_match =
-        |a: &[agent_sdk_core::llm::Message], b: &[agent_sdk_core::llm::Message]| -> bool {
-            let aj = serde_json::to_value(a).expect("serialize a");
-            let bj = serde_json::to_value(b).expect("serialize b");
-            aj == bj
-        };
+    let msgs_match = |a: &[agent_sdk_foundation::llm::Message],
+                      b: &[agent_sdk_foundation::llm::Message]|
+     -> bool {
+        let aj = serde_json::to_value(a).expect("serialize a");
+        let bj = serde_json::to_value(b).expect("serialize b");
+        aj == bj
+    };
 
     // Critical assertion: the projection's draft slot survives the
     // task's fail() — `fail_root_turn` only clears the *task* row,
@@ -2171,7 +2172,7 @@ async fn regression_tool_suspension_and_resume_completion() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "hello world".to_owned(),
             data: None,
@@ -2262,7 +2263,7 @@ async fn regression_re_suspension_child_retry_budget() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "result".to_owned(),
             data: None,
@@ -2342,7 +2343,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "ok".to_owned(),
             data: None,
@@ -2432,7 +2433,7 @@ async fn resume_llm_error_does_not_leak_staged_writes() -> Result<()> {
 async fn suspend_and_complete_children_durably(
     stores: &TestStores,
     tool_calls: Vec<(String, String, serde_json::Value)>,
-    child_results: &[(String, agent_sdk_core::ToolResult)],
+    child_results: &[(String, agent_sdk_foundation::ToolResult)],
 ) -> Result<AgentTask> {
     let provider = MockToolCallProvider::new(tool_calls);
     let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
@@ -2579,7 +2580,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
     let child_results = vec![
         (
             "call_a".to_owned(),
-            agent_sdk_core::ToolResult {
+            agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "result_a".to_owned(),
                 data: None,
@@ -2589,7 +2590,7 @@ async fn aggregate_all_successful_children() -> Result<()> {
         ),
         (
             "call_b".to_owned(),
-            agent_sdk_core::ToolResult {
+            agent_sdk_foundation::ToolResult {
                 success: true,
                 output: "result_b".to_owned(),
                 data: None,
@@ -2716,7 +2717,7 @@ async fn aggregate_mixed_success_and_failure() -> Result<()> {
     };
 
     // Complete child 0 with success result, fail child 1.
-    let success_result = agent_sdk_core::ToolResult {
+    let success_result = agent_sdk_foundation::ToolResult {
         success: true,
         output: "/home/user".to_owned(),
         data: None,
@@ -2800,7 +2801,7 @@ async fn resume_from_children_end_to_end() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "file1.txt\nfile2.txt".to_owned(),
             data: None,
@@ -2880,7 +2881,7 @@ async fn resume_from_children_end_to_end() -> Result<()> {
 async fn acquire_and_complete_child(
     stores: &TestStores,
     child: &AgentTask,
-    result: &agent_sdk_core::ToolResult,
+    result: &agent_sdk_foundation::ToolResult,
 ) -> Result<()> {
     stores
         .tasks
@@ -2977,7 +2978,7 @@ async fn resume_from_children_with_mixed_batch() -> Result<()> {
     acquire_and_complete_child(
         &stores,
         &child_tasks[0],
-        &agent_sdk_core::ToolResult::success("/home"),
+        &agent_sdk_foundation::ToolResult::success("/home"),
     )
     .await?;
     acquire_and_fail_child(&stores, &child_tasks[1], "oops").await?;
@@ -3042,7 +3043,7 @@ async fn resume_from_children_re_suspends_on_tool_calls() -> Result<()> {
 
     let child_results = vec![(
         "call_1".to_owned(),
-        agent_sdk_core::ToolResult {
+        agent_sdk_foundation::ToolResult {
             success: true,
             output: "first result".to_owned(),
             data: None,
@@ -3122,7 +3123,7 @@ async fn result_payload_round_trips_through_json() -> Result<()> {
     // task row and deserialization back produces the same value.
     let stores = TestStores::new();
 
-    let original_result = agent_sdk_core::ToolResult {
+    let original_result = agent_sdk_foundation::ToolResult {
         success: true,
         output: "round-trip test".to_owned(),
         data: Some(serde_json::json!({"key": "value"})),
@@ -3149,7 +3150,7 @@ async fn result_payload_round_trips_through_json() -> Result<()> {
     assert!(child.result_payload.is_some());
 
     // Deserialize and compare.
-    let recovered: agent_sdk_core::ToolResult =
+    let recovered: agent_sdk_foundation::ToolResult =
         serde_json::from_value(child.result_payload.clone().unwrap())?;
     assert_eq!(recovered.success, original_result.success);
     assert_eq!(recovered.output, original_result.output);
@@ -3245,8 +3246,8 @@ async fn reacquire_and_resume(
     resume_from_children(inputs, parent, provider, &stores.deps(), t_resume).await
 }
 
-fn ok_result(output: &str) -> agent_sdk_core::ToolResult {
-    agent_sdk_core::ToolResult {
+fn ok_result(output: &str) -> agent_sdk_foundation::ToolResult {
+    agent_sdk_foundation::ToolResult {
         success: true,
         output: output.to_owned(),
         data: None,
@@ -3454,7 +3455,7 @@ impl LlmProvider for InvalidRequestProvider {
 /// auto-retry envelopes through `event_repo.commit_event`, so we can
 /// inspect them with this helper without coupling to the proto layer.
 async fn collected_event_kinds(events: &InMemoryEventRepository) -> Vec<String> {
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::events::AgentEvent;
     let committed = events.get_events(&thread_a()).await.expect("read events");
     committed
         .into_iter()

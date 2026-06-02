@@ -28,7 +28,7 @@
 //! The janitor implementation itself is **out of scope** for this slice;
 //! only the storage shape and query surface are defined here.
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

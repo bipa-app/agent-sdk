@@ -4,7 +4,7 @@
 //! The [`StreamDelta`] enum represents individual events in a streaming response,
 //! and [`StreamAccumulator`] helps collect these events into a final response.
 
-use agent_sdk_core::llm::{ContentBlock, StopReason, Usage};
+use agent_sdk_foundation::llm::{ContentBlock, StopReason, Usage};
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -84,7 +84,7 @@ pub enum StreamDelta {
         /// Error message
         message: String,
         /// Categorization of the error so downstream consumers can map
-        /// it back to the correct [`agent_sdk_core::llm::ChatOutcome`]
+        /// it back to the correct [`agent_sdk_foundation::llm::ChatOutcome`]
         /// variant or audit-record `TurnAttemptOutcome` without losing
         /// the rate-limit / server-error / invalid-request distinction.
         kind: StreamErrorKind,
@@ -93,7 +93,7 @@ pub enum StreamDelta {
 
 /// Classification of a [`StreamDelta::Error`] event.
 ///
-/// Mirrors [`ChatOutcome`](agent_sdk_core::llm::ChatOutcome)'s error
+/// Mirrors [`ChatOutcome`](agent_sdk_foundation::llm::ChatOutcome)'s error
 /// variants so providers that emit errors via streaming preserve the
 /// same precision that non-streaming `chat()` callers see — every
 /// supported provider can map its underlying error (HTTP status,

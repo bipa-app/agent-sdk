@@ -60,9 +60,9 @@
 //! by older binaries continue to deserialize cleanly. New variants must
 //! be added with `#[serde(default)]` defaults on any new fields they
 //! introduce, the same forward-compatibility rule
-//! [`agent_sdk_core::ContinuationEnvelope`] follows.
+//! [`agent_sdk_foundation::ContinuationEnvelope`] follows.
 
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId, llm};
+use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, llm};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -93,7 +93,7 @@ pub struct SubagentInvocationState {
 ///
 /// `TaskState` deliberately does **not** derive `PartialEq` / `Eq`:
 /// the embedded [`ContinuationEnvelope`] and [`ListenExecutionContext`]
-/// payloads come from `agent-sdk-core` types that do not impl
+/// payloads come from `agent-sdk-foundation` types that do not impl
 /// `PartialEq`, and we keep equality concerns out of the schema layer.
 /// Tests that need to assert `TaskState` shape compare via JSON
 /// serialization (the durable wire form is the canonical contract
@@ -119,7 +119,7 @@ pub enum TaskState {
     WaitingOnChildren {
         /// Versioned continuation envelope captured at the moment the
         /// parent paused. Wrapped in `Box` so the enum stays small and
-        /// matches [`agent_sdk_core::AgentRunState::AwaitingConfirmation`].
+        /// matches [`agent_sdk_foundation::AgentRunState::AwaitingConfirmation`].
         continuation: Box<ContinuationEnvelope>,
         /// Messages buffered at the suspension point but not yet
         /// committed: the user prompt + the assistant response
@@ -362,7 +362,7 @@ impl TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::{
+    use agent_sdk_foundation::{
         AgentContinuation, AgentState, CONTINUATION_VERSION, ContinuationEnvelope, ThreadId,
         TokenUsage,
     };
@@ -413,7 +413,7 @@ mod tests {
             mcp: crate::worker::subagent::EffectiveSubagentMcpPolicy {
                 allowed_servers: set(&["docs"]),
             },
-            audit_provenance: Some(agent_sdk_core::audit::AuditProvenance::new(
+            audit_provenance: Some(agent_sdk_foundation::audit::AuditProvenance::new(
                 "anthropic",
                 "claude-sonnet-4-5-20250929",
             )),

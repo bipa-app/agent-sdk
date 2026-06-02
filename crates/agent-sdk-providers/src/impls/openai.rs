@@ -10,7 +10,7 @@
 use crate::attachments::{request_has_attachments, validate_request_attachments};
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
 };
@@ -856,8 +856,8 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
             Content::Text(text) => {
                 messages.push(ApiMessage {
                     role: match msg.role {
-                        agent_sdk_core::llm::Role::User => ApiRole::User,
-                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
+                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
                     },
                     content: Some(text.clone()),
                     tool_calls: None,
@@ -917,8 +917,8 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                 // Add assistant message with text and/or tool calls
                 if !text_parts.is_empty() || !tool_calls.is_empty() {
                     let role = match msg.role {
-                        agent_sdk_core::llm::Role::User => ApiRole::User,
-                        agent_sdk_core::llm::Role::Assistant => ApiRole::Assistant,
+                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
+                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
                     };
 
                     // Only add if it's an assistant message or has text content
@@ -946,7 +946,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
     messages
 }
 
-fn convert_tool(t: agent_sdk_core::llm::Tool) -> ApiTool {
+fn convert_tool(t: agent_sdk_foundation::llm::Tool) -> ApiTool {
     ApiTool {
         r#type: "function".to_owned(),
         function: ApiFunction {
@@ -1050,10 +1050,10 @@ struct ApiToolChoiceFunction {
 }
 
 impl ApiToolChoice {
-    fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+    fn from_tool_choice(tc: &agent_sdk_foundation::llm::ToolChoice) -> Self {
         match tc {
-            agent_sdk_core::llm::ToolChoice::Auto => Self::String("auto".to_owned()),
-            agent_sdk_core::llm::ToolChoice::Tool(name) => Self::Named {
+            agent_sdk_foundation::llm::ToolChoice::Auto => Self::String("auto".to_owned()),
+            agent_sdk_foundation::llm::ToolChoice::Tool(name) => Self::Named {
                 choice_type: "function".to_owned(),
                 function: ApiToolChoiceFunction { name: name.clone() },
             },
@@ -1079,7 +1079,7 @@ struct ApiJsonSchema {
 }
 
 impl ApiResponseFormat {
-    fn from_response_format(rf: &agent_sdk_core::llm::ResponseFormat) -> Self {
+    fn from_response_format(rf: &agent_sdk_foundation::llm::ResponseFormat) -> Self {
         Self {
             format_type: "json_schema",
             json_schema: ApiJsonSchema {
@@ -1762,7 +1762,7 @@ mod tests {
     fn test_build_api_messages_with_system() {
         let request = ChatRequest {
             system: "You are helpful.".to_string(),
-            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
+            messages: vec![agent_sdk_foundation::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
             max_tokens_explicit: true,
@@ -1788,7 +1788,7 @@ mod tests {
     fn test_build_api_messages_empty_system() {
         let request = ChatRequest {
             system: String::new(),
-            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
+            messages: vec![agent_sdk_foundation::llm::Message::user("Hello")],
             tools: None,
             max_tokens: 1024,
             max_tokens_explicit: true,
@@ -1806,12 +1806,12 @@ mod tests {
 
     #[test]
     fn test_convert_tool() {
-        let tool = agent_sdk_core::llm::Tool {
+        let tool = agent_sdk_foundation::llm::Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             display_name: "Test Tool".to_string(),
-            tier: agent_sdk_core::ToolTier::Observe,
+            tier: agent_sdk_foundation::ToolTier::Observe,
         };
 
         let api_tool = convert_tool(tool);
@@ -2063,13 +2063,13 @@ mod tests {
     fn test_should_use_responses_api_for_official_agentic_requests() {
         let request = ChatRequest {
             system: String::new(),
-            messages: vec![agent_sdk_core::llm::Message::user("Hello")],
-            tools: Some(vec![agent_sdk_core::llm::Tool {
+            messages: vec![agent_sdk_foundation::llm::Message::user("Hello")],
+            tools: Some(vec![agent_sdk_foundation::llm::Tool {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
                 display_name: "Read File".to_string(),
-                tier: agent_sdk_core::ToolTier::Observe,
+                tier: agent_sdk_foundation::ToolTier::Observe,
             }]),
             max_tokens: 1024,
             max_tokens_explicit: true,
@@ -2278,7 +2278,7 @@ mod tests {
         }];
 
         let response_format = Some(ApiResponseFormat::from_response_format(
-            &agent_sdk_core::llm::ResponseFormat::new(
+            &agent_sdk_foundation::llm::ResponseFormat::new(
                 "person",
                 serde_json::json!({"type": "object"}),
             ),

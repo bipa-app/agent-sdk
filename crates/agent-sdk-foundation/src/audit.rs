@@ -30,9 +30,9 @@
 //!
 //! # Trait location
 //!
-//! Only the **record shape** lives in `agent-sdk-core` (this module is
+//! Only the **record shape** lives in `agent-sdk-foundation` (this module is
 //! data-only). The async [`ToolAuditSink`](../../agent_sdk_tools/audit/trait.ToolAuditSink.html)
-//! trait lives in `agent-sdk-tools` so `agent-sdk-core` stays free of
+//! trait lives in `agent-sdk-tools` so `agent-sdk-foundation` stays free of
 //! async-trait dependencies.
 
 use crate::types::{ListenExecutionContext, ToolResult, ToolTier};

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use agent_server::journal::broker::{BrokerAdapter, InMemoryBrokerAdapter};
 use agent_server::journal::outbox::{InMemoryOutboxStore, NewOutboxRow, OutboxStatus, OutboxStore};
 use agent_server::journal::outbox_message::{

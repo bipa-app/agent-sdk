@@ -55,12 +55,12 @@
 
 use std::sync::Arc;
 
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::{ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result, ensure};
 use time::{Duration, OffsetDateTime};
 
-use agent_sdk_core::events::AgentEvent;
+use agent_sdk_foundation::events::AgentEvent;
 
 use super::checkpoint::{CheckpointId, NewCheckpointParams};
 use super::checkpoint_store::CheckpointStore;
@@ -160,8 +160,8 @@ mod in_memory_bundle {
     use crate::journal::turn_attempt::{
         CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
     };
-    use agent_sdk_core::events::AgentEvent;
-    use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, TokenUsage};
+    use agent_sdk_foundation::events::AgentEvent;
+    use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, TokenUsage};
     use async_trait::async_trait;
 
     #[async_trait]
@@ -453,13 +453,13 @@ mod in_memory_bundle {
         async fn get_history(
             &self,
             thread_id: &ThreadId,
-        ) -> Result<Vec<agent_sdk_core::llm::Message>> {
+        ) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
             self.message.get_history(thread_id).await
         }
         async fn commit_messages(
             &self,
             thread_id: &ThreadId,
-            messages: Vec<agent_sdk_core::llm::Message>,
+            messages: Vec<agent_sdk_foundation::llm::Message>,
             now: OffsetDateTime,
         ) -> Result<MessageProjection> {
             self.message.commit_messages(thread_id, messages, now).await
@@ -467,7 +467,7 @@ mod in_memory_bundle {
         async fn replace_history(
             &self,
             thread_id: &ThreadId,
-            messages: Vec<agent_sdk_core::llm::Message>,
+            messages: Vec<agent_sdk_foundation::llm::Message>,
             now: OffsetDateTime,
         ) -> Result<MessageProjection> {
             self.message.replace_history(thread_id, messages, now).await
@@ -475,7 +475,7 @@ mod in_memory_bundle {
         async fn set_draft(
             &self,
             thread_id: &ThreadId,
-            messages: Vec<agent_sdk_core::llm::Message>,
+            messages: Vec<agent_sdk_foundation::llm::Message>,
             now: OffsetDateTime,
         ) -> Result<MessageProjection> {
             self.message.set_draft(thread_id, messages, now).await
@@ -685,8 +685,8 @@ fn assert_semantic_eq<T: serde::Serialize>(left: &T, right: &T, label: &str) -> 
 /// about its contents, only that the parent/child rows are created.
 fn empty_suspension(thread: &ThreadId) -> SuspensionPayload {
     SuspensionPayload {
-        continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-            agent_sdk_core::AgentContinuation {
+        continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+            agent_sdk_foundation::AgentContinuation {
                 thread_id: thread.clone(),
                 turn: 1,
                 total_usage: TokenUsage::default(),
@@ -694,7 +694,7 @@ fn empty_suspension(thread: &ThreadId) -> SuspensionPayload {
                 pending_tool_calls: vec![],
                 awaiting_index: 0,
                 completed_results: vec![],
-                state: agent_sdk_core::AgentState::new(thread.clone()),
+                state: agent_sdk_foundation::AgentState::new(thread.clone()),
                 response_id: None,
                 stop_reason: None,
                 response_content: vec![],

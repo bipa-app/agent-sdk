@@ -27,7 +27,7 @@
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use agent_sdk_core::privacy::{RedactionPolicy, redact_string};
+use agent_sdk_foundation::privacy::{RedactionPolicy, redact_string};
 use opentelemetry::Context;
 use opentelemetry::KeyValue;
 use opentelemetry::global::BoxedSpan;

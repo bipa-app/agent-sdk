@@ -21,11 +21,11 @@
 //! [`PayloadRedactor::noop`] (or the module-level free functions,
 //! which delegate to it). Financial and other PII-sensitive
 //! integrations should construct a redactor with
-//! [`agent_sdk_core::privacy::BaselineDetector`] or a custom
+//! [`agent_sdk_foundation::privacy::BaselineDetector`] or a custom
 //! detector.
 
 use crate::llm::{ChatRequest, ChatResponse, Content, ContentBlock, Message, Role};
-use agent_sdk_core::privacy::{NoopDetector, PiiDetector, mask_spans};
+use agent_sdk_foundation::privacy::{NoopDetector, PiiDetector, mask_spans};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -267,7 +267,7 @@ fn determine_user_message_role(message: &Message) -> &'static str {
 mod tests {
     use super::*;
     use crate::llm::{ChatRequest, ChatResponse, ContentSource, StopReason, Usage};
-    use agent_sdk_core::privacy::BaselineDetector;
+    use agent_sdk_foundation::privacy::BaselineDetector;
 
     fn empty_request(system: &str, messages: Vec<Message>) -> ChatRequest {
         ChatRequest {

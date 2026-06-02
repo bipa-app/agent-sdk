@@ -30,14 +30,14 @@
 //!   [`ContinuationEnvelope`] in its [`TaskState::WaitingOnChildren`]
 //!   payload — enough for Phase 5 to resume.
 //!
-//! [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+//! [`ContinuationEnvelope`]: agent_sdk_foundation::ContinuationEnvelope
 //! [`spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
 //! [`TaskState::WaitingOnChildren`]: crate::journal::task_state::TaskState::WaitingOnChildren
 
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm::{self, ChatRequest};
-use agent_sdk_core::{
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm::{self, ChatRequest};
+use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, TokenUsage,
     ToolResult, ToolTier,
 };
@@ -300,7 +300,7 @@ pub async fn fail_root_turn(
     task_id: &AgentTaskId,
     worker_id: &WorkerId,
     lease_id: &LeaseId,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     error: &anyhow::Error,
     deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
@@ -423,7 +423,7 @@ async fn best_effort_close_open_attempts(
 /// - Task completion fails (text-only)
 /// - Child spawn fails (tool suspension)
 ///
-/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+/// [`ContinuationEnvelope`]: agent_sdk_foundation::ContinuationEnvelope
 pub async fn execute_root_turn(
     inputs: RootWorkerInputs,
     user_input: impl Into<super::user_input::UserInput>,
@@ -828,7 +828,7 @@ async fn commit_text_only_turn(
 /// after another worker already advanced the thread.
 async fn ensure_turn_not_already_committed(
     thread_store: &dyn ThreadStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     expected_turn: u32,
 ) -> Result<()> {
     let current_thread = thread_store
@@ -931,7 +931,7 @@ async fn load_root_span_ids(
 async fn build_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
@@ -1083,7 +1083,7 @@ pub(crate) struct LlmRetryParams<'a> {
     pub(crate) deps: &'a RootTurnDeps<'a>,
     /// Thread under which every event commit and audit close is
     /// attributed.
-    pub(crate) thread_id: &'a agent_sdk_core::ThreadId,
+    pub(crate) thread_id: &'a agent_sdk_foundation::ThreadId,
     /// Wall-clock timestamp the first attempt records on its closed
     /// attempt row when the streaming attempt fails.  Subsequent
     /// attempts capture a fresh `now` per retry.
@@ -1226,7 +1226,7 @@ struct RecoverableRetryParams<'a> {
     definition: &'a AgentDefinition,
     attempt_audit_prompt: &'a str,
     deps: &'a RootTurnDeps<'a>,
-    thread_id: &'a agent_sdk_core::ThreadId,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
 }
 
 /// Handle a recoverable streaming failure: bump the retry counter,
@@ -1307,7 +1307,7 @@ struct PromptTooLongRecoveryParams<'a> {
     inputs: &'a RootWorkerInputs,
     definition: &'a AgentDefinition,
     deps: &'a RootTurnDeps<'a>,
-    thread_id: &'a agent_sdk_core::ThreadId,
+    thread_id: &'a agent_sdk_foundation::ThreadId,
 }
 
 /// Detect a `prompt is too long`-class fatal error, run an emergency
@@ -1425,7 +1425,7 @@ fn stream_backoff_delay(attempt: u32) -> Duration {
 /// loop itself.
 async fn emit_auto_retry_start(
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     attempt: u32,
     max_attempts: u32,
     delay_ms: u64,
@@ -1457,7 +1457,7 @@ async fn emit_auto_retry_start(
 /// the last error.
 async fn emit_auto_retry_end(
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     attempt: u32,
     success: bool,
     final_error: Option<String>,
@@ -1522,7 +1522,7 @@ async fn call_llm_once(
     request: ChatRequest,
     attempt: &TurnAttempt,
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
     #[cfg(feature = "otel")]
@@ -1548,7 +1548,7 @@ async fn call_llm_once_instrumented(
     request: ChatRequest,
     attempt: &TurnAttempt,
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
     use agent_sdk::observability::loop_instrument;
@@ -1631,7 +1631,7 @@ async fn call_llm_once_inner(
     request: ChatRequest,
     attempt: &TurnAttempt,
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<OnceOutcome, StreamAttemptError> {
     let mut stream = std::pin::pin!(provider.chat_stream(request));
@@ -1770,7 +1770,7 @@ async fn call_llm_once_inner(
 fn synthesize_response(
     accumulator: StreamAccumulator,
     provider: &dyn LlmProvider,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
 ) -> llm::ChatResponse {
     let usage = accumulator.usage().cloned().unwrap_or_else(|| {
         log::warn!(
@@ -1806,7 +1806,7 @@ fn synthesize_response(
 /// during streaming should not abort the turn.
 async fn commit_streaming_delta(
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     event: AgentEvent,
     event_label: &str,
     delta_count: u64,
@@ -1856,7 +1856,7 @@ async fn close_attempt_with(
 async fn buffer_turn_messages(
     staged_messages: &crate::journal::staged::StagedMessageStore,
     staged_state: &crate::journal::staged::StagedStateStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     user_input: &super::user_input::UserInput,
     response: &llm::ChatResponse,
 ) -> Result<()> {
@@ -1962,7 +1962,7 @@ fn build_full_assistant_message(response: &llm::ChatResponse) -> llm::Message {
 /// provider's response id is not yet plumbed through the
 /// [`StreamDelta`] protocol.  Persisting `Some("")` would violate the
 /// documented contract on
-/// [`AgentContinuation::response_id`](agent_sdk_core::AgentContinuation::response_id)
+/// [`AgentContinuation::response_id`](agent_sdk_foundation::AgentContinuation::response_id)
 /// — `None` is the sentinel for "provider did not return an id" — so
 /// every caller that wants to durably record the response id must
 /// route through this helper.
@@ -2040,7 +2040,7 @@ fn build_content_events(response: &llm::ChatResponse, content_ids: &ContentIds) 
 /// observers see the model's output before the lifecycle edges.
 fn build_turn_complete_events(
     response: &llm::ChatResponse,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     turn_number: usize,
     turn_usage: &TokenUsage,
     total_usage: &TokenUsage,
@@ -2089,7 +2089,7 @@ fn build_turn_complete_events(
 ///
 /// No checkpoint or message-projection write occurs on this path.
 ///
-/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+/// [`ContinuationEnvelope`]: agent_sdk_foundation::ContinuationEnvelope
 async fn suspend_at_tool_boundary(
     inputs: RootWorkerInputs,
     user_input: &super::user_input::UserInput,
@@ -2516,7 +2516,7 @@ fn child_spawn_specs_for_response(
 /// `suspend_resumed_turn` — extracted so the two suspend paths stay
 /// in lockstep when the start-event shape changes.
 fn build_tool_call_start_events(
-    continuation: &agent_sdk_core::ContinuationEnvelope,
+    continuation: &agent_sdk_foundation::ContinuationEnvelope,
 ) -> Vec<AgentEvent> {
     continuation
         .payload
@@ -2542,7 +2542,7 @@ fn build_tool_call_start_events(
 /// of seeing only committed history. Errors are logged and dropped.
 async fn snapshot_suspension_draft(
     deps: &RootTurnDeps<'_>,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     task_id: &AgentTaskId,
     draft_snapshot: Vec<llm::Message>,
     now: OffsetDateTime,
@@ -2567,7 +2567,7 @@ async fn snapshot_suspension_draft(
 /// - The agent state snapshot (turn count and usage updated)
 /// - LLM response metadata (response ID, stop reason)
 ///
-/// [`ContinuationEnvelope`]: agent_sdk_core::ContinuationEnvelope
+/// [`ContinuationEnvelope`]: agent_sdk_foundation::ContinuationEnvelope
 async fn build_continuation(
     inputs: &RootWorkerInputs,
     response: &llm::ChatResponse,
@@ -2646,7 +2646,7 @@ async fn build_continuation(
 /// LLM response, resolving `tier` and `display_name` from the
 /// authoritative tool definitions on the [`AgentDefinition`].
 ///
-/// [`PendingToolCallInfo`]: agent_sdk_core::PendingToolCallInfo
+/// [`PendingToolCallInfo`]: agent_sdk_foundation::PendingToolCallInfo
 /// [`AgentDefinition`]: super::definition::AgentDefinition
 fn extract_pending_tool_calls(
     response: &llm::ChatResponse,
@@ -2724,7 +2724,7 @@ struct ResumeContext<'a> {
 /// - LLM returns a non-success outcome.
 /// - Commit path or task completion fails.
 ///
-/// [`AgentContinuation`]: agent_sdk_core::AgentContinuation
+/// [`AgentContinuation`]: agent_sdk_foundation::AgentContinuation
 /// [`TaskState::ReadyToResume`]: crate::journal::task_state::TaskState::ReadyToResume
 #[allow(clippy::too_many_lines)]
 pub async fn resume_root_turn(
@@ -3097,7 +3097,7 @@ async fn commit_resumed_turn(
 async fn buffer_resume_messages(
     staged_messages: &crate::journal::staged::StagedMessageStore,
     staged_state: &crate::journal::staged::StagedStateStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     continuation: &AgentContinuation,
     suspended_messages: &[llm::Message],
     child_results: &[(String, ToolResult)],
@@ -3159,7 +3159,7 @@ fn build_resumed_draft_messages(
 async fn build_resume_chat_request(
     definition: &AgentDefinition,
     staged_messages: &crate::journal::staged::StagedMessageStore,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     caller_metadata: Option<&serde_json::Value>,
 ) -> Result<ChatRequest> {
     let messages = staged_messages

@@ -347,7 +347,7 @@
 //!
 //! | Crate | Purpose |
 //! |-------|---------|
-//! | [`agent_sdk_core`] | Data-only contract types (IDs, events, LLM messages) |
+//! | [`agent_sdk_foundation`] | Data-only contract types (IDs, events, LLM messages) |
 //! | [`agent_sdk_tools`] | Tool traits, registry, hooks, stores, environment |
 //! | [`agent_sdk_providers`] | LLM provider trait and first-party implementations |
 //! | `agent-server` | Server-side orchestration (internal, not published) |
@@ -479,8 +479,8 @@ pub use capabilities::AgentCapabilities;
 pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 pub use tokio_util::sync::CancellationToken;
 
-// agent-sdk-core (via thin modules)
-pub use agent_sdk_core::privacy::{
+// agent-sdk-foundation (via thin modules)
+pub use agent_sdk_foundation::privacy::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
     redact_string, redact_value,
 };
@@ -648,7 +648,7 @@ pub use model_capabilities::{
 
 // Schema-validated structured output (Phase 13): the [`ResponseFormat`] request
 // field, the bounded re-prompt runner, and its typed result/error.
-pub use agent_sdk_core::llm::ResponseFormat;
+pub use agent_sdk_foundation::llm::ResponseFormat;
 pub use agent_sdk_providers::{
     StructuredConfig, StructuredOutput, StructuredOutputError, StructuredOutputSupport,
     run_structured,
@@ -675,7 +675,7 @@ pub mod advanced {
     };
 
     // Audit-record protocol emitted at every tool-lifecycle transition.
-    pub use agent_sdk_core::audit::{
+    pub use agent_sdk_foundation::audit::{
         AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
     };
 

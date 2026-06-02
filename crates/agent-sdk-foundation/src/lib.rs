@@ -18,7 +18,7 @@ pub mod privacy;
 pub mod types;
 
 // ── Flat re-exports ──────────────────────────────────────────────────
-// Downstream crates can `use agent_sdk_core::ThreadId` without reaching
+// Downstream crates can `use agent_sdk_foundation::ThreadId` without reaching
 // into sub-modules.
 
 pub use audit::{AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams};

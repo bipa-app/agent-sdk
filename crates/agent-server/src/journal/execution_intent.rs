@@ -64,7 +64,7 @@
 //! See the module-level doc of [`failure_model`] for the full decision
 //! table that later confirmation and replay work can build on.
 
-use agent_sdk_core::{PendingToolCallInfo, ToolResult};
+use agent_sdk_foundation::{PendingToolCallInfo, ToolResult};
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -422,7 +422,7 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
 /// Future phases may introduce explicit per-tool annotations.
 #[must_use]
 pub const fn classify_tool_effect(tool_call: &PendingToolCallInfo) -> ToolEffectClass {
-    use agent_sdk_core::ToolTier;
+    use agent_sdk_foundation::ToolTier;
 
     match tool_call.tier {
         ToolTier::Observe => ToolEffectClass::ReplaySafe,
@@ -702,7 +702,7 @@ pub mod failure_model {}
 mod tests {
     use super::*;
     use crate::journal::task::AgentTaskId;
-    use agent_sdk_core::{PendingToolCallInfo, ToolTier};
+    use agent_sdk_foundation::{PendingToolCallInfo, ToolTier};
 
     // ── OperationId ──────────────────────────────────────────────
 
@@ -763,7 +763,7 @@ mod tests {
             input: serde_json::json!({}),
             effective_input: serde_json::json!({}),
             listen_context: if listen {
-                Some(agent_sdk_core::ListenExecutionContext {
+                Some(agent_sdk_foundation::ListenExecutionContext {
                     operation_id: "op-1".into(),
                     revision: 1,
                     snapshot: serde_json::json!({}),

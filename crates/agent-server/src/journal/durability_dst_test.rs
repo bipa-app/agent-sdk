@@ -51,7 +51,7 @@ use time::{Duration, OffsetDateTime};
 
 use super::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use super::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 
 // ─────────────────────────────────────────────────────────────────────
 // Deterministic PRNG (SplitMix64) — no external `rand` dependency

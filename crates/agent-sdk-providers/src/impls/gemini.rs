@@ -8,7 +8,7 @@ pub(crate) mod data;
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
@@ -291,7 +291,7 @@ impl LlmProvider for GeminiProvider {
 
         let has_tool_calls = content
             .iter()
-            .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. }));
+            .any(|b| matches!(b, agent_sdk_foundation::llm::ContentBlock::ToolUse { .. }));
 
         let stop_reason = candidate
             .finish_reason

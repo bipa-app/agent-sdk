@@ -190,7 +190,7 @@ impl TurnAttemptStore for InMemoryTurnAttemptStore {
 mod tests {
     use super::super::turn_attempt::TurnAttemptSchemaError;
     use super::*;
-    use agent_sdk_core::audit::AuditProvenance;
+    use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::{Context, Result};
     use time::Duration;
 
@@ -220,7 +220,7 @@ mod tests {
             response_blob: serde_json::json!({"id": "msg_1"}),
             response_id: Some("msg_1".into()),
             response_model: Some("claude-sonnet-4-5-20250929".into()),
-            stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
             outcome: TurnAttemptOutcome::Success,
             input_tokens: 100,
             output_tokens: 50,

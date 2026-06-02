@@ -462,14 +462,14 @@
 //! surface for durable events.  Every event committed through this
 //! layer receives server-owned metadata (UUID v7 `event_id`, monotonic
 //! per-thread `sequence`, commit-time `timestamp`), replacing
-//! SDK-local [`SequenceCounter`](agent_sdk_core::events::SequenceCounter)
+//! SDK-local [`SequenceCounter`](agent_sdk_foundation::events::SequenceCounter)
 //! semantics for the authoritative server path.
 //!
 //! Key design properties:
 //!
 //! 1. **Single allocation authority** — the event repository is the
 //!    only place that assigns `event_id`, `sequence`, and `timestamp`
-//!    for committed events.  Workers submit raw [`AgentEvent`](agent_sdk_core::events::AgentEvent)s;
+//!    for committed events.  Workers submit raw [`AgentEvent`](agent_sdk_foundation::events::AgentEvent)s;
 //!    the repository wraps them atomically.
 //! 2. **Thread-scoped sequencing** — each thread gets an independent
 //!    monotonic counter starting at 0.  Sequences are contiguous

@@ -201,7 +201,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
+use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -1079,7 +1079,7 @@ pub trait AgentTaskStore: Send + Sync {
     /// does.
     ///
     /// This is the Phase 5.4 entry point for tool-runtime children
-    /// that carry a serialized [`agent_sdk_core::ToolResult`] back to
+    /// that carry a serialized [`agent_sdk_foundation::ToolResult`] back to
     /// the parent. The `result_payload` is persisted on the child row's
     /// [`AgentTask::result_payload`] field so the parent's resume path
     /// can read it from the journal via
@@ -3202,7 +3202,7 @@ mod tests {
     use super::*;
     use crate::journal::task::{LeaseId, TaskSchemaError, WorkerId};
     use crate::journal::task_state::TaskState;
-    use agent_sdk_core::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
+    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
@@ -3246,8 +3246,8 @@ mod tests {
     /// Sample listen/execute prepared operation paired with the
     /// confirmation continuation in tests that exercise the typed
     /// [`TaskState::AwaitingConfirmation`] payload.
-    fn sample_prepared_op() -> agent_sdk_core::ListenExecutionContext {
-        agent_sdk_core::ListenExecutionContext {
+    fn sample_prepared_op() -> agent_sdk_foundation::ListenExecutionContext {
+        agent_sdk_foundation::ListenExecutionContext {
             operation_id: "op-store".into(),
             revision: 1,
             snapshot: serde_json::json!({"preview": true}),
@@ -6919,7 +6919,7 @@ mod tests {
         EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
         InheritedSubagentPolicy, SubagentSandboxPolicy,
     };
-    use agent_sdk_core::audit::AuditProvenance;
+    use agent_sdk_foundation::audit::AuditProvenance;
 
     /// Spawn a parent root, lease it, and return
     /// `(parent, worker, lease)` so Phase 2.6 tests can exercise

@@ -40,8 +40,8 @@
 //! 3. **Single-turn scope** — each adapter is constructed for exactly
 //!    one turn attempt. There is no cross-turn reuse.
 
-use agent_sdk_core::llm;
-use agent_sdk_core::types::{AgentState, ThreadId};
+use agent_sdk_foundation::llm;
+use agent_sdk_foundation::types::{AgentState, ThreadId};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::RwLock;
@@ -346,7 +346,7 @@ impl StagedStores {
             AgentState {
                 thread_id: thread_id.clone(),
                 turn_count: 0,
-                total_usage: agent_sdk_core::TokenUsage::default(),
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
                 metadata: std::collections::HashMap::new(),
                 created_at: view.thread.created_at,
             }
@@ -369,7 +369,7 @@ impl StagedStores {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::TokenUsage;
+    use agent_sdk_foundation::TokenUsage;
 
     fn thread_a() -> ThreadId {
         ThreadId::from_string("t-staged-a")

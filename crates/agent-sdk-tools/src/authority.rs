@@ -6,7 +6,7 @@
 //! injects its own authority (or seeds the offset) so ordering is continuous
 //! across turns within the same thread.
 
-use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+use agent_sdk_foundation::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 
 /// Authority that governs how events are wrapped in envelopes.
 ///

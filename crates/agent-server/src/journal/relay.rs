@@ -252,7 +252,7 @@ pub struct TaskWakeupTrigger {
     /// Task that became runnable.
     pub task_id: super::task::AgentTaskId,
     /// Thread the task belongs to.
-    pub thread_id: agent_sdk_core::ThreadId,
+    pub thread_id: agent_sdk_foundation::ThreadId,
     /// Wall-clock time of the triggering mutation.
     pub now: OffsetDateTime,
     /// Maximum relay attempts for this row.
@@ -345,7 +345,7 @@ mod tests {
     use crate::journal::outbox::InMemoryOutboxStore;
     use crate::journal::outbox_message::{TaskWakeupPayload, ThreadEventsAvailablePayload};
     use crate::journal::task::AgentTaskId;
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
     use std::sync::Mutex;
     use time::Duration as TimeDuration;
 

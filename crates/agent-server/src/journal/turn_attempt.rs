@@ -28,7 +28,7 @@
 //! - Message projection → lives on [`super::message::MessageProjection`]
 //! - Checkpoint storage → out of scope (future phase)
 
-use agent_sdk_core::audit::AuditProvenance;
+use agent_sdk_foundation::audit::AuditProvenance;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::OffsetDateTime;
@@ -86,7 +86,7 @@ impl fmt::Display for TurnAttemptId {
 
 /// Terminal outcome for a single LLM request/response cycle.
 ///
-/// Maps to [`agent_sdk_core::llm::ChatOutcome`] variants plus a
+/// Maps to [`agent_sdk_foundation::llm::ChatOutcome`] variants plus a
 /// cancellation path. This is a server-audit enum — it records
 /// *what happened*, not *what to do next*.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +211,7 @@ pub struct TurnAttempt {
     pub response_model: Option<String>,
 
     /// Stop reason reported by the provider. `None` while open.
-    pub stop_reason: Option<agent_sdk_core::llm::StopReason>,
+    pub stop_reason: Option<agent_sdk_foundation::llm::StopReason>,
 
     // ── Outcome ──────────────────────────────────────────────────
     /// Terminal outcome of the attempt. `None` while open.
@@ -442,7 +442,7 @@ pub struct CloseAttemptParams {
     /// Model string the provider actually used.
     pub response_model: Option<String>,
     /// Stop reason from the provider.
-    pub stop_reason: Option<agent_sdk_core::llm::StopReason>,
+    pub stop_reason: Option<agent_sdk_foundation::llm::StopReason>,
     /// Terminal outcome of this attempt.
     pub outcome: TurnAttemptOutcome,
     /// Input tokens consumed.
@@ -494,7 +494,7 @@ mod tests {
             }),
             response_id: Some("msg_01".into()),
             response_model: Some("claude-sonnet-4-5-20250929".into()),
-            stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
             outcome: TurnAttemptOutcome::Success,
             input_tokens: 100,
             output_tokens: 50,
@@ -582,7 +582,7 @@ mod tests {
         );
         assert_eq!(
             closed.stop_reason,
-            Some(agent_sdk_core::llm::StopReason::EndTurn),
+            Some(agent_sdk_foundation::llm::StopReason::EndTurn),
         );
         assert_eq!(closed.input_tokens, Some(100));
         assert_eq!(closed.output_tokens, Some(50));
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn open_with_stop_reason_fails_validation() {
         let mut attempt = TurnAttempt::open(sample_open_params());
-        attempt.stop_reason = Some(agent_sdk_core::llm::StopReason::EndTurn);
+        attempt.stop_reason = Some(agent_sdk_foundation::llm::StopReason::EndTurn);
         assert_eq!(
             attempt.validate(),
             Err(TurnAttemptSchemaError::ResponseOnOpenAttempt),

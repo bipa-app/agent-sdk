@@ -9,7 +9,7 @@ pub(crate) mod data;
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
@@ -658,7 +658,7 @@ impl LlmProvider for AnthropicProvider {
                 std::collections::HashMap::new();
 
             let mut received_message_stop = false;
-            let mut pending_stop_reason: Option<agent_sdk_core::llm::StopReason> = None;
+            let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
             let mut chunk_count: u64 = 0;
             let mut total_bytes: u64 = 0;
 
@@ -943,7 +943,7 @@ mod tests {
         assert!(
             opus_47
                 .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
-                    agent_sdk_core::llm::Effort::High
+                    agent_sdk_foundation::llm::Effort::High
                 )))
                 .is_ok()
         );
@@ -983,7 +983,7 @@ mod tests {
         assert!(
             opus_48
                 .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
-                    agent_sdk_core::llm::Effort::High
+                    agent_sdk_foundation::llm::Effort::High
                 )))
                 .is_ok()
         );

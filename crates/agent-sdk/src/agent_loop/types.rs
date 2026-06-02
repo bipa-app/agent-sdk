@@ -10,7 +10,7 @@ use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
     PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
 };
-use agent_sdk_core::audit::AuditProvenance;
+use agent_sdk_foundation::audit::AuditProvenance;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -72,7 +72,7 @@ pub(super) struct TurnContext {
     pub(super) pending_reminder: Option<String>,
     // ── Turn summary accumulators ───────────────────────────────────
     //
-    // These mirror fields on `agent_sdk_core::TurnSummary` and are
+    // These mirror fields on `agent_sdk_foundation::TurnSummary` and are
     // populated incrementally as the turn progresses, then promoted to
     // a full `TurnSummary` by `build_turn_summary` when the outcome is
     // produced. Keeping the accumulators on `TurnContext` lets the
@@ -388,7 +388,7 @@ pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
     pub(super) provenance: AuditProvenance,
     /// Execution options selected by the caller, needed so the resume
     /// path can carry [`TurnOptions`] through into the emitted
-    /// [`agent_sdk_core::TurnSummary`].
+    /// [`agent_sdk_foundation::TurnSummary`].
     pub(super) turn_options: TurnOptions,
     /// Wall-clock instant when the enclosing `run_turn` invocation
     /// started — used to measure `duration_ms` for the summary.

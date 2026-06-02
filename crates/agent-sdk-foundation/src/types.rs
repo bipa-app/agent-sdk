@@ -1069,7 +1069,7 @@ pub struct TurnOptions {
 /// # Example
 ///
 /// ```no_run
-/// use agent_sdk_core::types::RunOptions;
+/// use agent_sdk_foundation::types::RunOptions;
 /// use serde_json::json;
 ///
 /// let opts = RunOptions {

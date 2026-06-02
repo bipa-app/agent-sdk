@@ -36,9 +36,9 @@
 use crate::authority::{EventAuthority, LocalEventAuthority};
 use crate::seed::{HostDependencies, ToolContextSeed};
 use crate::stores::EventStore;
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm;
-use agent_sdk_core::types::{ToolOutcome, ToolResult, ToolTier};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm;
+use agent_sdk_foundation::types::{ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -295,7 +295,7 @@ pub struct ToolContext<Ctx> {
     /// Optional event store for tools to emit turn-scoped events.
     event_store: Option<Arc<dyn EventStore>>,
     /// Thread associated with the bound event store.
-    event_thread_id: Option<agent_sdk_core::types::ThreadId>,
+    event_thread_id: Option<agent_sdk_foundation::types::ThreadId>,
     /// Turn associated with the bound event store.
     event_turn: Option<usize>,
     /// Optional event authority for wrapping events in envelopes
@@ -372,7 +372,7 @@ impl<Ctx> ToolContext<Ctx> {
     pub fn with_event_store(
         mut self,
         store: Arc<dyn EventStore>,
-        thread_id: agent_sdk_core::types::ThreadId,
+        thread_id: agent_sdk_foundation::types::ThreadId,
         turn: usize,
         authority: Arc<dyn EventAuthority>,
     ) -> Self {
@@ -385,7 +385,7 @@ impl<Ctx> ToolContext<Ctx> {
 
     /// Emit an event through the configured event store (if set).
     ///
-    /// The event is wrapped in an [`agent_sdk_core::AgentEventEnvelope`] with a unique ID,
+    /// The event is wrapped in an [`agent_sdk_foundation::AgentEventEnvelope`] with a unique ID,
     /// sequence number, and timestamp before publishing.
     ///
     /// # Errors
@@ -582,7 +582,7 @@ pub trait Tool<Ctx>: Send + Sync {
 ///
 /// ```
 /// use agent_sdk_tools::tools::{TypedTool, ToolContext};
-/// use agent_sdk_core::types::ToolResult;
+/// use agent_sdk_foundation::types::ToolResult;
 /// use serde::{Deserialize, Serialize};
 /// use serde_json::{json, Value};
 /// use std::future::Future;
@@ -804,7 +804,7 @@ where
 ///
 /// ```
 /// use agent_sdk_tools::tools::{ToolLogic, ToolContext};
-/// use agent_sdk_core::types::ToolResult;
+/// use agent_sdk_foundation::types::ToolResult;
 /// use serde_json::Value;
 ///
 /// struct MyTool;
@@ -854,7 +854,7 @@ pub trait ToolLogic<Ctx>: Send + Sync {
 ///
 /// ```
 /// use agent_sdk_tools::tools::{SimpleTool, ToolContext};
-/// use agent_sdk_core::types::ToolResult;
+/// use agent_sdk_foundation::types::ToolResult;
 /// use serde_json::{json, Value};
 /// use std::future::Future;
 ///

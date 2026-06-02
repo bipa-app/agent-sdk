@@ -5,7 +5,7 @@
 
 use crate::attachments::decode_attachment_bytes;
 use crate::streaming::{StreamBox, StreamDelta};
-use agent_sdk_core::llm::{Content, ContentBlock, StopReason, Usage};
+use agent_sdk_foundation::llm::{Content, ContentBlock, StopReason, Usage};
 use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -118,15 +118,15 @@ pub struct ApiFunctionCallingMode {
 }
 
 impl ApiFunctionCallingConfig {
-    pub fn from_tool_choice(tc: &agent_sdk_core::llm::ToolChoice) -> Self {
+    pub fn from_tool_choice(tc: &agent_sdk_foundation::llm::ToolChoice) -> Self {
         match tc {
-            agent_sdk_core::llm::ToolChoice::Auto => Self {
+            agent_sdk_foundation::llm::ToolChoice::Auto => Self {
                 function_calling_config: ApiFunctionCallingMode {
                     mode: "AUTO".to_owned(),
                     allowed_function_names: None,
                 },
             },
-            agent_sdk_core::llm::ToolChoice::Tool(name) => Self {
+            agent_sdk_foundation::llm::ToolChoice::Tool(name) => Self {
                 function_calling_config: ApiFunctionCallingMode {
                     mode: "ANY".to_owned(),
                     allowed_function_names: Some(vec![name.clone()]),
@@ -171,9 +171,9 @@ pub struct ApiThinkingConfig {
 /// - `MEDIUM`: balanced
 /// - `HIGH`: maximum reasoning depth (default, dynamic)
 pub const fn map_thinking_config(
-    config: &agent_sdk_core::llm::ThinkingConfig,
+    config: &agent_sdk_foundation::llm::ThinkingConfig,
 ) -> ApiThinkingConfig {
-    use agent_sdk_core::llm::{Effort, ThinkingMode};
+    use agent_sdk_foundation::llm::{Effort, ThinkingMode};
     // If an explicit effort is set, use it directly
     if let Some(effort) = config.effort {
         let level = match effort {
@@ -312,7 +312,7 @@ impl ApiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
-pub fn build_api_contents(messages: &[agent_sdk_core::llm::Message]) -> Vec<ApiContent> {
+pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<ApiContent> {
     // Build a mapping of tool_use_id -> function_name from all messages
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -330,8 +330,8 @@ pub fn build_api_contents(messages: &[agent_sdk_core::llm::Message]) -> Vec<ApiC
 
     for msg in messages {
         let role = match msg.role {
-            agent_sdk_core::llm::Role::User => "user",
-            agent_sdk_core::llm::Role::Assistant => "model",
+            agent_sdk_foundation::llm::Role::User => "user",
+            agent_sdk_foundation::llm::Role::Assistant => "model",
         };
 
         let parts = match &msg.content {
@@ -415,7 +415,7 @@ pub fn build_api_contents(messages: &[agent_sdk_core::llm::Message]) -> Vec<ApiC
     contents
 }
 
-pub fn convert_tools_to_config(tools: Vec<agent_sdk_core::llm::Tool>) -> ApiToolConfig {
+pub fn convert_tools_to_config(tools: Vec<agent_sdk_foundation::llm::Tool>) -> ApiToolConfig {
     ApiToolConfig {
         function_declarations: tools
             .into_iter()
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_build_api_contents_simple() {
-        let messages = vec![agent_sdk_core::llm::Message::user("Hello")];
+        let messages = vec![agent_sdk_foundation::llm::Message::user("Hello")];
 
         let contents = build_api_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_build_api_contents_assistant() {
-        let messages = vec![agent_sdk_core::llm::Message::assistant("Hi there!")];
+        let messages = vec![agent_sdk_foundation::llm::Message::assistant("Hi there!")];
 
         let contents = build_api_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -949,12 +949,12 @@ mod tests {
 
     #[test]
     fn test_convert_tools_to_config() {
-        let tools = vec![agent_sdk_core::llm::Tool {
+        let tools = vec![agent_sdk_foundation::llm::Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             display_name: "Test Tool".to_string(),
-            tier: agent_sdk_core::ToolTier::Observe,
+            tier: agent_sdk_foundation::ToolTier::Observe,
         }];
 
         let api_tools = convert_tools_to_config(tools);

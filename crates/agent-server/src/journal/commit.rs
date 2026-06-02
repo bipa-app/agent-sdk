@@ -60,8 +60,8 @@
 //! - Task state transitions — the caller is responsible for calling
 //!   [`super::store::AgentTaskStore::complete_task`] separately.
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
@@ -332,7 +332,7 @@ mod tests {
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::InMemoryTurnAttemptStore;
     use super::*;
-    use agent_sdk_core::audit::AuditProvenance;
+    use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::Context;
     use time::Duration;
 
@@ -375,7 +375,7 @@ mod tests {
             }),
             response_id: Some("msg_01".into()),
             response_model: Some("claude-sonnet-4-5-20250929".into()),
-            stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
             outcome: TurnAttemptOutcome::Success,
             input_tokens: 100,
             output_tokens: 50,

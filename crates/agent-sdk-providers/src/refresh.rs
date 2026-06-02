@@ -51,7 +51,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -268,7 +268,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use agent_sdk_core::llm::{ChatResponse, ContentBlock, StopReason, Usage};
+    use agent_sdk_foundation::llm::{ChatResponse, ContentBlock, StopReason, Usage};
     use anyhow::Context;
 
     use crate::streaming::StreamErrorKind;

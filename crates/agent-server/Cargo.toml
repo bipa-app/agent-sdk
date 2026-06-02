@@ -10,7 +10,7 @@ description = "Server-side agent orchestration built on narrow SDK crates"
 publish = false
 
 [dependencies]
-agent-sdk-core = { workspace = true }
+agent-sdk-foundation = { workspace = true }
 agent-sdk-tools = { workspace = true }
 agent-sdk-providers = { workspace = true }
 # Pulled in for `agent_sdk::context::{CompactionConfig, ContextCompactor,

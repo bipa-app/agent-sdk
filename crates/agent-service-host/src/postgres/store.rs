@@ -14,8 +14,10 @@
 //! aggregate advance, message head/raw-batch write, and checkpoint
 //! insert into one SQL transaction.
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm,
+};
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -5263,8 +5265,8 @@ fn maybe_inject_failure(
 mod tests {
     use std::env;
 
-    use agent_sdk_core::audit::AuditProvenance;
-    use agent_sdk_core::events::AgentEvent;
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::events::AgentEvent;
     use anyhow::{Context, Result};
     use sqlx::Connection;
     use sqlx::PgConnection;
@@ -5306,7 +5308,7 @@ mod tests {
             response_blob: serde_json::json!({"id": "msg_pg_1"}),
             response_id: Some("msg_pg_1".into()),
             response_model: Some("claude-sonnet-4-5-20250929".into()),
-            stop_reason: Some(agent_sdk_core::llm::StopReason::EndTurn),
+            stop_reason: Some(agent_sdk_foundation::llm::StopReason::EndTurn),
             outcome: TurnAttemptOutcome::Success,
             input_tokens: 120,
             output_tokens: 60,

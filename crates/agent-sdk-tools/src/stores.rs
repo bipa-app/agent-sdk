@@ -13,9 +13,9 @@
 //! corresponding in-memory event journal. For production, implement custom
 //! stores backed by your database (e.g., Postgres, Redis).
 
-use agent_sdk_core::events::AgentEventEnvelope;
-use agent_sdk_core::llm;
-use agent_sdk_core::types::{AgentState, ThreadId, ToolExecution};
+use agent_sdk_foundation::events::AgentEventEnvelope;
+use agent_sdk_foundation::llm;
+use agent_sdk_foundation::types::{AgentState, ThreadId, ToolExecution};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -449,9 +449,9 @@ impl ToolExecutionStore for InMemoryExecutionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
-    use agent_sdk_core::llm::Message;
-    use agent_sdk_core::types::ToolResult;
+    use agent_sdk_foundation::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use agent_sdk_foundation::llm::Message;
+    use agent_sdk_foundation::types::ToolResult;
 
     #[tokio::test]
     async fn test_in_memory_message_store() -> Result<()> {

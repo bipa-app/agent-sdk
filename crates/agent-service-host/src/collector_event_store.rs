@@ -15,7 +15,7 @@
 //!
 //! [`CollectorEventStore`] bridges the two worlds:  it implements
 //! [`EventStore::append`] by unwrapping the envelope and pushing the
-//! inner [`AgentEvent`](agent_sdk_core::events::AgentEvent) into the
+//! inner [`AgentEvent`](agent_sdk_foundation::events::AgentEvent) into the
 //! collector; [`commit_tool_events`] re-wraps them with the worker's
 //! authoritative sequence numbers after the state transition commits.
 //!
@@ -30,8 +30,8 @@
 //! [`EventAuthority`]: agent_sdk_tools::EventAuthority
 //! [`commit_tool_events`]: agent_server::worker::tool_task
 
-use agent_sdk_core::events::AgentEventEnvelope;
-use agent_sdk_core::types::ThreadId;
+use agent_sdk_foundation::events::AgentEventEnvelope;
+use agent_sdk_foundation::types::ThreadId;
 use agent_sdk_tools::stores::{EventStore, StoredTurnEvents};
 use agent_server::worker::ToolEventCollector;
 use anyhow::Result;
@@ -97,7 +97,7 @@ impl EventStore for CollectorEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::events::{AgentEvent, SequenceCounter};
+    use agent_sdk_foundation::events::{AgentEvent, SequenceCounter};
 
     #[tokio::test]
     async fn append_forwards_event_to_collector() -> Result<()> {

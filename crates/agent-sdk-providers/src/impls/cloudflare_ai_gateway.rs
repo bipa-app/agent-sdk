@@ -51,7 +51,7 @@ use crate::impls::openai::OpenAIProvider;
 use crate::model_capabilities::ModelCapabilities;
 use crate::provider::LlmProvider;
 use crate::streaming::StreamBox;
-use agent_sdk_core::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
+use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ThinkingConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 

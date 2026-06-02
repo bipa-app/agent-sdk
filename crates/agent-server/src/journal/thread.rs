@@ -29,7 +29,7 @@
 //! durable rows serialize as `"active"` / `"completed"`, matching
 //! the `snake_case` convention every other journal enum follows.
 
-use agent_sdk_core::{ThreadId, TokenUsage};
+use agent_sdk_foundation::{ThreadId, TokenUsage};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

@@ -26,7 +26,7 @@
 //! ## Crate boundary
 //!
 //! ```text
-//! agent-sdk-core  (leaf types)
+//! agent-sdk-foundation  (leaf types)
 //!       ↑              ↑
 //! agent-sdk-tools   agent-sdk-providers
 //!       ↑      ↑         ↑        ↑

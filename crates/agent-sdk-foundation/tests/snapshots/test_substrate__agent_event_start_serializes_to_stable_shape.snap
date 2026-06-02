@@ -1,5 +1,5 @@
 ---
-source: crates/agent-sdk-core/tests/test_substrate.rs
+source: crates/agent-sdk-foundation/tests/test_substrate.rs
 expression: event
 ---
 {

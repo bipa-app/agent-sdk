@@ -20,11 +20,11 @@ use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_core::{
+use agent_sdk_foundation::{
     AgentContinuation, AgentState, PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, ToolTier,
     events::AgentEvent, llm,
 };
@@ -310,7 +310,7 @@ fn parent_suspension_payload(thread_id: &ThreadId) -> SuspensionPayload {
         listen_context: None,
     };
     SuspensionPayload {
-        continuation: agent_sdk_core::ContinuationEnvelope::wrap(AgentContinuation {
+        continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(AgentContinuation {
             thread_id: thread_id.clone(),
             turn: 1,
             total_usage: TokenUsage::default(),

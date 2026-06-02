@@ -50,7 +50,7 @@
 //! Consumers track their own per-thread cursor and ignore duplicate
 //! deliveries.  The relay is at-least-once by design.
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -54,7 +54,7 @@ use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use agent_sdk_core::ToolTier;
+use agent_sdk_foundation::ToolTier;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
 use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
@@ -981,7 +981,7 @@ async fn run_task_with_heartbeat(
 struct HeartbeatLoopParams {
     stores: StoreRegistry,
     task_id: agent_server::journal::task::AgentTaskId,
-    thread_id: agent_sdk_core::ThreadId,
+    thread_id: agent_sdk_foundation::ThreadId,
     worker_id: WorkerId,
     lease_id: LeaseId,
     lease_duration: time::Duration,
@@ -1321,7 +1321,7 @@ fn publish_events(stores: &StoreRegistry, events: &[CommittedEvent]) {
 
 async fn newly_committed_events(
     stores: &StoreRegistry,
-    thread_id: &agent_sdk_core::ThreadId,
+    thread_id: &agent_sdk_foundation::ThreadId,
     watermark: u64,
 ) -> Result<Vec<CommittedEvent>> {
     Ok(stores
@@ -1389,7 +1389,7 @@ mod tests {
     use crate::runtime::{
         AllowAllConfirmationPolicy, ExecutionRuntime, NoopToolExecutor, StaticProviderResolver,
     };
-    use agent_sdk_core::llm::{
+    use agent_sdk_foundation::llm::{
         ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
     };
     use agent_sdk_providers::LlmProvider;
@@ -1474,7 +1474,7 @@ mod tests {
     // ── root_task_user_input — gRPC binary inputs round-trip ────
 
     fn task_with_input(items: Vec<SubmittedInputItem>) -> AgentTask {
-        let thread_id = agent_sdk_core::ThreadId::from_string("t-image-input");
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("t-image-input");
         let now = time::OffsetDateTime::UNIX_EPOCH;
         let mut task = AgentTask::new_root_turn(thread_id, now, 3);
         task.submitted_input = items;
@@ -1505,11 +1505,11 @@ mod tests {
         assert_eq!(user_input.blocks().len(), 2);
         assert!(matches!(
             &user_input.blocks()[0],
-            agent_sdk_core::llm::ContentBlock::Text { text } if text == "what's in this picture?"
+            agent_sdk_foundation::llm::ContentBlock::Text { text } if text == "what's in this picture?"
         ));
         assert!(matches!(
             &user_input.blocks()[1],
-            agent_sdk_core::llm::ContentBlock::Image { source }
+            agent_sdk_foundation::llm::ContentBlock::Image { source }
                 if source.media_type == "image/png" && source.data == "AAAA"
         ));
 
@@ -1539,7 +1539,7 @@ mod tests {
         assert_eq!(user_input.blocks().len(), 2);
         assert!(matches!(
             &user_input.blocks()[1],
-            agent_sdk_core::llm::ContentBlock::Document { source }
+            agent_sdk_foundation::llm::ContentBlock::Document { source }
                 if source.media_type == "application/pdf" && source.data == "JVBERi0xLjQK"
         ));
         Ok(())
@@ -1707,7 +1707,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sweep_runs_at_least_once_before_shutdown() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         let config = ServiceConfig {
@@ -1766,7 +1766,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn worker_acquires_pending_task() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         let config = ServiceConfig {
@@ -1836,7 +1836,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_loop_extends_lease_until_cancelled() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         let config = ServiceConfig::default();
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_loop_exits_when_lease_is_lost() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         let config = ServiceConfig::default();
@@ -1993,7 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakeup_fallback_sweep_advances_work_without_consumer() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         // Enable the wakeup scheduler but do NOT enable the AMQP
@@ -2065,7 +2065,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakeup_handler_never_executes_but_nudges_worker() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::{
             JournalTaskWakeupHandler, TaskWakeupHandler, TaskWakeupOutcome, WakeupSignal,
             outbox_message::TaskWakeupPayload, task::AgentTask,
@@ -2125,7 +2125,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakeup_handler_rechecks_journal_between_deliveries() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::{
             JournalTaskWakeupHandler, TaskWakeupHandler, TaskWakeupOutcome, WakeupSignal,
             outbox_message::TaskWakeupPayload,
@@ -2196,7 +2196,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_wakeups_do_not_produce_duplicate_executions() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         // Acceptance criterion 3: flood the signal with many nudges
@@ -2278,7 +2278,7 @@ mod tests {
     async fn relay_enabled_drains_outbox_and_marks_layer_healthy() -> Result<()> {
         use crate::config::{BrokerConfig, RelayConfig};
         use crate::health::LatencyLayerHealth;
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::outbox::NewOutboxRow;
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
@@ -2469,7 +2469,7 @@ mod tests {
 
     #[tokio::test]
     async fn execution_continues_while_outbox_rows_accumulate() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::outbox::{NewOutboxRow, OutboxStatus};
         use agent_server::journal::outbox_message::{
             OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
@@ -2590,7 +2590,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_sweep_maintains_progress_during_broker_outage() -> Result<()> {
-        use agent_sdk_core::ThreadId;
+        use agent_sdk_foundation::ThreadId;
         use agent_server::journal::task::AgentTask;
 
         // AC4: fallback sweeps and same-instance behavior keep

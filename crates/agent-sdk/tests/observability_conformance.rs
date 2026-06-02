@@ -45,7 +45,7 @@ use agent_sdk::{
     InMemoryStore, MessageStore, RetryConfig, RunOptions, ThreadId, Tool, ToolContext,
     ToolRegistry, builder,
 };
-use agent_sdk_core::privacy::BaselineDetector;
+use agent_sdk_foundation::privacy::BaselineDetector;
 use agent_sdk_otel::{OtelConfig, SamplerKind, install_global_provider};
 use anyhow::{Context, Result};
 use async_trait::async_trait;

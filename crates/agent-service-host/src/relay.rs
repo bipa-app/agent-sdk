@@ -59,7 +59,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use agent_server::journal::broker::BrokerAdapter;
 use agent_server::journal::outbox::{OutboxRow, OutboxStore};
 use agent_server::journal::relay::{
@@ -647,7 +647,7 @@ impl RelayScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
     use agent_server::journal::broker::InMemoryBrokerAdapter;
     use agent_server::journal::outbox::{InMemoryOutboxStore, NewOutboxRow, OutboxStatus};
     use agent_server::journal::outbox_message::{

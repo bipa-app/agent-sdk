@@ -61,7 +61,7 @@ jobs:
       # crates carry no semver contract.
       - run: >-
           cargo semver-checks check-release
-          --package agent-sdk-core
+          --package agent-sdk-foundation
           --package agent-sdk-tools
           --package agent-sdk-providers
           --package agent-sdk
@@ -87,7 +87,7 @@ jobs:
       - name: Build publishable crates on MSRV
         run: >-
           cargo +${{ matrix.rust }} check --all-features
-          --package agent-sdk-core
+          --package agent-sdk-foundation
           --package agent-sdk-tools
           --package agent-sdk-providers
           --package agent-sdk
@@ -107,7 +107,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Package leaf crates (full verify)
         run: |
-          cargo package --package agent-sdk-core
+          cargo package --package agent-sdk-foundation
           cargo package --package agent-sdk-macros
       - name: Validate dependent crate manifests pack
         run: |

@@ -18,7 +18,7 @@ use crate::impls::gemini::data::{
 };
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
@@ -383,7 +383,7 @@ impl VertexProvider {
 
         let has_tool_calls = content
             .iter()
-            .any(|b| matches!(b, agent_sdk_core::llm::ContentBlock::ToolUse { .. }));
+            .any(|b| matches!(b, agent_sdk_foundation::llm::ContentBlock::ToolUse { .. }));
 
         let stop_reason = candidate
             .finish_reason
@@ -748,7 +748,7 @@ impl VertexProvider {
             let mut tool_ids: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut received_message_stop = false;
-            let mut pending_stop_reason: Option<agent_sdk_core::llm::StopReason> = None;
+            let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 let Ok(chunk) = chunk_result else {

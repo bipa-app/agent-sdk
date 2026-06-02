@@ -26,7 +26,7 @@ use crate::types::{
     AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolInvocation, ToolOutcome,
     ToolResult, ToolTier,
 };
-use agent_sdk_core::audit::{
+use agent_sdk_foundation::audit::{
     AuditProvenance, ToolAuditOutcome, ToolAuditRecord, ToolAuditRecordParams,
 };
 

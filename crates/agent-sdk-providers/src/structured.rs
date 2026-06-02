@@ -7,7 +7,7 @@
 //! # How it works
 //!
 //! 1. The caller supplies a [`ChatRequest`] whose
-//!    [`response_format`](agent_sdk_core::llm::ChatRequest::response_format) is
+//!    [`response_format`](agent_sdk_foundation::llm::ChatRequest::response_format) is
 //!    set, plus a [`StructuredConfig`] bounding the retries.
 //! 2. The runner inspects the provider's
 //!    [`structured_output_support`](crate::LlmProvider::structured_output_support):
@@ -28,10 +28,10 @@
 //! This mirrors the Claude SDK's `output_format` +
 //! `error_max_structured_output_retries` behaviour.
 
-use agent_sdk_core::llm::{
+use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, ResponseFormat, Tool, ToolChoice,
 };
-use agent_sdk_core::types::ToolTier;
+use agent_sdk_foundation::types::ToolTier;
 
 use crate::provider::{LlmProvider, StructuredOutputSupport};
 
@@ -75,7 +75,7 @@ pub struct StructuredOutput {
 #[derive(Debug, thiserror::Error)]
 pub enum StructuredOutputError {
     /// The request did not carry a
-    /// [`response_format`](agent_sdk_core::llm::ChatRequest::response_format).
+    /// [`response_format`](agent_sdk_foundation::llm::ChatRequest::response_format).
     #[error("structured output requested without a response_format on the request")]
     MissingResponseFormat,
 
@@ -116,7 +116,7 @@ pub enum StructuredOutputError {
 /// Run a bounded, schema-validated structured-output exchange against `provider`.
 ///
 /// The `request`'s
-/// [`response_format`](agent_sdk_core::llm::ChatRequest::response_format) must
+/// [`response_format`](agent_sdk_foundation::llm::ChatRequest::response_format) must
 /// be set; on success the returned [`StructuredOutput::value`] is guaranteed to
 /// satisfy that schema.
 ///
@@ -309,7 +309,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use agent_sdk_core::llm::{StopReason, Usage};
+    use agent_sdk_foundation::llm::{StopReason, Usage};
     use anyhow::Result;
     use async_trait::async_trait;
 

@@ -33,7 +33,7 @@ publish = false
 # stay at 0.8.0.
 
 [[package]]
-name = "agent-sdk-core"
+name = "agent-sdk-foundation"
 publish = true
 version_group = "agent-sdk"
 

@@ -57,7 +57,7 @@
 //!   submitting the history to a model. The journal preserves the
 //!   raw draft as captured at the last suspension.
 
-use agent_sdk_core::{ThreadId, llm};
+use agent_sdk_foundation::{ThreadId, llm};
 use anyhow::{Context, Result, bail};
 use time::OffsetDateTime;
 
@@ -290,8 +290,8 @@ mod tests {
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
     use super::super::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
     use super::*;
-    use agent_sdk_core::TokenUsage;
-    use agent_sdk_core::audit::AuditProvenance;
+    use agent_sdk_foundation::TokenUsage;
+    use agent_sdk_foundation::audit::AuditProvenance;
     use anyhow::Context;
     use time::{Duration, OffsetDateTime};
 

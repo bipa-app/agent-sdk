@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use agent_sdk_core::ToolResult;
+use agent_sdk_foundation::ToolResult;
 use agent_sdk_tools::seed::{
     DefaultContextFactory, ExecutionContextFactory, HostDependencies, ToolContextSeed,
 };
@@ -321,9 +321,9 @@ fn tool_context_seed(bootstrap: &ToolTaskBootstrap) -> Result<ToolContextSeed> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_sdk_core::ThreadId;
-    use agent_sdk_core::events::AgentEvent;
-    use agent_sdk_core::types::ToolTier;
+    use agent_sdk_foundation::ThreadId;
+    use agent_sdk_foundation::events::AgentEvent;
+    use agent_sdk_foundation::types::ToolTier;
     use agent_sdk_tools::tools::{DynamicToolName, Tool, ToolContext};
     use serde_json::{Value, json};
 

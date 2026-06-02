@@ -2,7 +2,7 @@
 //!
 //! This module provides the server-side audit surface for tool-call
 //! lifecycle transitions within the child-task model. Unlike the SDK's
-//! [`ToolAuditRecord`](agent_sdk_core::audit::ToolAuditRecord) (designed
+//! [`ToolAuditRecord`](agent_sdk_foundation::audit::ToolAuditRecord) (designed
 //! for the inline execution path), this audit surface tracks the
 //! **durable multi-step lifecycle** that tool calls go through in the
 //! server's child-task model:
@@ -28,7 +28,7 @@
 //! baseline redaction rules that should be applied before persisting
 //! audit events to durable storage.
 
-use agent_sdk_core::ThreadId;
+use agent_sdk_foundation::ThreadId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -598,7 +598,7 @@ impl ToolAuditEventStore for RedactingToolAuditEventStore {
 mod tests {
     use super::*;
     use crate::journal::task::AgentTaskId;
-    use agent_sdk_core::ThreadId;
+    use agent_sdk_foundation::ThreadId;
     use time::Duration;
 
     fn t0() -> OffsetDateTime {

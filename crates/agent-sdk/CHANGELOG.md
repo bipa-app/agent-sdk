@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(agent-sdk)* cancellation + message-lifecycle edge-case matrix (Phase 11 · C, ENG-8710) ([#259](https://github.com/bipa-app/agent-sdk/pull/259))
 - Phase 10 · A — Cancellation completeness: LLM/streaming/compaction + Cancelled event (ENG-8703) ([#256](https://github.com/bipa-app/agent-sdk/pull/256))
 - *(observability)* conformance + privacy integration tests (Phase 9 · F1, ENG-8305) ([#246](https://github.com/bipa-app/agent-sdk/pull/246))
-- *(privacy)* lift RedactionPolicy into agent-sdk-core (ENG-8286) ([#221](https://github.com/bipa-app/agent-sdk/pull/221))
+- *(privacy)* lift RedactionPolicy into agent-sdk-foundation (ENG-8286) ([#221](https://github.com/bipa-app/agent-sdk/pull/221))
 - *(observability)* add Phase 9 inventory & gap report (ENG-8285) ([#220](https://github.com/bipa-app/agent-sdk/pull/220))
 - *(loop)* run consecutive Observe-tier tool calls in parallel ([#201](https://github.com/bipa-app/agent-sdk/pull/201))
 - bumping old dependencies to free bipa main of duplicated stuff ([#200](https://github.com/bipa-app/agent-sdk/pull/200))

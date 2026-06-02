@@ -197,7 +197,7 @@ impl ChatRequest {
     /// settings on with the chainable `with_*` setters:
     ///
     /// ```
-    /// use agent_sdk_core::llm::{ChatRequest, Message, ToolChoice};
+    /// use agent_sdk_foundation::llm::{ChatRequest, Message, ToolChoice};
     ///
     /// let req = ChatRequest::new("You are helpful.", vec![Message::user("Hi")])
     ///     .with_max_tokens(1024)

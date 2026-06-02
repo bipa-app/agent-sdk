@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_sdk_core::{ThreadId, llm};
+use agent_sdk_foundation::{ThreadId, llm};
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;

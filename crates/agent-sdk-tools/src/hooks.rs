@@ -13,9 +13,9 @@
 //! - [`AllowAllHooks`] - Allow all tools without confirmation
 //! - [`LoggingHooks`] - Debug logging for all events
 
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::llm;
-use agent_sdk_core::types::{ToolInvocation, ToolResult, ToolTier};
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm;
+use agent_sdk_foundation::types::{ToolInvocation, ToolResult, ToolTier};
 use async_trait::async_trait;
 
 /// Decision returned by pre-tool hooks

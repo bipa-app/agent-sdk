@@ -1,6 +1,6 @@
 //! Instrumentation helpers called from agent loop code paths.
 
-use agent_sdk_core::privacy::{RedactionPolicy, redact_string};
+use agent_sdk_foundation::privacy::{RedactionPolicy, redact_string};
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span, TraceContextExt};
 use opentelemetry::{Context, KeyValue};

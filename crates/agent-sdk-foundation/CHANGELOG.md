@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-core-v0.1.0-alpha.3...agent-sdk-core-v0.9.0) - 2026-06-02
+## [0.9.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.1.0-alpha.3...agent-sdk-foundation-v0.9.0) - 2026-06-02
 
 ### Added
 
@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 12 · D — MIT relicense + governance + Bipa scrub + full-history secret scan (ENG-8716) ([#265](https://github.com/bipa-app/agent-sdk/pull/265))
 - Phase 10 · A — Cancellation completeness: LLM/streaming/compaction + Cancelled event (ENG-8703) ([#256](https://github.com/bipa-app/agent-sdk/pull/256))
 - Phase 11 · A — Test substrate & CI: nextest, Postgres-in-CI, proptest/start_paused/insta, failpoints (ENG-8708) ([#253](https://github.com/bipa-app/agent-sdk/pull/253))
-- *(privacy)* lift RedactionPolicy into agent-sdk-core (ENG-8286) ([#221](https://github.com/bipa-app/agent-sdk/pull/221))
+- *(privacy)* lift RedactionPolicy into agent-sdk-foundation (ENG-8286) ([#221](https://github.com/bipa-app/agent-sdk/pull/221))
 - Convert Agent SDK repo to private distribution ([#193](https://github.com/bipa-app/agent-sdk/pull/193))
 - summary-only parent subagent visibility ([#181](https://github.com/bipa-app/agent-sdk/pull/181))
 - add gRPC local daemon transport ([#169](https://github.com/bipa-app/agent-sdk/pull/169))

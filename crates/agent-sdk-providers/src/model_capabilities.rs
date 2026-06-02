@@ -1,4 +1,4 @@
-use agent_sdk_core::llm::Usage;
+use agent_sdk_foundation::llm::Usage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceStatus {

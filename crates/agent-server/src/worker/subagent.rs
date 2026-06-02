@@ -30,9 +30,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_sdk_core::audit::AuditProvenance;
-use agent_sdk_core::events::AgentEvent;
-use agent_sdk_core::{ThreadId, TokenUsage, ToolResult, ToolTier, llm};
+use agent_sdk_foundation::audit::AuditProvenance;
+use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::{ThreadId, TokenUsage, ToolResult, ToolTier, llm};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -1437,14 +1437,14 @@ pub struct SpawnedSubagentBatch {
 /// orphan child thread rows after partial materialization.
 fn validate_batch_spawns(
     spawns: &[SubagentInvocationSpawn],
-) -> Result<Vec<agent_sdk_core::PendingToolCallInfo>> {
+) -> Result<Vec<agent_sdk_foundation::PendingToolCallInfo>> {
     let pending_tool_count = spawns[0]
         .payload
         .continuation
         .payload
         .pending_tool_calls
         .len();
-    let mut pending_tools_by_entry: Vec<agent_sdk_core::PendingToolCallInfo> =
+    let mut pending_tools_by_entry: Vec<agent_sdk_foundation::PendingToolCallInfo> =
         Vec::with_capacity(spawns.len());
     for spawn in spawns {
         let spawn_index_usize =
@@ -1497,7 +1497,7 @@ struct BatchEntryAssembly<'a> {
     invocation_task: AgentTask,
     child_root_task: AgentTask,
     child_thread: Thread,
-    pending_tool: agent_sdk_core::PendingToolCallInfo,
+    pending_tool: agent_sdk_foundation::PendingToolCallInfo,
 }
 
 /// Verify the durable linkage on one batch entry and emit its
@@ -1802,7 +1802,7 @@ async fn commit_parent_subagent_progress_if_possible(
 fn pending_subagent_tool_call(
     parent: &AgentTask,
     spawn_index: u32,
-) -> Result<agent_sdk_core::PendingToolCallInfo> {
+) -> Result<agent_sdk_foundation::PendingToolCallInfo> {
     let spawn_index = usize::try_from(spawn_index).context("subagent spawn_index exceeds usize")?;
     let continuation = match &parent.state {
         crate::journal::task_state::TaskState::WaitingOnChildren { continuation, .. }
@@ -2002,7 +2002,7 @@ const fn default_subagent_depth() -> u32 {
 }
 
 fn ensure_confirm_tier_subagent_tool(
-    tool_call: &agent_sdk_core::PendingToolCallInfo,
+    tool_call: &agent_sdk_foundation::PendingToolCallInfo,
 ) -> Result<()> {
     ensure!(
         tool_call.tier == ToolTier::Confirm,

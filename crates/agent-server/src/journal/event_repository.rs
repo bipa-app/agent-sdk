@@ -8,7 +8,7 @@
 //!
 //! Workers submit raw [`AgentEvent`]s; the repository allocates
 //! metadata and persists the committed record atomically.  This
-//! replaces SDK-local [`SequenceCounter`](agent_sdk_core::events::SequenceCounter)
+//! replaces SDK-local [`SequenceCounter`](agent_sdk_foundation::events::SequenceCounter)
 //! semantics for the authoritative server path.
 //!
 //! # Ownership rule
@@ -27,8 +27,8 @@
 
 use super::committed_event::CommittedEvent;
 use super::event_outbox_transaction::AtomicEventOutboxCommitter;
-use agent_sdk_core::ThreadId;
-use agent_sdk_core::events::AgentEvent;
+use agent_sdk_foundation::ThreadId;
+use agent_sdk_foundation::events::AgentEvent;
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use std::collections::HashMap;

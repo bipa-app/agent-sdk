@@ -22,7 +22,7 @@ use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
     ContinuationEnvelope, ThreadId, TokenUsage, ToolResult, TurnOutcome, TurnSummary,
 };
-use agent_sdk_core::audit::AuditProvenance;
+use agent_sdk_foundation::audit::AuditProvenance;
 use log::warn;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ pub(super) async fn initialize_from_input<M, S>(
     state_store: &Arc<S>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: &agent_sdk_core::audit::AuditProvenance,
+    provenance: &agent_sdk_foundation::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentError>
 where
     M: MessageStore,
@@ -235,9 +235,9 @@ async fn initialize_from_tool_results<M: MessageStore>(
     message_store: &Arc<M>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: &agent_sdk_core::audit::AuditProvenance,
+    provenance: &agent_sdk_foundation::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentError> {
-    use agent_sdk_core::audit::ToolAuditOutcome;
+    use agent_sdk_foundation::audit::ToolAuditOutcome;
 
     if continuation.thread_id != *thread_id {
         return Err(AgentError::new(
@@ -420,13 +420,13 @@ async fn record_external_tool_execution(
 /// belt-and-braces guard and should be unreachable in practice.
 async fn emit_external_tool_audit(
     audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: &agent_sdk_core::audit::AuditProvenance,
+    provenance: &agent_sdk_foundation::audit::AuditProvenance,
     continuation: &AgentContinuation,
     tool_call_id: &str,
-    outcome: agent_sdk_core::audit::ToolAuditOutcome,
+    outcome: agent_sdk_foundation::audit::ToolAuditOutcome,
 ) {
     use crate::types::ToolTier;
-    use agent_sdk_core::audit::{ToolAuditRecord, ToolAuditRecordParams};
+    use agent_sdk_foundation::audit::{ToolAuditRecord, ToolAuditRecordParams};
 
     let pending = continuation
         .pending_tool_calls
@@ -856,7 +856,7 @@ async fn initialize_run_loop_state<M, S>(
     state_store: &Arc<S>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: &agent_sdk_core::audit::AuditProvenance,
+    provenance: &agent_sdk_foundation::audit::AuditProvenance,
 ) -> Result<InitializedState, AgentRunState>
 where
     M: MessageStore,
@@ -925,7 +925,7 @@ async fn initialize_single_turn_state<M, S>(
     state_store: &Arc<S>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
     audit_sink: &Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: &agent_sdk_core::audit::AuditProvenance,
+    provenance: &agent_sdk_foundation::audit::AuditProvenance,
 ) -> Result<InitializedState, TurnOutcome>
 where
     M: MessageStore,
@@ -1036,7 +1036,7 @@ struct TurnSummaryParts<'a> {
     total_usage: &'a TokenUsage,
     provenance: &'a AuditProvenance,
     response_id: Option<&'a str>,
-    stop_reason: Option<agent_sdk_core::llm::StopReason>,
+    stop_reason: Option<agent_sdk_foundation::llm::StopReason>,
     tool_call_count: usize,
     start_time: Instant,
     turn_options: &'a TurnOptions,
@@ -1907,7 +1907,7 @@ where
     let tool_context =
         apply_tool_boundary_controls(tool_context, &cancel_token, config.tool_timeout_ms);
     let provenance =
-        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
+        agent_sdk_foundation::audit::AuditProvenance::new(provider.provider(), provider.model());
     let start_time = Instant::now();
     #[cfg(feature = "otel")]
     let input_kind = crate::observability::attrs::input_kind_str(&input);
@@ -2140,7 +2140,7 @@ where
     // Build provenance early so we can include it in the summary even
     // when the turn is cancelled before the first LLM call.
     let provenance =
-        agent_sdk_core::audit::AuditProvenance::new(provider.provider(), provider.model());
+        agent_sdk_foundation::audit::AuditProvenance::new(provider.provider(), provider.model());
 
     // Check for cancellation before starting any work.
     if cancel_token.is_cancelled() {
@@ -2262,7 +2262,7 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
     audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
-    provenance: agent_sdk_core::audit::AuditProvenance,
+    provenance: agent_sdk_foundation::audit::AuditProvenance,
     turn_options: TurnOptions,
     cancel_token: CancellationToken,
     turn: usize,

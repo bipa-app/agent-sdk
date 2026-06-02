@@ -48,7 +48,7 @@ pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
 pub use structured::{StructuredConfig, StructuredOutput, StructuredOutputError, run_structured};
 
 // Re-export all core LLM types so consumers can `use agent_sdk_providers::*`
-pub use agent_sdk_core::llm::*;
+pub use agent_sdk_foundation::llm::*;
 
 // Provider re-exports — each is gated behind its provider feature.
 #[cfg(feature = "cloudflare")]

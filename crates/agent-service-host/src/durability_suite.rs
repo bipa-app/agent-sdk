@@ -41,8 +41,8 @@ mod tests {
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
-    use agent_sdk_core::events::AgentEvent;
-    use agent_sdk_core::{ThreadId, TokenUsage, llm};
+    use agent_sdk_foundation::events::AgentEvent;
+    use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::recovery::RecoveryAction;
     use agent_server::journal::store::AgentTaskStore;
@@ -113,8 +113,8 @@ mod tests {
 
     fn suspension_payload(thread: &ThreadId) -> SuspensionPayload {
         SuspensionPayload {
-            continuation: agent_sdk_core::ContinuationEnvelope::wrap(
-                agent_sdk_core::AgentContinuation {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
                     thread_id: thread.clone(),
                     turn: 2,
                     total_usage: TokenUsage::default(),
@@ -122,7 +122,7 @@ mod tests {
                     pending_tool_calls: vec![],
                     awaiting_index: 0,
                     completed_results: vec![],
-                    state: agent_sdk_core::AgentState::new(thread.clone()),
+                    state: agent_sdk_foundation::AgentState::new(thread.clone()),
                     response_id: None,
                     stop_reason: None,
                     response_content: vec![],
@@ -299,7 +299,7 @@ mod tests {
             .open_attempt(OpenAttemptParams {
                 task_id: task_id.clone(),
                 attempt_number,
-                provenance: agent_sdk_core::audit::AuditProvenance::new(
+                provenance: agent_sdk_foundation::audit::AuditProvenance::new(
                     "anthropic",
                     "claude-sonnet-4-5-20250929",
                 ),
