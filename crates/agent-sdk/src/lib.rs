@@ -697,12 +697,14 @@ pub mod advanced {
 ///
 /// `use agent_sdk::prelude::*;` brings the ~dozen names a newcomer needs:
 /// the [`builder`], configuration and I/O types, the [`Tool`] surface, the
-/// in-memory event store, the cancellation token, and the default
+/// in-memory event store, the cancellation token, and — when the `anthropic`
+/// feature is enabled (the default) — the
 /// [`AnthropicProvider`](crate::providers::AnthropicProvider). Server-only
 /// contract types are intentionally excluded — reach for [`crate::advanced`]
 /// when you need them.
 pub mod prelude {
     pub use crate::builder;
+    #[cfg(feature = "anthropic")]
     pub use crate::providers::AnthropicProvider;
     // `tool!` (declarative) plus the `Tool` / `TypedTool` / `ToolName` derives
     // ride along on the same-named trait re-exports below — importing the trait

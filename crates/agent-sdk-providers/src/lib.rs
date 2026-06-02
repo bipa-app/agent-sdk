@@ -18,6 +18,18 @@
 
 #![forbid(unsafe_code)]
 
+// The attachment-validation helpers are only ever called from a provider
+// impl (each gated behind its provider feature), so the whole module is dead
+// code when no provider is compiled in. Gate it on "any provider feature" to
+// keep `--no-default-features` builds warning- (and `-D warnings`-) clean.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "openai-codex",
+    feature = "gemini",
+    feature = "vertex",
+    feature = "cloudflare",
+))]
 pub mod attachments;
 pub mod impls;
 pub mod model_capabilities;

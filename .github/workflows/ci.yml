@@ -177,6 +177,37 @@ jobs:
       - run: cargo check -p agent-sdk --examples --all-features
 
   # ───────────────────────────────────────────────────────────────────
+  # Feature-matrix — non-default feature combos for the publishable crates.
+  #
+  # The main `check` job only builds `--all-features`, which hides
+  # re-exports / modules that aren't gated behind their provider feature.
+  # This matrix builds each publishable provider-bearing crate with no
+  # default features and then with exactly one provider feature on, so a
+  # consumer who picks a single provider (or none) still compiles. Keep
+  # the feature list in sync with the `[features]` sections of
+  # `crates/agent-sdk/Cargo.toml` and `crates/agent-sdk-providers/Cargo.toml`.
+  feature-matrix:
+    name: Feature matrix (${{ matrix.crate }} ${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agent-sdk, agent-sdk-providers]
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features anthropic"
+          - "--no-default-features --features openai"
+          - "--no-default-features --features openai-codex"
+          - "--no-default-features --features gemini"
+          - "--no-default-features --features vertex"
+          - "--no-default-features --features cloudflare"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p ${{ matrix.crate }} ${{ matrix.features }}
+
+  # ───────────────────────────────────────────────────────────────────
   # Tier-C provider live smoke — NIGHTLY / SECRETS ONLY.
   #
   # This is the *only* job that uses real provider API keys. It is gated
