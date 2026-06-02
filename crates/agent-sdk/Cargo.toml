@@ -96,7 +96,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 env_logger = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-agent-sdk-otel = { workspace = true }
+agent-sdk-otel = { path = "../agent-sdk-otel" }  # path-only (no version): breaks the otel<->agent-sdk publish cycle — cargo drops versionless dev-deps on publish
 # Compile-fail UI tests for the Phase 13·E derive macros. Lives here (not in
 # the proc-macro crate) because the generated code resolves `::agent_sdk::…`
 # paths, which only this crate can provide.
