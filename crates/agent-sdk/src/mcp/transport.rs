@@ -60,6 +60,44 @@ pub trait McpTransport: Send + Sync {
 /// Default response timeout for MCP requests (60 seconds).
 const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// Map of in-flight requests to the channel that delivers their response.
+///
+/// A `std::sync::Mutex` (not a `tokio::sync::Mutex`) is used deliberately: the
+/// critical sections are a single `HashMap` insert or remove and are never held
+/// across an `.await`. Keeping the lock synchronous lets [`PendingGuard`]'s
+/// `Drop` remove its entry without blocking inside an async context.
+type PendingMap = std::sync::Mutex<HashMap<RequestId, oneshot::Sender<JsonRpcResponse>>>;
+
+/// RAII guard that removes a pending-request entry on drop.
+///
+/// The `send` path inserts a `oneshot::Sender` into the `pending` map before
+/// writing the request, then awaits the matching response with a timeout. If
+/// the future returns early for *any* reason — timeout, the response channel
+/// closing, or the task being cancelled/dropped mid-await — the entry would
+/// otherwise leak. For a server that times out frequently this grows the map
+/// without bound and eventually OOMs a long-lived host (ENG-8736).
+///
+/// Holding this guard for the duration of the await guarantees the entry is
+/// removed on every exit path. On the success path the reader task has already
+/// removed the entry by the time the guard drops, so the removal is a harmless
+/// no-op.
+struct PendingGuard<'a> {
+    pending: &'a PendingMap,
+    request_id: RequestId,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock means a prior holder panicked while mutating the map;
+        // recover the guard and still remove our entry so it cannot leak.
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(&self.request_id);
+    }
+}
+
 /// Stdio transport for MCP servers.
 ///
 /// Spawns a subprocess and communicates via stdin/stdout using JSON-RPC.
@@ -67,7 +105,7 @@ pub struct StdioTransport {
     /// Request ID counter.
     next_id: AtomicU64,
     /// Pending requests awaiting responses.
-    pending: Mutex<HashMap<RequestId, oneshot::Sender<JsonRpcResponse>>>,
+    pending: PendingMap,
     /// Writer to send requests.
     writer: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
     /// Child process handle.
@@ -102,7 +140,7 @@ impl StdioTransport {
 
         let transport = Arc::new(Self {
             next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(HashMap::new()),
             writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
             _child: Arc::new(Mutex::new(child)),
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
@@ -129,8 +167,14 @@ impl StdioTransport {
                             continue;
                         }
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
-                            let mut pending = transport_clone.pending.lock().await;
-                            if let Some(sender) = pending.remove(&response.id) {
+                            let sender = {
+                                let mut pending = match transport_clone.pending.lock() {
+                                    Ok(pending) => pending,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                pending.remove(&response.id)
+                            };
+                            if let Some(sender) = sender {
                                 let _ = sender.send(response);
                             }
                         }
@@ -174,7 +218,7 @@ impl StdioTransport {
 
         let transport = Arc::new(Self {
             next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(HashMap::new()),
             writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
             _child: Arc::new(Mutex::new(child)),
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
@@ -201,8 +245,14 @@ impl StdioTransport {
                             continue;
                         }
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
-                            let mut pending = transport_clone.pending.lock().await;
-                            if let Some(sender) = pending.remove(&response.id) {
+                            let sender = {
+                                let mut pending = match transport_clone.pending.lock() {
+                                    Ok(pending) => pending,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                pending.remove(&response.id)
+                            };
+                            if let Some(sender) = sender {
                                 let _ = sender.send(response);
                             }
                         }
@@ -218,6 +268,78 @@ impl StdioTransport {
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Number of in-flight requests still registered in the pending map.
+    ///
+    /// Test-only accessor used to assert the map does not grow unbounded when
+    /// requests time out (ENG-8736).
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Spawn a transport with a custom response timeout.
+    ///
+    /// Test-only helper so timeout behaviour can be exercised deterministically
+    /// without waiting for the production 60s default.
+    #[cfg(test)]
+    fn spawn_with_timeout(
+        command: &str,
+        args: &[&str],
+        response_timeout: std::time::Duration,
+    ) -> Result<Arc<Self>> {
+        let mut child = Command::new(command)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("Failed to spawn MCP server: {command}"))?;
+
+        let stdin = child.stdin.take().context("Failed to get stdin")?;
+        let stdout = child.stdout.take().context("Failed to get stdout")?;
+
+        let transport = Arc::new(Self {
+            next_id: AtomicU64::new(1),
+            pending: std::sync::Mutex::new(HashMap::new()),
+            writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
+            _child: Arc::new(Mutex::new(child)),
+            response_timeout,
+        });
+
+        let transport_clone = Arc::clone(&transport);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
+                            let sender = {
+                                let mut pending = match transport_clone.pending.lock() {
+                                    Ok(pending) => pending,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                pending.remove(&response.id)
+                            };
+                            if let Some(sender) = sender {
+                                let _ = sender.send(response);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(transport)
+    }
 }
 
 #[async_trait]
@@ -230,9 +352,21 @@ impl McpTransport for StdioTransport {
         // Create response channel
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.insert(request.id.clone(), tx);
         }
+
+        // From here on, this guard removes the pending entry on every exit
+        // path — timeout, channel-closed, JSON-RPC error, or this future being
+        // cancelled/dropped mid-await. Without it the entry leaks and the map
+        // grows unbounded for a server that times out frequently (ENG-8736).
+        let _pending_guard = PendingGuard {
+            pending: &self.pending,
+            request_id: request.id.clone(),
+        };
 
         // Send request
         let json = serde_json::to_string(&request)?;
@@ -279,6 +413,7 @@ impl McpTransport for StdioTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
     fn test_request_id_generation() {
@@ -286,5 +421,48 @@ mod tests {
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 1);
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 2);
         assert_eq!(next_id.fetch_add(1, Ordering::SeqCst), 3);
+    }
+
+    /// Regression test for ENG-8736: a server that never replies must not leak
+    /// pending-request entries on timeout. We spawn a child that drains stdin
+    /// to `/dev/null` and never writes to stdout, so every `send` hits the
+    /// timeout branch. After N timed-out requests the pending map must be empty
+    /// — without the [`PendingGuard`] it would hold N stale senders and grow
+    /// without bound, eventually exhausting the memory of a long-lived host.
+    #[tokio::test]
+    async fn timed_out_requests_do_not_leak_pending_entries() -> Result<()> {
+        const N: usize = 8;
+
+        // `cat > /dev/null` accepts everything written to stdin and emits
+        // nothing on stdout, guaranteeing a timeout on every request.
+        let transport = StdioTransport::spawn_with_timeout(
+            "sh",
+            &["-c", "cat > /dev/null"],
+            std::time::Duration::from_millis(50),
+        )?;
+
+        ensure!(
+            transport.pending_len() == 0,
+            "pending map should start empty"
+        );
+
+        for _ in 0..N {
+            let request = JsonRpcRequest::new("tools/list", None, 0);
+            let result = transport.send(request).await;
+            ensure!(
+                result.is_err(),
+                "request should time out when the server never replies"
+            );
+        }
+
+        // The leak would manifest here: each timed-out request would leave its
+        // sender behind. With the guard, every exit path removes the entry.
+        ensure!(
+            transport.pending_len() == 0,
+            "pending map must be empty after {N} timeouts, found {} stale entries",
+            transport.pending_len(),
+        );
+
+        Ok(())
     }
 }
