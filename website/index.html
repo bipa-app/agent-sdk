@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>agent-sdk &mdash; Durable agent loops in Rust</title>
+  <meta name="description" content="agent-sdk is an open-source Rust SDK for building durable, crash-safe agent loops: mid-turn cancellation with balanced history, append-only journals, multi-provider LLMs, typed tools, MCP, and a durable Postgres/SQLite serving host." />
+  <meta name="color-scheme" content="dark" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="agent-sdk &mdash; Durable agent loops in Rust" />
+  <meta property="og:description" content="A Temporal-grade backend for agent loops in Rust. Crash-safe durable execution, multi-provider, MCP, typed tools, structured output." />
+  <meta property="og:url" content="https://github.com/bipa-app/agent-sdk" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            rust: {
+              50: '#fbf3ec',
+              100: '#f6e2d2',
+              200: '#ecc1a0',
+              300: '#e09a68',
+              400: '#d97f43',
+              500: '#ce6c2c',
+              600: '#b85420',
+              700: '#9a3f1c',
+              800: '#7c331c',
+              900: '#662c1b',
+            },
+            ink: {
+              950: '#0a0805',
+              900: '#0f0c08',
+              850: '#15110b',
+              800: '#1b160f',
+              700: '#272015',
+              600: '#3a3022',
+            },
+          },
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
+            sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'sans-serif'],
+          },
+        },
+      },
+    };
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --glow-rust: rgba(206, 108, 44, 0.16);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background-color: #0a0805;
+      background-image:
+        radial-gradient(900px circle at 12% -8%, var(--glow-rust), transparent 55%),
+        radial-gradient(700px circle at 88% 4%, rgba(154, 63, 28, 0.12), transparent 50%);
+      background-attachment: fixed;
+    }
+
+    /* Subtle grid texture for the rust-flavored backdrop */
+    .grid-texture::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(to right, rgba(206, 108, 44, 0.045) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(206, 108, 44, 0.045) 1px, transparent 1px);
+      background-size: 56px 56px;
+      -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black, transparent 75%);
+      mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black, transparent 75%);
+      pointer-events: none;
+    }
+
+    .text-gradient {
+      background: linear-gradient(120deg, #f6e2d2 0%, #e09a68 45%, #ce6c2c 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .card {
+      background: linear-gradient(160deg, rgba(27, 22, 15, 0.85), rgba(15, 12, 8, 0.7));
+      border: 1px solid rgba(206, 108, 44, 0.12);
+      transition: border-color 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
+    }
+    .card:hover {
+      border-color: rgba(217, 127, 67, 0.4);
+      transform: translateY(-3px);
+      box-shadow: 0 18px 40px -24px rgba(206, 108, 44, 0.55);
+    }
+
+    .install-line {
+      background: linear-gradient(160deg, rgba(27, 22, 15, 0.95), rgba(10, 8, 5, 0.9));
+      border: 1px solid rgba(206, 108, 44, 0.22);
+    }
+
+    .code-panel {
+      background: #0c0a07;
+      border: 1px solid rgba(206, 108, 44, 0.16);
+    }
+
+    pre, code { font-feature-settings: "calt" 1; }
+    pre { tab-size: 2; }
+
+    /* Lightweight syntax highlight tokens */
+    .tok-kw  { color: #e09a68; }
+    .tok-fn  { color: #f6c98a; }
+    .tok-str { color: #b9c98a; }
+    .tok-ty  { color: #6fb3c4; }
+    .tok-com { color: #6b5e4c; font-style: italic; }
+    .tok-mac { color: #d97f43; }
+    .tok-num { color: #cf9f6b; }
+
+    .copy-btn { transition: background-color 0.2s ease, color 0.2s ease; }
+
+    :focus-visible {
+      outline: 2px solid #e09a68;
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .card { transition: none; }
+      .card:hover { transform: none; }
+    }
+  </style>
+</head>
+
+<body class="font-sans text-ink-50 antialiased selection:bg-rust-500/30">
+  <a href="#quickstart" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-rust-600 focus:px-4 focus:py-2 focus:text-white">
+    Skip to quickstart
+  </a>
+
+  <!-- ============================ NAV ============================ -->
+  <header class="sticky top-0 z-40 border-b border-rust-500/10 bg-ink-950/70 backdrop-blur-md">
+    <nav class="mx-auto flex max-w-6xl items-center justify-between px-5 py-4" aria-label="Primary">
+      <a href="#top" class="flex items-center gap-2.5 font-mono text-sm font-bold tracking-tight text-stone-100">
+        <span aria-hidden="true" class="flex h-7 w-7 items-center justify-center rounded-md bg-rust-600/20 text-rust-300 ring-1 ring-rust-500/30">&#9881;</span>
+        agent-sdk
+      </a>
+      <div class="hidden items-center gap-7 text-sm text-stone-400 md:flex">
+        <a href="#features" class="transition hover:text-rust-300">Features</a>
+        <a href="#quickstart" class="transition hover:text-rust-300">Quickstart</a>
+        <a href="#durability" class="transition hover:text-rust-300">Durability</a>
+        <a href="https://docs.rs/agent-sdk" class="transition hover:text-rust-300">Docs</a>
+      </div>
+      <a href="https://github.com/bipa-app/agent-sdk"
+         class="inline-flex items-center gap-2 rounded-lg border border-rust-500/30 bg-rust-600/10 px-3.5 py-1.5 text-sm font-medium text-rust-200 transition hover:bg-rust-600/20 hover:text-white">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/>
+        </svg>
+        GitHub
+      </a>
+    </nav>
+  </header>
+
+  <!-- ============================ HERO ============================ -->
+  <main id="top">
+    <section class="grid-texture relative overflow-hidden">
+      <div class="relative mx-auto max-w-5xl px-5 pb-16 pt-20 text-center sm:pt-28">
+        <span class="mb-6 inline-flex items-center gap-2 rounded-full border border-rust-500/25 bg-rust-600/10 px-4 py-1.5 text-xs font-medium uppercase tracking-wider text-rust-200">
+          <span class="relative flex h-2 w-2" aria-hidden="true">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-rust-400 opacity-60"></span>
+            <span class="relative inline-flex h-2 w-2 rounded-full bg-rust-400"></span>
+          </span>
+          v0.9 &middot; Technical preview
+        </span>
+
+        <h1 class="mx-auto max-w-3xl text-4xl font-extrabold leading-[1.07] tracking-tight text-stone-50 sm:text-6xl">
+          Durable agent loops <span class="text-gradient">in Rust</span>
+        </h1>
+
+        <p class="mx-auto mt-6 max-w-2xl text-lg leading-relaxed text-stone-400">
+          A crash-safe foundation for LLM agents &mdash; mid-turn cancellation with balanced
+          tool-use history, append-only journals that persist <em class="not-italic text-stone-200">and</em> replay,
+          single-writer-per-thread leases, and a durable gRPC + Postgres/SQLite serving host.
+          A Temporal-grade backend for agent loops.
+        </p>
+
+        <!-- Install line -->
+        <div class="mx-auto mt-9 flex max-w-md flex-col items-stretch gap-3">
+          <div class="install-line flex items-center justify-between gap-3 rounded-xl px-4 py-3.5 text-left shadow-lg shadow-black/40">
+            <code class="select-all font-mono text-sm text-stone-200">
+              <span class="text-rust-300" aria-hidden="true">$</span> cargo add agent-sdk
+            </code>
+            <button type="button"
+                    class="copy-btn shrink-0 rounded-md border border-rust-500/25 bg-rust-600/10 px-2.5 py-1 font-mono text-xs text-rust-200 hover:bg-rust-600/25 hover:text-white"
+                    data-copy="cargo add agent-sdk"
+                    aria-label="Copy install command">
+              copy
+            </button>
+          </div>
+          <p class="font-mono text-xs text-stone-500">
+            Rust 2024 &middot; MSRV 1.91 &middot; default feature: <span class="text-stone-400">anthropic</span>
+          </p>
+        </div>
+
+        <!-- CTAs -->
+        <div class="mt-9 flex flex-wrap items-center justify-center gap-3">
+          <a href="#quickstart"
+             class="rounded-lg bg-rust-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-rust-900/40 transition hover:bg-rust-500">
+            Read the quickstart
+          </a>
+          <a href="https://github.com/bipa-app/agent-sdk"
+             class="rounded-lg border border-stone-700 bg-ink-800/60 px-5 py-2.5 text-sm font-semibold text-stone-200 transition hover:border-rust-500/40 hover:text-white">
+            Star on GitHub
+          </a>
+        </div>
+
+        <p class="mx-auto mt-8 max-w-xl text-xs leading-relaxed text-stone-600">
+          Open-source under MIT &middot; developed in the open and hardening toward production.
+          Not yet battle-tested &mdash; expect pre-1.0 breaking changes.
+        </p>
+      </div>
+    </section>
+
+    <!-- ============================ FEATURES ============================ -->
+    <section id="features" class="mx-auto max-w-6xl px-5 py-16 sm:py-20" aria-labelledby="features-heading">
+      <div class="mx-auto max-w-2xl text-center">
+        <h2 id="features-heading" class="text-3xl font-bold tracking-tight text-stone-50 sm:text-4xl">
+          Built for the hard parts
+        </h2>
+        <p class="mt-4 text-stone-400">
+          The agent loop is easy to prototype and brutal to make reliable. agent-sdk owns the
+          harness so your tools and prompts stay simple.
+        </p>
+      </div>
+
+      <div class="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+        <!-- Durable execution -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#128274;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Crash-safe durable execution</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            Append-only event journal per thread, write-ahead tool-execution intents, and state
+            checkpoints at every turn boundary. Cancel mid-turn and the SDK keeps
+            <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">tool_use</code> /
+            <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">tool_result</code> history balanced.
+          </p>
+        </article>
+
+        <!-- Multi-provider -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#127760;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Multi-provider LLMs</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            One <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">LlmProvider</code> trait,
+            many backends: Anthropic, OpenAI, Gemini, Vertex AI, and Cloudflare &mdash; each behind a
+            Cargo feature, with streaming and extended-thinking support.
+          </p>
+        </article>
+
+        <!-- MCP -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#128268;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Model Context Protocol</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            Connect MCP servers over local stdio subprocesses or remote streamable-HTTP / SSE.
+            Discover tools and resources, then register them straight into your
+            <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">ToolRegistry</code>.
+            <span class="mt-1 block font-mono text-[11px] text-stone-600">feature = "mcp"</span>
+          </p>
+        </article>
+
+        <!-- Typed tools -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#129683;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Typed tools &amp; tiers</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            Implement <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">TypedTool</code>
+            for validated, deserialized input &mdash; malformed args become a self-correction result, not a crash.
+            Mark a tool <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">Confirm</code>
+            for human-in-the-loop, or derive it with <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">#[derive(Tool)]</code>.
+          </p>
+        </article>
+
+        <!-- Structured output -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#129518;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Structured output</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            Get schema-valid JSON back from any provider &mdash; native JSON mode where supported,
+            or a forced <code class="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-xs text-rust-200">respond</code> tool as fallback &mdash;
+            validated and re-prompted on mismatch.
+          </p>
+        </article>
+
+        <!-- Serving host -->
+        <article class="card rounded-2xl p-6">
+          <div class="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-rust-600/15 text-xl text-rust-300 ring-1 ring-rust-500/20" aria-hidden="true">&#127959;&#65039;</div>
+          <h3 class="text-lg font-semibold text-stone-100">Durable serving host</h3>
+          <p class="mt-2 text-sm leading-relaxed text-stone-400">
+            A gRPC service host backed by Postgres or SQLite: task journal, thread &amp; message
+            projections, turn attempts, checkpoints, transactional outbox, and lease-based workers
+            that recover after a crash.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ============================ QUICKSTART ============================ -->
+    <section id="quickstart" class="border-y border-rust-500/10 bg-ink-900/50">
+      <div class="mx-auto max-w-5xl px-5 py-16 sm:py-20" aria-labelledby="quickstart-heading">
+        <div class="mx-auto max-w-2xl text-center">
+          <h2 id="quickstart-heading" class="text-3xl font-bold tracking-tight text-stone-50 sm:text-4xl">
+            Your first agent
+          </h2>
+          <p class="mt-4 text-stone-400">
+            Build the loop, register a typed tool, and ask a question. Persistence,
+            cancellation, and tool dispatch are handled for you.
+          </p>
+        </div>
+
+        <div class="code-panel mx-auto mt-10 max-w-3xl overflow-hidden rounded-2xl shadow-2xl shadow-black/50">
+          <!-- panel header -->
+          <div class="flex items-center justify-between border-b border-rust-500/10 bg-ink-850/80 px-4 py-2.5">
+            <div class="flex items-center gap-3">
+              <div class="flex gap-1.5" aria-hidden="true">
+                <span class="h-3 w-3 rounded-full bg-rust-700/70"></span>
+                <span class="h-3 w-3 rounded-full bg-rust-500/60"></span>
+                <span class="h-3 w-3 rounded-full bg-rust-300/50"></span>
+              </div>
+              <span class="font-mono text-xs text-stone-500">src/main.rs</span>
+            </div>
+            <button type="button"
+                    class="copy-btn rounded-md border border-rust-500/20 bg-rust-600/10 px-2.5 py-1 font-mono text-xs text-rust-200 hover:bg-rust-600/25 hover:text-white"
+                    data-copy-target="quickstart-code"
+                    aria-label="Copy quickstart code">
+              copy
+            </button>
+          </div>
+
+          <!-- code -->
+          <div class="overflow-x-auto">
+<pre class="px-5 py-5 font-mono text-[13px] leading-relaxed text-stone-300"><code id="quickstart-code"><span class="tok-kw">use</span> agent_sdk::prelude::*;
+<span class="tok-kw">use</span> agent_sdk::<span class="tok-ty">ThreadId</span>;
+<span class="tok-kw">use</span> serde::{Deserialize, Serialize};
+<span class="tok-kw">use</span> serde_json::json;
+
+<span class="tok-com">// A typed tool: input is validated before `execute` runs.</span>
+<span class="tok-attr tok-com">#[derive(Debug, Serialize, Deserialize)]</span>
+<span class="tok-kw">struct</span> <span class="tok-ty">WeatherArgs</span> { city: <span class="tok-ty">String</span> }
+
+<span class="tok-kw">struct</span> <span class="tok-ty">WeatherTool</span>;
+
+<span class="tok-kw">impl</span> <span class="tok-ty">TypedTool</span>&lt;()&gt; <span class="tok-kw">for</span> <span class="tok-ty">WeatherTool</span> {
+    <span class="tok-kw">type</span> Input = <span class="tok-ty">WeatherArgs</span>;
+
+    <span class="tok-kw">fn</span> <span class="tok-fn">name</span>(&amp;<span class="tok-kw">self</span>) -&gt; &amp;<span class="tok-kw">'static</span> <span class="tok-ty">str</span> { <span class="tok-str">"get_weather"</span> }
+    <span class="tok-kw">fn</span> <span class="tok-fn">display_name</span>(&amp;<span class="tok-kw">self</span>) -&gt; &amp;<span class="tok-kw">'static</span> <span class="tok-ty">str</span> { <span class="tok-str">"Weather"</span> }
+    <span class="tok-kw">fn</span> <span class="tok-fn">description</span>(&amp;<span class="tok-kw">self</span>) -&gt; &amp;<span class="tok-kw">'static</span> <span class="tok-ty">str</span> {
+        <span class="tok-str">"Get the current weather for a city."</span>
+    }
+    <span class="tok-kw">fn</span> <span class="tok-fn">input_schema</span>(&amp;<span class="tok-kw">self</span>) -&gt; serde_json::<span class="tok-ty">Value</span> {
+        <span class="tok-mac">json!</span>({
+            <span class="tok-str">"type"</span>: <span class="tok-str">"object"</span>,
+            <span class="tok-str">"properties"</span>: { <span class="tok-str">"city"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"string"</span> } },
+            <span class="tok-str">"required"</span>: [<span class="tok-str">"city"</span>]
+        })
+    }
+    <span class="tok-kw">fn</span> <span class="tok-fn">tier</span>(&amp;<span class="tok-kw">self</span>) -&gt; <span class="tok-ty">ToolTier</span> { <span class="tok-ty">ToolTier</span>::Observe }
+
+    <span class="tok-kw">async fn</span> <span class="tok-fn">execute</span>(
+        &amp;<span class="tok-kw">self</span>,
+        _ctx: &amp;<span class="tok-ty">ToolContext</span>&lt;()&gt;,
+        input: <span class="tok-ty">WeatherArgs</span>,
+    ) -&gt; anyhow::<span class="tok-ty">Result</span>&lt;<span class="tok-ty">ToolResult</span>&gt; {
+        <span class="tok-ty">Ok</span>(<span class="tok-ty">ToolResult</span>::<span class="tok-fn">success</span>(<span class="tok-mac">format!</span>(
+            <span class="tok-str">"{}: 18&deg;C, light rain"</span>, input.city
+        )))
+    }
+}
+
+<span class="tok-attr tok-com">#[tokio::main]</span>
+<span class="tok-kw">async fn</span> <span class="tok-fn">main</span>() -&gt; anyhow::<span class="tok-ty">Result</span>&lt;()&gt; {
+    <span class="tok-kw">let mut</span> tools = <span class="tok-ty">ToolRegistry</span>::<span class="tok-fn">new</span>();
+    tools.<span class="tok-fn">register_typed</span>(<span class="tok-ty">WeatherTool</span>);
+
+    <span class="tok-com">// Reads ANTHROPIC_API_KEY from the environment.</span>
+    <span class="tok-kw">let</span> agent = <span class="tok-fn">builder</span>::&lt;()&gt;()
+        .<span class="tok-fn">provider</span>(<span class="tok-ty">AnthropicProvider</span>::<span class="tok-fn">try_from_env</span>()?)
+        .<span class="tok-fn">tools</span>(tools)
+        .<span class="tok-fn">build</span>();
+
+    <span class="tok-kw">let</span> answer = agent
+        .<span class="tok-fn">ask</span>(<span class="tok-ty">ThreadId</span>::<span class="tok-fn">new</span>(), <span class="tok-str">"What's the weather in Lisbon?"</span>)
+        .<span class="tok-kw">await</span>?;
+
+    <span class="tok-mac">println!</span>(<span class="tok-str">"{answer}"</span>);
+    <span class="tok-ty">Ok</span>(())
+}</code></pre>
+          </div>
+        </div>
+
+        <p class="mx-auto mt-6 max-w-3xl text-center text-sm text-stone-500">
+          Prefer full control? Use
+          <code class="rounded bg-ink-700/70 px-1.5 py-0.5 font-mono text-xs text-rust-200">agent.run_turn(..)</code>
+          for the streaming run-loop, or
+          <code class="rounded bg-ink-700/70 px-1.5 py-0.5 font-mono text-xs text-rust-200">agent.ask(thread_id, input)</code>
+          for a single turn when full control over application context or cancellation isn't needed.
+        </p>
+      </div>
+    </section>
+
+    <!-- ============================ DURABILITY STRIP ============================ -->
+    <section id="durability" class="mx-auto max-w-6xl px-5 py-16 sm:py-20" aria-labelledby="durability-heading">
+      <div class="mx-auto max-w-2xl text-center">
+        <h2 id="durability-heading" class="text-3xl font-bold tracking-tight text-stone-50 sm:text-4xl">
+          The durability story
+        </h2>
+        <p class="mt-4 text-stone-400">
+          Three storage layers and a single-writer-per-thread contract turn a fragile loop
+          into one that survives process restarts.
+        </p>
+      </div>
+
+      <dl class="mt-12 grid gap-5 md:grid-cols-3">
+        <div class="card rounded-2xl p-6">
+          <dt class="font-mono text-sm font-semibold text-rust-300">Append-only journal</dt>
+          <dd class="mt-2 text-sm leading-relaxed text-stone-400">
+            Every turn writes an ordered <code class="font-mono text-xs text-rust-200">AgentEvent</code> stream
+            that replays without gaps or duplicates &mdash; even with a producer committing during replay.
+          </dd>
+        </div>
+        <div class="card rounded-2xl p-6">
+          <dt class="font-mono text-sm font-semibold text-rust-300">Write-ahead tool intents</dt>
+          <dd class="mt-2 text-sm leading-relaxed text-stone-400">
+            Tool intent is recorded before execution and the result cached after. Crash in between?
+            The retry is idempotent &mdash; the result is already there.
+          </dd>
+        </div>
+        <div class="card rounded-2xl p-6">
+          <dt class="font-mono text-sm font-semibold text-rust-300">Leases &amp; heartbeats</dt>
+          <dd class="mt-2 text-sm leading-relaxed text-stone-400">
+            One writer per thread, enforced by leases. If a worker vanishes, expiry sweeps requeue
+            its work &mdash; no orphaned turns, no double-counting.
+          </dd>
+        </div>
+      </dl>
+
+      <p class="mx-auto mt-10 max-w-3xl text-center text-xs leading-relaxed text-stone-600">
+        Honest about maturity: the local agent loop and the durable journal are well-tested
+        (including seeded deterministic-simulation fault injection), while transports and
+        multi-instance operation are still hardening. This is a 0.9 technical preview.
+      </p>
+    </section>
+  </main>
+
+  <!-- ============================ FOOTER ============================ -->
+  <footer class="border-t border-rust-500/10 bg-ink-950/80">
+    <div class="mx-auto max-w-6xl px-5 py-12">
+      <div class="flex flex-col items-start justify-between gap-8 md:flex-row md:items-center">
+        <div>
+          <div class="flex items-center gap-2.5 font-mono text-sm font-bold text-stone-100">
+            <span aria-hidden="true" class="flex h-7 w-7 items-center justify-center rounded-md bg-rust-600/20 text-rust-300 ring-1 ring-rust-500/30">&#9881;</span>
+            agent-sdk
+          </div>
+          <p class="mt-3 max-w-sm text-sm text-stone-500">
+            Durable, crash-safe agent loops in Rust. Open-source under the MIT license.
+          </p>
+        </div>
+
+        <nav class="flex flex-wrap gap-x-10 gap-y-6" aria-label="Footer">
+          <div>
+            <h3 class="font-mono text-xs uppercase tracking-wider text-stone-600">Project</h3>
+            <ul class="mt-3 space-y-2 text-sm">
+              <li><a href="https://github.com/bipa-app/agent-sdk" class="text-stone-400 transition hover:text-rust-300">GitHub</a></li>
+              <li><a href="https://docs.rs/agent-sdk" class="text-stone-400 transition hover:text-rust-300">docs.rs</a></li>
+              <li><a href="https://github.com/bipa-app/agent-sdk/blob/main/crates/agent-sdk/COOKBOOK.md" class="text-stone-400 transition hover:text-rust-300">Cookbook</a></li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="font-mono text-xs uppercase tracking-wider text-stone-600">Install</h3>
+            <ul class="mt-3 space-y-2 text-sm">
+              <li><a href="https://crates.io/crates/agent-sdk" class="text-stone-400 transition hover:text-rust-300">crates.io</a></li>
+              <li><code class="font-mono text-xs text-stone-500">cargo add agent-sdk</code></li>
+            </ul>
+          </div>
+        </nav>
+      </div>
+
+      <div class="mt-10 flex flex-col items-start justify-between gap-3 border-t border-rust-500/10 pt-6 text-xs text-stone-600 sm:flex-row sm:items-center">
+        <p>&copy; 2026 agent-sdk contributors &middot; MIT License</p>
+        <p class="font-mono">v0.9.x &middot; technical preview &middot; not yet production-ready</p>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Copy-to-clipboard for install line and code block.
+    (function () {
+      function flash(btn) {
+        var original = btn.textContent;
+        btn.textContent = 'copied';
+        btn.classList.add('text-white', 'bg-rust-600/40');
+        setTimeout(function () {
+          btn.textContent = original;
+          btn.classList.remove('text-white', 'bg-rust-600/40');
+        }, 1400);
+      }
+
+      document.querySelectorAll('[data-copy], [data-copy-target]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var text = btn.getAttribute('data-copy');
+          if (!text) {
+            var targetId = btn.getAttribute('data-copy-target');
+            var el = targetId && document.getElementById(targetId);
+            text = el ? el.innerText : '';
+          }
+          if (!text) return;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () { flash(btn); }).catch(function () {});
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
