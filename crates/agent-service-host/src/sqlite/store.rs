@@ -15,7 +15,9 @@
 //!   as ISO 8601 TEXT and JSON values as TEXT.
 
 use agent_sdk_foundation::events::AgentEvent;
-use agent_sdk_foundation::{ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm};
+use agent_sdk_foundation::{
+    ContinuationEnvelope, ListenExecutionContext, ThreadId, TokenUsage, llm,
+};
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;

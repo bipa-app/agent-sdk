@@ -1873,7 +1873,9 @@ fn decode_idempotency_result<T: serde::de::DeserializeOwned>(
 /// belongs to a turn whose `Done` is at some sequence `>= S`.
 const fn turn_number_for_event(event: &agent_sdk_foundation::events::AgentEvent) -> Option<u64> {
     match event {
-        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. } => Some(*total_turns as u64),
+        agent_sdk_foundation::events::AgentEvent::Done { total_turns, .. } => {
+            Some(*total_turns as u64)
+        }
         _ => None,
     }
 }
@@ -2489,7 +2491,9 @@ mod tests {
     };
     #[cfg(feature = "postgres")]
     use agent_sdk_foundation::ThreadId;
-    use agent_sdk_foundation::llm::{ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage};
+    use agent_sdk_foundation::llm::{
+        ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage,
+    };
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;

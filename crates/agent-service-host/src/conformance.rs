@@ -248,7 +248,9 @@ mod tests {
                     output_tokens: 50,
                     cached_input_tokens: 0,
                 },
-                messages: vec![agent_sdk_foundation::llm::Message::assistant("test response")],
+                messages: vec![agent_sdk_foundation::llm::Message::assistant(
+                    "test response",
+                )],
                 turn_usage,
                 agent_state_snapshot: serde_json::json!({}),
                 events: vec![],

@@ -782,7 +782,9 @@ mod tests {
     /// fields.
     #[test]
     fn server_can_construct_turn_summary_via_new() {
-        use agent_sdk_foundation::{AuditProvenance, ThreadId, ToolRuntime, TurnOptions, TurnSummary};
+        use agent_sdk_foundation::{
+            AuditProvenance, ThreadId, ToolRuntime, TurnOptions, TurnSummary,
+        };
 
         let options = TurnOptions {
             tool_runtime: ToolRuntime::External,

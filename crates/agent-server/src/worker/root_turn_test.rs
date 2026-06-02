@@ -1932,12 +1932,13 @@ async fn failed_resumed_turn_preserves_in_flight_history_via_draft() -> Result<(
     assert!(failed.state.is_none());
 
     // Helper: structural compare for `llm::Message` (no PartialEq).
-    let msgs_match =
-        |a: &[agent_sdk_foundation::llm::Message], b: &[agent_sdk_foundation::llm::Message]| -> bool {
-            let aj = serde_json::to_value(a).expect("serialize a");
-            let bj = serde_json::to_value(b).expect("serialize b");
-            aj == bj
-        };
+    let msgs_match = |a: &[agent_sdk_foundation::llm::Message],
+                      b: &[agent_sdk_foundation::llm::Message]|
+     -> bool {
+        let aj = serde_json::to_value(a).expect("serialize a");
+        let bj = serde_json::to_value(b).expect("serialize b");
+        aj == bj
+    };
 
     // Critical assertion: the projection's draft slot survives the
     // task's fail() — `fail_root_turn` only clears the *task* row,
