@@ -1,0 +1,159 @@
+name: agent-sdk-langfuse
+
+# Local Langfuse stack for testing the `agent-sdk` OTLP exporter.
+#
+# Bring it up with:
+#   docker compose -f dev/observability/langfuse/docker-compose.yml up -d
+#
+# UI:                 http://localhost:4000
+# Login:              otel@example.com / changeme123
+# Project public key: pk-lf-local-public-key
+# Project secret key: sk-lf-local-secret-key
+# OTLP gRPC:          http://localhost:4317
+# OTLP HTTP:          http://localhost:4318
+#
+# Point `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` at the
+# collector defined below; leave it unset to run the SDK in no-op mode.
+#
+# Setup walkthrough: crates/agent-sdk/docs/observability/LANGFUSE.md
+#
+# Credentials below are well-known local-only values intended for
+# development on a developer's laptop. Do NOT reuse them anywhere
+# else — they are checked in deliberately so a fresh checkout boots
+# without any post-install steps.
+#
+# Compose project name `agent-sdk-langfuse` keeps this stack distinct
+# from any other Langfuse stack you may run; the volumes are
+# prefixed `agent_sdk_langfuse_*` for the same reason.
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@langfuse-clickhouse:9000
+  CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: clickhouse
+  CLICKHOUSE_DB: default
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: langfuse-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+  SALT: langfuse-local-salt
+  ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  TELEMETRY_ENABLED: "false"
+  NEXTAUTH_SECRET: langfuse-local-nextauth-secret
+  NEXTAUTH_URL: http://localhost:4000
+  AUTH_DISABLE_SIGNUP: "true"
+  LANGFUSE_INIT_ORG_ID: local-org
+  LANGFUSE_INIT_ORG_NAME: Local Agent SDK
+  LANGFUSE_INIT_PROJECT_ID: local-project
+  LANGFUSE_INIT_PROJECT_NAME: Agent SDK Local OTEL
+  LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-local-public-key
+  LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-local-secret-key
+  LANGFUSE_INIT_USER_EMAIL: otel@example.com
+  LANGFUSE_INIT_USER_NAME: Local OTEL
+  LANGFUSE_INIT_USER_PASSWORD: changeme123
+
+services:
+  langfuse-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+    volumes:
+      - agent_sdk_langfuse_postgres:/var/lib/postgresql/data
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - agent_sdk_langfuse_clickhouse:/var/lib/clickhouse
+      - agent_sdk_langfuse_clickhouse_logs:/var/log/clickhouse-server
+
+  langfuse-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "langfuse"]
+    volumes:
+      - agent_sdk_langfuse_redis:/data
+
+  langfuse-minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - agent_sdk_langfuse_minio:/data
+
+  langfuse-minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - langfuse-minio
+    entrypoint: >-
+      /bin/sh -c '
+      until /usr/bin/mc alias set local http://langfuse-minio:9000 minio miniosecret; do
+        sleep 2;
+      done;
+      /usr/bin/mc mb --ignore-existing local/langfuse;
+      '
+    restart: "no"
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      - langfuse-postgres
+      - langfuse-clickhouse
+      - langfuse-redis
+      - langfuse-minio-init
+    environment:
+      <<: *langfuse-env
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      - langfuse-worker
+    environment:
+      <<: *langfuse-env
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    ports:
+      - "4000:3000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    restart: unless-stopped
+    depends_on:
+      - langfuse-web
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+volumes:
+  agent_sdk_langfuse_postgres:
+  agent_sdk_langfuse_clickhouse:
+  agent_sdk_langfuse_clickhouse_logs:
+  agent_sdk_langfuse_redis:
+  agent_sdk_langfuse_minio:
