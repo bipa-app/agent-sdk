@@ -105,8 +105,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Package leaf crate (full verify)
-        run: cargo package --package agent-sdk-core
+      - name: Package leaf crates (full verify)
+        run: |
+          cargo package --package agent-sdk-core
+          cargo package --package agent-sdk-macros
       - name: Validate dependent crate manifests pack
         run: |
           for crate in agent-sdk-tools agent-sdk-providers agent-sdk agent-sdk-otel agent-sdk-cli; do

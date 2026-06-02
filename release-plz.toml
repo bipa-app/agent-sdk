@@ -35,6 +35,12 @@ publish = true
 name = "agent-sdk-tools"
 publish = true
 
+# Proc-macro crate. `agent-sdk` depends on it, so it must publish (in
+# dependency order, before `agent-sdk`).
+[[package]]
+name = "agent-sdk-macros"
+publish = true
+
 [[package]]
 name = "agent-sdk-providers"
 publish = true
