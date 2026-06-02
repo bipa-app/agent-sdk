@@ -1,16 +1,20 @@
 name: release-plz
 
-# Automates the *preparation* of releases only. On every push to `main`,
-# release-plz opens/updates a "release PR" that bumps versions and updates
-# CHANGELOG.md from conventional commits. Merging that PR is a human decision.
+# Two release flows, split by trigger so publishing is never automatic:
 #
-# DELIBERATELY NOT ENABLED HERE: the actual `cargo publish` + git tag. That
-# `release-plz release` step (which needs a CARGO_REGISTRY_TOKEN secret) is
-# left commented out below. Turning it on — and cutting the first crates.io
-# release in dependency order — is the human-gated go-live step.
+#  * push to `main`  → `release-pr` job: opens/updates the "release PR" that
+#    bumps versions + updates CHANGELOGs from conventional commits. Merging it
+#    is a human decision; this never publishes.
+#  * manual dispatch → `release` job: runs `release-plz release`, which
+#    publishes to crates.io in dependency order using CARGO_REGISTRY_TOKEN,
+#    publishing only the crates whose manifest version is not yet on crates.io
+#    (so the new sub-crates are created on first publish; `agent-sdk` bumps
+#    from its existing 0.8.0). This is the HITL go-live: it runs ONLY when a
+#    human triggers the workflow, never on push.
 on:
   push:
     branches: [main]
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -25,8 +29,8 @@ jobs:
   release-pr:
     name: Open/update release PR
     runs-on: ubuntu-latest
-    # Skip on forks: no write token there.
-    if: github.repository == 'bipa-app/agent-sdk'
+    # Push only: opens/updates the release PR, never publishes. Skip on forks.
+    if: github.repository == 'bipa-app/agent-sdk' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,26 +41,33 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PAT (RELEASE_GITHUB_TOKEN), not the default GITHUB_TOKEN: GitHub
+          # suppresses workflow runs for events created with GITHUB_TOKEN, so a
+          # PR opened with it gets no CI. The PAT (Contents:RW + Pull
+          # requests:RW) makes the release PR trigger ci.yml + release-gates.yml.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
 
-  # ────────────────────────────────────────────────────────────────────
-  # HITL GO-LIVE (intentionally disabled). Uncomment and add the
-  # CARGO_REGISTRY_TOKEN secret to enable automated, dependency-ordered
-  # publishing once the owner approves the first release.
-  #
-  # release:
-  #   name: Publish to crates.io (HITL — disabled)
-  #   runs-on: ubuntu-latest
-  #   if: github.repository == 'bipa-app/agent-sdk'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - name: Run release-plz (publish)
-  #       uses: release-plz/action@v0.5
-  #       with:
-  #         command: release
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  # HITL GO-LIVE. Runs ONLY on manual workflow_dispatch — never on push — so a
+  # publish is always a deliberate human action. `release-plz release`
+  # publishes the crates whose manifest version is not yet on crates.io, in
+  # dependency order (agent-sdk-macros before agent-sdk, etc.), tags the
+  # release, and skips anything already published. Trigger it after the
+  # release PR (the version bump) has merged and the SDK is ready to ship.
+  release:
+    name: Publish to crates.io (manual)
+    runs-on: ubuntu-latest
+    if: github.repository == 'bipa-app/agent-sdk' && github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz (publish)
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          # Same PAT for the git tag + GitHub Release (Contents:RW). crates.io
+          # upload uses the separate CARGO_REGISTRY_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
