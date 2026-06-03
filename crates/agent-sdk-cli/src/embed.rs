@@ -20,10 +20,8 @@ pub const COLLECTOR_YAML: &str = include_str!(concat!(
     "/embedded/langfuse/otel-collector.yaml"
 ));
 
-pub const LANGFUSE_DOC: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/embedded/LANGFUSE.md"
-));
+pub const LANGFUSE_DOC: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/embedded/LANGFUSE.md"));
 
 pub const COMPOSE_FILENAME: &str = "docker-compose.yml";
 pub const COLLECTOR_FILENAME: &str = "otel-collector.yaml";
