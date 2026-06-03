@@ -1,0 +1,31 @@
+# OpenTelemetry collector config for the local Agent SDK Langfuse stack.
+# See dev/observability/langfuse/docker-compose.yml and
+# crates/agent-sdk/docs/observability/LANGFUSE.md.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  debug:
+    verbosity: normal
+  otlphttp/langfuse:
+    # This maps to http://langfuse-web:3000/api/public/otel/v1/traces.
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: Basic cGstbGYtbG9jYWwtcHVibGljLWtleTpzay1sZi1sb2NhbC1zZWNyZXQta2V5
+    compression: gzip
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/langfuse, debug]

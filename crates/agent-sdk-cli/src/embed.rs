@@ -1,27 +1,27 @@
 //! Compose stack and docs embedded at compile time.
 //!
-//! The CLI is a thin distribution channel for files that already live
-//! in the SDK workspace under `dev/observability/langfuse/` and
-//! `crates/agent-sdk/docs/observability/`. `include_str!` makes the
-//! binary self-contained while keeping a single source of truth: a
-//! `cargo install --git …` build pulls the files in via the source
-//! tree at build time, and the CLI never drifts from the checked-in
-//! compose.
+//! The CLI is a thin distribution channel for the langfuse observability
+//! stack. The files are embedded via `include_str!` so the binary is
+//! self-contained. They live under this crate's `embedded/` directory
+//! (NOT the workspace `dev/` tree) so they are packaged into the published
+//! `.crate` tarball — `include_str!` cannot reach files outside the crate
+//! root, which is what a published crate compiles against. The copies under
+//! `embedded/` mirror `dev/observability/langfuse/` and
+//! `crates/agent-sdk/docs/observability/LANGFUSE.md` — keep the `embedded/`
+//! copies in sync with those sources when they change.
 
 pub const COMPOSE_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../dev/observability/langfuse/docker-compose.yml"
+    "/embedded/langfuse/docker-compose.yml"
 ));
 
 pub const COLLECTOR_YAML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../dev/observability/langfuse/otel-collector.yaml"
+    "/embedded/langfuse/otel-collector.yaml"
 ));
 
-pub const LANGFUSE_DOC: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../agent-sdk/docs/observability/LANGFUSE.md"
-));
+pub const LANGFUSE_DOC: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/embedded/LANGFUSE.md"));
 
 pub const COMPOSE_FILENAME: &str = "docker-compose.yml";
 pub const COLLECTOR_FILENAME: &str = "otel-collector.yaml";
