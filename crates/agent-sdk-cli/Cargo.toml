@@ -18,6 +18,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[bin]]
 name = "agent-sdk"
 path = "src/main.rs"
+# The binary target shares the `agent-sdk` name with the library crate, so both
+# rustdoc to target/doc/agent_sdk/ — an order-dependent "output filename
+# collision" that aborts `cargo doc --workspace` under `-D warnings`. Binaries
+# don't need rustdoc output, so exclude this one to make the collision impossible.
+doc = false
 
 [dependencies]
 agent-sdk = { workspace = true, features = ["openai", "gemini", "vertex", "cloudflare"] }
