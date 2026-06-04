@@ -845,6 +845,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
         messages.push(ApiMessage {
             role: ApiRole::System,
             content: Some(request.system.clone()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -860,90 +861,104 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                         agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
                     },
                     content: Some(text.clone()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
             }
-            Content::Blocks(blocks) => {
-                // Handle mixed content blocks
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push(text.clone());
-                        }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. } => {
-                            // These blocks are not sent to the OpenAI API
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            tool_calls.push(ApiToolCall {
-                                id: id.clone(),
-                                r#type: "function".to_owned(),
-                                function: ApiFunctionCall {
-                                    name: name.clone(),
-                                    arguments: serde_json::to_string(input)
-                                        .unwrap_or_else(|_| "{}".to_owned()),
-                                },
-                            });
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } => {
-                            // Tool results are separate messages in OpenAI
-                            messages.push(ApiMessage {
-                                role: ApiRole::Tool,
-                                content: Some(content.clone()),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                            });
-                        }
-                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
-                        // SDK version cannot represent is not sent to OpenAI.
-                        _ => {
-                            log::warn!("Skipping unrecognized OpenAI content block");
-                        }
-                    }
-                }
-
-                // Add assistant message with text and/or tool calls
-                if !text_parts.is_empty() || !tool_calls.is_empty() {
-                    let role = match msg.role {
-                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
-                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
-                    };
-
-                    // Only add if it's an assistant message or has text content
-                    if role == ApiRole::Assistant || !text_parts.is_empty() {
-                        messages.push(ApiMessage {
-                            role,
-                            content: if text_parts.is_empty() {
-                                None
-                            } else {
-                                Some(text_parts.join("\n"))
-                            },
-                            tool_calls: if tool_calls.is_empty() {
-                                None
-                            } else {
-                                Some(tool_calls)
-                            },
-                            tool_call_id: None,
-                        });
-                    }
-                }
-            }
+            Content::Blocks(blocks) => push_block_message(&mut messages, msg.role, blocks),
         }
     }
 
     messages
+}
+
+/// Convert a single SDK `Content::Blocks` message into `OpenAI` API messages,
+/// appending them to `messages`. Tool results become standalone `tool`
+/// messages; the remaining text / reasoning / tool calls collapse into one
+/// assistant (or user) message.
+fn push_block_message(
+    messages: &mut Vec<ApiMessage>,
+    role: agent_sdk_foundation::llm::Role,
+    blocks: &[ContentBlock],
+) {
+    let mut text_parts = Vec::new();
+    let mut thinking_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::Thinking { thinking, .. } => {
+                // Reasoning models (DeepSeek / GLM / MiniMax via OpenRouter)
+                // require their prior `reasoning_content` to be replayed on
+                // subsequent thinking-mode turns or they return HTTP 400.
+                // Collect it here and echo it back on the assistant message
+                // below — the outbound counterpart to the #288 inbound
+                // fallback that surfaces `reasoning_content` as a Thinking block.
+                thinking_parts.push(thinking.clone());
+            }
+            ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => {
+                // These blocks are not sent to the OpenAI API.
+            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                tool_calls.push(ApiToolCall {
+                    id: id.clone(),
+                    r#type: "function".to_owned(),
+                    function: ApiFunctionCall {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned()),
+                    },
+                });
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                // Tool results are separate messages in OpenAI.
+                messages.push(ApiMessage {
+                    role: ApiRole::Tool,
+                    content: Some(content.clone()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+            // `ContentBlock` is `#[non_exhaustive]`; a block kind this SDK
+            // version cannot represent is not sent to OpenAI.
+            _ => log::warn!("Skipping unrecognized OpenAI content block"),
+        }
+    }
+
+    if text_parts.is_empty() && thinking_parts.is_empty() && tool_calls.is_empty() {
+        return;
+    }
+
+    let role = match role {
+        agent_sdk_foundation::llm::Role::User => ApiRole::User,
+        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
+    };
+
+    // Reasoning is only meaningful on an assistant turn — only assistant
+    // messages carry the model's own prior thinking.
+    let reasoning_content = (role == ApiRole::Assistant && !thinking_parts.is_empty())
+        .then(|| thinking_parts.join("\n"));
+
+    // Only add if it's an assistant message or has text content.
+    if role == ApiRole::Assistant || !text_parts.is_empty() {
+        messages.push(ApiMessage {
+            role,
+            content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
+            reasoning_content,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        });
+    }
 }
 
 fn convert_tool(t: agent_sdk_foundation::llm::Tool) -> ApiTool {
@@ -1139,6 +1154,17 @@ struct ApiMessage {
     role: ApiRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// `DeepSeek`-style reasoning echoed back on a prior assistant turn.
+    ///
+    /// Reasoning models (`DeepSeek` / GLM / `MiniMax` via `OpenRouter`) require
+    /// their previous `reasoning_content` to be replayed on subsequent
+    /// thinking-mode turns, or they reject the request with HTTP 400. This is
+    /// only ever populated when the assistant message carried a `Thinking`
+    /// block (i.e. the model itself produced reasoning), so non-reasoning
+    /// providers — which never emit such blocks — never see the field thanks
+    /// to `skip_serializing_if`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1593,6 +1619,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::User,
             content: Some("Hello, world!".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -1610,6 +1637,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::Assistant,
             content: Some("Let me help.".to_string()),
+            reasoning_content: None,
             tool_calls: Some(vec![ApiToolCall {
                 id: "call_123".to_string(),
                 r#type: "function".to_string(),
@@ -1634,6 +1662,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::Tool,
             content: Some("File contents here".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some("call_123".to_string()),
         };
@@ -1833,6 +1862,119 @@ mod tests {
         let api_messages = build_api_messages(&request);
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, ApiRole::User);
+    }
+
+    /// Build a single-message request that carries the given assistant blocks.
+    fn request_with_assistant_blocks(blocks: Vec<ContentBlock>) -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages: vec![agent_sdk_foundation::llm::Message::assistant_with_content(
+                blocks,
+            )],
+            tools: None,
+            max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn test_build_api_messages_echoes_assistant_thinking_as_reasoning_content() {
+        // Outbound: a prior assistant turn that carried a Thinking block must
+        // replay that text as `reasoning_content`, or DeepSeek-style reasoning
+        // models reject the next request with HTTP 400.
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "Step-by-step reasoning.".to_string(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "Final answer.".to_string(),
+            },
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(api_messages[0].role, ApiRole::Assistant);
+        assert_eq!(api_messages[0].content, Some("Final answer.".to_string()));
+        assert_eq!(
+            api_messages[0].reasoning_content,
+            Some("Step-by-step reasoning.".to_string())
+        );
+
+        // And it must actually serialize onto the wire under `reasoning_content`.
+        let json = serde_json::to_string(&api_messages[0]).unwrap();
+        assert!(json.contains("\"reasoning_content\":\"Step-by-step reasoning.\""));
+    }
+
+    #[test]
+    fn test_build_api_messages_emits_thinking_only_assistant_turn() {
+        // A reasoning model can land its usable output in reasoning_content
+        // alone (no visible text). That assistant turn must still be sent —
+        // dropping it loses the reasoning the model needs replayed.
+        let request = request_with_assistant_blocks(vec![ContentBlock::Thinking {
+            thinking: "Only reasoning here.".to_string(),
+            signature: None,
+        }]);
+
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(api_messages[0].role, ApiRole::Assistant);
+        assert_eq!(api_messages[0].content, None);
+        assert_eq!(
+            api_messages[0].reasoning_content,
+            Some("Only reasoning here.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_api_messages_omits_reasoning_content_for_plain_assistant_turn() {
+        // Non-reasoning turn: no Thinking block, so no `reasoning_content` is
+        // emitted. Providers that 400 on unknown fields never see it.
+        let request = request_with_assistant_blocks(vec![ContentBlock::Text {
+            text: "Just text.".to_string(),
+        }]);
+
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(api_messages[0].reasoning_content, None);
+
+        let json = serde_json::to_string(&api_messages[0]).unwrap();
+        assert!(!json.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn test_reasoning_content_survives_inbound_to_outbound_round_trip() {
+        // Full DeepSeek-style round-trip: a response whose usable output is in
+        // `reasoning_content` is parsed into a Thinking block by the #288
+        // inbound parser, and that Thinking block must serialize back out as
+        // `reasoning_content` on the next request — otherwise the next turn 400s.
+        let inbound = ApiResponseMessage {
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some("Prior chain of thought.".to_string()),
+            reasoning: None,
+        };
+
+        // Inbound (#288): reasoning_content -> Thinking block.
+        let blocks = build_content_blocks(&inbound);
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::Thinking { thinking, .. }] if thinking == "Prior chain of thought."
+        ));
+
+        // Outbound: Thinking block -> reasoning_content on the assistant message.
+        let request = request_with_assistant_blocks(blocks);
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(
+            api_messages[0].reasoning_content,
+            Some("Prior chain of thought.".to_string())
+        );
     }
 
     #[test]
@@ -2291,6 +2433,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2316,6 +2459,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2341,6 +2485,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2373,6 +2518,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2401,6 +2547,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2427,6 +2574,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2464,6 +2612,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
