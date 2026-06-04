@@ -867,7 +867,8 @@ const fn api_role(role: agent_sdk_foundation::llm::Role) -> ApiRole {
 /// to, appending them to `messages`.
 ///
 /// Tool results become standalone `tool` messages; text, tool calls and (on
-/// assistant turns) echoed-back reasoning collapse into a single message.
+/// assistant tool-call turns) echoed-back reasoning collapse into a single
+/// message.
 fn append_block_messages(
     messages: &mut Vec<ApiMessage>,
     role: agent_sdk_foundation::llm::Role,
@@ -882,8 +883,9 @@ fn append_block_messages(
             ContentBlock::Text { text } => text_parts.push(text.clone()),
             ContentBlock::Thinking { thinking, .. } => {
                 // DeepSeek-style thinking-mode multi-turn requires the prior
-                // assistant reasoning_content to be echoed back or the API 400s.
-                // Carried into reasoning_content on the assistant message below.
+                // assistant reasoning_content to be echoed back on a tool-call
+                // turn or the API 400s. Collected here; only carried into
+                // reasoning_content below when this turn also has a tool call.
                 thinking_parts.push(thinking.clone());
             }
             ContentBlock::RedactedThinking { .. }
@@ -925,13 +927,19 @@ fn append_block_messages(
 
     let role = api_role(role);
 
-    // reasoning_content is only meaningful echoed back on assistant turns
-    // (DeepSeek thinking-mode pass-back). It is never attached to user messages.
-    let reasoning_content = if role == ApiRole::Assistant && !thinking_parts.is_empty() {
-        Some(thinking_parts.join("\n"))
-    } else {
-        None
-    };
+    // reasoning_content is only echoed back on an assistant turn that ALSO
+    // carries a tool call — the one case DeepSeek's thinking-mode protocol
+    // requires it. Per that protocol legacy `deepseek-reasoner` 400s if
+    // reasoning_content appears in input at all, and DeepSeek V4 thinking-mode
+    // only needs it on tool-call turns. So a plain reasoning-only assistant
+    // turn (no tool call) does NOT carry reasoning_content, and it is never
+    // attached to user messages.
+    let reasoning_content =
+        if role == ApiRole::Assistant && !thinking_parts.is_empty() && !tool_calls.is_empty() {
+            Some(thinking_parts.join("\n"))
+        } else {
+            None
+        };
 
     // Add the message when it carries text, tool calls, or (for an assistant
     // turn) reasoning to echo back. Only emit if it's an assistant message or
@@ -1184,10 +1192,11 @@ struct ApiMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     /// `DeepSeek`-style thinking-mode multi-turn requires the prior assistant
-    /// `reasoning_content` to be echoed back on the next request or the API
+    /// `reasoning_content` to be echoed back on a tool-call turn or the API
     /// rejects it (HTTP 400). Carried back only for assistant turns that had a
-    /// Thinking block; omitted entirely otherwise so the normal path is
-    /// unchanged.
+    /// Thinking block AND a tool call; omitted entirely otherwise (including
+    /// reasoning-only turns, since legacy `deepseek-reasoner` 400s if
+    /// `reasoning_content` appears in input) so the normal path is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1914,9 +1923,92 @@ mod tests {
     }
 
     #[test]
-    fn test_build_api_messages_echoes_assistant_reasoning_content() -> anyhow::Result<()> {
-        // DeepSeek-style thinking-mode multi-turn: the prior assistant turn's
-        // reasoning must be echoed back as `reasoning_content` or the API 400s.
+    fn test_build_api_messages_echoes_assistant_reasoning_content_on_tool_call()
+    -> anyhow::Result<()> {
+        // DeepSeek V4 thinking-mode requires the prior assistant turn's
+        // reasoning to be echoed back as `reasoning_content` ONLY on a turn
+        // that also performed a tool call, or the API 400s.
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::user("What is the weather?"),
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "I should call the weather tool.".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "Paris"}),
+                    thought_signature: None,
+                },
+            ]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let assistant = api_messages
+            .iter()
+            .find(|m| m.role == ApiRole::Assistant)
+            .context("assistant message present")?;
+        assert!(assistant.tool_calls.is_some());
+        assert_eq!(
+            assistant.reasoning_content,
+            Some("I should call the weather tool.".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_reasoning_content_serializes_on_tool_call_turn() -> anyhow::Result<()>
+    {
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "thinking out loud".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "do_thing".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                },
+            ]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
+        assert!(json.contains("\"reasoning_content\":\"thinking out loud\""));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_reasoning_only_turn_is_not_echoed() -> anyhow::Result<()> {
+        // A reasoning-only assistant turn (no visible text, no tool call) must
+        // NOT carry reasoning_content: legacy `deepseek-reasoner` 400s if
+        // reasoning_content appears in input, and DeepSeek V4 thinking-mode only
+        // needs it on tool-call turns. With no other payload the turn collapses
+        // to nothing and is dropped entirely.
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "pondering".to_string(),
+                    signature: None,
+                },
+            ]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
+        assert!(!json.contains("reasoning_content"));
+        assert!(api_messages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_reasoning_with_text_no_tool_call_is_not_echoed() -> anyhow::Result<()>
+    {
+        // An assistant turn carrying reasoning + visible text but NO tool call
+        // is emitted for its text, but its reasoning is NOT echoed back.
         let request = request_with_messages(vec![
             agent_sdk_foundation::llm::Message::user("What is 2+2?"),
             agent_sdk_foundation::llm::Message::assistant_with_content(vec![
@@ -1932,59 +2024,15 @@ mod tests {
         ]);
 
         let api_messages = build_api_messages(&request);
+        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
+        assert!(!json.contains("reasoning_content"));
         let assistant = api_messages
             .iter()
             .find(|m| m.role == ApiRole::Assistant)
             .context("assistant message present")?;
         assert_eq!(assistant.content, Some("4".to_string()));
-        assert_eq!(
-            assistant.reasoning_content,
-            Some("Let me add 2 and 2.".to_string())
-        );
+        assert_eq!(assistant.reasoning_content, None);
         Ok(())
-    }
-
-    #[test]
-    fn test_build_api_messages_reasoning_content_serializes_on_assistant() -> anyhow::Result<()> {
-        let request = request_with_messages(vec![
-            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
-                ContentBlock::Thinking {
-                    thinking: "thinking out loud".to_string(),
-                    signature: None,
-                },
-                ContentBlock::Text {
-                    text: "done".to_string(),
-                },
-            ]),
-        ]);
-
-        let api_messages = build_api_messages(&request);
-        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
-        assert!(json.contains("\"reasoning_content\":\"thinking out loud\""));
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_api_messages_assistant_with_only_thinking_is_echoed() {
-        // An assistant turn that produced only reasoning (no visible text, no
-        // tool call) must still be emitted carrying its reasoning_content.
-        let request = request_with_messages(vec![
-            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
-                ContentBlock::Thinking {
-                    thinking: "pondering".to_string(),
-                    signature: None,
-                },
-            ]),
-        ]);
-
-        let api_messages = build_api_messages(&request);
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, ApiRole::Assistant);
-        assert_eq!(api_messages[0].content, None);
-        assert_eq!(
-            api_messages[0].reasoning_content,
-            Some("pondering".to_string())
-        );
     }
 
     #[test]
