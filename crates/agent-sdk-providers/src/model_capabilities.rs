@@ -734,7 +734,7 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "MiniMax-M2.5",
         context_window: Some(204_800),
         max_output_tokens: Some(131_072),
-        pricing: Some(Pricing::flat_with_cached(0.3, 1.2, 0.155).with_notes("Native MiniMax first-party pricing: input $0.30/M, output $1.20/M, cached input ~$0.155/M.")),
+        pricing: Some(Pricing::flat_with_cached(0.3, 1.2, 0.03).with_notes("Native MiniMax first-party pricing: input $0.30/M, output $1.20/M, cache-read input $0.03/M (platform.minimax.io PAYG).")),
         supports_thinking: true,
         supports_adaptive_thinking: false,
         source_url: MINIMAX_PRICING_URL,
@@ -935,6 +935,9 @@ mod tests {
         let pricing = native.pricing.unwrap();
         assert!((pricing.input.unwrap().usd_per_million_tokens - 0.3).abs() < f64::EPSILON);
         assert!((pricing.output.unwrap().usd_per_million_tokens - 1.2).abs() < f64::EPSILON);
+        // Cache-read is the first-party platform.minimax.io PAYG rate ($0.03/M),
+        // not the ~$0.155/M that an earlier entry overstated by ~3-5x.
+        assert!((pricing.cached_input.unwrap().usd_per_million_tokens - 0.03).abs() < f64::EPSILON);
     }
 
     #[test]
