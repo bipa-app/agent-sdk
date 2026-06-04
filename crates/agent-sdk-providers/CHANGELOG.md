@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.1...agent-sdk-providers-v0.9.2) - 2026-06-04
+
+### Fixed
+
+- *(providers)* streaming reasoning fallback + multi-turn reasoning echo-back + MiniMax cache price ([#291](https://github.com/bipa-app/agent-sdk/pull/291))
+
 ## [0.9.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.0...agent-sdk-providers-v0.9.1) - 2026-06-04
 
 ### Added
