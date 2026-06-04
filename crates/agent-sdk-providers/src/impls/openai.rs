@@ -987,23 +987,30 @@ fn reasoning_text(message: &ApiResponseMessage) -> Option<&str> {
 fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
-    // Add text content if present
+    // Reasoning models (DeepSeek-style) return their chain-of-thought in
+    // `reasoning_content` (or `reasoning`) ALONGSIDE the visible answer in
+    // `content`. Capture it as a Thinking block whenever it is present — NOT
+    // only as a fallback for empty `content` — so it is replayed back as
+    // `reasoning_content` on the next thinking-mode turn (see the outbound
+    // `push_block_message`). DeepSeek returns HTTP 400 if a prior turn's
+    // reasoning is dropped, so the old "fallback only" behaviour broke the
+    // round-trip for the mainline case (answer in `content` + CoT in
+    // `reasoning_content`). Thinking precedes the answer, matching emission
+    // order, and the absent-reasoning / truncated-before-content cases still
+    // work (only a Thinking block, no Text).
+    if let Some(reasoning) = reasoning_text(message) {
+        blocks.push(ContentBlock::Thinking {
+            thinking: reasoning.to_owned(),
+            signature: None,
+        });
+    }
+
+    // Add text content if present.
     if let Some(content) = &message.content
         && !content.is_empty()
     {
         blocks.push(ContentBlock::Text {
             text: content.clone(),
-        });
-    } else if let Some(reasoning) = reasoning_text(message) {
-        // Reasoning-model fallback: when `content` is empty/absent but the model
-        // produced reasoning tokens (DeepSeek-style answer-in-`reasoning_content`,
-        // or any reasoning model truncated under a tight `max_tokens` before it
-        // emitted visible content), surface the reasoning as a Thinking block so
-        // the usable output is not silently dropped. This is a fallback only —
-        // when `content` is present the reasoning is left untouched.
-        blocks.push(ContentBlock::Thinking {
-            thinking: reasoning.to_owned(),
-            signature: None,
         });
     }
 
@@ -1978,6 +1985,48 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_content_round_trip_with_content_present() {
+        // The MAINLINE DeepSeek shape: the answer is in `content` AND the
+        // chain-of-thought is in `reasoning_content`. The inbound parser must
+        // capture BOTH (a Thinking block + a Text block), and the outbound
+        // serializer must replay the reasoning as `reasoning_content` while
+        // keeping the answer in `content`. Dropping the reasoning here (the old
+        // "fallback only" behaviour) is exactly what made the next turn 400.
+        let inbound = ApiResponseMessage {
+            content: Some("The answer is 42.".to_string()),
+            tool_calls: None,
+            reasoning_content: Some("Let me work through it...".to_string()),
+            reasoning: None,
+        };
+
+        // Inbound: a Thinking block (CoT, first) AND a Text block (answer).
+        let blocks = build_content_blocks(&inbound);
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [
+                    ContentBlock::Thinking { thinking, .. },
+                    ContentBlock::Text { text },
+                ] if thinking == "Let me work through it..." && text == "The answer is 42."
+            ),
+            "expected [Thinking, Text], got {blocks:?}"
+        );
+
+        // Outbound: answer stays in `content`, CoT replays in `reasoning_content`.
+        let request = request_with_assistant_blocks(blocks);
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(
+            api_messages[0].content,
+            Some("The answer is 42.".to_string())
+        );
+        assert_eq!(
+            api_messages[0].reasoning_content,
+            Some("Let me work through it...".to_string())
+        );
+    }
+
+    #[test]
     fn test_convert_tool() {
         let tool = agent_sdk_foundation::llm::Tool {
             name: "test_tool".to_string(),
@@ -2082,9 +2131,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_content_blocks_does_not_add_reasoning_when_content_present() {
-        // The normal content-present case must be unchanged: reasoning is NOT
-        // surfaced as a Thinking block when there is usable text content.
+    fn test_build_content_blocks_captures_reasoning_alongside_content() {
+        // The mainline DeepSeek shape: reasoning IS captured as a Thinking block
+        // even when usable text content is present, so it can be replayed as
+        // `reasoning_content` on the next thinking-mode turn. Dropping it here
+        // (the old behaviour) is exactly what made the next turn return 400.
         let message = ApiResponseMessage {
             content: Some("Final answer.".to_string()),
             tool_calls: None,
@@ -2093,8 +2144,11 @@ mod tests {
         };
 
         let blocks = build_content_blocks(&message);
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Final answer."));
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, .. } if thinking == "internal chain of thought")
+        );
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "Final answer."));
     }
 
     #[test]
