@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-sdk-foundation",
  "agent-sdk-macros",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-foundation"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "insta",
  "proptest",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -2321,9 +2321,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 dependencies = [
  "value-bag",
 ]
@@ -5606,9 +5606,9 @@ dependencies = [
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",

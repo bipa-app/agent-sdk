@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.0...agent-sdk-providers-v0.9.1) - 2026-06-04
+
+### Added
+
+- *(providers)* register open-model capabilities + reasoning-response fallback ([#288](https://github.com/bipa-app/agent-sdk/pull/288))
+
 ## [0.9.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.8.0...agent-sdk-providers-v0.9.0) - 2026-06-02
 
 ### Added
