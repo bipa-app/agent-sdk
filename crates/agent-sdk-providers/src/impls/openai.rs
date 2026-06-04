@@ -554,6 +554,7 @@ impl LlmProvider for OpenAIProvider {
                     for result in process_sse_data(data) {
                         match result {
                             SseProcessResult::TextDelta(c) => yield Ok(StreamDelta::TextDelta { delta: c, block_index: 0 }),
+                            SseProcessResult::ThinkingDelta(c) => yield Ok(StreamDelta::ThinkingDelta { delta: c, block_index: 0 }),
                             SseProcessResult::ToolCallUpdate { index, id, name, arguments } => apply_tool_call_update(&mut tool_calls, index, id, name, arguments),
                             SseProcessResult::Usage(u) => usage = Some(u),
                             SseProcessResult::Done(sr) => {
@@ -656,6 +657,10 @@ fn build_stream_end_deltas(
 enum SseProcessResult {
     /// Emit a text delta.
     TextDelta(String),
+    /// Emit a thinking/reasoning delta (reasoning-model fallback when the model
+    /// streams its output via `reasoning_content`/`reasoning` and `content` is
+    /// empty, mirroring the non-streaming `build_content_blocks` fallback).
+    ThinkingDelta(String),
     /// Update tool call accumulator (index, optional id, optional name, optional args).
     ToolCallUpdate {
         index: usize,
@@ -698,11 +703,25 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
 
     // Process choices
     if let Some(choice) = chunk.choices.into_iter().next() {
-        // Handle text content delta
+        // Handle text content delta. When `content` is empty/absent but the
+        // model streamed reasoning tokens (DeepSeek-style answer-in-
+        // `reasoning_content`, or `OpenRouter`-normalized `reasoning`), surface
+        // the reasoning as a thinking delta so the usable output is not silently
+        // dropped under streaming. This mirrors the non-streaming
+        // `build_content_blocks` fallback: text content takes precedence and the
+        // reasoning fallback only fires when `content` is empty.
         if let Some(content) = choice.delta.content
             && !content.is_empty()
         {
             results.push(SseProcessResult::TextDelta(content));
+        } else if let Some(reasoning) = choice
+            .delta
+            .reasoning_content
+            .as_deref()
+            .or(choice.delta.reasoning.as_deref())
+            .filter(|r| !r.is_empty())
+        {
+            results.push(SseProcessResult::ThinkingDelta(reasoning.to_owned()));
         }
 
         // Handle tool call deltas
@@ -837,6 +856,107 @@ const fn map_budget_to_reasoning(budget_tokens: u32) -> ReasoningEffort {
     }
 }
 
+const fn api_role(role: agent_sdk_foundation::llm::Role) -> ApiRole {
+    match role {
+        agent_sdk_foundation::llm::Role::User => ApiRole::User,
+        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
+    }
+}
+
+/// Convert a `Content::Blocks` message into the `OpenAI` wire messages it maps
+/// to, appending them to `messages`.
+///
+/// Tool results become standalone `tool` messages; text, tool calls and (on
+/// assistant turns) echoed-back reasoning collapse into a single message.
+fn append_block_messages(
+    messages: &mut Vec<ApiMessage>,
+    role: agent_sdk_foundation::llm::Role,
+    blocks: &[ContentBlock],
+) {
+    let mut text_parts = Vec::new();
+    let mut thinking_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::Thinking { thinking, .. } => {
+                // DeepSeek-style thinking-mode multi-turn requires the prior
+                // assistant reasoning_content to be echoed back or the API 400s.
+                // Carried into reasoning_content on the assistant message below.
+                thinking_parts.push(thinking.clone());
+            }
+            ContentBlock::RedactedThinking { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => {
+                // These blocks are not sent to the OpenAI API
+            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                tool_calls.push(ApiToolCall {
+                    id: id.clone(),
+                    r#type: "function".to_owned(),
+                    function: ApiFunctionCall {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned()),
+                    },
+                });
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                // Tool results are separate messages in OpenAI
+                messages.push(ApiMessage {
+                    role: ApiRole::Tool,
+                    content: Some(content.clone()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+            // `ContentBlock` is `#[non_exhaustive]`; a block kind this SDK
+            // version cannot represent is not sent to OpenAI.
+            _ => log::warn!("Skipping unrecognized OpenAI content block"),
+        }
+    }
+
+    let role = api_role(role);
+
+    // reasoning_content is only meaningful echoed back on assistant turns
+    // (DeepSeek thinking-mode pass-back). It is never attached to user messages.
+    let reasoning_content = if role == ApiRole::Assistant && !thinking_parts.is_empty() {
+        Some(thinking_parts.join("\n"))
+    } else {
+        None
+    };
+
+    // Add the message when it carries text, tool calls, or (for an assistant
+    // turn) reasoning to echo back. Only emit if it's an assistant message or
+    // has text content.
+    let has_payload =
+        !text_parts.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some();
+    if has_payload && (role == ApiRole::Assistant || !text_parts.is_empty()) {
+        messages.push(ApiMessage {
+            role,
+            content: if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n"))
+            },
+            reasoning_content,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            tool_call_id: None,
+        });
+    }
+}
+
 fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
     let mut messages = Vec::new();
 
@@ -845,6 +965,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
         messages.push(ApiMessage {
             role: ApiRole::System,
             content: Some(request.system.clone()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -855,91 +976,14 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
         match &msg.content {
             Content::Text(text) => {
                 messages.push(ApiMessage {
-                    role: match msg.role {
-                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
-                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
-                    },
+                    role: api_role(msg.role),
                     content: Some(text.clone()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
             }
-            Content::Blocks(blocks) => {
-                // Handle mixed content blocks
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push(text.clone());
-                        }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. } => {
-                            // These blocks are not sent to the OpenAI API
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            tool_calls.push(ApiToolCall {
-                                id: id.clone(),
-                                r#type: "function".to_owned(),
-                                function: ApiFunctionCall {
-                                    name: name.clone(),
-                                    arguments: serde_json::to_string(input)
-                                        .unwrap_or_else(|_| "{}".to_owned()),
-                                },
-                            });
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } => {
-                            // Tool results are separate messages in OpenAI
-                            messages.push(ApiMessage {
-                                role: ApiRole::Tool,
-                                content: Some(content.clone()),
-                                tool_calls: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                            });
-                        }
-                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
-                        // SDK version cannot represent is not sent to OpenAI.
-                        _ => {
-                            log::warn!("Skipping unrecognized OpenAI content block");
-                        }
-                    }
-                }
-
-                // Add assistant message with text and/or tool calls
-                if !text_parts.is_empty() || !tool_calls.is_empty() {
-                    let role = match msg.role {
-                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
-                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
-                    };
-
-                    // Only add if it's an assistant message or has text content
-                    if role == ApiRole::Assistant || !text_parts.is_empty() {
-                        messages.push(ApiMessage {
-                            role,
-                            content: if text_parts.is_empty() {
-                                None
-                            } else {
-                                Some(text_parts.join("\n"))
-                            },
-                            tool_calls: if tool_calls.is_empty() {
-                                None
-                            } else {
-                                Some(tool_calls)
-                            },
-                            tool_call_id: None,
-                        });
-                    }
-                }
-            }
+            Content::Blocks(blocks) => append_block_messages(&mut messages, msg.role, blocks),
         }
     }
 
@@ -1139,6 +1183,13 @@ struct ApiMessage {
     role: ApiRole,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// `DeepSeek`-style thinking-mode multi-turn requires the prior assistant
+    /// `reasoning_content` to be echoed back on the next request or the API
+    /// rejects it (HTTP 400). Carried back only for assistant turns that had a
+    /// Thinking block; omitted entirely otherwise so the normal path is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1269,6 +1320,14 @@ struct SseChoice {
 struct SseDelta {
     content: Option<String>,
     tool_calls: Option<Vec<SseToolCallDelta>>,
+    /// `DeepSeek`-style streamed chain-of-thought, returned at the same level as
+    /// `content` (`DeepSeek` V4 / some `OpenRouter` providers).
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// `OpenRouter` normalizes streamed reasoning under a `reasoning` field for
+    /// some upstreams; treated as an equivalent fallback to `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1327,6 +1386,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
 
     // ===================
     // Constructor Tests
@@ -1593,6 +1653,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::User,
             content: Some("Hello, world!".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -1610,6 +1671,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::Assistant,
             content: Some("Let me help.".to_string()),
+            reasoning_content: None,
             tool_calls: Some(vec![ApiToolCall {
                 id: "call_123".to_string(),
                 r#type: "function".to_string(),
@@ -1634,6 +1696,7 @@ mod tests {
         let message = ApiMessage {
             role: ApiRole::Tool,
             content: Some("File contents here".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some("call_123".to_string()),
         };
@@ -1833,6 +1896,140 @@ mod tests {
         let api_messages = build_api_messages(&request);
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, ApiRole::User);
+    }
+
+    fn request_with_messages(messages: Vec<agent_sdk_foundation::llm::Message>) -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages,
+            tools: None,
+            max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn test_build_api_messages_echoes_assistant_reasoning_content() -> anyhow::Result<()> {
+        // DeepSeek-style thinking-mode multi-turn: the prior assistant turn's
+        // reasoning must be echoed back as `reasoning_content` or the API 400s.
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::user("What is 2+2?"),
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me add 2 and 2.".to_string(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "4".to_string(),
+                },
+            ]),
+            agent_sdk_foundation::llm::Message::user("And 3+3?"),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let assistant = api_messages
+            .iter()
+            .find(|m| m.role == ApiRole::Assistant)
+            .context("assistant message present")?;
+        assert_eq!(assistant.content, Some("4".to_string()));
+        assert_eq!(
+            assistant.reasoning_content,
+            Some("Let me add 2 and 2.".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_reasoning_content_serializes_on_assistant() -> anyhow::Result<()> {
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "thinking out loud".to_string(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+            ]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
+        assert!(json.contains("\"reasoning_content\":\"thinking out loud\""));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_assistant_with_only_thinking_is_echoed() {
+        // An assistant turn that produced only reasoning (no visible text, no
+        // tool call) must still be emitted carrying its reasoning_content.
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![
+                ContentBlock::Thinking {
+                    thinking: "pondering".to_string(),
+                    signature: None,
+                },
+            ]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(api_messages[0].role, ApiRole::Assistant);
+        assert_eq!(api_messages[0].content, None);
+        assert_eq!(
+            api_messages[0].reasoning_content,
+            Some("pondering".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_api_messages_normal_path_has_no_reasoning_content() -> anyhow::Result<()> {
+        // Normal path unchanged: an assistant turn with no Thinking block must
+        // not attach reasoning_content.
+        let request = request_with_messages(vec![
+            agent_sdk_foundation::llm::Message::user("hi"),
+            agent_sdk_foundation::llm::Message::assistant_with_content(vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }]),
+        ]);
+
+        let api_messages = build_api_messages(&request);
+        let json = serde_json::to_string(&api_messages).context("serialize api messages")?;
+        assert!(!json.contains("reasoning_content"));
+        let assistant = api_messages
+            .iter()
+            .find(|m| m.role == ApiRole::Assistant)
+            .context("assistant message present")?;
+        assert_eq!(assistant.reasoning_content, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_api_messages_does_not_attach_reasoning_to_user_blocks() {
+        // A user turn carrying a Thinking block (unusual, but possible) must not
+        // be turned into a reasoning_content echo.
+        let request =
+            request_with_messages(vec![agent_sdk_foundation::llm::Message::user_with_content(
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: "user-side thinking".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "question".to_string(),
+                    },
+                ],
+            )]);
+
+        let api_messages = build_api_messages(&request);
+        assert_eq!(api_messages.len(), 1);
+        assert_eq!(api_messages[0].role, ApiRole::User);
+        assert_eq!(api_messages[0].reasoning_content, None);
     }
 
     #[test]
@@ -2188,6 +2385,113 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_delta_deserializes_reasoning_fields() -> anyhow::Result<()> {
+        // The streaming delta struct must accept DeepSeek `reasoning_content`
+        // and OpenRouter-normalized `reasoning` so reasoning tokens are not
+        // dropped on deserialization.
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "step one"
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+        )
+        .context("deserialize sse chunk")?;
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content,
+            Some("step one".to_string())
+        );
+        assert!(chunk.choices[0].delta.content.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_sse_data_emits_thinking_delta_from_reasoning_content() {
+        // Reasoning-model fallback under streaming: a delta whose visible
+        // `content` is absent but whose `reasoning_content` carries tokens must
+        // surface as a ThinkingDelta, mirroring the non-streaming fallback so the
+        // output is not silently dropped.
+        let results = process_sse_data(
+            r#"{
+                "choices": [{
+                    "delta": { "reasoning_content": "thinking..." },
+                    "finish_reason": null
+                }]
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::ThinkingDelta(text)] if text == "thinking..."
+        ));
+    }
+
+    #[test]
+    fn test_process_sse_data_emits_thinking_delta_from_reasoning_field() {
+        // OpenRouter-normalized `reasoning` field is an equivalent fallback.
+        let results = process_sse_data(
+            r#"{
+                "choices": [{
+                    "delta": { "reasoning": "pondering" },
+                    "finish_reason": null
+                }]
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::ThinkingDelta(text)] if text == "pondering"
+        ));
+    }
+
+    #[test]
+    fn test_process_sse_data_prefers_text_content_over_reasoning() {
+        // When visible `content` is present, it takes precedence and the
+        // reasoning fallback does not fire (mirrors non-streaming behavior).
+        let results = process_sse_data(
+            r#"{
+                "choices": [{
+                    "delta": {
+                        "content": "answer",
+                        "reasoning_content": "ignored"
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::TextDelta(text)] if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn test_process_sse_data_empty_content_falls_back_to_reasoning() {
+        // An explicitly empty `content` string must still trigger the reasoning
+        // fallback rather than emitting an empty TextDelta.
+        let results = process_sse_data(
+            r#"{
+                "choices": [{
+                    "delta": {
+                        "content": "",
+                        "reasoning_content": "fallback"
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::ThinkingDelta(text)] if text == "fallback"
+        ));
+    }
+
+    #[test]
     fn test_api_usage_rejects_fractional_numbers() {
         let json = r#"{
             "prompt_tokens": 42.5,
@@ -2291,6 +2595,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2316,6 +2621,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2341,6 +2647,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2373,6 +2680,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2401,6 +2709,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2427,6 +2736,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -2464,6 +2774,7 @@ mod tests {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
