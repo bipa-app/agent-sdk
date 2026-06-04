@@ -957,6 +957,18 @@ fn convert_tool(t: agent_sdk_foundation::llm::Tool) -> ApiTool {
     }
 }
 
+/// Non-empty reasoning text from an `OpenAI`-compatible response message, if any.
+///
+/// Prefers `DeepSeek`-style `reasoning_content`, falling back to the `reasoning`
+/// field used by some `OpenRouter` upstreams.
+fn reasoning_text(message: &ApiResponseMessage) -> Option<&str> {
+    message
+        .reasoning_content
+        .as_deref()
+        .or(message.reasoning.as_deref())
+        .filter(|r| !r.is_empty())
+}
+
 fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
@@ -966,6 +978,17 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
     {
         blocks.push(ContentBlock::Text {
             text: content.clone(),
+        });
+    } else if let Some(reasoning) = reasoning_text(message) {
+        // Reasoning-model fallback: when `content` is empty/absent but the model
+        // produced reasoning tokens (DeepSeek-style answer-in-`reasoning_content`,
+        // or any reasoning model truncated under a tight `max_tokens` before it
+        // emitted visible content), surface the reasoning as a Thinking block so
+        // the usable output is not silently dropped. This is a fallback only —
+        // when `content` is present the reasoning is left untouched.
+        blocks.push(ContentBlock::Thinking {
+            thinking: reasoning.to_owned(),
+            signature: None,
         });
     }
 
@@ -1179,6 +1202,14 @@ struct ApiChoice {
 struct ApiResponseMessage {
     content: Option<String>,
     tool_calls: Option<Vec<ApiResponseToolCall>>,
+    /// `DeepSeek`-style chain-of-thought, returned at the same level as
+    /// `content` (`DeepSeek` V4 / some `OpenRouter` providers).
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// `OpenRouter` normalizes reasoning under a `reasoning` field for some
+    /// upstreams; treated as an equivalent fallback to `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1825,6 +1856,8 @@ mod tests {
         let message = ApiResponseMessage {
             content: Some("Hello!".to_string()),
             tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
         };
 
         let blocks = build_content_blocks(&message);
@@ -1843,6 +1876,8 @@ mod tests {
                     arguments: "{\"path\": \"test.txt\"}".to_string(),
                 },
             }]),
+            reasoning_content: None,
+            reasoning: None,
         };
 
         let blocks = build_content_blocks(&message);
@@ -1851,6 +1886,125 @@ mod tests {
         assert!(
             matches!(&blocks[1], ContentBlock::ToolUse { id, name, .. } if id == "call_123" && name == "read_file")
         );
+    }
+
+    #[test]
+    fn test_build_content_blocks_falls_back_to_reasoning_content_when_content_empty() {
+        // DeepSeek-style: answer / usable output arrives in reasoning_content
+        // while content is null. Without the fallback this dropped all output.
+        let message = ApiResponseMessage {
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some("The answer is 42.".to_string()),
+            reasoning: None,
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, signature } if thinking == "The answer is 42." && signature.is_none())
+        );
+    }
+
+    #[test]
+    fn test_build_content_blocks_falls_back_to_reasoning_field() {
+        // Some OpenRouter upstreams normalize reasoning under `reasoning`.
+        let message = ApiResponseMessage {
+            content: Some(String::new()),
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: Some("Considering options...".to_string()),
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, .. } if thinking == "Considering options...")
+        );
+    }
+
+    #[test]
+    fn test_build_content_blocks_prefers_reasoning_content_over_reasoning() {
+        let message = ApiResponseMessage {
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some("primary".to_string()),
+            reasoning: Some("secondary".to_string()),
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, .. } if thinking == "primary")
+        );
+    }
+
+    #[test]
+    fn test_build_content_blocks_does_not_add_reasoning_when_content_present() {
+        // The normal content-present case must be unchanged: reasoning is NOT
+        // surfaced as a Thinking block when there is usable text content.
+        let message = ApiResponseMessage {
+            content: Some("Final answer.".to_string()),
+            tool_calls: None,
+            reasoning_content: Some("internal chain of thought".to_string()),
+            reasoning: None,
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Final answer."));
+    }
+
+    #[test]
+    fn test_build_content_blocks_reasoning_fallback_with_tool_calls() {
+        // Empty content + reasoning + a tool call: surface the reasoning AND the
+        // tool call (reasoning model under tight max_tokens that still tool-called).
+        let message = ApiResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ApiResponseToolCall {
+                id: "call_1".to_string(),
+                function: ApiResponseFunctionCall {
+                    name: "search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            reasoning_content: Some("I should search.".to_string()),
+            reasoning: None,
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, .. } if thinking == "I should search.")
+        );
+        assert!(matches!(&blocks[1], ContentBlock::ToolUse { name, .. } if name == "search"));
+    }
+
+    #[test]
+    fn test_build_content_blocks_empty_message_yields_no_blocks() {
+        // Genuine truncation with no reasoning text: still produce nothing
+        // (behavior unchanged for the empty case).
+        let message = ApiResponseMessage {
+            content: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        };
+
+        let blocks = build_content_blocks(&message);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_api_response_message_deserializes_reasoning_content() {
+        let json = r#"{
+            "content": null,
+            "reasoning_content": "step by step"
+        }"#;
+
+        let message: ApiResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(reasoning_text(&message), Some("step by step"));
+        assert!(message.content.is_none());
     }
 
     // ===================

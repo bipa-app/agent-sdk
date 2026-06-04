@@ -120,6 +120,20 @@ const OPENAI_GPT53_CODEX_URL: &str = "https://developers.openai.com/api/docs/mod
 const GOOGLE_MODELS_URL: &str = "https://ai.google.dev/gemini-api/docs/models";
 const GOOGLE_PRICING_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 
+// Open-model routes. All reached through OpenAIProvider (provider()=="openai"),
+// whether via OpenRouter slugs or the native z.ai / Moonshot / MiniMax base URLs.
+const OPENROUTER_GLM51_URL: &str = "https://openrouter.ai/z-ai/glm-5.1";
+const ZAI_GLM5_PRICING_URL: &str = "https://docs.z.ai/guides/overview/pricing";
+const OPENROUTER_KIMI_K26_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2.6";
+const OPENROUTER_KIMI_K25_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2.5";
+const KIMI_K25_AA_URL: &str = "https://artificialanalysis.ai/models/kimi-k2-5";
+const OPENROUTER_KIMI_K2_THINKING_URL: &str = "https://openrouter.ai/moonshotai/kimi-k2-thinking";
+const OPENROUTER_DEEPSEEK_V4_PRO_URL: &str = "https://openrouter.ai/deepseek/deepseek-v4-pro";
+const OPENROUTER_DEEPSEEK_V4_FLASH_URL: &str = "https://openrouter.ai/deepseek/deepseek-v4-flash";
+const DEEPSEEK_PRICING_URL: &str = "https://api-docs.deepseek.com/quick_start/pricing";
+const MINIMAX_PRICING_URL: &str = "https://platform.minimax.io/docs/guides/pricing-paygo";
+const OPENROUTER_MINIMAX_M25_URL: &str = "https://openrouter.ai/minimax/minimax-m2.5";
+
 const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Anthropic
     ModelCapabilities {
@@ -592,6 +606,153 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         source_status: SourceStatus::Official,
         notes: None,
     },
+    // Open models (z.ai / Moonshot / DeepSeek / MiniMax). All routed through
+    // OpenAIProvider, so provider == "openai" and the model_id is the exact
+    // string the caller passes (OpenRouter slug or native model id).
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "z-ai/glm-5.1",
+        context_window: Some(202_752),
+        max_output_tokens: Some(131_072),
+        pricing: Some(Pricing::flat(0.98, 3.08).with_notes("OpenRouter rate for z-ai/glm-5.1: input $0.98/M, output $3.08/M.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_GLM51_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("GLM-5.1 (z.ai/Zhipu) via OpenRouter slug. Reasoning/thinking model; context 203K (=202,752). max_output 128K from z.ai GLM-5.1 docs, sized generously for hidden reasoning + answer. Released ~Apr 7, 2026."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "glm-5",
+        context_window: Some(200_000),
+        max_output_tokens: Some(131_072),
+        pricing: Some(Pricing::flat(1.0, 3.2).with_notes("Native z.ai pricing: input $1.0/M, output $3.2/M (higher than the OpenRouter GLM-5 rate of $0.60/$1.92).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: ZAI_GLM5_PRICING_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Native z.ai constructor model string `glm-5`. Reasoning/thinking model; 200K context, 128K (131072) max output per docs.z.ai/guides/llm/glm-5. Native pricing used for the native route. Released ~Feb 11, 2026."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "moonshotai/kimi-k2.6",
+        context_window: Some(262_144),
+        max_output_tokens: Some(65_536),
+        pricing: Some(Pricing::flat(0.684, 3.42).with_notes("OpenRouter rate for moonshotai/kimi-k2.6: input $0.684/M, output $3.42/M.")),
+        supports_thinking: false,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_KIMI_K26_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Exact OpenRouter slug (note the dot). Hybrid model marketed/used as a non-reasoning coding+multimodal model, so supports_thinking=false (use moonshotai/kimi-k2-thinking for the dedicated reasoning model). Context 262,144; 65536 is a generous app-side completion budget within the window."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "moonshotai/kimi-k2.5",
+        context_window: Some(262_144),
+        max_output_tokens: Some(32_768),
+        pricing: Some(Pricing::flat(0.4, 1.9).with_notes("OpenRouter rate for moonshotai/kimi-k2.5: input $0.40/M, output $1.90/M.")),
+        supports_thinking: false,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_KIMI_K25_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("OpenRouter route for the model the native constructor names 'kimi-k2.5'. Treated as non-reasoning (visual-coding + agentic tool-calling) on OpenRouter. Context 262,144; 32768 is a generous app-side completion budget within the window."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "kimi-k2.5",
+        context_window: Some(262_144),
+        max_output_tokens: Some(32_768),
+        pricing: Some(Pricing::flat(0.6, 3.0).with_notes("Native Moonshot estimate from Artificial Analysis (~$0.58 in / $3.00 out); input rounded up to $0.60 to stay conservative for budget reservation.")),
+        supports_thinking: false,
+        supports_adaptive_thinking: false,
+        source_url: KIMI_K25_AA_URL,
+        source_status: SourceStatus::Unverified,
+        notes: Some("Exact native model_id used by the native constructor (Moonshot platform.kimi.ai base_url). Native pricing not on the first-party table (only k2.6 is enumerated); figures derived from Artificial Analysis. Context 262,144; 32768 is a generous within-window completion budget."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "kimi-k2-thinking",
+        context_window: Some(262_144),
+        max_output_tokens: Some(131_072),
+        pricing: Some(Pricing::flat(0.6, 2.5).with_notes("Cross-provider median for kimi-k2-thinking (OpenRouter/Artificial Analysis): input $0.60/M, output $2.50/M, used as a conservative native estimate.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_KIMI_K2_THINKING_URL,
+        source_status: SourceStatus::Unverified,
+        notes: Some("Exact native model_id used by the native constructor; a REASONING model (emits hidden chain-of-thought before the answer). Native Moonshot base_url. First-party pricing could not be isolated; figures are the cross-provider median. Context 262,144; max_output 131072 sized generously for reasoning tokens, within the window."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "deepseek/deepseek-v4-pro",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(384_000),
+        pricing: Some(Pricing::flat(0.44, 0.87).with_notes("OpenRouter effective post-promo rate ($0.435 in rounded up to $0.44 / $0.87 out). Pre-promo regular rate was $1.74/$3.48.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_DEEPSEEK_V4_PRO_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Primary model named in forge config; exact OpenRouter slug. Large MoE (1.6T total / 49B active), released 2026-04-24. Reasoning/thinking model; DeepSeek returns the answer in `content` and chain-of-thought in a separate `reasoning_content` field, which must be echoed back in subsequent thinking-mode turns or the API returns 400. Max output 384K (DeepSeek ceiling), sized generously for reasoning."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "deepseek-v4-pro",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(384_000),
+        pricing: Some(Pricing::flat_with_cached(0.44, 0.87, 0.003_625).with_notes("Official DeepSeek pricing: input cache-MISS $0.435/M (rounded up to $0.44), cache-HIT $0.003625/M, output $0.87/M.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: DEEPSEEK_PRICING_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Native DeepSeek API model id 'deepseek-v4-pro' (no vendor prefix). 1M context, 384K max output. Reasoning/thinking model; separate `reasoning_content` that must be echoed back in multi-turn thinking-mode requests or you get a 400. Legacy ids deepseek-reasoner/deepseek-chat now map to V4-FLASH, not Pro."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "deepseek/deepseek-v4-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(384_000),
+        pricing: Some(Pricing::flat(0.15, 0.28).with_notes("DeepSeek list rate rounded up ($0.14 in -> $0.15 / $0.28 out) used instead of OpenRouter's lower fluctuating effective rate so consumers never under-reserve budget.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_DEEPSEEK_V4_FLASH_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Sibling V4 model (cheaper routing target). Efficiency MoE (284B total / 13B active), released 2026-04-24. Reasoning/thinking model with the same reasoning_content split + mandatory pass-back-or-400 behavior as V4 Pro. Max output 384K per DeepSeek docs."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "deepseek-v4-flash",
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(384_000),
+        pricing: Some(Pricing::flat_with_cached(0.14, 0.28, 0.002_8).with_notes("Official DeepSeek pricing: input cache-MISS $0.14/M, cache-HIT $0.0028/M, output $0.28/M.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: DEEPSEEK_PRICING_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Native DeepSeek API model id 'deepseek-v4-flash'. 1M context, 384K max output. Reasoning/thinking model; same content/reasoning_content split and mandatory pass-back in thinking mode. Legacy aliases deepseek-chat/deepseek-reasoner now resolve to this Flash model."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "MiniMax-M2.5",
+        context_window: Some(204_800),
+        max_output_tokens: Some(131_072),
+        pricing: Some(Pricing::flat_with_cached(0.3, 1.2, 0.155).with_notes("Native MiniMax first-party pricing: input $0.30/M, output $1.20/M, cached input ~$0.155/M.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: MINIMAX_PRICING_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("Native agent-sdk constructor model string 'MiniMax-M2.5' (api.minimax.io, OpenAI-compatible). Reasoning/thinking model; emits chain-of-thought in <think>...</think> tags and supports interleaved thinking. Context 204,800; max_output 131072 sized generously for hidden reasoning + answer within the window."),
+    },
+    ModelCapabilities {
+        provider: "openai",
+        model_id: "minimax/minimax-m2.5",
+        context_window: Some(204_800),
+        max_output_tokens: Some(131_072),
+        pricing: Some(Pricing::flat(0.15, 1.15).with_notes("OpenRouter rate for minimax/minimax-m2.5: input $0.15/M, output $1.15/M (lower than MiniMax's $0.30/$1.20 first-party rate; OpenRouter prices can fluctuate, so reserve conservatively).")),
+        supports_thinking: true,
+        supports_adaptive_thinking: false,
+        source_url: OPENROUTER_MINIMAX_M25_URL,
+        source_status: SourceStatus::Derived,
+        notes: Some("OpenRouter slug 'minimax/minimax-m2.5' (same M2.5 weights as native). Reasoning/thinking model. Context 204,800; max_output 131072 sized generously for hidden reasoning tokens before the answer."),
+    },
 ];
 
 #[must_use]
@@ -684,6 +845,96 @@ mod tests {
         let pro = get_model_capabilities("gemini", "gemini-3.1-pro-preview").unwrap();
         assert_eq!(pro.max_output_tokens, Some(65_536));
         assert!(pro.supports_thinking);
+    }
+
+    #[test]
+    fn test_lookup_open_reasoning_models_resolve_with_thinking() {
+        // DeepSeek V4 Pro via OpenRouter slug — reasoning model.
+        let deepseek = get_model_capabilities("openai", "deepseek/deepseek-v4-pro").unwrap();
+        assert!(deepseek.supports_thinking);
+        assert_eq!(deepseek.max_output_tokens, Some(384_000));
+        let pricing = deepseek.pricing.unwrap();
+        assert!(pricing.input.unwrap().usd_per_million_tokens > 0.0);
+        assert!(pricing.output.unwrap().usd_per_million_tokens > 0.0);
+
+        // z.ai GLM-5.1 via OpenRouter slug — reasoning model.
+        let glm = get_model_capabilities("openai", "z-ai/glm-5.1").unwrap();
+        assert!(glm.supports_thinking);
+        assert_eq!(glm.max_output_tokens, Some(131_072));
+        let glm_pricing = glm.pricing.unwrap();
+        assert!((glm_pricing.input.unwrap().usd_per_million_tokens - 0.98).abs() < f64::EPSILON);
+        assert!((glm_pricing.output.unwrap().usd_per_million_tokens - 3.08).abs() < f64::EPSILON);
+
+        // Kimi K2 Thinking native — reasoning model.
+        let kimi_thinking = get_model_capabilities("openai", "kimi-k2-thinking").unwrap();
+        assert!(kimi_thinking.supports_thinking);
+        assert_eq!(kimi_thinking.max_output_tokens, Some(131_072));
+        assert!(
+            kimi_thinking
+                .pricing
+                .unwrap()
+                .output
+                .unwrap()
+                .usd_per_million_tokens
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn test_lookup_open_non_reasoning_kimi_models() {
+        // Kimi K2.6 / K2.5 are registered as non-reasoning coding models.
+        let k26 = get_model_capabilities("openai", "moonshotai/kimi-k2.6").unwrap();
+        assert!(!k26.supports_thinking);
+        assert_eq!(k26.max_output_tokens, Some(65_536));
+        assert!(k26.pricing.unwrap().input.unwrap().usd_per_million_tokens > 0.0);
+
+        let k25_native = get_model_capabilities("openai", "kimi-k2.5").unwrap();
+        assert!(!k25_native.supports_thinking);
+        assert_eq!(k25_native.max_output_tokens, Some(32_768));
+    }
+
+    #[test]
+    fn test_lookup_all_open_models_resolve() {
+        // Every model_id below is exactly how the consumer looks them up
+        // (provider == "openai" for all open routes).
+        for model_id in [
+            "z-ai/glm-5.1",
+            "glm-5",
+            "moonshotai/kimi-k2.6",
+            "moonshotai/kimi-k2.5",
+            "kimi-k2.5",
+            "kimi-k2-thinking",
+            "deepseek/deepseek-v4-pro",
+            "deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+            "deepseek-v4-flash",
+            "MiniMax-M2.5",
+            "minimax/minimax-m2.5",
+        ] {
+            let caps = get_model_capabilities("openai", model_id)
+                .unwrap_or_else(|| panic!("missing capabilities for {model_id}"));
+            assert!(
+                caps.pricing.is_some(),
+                "pricing should be populated for {model_id}"
+            );
+            assert!(
+                caps.max_output_tokens.is_some_and(|m| m > 0),
+                "max_output_tokens should be non-zero for {model_id}"
+            );
+            assert!(
+                caps.context_window.is_some_and(|c| c > 0),
+                "context_window should be non-zero for {model_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lookup_minimax_native_pricing() {
+        let native = get_model_capabilities("openai", "MiniMax-M2.5").unwrap();
+        assert!(native.supports_thinking);
+        let pricing = native.pricing.unwrap();
+        assert!((pricing.input.unwrap().usd_per_million_tokens - 0.3).abs() < f64::EPSILON);
+        assert!((pricing.output.unwrap().usd_per_million_tokens - 1.2).abs() < f64::EPSILON);
     }
 
     #[test]
