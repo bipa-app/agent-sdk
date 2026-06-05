@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.9.1...agent-sdk-foundation-v0.9.2) - 2026-06-05
+
+### Other
+
+- release v0.9.2 ([#290](https://github.com/bipa-app/agent-sdk/pull/290))
+
 ## [0.9.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.1.0-alpha.3...agent-sdk-foundation-v0.9.0) - 2026-06-02
 
 ### Added
