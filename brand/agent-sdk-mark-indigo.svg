@@ -1,0 +1,6 @@
+<!-- agent-sdk mark, primary indigo (#4F46E5), transparent background. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke="#4F46E5" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+  <polygon points="16,4.5 25.96,10.25 25.96,21.75 16,27.5 6.04,21.75 6.04,10.25"/>
+  <path d="M 18.27 11.545 A 5 5 0 1 1 12.654 12.284" stroke-linecap="butt"/>
+  <polygon points="14.735,10.411 13.993,13.771 11.316,10.798" fill="#4F46E5" stroke="none"/>
+</svg>

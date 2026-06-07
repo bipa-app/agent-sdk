@@ -1,0 +1,19 @@
+<!-- agent-sdk horizontal lockup: mark + wordmark, currentColor.
+     Mark occupies a 32x32 box on the left; wordmark set in Inter 600, lowercase.
+     Clearspace = roughly half the mark height on all sides. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 184 48" fill="none" stroke="currentColor"
+     stroke-linecap="round" stroke-linejoin="round">
+  <!-- mark (scaled 32 -> ~36, vertically centered) -->
+  <g transform="translate(8,6) scale(1.125)">
+    <g stroke-width="1.96">
+      <polygon points="16,4.5 25.96,10.25 25.96,21.75 16,27.5 6.04,21.75 6.04,10.25"/>
+      <path d="M 18.27 11.545 A 5 5 0 1 1 12.654 12.284" stroke-linecap="butt"/>
+      <polygon points="14.735,10.411 13.993,13.771 11.316,10.798" fill="currentColor" stroke="none"/>
+    </g>
+  </g>
+  <!-- wordmark -->
+  <text x="56" y="31.5" fill="currentColor" stroke="none"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, sans-serif"
+        font-size="22" font-weight="600" letter-spacing="-0.4"
+        style="font-variant-ligatures:none">agent-sdk</text>
+</svg>
