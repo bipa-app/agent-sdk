@@ -138,6 +138,18 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     // Anthropic
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-fable-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(10.0, 50.0).with_notes("Anthropic Fable 5 official pricing: $10 input / $50 output per 1M tokens.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Fable 5 is adaptive-only: adaptive thinking is always on (applies even when `thinking` is unset) and `ThinkingMode::Enabled { budget_tokens }` is rejected by the Anthropic API. The SDK fails fast in validate_thinking_config. Raw chain of thought is never returned — thinking blocks arrive empty (the SDK requests thinking display=omitted). Safety classifiers may decline a request with stop_reason=refusal on an HTTP 200."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-opus-4-8",
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
@@ -778,6 +790,25 @@ pub const fn supported_model_capabilities() -> &'static [ModelCapabilities] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lookup_anthropic_fable_5() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let caps = get_model_capabilities("anthropic", "claude-fable-5")
+            .context("claude-fable-5 capabilities missing")?;
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        assert!(caps.supports_adaptive_thinking);
+        assert_eq!(caps.source_status, SourceStatus::Official);
+        let pricing = caps.pricing.context("pricing missing")?;
+        let input = pricing.input.context("input price missing")?;
+        let output = pricing.output.context("output price missing")?;
+        assert!((input.usd_per_million_tokens - 10.0).abs() < f64::EPSILON);
+        assert!((output.usd_per_million_tokens - 50.0).abs() < f64::EPSILON);
+        Ok(())
+    }
 
     #[test]
     fn test_lookup_anthropic_opus_48() {

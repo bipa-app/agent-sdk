@@ -38,6 +38,7 @@ pub const MODEL_SONNET_46: &str = "claude-sonnet-4-6";
 pub const MODEL_OPUS_46: &str = "claude-opus-4-6";
 pub const MODEL_OPUS_47: &str = "claude-opus-4-7";
 pub const MODEL_OPUS_48: &str = "claude-opus-4-8";
+pub const MODEL_FABLE_5: &str = "claude-fable-5";
 
 /// Claude Code tool name mappings for OAuth mode.
 ///
@@ -338,6 +339,19 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_OPUS_48)
     }
 
+    /// Create a provider using Claude Fable 5.
+    ///
+    /// Note: Fable 5 is adaptive-only — the API applies adaptive thinking
+    /// even when no thinking config is sent, and raw chain of thought is
+    /// never returned (thinking blocks arrive with empty content). Passing a
+    /// `ThinkingConfig` with `ThinkingMode::Enabled { budget_tokens }`
+    /// will return an `InvalidRequest` — use `ThinkingConfig::adaptive()`
+    /// or `ThinkingConfig::adaptive_with_effort(_)` instead.
+    #[must_use]
+    pub fn fable(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_FABLE_5)
+    }
+
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
     pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
@@ -362,7 +376,7 @@ impl AnthropicProvider {
     fn requires_adaptive_thinking(&self) -> bool {
         matches!(
             self.model.as_str(),
-            MODEL_SONNET_46 | MODEL_OPUS_46 | MODEL_OPUS_47 | MODEL_OPUS_48
+            MODEL_SONNET_46 | MODEL_OPUS_46 | MODEL_OPUS_47 | MODEL_OPUS_48 | MODEL_FABLE_5
         )
     }
 }
@@ -993,6 +1007,45 @@ mod tests {
     fn test_opus_48_factory_creates_opus_48_provider() {
         let provider = AnthropicProvider::opus_48("test-api-key".to_string());
         assert_eq!(provider.model(), MODEL_OPUS_48);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_fable_5_rejects_budgeted_thinking() {
+        // Fable 5 is adaptive-only: the API applies adaptive thinking even
+        // when `thinking` is unset and rejects budget-based configs. Fail
+        // fast with a migration hint instead of a 400 from the API.
+        let fable = AnthropicProvider::fable("test-api-key".to_string());
+        let error = fable
+            .validate_thinking_config(Some(&ThinkingConfig::new(10_000)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ThinkingConfig::adaptive()"),
+            "expected migration hint, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_fable_5_accepts_adaptive_thinking() {
+        let fable = AnthropicProvider::fable("test-api-key".to_string());
+        assert!(
+            fable
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_ok()
+        );
+        assert!(
+            fable
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive_with_effort(
+                    agent_sdk_foundation::llm::Effort::High
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_fable_factory_creates_fable_5_provider() {
+        let provider = AnthropicProvider::fable("test-api-key".to_string());
+        assert_eq!(provider.model(), MODEL_FABLE_5);
         assert_eq!(provider.provider(), "anthropic");
     }
 
