@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.9.1...agent-sdk-cli-v0.9.2) - 2026-06-04
+## [0.9.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.9.1...agent-sdk-cli-v0.9.2) - 2026-06-09
+
+### Added
+
+- *(providers)* add Claude Fable 5 model support — `--model fable` alias ([#297](https://github.com/bipa-app/agent-sdk/pull/297))
 
 ### Fixed
 
