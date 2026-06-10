@@ -485,6 +485,7 @@ impl LlmProvider for OpenAIProvider {
 
             let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
             let include_stream_usage = use_stream_usage_options(&self.base_url);
+            let include_openrouter_usage = use_openrouter_usage_options(&self.base_url);
             let api_request = ApiChatRequestStreaming {
                 model: &self.model,
                 messages: &messages,
@@ -496,6 +497,9 @@ impl LlmProvider for OpenAIProvider {
                 response_format,
                 stream_options: include_stream_usage.then_some(ApiStreamOptions {
                     include_usage: true,
+                }),
+                usage: include_openrouter_usage.then_some(ApiOpenRouterUsageOptions {
+                    include: true,
                 }),
                 stream: true,
             };
@@ -535,6 +539,7 @@ impl LlmProvider for OpenAIProvider {
             let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
                 std::collections::HashMap::new();
             let mut usage: Option<Usage> = None;
+            let mut stop_reason: Option<StopReason> = None;
             let mut buffer = String::new();
             let mut stream = response.bytes_stream();
 
@@ -558,11 +563,16 @@ impl LlmProvider for OpenAIProvider {
                             SseProcessResult::ToolCallUpdate { index, id, name, arguments } => apply_tool_call_update(&mut tool_calls, index, id, name, arguments),
                             SseProcessResult::Usage(u) => usage = Some(u),
                             SseProcessResult::Done(sr) => {
-                                for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
-                                return;
+                                stop_reason = Some(sr);
                             }
                             SseProcessResult::Sentinel => {
-                                let sr = if tool_calls.is_empty() { StopReason::EndTurn } else { StopReason::ToolUse };
+                                let sr = stop_reason.unwrap_or({
+                                    if tool_calls.is_empty() {
+                                        StopReason::EndTurn
+                                    } else {
+                                        StopReason::ToolUse
+                                    }
+                                });
                                 for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
                                 return;
                             }
@@ -572,7 +582,8 @@ impl LlmProvider for OpenAIProvider {
             }
 
             // Stream ended without [DONE] - emit what we have
-            for delta in build_stream_end_deltas(&tool_calls, usage, StopReason::EndTurn) {
+            let sr = stop_reason.unwrap_or(StopReason::EndTurn);
+            for delta in build_stream_end_deltas(&tool_calls, usage, sr) {
                 yield Ok(delta);
             }
         })
@@ -751,8 +762,12 @@ fn use_max_tokens_alias(base_url: &str) -> bool {
         || base_url.contains("minimax.io")
 }
 
-fn use_stream_usage_options(base_url: &str) -> bool {
-    base_url == DEFAULT_BASE_URL || base_url.contains("api.openai.com")
+const fn use_stream_usage_options(base_url: &str) -> bool {
+    !base_url.is_empty()
+}
+
+fn use_openrouter_usage_options(base_url: &str) -> bool {
+    base_url.contains("openrouter.ai")
 }
 
 /// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
@@ -1101,6 +1116,8 @@ struct ApiChatRequestStreaming<'a> {
     response_format: Option<ApiResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ApiStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<ApiOpenRouterUsageOptions>,
     stream: bool,
 }
 
@@ -1169,6 +1186,11 @@ impl ApiResponseFormat {
 #[derive(Clone, Copy, Serialize)]
 struct ApiStreamOptions {
     include_usage: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ApiOpenRouterUsageOptions {
+    include: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -2432,6 +2454,74 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_chat_stream_reads_trailing_usage_after_finish_reason() -> anyhow::Result<()> {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url(
+            "test-key-not-a-secret",
+            "custom-compatible-model",
+            server.uri(),
+        );
+        let request = ChatRequest {
+            system: String::new(),
+            messages: vec![agent_sdk_foundation::llm::Message::user("hello")],
+            tools: None,
+            max_tokens: 16,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        };
+
+        let mut stream = std::pin::pin!(provider.chat_stream(request));
+        let mut saw_usage = false;
+        let mut saw_done = false;
+        while let Some(item) = stream.next().await {
+            match item.context("stream delta")? {
+                StreamDelta::Usage(Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }) => {
+                    assert!(!saw_done);
+                    saw_usage = true;
+                }
+                StreamDelta::Done { stop_reason } => {
+                    assert!(saw_usage);
+                    assert_eq!(stop_reason, Some(StopReason::EndTurn));
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_usage);
+        assert!(saw_done);
+        Ok(())
+    }
+
     #[test]
     fn test_sse_delta_deserializes_reasoning_fields() -> anyhow::Result<()> {
         // The streaming delta struct must accept DeepSeek `reasoning_content`
@@ -2556,6 +2646,21 @@ mod tests {
         assert!(use_max_tokens_alias(BASE_URL_KIMI));
         assert!(use_max_tokens_alias(BASE_URL_ZAI));
         assert!(use_max_tokens_alias(BASE_URL_MINIMAX));
+    }
+
+    #[test]
+    fn test_use_stream_usage_options_for_openai_compatible_urls() {
+        assert!(use_stream_usage_options(DEFAULT_BASE_URL));
+        assert!(use_stream_usage_options("https://api.openai.com/v1"));
+        assert!(use_stream_usage_options("http://localhost:11434/v1"));
+        assert!(use_stream_usage_options("https://gateway.example.test/v1"));
+    }
+
+    #[test]
+    fn test_use_openrouter_usage_options_only_for_openrouter() {
+        assert!(use_openrouter_usage_options("https://openrouter.ai/api/v1"));
+        assert!(!use_openrouter_usage_options(DEFAULT_BASE_URL));
+        assert!(!use_openrouter_usage_options("http://localhost:11434/v1"));
     }
 
     #[test]
@@ -2712,6 +2817,7 @@ mod tests {
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
+            usage: None,
             stream: true,
         };
 
@@ -2742,14 +2848,50 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
-            stream_options: None,
+            stream_options: Some(ApiStreamOptions {
+                include_usage: true,
+            }),
+            usage: None,
             stream: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
-        assert!(!json.contains("\"stream_options\""));
+        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
+        assert!(!json.contains("\"usage\""));
+    }
+
+    #[test]
+    fn test_streaming_request_serialization_with_openrouter_usage_options() -> anyhow::Result<()> {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let request = ApiChatRequestStreaming {
+            model: "openrouter/model",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+            stream_options: Some(ApiStreamOptions {
+                include_usage: true,
+            }),
+            usage: Some(ApiOpenRouterUsageOptions { include: true }),
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).context("serialize streaming request")?;
+        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
+        assert!(json.contains("\"usage\":{\"include\":true}"));
+        Ok(())
     }
 
     #[test]
