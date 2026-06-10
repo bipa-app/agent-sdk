@@ -566,13 +566,8 @@ impl LlmProvider for OpenAIProvider {
                                 stop_reason = Some(sr);
                             }
                             SseProcessResult::Sentinel => {
-                                let sr = stop_reason.unwrap_or({
-                                    if tool_calls.is_empty() {
-                                        StopReason::EndTurn
-                                    } else {
-                                        StopReason::ToolUse
-                                    }
-                                });
+                                let sr = stop_reason
+                                    .unwrap_or_else(|| fallback_stream_stop_reason(&tool_calls));
                                 for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
                                 return;
                             }
@@ -582,7 +577,7 @@ impl LlmProvider for OpenAIProvider {
             }
 
             // Stream ended without [DONE] - emit what we have
-            let sr = stop_reason.unwrap_or(StopReason::EndTurn);
+            let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(&tool_calls));
             for delta in build_stream_end_deltas(&tool_calls, usage, sr) {
                 yield Ok(delta);
             }
@@ -662,6 +657,16 @@ fn build_stream_end_deltas(
     });
 
     deltas
+}
+
+fn fallback_stream_stop_reason(
+    tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
+) -> StopReason {
+    if tool_calls.is_empty() {
+        StopReason::EndTurn
+    } else {
+        StopReason::ToolUse
+    }
 }
 
 /// Result of processing an SSE chunk.
@@ -762,8 +767,8 @@ fn use_max_tokens_alias(base_url: &str) -> bool {
         || base_url.contains("minimax.io")
 }
 
-const fn use_stream_usage_options(base_url: &str) -> bool {
-    !base_url.is_empty()
+const fn use_stream_usage_options(_base_url: &str) -> bool {
+    true
 }
 
 fn use_openrouter_usage_options(base_url: &str) -> bool {
@@ -1336,6 +1341,7 @@ struct ToolCallAccumulator {
 /// A single chunk in `OpenAI`'s SSE stream.
 #[derive(Deserialize)]
 struct SseChunk {
+    #[serde(default)]
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<SseUsage>,
@@ -2454,6 +2460,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_process_sse_data_reads_usage_when_choices_are_omitted() {
+        let results = process_sse_data(
+            r#"{
+                "usage": {
+                    "prompt_tokens": 42,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 10
+                    }
+                }
+            }"#,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [SseProcessResult::Usage(Usage {
+                input_tokens: 42,
+                output_tokens: 7,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 0,
+            })]
+        ));
+    }
+
+    #[test]
+    fn test_fallback_stream_stop_reason_uses_tool_use_when_tool_calls_accumulated() {
+        let mut tool_calls = std::collections::HashMap::new();
+        assert_eq!(
+            fallback_stream_stop_reason(&tool_calls),
+            StopReason::EndTurn
+        );
+
+        tool_calls.insert(
+            0,
+            ToolCallAccumulator {
+                id: "call_123".to_owned(),
+                name: "search".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            fallback_stream_stop_reason(&tool_calls),
+            StopReason::ToolUse
+        );
+    }
+
     #[tokio::test]
     async fn test_chat_stream_reads_trailing_usage_after_finish_reason() -> anyhow::Result<()> {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
@@ -2468,6 +2522,11 @@ mod tests {
 
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/chat/completions"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "stream_options": {
+                    "include_usage": true,
+                },
+            })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -2649,7 +2708,8 @@ mod tests {
     }
 
     #[test]
-    fn test_use_stream_usage_options_for_openai_compatible_urls() {
+    fn test_use_stream_usage_options_is_always_enabled() {
+        assert!(use_stream_usage_options(""));
         assert!(use_stream_usage_options(DEFAULT_BASE_URL));
         assert!(use_stream_usage_options("https://api.openai.com/v1"));
         assert!(use_stream_usage_options("http://localhost:11434/v1"));
