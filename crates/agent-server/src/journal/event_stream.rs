@@ -60,17 +60,19 @@ use tokio::sync::broadcast;
 /// Created by [`stream_events`].  Call [`next`](EventStream::next) in
 /// a loop to receive events in sequence order.
 pub struct EventStream {
-    /// Events buffered from the durable replay phase.
-    replay_buffer: Vec<CommittedEvent>,
-    /// Current index into `replay_buffer`.
-    replay_index: usize,
+    /// Events captured during the durable replay phase, drained by
+    /// move (no per-event clone) as `next()` yields them.
+    replay: std::vec::IntoIter<CommittedEvent>,
     /// Live tail receiver (post-watermark events).
     live_rx: EventReceiver,
     /// The highest sequence yielded so far.  Used to skip duplicates
     /// during the handoff window.
     last_yielded: Option<u64>,
-    /// Whether the replay phase has been fully drained.
-    replay_drained: bool,
+    /// Latched once the live tail reports a `Lagged` gap.  After a gap
+    /// the stream can no longer guarantee contiguity, so subsequent
+    /// `next()` calls return `None` to force a reconnect through
+    /// [`stream_events`] rather than silently skipping the lost range.
+    lagged: bool,
     /// When set, `next()` yields a `RetentionGap` as its first item
     /// before proceeding to replay/live.
     retention_gap: Option<(u64, u64)>,
@@ -104,6 +106,14 @@ impl EventStream {
     /// Returns `None` when the live tail channel is closed (all
     /// notifiers dropped).
     pub async fn next(&mut self) -> Option<StreamEvent> {
+        // Once the live tail has reported a gap, the no-gaps guarantee
+        // is void: return `None` so a caller that ignores `Lagged`
+        // fails safe (stream appears closed) instead of silently
+        // receiving post-gap events with skipped sequences.
+        if self.lagged {
+            return None;
+        }
+
         // Phase 0: yield a retention gap signal if the client requested
         // events below the retention floor.
         if let Some((requested, floor)) = self.retention_gap.take() {
@@ -113,27 +123,15 @@ impl EventStream {
             });
         }
 
-        // Phase 1: drain the replay buffer.
-        if !self.replay_drained {
-            if let Some(event) = self.next_from_replay() {
-                return Some(StreamEvent::Event(Box::new(event)));
-            }
-            self.replay_drained = true;
-            self.replay_buffer.clear();
+        // Phase 1: drain the replay window by moving events out of the
+        // buffer (no clone).
+        if let Some(event) = self.replay.next() {
+            self.last_yielded = Some(event.sequence);
+            return Some(StreamEvent::Event(Box::new(event)));
         }
 
         // Phase 2: live tail.
         self.next_from_live().await
-    }
-
-    fn next_from_replay(&mut self) -> Option<CommittedEvent> {
-        if self.replay_index < self.replay_buffer.len() {
-            let event = self.replay_buffer[self.replay_index].clone();
-            self.replay_index += 1;
-            self.last_yielded = Some(event.sequence);
-            return Some(event);
-        }
-        None
     }
 
     async fn next_from_live(&mut self) -> Option<StreamEvent> {
@@ -148,6 +146,7 @@ impl EventStream {
                     return Some(StreamEvent::Event(Box::new(event)));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    self.lagged = true;
                     return Some(StreamEvent::Lagged { skipped: n });
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -169,7 +168,11 @@ impl EventStream {
 /// from durable replay to live tail without gaps or duplicates.
 ///
 /// Pass `after_sequence = None` to replay from the beginning of the
-/// thread's event history.
+/// thread's event history.  If that beginning has been purged (the
+/// retention floor is above 0), the stream first yields a
+/// [`StreamEvent::RetentionGap`] with `requested_after = 0` and then
+/// resumes at the floor — the same signal a `Some(after)` request
+/// below the floor receives, so both entry points behave consistently.
 ///
 /// # Errors
 ///
@@ -190,21 +193,23 @@ pub async fn stream_events(
         .await
         .context("stream_events: read retention floor")?;
 
+    // The first sequence the client still needs.  `None` ("from the
+    // beginning") wants sequence 0; `Some(after)` wants `after + 1`.
+    // A retention gap exists exactly when this next-wanted sequence
+    // sits below the floor (it was purged).  `requested_after_marker`
+    // is the value reported in the gap frame — the client's supplied
+    // `after`, or 0 for a from-the-start request.
+    let next_wanted = after_sequence.map_or(0, |after| after + 1);
+    let requested_after_marker = after_sequence.unwrap_or(0);
+
     let mut retention_gap = None;
     let effective_after = if floor > 0 {
-        match after_sequence {
-            // A genuine gap exists only when at least one sequence in
-            // `(after, floor)` is missing — i.e. `after + 1 < floor`.
-            // When `after == floor - 1`, the client has already seen
-            // every purged event and can resume seamlessly at `floor`
-            // without a (false-positive) gap signal.
-            Some(after) if after + 1 < floor => {
-                retention_gap = Some((after, floor));
-                Some(floor.saturating_sub(1))
-            }
-            None => Some(floor.saturating_sub(1)),
-            other => other,
+        if next_wanted < floor {
+            retention_gap = Some((requested_after_marker, floor));
         }
+        // Resume at the floor, but never rewind a client already ahead
+        // of it.
+        Some(after_sequence.map_or(floor - 1, |after| after.max(floor - 1)))
     } else {
         after_sequence
     };
@@ -222,10 +227,16 @@ pub async fn stream_events(
     // Step 3: replay durable events in the window
     // `(effective_after, high_water]`.
     //
-    // For "replay from start" (`effective_after = None`) we load all
-    // events up to the watermark via `get_events` + filter, because
-    // `get_events_in_range` uses a strictly-greater-than lower bound
-    // and would skip sequence 0.
+    // The `Some(after)` path is already watermark-bounded — it pulls
+    // only the `(after, high_water]` window, not the full log.  The
+    // "replay from start" (`effective_after = None`) path still loads
+    // every event up to the watermark via `get_events` + filter,
+    // because `get_events_in_range` uses a strictly-greater-than lower
+    // bound and cannot express "from sequence 0".  Folding that into a
+    // chunked, inclusive-lower-bound query needs an `EventRepository`
+    // method change that ripples into the durable backends, so it is
+    // tracked separately; the buffer is drained by move below so we no
+    // longer hold a second copy.
     let mut replay_buffer: Vec<CommittedEvent> = if watermark == 0 {
         Vec::new()
     } else {
@@ -263,20 +274,13 @@ pub async fn stream_events(
         .context("stream_events: re-read retention floor")?;
 
     if floor_after_fetch > floor {
-        let requested = match (retention_gap, after_sequence) {
-            (Some((requested_after, _)), _) => requested_after,
-            (None, Some(after)) => after,
-            (None, None) => 0,
-        };
-        // A gap requires at least one purged sequence between
-        // `requested` and `floor_after_fetch` — i.e. `floor > requested + 1`.
-        // Mirror Step 1.5's `after + 1 < floor` guard so the two steps
-        // agree at the boundary `requested == floor_after_fetch - 1`:
-        // the client has already seen every purged event and can
-        // resume seamlessly at the new floor with no false-positive
-        // gap.
-        if floor_after_fetch > requested.saturating_add(1) {
-            retention_gap = Some((requested, floor_after_fetch));
+        // Reuse Step 1.5's unified rule: a gap exists when the client's
+        // next-wanted sequence sits below the (now higher) floor.  This
+        // keeps `None` and `Some(after)` requests consistent at every
+        // boundary, including `next_wanted == floor_after_fetch - 1`
+        // (the client already has every purged event → no gap).
+        if next_wanted < floor_after_fetch {
+            retention_gap = Some((requested_after_marker, floor_after_fetch));
         }
         // `retain` is unconditional: any in-buffer event below the
         // new floor was purged by the janitor and must not be served.
@@ -297,11 +301,10 @@ pub async fn stream_events(
     }
 
     Ok(EventStream {
-        replay_buffer,
-        replay_index: 0,
+        replay: replay_buffer.into_iter(),
         live_rx,
         last_yielded: initial_last_yielded,
-        replay_drained: false,
+        lagged: false,
         retention_gap,
     })
 }
@@ -407,7 +410,7 @@ mod tests {
         )
         .await?;
         // Replay buffer should be empty.
-        assert!(stream.replay_buffer.is_empty());
+        assert_eq!(stream.replay.len(), 0);
         Ok(())
     }
 
@@ -566,10 +569,10 @@ mod tests {
         let stream_a = stream_events(&thread_a(), None, &repo, &retention, &notifier).await?;
         let stream_b = stream_events(&thread_b, None, &repo, &retention, &notifier).await?;
 
-        assert_eq!(stream_a.replay_buffer.len(), 1);
-        assert_eq!(stream_a.replay_buffer[0].thread_id, thread_a());
-        assert_eq!(stream_b.replay_buffer.len(), 1);
-        assert_eq!(stream_b.replay_buffer[0].thread_id, thread_b);
+        assert_eq!(stream_a.replay.len(), 1);
+        assert_eq!(stream_a.replay.as_slice()[0].thread_id, thread_a());
+        assert_eq!(stream_b.replay.len(), 1);
+        assert_eq!(stream_b.replay.as_slice()[0].thread_id, thread_b);
         Ok(())
     }
 
@@ -650,7 +653,7 @@ mod tests {
             &notifier,
         )
         .await?;
-        assert!(stream.replay_buffer.is_empty());
+        assert_eq!(stream.replay.len(), 0);
 
         // Only live events should arrive.
         let e3 = repo
@@ -668,7 +671,7 @@ mod tests {
     // ── Replay buffer memory ────────────────────────────────────────
 
     #[tokio::test]
-    async fn replay_buffer_cleared_after_drain() -> Result<()> {
+    async fn replay_buffer_drained_by_move() -> Result<()> {
         let repo = InMemoryEventRepository::new();
         let notifier = EventNotifier::new();
 
@@ -685,21 +688,13 @@ mod tests {
             &notifier,
         )
         .await?;
-        assert_eq!(stream.replay_buffer.len(), 2);
+        assert_eq!(stream.replay.len(), 2);
 
-        // Drain replay.
+        // Each yield moves one event out of the replay window.
         stream.next().await;
+        assert_eq!(stream.replay.len(), 1);
         stream.next().await;
-
-        // Commit and notify a live event so the transition call doesn't block.
-        let e = repo
-            .commit_event(&thread_a(), AgentEvent::text("m3", "c"), t_plus(2))
-            .await?;
-        notifier.notify(&[e]);
-
-        // This call transitions to live tail, clearing the replay buffer.
-        stream.next().await;
-        assert!(stream.replay_buffer.is_empty());
+        assert_eq!(stream.replay.len(), 0);
         Ok(())
     }
 
@@ -1237,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_from_none_with_floor_starts_from_floor() -> Result<()> {
+    async fn replay_from_none_with_floor_emits_gap_then_starts_from_floor() -> Result<()> {
         use super::super::retention::RetentionStore;
 
         let repo = InMemoryEventRepository::new();
@@ -1257,10 +1252,71 @@ mod tests {
 
         let mut stream = stream_events(&thread_a(), None, &repo, &retention, &notifier).await?;
 
+        // `None` over a purged prefix yields a RetentionGap with
+        // `requested_after = 0`, consistent with the `Some(after)`
+        // below-floor path, before resuming at the floor.
+        match stream.next().await {
+            Some(StreamEvent::RetentionGap {
+                requested_after,
+                retention_floor,
+            }) => {
+                assert_eq!(requested_after, 0);
+                assert_eq!(retention_floor, 3);
+            }
+            other => panic!("expected RetentionGap(0, 3), got {other:?}"),
+        }
         match stream.next().await {
             Some(StreamEvent::Event(e)) => assert_eq!(e.sequence, 3),
             other => panic!("expected Event(seq=3) from floor, got {other:?}"),
         }
+        Ok(())
+    }
+
+    // ── Lagged latch (no silent gap after Lagged) ──────────────────
+
+    #[tokio::test]
+    async fn stream_returns_none_after_lagged_instead_of_silent_gap() -> Result<()> {
+        // Tiny broadcast buffer so the live tail overflows deterministically.
+        let repo = InMemoryEventRepository::new();
+        let notifier = EventNotifier::with_capacity(2);
+
+        // Start at the head: nothing to replay, parks on the live tail.
+        repo.commit_event(&thread_a(), AgentEvent::text("m0", "a"), t0())
+            .await?;
+        let mut stream = stream_events(
+            &thread_a(),
+            Some(0),
+            &repo,
+            &InMemoryRetentionStore::new(),
+            &notifier,
+        )
+        .await?;
+
+        // Overflow the capacity-2 broadcast buffer before draining.
+        for i in 1..=5i64 {
+            let e = repo
+                .commit_event(
+                    &thread_a(),
+                    AgentEvent::text(format!("m{i}"), "x"),
+                    t_plus(i),
+                )
+                .await?;
+            notifier.notify(&[e]);
+        }
+
+        // First poll surfaces the gap exactly once.
+        match stream.next().await {
+            Some(StreamEvent::Lagged { skipped }) => assert!(skipped > 0),
+            other => panic!("expected Lagged, got {other:?}"),
+        }
+
+        // A caller that ignores `Lagged` and keeps polling must NOT
+        // receive post-gap events with skipped sequences — the stream
+        // latches closed so the omission is fail-safe.
+        assert!(
+            stream.next().await.is_none(),
+            "stream must report None after Lagged, not silently skip the gap",
+        );
         Ok(())
     }
 }

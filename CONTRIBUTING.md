@@ -26,7 +26,7 @@ before investing significant effort.
 
 ### Prerequisites
 
-- Rust 1.85+ (2024 edition)
+- Rust 1.91+ (2024 edition; workspace MSRV, verified by CI)
 - Cargo
 
 ### Building
@@ -55,11 +55,22 @@ scripts/postgres18-dev.sh up
 scripts/postgres18-dev.sh wait
 ```
 
-Refresh SQLx metadata against a fresh local database:
+Refresh SQLx metadata against a fresh local database. The `.sqlx` cache holds
+entries for **both** the Postgres and SQLite backends, and `cargo sqlx prepare`
+wipes `.sqlx/` before writing — so you must refresh both backends, in order:
 
 ```bash
+# 1. Regenerate the Postgres entries (this DROPS the SQLite entries).
 scripts/postgres18-dev.sh prepare
+
+# 2. Regenerate the SQLite entries. This script backs up and merges the
+#    existing Postgres entries, so run it AFTER the Postgres prepare.
+scripts/sqlite-dev.sh prepare
 ```
+
+> **Warning:** running `scripts/postgres18-dev.sh prepare` on its own leaves the
+> SQLite query cache empty and breaks `SQLX_OFFLINE` builds for the SQLite
+> backend. Always follow it with `scripts/sqlite-dev.sh prepare`.
 
 Validate that the current migration bundle applies cleanly and that the
 Postgres store tests pass against the local database:
@@ -180,6 +191,29 @@ pub struct CreateParams { pub a: A, pub b: B, /* ... */ }
 pub fn create(params: CreateParams) { }
 ```
 
+## Signed Commits
+
+**All commits must be GPG-signed and verified.** Configure signing before you
+start:
+
+```bash
+git config user.signingkey <YOUR_KEY_ID>
+git config commit.gpgsign true   # or set globally
+```
+
+Then add the public key to your GitHub account (Settings → SSH and GPG keys) so
+commits show as **Verified**. Sign an individual commit with `git commit -S`;
+re-sign existing commits on a branch with:
+
+```bash
+git rebase --exec 'git commit --amend --no-edit -S' <base>
+git push --force-with-lease
+```
+
+If your tooling commits non-interactively (some sandboxes disable signing even
+when `commit.gpgsign = true`), pass `-S` explicitly and make sure your
+`gpg-agent` has the key passphrase cached.
+
 ## Pull Request Process
 
 All pull requests target the **`main`** branch.
@@ -189,7 +223,8 @@ All pull requests target the **`main`** branch.
 3. Add tests for new functionality
 4. Keep PRs focused - one feature or fix per PR
 5. Write clear commit messages that explain the "why"
-6. Reference any related issues in the PR description
+6. Sign every commit (see [Signed Commits](#signed-commits)) — commits must be Verified
+7. Reference any related issues in the PR description
 
 ## Reporting Issues
 

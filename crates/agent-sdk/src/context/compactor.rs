@@ -1,6 +1,8 @@
 //! Context compaction implementation.
 
-use crate::llm::{ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role};
+use crate::llm::{
+    ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role, StopReason,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::fmt::Write;
@@ -17,8 +19,9 @@ const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const SUMMARY_ACKNOWLEDGMENT: &str =
     "I understand the context from the summary. Let me continue from where we left off.";
-const MAX_RETAINED_TAIL_MESSAGE_TOKENS: usize = 20_000;
 const MAX_TOOL_RESULT_CHARS: usize = 500;
+const TRUNCATED_SUMMARY_MARKER: &str =
+    "\n\n[summary truncated: exceeded the configured summary_max_tokens budget]";
 
 /// Trait for context compaction strategies.
 ///
@@ -116,13 +119,23 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         self
     }
 
-    /// Return true when a content object is a previously inserted compaction summary marker.
-    fn is_summary_message(content: &Content) -> bool {
+    /// If `content` is a previously inserted compaction summary, return its
+    /// text with the `SUMMARY_PREFIX` marker stripped; otherwise `None`.
+    ///
+    /// Used to carry a prior summary's prose forward into the next compaction
+    /// instead of discarding it (which silently destroyed all pre-first-
+    /// compaction context). The marker is still a content-prefix sentinel
+    /// because `Message` lives in a foundation crate and cannot carry a
+    /// structural flag from here; the compactor itself is the only writer of
+    /// the prefix.
+    fn extract_summary_text(content: &Content) -> Option<String> {
         match content {
-            Content::Text(text) => text.starts_with(SUMMARY_PREFIX),
-            Content::Blocks(blocks) => blocks.iter().any(|block| match block {
-                ContentBlock::Text { text } => text.starts_with(SUMMARY_PREFIX),
-                _ => false,
+            Content::Text(text) => text.strip_prefix(SUMMARY_PREFIX).map(str::to_string),
+            Content::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => {
+                    text.strip_prefix(SUMMARY_PREFIX).map(str::to_string)
+                }
+                _ => None,
             }),
         }
     }
@@ -149,20 +162,27 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
         )
     }
 
-    /// Shift split point backwards until tool-use/result pairs are not split.
+    /// Shift split point backwards until a `tool_use`/`tool_result` pair is not
+    /// split.
+    ///
+    /// Only the `assistant(tool_use)` -> `user(tool_result)` boundary is
+    /// unsplittable: that is the single tool turn that must stay together for
+    /// the wire payload to be valid. Splitting at a `user(tool_result)` ->
+    /// `assistant(tool_use)` boundary is API-valid (the retained tail then
+    /// begins with an `assistant` `tool_use` followed by its own result), so
+    /// it is *not* treated as a pair. Treating it as a pair used to walk the
+    /// split backward through an entire unbroken tool chain — the dominant
+    /// shape of autonomous traces — defeating the retained-tail token cap and
+    /// summarizing almost nothing.
     fn split_point_preserves_tool_pairs(messages: &[Message], mut split_point: usize) -> usize {
         while split_point > 0 && split_point < messages.len() {
             let prev = &messages[split_point - 1];
             let next = &messages[split_point];
 
-            let crosses_tool_pair = (prev.role == Role::Assistant
+            let crosses_tool_pair = prev.role == Role::Assistant
                 && Self::has_tool_use(&prev.content)
                 && next.role == Role::User
-                && Self::has_tool_result(&next.content))
-                || (prev.role == Role::User
-                    && Self::has_tool_result(&prev.content)
-                    && next.role == Role::Assistant
-                    && Self::has_tool_use(&next.content));
+                && Self::has_tool_result(&next.content);
 
             if crosses_tool_pair {
                 split_point -= 1;
@@ -323,7 +343,10 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
     }
 
     /// Format messages for summarization.
-    fn format_messages_for_summary(messages: &[Message]) -> String {
+    ///
+    /// Borrows each message rather than taking a slice of owned values so the
+    /// caller can pass a filtered view (`Vec<&Message>`) without cloning.
+    fn format_messages_for_summary<'a>(messages: impl IntoIterator<Item = &'a Message>) -> String {
         let mut output = String::new();
 
         for message in messages {
@@ -398,35 +421,36 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
     }
 
     /// Build the summarization prompt.
-    fn build_summary_prompt(&self, messages_text: &str) -> String {
-        format!(
+    ///
+    /// When `prior_summaries` is non-empty (a re-compaction is folding earlier
+    /// summaries back in), their prose is prepended as a labeled section so the
+    /// model preserves and subsumes those facts in the new summary rather than
+    /// losing all pre-first-compaction context.
+    fn build_summary_prompt(&self, prior_summaries: &[String], messages_text: &str) -> String {
+        let base = format!(
             "{}{}{}",
             self.summary_prompt_prefix, messages_text, self.summary_prompt_suffix
-        )
-    }
-}
+        );
 
-#[async_trait]
-impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
-    async fn compact(&self, messages: &[Message]) -> Result<String> {
-        let messages_to_summarize: Vec<_> = messages
-            .iter()
-            .filter(|message| !Self::is_summary_message(&message.content))
-            .cloned()
-            .collect();
-
-        if messages_to_summarize.is_empty() {
-            return Ok(COMPACT_EMPTY_SUMMARY.to_string());
+        if prior_summaries.is_empty() {
+            return base;
         }
 
-        let messages_text = Self::format_messages_for_summary(&messages_to_summarize);
-        let prompt = self.build_summary_prompt(&messages_text);
+        let prior = prior_summaries.join("\n\n");
+        format!(
+            "Previous summary of earlier conversation. Preserve every fact below \
+             in your new summary so no earlier context is lost:\n{prior}\n\n{base}"
+        )
+    }
 
+    /// Run a single summarization LLM call, returning the summary text and
+    /// whether the response was truncated by the `max_tokens` budget.
+    async fn run_summarization(&self, prompt: String, max_tokens: usize) -> Result<(String, bool)> {
         let request = ChatRequest {
             system: self.system_prompt.clone(),
             messages: vec![Message::user(prompt)],
             tools: None,
-            max_tokens: 2000,
+            max_tokens: u32::try_from(max_tokens).unwrap_or(u32::MAX),
             max_tokens_explicit: true,
             session_id: None,
             cached_content: None,
@@ -442,10 +466,14 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
             .context("Failed to call LLM for summarization")?;
 
         match outcome {
-            ChatOutcome::Success(response) => response
-                .first_text()
-                .map(String::from)
-                .context("No text in summarization response"),
+            ChatOutcome::Success(response) => {
+                let truncated = response.stop_reason == Some(StopReason::MaxTokens);
+                let text = response
+                    .first_text()
+                    .map(String::from)
+                    .context("No text in summarization response")?;
+                Ok((text, truncated))
+            }
             ChatOutcome::RateLimited => {
                 bail!("Rate limited during summarization")
             }
@@ -461,6 +489,62 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
                 bail!("Unrecognized provider outcome during summarization")
             }
         }
+    }
+}
+
+#[async_trait]
+impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
+    async fn compact(&self, messages: &[Message]) -> Result<String> {
+        // Separate prior compaction summaries (whose prose must be carried
+        // forward) from fresh messages (which still need summarizing). Prior
+        // summaries used to be filtered out and silently dropped, destroying
+        // all context from before the previous compaction.
+        let mut prior_summaries: Vec<String> = Vec::new();
+        let mut fresh: Vec<&Message> = Vec::new();
+        for message in messages {
+            if let Some(text) = Self::extract_summary_text(&message.content) {
+                if !text.is_empty() {
+                    prior_summaries.push(text);
+                }
+            } else {
+                fresh.push(message);
+            }
+        }
+
+        // Nothing fresh to summarize: carry prior summaries forward verbatim
+        // (no LLM call needed) rather than discarding them.
+        if fresh.is_empty() {
+            if prior_summaries.is_empty() {
+                return Ok(COMPACT_EMPTY_SUMMARY.to_string());
+            }
+            return Ok(prior_summaries.join("\n\n"));
+        }
+
+        let messages_text = Self::format_messages_for_summary(fresh.iter().copied());
+        let prompt = self.build_summary_prompt(&prior_summaries, &messages_text);
+
+        let budget = self.config.summary_max_tokens;
+        let (mut summary, truncated) = self.run_summarization(prompt.clone(), budget).await?;
+
+        if truncated {
+            log::warn!(
+                "compaction summary hit the max_tokens budget ({budget}); \
+                 retrying with a larger budget to avoid silent context loss"
+            );
+            let (retry_summary, still_truncated) = self
+                .run_summarization(prompt, budget.saturating_mul(2))
+                .await?;
+            summary = retry_summary;
+            if still_truncated {
+                log::warn!(
+                    "compaction summary still truncated after retry; appending a \
+                     truncation marker so downstream context loss is visible"
+                );
+                summary.push_str(TRUNCATED_SUMMARY_MARKER);
+            }
+        }
+
+        Ok(summary)
     }
 
     fn estimate_tokens(&self, messages: &[Message]) -> usize {
@@ -480,7 +564,7 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
         estimated_tokens > self.config.threshold_tokens
     }
 
-    async fn compact_history(&self, messages: Vec<Message>) -> Result<CompactionResult> {
+    async fn compact_history(&self, mut messages: Vec<Message>) -> Result<CompactionResult> {
         let original_count = messages.len();
         let original_tokens = self.estimate_tokens(&messages);
 
@@ -500,13 +584,16 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
         split_point = Self::split_point_preserves_tool_pairs_with_cap(
             &messages,
             split_point,
-            MAX_RETAINED_TAIL_MESSAGE_TOKENS,
+            self.config.max_retained_tail_tokens,
         );
 
-        let (to_summarize, to_keep) = messages.split_at(split_point);
+        // Move the retained tail out of `messages` so it doesn't have to be
+        // cloned: `messages` then holds exactly the slice to summarize.
+        let to_keep = messages.split_off(split_point);
+        let to_summarize = messages;
 
         // Summarize old messages
-        let summary = self.compact(to_summarize).await?;
+        let summary = self.compact(&to_summarize).await?;
 
         // Build new message history
         let mut new_messages = Vec::with_capacity(2 + to_keep.len());
@@ -528,7 +615,8 @@ impl<P: LlmProvider + ?Sized> ContextCompactor for LlmContextCompactor<P> {
         // summary (split shifted forward) or paired with its
         // `tool_use` inside `to_keep` (split shifted backward). No
         // post-hoc rewriting of the assembled output is required.
-        new_messages.extend(to_keep.iter().cloned());
+        // The tail is moved (not cloned) since `compact_history` owns it.
+        new_messages.extend(to_keep);
 
         let new_count = new_messages.len();
         let new_tokens = self.estimate_tokens(&new_messages);
@@ -551,60 +639,94 @@ mod tests {
 
     struct MockProvider {
         summary_response: String,
-        requests: Option<Arc<Mutex<Vec<String>>>>,
+        requests: Arc<Mutex<Vec<String>>>,
+        /// When true, the summary echoes the received prompt (simulating an LLM
+        /// that faithfully preserves its input — used to assert carry-forward).
+        echo_input: bool,
+        /// `stop_reason` returned by the mock; `MaxTokens` simulates truncation.
+        stop_reason: StopReason,
     }
 
     impl MockProvider {
-        fn new(summary: &str) -> Self {
+        fn build(
+            summary: &str,
+            requests: Arc<Mutex<Vec<String>>>,
+            echo_input: bool,
+            stop_reason: StopReason,
+        ) -> Self {
             Self {
                 summary_response: summary.to_string(),
-                requests: None,
+                requests,
+                echo_input,
+                stop_reason,
             }
         }
 
+        fn new(summary: &str) -> Self {
+            Self::build(
+                summary,
+                Arc::new(Mutex::new(Vec::new())),
+                false,
+                StopReason::EndTurn,
+            )
+        }
+
         fn new_with_request_log(summary: &str, requests: Arc<Mutex<Vec<String>>>) -> Self {
-            Self {
-                summary_response: summary.to_string(),
-                requests: Some(requests),
-            }
+            Self::build(summary, requests, false, StopReason::EndTurn)
+        }
+
+        /// A provider whose summary echoes the received prompt verbatim.
+        fn new_echo(requests: Arc<Mutex<Vec<String>>>) -> Self {
+            Self::build("", requests, true, StopReason::EndTurn)
+        }
+
+        /// A provider that always reports `MaxTokens` (a truncated summary).
+        fn new_truncating(summary: &str, requests: Arc<Mutex<Vec<String>>>) -> Self {
+            Self::build(summary, requests, false, StopReason::MaxTokens)
+        }
+
+        fn user_prompt_of(request: &ChatRequest) -> String {
+            request
+                .messages
+                .iter()
+                .find_map(|message| match &message.content {
+                    Content::Text(text) => Some(text.clone()),
+                    Content::Blocks(blocks) => {
+                        let text = blocks
+                            .iter()
+                            .filter_map(|block| {
+                                if let ContentBlock::Text { text } = block {
+                                    Some(text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.is_empty() { None } else { Some(text) }
+                    }
+                })
+                .unwrap_or_default()
         }
     }
 
     #[async_trait]
     impl LlmProvider for MockProvider {
         async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-            if let Some(requests) = &self.requests {
-                let mut entries = requests.lock().unwrap();
-                let user_prompt = request
-                    .messages
-                    .iter()
-                    .find_map(|message| match &message.content {
-                        Content::Text(text) => Some(text.clone()),
-                        Content::Blocks(blocks) => {
-                            let text = blocks
-                                .iter()
-                                .filter_map(|block| {
-                                    if let ContentBlock::Text { text } = block {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if text.is_empty() { None } else { Some(text) }
-                        }
-                    })
-                    .unwrap_or_default();
-                entries.push(user_prompt);
+            let user_prompt = Self::user_prompt_of(&request);
+            if let Ok(mut entries) = self.requests.lock() {
+                entries.push(user_prompt.clone());
             }
+            let text = if self.echo_input {
+                user_prompt
+            } else {
+                self.summary_response.clone()
+            };
             Ok(ChatOutcome::Success(ChatResponse {
                 id: "test".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: self.summary_response.clone(),
-                }],
+                content: vec![ContentBlock::Text { text }],
                 model: "mock".to_string(),
-                stop_reason: Some(StopReason::EndTurn),
+                stop_reason: Some(self.stop_reason),
                 usage: Usage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -780,7 +902,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compact_filters_summary_messages() -> Result<()> {
+    async fn test_compact_carries_prior_summary_into_request() -> Result<()> {
+        // A prior compaction summary must be carried forward into the
+        // summarization input (not silently filtered out), so its facts are
+        // preserved across re-compaction. The fresh message is summarized as
+        // usual; the prior summary is included as a "Previous summary" section.
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(MockProvider::new_with_request_log(
             "Fresh summary",
@@ -796,20 +922,25 @@ mod tests {
 
         let summary = compactor.compact(&messages).await?;
 
-        {
-            let recorded = requests.lock().unwrap();
-            assert_eq!(recorded.len(), 1);
-            assert_eq!(summary, "Fresh summary");
-            assert!(recorded[0].contains("Continue with the next task using this context."));
-            assert!(!recorded[0].contains("already compacted context"));
-            drop(recorded);
-        }
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 1);
+        // The new summary is the LLM's output; the prior summary lives in the
+        // request, where a real model subsumes it into the new summary.
+        assert_eq!(summary, "Fresh summary");
+        assert!(recorded[0].contains("Continue with the next task using this context."));
+        assert!(
+            recorded[0].contains("already compacted context"),
+            "prior summary must be carried into the summarization input"
+        );
+        drop(recorded);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_compact_history_ignores_prior_summary_in_candidate_payload() -> Result<()> {
+    async fn test_compact_history_carries_prior_summary_in_candidate_payload() -> Result<()> {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(MockProvider::new_with_request_log(
             "Fresh history summary",
@@ -829,21 +960,26 @@ mod tests {
 
         let result = compactor.compact_history(messages).await?;
 
-        {
-            let recorded = requests.lock().unwrap();
-            assert_eq!(recorded.len(), 1);
-            assert!(recorded[0].contains("Current turn content from the latest exchange."));
-            assert!(!recorded[0].contains("already compacted context"));
-            drop(recorded);
-        }
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains("Current turn content from the latest exchange."));
+        // The prior summary is carried into the summarization input rather than
+        // being silently discarded.
+        assert!(
+            recorded[0].contains("already compacted context"),
+            "prior summary content must reach the summarizer"
+        );
+        drop(recorded);
         assert_eq!(result.new_count, 4);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_compact_history_is_no_op_when_candidate_window_has_only_summaries() -> Result<()>
-    {
+    async fn test_compact_history_carries_summaries_forward_when_window_has_only_summaries()
+    -> Result<()> {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(MockProvider::new_with_request_log(
             "This summary should not be used",
@@ -863,16 +999,27 @@ mod tests {
 
         let result = compactor.compact_history(messages).await?;
 
-        {
-            let recorded = requests.lock().unwrap();
-            assert!(recorded.is_empty());
-            drop(recorded);
-        }
+        // No fresh content in the candidate window -> no LLM call is made, but
+        // the prior summaries must be carried forward verbatim, NOT replaced
+        // with an empty-summary placeholder (which used to destroy context).
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert!(recorded.is_empty());
+        drop(recorded);
         assert_eq!(result.new_count, 4);
         assert_eq!(result.messages.len(), 4);
 
         if let Content::Text(text) = &result.messages[0].content {
-            assert!(text.contains(COMPACT_EMPTY_SUMMARY));
+            assert!(
+                text.contains("first prior compacted section"),
+                "first prior summary lost"
+            );
+            assert!(
+                text.contains("second prior compacted section"),
+                "second prior summary lost"
+            );
+            assert!(!text.contains(COMPACT_EMPTY_SUMMARY));
         } else {
             panic!("Expected summary text in first message");
         }
@@ -1142,7 +1289,8 @@ mod tests {
         assert!(all_retained);
         assert_eq!(latest_index, 7);
         assert!(
-            TokenEstimator::estimate_history(retained_tail) <= MAX_RETAINED_TAIL_MESSAGE_TOKENS
+            TokenEstimator::estimate_history(retained_tail)
+                <= compactor.config().max_retained_tail_tokens
         );
         assert!(compactor.needs_compaction(&result.messages));
 
@@ -1177,6 +1325,185 @@ mod tests {
         } else {
             panic!("Expected summary text when retained tail is empty");
         }
+
+        Ok(())
+    }
+
+    fn message_contains(message: &Message, needle: &str) -> bool {
+        match &message.content {
+            Content::Text(text) => text.contains(needle),
+            Content::Blocks(blocks) => blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains(needle),
+                _ => false,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epoch_one_facts_survive_two_compactions() -> Result<()> {
+        // Regression for re-compaction data loss: a fact recorded before the
+        // first compaction must still be present in the history after a second
+        // compaction. The echo provider models a faithful LLM that preserves
+        // its input; the bug was that the first summary (carrying the epoch-1
+        // fact) was filtered out of the second summarization and dropped.
+        const EPOCH1_FACT: &str = "EPOCH1_FACT: the API key lives in config/secrets.toml";
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_echo(requests.clone()));
+        let config = CompactionConfig::default()
+            .with_retain_recent(2)
+            .with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let epoch1 = vec![
+            Message::user(EPOCH1_FACT),
+            Message::assistant("Understood, noted the secrets path."),
+            Message::user("Now add error handling to main.rs."),
+            Message::assistant("Added error handling to main.rs."),
+            Message::user("latest user message one"),
+            Message::assistant("latest assistant message two"),
+        ];
+
+        let first = compactor.compact_history(epoch1).await?;
+        assert!(
+            first
+                .messages
+                .iter()
+                .any(|m| message_contains(m, "EPOCH1_FACT")),
+            "epoch-1 fact must be captured in the first summary"
+        );
+
+        // Build the epoch-2 history on top of the first compaction's output.
+        let mut epoch2 = first.messages;
+        epoch2.push(Message::user("Another later turn."));
+        epoch2.push(Message::assistant("Reply to the later turn."));
+        epoch2.push(Message::user("Final turn a."));
+        epoch2.push(Message::assistant("Final turn b."));
+
+        let second = compactor.compact_history(epoch2).await?;
+
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|m| message_contains(m, "EPOCH1_FACT")),
+            "epoch-1 fact must survive the second compaction"
+        );
+
+        // Sanity: the second compaction actually summarized (made an LLM call
+        // on the prior summary), so this is a true re-compaction path.
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert!(
+            recorded.iter().any(|req| req.contains("EPOCH1_FACT")),
+            "prior summary carrying the epoch-1 fact must reach the summarizer"
+        );
+        drop(recorded);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_history_long_tool_chain_respects_token_cap() -> Result<()> {
+        // Regression for the pair-shift bug: in an unbroken tool chain, the
+        // old second clause of `crosses_tool_pair` walked the split point back
+        // through the entire chain, retaining everything and defeating the
+        // token cap. With only the assistant(tool_use)->user(tool_result)
+        // boundary unsplittable, the retained tail stays bounded near the cap.
+        let provider = Arc::new(MockProvider::new("Summary of the early tool chain."));
+        let cap = 20_000;
+        // retain_recent asks to keep many messages, but the cap must override
+        // it. retain_recent < message count so we don't hit the early return.
+        let config = CompactionConfig::default()
+            .with_retain_recent(18)
+            .with_min_messages(1)
+            .with_threshold_tokens(1)
+            .with_max_retained_tail_tokens(cap);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        // 10 alternating tool pairs (20 messages), each large enough that the
+        // whole chain dwarfs the cap.
+        let mut messages = Vec::new();
+        for i in 0..10 {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: format!("tool_{i}"),
+                    name: "run".to_string(),
+                    input: serde_json::json!({ "arg": "y".repeat(12_000) }),
+                    thought_signature: None,
+                }]),
+            });
+            messages.push(Message {
+                role: Role::User,
+                content: Content::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("tool_{i}"),
+                    content: format!("result-{i}: {}", "z".repeat(12_000)),
+                    is_error: None,
+                }]),
+            });
+        }
+
+        let full_tokens = TokenEstimator::estimate_history(&messages);
+        assert!(
+            full_tokens > cap * 2,
+            "test setup: full chain must far exceed the cap"
+        );
+
+        let result = compactor.compact_history(messages).await?;
+
+        // The retained tail is non-empty, so the output is
+        // [summary, ack, ...tail]; skip the synthetic summary + ack prefix.
+        let retained_tail = &result.messages[2..];
+
+        let tail_tokens = TokenEstimator::estimate_history(retained_tail);
+        // Bounded near the cap (soft cap allows one extra message from pair
+        // preservation); crucially NOT the entire chain.
+        assert!(
+            tail_tokens <= cap + 8_000,
+            "retained tail {tail_tokens} should be bounded by the cap {cap}, not the whole chain"
+        );
+        assert!(
+            retained_tail.len() < 20,
+            "compaction must have summarized part of the chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compact_warns_and_marks_truncated_summary() -> Result<()> {
+        // Regression for silent summary truncation: when the summarizer hits
+        // MaxTokens, the compactor retries with a larger budget and, if still
+        // truncated, appends a visible marker instead of silently accepting a
+        // clipped summary.
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new_truncating(
+            "partial summary cut off mid-",
+            requests.clone(),
+        ));
+        let config = CompactionConfig::default().with_min_messages(1);
+        let compactor = LlmContextCompactor::new(provider, config);
+
+        let messages = vec![
+            Message::user("Some content that needs summarizing."),
+            Message::assistant("More content to summarize here."),
+        ];
+
+        let summary = compactor.compact(&messages).await?;
+
+        assert!(
+            summary.contains("[summary truncated"),
+            "a persistently truncated summary must carry a truncation marker"
+        );
+
+        // The compactor retried once with a larger budget: two calls total.
+        let recorded = requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("request log poisoned"))?;
+        assert_eq!(recorded.len(), 2, "truncation should trigger one retry");
+        drop(recorded);
 
         Ok(())
     }

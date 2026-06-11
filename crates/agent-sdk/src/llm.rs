@@ -3,27 +3,6 @@
 //! This module re-exports from [`agent_sdk_providers`] and [`agent_sdk_foundation`]
 //! so that existing `crate::llm::*` paths continue to resolve.
 
-// The providers crate only compiles its `attachments` module when at least
-// one provider feature is enabled (the helpers are dead code otherwise), so
-// this facade re-export must carry the matching gate.
-#[cfg(any(
-    feature = "anthropic",
-    feature = "openai",
-    feature = "openai-codex",
-    feature = "gemini",
-    feature = "vertex",
-    feature = "cloudflare",
-))]
-pub mod attachments {
-    //! Attachment validation (facade for external consumers).
-    //!
-    //! The upstream helpers are all `pub(crate)`, so this glob re-exports no
-    //! public name today; the `allow` keeps the facade shell compiling until
-    //! a `pub` item lands upstream.
-    #[allow(unused_imports)]
-    pub use agent_sdk_providers::attachments::*;
-}
-
 pub mod router {
     //! Model routing.
     pub use agent_sdk_providers::router::*;

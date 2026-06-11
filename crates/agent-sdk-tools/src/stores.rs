@@ -148,6 +148,42 @@ pub trait EventStore: Send + Sync {
             .collect())
     }
 
+    /// Count the stored events for `thread_id` without materializing them.
+    ///
+    /// The default falls back to the length of
+    /// [`get_events`](EventStore::get_events) (which clones the whole history);
+    /// stores that can answer cheaply should override this. Callers that only
+    /// need a baseline count — e.g. to read just the new events after a turn —
+    /// should prefer this over `get_events(..).len()`.
+    ///
+    /// # Errors
+    /// Returns an error if the count cannot be retrieved.
+    async fn event_count(&self, thread_id: &ThreadId) -> Result<usize> {
+        Ok(self.get_events(thread_id).await?.len())
+    }
+
+    /// Retrieve event envelopes for `thread_id` from `offset` onward, in overall
+    /// append order, skipping the earlier ones.
+    ///
+    /// Lets incremental readers avoid re-cloning the whole history each call.
+    /// The default slices [`get_events`](EventStore::get_events); stores with a
+    /// cheaper access path should override.
+    ///
+    /// # Errors
+    /// Returns an error if the events cannot be retrieved.
+    async fn get_events_since(
+        &self,
+        thread_id: &ThreadId,
+        offset: usize,
+    ) -> Result<Vec<AgentEventEnvelope>> {
+        Ok(self
+            .get_events(thread_id)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .collect())
+    }
+
     /// Clear all events for the given thread.
     ///
     /// # Errors
@@ -192,12 +228,24 @@ pub trait ToolExecutionStore: Send + Sync {
     ) -> Result<Option<ToolExecution>>;
 }
 
-/// In-memory implementation of `MessageStore` and `StateStore`.
-/// Useful for testing and simple use cases.
 #[derive(Default)]
-pub struct InMemoryStore {
+struct InMemoryStoreInner {
     messages: RwLock<HashMap<String, Vec<llm::Message>>>,
     states: RwLock<HashMap<String, AgentState>>,
+}
+
+/// In-memory implementation of `MessageStore` and `StateStore`.
+/// Useful for testing and simple use cases.
+///
+/// Cloning shares the same underlying message/state maps (mirroring
+/// [`InMemoryEventStore`]'s shared-journal semantics). This matters because the
+/// agent builder takes its stores **by value**: hand the builder a clone and
+/// keep the original, and the kept handle still observes everything the agent
+/// records. Without shared handles, history written through the builder's copy
+/// would be permanently unreachable to the caller.
+#[derive(Clone, Default)]
+pub struct InMemoryStore {
+    inner: Arc<InMemoryStoreInner>,
 }
 
 impl InMemoryStore {
@@ -251,7 +299,8 @@ impl InMemoryEventStore {
 #[async_trait]
 impl MessageStore for InMemoryStore {
     async fn append(&self, thread_id: &ThreadId, message: llm::Message) -> Result<()> {
-        self.messages
+        self.inner
+            .messages
             .write()
             .ok()
             .context("lock poisoned")?
@@ -262,12 +311,13 @@ impl MessageStore for InMemoryStore {
     }
 
     async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
-        let messages = self.messages.read().ok().context("lock poisoned")?;
+        let messages = self.inner.messages.read().ok().context("lock poisoned")?;
         Ok(messages.get(&thread_id.0).cloned().unwrap_or_default())
     }
 
     async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
-        self.messages
+        self.inner
+            .messages
             .write()
             .ok()
             .context("lock poisoned")?
@@ -280,7 +330,8 @@ impl MessageStore for InMemoryStore {
         thread_id: &ThreadId,
         messages: Vec<llm::Message>,
     ) -> Result<()> {
-        self.messages
+        self.inner
+            .messages
             .write()
             .ok()
             .context("lock poisoned")?
@@ -292,7 +343,8 @@ impl MessageStore for InMemoryStore {
 #[async_trait]
 impl StateStore for InMemoryStore {
     async fn save(&self, state: &AgentState) -> Result<()> {
-        self.states
+        self.inner
+            .states
             .write()
             .ok()
             .context("lock poisoned")?
@@ -301,17 +353,64 @@ impl StateStore for InMemoryStore {
     }
 
     async fn load(&self, thread_id: &ThreadId) -> Result<Option<AgentState>> {
-        let states = self.states.read().ok().context("lock poisoned")?;
+        let states = self.inner.states.read().ok().context("lock poisoned")?;
         Ok(states.get(&thread_id.0).cloned())
     }
 
     async fn delete(&self, thread_id: &ThreadId) -> Result<()> {
-        self.states
+        self.inner
+            .states
             .write()
             .ok()
             .context("lock poisoned")?
             .remove(&thread_id.0);
         Ok(())
+    }
+}
+
+// Blanket impls so a shared `Arc<Store>` is itself a `MessageStore` /
+// `StateStore`. This lets callers keep a readable handle after handing the
+// store to the agent builder (which takes stores by value), without forcing
+// every store type to be `Clone`.
+#[async_trait]
+impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn append(&self, thread_id: &ThreadId, message: llm::Message) -> Result<()> {
+        (**self).append(thread_id, message).await
+    }
+
+    async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
+        (**self).get_history(thread_id).await
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
+        (**self).clear(thread_id).await
+    }
+
+    async fn count(&self, thread_id: &ThreadId) -> Result<usize> {
+        (**self).count(thread_id).await
+    }
+
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+    ) -> Result<()> {
+        (**self).replace_history(thread_id, messages).await
+    }
+}
+
+#[async_trait]
+impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn save(&self, state: &AgentState) -> Result<()> {
+        (**self).save(state).await
+    }
+
+    async fn load(&self, thread_id: &ThreadId) -> Result<Option<AgentState>> {
+        (**self).load(thread_id).await
+    }
+
+    async fn delete(&self, thread_id: &ThreadId) -> Result<()> {
+        (**self).delete(thread_id).await
     }
 }
 
@@ -362,12 +461,140 @@ impl EventStore for InMemoryEventStore {
             .unwrap_or_default())
     }
 
+    async fn event_count(&self, thread_id: &ThreadId) -> Result<usize> {
+        // Sum the per-turn lengths under the read lock — no envelope is cloned.
+        let turns = self.inner.turns.read().await;
+        Ok(turns.get(&thread_id.0).map_or(0, |thread_turns| {
+            thread_turns.values().map(|turn| turn.events.len()).sum()
+        }))
+    }
+
+    async fn get_events_since(
+        &self,
+        thread_id: &ThreadId,
+        offset: usize,
+    ) -> Result<Vec<AgentEventEnvelope>> {
+        // Only the requested tail is cloned, not the whole history.
+        let turns = self.inner.turns.read().await;
+        Ok(turns
+            .get(&thread_id.0)
+            .map(|thread_turns| {
+                thread_turns
+                    .values()
+                    .flat_map(|turn| turn.events.iter())
+                    .skip(offset)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
         {
             let mut turns = self.inner.turns.write().await;
             turns.remove(&thread_id.0);
         }
         Ok(())
+    }
+}
+
+/// An [`EventStore`] decorator that invokes a callback on every appended
+/// envelope, then delegates all storage to an inner store.
+///
+/// This is the reusable, blessed way to "stream to stdout" (or to any live
+/// observer) with the SDK: the agent loop writes every [`AgentEventEnvelope`]
+/// through the configured event store, so wrapping a store lets you watch
+/// events as they happen — printing `TextDelta`s, forwarding to a UI channel —
+/// without hand-rolling the full five-method [`EventStore`] surface or wiring an
+/// in-process channel. The callback runs before the inner store records the
+/// envelope.
+///
+/// # Example
+///
+/// ```
+/// use agent_sdk_tools::stores::{InMemoryEventStore, ObservingEventStore};
+/// use agent_sdk_foundation::events::AgentEvent;
+///
+/// let _store = ObservingEventStore::new(InMemoryEventStore::new(), |envelope| {
+///     if let AgentEvent::TextDelta { delta, .. } = &envelope.event {
+///         print!("{delta}");
+///     }
+/// });
+/// ```
+pub struct ObservingEventStore<S, F> {
+    inner: S,
+    observer: F,
+}
+
+impl<S, F> ObservingEventStore<S, F>
+where
+    S: EventStore,
+    F: Fn(&AgentEventEnvelope) + Send + Sync,
+{
+    /// Wrap `inner`, calling `observer` on every appended envelope before it is
+    /// persisted.
+    #[must_use]
+    pub const fn new(inner: S, observer: F) -> Self {
+        Self { inner, observer }
+    }
+
+    /// Borrow the wrapped inner store (e.g. to read back persisted history).
+    #[must_use]
+    pub const fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl<S, F> EventStore for ObservingEventStore<S, F>
+where
+    S: EventStore,
+    F: Fn(&AgentEventEnvelope) + Send + Sync,
+{
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> Result<()> {
+        (self.observer)(&envelope);
+        self.inner.append(thread_id, turn, envelope).await
+    }
+
+    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
+        self.inner.finish_turn(thread_id, turn).await
+    }
+
+    async fn get_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+    ) -> Result<Option<StoredTurnEvents>> {
+        self.inner.get_turn(thread_id, turn).await
+    }
+
+    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<StoredTurnEvents>> {
+        self.inner.get_turns(thread_id).await
+    }
+
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<AgentEventEnvelope>> {
+        self.inner.get_events(thread_id).await
+    }
+
+    async fn event_count(&self, thread_id: &ThreadId) -> Result<usize> {
+        self.inner.event_count(thread_id).await
+    }
+
+    async fn get_events_since(
+        &self,
+        thread_id: &ThreadId,
+        offset: usize,
+    ) -> Result<Vec<AgentEventEnvelope>> {
+        self.inner.get_events_since(thread_id, offset).await
+    }
+
+    async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
+        self.inner.clear(thread_id).await
     }
 }
 
@@ -399,31 +626,52 @@ impl ToolExecutionStore for InMemoryExecutionStore {
 
     async fn record_execution(&self, execution: ToolExecution) -> Result<()> {
         let tool_call_id = execution.tool_call_id.clone();
-        self.executions
-            .write()
-            .ok()
-            .context("lock poisoned")?
-            .insert(tool_call_id, execution);
+        let operation_id = execution.operation_id.clone();
+
+        // Hold the executions write lock for the whole insert. Readers acquire
+        // executions first (the global executions -> operation_index lock
+        // order), so they cannot observe a half-written record. Indexing the
+        // operation_id here (not only in `update_execution`) means a write-ahead
+        // record is resolvable by `get_execution_by_operation_id` immediately.
+        let mut executions = self.executions.write().ok().context("lock poisoned")?;
+        if let Some(op_id) = operation_id {
+            self.operation_index
+                .write()
+                .ok()
+                .context("lock poisoned")?
+                .insert(op_id, tool_call_id.clone());
+        }
+        executions.insert(tool_call_id, execution);
+        drop(executions);
         Ok(())
     }
 
     async fn update_execution(&self, execution: ToolExecution) -> Result<()> {
         let tool_call_id = execution.tool_call_id.clone();
+        let new_operation_id = execution.operation_id.clone();
 
-        // Update operation_id index if present
-        if let Some(ref op_id) = execution.operation_id {
-            self.operation_index
-                .write()
-                .ok()
-                .context("lock poisoned")?
-                .insert(op_id.clone(), tool_call_id.clone());
+        // Hold the executions write lock across the whole update so a concurrent
+        // reader (which gates on executions first) can never observe the new
+        // index entry against a stale execution.
+        let mut executions = self.executions.write().ok().context("lock poisoned")?;
+
+        // Drop a superseded operation_id index entry when the id changes, so a
+        // stale id stops resolving instead of pointing forever at this call.
+        let stale_op_id = executions
+            .get(&tool_call_id)
+            .and_then(|prev| prev.operation_id.clone())
+            .filter(|prev| Some(prev) != new_operation_id.as_ref());
+        if stale_op_id.is_some() || new_operation_id.is_some() {
+            let mut op_index = self.operation_index.write().ok().context("lock poisoned")?;
+            if let Some(stale) = stale_op_id {
+                op_index.remove(&stale);
+            }
+            if let Some(op_id) = new_operation_id {
+                op_index.insert(op_id, tool_call_id.clone());
+            }
         }
-
-        self.executions
-            .write()
-            .ok()
-            .context("lock poisoned")?
-            .insert(tool_call_id, execution);
+        executions.insert(tool_call_id, execution);
+        drop(executions);
         Ok(())
     }
 
@@ -431,17 +679,18 @@ impl ToolExecutionStore for InMemoryExecutionStore {
         &self,
         operation_id: &str,
     ) -> Result<Option<ToolExecution>> {
-        // Get tool_call_id and drop lock before acquiring another
+        // Acquire executions first (the global executions -> operation_index
+        // lock order) and hold it while resolving the id, so this reader can
+        // neither deadlock against nor observe a partial write from a concurrent
+        // record/update.
+        let executions = self.executions.read().ok().context("lock poisoned")?;
         let tool_call_id = {
             let op_index = self.operation_index.read().ok().context("lock poisoned")?;
             op_index.get(operation_id).cloned()
         };
-
         let Some(tool_call_id) = tool_call_id else {
             return Ok(None);
         };
-
-        let executions = self.executions.read().ok().context("lock poisoned")?;
         Ok(executions.get(&tool_call_id).cloned())
     }
 }
@@ -744,6 +993,169 @@ mod tests {
         let not_found = store.get_execution_by_operation_id("nonexistent").await?;
         assert!(not_found.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_clone_shares_history() -> Result<()> {
+        // A clone handed to the builder shares state with the kept handle, so
+        // history written by the agent stays reachable to the caller.
+        let store = InMemoryStore::new();
+        let handle = store.clone();
+        let thread_id = ThreadId::new();
+
+        store.append(&thread_id, Message::user("hello")).await?;
+
+        let history = handle.get_history(&thread_id).await?;
+        assert_eq!(
+            history.len(),
+            1,
+            "clone must observe appends via the original"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arc_store_blanket_impls_forward() -> Result<()> {
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::new());
+        let thread_id = ThreadId::new();
+
+        // `Arc<InMemoryStore>` is itself a `MessageStore` and `StateStore`.
+        MessageStore::append(&store, &thread_id, Message::user("hi")).await?;
+        assert_eq!(MessageStore::count(&store, &thread_id).await?, 1);
+
+        let state = AgentState::new(thread_id.clone());
+        StateStore::save(&store, &state).await?;
+        assert!(StateStore::load(&store, &thread_id).await?.is_some());
+
+        // The kept Arc handle still sees everything.
+        assert_eq!(store.get_history(&thread_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_count_and_get_events_since_are_incremental() -> Result<()> {
+        let store = InMemoryEventStore::new();
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        assert_eq!(store.event_count(&thread_id).await?, 0);
+
+        for (turn, (id, text)) in [(1, ("m1", "a")), (1, ("m2", "b")), (2, ("m3", "c"))] {
+            store
+                .append(
+                    &thread_id,
+                    turn,
+                    AgentEventEnvelope::wrap(AgentEvent::text(id, text), &seq),
+                )
+                .await?;
+        }
+
+        assert_eq!(store.event_count(&thread_id).await?, 3);
+
+        let tail = store.get_events_since(&thread_id, 1).await?;
+        assert_eq!(tail.len(), 2, "should skip the first event");
+        // Consistent with the full read.
+        let all = store.get_events(&thread_id).await?;
+        assert_eq!(all.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_execution_indexes_operation_id_immediately() -> Result<()> {
+        let store = InMemoryExecutionStore::new();
+        let thread_id = ThreadId::new();
+
+        let mut execution = ToolExecution::new_in_flight(
+            "call_1",
+            thread_id,
+            "async_tool",
+            "Async Tool",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
+        );
+        execution.set_operation_id("op_1");
+        // Write-ahead record only — no `update_execution` call.
+        store.record_execution(execution).await?;
+
+        let loaded = store.get_execution_by_operation_id("op_1").await?;
+        assert_eq!(
+            loaded
+                .context("write-ahead operation_id must resolve")?
+                .tool_call_id,
+            "call_1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_execution_removes_stale_operation_id() -> Result<()> {
+        let store = InMemoryExecutionStore::new();
+        let thread_id = ThreadId::new();
+
+        let mut execution = ToolExecution::new_in_flight(
+            "call_2",
+            thread_id,
+            "async_tool",
+            "Async Tool",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
+        );
+        execution.set_operation_id("op_old");
+        store.record_execution(execution.clone()).await?;
+
+        // Re-point the execution at a new operation id.
+        execution.set_operation_id("op_new");
+        store.update_execution(execution).await?;
+
+        assert!(
+            store
+                .get_execution_by_operation_id("op_old")
+                .await?
+                .is_none(),
+            "superseded operation_id must stop resolving"
+        );
+        let loaded = store.get_execution_by_operation_id("op_new").await?;
+        assert_eq!(
+            loaded
+                .context("new operation_id must resolve")?
+                .tool_call_id,
+            "call_2"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observing_event_store_invokes_callback_and_delegates() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_for_cb = Arc::clone(&seen);
+        let store = ObservingEventStore::new(InMemoryEventStore::new(), move |_envelope| {
+            seen_for_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("m1", "hi"), &seq),
+            )
+            .await?;
+        store
+            .append(
+                &thread_id,
+                1,
+                AgentEventEnvelope::wrap(AgentEvent::text("m2", "yo"), &seq),
+            )
+            .await?;
+
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "observer runs per append");
+        // Delegation: the inner store actually persisted both events.
+        assert_eq!(store.get_events(&thread_id).await?.len(), 2);
+        assert_eq!(store.inner().get_events(&thread_id).await?.len(), 2);
         Ok(())
     }
 }

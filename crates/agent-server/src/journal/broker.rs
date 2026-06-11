@@ -25,6 +25,7 @@
 //!    [`super::outbox_message`]); the broker has no authority over
 //!    that state.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -58,21 +59,42 @@ pub trait BrokerAdapter: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// In-memory test adapter
+// In-memory bounded adapter
 // ─────────────────────────────────────────────────────────────────────
+
+/// Default cap on the in-memory adapter's recording buffer.
+///
+/// The host wires this adapter as the default broker, so an unbounded
+/// buffer would leak memory proportional to total outbox throughput on
+/// a long-running deploy.  The buffer is a bounded ring: once full it
+/// drops the oldest recorded message (and warns), keeping memory flat
+/// while still letting tests assert on recent publishes.
+const DEFAULT_RECORD_CAPACITY: usize = 1024;
 
 #[derive(Default)]
 struct InMemoryBrokerAdapterInner {
-    published: Vec<OutboxMessage>,
+    published: VecDeque<OutboxMessage>,
+    dropped: u64,
 }
 
-/// Test adapter that records every published message.
+/// In-memory adapter that records recent published messages in a
+/// bounded ring buffer.
 ///
 /// Cloning shares the underlying buffer so a publisher driven from
 /// one task and assertions made from another see the same state.
-#[derive(Clone, Default)]
+/// Suitable both as a test double and as the host's default
+/// no-broker-configured adapter: the default-capacity cap bounds memory
+/// regardless of throughput.
+#[derive(Clone)]
 pub struct InMemoryBrokerAdapter {
     inner: Arc<RwLock<InMemoryBrokerAdapterInner>>,
+    capacity: usize,
+}
+
+impl Default for InMemoryBrokerAdapter {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_RECORD_CAPACITY)
+    }
 }
 
 impl InMemoryBrokerAdapter {
@@ -81,17 +103,32 @@ impl InMemoryBrokerAdapter {
         Self::default()
     }
 
-    /// Snapshot of every message published so far, in publish order.
-    pub async fn published(&self) -> Vec<OutboxMessage> {
-        self.inner.read().await.published.clone()
+    /// Create an adapter whose recording buffer retains at most
+    /// `capacity` of the most recently published messages (clamped to a
+    /// minimum of 1).
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InMemoryBrokerAdapterInner::default())),
+            capacity: capacity.max(1),
+        }
     }
 
-    /// Number of messages published so far.
+    /// Snapshot of the retained messages, oldest first.
+    ///
+    /// Only the most recent [`capacity`](Self::with_capacity) messages
+    /// are retained; older ones may have been dropped (see
+    /// [`dropped_count`](Self::dropped_count)).
+    pub async fn published(&self) -> Vec<OutboxMessage> {
+        self.inner.read().await.published.iter().cloned().collect()
+    }
+
+    /// Number of retained messages (never exceeds the capacity).
     pub async fn published_count(&self) -> usize {
         self.inner.read().await.published.len()
     }
 
-    /// Number of messages of a specific kind published so far.
+    /// Number of retained messages of a specific kind.
     pub async fn published_count_of(&self, kind: OutboxMessageKind) -> usize {
         self.inner
             .read()
@@ -101,12 +138,28 @@ impl InMemoryBrokerAdapter {
             .filter(|message| message.kind() == kind)
             .count()
     }
+
+    /// Number of messages evicted from the ring buffer because it was
+    /// at capacity when a newer message arrived.
+    pub async fn dropped_count(&self) -> u64 {
+        self.inner.read().await.dropped
+    }
 }
 
 #[async_trait]
 impl BrokerAdapter for InMemoryBrokerAdapter {
     async fn publish(&self, message: &OutboxMessage) -> Result<()> {
-        self.inner.write().await.published.push(message.clone());
+        let mut inner = self.inner.write().await;
+        if inner.published.len() >= self.capacity {
+            inner.published.pop_front();
+            inner.dropped += 1;
+            log::warn!(
+                capacity = self.capacity as u64;
+                "InMemoryBrokerAdapter recording buffer full; dropping oldest message",
+            );
+        }
+        inner.published.push_back(message.clone());
+        drop(inner);
         Ok(())
     }
 }
@@ -210,6 +263,31 @@ mod tests {
     async fn adapter_can_be_used_through_dyn_trait() -> Result<()> {
         let adapter: Arc<dyn BrokerAdapter> = Arc::new(InMemoryBrokerAdapter::new());
         adapter.publish(&task_message()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recording_buffer_is_bounded_and_drops_oldest() -> Result<()> {
+        // Capacity 2: publishing 5 messages keeps only the last 2 and
+        // counts the 3 evictions, so memory stays flat under sustained
+        // throughput (this adapter is the host's default broker).
+        let adapter = InMemoryBrokerAdapter::with_capacity(2);
+        for seq in 0..5u64 {
+            adapter.publish(&events_message(seq)).await?;
+        }
+
+        assert_eq!(adapter.published_count().await, 2);
+        assert_eq!(adapter.dropped_count().await, 3);
+
+        let retained = adapter.published().await;
+        let retained_seqs: Vec<u64> = retained
+            .iter()
+            .map(|m| match m {
+                OutboxMessage::ThreadEventsAvailable(p) => p.last_sequence,
+                OutboxMessage::TaskWakeup(_) => panic!("unexpected kind"),
+            })
+            .collect();
+        assert_eq!(retained_seqs, vec![3, 4]);
         Ok(())
     }
 }

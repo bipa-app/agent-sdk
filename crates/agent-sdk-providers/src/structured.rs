@@ -149,7 +149,14 @@ pub async fn run_structured(
     let mut last_errors = String::new();
 
     for attempt in 0..max_attempts {
-        let outcome = provider.chat(request.clone()).await?;
+        // Clone only when a retry may still follow; on the final attempt move the
+        // request in (no deep clone of the message history + attachments).
+        let attempt_request = if attempt + 1 == max_attempts {
+            std::mem::replace(&mut request, ChatRequest::new(String::new(), Vec::new()))
+        } else {
+            request.clone()
+        };
+        let outcome = provider.chat(attempt_request).await?;
         let response = match outcome {
             ChatOutcome::Success(response) => response,
             ChatOutcome::RateLimited => {
@@ -186,6 +193,7 @@ pub async fn run_structured(
             append_correction(
                 &mut request,
                 &response,
+                support,
                 "Your previous reply did not contain a structured answer. \
                  Respond with a single JSON value that satisfies the requested schema.",
             );
@@ -214,7 +222,7 @@ pub async fn run_structured(
                 "Your previous JSON output did not satisfy the schema. \
                  Fix these validation errors and resend the full JSON value: {last_errors}"
             );
-            append_correction(&mut request, &response, &correction);
+            append_correction(&mut request, &response, support, &correction);
         }
     }
 
@@ -295,11 +303,41 @@ fn strip_code_fence(text: &str) -> &str {
 
 /// Append the assistant's previous output plus a corrective user message so the
 /// next attempt sees the validation feedback.
-fn append_correction(request: &mut ChatRequest, previous: &ChatResponse, correction: &str) {
+///
+/// For the tool-forcing path (Anthropic), the assistant turn carries a forced
+/// `respond` `ContentBlock::ToolUse`. The Anthropic Messages API rejects any
+/// conversation where a `tool_use` is not immediately followed by a matching
+/// `tool_result` in the next user message, so the correction is delivered as a
+/// `ToolResult` for that tool-use id (carrying the validation errors) rather than
+/// as plain user text — otherwise the very first re-prompt 400s. When no forced
+/// tool call is present (or for native providers) the correction is plain text.
+fn append_correction(
+    request: &mut ChatRequest,
+    previous: &ChatResponse,
+    support: StructuredOutputSupport,
+    correction: &str,
+) {
     request
         .messages
         .push(Message::assistant_with_content(previous.content.clone()));
-    request.messages.push(Message::user(correction));
+
+    let respond_tool_use_id = if matches!(support, StructuredOutputSupport::ToolForcing) {
+        previous.content.iter().find_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } if name == RESPOND_TOOL_NAME => Some(id.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    match respond_tool_use_id {
+        Some(tool_use_id) => {
+            request
+                .messages
+                .push(Message::tool_result(tool_use_id, correction, true));
+        }
+        None => request.messages.push(Message::user(correction)),
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +597,69 @@ mod tests {
             seen[1].messages.len() > seen[0].messages.len()
         };
         assert!(grew);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_forcing_retry_appends_tool_result_for_forced_tool_use() -> Result<()> {
+        use agent_sdk_foundation::llm::Content;
+
+        let provider = ScriptedProvider::new(
+            "anthropic",
+            StructuredOutputSupport::ToolForcing,
+            vec![
+                // First respond: invalid (missing required `age`).
+                success(respond_tool_block(serde_json::json!({"name": "x"}))),
+                // Retry: valid.
+                success(respond_tool_block(
+                    serde_json::json!({"name": "x", "age": 1}),
+                )),
+            ],
+        );
+
+        let out = run_structured(
+            &provider,
+            request_with_format(),
+            StructuredConfig { max_retries: 1 },
+        )
+        .await?;
+        assert_eq!(out.retries, 1);
+
+        // The retry request must be a valid Anthropic conversation: the appended
+        // assistant `respond` tool_use must be answered by a user tool_result with
+        // a matching tool_use_id — not a bare user text message (which 400s).
+        let seen = provider.seen_requests.lock().expect("seen lock");
+        let retry = &seen[1];
+
+        let assistant_tool_use_id = retry
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                Content::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                    ContentBlock::ToolUse { id, name, .. } if name == RESPOND_TOOL_NAME => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                }),
+                Content::Text(_) => None,
+            })
+            .expect("assistant respond tool_use present in retry");
+
+        let has_matching_result = retry.messages.iter().any(|m| match &m.content {
+            Content::Blocks(blocks) => blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult { tool_use_id, .. }
+                        if *tool_use_id == assistant_tool_use_id
+                )
+            }),
+            Content::Text(_) => false,
+        });
+        drop(seen);
+        assert!(
+            has_matching_result,
+            "retry must carry a tool_result for the forced tool_use id"
+        );
         Ok(())
     }
 

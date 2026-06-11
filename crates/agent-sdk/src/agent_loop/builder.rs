@@ -23,11 +23,19 @@ use super::AgentLoop;
 ///     .build();
 /// ```
 pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
-    provider: Option<P>,
+    // `provider` / `hooks` / `message_store` / `state_store` are stored as the
+    // bare generic type, not `Option<_>`: the type-transitioning setters
+    // ([`provider`](Self::provider), [`hooks`](Self::hooks),
+    // [`message_store`](Self::message_store), [`state_store`](Self::state_store))
+    // move the value in and flip the corresponding type parameter from the
+    // unset `()` to the concrete type. The build methods are only reachable
+    // once those parameters satisfy their trait bounds, so the values are
+    // always present — there is no runtime "not set" state to guard against.
+    provider: P,
     tools: Option<ToolRegistry<Ctx>>,
-    hooks: Option<H>,
-    message_store: Option<M>,
-    state_store: Option<S>,
+    hooks: H,
+    message_store: M,
+    state_store: S,
     event_store: Option<Arc<dyn EventStore>>,
     event_authority: Option<Arc<dyn EventAuthority>>,
     config: Option<AgentConfig>,
@@ -44,11 +52,11 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            provider: None,
+            provider: (),
             tools: None,
-            hooks: None,
-            message_store: None,
-            state_store: None,
+            hooks: (),
+            message_store: (),
+            state_store: (),
             event_store: None,
             event_authority: None,
             config: None,
@@ -73,7 +81,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn provider<P2: LlmProvider>(self, provider: P2) -> AgentLoopBuilder<Ctx, P2, H, M, S> {
         AgentLoopBuilder {
-            provider: Some(provider),
+            provider,
             tools: self.tools,
             hooks: self.hooks,
             message_store: self.message_store,
@@ -103,7 +111,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
         AgentLoopBuilder {
             provider: self.provider,
             tools: self.tools,
-            hooks: Some(hooks),
+            hooks,
             message_store: self.message_store,
             state_store: self.state_store,
             event_store: self.event_store,
@@ -128,7 +136,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             provider: self.provider,
             tools: self.tools,
             hooks: self.hooks,
-            message_store: Some(message_store),
+            message_store,
             state_store: self.state_store,
             event_store: self.event_store,
             event_authority: self.event_authority,
@@ -153,7 +161,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             tools: self.tools,
             hooks: self.hooks,
             message_store: self.message_store,
-            state_store: Some(state_store),
+            state_store,
             event_store: self.event_store,
             event_authority: self.event_authority,
             config: self.config,
@@ -374,15 +382,11 @@ where
     /// is used by default so the 30-second path needs no `Arc` ceremony. Wire
     /// a durable store explicitly when you need persistence across process
     /// restarts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a provider has not been set.
     #[must_use]
     pub fn build(self) -> AgentLoop<Ctx, P, DefaultHooks, InMemoryStore, InMemoryStore> {
-        let Some(provider) = self.provider else {
-            panic!("provider is required");
-        };
+        // `self.provider` is the bare `P` moved in by `provider()`. This
+        // method is only reachable once `P: LlmProvider`, so the provider is
+        // always present — no runtime "unset" state to guard.
         let event_store = self
             .event_store
             .unwrap_or_else(|| Arc::new(crate::stores::InMemoryEventStore::new()));
@@ -390,7 +394,7 @@ where
         let config = self.config.unwrap_or_default();
 
         AgentLoop {
-            provider: Arc::new(provider),
+            provider: Arc::new(self.provider),
             tools: Arc::new(tools),
             hooks: Arc::new(DefaultHooks),
             message_store: Arc::new(InMemoryStore::new()),
@@ -420,40 +424,29 @@ where
 {
     /// Build the agent loop with all custom components.
     ///
+    /// `provider`, `hooks`, `message_store`, and `state_store` are guaranteed
+    /// present by the type-state builder (this method is only callable once
+    /// each is set to a concrete type), so they cannot be missing at runtime.
+    ///
     /// # Panics
     ///
-    /// Panics if any of the following have not been set:
-    /// - `provider`
-    /// - `hooks`
-    /// - `message_store`
-    /// - `state_store`
-    /// - `event_store`
+    /// Panics if an [`event_store`](Self::event_store) has not been set — it is
+    /// the one component supplied via a plain `Arc` setter rather than a
+    /// type-transitioning one, so it has no compile-time "set" guarantee.
     #[must_use]
     pub fn build_with_stores(self) -> AgentLoop<Ctx, P, H, M, S> {
-        let Some(provider) = self.provider else {
-            panic!("provider is required");
-        };
         let tools = self.tools.unwrap_or_default();
-        let Some(hooks) = self.hooks else {
-            panic!("hooks is required when using build_with_stores");
-        };
-        let Some(message_store) = self.message_store else {
-            panic!("message_store is required when using build_with_stores");
-        };
-        let Some(state_store) = self.state_store else {
-            panic!("state_store is required when using build_with_stores");
-        };
         let Some(event_store) = self.event_store else {
             panic!("event_store is required when using build_with_stores");
         };
         let config = self.config.unwrap_or_default();
 
         AgentLoop {
-            provider: Arc::new(provider),
+            provider: Arc::new(self.provider),
             tools: Arc::new(tools),
-            hooks: Arc::new(hooks),
-            message_store: Arc::new(message_store),
-            state_store: Arc::new(state_store),
+            hooks: Arc::new(self.hooks),
+            message_store: Arc::new(self.message_store),
+            state_store: Arc::new(self.state_store),
             event_store,
             event_authority: self.event_authority,
             config,

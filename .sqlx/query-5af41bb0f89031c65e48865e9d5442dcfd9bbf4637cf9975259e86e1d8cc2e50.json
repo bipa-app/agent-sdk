@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_execution_intents (\n    operation_id, effect_class, tool_call_id, child_task_id,\n    tool_name, input, status, error, created_at, updated_at\n) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\nON CONFLICT (operation_id) DO NOTHING\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5af41bb0f89031c65e48865e9d5442dcfd9bbf4637cf9975259e86e1d8cc2e50"
+}

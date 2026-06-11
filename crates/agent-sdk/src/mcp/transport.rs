@@ -6,11 +6,28 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
+
+/// Serialize a JSON-RPC *notification*: a request message with its `id` field
+/// removed.
+///
+/// JSON-RPC 2.0 (and the MCP spec) require notifications to omit `id`; a
+/// notification that carries an id is malformed and strict servers reject it or
+/// emit an orphan response. Our [`JsonRpcRequest`] type always carries an id for
+/// serialization, so we strip it here before sending.
+pub(crate) fn notification_body(request: &JsonRpcRequest) -> Result<String> {
+    let mut value =
+        serde_json::to_value(request).context("failed to serialize MCP notification")?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("id");
+    }
+    serde_json::to_string(&value).context("failed to serialize MCP notification")
+}
 
 /// Trait for MCP transports.
 ///
@@ -105,13 +122,20 @@ pub struct StdioTransport {
     /// Request ID counter.
     next_id: AtomicU64,
     /// Pending requests awaiting responses.
-    pending: PendingMap,
+    ///
+    /// Wrapped in `Arc` so the reader task can hold the map *without* keeping
+    /// the rest of the transport (the child handle, the stdin writer) alive.
+    /// Holding only the map means dropping every user handle drops the writer
+    /// (closing the child's stdin → the child exits → stdout EOF → the reader
+    /// task ends), instead of the reader's strong reference pinning the process
+    /// forever.
+    pending: Arc<PendingMap>,
     /// Writer to send requests.
     writer: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
-    /// Child process handle.
-    _child: Arc<Mutex<Child>>,
+    /// Child process handle (`kill_on_drop`); also killed explicitly by `close`.
+    child: Arc<Mutex<Child>>,
     /// Timeout for awaiting responses.
-    response_timeout: std::time::Duration,
+    response_timeout: Duration,
 }
 
 impl StdioTransport {
@@ -126,64 +150,7 @@ impl StdioTransport {
     ///
     /// Returns an error if the process fails to spawn.
     pub fn spawn(command: &str, args: &[&str]) -> Result<Arc<Self>> {
-        let mut child = Command::new(command)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("Failed to spawn MCP server: {command}"))?;
-
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = child.stdout.take().context("Failed to get stdout")?;
-
-        let transport = Arc::new(Self {
-            next_id: AtomicU64::new(1),
-            pending: std::sync::Mutex::new(HashMap::new()),
-            writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
-            _child: Arc::new(Mutex::new(child)),
-            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
-        });
-
-        // Spawn reader task
-        let transport_clone = Arc::clone(&transport);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break, // EOF or error
-                    Ok(_) => {
-                        const MAX_LINE_LEN: usize = 10 * 1024 * 1024; // 10 MiB
-                        if line.len() > MAX_LINE_LEN {
-                            log::warn!(
-                                "MCP stdout line exceeds {} bytes (got {}), skipping",
-                                MAX_LINE_LEN,
-                                line.len()
-                            );
-                            continue;
-                        }
-                        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
-                            let sender = {
-                                let mut pending = match transport_clone.pending.lock() {
-                                    Ok(pending) => pending,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                pending.remove(&response.id)
-                            };
-                            if let Some(sender) = sender {
-                                let _ = sender.send(response);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(transport)
+        Self::spawn_with_env(command, args, &[])
     }
 
     /// Spawn a new MCP server process with environment variables.
@@ -198,6 +165,49 @@ impl StdioTransport {
     ///
     /// Returns an error if the process fails to spawn.
     pub fn spawn_with_env(command: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Arc<Self>> {
+        Self::spawn_inner(command, args, env, DEFAULT_RESPONSE_TIMEOUT)
+    }
+
+    /// Spawn a transport with a custom response timeout.
+    ///
+    /// MCP tool calls routinely exceed the 60s default (builds, codegen);
+    /// this lets callers raise (or lower) the per-request response deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process fails to spawn.
+    pub fn spawn_with_timeout(
+        command: &str,
+        args: &[&str],
+        response_timeout: Duration,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_inner(command, args, &[], response_timeout)
+    }
+
+    /// Spawn a transport with both environment variables and a custom response
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process fails to spawn.
+    pub fn spawn_with_env_and_timeout(
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        response_timeout: Duration,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_inner(command, args, env, response_timeout)
+    }
+
+    /// Shared constructor: spawn the child, wire up the reader task, and return
+    /// the transport. All public constructors funnel through here so the
+    /// reader-loop and process setup live in exactly one place.
+    fn spawn_inner(
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        response_timeout: Duration,
+    ) -> Result<Arc<Self>> {
         let mut cmd = Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -218,14 +228,27 @@ impl StdioTransport {
 
         let transport = Arc::new(Self {
             next_id: AtomicU64::new(1),
-            pending: std::sync::Mutex::new(HashMap::new()),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
-            _child: Arc::new(Mutex::new(child)),
-            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+            child: Arc::new(Mutex::new(child)),
+            response_timeout,
         });
 
-        // Spawn reader task
-        let transport_clone = Arc::clone(&transport);
+        // The reader task holds only the pending map (not the transport), so it
+        // never keeps the child/writer alive. See [`StdioTransport::pending`].
+        Self::spawn_reader(stdout, Arc::clone(&transport.pending));
+
+        Ok(transport)
+    }
+
+    /// Spawn the background task that reads JSON-RPC responses off the child's
+    /// stdout and dispatches them to waiting senders.
+    ///
+    /// On EOF or read error (the child died or closed stdout) the task drains
+    /// the pending map, dropping every sender. Each waiting `send` then fails
+    /// immediately via the "Response channel closed" path instead of burning
+    /// the full response timeout.
+    fn spawn_reader(stdout: ChildStdout, pending: Arc<PendingMap>) {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -246,11 +269,10 @@ impl StdioTransport {
                         }
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
                             let sender = {
-                                let mut pending = match transport_clone.pending.lock() {
-                                    Ok(pending) => pending,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                pending.remove(&response.id)
+                                let mut map = pending
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                map.remove(&response.id)
                             };
                             if let Some(sender) = sender {
                                 let _ = sender.send(response);
@@ -259,9 +281,15 @@ impl StdioTransport {
                     }
                 }
             }
-        });
 
-        Ok(transport)
+            // Reader exited: the child closed stdout (it died or finished).
+            // Fail all in-flight requests now so callers don't wait out the
+            // full response timeout.
+            let mut map = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.clear();
+        });
     }
 
     /// Get the next request ID.
@@ -279,66 +307,6 @@ impl StdioTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
-    }
-
-    /// Spawn a transport with a custom response timeout.
-    ///
-    /// Test-only helper so timeout behaviour can be exercised deterministically
-    /// without waiting for the production 60s default.
-    #[cfg(test)]
-    fn spawn_with_timeout(
-        command: &str,
-        args: &[&str],
-        response_timeout: std::time::Duration,
-    ) -> Result<Arc<Self>> {
-        let mut child = Command::new(command)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("Failed to spawn MCP server: {command}"))?;
-
-        let stdin = child.stdin.take().context("Failed to get stdin")?;
-        let stdout = child.stdout.take().context("Failed to get stdout")?;
-
-        let transport = Arc::new(Self {
-            next_id: AtomicU64::new(1),
-            pending: std::sync::Mutex::new(HashMap::new()),
-            writer: Mutex::new(tokio::io::BufWriter::new(stdin)),
-            _child: Arc::new(Mutex::new(child)),
-            response_timeout,
-        });
-
-        let transport_clone = Arc::clone(&transport);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
-                            let sender = {
-                                let mut pending = match transport_clone.pending.lock() {
-                                    Ok(pending) => pending,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                pending.remove(&response.id)
-                            };
-                            if let Some(sender) = sender {
-                                let _ = sender.send(response);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(transport)
     }
 }
 
@@ -364,7 +332,7 @@ impl McpTransport for StdioTransport {
         // cancelled/dropped mid-await. Without it the entry leaks and the map
         // grows unbounded for a server that times out frequently (ENG-8736).
         let _pending_guard = PendingGuard {
-            pending: &self.pending,
+            pending: self.pending.as_ref(),
             request_id: request.id.clone(),
         };
 
@@ -391,11 +359,12 @@ impl McpTransport for StdioTransport {
     }
 
     async fn send_notification(&self, mut request: JsonRpcRequest) -> Result<()> {
-        // Assign an ID for serialization but don't register a pending response
+        // Advance the shared id counter so request ids stay monotonic across the
+        // connection, but strip the id on the wire: JSON-RPC 2.0 / MCP
+        // notifications must not carry one.
         let id = self.next_request_id();
         request.id = RequestId::Number(id);
-
-        let json = serde_json::to_string(&request)?;
+        let json = notification_body(&request)?;
         let mut writer = self.writer.lock().await;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -405,7 +374,31 @@ impl McpTransport for StdioTransport {
     }
 
     async fn close(&self) -> Result<()> {
-        // Closing is handled by dropping the transport (kill_on_drop)
+        // Close stdin so the child sees EOF and can exit cleanly.
+        {
+            let mut writer = self.writer.lock().await;
+            let _ = writer.flush().await;
+            let _ = writer.shutdown().await;
+            drop(writer);
+        }
+
+        // Kill the child process explicitly rather than relying on a drop that
+        // may never happen while user handles are alive.
+        {
+            let mut child = self.child.lock().await;
+            let _ = child.start_kill();
+        }
+
+        // Fail any in-flight requests immediately so awaiting `send` calls do
+        // not wait out the response timeout.
+        {
+            let mut map = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.clear();
+        }
+
         Ok(())
     }
 }
@@ -461,6 +454,74 @@ mod tests {
             transport.pending_len() == 0,
             "pending map must be empty after {N} timeouts, found {} stale entries",
             transport.pending_len(),
+        );
+
+        Ok(())
+    }
+
+    /// JSON-RPC notifications must not carry an `id` (finding 13).
+    #[test]
+    fn notification_body_omits_id() -> Result<()> {
+        let request = JsonRpcRequest::new("notifications/initialized", None, 7);
+        let body = notification_body(&request)?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        ensure!(
+            value.get("id").is_none(),
+            "notification must not carry an id, got: {body}"
+        );
+        ensure!(
+            value.get("method").and_then(serde_json::Value::as_str)
+                == Some("notifications/initialized"),
+            "notification method must be preserved"
+        );
+        ensure!(
+            value.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0"),
+            "jsonrpc version must be preserved"
+        );
+        Ok(())
+    }
+
+    /// Regression test for findings 3 & 12: `close()` must terminate the child
+    /// and fail in-flight requests immediately instead of leaving them to wait
+    /// out the full response timeout. The child drains stdin and never replies,
+    /// so without the fix `send` would block for the entire (30s) timeout.
+    #[tokio::test]
+    async fn close_fails_in_flight_requests_promptly() -> Result<()> {
+        let transport = StdioTransport::spawn_with_timeout(
+            "sh",
+            &["-c", "cat > /dev/null"],
+            Duration::from_secs(30),
+        )?;
+
+        let sender = Arc::clone(&transport);
+        let handle = tokio::spawn(async move {
+            sender
+                .send(JsonRpcRequest::new("tools/list", None, 0))
+                .await
+        });
+
+        // Wait until the request is registered in the pending map.
+        for _ in 0..200 {
+            if transport.pending_len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ensure!(
+            transport.pending_len() == 1,
+            "request should be registered before close()"
+        );
+
+        transport.close().await?;
+
+        // The in-flight request must fail well under the 30s response timeout.
+        let send_result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .context("in-flight request did not fail promptly after close()")?
+            .context("send task panicked")?;
+        ensure!(
+            send_result.is_err(),
+            "in-flight request must fail when the transport is closed"
         );
 
         Ok(())

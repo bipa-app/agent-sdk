@@ -70,9 +70,15 @@ impl TokenEstimator {
                 estimated.max(Self::REDACTED_THINKING_MIN_TOKENS)
             }
             ContentBlock::ToolUse { name, input, .. } => {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
+                // Estimate the serialized JSON length without actually
+                // serializing: `needs_compaction` runs before every LLM call,
+                // so allocating a String per tool-use block on every round-trip
+                // is O(n^2) over a session. The recursive estimator also avoids
+                // the silent 0-byte underestimate that `to_string(..)
+                // .unwrap_or_default()` produced on a serialization failure.
+                let input_len = Self::estimate_json_len(input);
                 Self::estimate_text(name)
-                    + Self::estimate_text(&input_str)
+                    + input_len.div_ceil(Self::CHARS_PER_TOKEN)
                     + Self::TOOL_USE_OVERHEAD
             }
             ContentBlock::ToolResult { content, .. } => {
@@ -92,6 +98,64 @@ impl TokenEstimator {
     #[must_use]
     pub fn estimate_history(messages: &[Message]) -> usize {
         messages.iter().map(Self::estimate_message).sum()
+    }
+
+    /// Approximate the serialized-JSON byte length of a value without
+    /// allocating a serialized `String`.
+    ///
+    /// Mirrors `serde_json::to_string`'s output length closely enough for token
+    /// estimation: it sums key/string lengths, structural punctuation, and a
+    /// digit count for numbers. It is intentionally slightly conservative
+    /// (over-counts a trailing separator per element) since over-estimating
+    /// context size is safer than under-estimating it.
+    fn estimate_json_len(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Null => 4, // "null"
+            serde_json::Value::Bool(b) => {
+                if *b {
+                    4 // "true"
+                } else {
+                    5 // "false"
+                }
+            }
+            serde_json::Value::Number(n) => n.as_u64().map_or_else(
+                || {
+                    n.as_i64().map_or(
+                        // Floating point or arbitrary-precision: a fixed
+                        // estimate is fine for a token heuristic.
+                        8,
+                        |i| Self::decimal_digits(i.unsigned_abs()) + usize::from(i < 0),
+                    )
+                },
+                Self::decimal_digits,
+            ),
+            // String value plus surrounding quotes.
+            serde_json::Value::String(s) => s.len() + 2,
+            serde_json::Value::Array(items) => {
+                // Brackets plus a separator allowance per element.
+                2 + items
+                    .iter()
+                    .map(|item| Self::estimate_json_len(item) + 1)
+                    .sum::<usize>()
+            }
+            serde_json::Value::Object(entries) => {
+                // Braces plus key (quoted) + ':' + value + ',' per entry.
+                2 + entries
+                    .iter()
+                    .map(|(key, val)| key.len() + 2 + 1 + Self::estimate_json_len(val) + 1)
+                    .sum::<usize>()
+            }
+        }
+    }
+
+    /// Count the decimal digits in a `u64` without allocating.
+    const fn decimal_digits(mut n: u64) -> usize {
+        let mut digits = 1;
+        while n >= 10 {
+            n /= 10;
+            digits += 1;
+        }
+        digits
     }
 }
 
@@ -221,6 +285,50 @@ mod tests {
 
         let estimate = TokenEstimator::estimate_block(&block);
         assert_eq!(estimate, TokenEstimator::REDACTED_THINKING_MIN_TOKENS);
+    }
+
+    #[test]
+    fn test_estimate_json_len_tracks_serialized_size() {
+        // The no-allocation estimator should track the real serialized length
+        // closely (within the per-element separator slack it intentionally adds).
+        for value in [
+            json!({"path": "/test.txt"}),
+            json!({"a": 1, "b": [1, 2, 3], "c": {"nested": true}}),
+            json!([null, false, "string", 12_345]),
+            json!("plain string"),
+            json!(9_876_543),
+        ] {
+            let estimated = TokenEstimator::estimate_json_len(&value);
+            let actual = serde_json::to_string(&value).map_or(0, |s| s.len());
+            assert!(
+                estimated >= actual,
+                "estimate {estimated} should be >= actual {actual} for {value}"
+            );
+            assert!(
+                estimated <= actual * 2 + 8,
+                "estimate {estimated} wildly exceeds actual {actual} for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_use_estimate_is_nonzero_for_nonempty_input() {
+        // Regression: the old `to_string(..).unwrap_or_default()` path could
+        // silently produce a 0-length input estimate. The recursive estimator
+        // always accounts for the input.
+        let block = ContentBlock::ToolUse {
+            id: "tool_1".to_string(),
+            name: "bash".to_string(),
+            input: json!({"command": "echo hello world"}),
+            thought_signature: None,
+        };
+
+        let estimate = TokenEstimator::estimate_block(&block);
+        // name (1) + overhead (20) is 21; the input must add more on top.
+        assert!(
+            estimate > 21,
+            "input length must contribute to the estimate"
+        );
     }
 
     #[test]

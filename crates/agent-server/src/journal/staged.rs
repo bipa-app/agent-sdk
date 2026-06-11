@@ -160,7 +160,13 @@ impl MessageStore for StagedMessageStore {
             self.thread_id,
             thread_id,
         );
+        // Clearing means "the new committed seed is empty". We must
+        // re-point `seed_len` at the now-empty buffer (mirroring
+        // `replace_history`); otherwise a later append within the same
+        // attempt lands at an index below the stale `seed_len`, and
+        // `drain_messages` would silently skip — and lose — it.
         self.messages.write().ok().context("lock poisoned")?.clear();
+        *self.seed_len.write().ok().context("lock poisoned")? = 0;
         Ok(())
     }
 
@@ -453,6 +459,24 @@ mod tests {
         store.clear(&thread_a()).await?;
         let history = store.get_history(&thread_a()).await?;
         assert!(history.is_empty());
+        Ok(())
+    }
+
+    /// Regression for finding #12: `clear` must reset `seed_len` so a
+    /// later append is not silently dropped by `drain_messages`.
+    #[tokio::test]
+    async fn staged_clear_resets_seed_len_so_appends_survive_drain() -> Result<()> {
+        // Seed 2 messages.
+        let store = StagedMessageStore::new(thread_a(), sample_messages());
+        // Clear mid-attempt.
+        store.clear(&thread_a()).await?;
+        // Append 1 message after the clear.
+        store
+            .append(&thread_a(), llm::Message::user("after clear"))
+            .await?;
+        // drain must return exactly the 1 post-clear append, not skip it.
+        let drained = store.drain_messages()?;
+        assert_eq!(drained.len(), 1);
         Ok(())
     }
 

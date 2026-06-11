@@ -23,6 +23,7 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 - **Agent Loop** - Core orchestration that handles the LLM conversation and tool execution cycle
 - **Provider Agnostic** - Built-in support for Anthropic (Claude), OpenAI, and Google Gemini, plus a trait for custom providers
 - **Tool System** - Define tools with JSON schema validation and typed tool names; the LLM decides when to use them
+- **Structured Output** - Schema-validated, bounded-re-prompt JSON output via `run_structured`, `ResponseFormat`, and `StructuredOutput`
 - **Async Tools** - Long-running operations with progress streaming via `AsyncTool` trait
 - **Lifecycle Hooks** - Intercept tool calls for logging, user confirmation, rate limiting, or security checks
 - **Streaming Events** - Real-time event stream for building responsive UIs
@@ -46,14 +47,6 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Installation
 
-> **Note:** a fresh crates.io release on the current API is being cut. Until it
-> lands you can depend on the repository directly:
->
-> ```toml
-> [dependencies]
-> agent-sdk = { git = "https://github.com/bipa-app/agent-sdk" }
-> ```
-
 Add the SDK to your project with Cargo:
 
 ```bash
@@ -66,7 +59,7 @@ Or add it directly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agent-sdk = "0.8"
+agent-sdk = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -94,8 +87,21 @@ Enable the ones you need, for example:
 
 ```toml
 [dependencies]
-agent-sdk = { version = "0.8", features = ["openai", "gemini", "web", "mcp"] }
+agent-sdk = { version = "0.9", features = ["openai", "gemini", "web", "mcp"] }
 ```
+
+### Upgrading from 0.8
+
+0.9.0 was a breaking release. The two changes most likely to affect existing
+code:
+
+- **Feature-gated providers and tools.** Providers other than Anthropic, plus
+  the `web`, `mcp`, and `skills` tool surfaces, are now opt-in Cargo features
+  (see the table above). A 0.8 build that used OpenAI/Gemini/Vertex/Cloudflare,
+  web tools, or MCP must enable the matching feature.
+- **`#[non_exhaustive]` wire/streaming enums.** Public wire and streaming enums
+  (e.g. `AgentEvent`, `ChatOutcome`, `StopReason`) are now `#[non_exhaustive]`,
+  so `match` arms over them must include a wildcard `_ => { ... }`.
 
 ## OpenTelemetry
 
@@ -103,7 +109,7 @@ Enable the optional `otel` feature to emit OpenTelemetry spans from the agent lo
 
 ```toml
 [dependencies]
-agent-sdk = { version = "0.8", features = ["otel"] }
+agent-sdk = { version = "0.9", features = ["otel"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 # Add the exporter crate that matches your backend, for example opentelemetry-otlp.
@@ -181,10 +187,36 @@ runnable example under [`crates/agent-sdk/examples/`](crates/agent-sdk/examples)
 
 ## Quick Start
 
-Build an agent, run a prompt, and read the reply from the agent's event store.
-The agent loop writes every [`AgentEvent`] to the configured `EventStore`; you
-read them back once the run completes (or wrap the store to observe them live —
-see the [`streaming`](crates/agent-sdk/examples/streaming.rs) example).
+The 30-second path: build an agent, ask a question, get the answer. `ask()`
+builds the tool context and cancellation token for you and returns the
+assembled assistant text. `use agent_sdk::prelude::*;` brings in the handful of
+names a newcomer needs (`builder`, the config + I/O types, the `Tool` surface,
+the in-memory event store, the cancellation token, and the default
+`AnthropicProvider`).
+
+```rust
+use agent_sdk::prelude::*;
+use agent_sdk::ThreadId;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let agent = builder::<()>()
+        .provider(AnthropicProvider::from_env()) // reads ANTHROPIC_API_KEY
+        .build();
+
+    let answer = agent
+        .ask(ThreadId::new(), "What is the capital of France?")
+        .await?;
+    println!("{answer}");
+    Ok(())
+}
+```
+
+When you need application context, a confirmation flow, explicit cancellation,
+or to stream events live, drop down to `run()`. It writes every `AgentEvent`
+to the configured `EventStore`; you read them back once the run completes (or
+wrap the store to observe them live — see the
+[`streaming`](crates/agent-sdk/examples/streaming.rs) example).
 
 ```rust
 use std::sync::Arc;
@@ -267,7 +299,7 @@ ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example streaming
 ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example tool_round_trip
 
 # Connect to an external MCP server (stdio) and use its tools
-ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example mcp_filesystem
+ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example mcp_filesystem --features mcp
 
 # Basic conversation (no tools)
 ANTHROPIC_API_KEY=your_key cargo run -p agent-sdk --example basic_agent
@@ -518,6 +550,47 @@ let mut tools = ToolRegistry::new();
 tools.register_async(TransferTool);
 ```
 
+## Structured Output
+
+Constrain the model's final answer to a JSON Schema. `run_structured` validates
+the output and bounded-re-prompts on a schema mismatch before failing with a
+typed error; the returned `StructuredOutput::value` is guaranteed to satisfy the
+schema. See `examples/structured_output.rs` for a complete offline-runnable
+version.
+
+```rust
+use agent_sdk::llm::{ChatRequest, Message, ResponseFormat};
+use agent_sdk::{StructuredConfig, run_structured};
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+struct Person {
+    name: String,
+    age: u32,
+}
+
+let schema = json!({
+    "type": "object",
+    "properties": {
+        "name": { "type": "string" },
+        "age": { "type": "integer", "minimum": 0 }
+    },
+    "required": ["name", "age"],
+    "additionalProperties": false
+});
+
+let request = ChatRequest::new(
+    "Extract the person described by the user.",
+    vec![Message::user("Ada Lovelace is 36.")],
+)
+.with_response_format(ResponseFormat::new("person", schema));
+
+// `provider` is any `LlmProvider`, e.g. `AnthropicProvider::from_env()`.
+let out = run_structured(&provider, request, StructuredConfig::default()).await?;
+let person: Person = serde_json::from_value(out.value)?;
+```
+
 ## Extended Thinking
 
 Configure thinking on the provider when you choose the model:
@@ -556,7 +629,11 @@ events with the model's reasoning output.
 Hooks let you intercept and control agent behavior:
 
 ```rust
-use agent_sdk::{AgentEvent, AgentHooks, ToolDecision, ToolInvocation, ToolResult, ToolTier};
+use std::sync::Arc;
+use agent_sdk::{
+    AgentEvent, AgentHooks, InMemoryEventStore, InMemoryStore, ToolDecision,
+    ToolInvocation, ToolResult, ToolTier, builder,
+};
 use async_trait::async_trait;
 
 struct MyHooks;
@@ -598,10 +675,15 @@ impl AgentHooks for MyHooks {
     }
 }
 
+// Setting hooks changes the builder's type, so the build must also supply the
+// message/state/event stores and finish with `build_with_stores()`.
 let agent = builder::<()>()
     .provider(provider)
     .hooks(MyHooks)
-    .build();
+    .message_store(InMemoryStore::new())
+    .state_store(InMemoryStore::new())
+    .event_store(Arc::new(InMemoryEventStore::new()))
+    .build_with_stores();
 ```
 
 ### Audit Sink
@@ -716,45 +798,51 @@ agent.run(thread_id, prompt, tool_ctx, CancellationToken::new());
 
 The agent emits events during execution for real-time UI updates.
 
-### Event Channel Behavior
+### Consuming events
 
-The agent uses a bounded channel (capacity 100) for events. The SDK is designed to be resilient to slow consumers:
+The agent loop persists every `AgentEvent` to the configured `EventStore`.
+There are two ways to consume them:
 
-- **Non-blocking sends**: Events are sent using `try_send` first. If the channel is full, the SDK waits up to 30 seconds before timing out.
-- **Consumer disconnection**: If the event receiver is dropped, the agent continues processing the LLM response without blocking.
-- **Backpressure handling**: If your consumer is slow, you'll see warnings like `Event channel full, waiting for consumer...` in the logs.
-
-**Best practices for consuming events:**
+- **After the run** — read them back from the store once `run()` completes (as
+  in the Quick Start). Simplest for batch or request/response use.
+- **Live** — wrap the `EventStore` so its `append` observes each event as it is
+  written (see `examples/streaming.rs`), or implement `AgentHooks::on_event`.
 
 ```rust
-// GOOD: Process events quickly, offload heavy work
-while let Some(envelope) = events.recv().await {
+// After the run: read the persisted events from the store.
+for envelope in event_store.get_events(&thread_id).await? {
     match envelope.event {
-        AgentEvent::TextDelta {
-            message_id: _,
-            delta,
-        } => {
-            // Quick: just buffer or forward
+        AgentEvent::TextDelta { message_id: _, delta } => {
+            // Buffer or forward each streamed chunk.
             buffer.push_str(&delta);
         }
         AgentEvent::Done { .. } => break,
         _ => {}
     }
 }
+```
 
-// GOOD: Spawn heavy processing to avoid blocking
-while let Some(envelope) = events.recv().await {
-    let envelope = envelope.clone();
-    tokio::spawn(async move {
-        // Heavy processing in background
-        save_to_database(&envelope).await;
-    });
-}
+For live streaming, wrap the store and react inside `append`:
 
-// BAD: Blocking I/O in the event loop
-while let Some(_envelope) = events.recv().await {
-    // This blocks the consumer, causing backpressure
-    std::thread::sleep(Duration::from_secs(1));
+```rust
+use agent_sdk::{AgentEvent, AgentEventEnvelope, EventStore, ThreadId};
+use async_trait::async_trait;
+
+#[async_trait]
+impl EventStore for PrintingEventStore {
+    async fn append(
+        &self,
+        thread_id: &ThreadId,
+        turn: usize,
+        envelope: AgentEventEnvelope,
+    ) -> anyhow::Result<()> {
+        if let AgentEvent::TextDelta { delta, .. } = &envelope.event {
+            print!("{delta}"); // stream to the UI as chunks arrive
+        }
+        // Delegate persistence (and the rest of the trait) to the inner store.
+        self.inner.append(thread_id, turn, envelope).await
+    }
+    // ... delegate finish_turn / get_turn / get_turns / clear to `self.inner`.
 }
 ```
 
@@ -777,7 +865,7 @@ while let Some(_envelope) = events.recv().await {
 | `Error` | An error occurred |
 
 ```rust
-while let Some(envelope) = events.recv().await {
+for envelope in event_store.get_events(&thread_id).await? {
     match envelope.event {
         AgentEvent::Start { thread_id, turn } => {
             println!("Starting turn {turn}");
@@ -903,15 +991,23 @@ Task statuses: `Pending` (○), `InProgress` (⚡), `Completed` (✓)
 Spawn isolated child agents for complex subtasks:
 
 ```rust
-use agent_sdk::{SubagentFactory, SubagentConfig, SubagentTool};
+use std::sync::Arc;
+use agent_sdk::{EventStore, InMemoryEventStore, SubagentConfig, SubagentFactory};
 
-let factory = SubagentFactory::new(provider, subagent_tools);
-let config = SubagentConfig {
-    system_prompt: "You are a research assistant.".into(),
-    max_turns: Some(10),
-    ..Default::default()
-};
-let subagent_tool = SubagentTool::new(factory, config);
+// `provider` is an `Arc<P>`; `subagent_tools` is a read-only `ToolRegistry<()>`.
+// The factory takes the provider plus a closure that mints a fresh event store
+// for each subagent run, and the tool registry is supplied separately.
+let factory = SubagentFactory::new(provider, || {
+    Arc::new(InMemoryEventStore::new()) as Arc<dyn EventStore>
+})
+.with_read_only_registry(subagent_tools);
+
+let config = SubagentConfig::new("researcher")
+    .with_system_prompt("You are a research assistant.")
+    .with_max_turns(10);
+
+// `create_read_only` builds a `SubagentTool` you register like any other tool.
+let subagent_tool = factory.create_read_only(config)?;
 ```
 
 Subagents run in isolated threads with their own context and stream progress events back to the parent.
@@ -920,15 +1016,21 @@ Subagents run in isolated threads with their own context and stream progress eve
 
 Integrate external tools via the Model Context Protocol:
 
+Enable the `mcp` feature, then connect a transport and bridge the server's
+tools into your registry:
+
 ```rust
+use std::sync::Arc;
 use agent_sdk::mcp::{McpClient, StdioTransport, register_mcp_tools};
 
-// Connect to an MCP server
+// Spawn the MCP server over stdio (synchronous; returns the transport).
 let transport = StdioTransport::spawn("mcp-server", &["--stdio"])?;
-let client = McpClient::new(transport);
 
-// Register all tools from the MCP server
-register_mcp_tools(&mut registry, &client).await?;
+// `McpClient::new` is async, performs the handshake, and returns a Result.
+let client = Arc::new(McpClient::new(transport, "mcp-server".to_string()).await?);
+
+// Register all tools the MCP server advertises. The client is passed by Arc.
+register_mcp_tools(&mut registry, Arc::clone(&client)).await?;
 ```
 
 ## User Interaction
@@ -954,19 +1056,26 @@ The SDK provides trait-based storage for production deployments:
 `InMemoryStore` and `InMemoryExecutionStore` are provided for testing. For production, implement the traits with your database (Postgres, Redis, etc.):
 
 ```rust
-use agent_sdk::{MessageStore, StateStore, ToolExecutionStore, InMemoryStore, InMemoryExecutionStore};
+use std::sync::Arc;
+use agent_sdk::{
+    DefaultHooks, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, builder,
+};
 
 // Use in-memory stores for development
 let message_store = InMemoryStore::new();
 let state_store = InMemoryStore::new();
 let exec_store = InMemoryExecutionStore::new();
 
+// `build_with_stores()` requires hooks + message/state/event stores; the
+// execution store is an optional add-on for crash-safe tool idempotency.
 let agent = builder::<()>()
     .provider(provider)
+    .hooks(DefaultHooks)
     .message_store(message_store)
     .state_store(state_store)
+    .event_store(Arc::new(InMemoryEventStore::new()))
     .execution_store(exec_store)
-    .build();
+    .build_with_stores();
 ```
 
 The `ToolExecutionStore` enables crash recovery by recording tool calls before execution, ensuring idempotency on retry.

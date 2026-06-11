@@ -302,6 +302,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            cancel: None,
         }
     }
 }
@@ -3626,6 +3627,210 @@ async fn stream_invalid_request_does_not_retry() -> Result<()> {
     assert!(
         kinds.iter().all(|k| k != "auto_retry_start"),
         "no retry should have been attempted, found: {kinds:?}",
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Findings #3 / #11 / #12 — per-turn (`tools_fn`) tier drives the gate
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pending_tool_tier_uses_per_turn_tools_fn_not_static_list() -> Result<()> {
+    // The host gates the confirmation pause on the pending tool call's
+    // tier. `tools_fn` can harden a tool's tier per caller (e.g.
+    // `Confirm` for guests where the static list says `Observe`). That
+    // stricter per-turn tier MUST win, or confirmation is silently
+    // skipped.
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "rm -rf /"}));
+
+    let definition = AgentDefinition {
+        provider: "mock".into(),
+        model: "mock-model".into(),
+        system_prompt: "test".into(),
+        max_tokens: 1024,
+        // Static list: bash is the permissive Observe tier.
+        tools: vec![Tool {
+            name: "bash".into(),
+            description: "Run a shell command".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            display_name: "Bash (static)".into(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }],
+        thinking: ThinkingPolicy::default(),
+        // Per-turn override (consulted because the task carries
+        // caller_metadata): bash is hardened to Confirm.
+        tools_fn: Some(Arc::new(|_ctx| {
+            vec![Tool {
+                name: "bash".into(),
+                description: "Run a shell command".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                display_name: "Bash (hardened)".into(),
+                tier: agent_sdk_foundation::ToolTier::Confirm,
+            }]
+        })),
+        policy: RuntimePolicy::server_default(),
+    };
+
+    // Task with caller_metadata so `resolve_tools` invokes `tools_fn`.
+    let mut task = AgentTask::new_root_turn(thread_a(), t0(), 3);
+    task.caller_metadata = Some(serde_json::json!({"role": "guest"}));
+    let task_id = task.id.clone();
+    stores.tasks.submit_root_turn(task).await?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &task_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(300),
+            t0(),
+        )
+        .await?
+        .context("task should be acquirable")?;
+
+    let bootstrap = WorkerBootstrapContext {
+        task: acquired,
+        definition,
+        thread_id: thread_a(),
+        task_id: task_id.clone(),
+        worker_id: WorkerId::from_string("worker_test"),
+        lease_id: LeaseId::from_string("lease_test"),
+    };
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let outcome = execute_root_turn(inputs, "do it", &provider, &stores.deps(), t_plus(5)).await?;
+    let RootTurnOutcome::Suspended { .. } = outcome else {
+        panic!("expected Suspended on a tool-use turn");
+    };
+
+    let parent = stores
+        .tasks
+        .get(&task_id)
+        .await?
+        .context("parent task should exist")?;
+    let continuation = match &parent.state {
+        TaskState::WaitingOnChildren { continuation, .. } => continuation,
+        other => panic!("expected WaitingOnChildren, got {other:?}"),
+    };
+    let tool_call = &continuation.payload.pending_tool_calls[0];
+    assert_eq!(
+        tool_call.tier,
+        agent_sdk_foundation::ToolTier::Confirm,
+        "the per-turn tools_fn Confirm tier must win over the static Observe tier",
+    );
+    assert_eq!(tool_call.display_name, "Bash (hardened)");
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Findings #6 / #7 — cooperative cancellation
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancelled_token_aborts_root_turn_without_committing() -> Result<()> {
+    // A tripped cancellation token must stop the worker cooperatively
+    // (no commit, no completed turn) rather than streaming + committing
+    // a cancelled thread's turn and only failing at the final CAS.
+    let stores = TestStores::new();
+    let provider = MockTextProvider::new("should never be committed");
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = execute_root_turn(inputs, "hi", &provider, &deps, t_plus(5)).await;
+    let Err(error) = result else {
+        panic!("cancelled turn must not return a committed outcome");
+    };
+    assert!(
+        format!("{error:#}").to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error:#}",
+    );
+
+    // The turn never committed.
+    let thread = stores
+        .threads
+        .get(&thread_a())
+        .await?
+        .context("thread should exist")?;
+    assert_eq!(thread.committed_turns, 0);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Finding #10 — selector errors fail the turn (trait contract)
+// ─────────────────────────────────────────────────────────────────────
+
+struct FailingSpawnSelector;
+
+#[async_trait]
+impl super::subagent_spawn_selector::SubagentSpawnSelector for FailingSpawnSelector {
+    async fn decide(
+        &self,
+        _parent_thread_id: &ThreadId,
+        _tool_calls: &[agent_sdk_foundation::PendingToolCallInfo],
+    ) -> Result<Vec<super::subagent_spawn_selector::SubagentSpawnDecision>> {
+        anyhow::bail!("synthetic selector failure")
+    }
+}
+
+#[tokio::test]
+async fn selector_error_fails_the_turn() -> Result<()> {
+    // The SubagentSpawnSelector contract reserves `Err` for genuinely
+    // unrecoverable conditions; the worker must propagate it as the turn
+    // error rather than silently rerouting to spawn_tool_children.
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "pwd"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let selector = FailingSpawnSelector;
+    let mut deps = stores.deps();
+    deps.subagent_spawn_selector = Some(&selector);
+
+    let result = execute_root_turn(inputs, "go", &provider, &deps, t_plus(5)).await;
+    let Err(error) = result else {
+        panic!("a failing selector must fail the turn, not silently reroute");
+    };
+    assert!(
+        format!("{error:#}").contains("selector failed")
+            || format!("{error:#}").contains("synthetic selector failure"),
+        "expected the selector error to surface, got: {error:#}",
     );
 
     Ok(())

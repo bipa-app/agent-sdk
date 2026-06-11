@@ -25,6 +25,7 @@
 //! introduced by A5 is `agent_sdk::RunOptions`.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_sdk_foundation::privacy::{RedactionPolicy, redact_string};
@@ -264,6 +265,11 @@ pub struct RootTraceState {
     redactor: RedactionPolicy,
     max_chars: usize,
     buffer: Mutex<String>,
+    /// Cached char length of `buffer`, updated under the buffer lock on
+    /// every accepted append. Read lock-free so [`append`](Self::append)
+    /// can short-circuit once the cap is reached without taking the mutex
+    /// or recounting the buffer.
+    char_len: AtomicUsize,
 }
 
 impl RootTraceState {
@@ -275,6 +281,7 @@ impl RootTraceState {
             redactor: RedactionPolicy::baseline(),
             max_chars,
             buffer: Mutex::new(buffer),
+            char_len: AtomicUsize::new(0),
         }
     }
 
@@ -344,15 +351,31 @@ impl RootTraceState {
     }
 
     fn append(&self, label: &str, text: &str) {
+        // Once the buffer reaches the cap, `flush` keeps only the HEAD (see
+        // `truncate_trace_text`), so no later text can ever reach
+        // `langfuse.trace.output`. Short-circuit BEFORE the expensive regex
+        // redaction pass so a long daemon run streaming large tool outputs
+        // stops burning CPU on — and stops accumulating — provably-discarded
+        // appends. The check is lock-free; a tiny overshoot under contention
+        // is harmless because `flush` truncates anyway.
+        if self.char_len.load(Ordering::Acquire) >= self.max_chars {
+            return;
+        }
         let masked = redact_string(text, &self.redactor);
         let Ok(mut buf) = self.buffer.lock() else {
             log::warn!("langfuse trace-output buffer mutex poisoned; dropping update");
             return;
         };
-        if !buf.is_empty() {
-            buf.push_str("\n\n---\n\n");
+        // Re-check under the lock: a racing writer may have filled the buffer
+        // between the lock-free check above and acquiring the lock.
+        if self.char_len.load(Ordering::Relaxed) >= self.max_chars {
+            return;
         }
-        let _ = write!(buf, "[{label}]\n{masked}");
+        let sep = if buf.is_empty() { "" } else { "\n\n---\n\n" };
+        let chunk = format!("{sep}[{label}]\n{masked}");
+        self.char_len
+            .fetch_add(chunk.chars().count(), Ordering::Release);
+        buf.push_str(&chunk);
     }
 }
 
@@ -496,6 +519,23 @@ mod tests {
         assert_eq!(
             langfuse_trace_input(&submit, 100).as_deref(),
             Some("[External tool results]")
+        );
+    }
+
+    #[test]
+    fn append_short_circuits_once_buffer_reaches_cap() {
+        let state = RootTraceState::new(5);
+        // First chunk already pushes the buffer past the 5-char cap.
+        state.append("X", "aaaaaaaaaa");
+        let after_first = state.char_len.load(Ordering::Acquire);
+        assert!(after_first >= 5, "first append should exceed the cap");
+        // Every later append must be dropped without growing the buffer or
+        // running redaction.
+        state.append("Y", "bbbbbbbbbb");
+        let after_second = state.char_len.load(Ordering::Acquire);
+        assert_eq!(
+            after_first, after_second,
+            "buffer must not grow once it has reached max_chars"
         );
     }
 

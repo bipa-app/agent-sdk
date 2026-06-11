@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk-tools"
-version = "0.9.3"
+version = "0.9.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Tool traits, registry, hooks, and store contracts for the Agent SDK"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "tools"]
 categories = ["api-bindings", "asynchronous"]
 

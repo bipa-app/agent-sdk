@@ -297,6 +297,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            cancel: None,
         }
     }
 }
@@ -603,6 +604,7 @@ async fn confirmation_state_survives_restart() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -645,6 +647,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -743,6 +746,7 @@ async fn confirmation_rejected_produces_canonical_error() -> Result<()> {
             reason: "user declined".into(),
         },
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -803,6 +807,7 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
         &child_id,
         ConfirmationDecision::Timeout,
         &stores.tasks,
+        &stores.events,
         t_plus(60),
     )
     .await?;
@@ -1039,6 +1044,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
         &child_id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;

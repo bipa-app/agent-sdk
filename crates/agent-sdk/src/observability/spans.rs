@@ -96,7 +96,9 @@ pub fn link_to_replay_origin(
     original_span_id: &str,
     attempt_index: u32,
 ) {
-    let Some(target) = parse_span_context(original_trace_id, original_span_id) else {
+    let Some(target) =
+        span_context_from_hex(original_trace_id, original_span_id, TraceFlags::SAMPLED)
+    else {
         return;
     };
     add_link(
@@ -126,7 +128,8 @@ pub fn link_to_replay_origin(
 /// spans is dropped by tail sampling.  Malformed ids are silently
 /// dropped (see [`link_to_replay_origin`]).
 pub fn link_to_parent_turn(span: &mut BoxedSpan, parent_trace_id: &str, parent_span_id: &str) {
-    let Some(target) = parse_span_context(parent_trace_id, parent_span_id) else {
+    let Some(target) = span_context_from_hex(parent_trace_id, parent_span_id, TraceFlags::SAMPLED)
+    else {
         return;
     };
     add_link(span, target, vec![]);
@@ -142,29 +145,61 @@ pub fn link_to_parent_turn(span: &mut BoxedSpan, parent_trace_id: &str, parent_s
 /// persists the root span's `(trace_id, span_id)` and rebuilds a remote
 /// parent context from them via this helper so resumed `chat` calls and
 /// child-task `execute_tool` calls nest under the turn root. Returns
-/// `None` for malformed / zero ids (treated as "no parent"). Thin public
-/// wrapper over `parse_span_context`.
+/// `None` for malformed / zero ids (treated as "no parent").
+///
+/// **Legacy entry point — assumes the remote parent was sampled.** It
+/// always marks the reconstructed context SAMPLED, which forces a
+/// `ParentBased` sampler to record every re-parented child even when the
+/// root span was sampled out. Prefer [`remote_span_context_with_sampling`]
+/// and pass the root span's real sampled bit so ratio sampling configured
+/// for the root is honoured by its children.
 #[must_use]
 pub fn remote_span_context(trace_hex: &str, span_hex: &str) -> Option<SpanContext> {
-    parse_span_context(trace_hex, span_hex)
+    span_context_from_hex(trace_hex, span_hex, TraceFlags::SAMPLED)
 }
 
-/// Build a `SpanContext` from hex-encoded trace + span ids.
+/// Build a remote `SpanContext` that carries the root span's **real**
+/// sampled bit.
+///
+/// A `ParentBased` sampler decides whether to record a child span from its
+/// remote parent's sampled flag. Forcing SAMPLED (see
+/// [`remote_span_context`]) therefore defeats ratio sampling: a child of a
+/// sampled-out root would still be recorded and exported, orphaned from a
+/// parent that was never exported. Passing the parent's actual `sampled`
+/// state keeps the child's sampling decision aligned with the root's.
+///
+/// Returns `None` for malformed / zero ids (treated as "no parent").
+#[must_use]
+pub fn remote_span_context_with_sampling(
+    trace_hex: &str,
+    span_hex: &str,
+    sampled: bool,
+) -> Option<SpanContext> {
+    span_context_from_hex(trace_hex, span_hex, sampled_flags(sampled))
+}
+
+const fn sampled_flags(sampled: bool) -> TraceFlags {
+    if sampled {
+        TraceFlags::SAMPLED
+    } else {
+        TraceFlags::NOT_SAMPLED
+    }
+}
+
+/// Build a `SpanContext` from hex-encoded trace + span ids with explicit
+/// trace flags.
 ///
 /// Returns `None` when either id is malformed or zero (`TraceId::INVALID`
-/// / `SpanId::INVALID`).  The constructed context is marked
-/// `is_remote = true` and carries the SAMPLED flag so the link is
-/// honoured by all `OTel` exporters.
-fn parse_span_context(trace_hex: &str, span_hex: &str) -> Option<SpanContext> {
+/// / `SpanId::INVALID`). The constructed context is marked
+/// `is_remote = true`.
+fn span_context_from_hex(
+    trace_hex: &str,
+    span_hex: &str,
+    flags: TraceFlags,
+) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_hex).ok()?;
     let span_id = SpanId::from_hex(span_hex).ok()?;
-    let ctx = SpanContext::new(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        true,
-        TraceState::default(),
-    );
+    let ctx = SpanContext::new(trace_id, span_id, flags, true, TraceState::default());
     if !ctx.is_valid() {
         return None;
     }
@@ -225,5 +260,47 @@ fn apply_capture_decision(
             span.set_attribute(KeyValue::new(ref_attr, r.clone()));
         }
         CaptureDecision::Omit => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_span_context, remote_span_context_with_sampling};
+    use anyhow::Context as _;
+
+    // Valid W3C example ids (RFC trace-context), both non-zero.
+    const TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN_HEX: &str = "00f067aa0ba902b7";
+
+    #[test]
+    fn remote_span_context_honours_real_sampled_bit() -> anyhow::Result<()> {
+        let kept =
+            remote_span_context_with_sampling(TRACE_HEX, SPAN_HEX, true).context("sampled ctx")?;
+        assert!(kept.is_sampled(), "sampled=true must produce a sampled ctx");
+        assert!(kept.is_remote());
+
+        let dropped = remote_span_context_with_sampling(TRACE_HEX, SPAN_HEX, false)
+            .context("unsampled ctx")?;
+        assert!(
+            !dropped.is_sampled(),
+            "sampled=false must NOT force the SAMPLED flag (ratio sampling respected)"
+        );
+        assert!(dropped.is_remote());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_remote_span_context_stays_sampled() -> anyhow::Result<()> {
+        let ctx = remote_span_context(TRACE_HEX, SPAN_HEX).context("ctx")?;
+        assert!(ctx.is_sampled());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_span_context_rejects_zero_ids() {
+        assert!(
+            remote_span_context_with_sampling(&"0".repeat(32), &"0".repeat(16), true).is_none()
+        );
+        assert!(remote_span_context_with_sampling("not-hex", SPAN_HEX, false).is_none());
     }
 }

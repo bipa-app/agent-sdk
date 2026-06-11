@@ -62,7 +62,7 @@
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use time::OffsetDateTime;
 
 use super::checkpoint::Checkpoint;
@@ -91,6 +91,18 @@ pub struct CompletedTurnCommit {
     pub thread_id: ThreadId,
     /// Task that produced this turn.
     pub task_id: AgentTaskId,
+    /// The turn number this commit is expected to produce — i.e.
+    /// `thread.committed_turns + 1` at the moment the worker decided to
+    /// commit.
+    ///
+    /// Every committer (in-memory, Postgres, `SQLite`) asserts this
+    /// equals `thread.committed_turns + 1` against the freshly
+    /// locked/loaded thread row *before* applying the increment. A
+    /// stale-lease worker that lost a race to another worker therefore
+    /// fails the assertion instead of durably double-committing the
+    /// turn (double-incrementing `committed_turns`, appending the same
+    /// messages twice, and double-billing usage).
+    pub expected_turn: u32,
     /// The open attempt to close.
     pub turn_attempt_id: TurnAttemptId,
     /// Parameters for closing the turn attempt.
@@ -230,6 +242,26 @@ pub async fn commit_completed_turn(
     // run first, then commit the events as the final step.
     let events = std::mem::take(&mut params.events);
     let thread_id_for_events = params.thread_id.clone();
+
+    // Stale turn double-commit guard. Re-read the thread row and assert
+    // it is still positioned to produce `expected_turn` before touching
+    // any projection. A stale-lease worker that lost the race to another
+    // worker (which already advanced the thread) fails here instead of
+    // durably double-committing the turn. Running the guard before the
+    // attempt close means a rejected stale commit leaves no side effects,
+    // mirroring the durable backends, where the in-transaction assertion
+    // rolls back the staged attempt close on mismatch.
+    let committed_turns_before = thread_store
+        .get(&params.thread_id)
+        .await
+        .context("commit: re-read thread for stale-turn guard")?
+        .map_or(0, |thread| thread.committed_turns);
+    ensure!(
+        committed_turns_before.saturating_add(1) == params.expected_turn,
+        "stale turn commit: expected {}, thread at {}",
+        params.expected_turn,
+        committed_turns_before,
+    );
 
     // 1. Close the turn attempt.
     let closed_attempt = turn_attempt_store
@@ -433,6 +465,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task_id.clone(),
+                expected_turn: 1,
                 turn_attempt_id: attempt_id.clone(),
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -494,6 +527,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task1,
+                expected_turn: 1,
                 turn_attempt_id: a1,
                 close_attempt_params: sample_close_params(),
                 messages: vec![llm::Message::user("turn 1")],
@@ -517,6 +551,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task2,
+                expected_turn: 2,
                 turn_attempt_id: a2,
                 close_attempt_params: sample_close_params(),
                 messages: vec![llm::Message::user("turn 2")],
@@ -565,6 +600,106 @@ mod tests {
         Ok(())
     }
 
+    // ── Stale turn double-commit guard ───────────────────────────
+
+    #[tokio::test]
+    async fn stale_expected_turn_is_rejected_while_correct_one_succeeds() -> Result<()> {
+        let s = Stores::new();
+        let task1 = AgentTaskId::from_string("task_stale-1");
+        let task2_stale = AgentTaskId::from_string("task_stale-2a");
+        let task2_ok = AgentTaskId::from_string("task_stale-2b");
+        let a1 = s.open_attempt(&task1, 1).await;
+        let a2_stale = s.open_attempt(&task2_stale, 1).await;
+        let a2_ok = s.open_attempt(&task2_ok, 1).await;
+
+        // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
+        commit_completed_turn(
+            CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id: task1,
+                expected_turn: 1,
+                turn_attempt_id: a1,
+                close_attempt_params: sample_close_params(),
+                messages: vec![llm::Message::user("turn 1")],
+                turn_usage: usage(100, 50),
+                agent_state_snapshot: serde_json::json!({"turn": 1}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                now: t_plus(1),
+            },
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("turn 1")?;
+
+        // A stale-lease worker still believes it is producing turn 1.
+        // The guard rejects it before any projection advances.
+        let err = commit_completed_turn(
+            CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id: task2_stale,
+                expected_turn: 1,
+                turn_attempt_id: a2_stale,
+                close_attempt_params: sample_close_params(),
+                messages: vec![llm::Message::user("stale turn 2")],
+                turn_usage: usage(200, 80),
+                agent_state_snapshot: serde_json::json!({"turn": 2}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                now: t_plus(2),
+            },
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("stale turn commit"),
+            "expected stale-turn rejection, got: {err}",
+        );
+
+        // The thread did not advance and no second checkpoint landed.
+        let thread = s.threads.get(&thread_a()).await?.context("thread")?;
+        assert_eq!(thread.committed_turns, 1, "stale commit must not advance");
+        assert_eq!(s.checkpoints.list_by_thread(&thread_a()).await?.len(), 1);
+
+        // The correct expected_turn for the next turn succeeds.
+        let ok = commit_completed_turn(
+            CompletedTurnCommit {
+                thread_id: thread_a(),
+                task_id: task2_ok,
+                expected_turn: 2,
+                turn_attempt_id: a2_ok,
+                close_attempt_params: sample_close_params(),
+                messages: vec![llm::Message::user("turn 2")],
+                turn_usage: usage(200, 80),
+                agent_state_snapshot: serde_json::json!({"turn": 2}),
+                events: Vec::new(),
+                outbox_max_attempts: 3,
+                now: t_plus(3),
+            },
+            &s.threads,
+            &s.messages,
+            &s.attempts,
+            &s.checkpoints,
+            &s.events,
+        )
+        .await
+        .context("turn 2")?;
+        assert_eq!(ok.thread.committed_turns, 2);
+        assert_eq!(ok.checkpoint.turn_number, 2);
+        assert_eq!(s.checkpoints.list_by_thread(&thread_a()).await?.len(), 2);
+
+        Ok(())
+    }
+
     // ── Thread isolation ─────────────────────────────────────────
 
     #[tokio::test]
@@ -579,6 +714,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task_a,
+                expected_turn: 1,
                 turn_attempt_id: a_a,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -601,6 +737,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_b(),
                 task_id: task_b,
+                expected_turn: 1,
                 turn_attempt_id: a_b,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -643,6 +780,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: AgentTaskId::from_string("task_x"),
+                expected_turn: 1,
                 turn_attempt_id: TurnAttemptId::from_string("attempt_nonexistent"),
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -696,6 +834,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id,
+                expected_turn: 1,
                 turn_attempt_id: attempt_id,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -739,6 +878,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task1,
+                expected_turn: 1,
                 turn_attempt_id: a1,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -767,6 +907,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id: task2,
+                expected_turn: 2,
                 turn_attempt_id: a2,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -832,6 +973,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id,
+                expected_turn: 1,
                 turn_attempt_id: attempt_id,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -878,6 +1020,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id,
+                expected_turn: 1,
                 turn_attempt_id: attempt_id,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),
@@ -937,6 +1080,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread_a(),
                 task_id,
+                expected_turn: 1,
                 turn_attempt_id: attempt_id,
                 close_attempt_params: sample_close_params(),
                 messages: sample_messages(),

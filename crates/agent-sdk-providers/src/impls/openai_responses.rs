@@ -6,10 +6,10 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
-    ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, ResponseFormat,
+    StopReason, ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,6 +18,18 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Build an HTTP client with connect/keepalive timeouts matching the sibling
+/// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
+/// connect timeout, so a black-holed connect would wedge `chat`/`chat_stream`
+/// forever.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
 
 // GPT-5.3-Codex (latest Codex model)
 pub const MODEL_GPT53_CODEX: &str = "gpt-5.3-codex";
@@ -49,6 +61,8 @@ pub struct OpenAIResponsesProvider {
     model: String,
     base_url: String,
     thinking: Option<ThinkingConfig>,
+    /// Extra headers applied to every request (e.g. for gateway / BYOK auth).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAIResponsesProvider {
@@ -56,11 +70,12 @@ impl OpenAIResponsesProvider {
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -68,12 +83,49 @@ impl OpenAIResponsesProvider {
     #[must_use]
     pub fn with_base_url(api_key: String, model: String, base_url: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key,
             model,
             base_url,
             thinking: None,
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Add extra HTTP headers applied to every request.
+    ///
+    /// Used by [`OpenAIProvider`](super::openai::OpenAIProvider)'s transparent
+    /// Responses-API reroute to forward its BYOK / gateway auth headers (e.g.
+    /// `cf-aig-authorization`) so a rerouted request authenticates correctly.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Reuse an existing pooled `reqwest::Client` instead of building a fresh one.
+    ///
+    /// `reqwest::Client` is an `Arc` handle (cheap to clone) backed by a
+    /// connection pool; reusing it across the reroute preserves keep-alive so a
+    /// rerouted agent loop does not pay a new TCP+TLS handshake every turn.
+    #[must_use]
+    pub(crate) fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Apply auth + extra headers to a request builder. Skips `Authorization`
+    /// when `api_key` is empty (BYOK gateway mode — auth is carried by
+    /// `extra_headers`).
+    fn apply_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.header("Authorization", format!("Bearer {}", self.api_key))
+        };
+        self.extra_headers
+            .iter()
+            .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 
     /// Create a provider using GPT-5.3-Codex (latest codex model).
@@ -114,6 +166,8 @@ impl LlmProvider for OpenAIResponsesProvider {
         }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
+        let text = request.response_format.as_ref().map(ApiResponseText::from);
+        let tool_choice = request.tool_choice.as_ref().map(ApiToolChoice::from);
         let tools: Option<Vec<ApiTool>> = request
             .tools
             .map(|ts| ts.into_iter().map(convert_tool).collect());
@@ -126,6 +180,8 @@ impl LlmProvider for OpenAIResponsesProvider {
             max_output_tokens: Some(request.max_tokens),
             reasoning,
             parallel_tool_calls: parallel_tool_calls.then_some(true),
+            text,
+            tool_choice,
         };
 
         log::debug!(
@@ -134,11 +190,12 @@ impl LlmProvider for OpenAIResponsesProvider {
             request.max_tokens
         );
 
-        let response = self
+        let builder = self
             .client
             .post(format!("{}/responses", self.base_url))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_headers(builder)
             .json(&api_request)
             .send()
             .await
@@ -156,65 +213,14 @@ impl LlmProvider for OpenAIResponsesProvider {
             bytes.len()
         );
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
-        }
-
-        if status.is_server_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::error!("OpenAI Responses server error status={status} body={body}");
-            return Ok(ChatOutcome::ServerError(body.into_owned()));
-        }
-
-        if status.is_client_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::warn!("OpenAI Responses client error status={status} body={body}");
-            return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
+        if let Some(outcome) = classify_responses_status(status, &bytes) {
+            return Ok(outcome);
         }
 
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
 
-        let content = build_content_blocks(&api_response.output);
-
-        // Determine stop reason based on output content
-        let has_tool_calls = content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-        let stop_reason = if has_tool_calls {
-            Some(StopReason::ToolUse)
-        } else {
-            api_response.status.map(|s| match s {
-                ApiStatus::Completed => StopReason::EndTurn,
-                ApiStatus::Incomplete => StopReason::MaxTokens,
-                ApiStatus::Failed => StopReason::StopSequence,
-            })
-        };
-
-        Ok(ChatOutcome::Success(ChatResponse {
-            id: api_response.id,
-            content,
-            model: api_response.model,
-            stop_reason,
-            usage: api_response.usage.map_or(
-                Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                },
-                |u| Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cached_input_tokens: u
-                        .input_tokens_details
-                        .as_ref()
-                        .map_or(0, |details| details.cached_tokens),
-                    cache_creation_input_tokens: 0,
-                },
-            ),
-        }))
+        Ok(build_responses_outcome(api_response))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -239,6 +245,8 @@ impl LlmProvider for OpenAIResponsesProvider {
             }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
+            let text = request.response_format.as_ref().map(ApiResponseText::from);
+            let tool_choice = request.tool_choice.as_ref().map(ApiToolChoice::from);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
                 .map(|ts| ts.into_iter().map(convert_tool).collect());
@@ -251,15 +259,18 @@ impl LlmProvider for OpenAIResponsesProvider {
                 max_output_tokens: Some(request.max_tokens),
                 reasoning,
                 parallel_tool_calls: parallel_tool_calls.then_some(true),
+                text,
+                tool_choice,
                 stream: true,
             };
 
             log::debug!("OpenAI Responses API streaming request model={} max_tokens={}", self.model, request.max_tokens);
 
-            let Ok(response) = self.client
+            let stream_builder = self.client
                 .post(format!("{}/responses", self.base_url))
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json");
+            let Ok(response) = self
+                .apply_headers(stream_builder)
                 .json(&api_request)
                 .send()
                 .await
@@ -284,7 +295,7 @@ impl LlmProvider for OpenAIResponsesProvider {
                 return;
             }
 
-            let mut buffer = String::new();
+            let mut sse = SseLineBuffer::new();
             let mut stream = response.bytes_stream();
             let mut usage: Option<Usage> = None;
             let mut tool_calls: std::collections::HashMap<String, ToolCallAccumulator> =
@@ -295,11 +306,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                     yield Err(anyhow::anyhow!("stream error"));
                     return;
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                sse.extend(&chunk);
 
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                while let Some(line) = sse.next_line() {
+                    let line = line.trim();
                     if line.is_empty() { continue; }
 
                     let Some(data) = line.strip_prefix("data: ") else {
@@ -312,19 +322,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                     }
 
                     if data == "[DONE]" {
-                        // Emit any accumulated tool calls
-                        for acc in tool_calls.values() {
-                            yield Ok(StreamDelta::ToolUseStart {
-                                id: acc.id.clone(),
-                                name: acc.name.clone(),
-                                block_index: 1,
-                                thought_signature: None,
-                            });
-                            yield Ok(StreamDelta::ToolInputDelta {
-                                id: acc.id.clone(),
-                                delta: acc.arguments.clone(),
-                                block_index: 1,
-                            });
+                        // Emit any accumulated tool calls with distinct,
+                        // registration-ordered block indices.
+                        for delta in flush_responses_tool_calls(&tool_calls) {
+                            yield Ok(delta);
                         }
 
                         if let Some(u) = usage.take() {
@@ -361,12 +362,14 @@ impl LlmProvider for OpenAIResponsesProvider {
                                     && let (Some(item_id), Some(call_id), Some(name)) =
                                         (&item.id, &item.call_id, &item.name)
                                 {
+                                    let order = tool_calls.len();
                                     tool_calls
                                         .entry(item_id.clone())
                                         .or_insert_with(|| ToolCallAccumulator {
                                             id: call_id.clone(),
                                             name: name.clone(),
                                             arguments: String::new(),
+                                            order,
                                         });
                                 }
                             }
@@ -374,12 +377,14 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 if let (Some(item_id), Some(delta)) =
                                     (event.resolve_item_id().map(str::to_owned), event.delta)
                                 {
+                                    let order = tool_calls.len();
                                     let acc =
                                         tool_calls.entry(item_id.clone()).or_insert_with(|| {
                                             ToolCallAccumulator {
                                                 id: item_id,
                                                 name: event.name.unwrap_or_default(),
                                                 arguments: String::new(),
+                                                order,
                                             }
                                         });
                                     acc.arguments.push_str(&delta);
@@ -446,19 +451,10 @@ impl LlmProvider for OpenAIResponsesProvider {
                 }
             }
 
-            // Stream ended without [DONE] — flush accumulated tool calls
-            for acc in tool_calls.values() {
-                yield Ok(StreamDelta::ToolUseStart {
-                    id: acc.id.clone(),
-                    name: acc.name.clone(),
-                    block_index: 1,
-                    thought_signature: None,
-                });
-                yield Ok(StreamDelta::ToolInputDelta {
-                    id: acc.id.clone(),
-                    delta: acc.arguments.clone(),
-                    block_index: 1,
-                });
+            // Stream ended without [DONE] — flush accumulated tool calls with
+            // distinct, registration-ordered block indices.
+            for delta in flush_responses_tool_calls(&tool_calls) {
+                yield Ok(delta);
             }
 
             if let Some(u) = usage {
@@ -820,6 +816,91 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     blocks
 }
 
+/// Classify a non-success HTTP status into an early [`ChatOutcome`].
+///
+/// Returns `None` when the status is a success and the body should instead be
+/// parsed as an [`ApiResponse`].
+fn classify_responses_status(status: StatusCode, bytes: &[u8]) -> Option<ChatOutcome> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some(ChatOutcome::RateLimited);
+    }
+    if status.is_server_error() {
+        let body = String::from_utf8_lossy(bytes);
+        log::error!("OpenAI Responses server error status={status} body={body}");
+        return Some(ChatOutcome::ServerError(body.into_owned()));
+    }
+    if status.is_client_error() {
+        let body = String::from_utf8_lossy(bytes);
+        log::warn!("OpenAI Responses client error status={status} body={body}");
+        return Some(ChatOutcome::InvalidRequest(body.into_owned()));
+    }
+    None
+}
+
+/// Map a parsed Responses API body into a [`ChatOutcome`].
+///
+/// The Responses API reports generation failures as HTTP 200 with
+/// `status=failed` plus an error object. That is surfaced as a server error
+/// instead of a successful turn with empty content (mirrors the streaming
+/// `response.failed` handling).
+fn build_responses_outcome(api_response: ApiResponse) -> ChatOutcome {
+    if matches!(api_response.status, Some(ApiStatus::Failed)) {
+        let message = api_response
+            .error
+            .and_then(|error| error.message)
+            .unwrap_or_else(|| "OpenAI Responses API reported status=failed".to_owned());
+        log::error!("OpenAI Responses generation failed: {message}");
+        return ChatOutcome::ServerError(message);
+    }
+
+    let content = build_content_blocks(&api_response.output);
+
+    // Determine stop reason based on output content
+    let has_tool_calls = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+    let stop_reason = if has_tool_calls {
+        Some(StopReason::ToolUse)
+    } else {
+        api_response.status.map(|s| match s {
+            ApiStatus::Completed => StopReason::EndTurn,
+            ApiStatus::Incomplete => StopReason::MaxTokens,
+            // Unreachable: Failed is handled above, but map defensively.
+            ApiStatus::Failed => StopReason::StopSequence,
+        })
+    };
+
+    ChatOutcome::Success(ChatResponse {
+        id: api_response.id,
+        content,
+        model: api_response.model,
+        stop_reason,
+        usage: map_usage(api_response.usage),
+    })
+}
+
+/// Convert the Responses API usage object into the SDK [`Usage`] shape.
+fn map_usage(usage: Option<ApiUsage>) -> Usage {
+    usage.map_or(
+        Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+        |u| Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cached_input_tokens: u
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            cache_creation_input_tokens: 0,
+        },
+    )
+}
+
 fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
     thinking
         .and_then(resolve_reasoning_effort)
@@ -875,6 +956,41 @@ struct ToolCallAccumulator {
     id: String,
     name: String,
     arguments: String,
+    /// Registration order, used to assign deterministic, distinct block indices
+    /// when flushing (`HashMap` iteration order is otherwise nondeterministic).
+    order: usize,
+}
+
+/// Emit accumulated tool calls as stream deltas with distinct, monotonically
+/// increasing block indices in registration order.
+///
+/// The previous implementation assigned every call `block_index: 1` and iterated
+/// `HashMap::values()`, so [`StreamAccumulator`](crate::streaming::StreamAccumulator)'s
+/// stable sort preserved nondeterministic insertion order — multi-tool turns
+/// replayed in different orders run to run. Sorting by registration order with a
+/// unique index per call makes the final content-block order deterministic.
+fn flush_responses_tool_calls(
+    tool_calls: &std::collections::HashMap<String, ToolCallAccumulator>,
+) -> Vec<StreamDelta> {
+    let mut accs: Vec<&ToolCallAccumulator> = tool_calls.values().collect();
+    accs.sort_by_key(|acc| acc.order);
+
+    let mut deltas = Vec::with_capacity(accs.len() * 2);
+    for (idx, acc) in accs.iter().enumerate() {
+        let block_index = idx + 1;
+        deltas.push(StreamDelta::ToolUseStart {
+            id: acc.id.clone(),
+            name: acc.name.clone(),
+            block_index,
+            thought_signature: None,
+        });
+        deltas.push(StreamDelta::ToolInputDelta {
+            id: acc.id.clone(),
+            delta: acc.arguments.clone(),
+            block_index,
+        });
+    }
+    deltas
 }
 
 // ============================================================================
@@ -893,6 +1009,10 @@ struct ApiResponsesRequest<'a> {
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<ApiResponseText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ApiToolChoice>,
 }
 
 #[derive(Serialize)]
@@ -907,12 +1027,75 @@ struct ApiResponsesRequestStreaming<'a> {
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<ApiResponseText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ApiToolChoice>,
     stream: bool,
 }
 
 #[derive(Serialize)]
 struct ApiReasoning {
     effort: ReasoningEffort,
+}
+
+/// Responses API structured-output wire field: `{"text": {"format": {...}}}`.
+///
+/// The Responses API carries JSON-schema structured output under
+/// `text.format` (type `json_schema`), unlike Chat Completions' top-level
+/// `response_format`.
+#[derive(Serialize)]
+struct ApiResponseText {
+    format: ApiResponseTextFormat,
+}
+
+#[derive(Serialize)]
+struct ApiResponseTextFormat {
+    #[serde(rename = "type")]
+    format_type: &'static str,
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
+}
+
+impl From<&ResponseFormat> for ApiResponseText {
+    fn from(rf: &ResponseFormat) -> Self {
+        Self {
+            format: ApiResponseTextFormat {
+                format_type: "json_schema",
+                name: rf.name.clone(),
+                schema: rf.schema.clone(),
+                strict: rf.strict,
+            },
+        }
+    }
+}
+
+/// Responses API `tool_choice` wire format.
+///
+/// - `"auto"` — model decides.
+/// - `{"type": "function", "name": "<name>"}` — force a specific function.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ApiToolChoice {
+    Mode(&'static str),
+    Function {
+        #[serde(rename = "type")]
+        choice_type: &'static str,
+        name: String,
+    },
+}
+
+impl From<&ToolChoice> for ApiToolChoice {
+    fn from(tc: &ToolChoice) -> Self {
+        match tc {
+            ToolChoice::Auto => Self::Mode("auto"),
+            ToolChoice::Tool(name) => Self::Function {
+                choice_type: "function",
+                name: name.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1018,6 +1201,14 @@ struct ApiResponse {
     status: Option<ApiStatus>,
     #[serde(default)]
     usage: Option<ApiUsage>,
+    #[serde(default)]
+    error: Option<ApiResponseError>,
+}
+
+#[derive(Deserialize)]
+struct ApiResponseError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1294,6 +1485,93 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(
             matches!(&blocks[0], ContentBlock::ToolUse { id, name, .. } if id == "call_123" && name == "test_tool")
+        );
+    }
+
+    #[test]
+    fn test_request_serializes_response_format_as_text_format_and_forced_tool_choice() {
+        let req = ApiResponsesRequest {
+            model: "gpt-5.3-codex",
+            input: &[],
+            tools: None,
+            max_output_tokens: Some(1024),
+            reasoning: None,
+            parallel_tool_calls: None,
+            text: Some(ApiResponseText::from(&ResponseFormat::new(
+                "person",
+                serde_json::json!({"type": "object"}),
+            ))),
+            tool_choice: Some(ApiToolChoice::from(&ToolChoice::Tool("respond".to_owned()))),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["text"]["format"]["type"], "json_schema");
+        assert_eq!(json["text"]["format"]["name"], "person");
+        assert_eq!(json["text"]["format"]["strict"], true);
+        assert_eq!(json["text"]["format"]["schema"]["type"], "object");
+        assert_eq!(json["tool_choice"]["type"], "function");
+        assert_eq!(json["tool_choice"]["name"], "respond");
+    }
+
+    #[test]
+    fn test_tool_choice_auto_serializes_as_string() {
+        let json = serde_json::to_value(ApiToolChoice::from(&ToolChoice::Auto)).unwrap();
+        assert_eq!(json, serde_json::json!("auto"));
+    }
+
+    #[test]
+    fn test_api_response_failed_status_carries_error_message() {
+        let json = r#"{
+            "id": "resp_fail",
+            "model": "gpt-5.3-codex",
+            "output": [],
+            "status": "failed",
+            "error": {"message": "model produced no output"}
+        }"#;
+
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        assert!(matches!(resp.status, Some(ApiStatus::Failed)));
+        assert_eq!(
+            resp.error.and_then(|e| e.message).as_deref(),
+            Some("model produced no output")
+        );
+    }
+
+    #[test]
+    fn test_flush_responses_tool_calls_assigns_distinct_ordered_indices() {
+        let mut tool_calls = std::collections::HashMap::new();
+        tool_calls.insert(
+            "b".to_owned(),
+            ToolCallAccumulator {
+                id: "b".to_owned(),
+                name: "second".to_owned(),
+                arguments: "{}".to_owned(),
+                order: 1,
+            },
+        );
+        tool_calls.insert(
+            "a".to_owned(),
+            ToolCallAccumulator {
+                id: "a".to_owned(),
+                name: "first".to_owned(),
+                arguments: "{}".to_owned(),
+                order: 0,
+            },
+        );
+
+        let deltas = flush_responses_tool_calls(&tool_calls);
+        let starts: Vec<(String, usize)> = deltas
+            .iter()
+            .filter_map(|d| match d {
+                StreamDelta::ToolUseStart {
+                    name, block_index, ..
+                } => Some((name.clone(), *block_index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![("first".to_owned(), 1), ("second".to_owned(), 2)]
         );
     }
 }

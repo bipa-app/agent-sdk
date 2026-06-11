@@ -24,7 +24,7 @@ use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
 use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::event_notifier::EventNotifier;
-use crate::journal::event_repository::InMemoryEventRepository;
+use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::execution_intent::{GuardedExecutionDeps, InMemoryExecutionIntentStore};
 use crate::journal::message_store::InMemoryMessageProjectionStore;
@@ -253,6 +253,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            cancel: None,
         }
     }
 }
@@ -463,6 +464,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -551,6 +553,7 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -646,6 +649,7 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
             reason: "user declined the transfer".into(),
         },
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -679,6 +683,56 @@ async fn rejection_fails_child_without_executing() -> Result<()> {
     Ok(())
 }
 
+// Finding #5: a rejected confirmation must commit a terminal
+// ToolCallEnd so the tool lifecycle closes in the event stream
+// (ToolCallStart + ToolRequiresConfirmation would otherwise hang open
+// forever for replay and live clients).
+#[tokio::test]
+async fn rejection_emits_failure_tool_call_end() -> Result<()> {
+    let stores = TestStores::new();
+
+    let (_parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "transfer".into(),
+            serde_json::json!({"amount": 100}),
+        )],
+    )
+    .await?;
+
+    let child = acquire_child(&stores.tasks, &children[0].id).await?;
+    let bootstrap = resolve_tool_bootstrap(child, &stores.tasks).await?;
+    pause_tool_for_confirmation(&bootstrap, &stores.tasks, &stores.events, t_plus(15)).await?;
+
+    apply_confirmation_decision(
+        &children[0].id,
+        ConfirmationDecision::Rejected {
+            reason: "user declined".into(),
+        },
+        &stores.tasks,
+        &stores.events,
+        t_plus(20),
+    )
+    .await?;
+
+    let events = stores.events.get_events(&thread_a()).await?;
+    let end = events
+        .iter()
+        .find_map(|e| match &e.event {
+            AgentEvent::ToolCallEnd { id, result, .. } => Some((id.clone(), result.success)),
+            _ => None,
+        })
+        .context("expected a terminal ToolCallEnd after rejection")?;
+    assert_eq!(end.0, "call_1");
+    assert!(
+        !end.1,
+        "the closing ToolCallEnd must carry a failure result"
+    );
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Phase 5.3 — timeout
 // ─────────────────────────────────────────────────────────────────────
@@ -707,6 +761,7 @@ async fn timeout_fails_child_without_executing() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Timeout,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;
@@ -754,6 +809,7 @@ async fn reject_on_non_awaiting_row_fails() -> Result<()> {
             reason: "nope".into(),
         },
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await;
@@ -785,6 +841,7 @@ async fn approve_on_non_awaiting_row_fails() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await;
@@ -842,6 +899,7 @@ async fn awaiting_confirmation_state_survives_store_reread() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(25),
     )
     .await?;
@@ -929,6 +987,7 @@ async fn multi_child_confirmation_does_not_affect_siblings() -> Result<()> {
             reason: "denied".into(),
         },
         &stores.tasks,
+        &stores.events,
         t_plus(25),
     )
     .await?;
@@ -1006,6 +1065,7 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
         &children[0].id,
         ConfirmationDecision::Approved,
         &stores.tasks,
+        &stores.events,
         t_plus(20),
     )
     .await?;

@@ -3,10 +3,8 @@
 //! Used by both the `GeminiProvider` (API key auth) and `VertexProvider` (`OAuth2` Bearer auth)
 //! since they share the same request/response format.
 
-use crate::attachments::decode_attachment_bytes;
-use crate::streaming::{StreamBox, StreamDelta};
+use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{Content, ContentBlock, StopReason, Usage};
-use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -204,41 +202,112 @@ pub const fn map_thinking_config(
     }
 }
 
+/// JSON-Schema keywords that Gemini's OpenAPI-flavoured `responseSchema`
+/// (and `functionDeclarations.parameters`) rejects.
+const GEMINI_STRIPPED_SCHEMA_KEYS: [&str; 6] = [
+    "$schema",
+    "$id",
+    "additionalProperties",
+    "title",
+    "definitions",
+    "$defs",
+];
+
+/// Maximum `$ref` resolution depth. Guards against runaway inlining of
+/// (self-)recursive schemas, which cannot be represented as a finite inlined
+/// document anyway.
+const GEMINI_MAX_REF_DEPTH: usize = 64;
+
+/// Resolve a local JSON-pointer `$ref` (`#/$defs/Name` or
+/// `#/definitions/Name`) to its definition name.
+fn resolve_local_ref_name(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+}
+
+/// Collect the top-level `$defs` / `definitions` map of a schema document.
+fn collect_schema_defs(schema: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut defs = serde_json::Map::new();
+    if let serde_json::Value::Object(map) = schema {
+        for key in ["$defs", "definitions"] {
+            if let Some(serde_json::Value::Object(group)) = map.get(key) {
+                for (name, def) in group {
+                    defs.insert(name.clone(), def.clone());
+                }
+            }
+        }
+    }
+    defs
+}
+
+fn sanitize_schema_value(
+    value: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            // A `$ref` node: inline the referenced definition so the wire schema
+            // is self-contained (Gemini does not resolve `$ref`/`$defs`).
+            if let Some(serde_json::Value::String(reference)) = map.get("$ref")
+                && depth < GEMINI_MAX_REF_DEPTH
+                && let Some(name) = resolve_local_ref_name(reference)
+                && let Some(target) = defs.get(name)
+            {
+                let mut inlined = sanitize_schema_value(target, defs, depth + 1);
+                // Merge any sibling keys that accompanied the `$ref` (e.g. an
+                // overriding `description`) on top of the inlined definition.
+                if let serde_json::Value::Object(inlined_map) = &mut inlined {
+                    for (key, val) in map {
+                        if key == "$ref" || GEMINI_STRIPPED_SCHEMA_KEYS.contains(&key.as_str()) {
+                            continue;
+                        }
+                        inlined_map
+                            .insert(key.clone(), sanitize_schema_value(val, defs, depth + 1));
+                    }
+                }
+                return inlined;
+            }
+
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                // `$ref` is dropped here only when it could not be resolved
+                // above; leaving it would point at a stripped `$defs` target.
+                if key == "$ref" || GEMINI_STRIPPED_SCHEMA_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                out.insert(key.clone(), sanitize_schema_value(val, defs, depth));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_schema_value(item, defs, depth))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Sanitize a JSON Schema document into the subset Gemini accepts for
-/// `responseSchema`.
+/// `responseSchema` and `functionDeclarations.parameters`.
 ///
 /// Gemini's structured-output schema is OpenAPI-flavoured and rejects several
 /// JSON-Schema-isms (`$schema`, `additionalProperties`, `title`, `$id`,
-/// `definitions`/`$defs`). This strips those keys recursively while preserving
-/// the structural keywords (`type`, `properties`, `items`, `required`, `enum`).
+/// `definitions`/`$defs`, `$ref`). schemars-derived schemas emit `$defs` + `$ref`
+/// for any nested struct, so this first **inlines** every resolvable local
+/// `$ref` against the document's `$defs`/`definitions`, then strips the
+/// unsupported keys recursively while preserving the structural keywords
+/// (`type`, `properties`, `items`, `required`, `enum`). The result is a
+/// self-contained document with no dangling `$ref` pointing at a removed target.
 /// The runtime still validates the *model output* against the original,
 /// un-sanitized schema, so sanitization only relaxes what is sent on the wire.
 #[must_use]
 pub fn gemini_response_schema(schema: &serde_json::Value) -> serde_json::Value {
-    const STRIPPED: [&str; 6] = [
-        "$schema",
-        "$id",
-        "additionalProperties",
-        "title",
-        "definitions",
-        "$defs",
-    ];
-    match schema {
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (key, value) in map {
-                if STRIPPED.contains(&key.as_str()) {
-                    continue;
-                }
-                out.insert(key.clone(), gemini_response_schema(value));
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(gemini_response_schema).collect())
-        }
-        other => other.clone(),
-    }
+    let defs = collect_schema_defs(schema);
+    sanitize_schema_value(schema, &defs, 0)
 }
 
 // ============================================================================
@@ -351,12 +420,15 @@ pub fn build_api_contents(messages: &[agent_sdk_foundation::llm::Message]) -> Ve
                         }
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Image { source } | ContentBlock::Document { source } => {
-                            let bytes = decode_attachment_bytes(&source.data)
-                                .unwrap_or_else(|_| Vec::new());
+                            // `source.data` is already base64; the Gemini wire
+                            // format also expects base64, so pass it through
+                            // directly instead of decoding and re-encoding it
+                            // (a no-op round-trip) on every turn. Well-formedness
+                            // is enforced once by `validate_request_attachments`.
                             parts.push(ApiPart::InlineData {
                                 inline_data: ApiBlob {
                                     mime_type: source.media_type.clone(),
-                                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                    data: source.data.clone(),
                                 },
                             });
                         }
@@ -422,7 +494,10 @@ pub fn convert_tools_to_config(tools: Vec<agent_sdk_foundation::llm::Tool>) -> A
             .map(|t| ApiFunctionDeclaration {
                 name: t.name,
                 description: t.description,
-                parameters: t.input_schema,
+                // Gemini rejects the same JSON-Schema-isms in tool parameter
+                // schemas as in `responseSchema`; sanitize/inline so nested
+                // (`$defs` + `$ref`) tool schemas do not 400 the request.
+                parameters: gemini_response_schema(&t.input_schema),
             })
             .collect(),
     }
@@ -483,6 +558,170 @@ pub const fn map_finish_reason(reason: &ApiFinishReason, has_tool_calls: bool) -
 // Shared SSE Stream Parser
 // ============================================================================
 
+/// Truncate SSE data to a bounded preview for log messages.
+fn preview_gemini_sse_data(data: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 200;
+    let mut preview = data.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if data.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Extract an error message from a Gemini mid-stream `{"error": ...}` payload.
+///
+/// Gemini can interleave an error object into the SSE stream (e.g. quota
+/// exhaustion, internal failure) instead of a normal candidate. Returns the
+/// human-readable message when the payload is such an error, otherwise `None`.
+fn gemini_stream_error_message(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_owned);
+    Some(message)
+}
+
+/// Classification of a single Gemini SSE line.
+enum GeminiLineParse {
+    /// Blank line, comment, or a non-`data:` line — ignore.
+    Skip,
+    /// A well-formed `generateContent` chunk.
+    Response(ApiGenerateContentResponse),
+    /// A mid-stream `{"error": ...}` payload.
+    Error(String),
+    /// A `data:` line whose JSON could not be parsed.
+    ParseFailed { error: String, preview: String },
+}
+
+/// Parse one Gemini SSE line into a [`GeminiLineParse`].
+fn parse_gemini_sse_line(line: &str) -> GeminiLineParse {
+    let line = line.trim();
+    if line.is_empty() {
+        return GeminiLineParse::Skip;
+    }
+    // Gemini SSE format: "data: {...}"
+    let Some(data) = line.strip_prefix("data: ") else {
+        return GeminiLineParse::Skip;
+    };
+    serde_json::from_str::<ApiGenerateContentResponse>(data).map_or_else(
+        |error| {
+            gemini_stream_error_message(data).map_or_else(
+                || GeminiLineParse::ParseFailed {
+                    error: error.to_string(),
+                    preview: preview_gemini_sse_data(data),
+                },
+                GeminiLineParse::Error,
+            )
+        },
+        GeminiLineParse::Response,
+    )
+}
+
+/// Decide the terminal `StreamDelta` for a Gemini stream.
+///
+/// Mirrors the Anthropic path: a stream that ends without ever seeing a
+/// `finishReason` was truncated mid-response and is surfaced as a
+/// [`StreamErrorKind::ServerError`] rather than a clean `Done`, so the agent
+/// loop does not persist a partial completion as success.
+fn gemini_stream_terminal(saw_finish_reason: bool, stop_reason: Option<StopReason>) -> StreamDelta {
+    if saw_finish_reason {
+        StreamDelta::Done { stop_reason }
+    } else {
+        log::warn!(
+            "Gemini SSE stream ended without a finishReason - stream may have been truncated"
+        );
+        StreamDelta::Error {
+            message: "Stream ended unexpectedly without completion".to_string(),
+            kind: StreamErrorKind::ServerError,
+        }
+    }
+}
+
+/// Mutable accumulator state threaded through the Gemini SSE stream parser.
+#[derive(Default)]
+struct GeminiStreamState {
+    block_index: usize,
+    in_text_block: bool,
+    saw_function_call: bool,
+    saw_finish_reason: bool,
+    usage: Option<Usage>,
+    stop_reason: Option<StopReason>,
+}
+
+/// Fold one parsed Gemini `generateContent` chunk into the stream state,
+/// returning the [`StreamDelta`]s the generator should emit for it (in order).
+///
+/// Extracted from the streaming generator so the `yield`-driven loop stays
+/// small: all non-`yield` event mapping lives here and the generator simply
+/// re-emits the returned deltas.
+fn process_gemini_response(
+    state: &mut GeminiStreamState,
+    response: ApiGenerateContentResponse,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+
+    if let Some(usage) = response.usage_metadata {
+        state.usage = Some(usage.into_usage());
+    }
+
+    let Some(candidate) = response.candidates.into_iter().next() else {
+        return deltas;
+    };
+
+    if let Some(reason) = &candidate.finish_reason {
+        state.saw_finish_reason = true;
+        state.stop_reason = Some(map_finish_reason(reason, false));
+    }
+
+    // content may be empty on safety-blocked responses
+    for part in &candidate.content.parts {
+        match part {
+            ApiPart::Text { text, .. } if !text.is_empty() => {
+                // Gemini sends complete text parts per SSE event (not
+                // incremental deltas like Anthropic). Keep the same block_index
+                // for consecutive text parts so the StreamAccumulator appends
+                // them into one text block.
+                if !state.in_text_block {
+                    state.in_text_block = true;
+                }
+                deltas.push(StreamDelta::TextDelta {
+                    delta: text.clone(),
+                    block_index: state.block_index,
+                });
+            }
+            ApiPart::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
+                // Switching away from text — advance index.
+                if state.in_text_block {
+                    state.in_text_block = false;
+                    state.block_index += 1;
+                }
+                state.saw_function_call = true;
+                let id = format!("call_{}", uuid_simple());
+                deltas.push(StreamDelta::ToolUseStart {
+                    id: id.clone(),
+                    name: function_call.name.clone(),
+                    block_index: state.block_index,
+                    thought_signature: thought_signature.clone(),
+                });
+                deltas.push(StreamDelta::ToolInputDelta {
+                    id,
+                    delta: serde_json::to_string(&function_call.args).unwrap_or_default(),
+                    block_index: state.block_index,
+                });
+                state.block_index += 1;
+            }
+            _ => {}
+        }
+    }
+
+    deltas
+}
+
 /// Parse a Gemini SSE response stream into `StreamDelta` events.
 ///
 /// This is used by both `GeminiProvider` and `VertexProvider` since the
@@ -490,104 +729,78 @@ pub const fn map_finish_reason(reason: &ApiFinishReason, has_tool_calls: bool) -
 /// incremental text — not cumulative.
 pub fn stream_gemini_response(response: reqwest::Response) -> StreamBox<'static> {
     Box::pin(async_stream::stream! {
-        let mut block_index: usize = 0;
-        let mut in_text_block = false;
-        let mut saw_function_call = false;
-        let mut usage: Option<Usage> = None;
-        let mut stop_reason: Option<StopReason> = None;
+        let mut state = GeminiStreamState::default();
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
 
-        while let Some(chunk_result) = stream.next().await {
-            let Ok(chunk) = chunk_result else {
-                yield Err(anyhow::anyhow!("stream error"));
-                return;
+        loop {
+            let eof = match stream.next().await {
+                Some(Ok(chunk)) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    false
+                }
+                Some(Err(e)) => {
+                    // Include the underlying cause so RefreshingProvider's 401
+                    // detection (and operators) can see the real failure.
+                    yield Err(anyhow::anyhow!("stream error: {e}"));
+                    return;
+                }
+                None => true,
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // At EOF, flush any residual final line that lacks a trailing
+            // newline — it typically carries finishReason / usageMetadata.
+            if eof && !buffer.is_empty() && !buffer.ends_with('\n') {
+                buffer.push('\n');
+            }
 
             while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
-                if line.is_empty() {
-                    continue;
-                }
+                // Parse from the borrowed slice into owned data, then drain
+                // once (no per-line reallocation of the residual buffer).
+                let parsed = parse_gemini_sse_line(&buffer[..pos]);
+                buffer.drain(..=pos);
 
-                // Gemini SSE format: "data: {...}"
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                let Ok(resp) =
-                    serde_json::from_str::<ApiGenerateContentResponse>(data)
-                else {
-                    continue;
-                };
-
-                // Extract usage
-                if let Some(u) = resp.usage_metadata {
-                    usage = Some(u.into_usage());
-                }
-
-                // Process candidates
-                if let Some(candidate) = resp.candidates.into_iter().next() {
-                    if let Some(reason) = &candidate.finish_reason {
-                        stop_reason = Some(map_finish_reason(reason, false));
+                match parsed {
+                    GeminiLineParse::Skip => {}
+                    GeminiLineParse::ParseFailed { error, preview } => {
+                        log::warn!(
+                            "Failed to parse Gemini SSE event error={error} data_preview={preview}"
+                        );
                     }
-
-                    // content may be empty on safety-blocked responses
-                    for part in &candidate.content.parts {
-                        match part {
-                            ApiPart::Text { text, .. } if !text.is_empty() => {
-                                // Gemini sends complete text parts per SSE event (not
-                                // incremental deltas like Anthropic). Keep the same
-                                // block_index for consecutive text parts so the
-                                // StreamAccumulator appends them into one text block.
-                                if !in_text_block {
-                                    in_text_block = true;
-                                }
-                                yield Ok(StreamDelta::TextDelta {
-                                    delta: text.clone(),
-                                    block_index,
-                                });
-                            }
-                            ApiPart::FunctionCall { function_call, thought_signature } => {
-                                // Switching away from text — advance the block index.
-                                if in_text_block {
-                                    in_text_block = false;
-                                    block_index += 1;
-                                }
-                                saw_function_call = true;
-                                let id = format!("call_{}", uuid_simple());
-                                yield Ok(StreamDelta::ToolUseStart {
-                                    id: id.clone(),
-                                    name: function_call.name.clone(),
-                                    block_index,
-                                    thought_signature: thought_signature.clone(),
-                                });
-                                yield Ok(StreamDelta::ToolInputDelta {
-                                    id,
-                                    delta: serde_json::to_string(&function_call.args)
-                                        .unwrap_or_default(),
-                                    block_index,
-                                });
-                                block_index += 1;
-                            }
-                            _ => {}
+                    GeminiLineParse::Error(message) => {
+                        log::warn!("Gemini stream returned an error payload: {message}");
+                        yield Ok(StreamDelta::Error {
+                            message,
+                            kind: StreamErrorKind::ServerError,
+                        });
+                        return;
+                    }
+                    GeminiLineParse::Response(resp) => {
+                        for delta in process_gemini_response(&mut state, resp) {
+                            yield Ok(delta);
                         }
                     }
                 }
             }
+
+            if eof {
+                break;
+            }
         }
 
         // Override to ToolUse if we saw any function calls during the stream.
-        if saw_function_call {
-            stop_reason = Some(StopReason::ToolUse);
+        if state.saw_function_call {
+            state.stop_reason = Some(StopReason::ToolUse);
         }
 
-        // Emit final events
-        if let Some(u) = usage {
+        // Emit usage (token accounting) before the terminal event.
+        if let Some(u) = state.usage {
             yield Ok(StreamDelta::Usage(u));
         }
-        yield Ok(StreamDelta::Done { stop_reason });
+        yield Ok(gemini_stream_terminal(
+            state.saw_finish_reason,
+            state.stop_reason,
+        ));
     })
 }
 
@@ -1120,5 +1333,200 @@ mod tests {
             map_finish_reason(&ApiFinishReason::MaxTokens, false),
             StopReason::MaxTokens
         );
+    }
+
+    // ===================
+    // SSE Line Parser Tests
+    // ===================
+
+    #[test]
+    fn test_parse_gemini_sse_line_valid_response() {
+        let line = r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi"}]}}]}"#;
+        match parse_gemini_sse_line(line) {
+            GeminiLineParse::Response(resp) => assert_eq!(resp.candidates.len(), 1),
+            _ => panic!("expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_sse_line_skips_blank_and_non_data() {
+        assert!(matches!(parse_gemini_sse_line(""), GeminiLineParse::Skip));
+        assert!(matches!(
+            parse_gemini_sse_line("event: ping"),
+            GeminiLineParse::Skip
+        ));
+    }
+
+    #[test]
+    fn test_parse_gemini_sse_line_detects_error_payload() {
+        // Mid-stream error payloads must surface as an error, not be silently
+        // skipped (which previously let a failed stream look successful).
+        let line = r#"data: {"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        match parse_gemini_sse_line(line) {
+            GeminiLineParse::Error(message) => assert_eq!(message, "quota exceeded"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_sse_line_reports_malformed_json() {
+        let line = "data: {not valid json";
+        match parse_gemini_sse_line(line) {
+            GeminiLineParse::ParseFailed { error, preview } => {
+                assert!(!error.is_empty());
+                assert!(preview.contains("not valid json"));
+            }
+            _ => panic!("expected ParseFailed"),
+        }
+    }
+
+    #[test]
+    fn test_gemini_stream_error_message_extracts_message() {
+        assert_eq!(
+            gemini_stream_error_message(r#"{"error":{"message":"boom"}}"#),
+            Some("boom".to_string())
+        );
+        assert_eq!(gemini_stream_error_message(r#"{"candidates":[]}"#), None);
+    }
+
+    #[test]
+    fn test_gemini_stream_terminal_done_when_finish_seen() {
+        let terminal = gemini_stream_terminal(true, Some(StopReason::EndTurn));
+        assert!(matches!(
+            terminal,
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_gemini_stream_terminal_error_when_no_finish_reason() {
+        // A stream that ends without a finishReason was truncated; surface a
+        // ServerError instead of a clean Done so the loop does not persist a
+        // partial completion as success.
+        let terminal = gemini_stream_terminal(false, None);
+        assert!(matches!(
+            terminal,
+            StreamDelta::Error {
+                kind: StreamErrorKind::ServerError,
+                ..
+            }
+        ));
+    }
+
+    // ===================
+    // Response Schema Sanitizer Tests ($ref inlining)
+    // ===================
+
+    #[test]
+    fn test_gemini_response_schema_inlines_nested_refs() {
+        // Mirrors a schemars-derived schema for a struct with a nested struct:
+        // the nested type lands in `$defs` and is referenced via `$ref`.
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Person",
+            "type": "object",
+            "$defs": {
+                "Address": {
+                    "title": "Address",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "city": { "type": "string", "title": "City" }
+                    },
+                    "required": ["city"]
+                }
+            },
+            "properties": {
+                "name": { "type": "string" },
+                "home": { "$ref": "#/$defs/Address" }
+            },
+            "required": ["name", "home"]
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+        let serialized = serde_json::to_string(&sanitized).unwrap_or_default();
+
+        // No JSON-Schema-isms or dangling refs survive on the wire.
+        assert!(!serialized.contains("$ref"), "ref survived: {serialized}");
+        assert!(!serialized.contains("$defs"), "defs survived: {serialized}");
+        assert!(!serialized.contains("$schema"));
+        assert!(!serialized.contains("additionalProperties"));
+        assert!(!serialized.contains("title"));
+
+        // The nested definition was inlined in place of the `$ref`.
+        assert_eq!(sanitized["properties"]["home"]["type"], "object");
+        assert_eq!(
+            sanitized["properties"]["home"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(sanitized["properties"]["home"]["required"][0], "city");
+    }
+
+    #[test]
+    fn test_gemini_response_schema_inlines_array_item_refs() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "definitions": {
+                "Tag": { "type": "string", "enum": ["a", "b"] }
+            },
+            "properties": {
+                "tags": { "type": "array", "items": { "$ref": "#/definitions/Tag" } }
+            }
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+        let serialized = serde_json::to_string(&sanitized).unwrap_or_default();
+        assert!(!serialized.contains("$ref"));
+        assert!(!serialized.contains("definitions"));
+        assert_eq!(sanitized["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(sanitized["properties"]["tags"]["items"]["enum"][0], "a");
+    }
+
+    #[test]
+    fn test_gemini_response_schema_recursive_ref_terminates() {
+        // A self-referential schema cannot be fully inlined; the depth guard
+        // must terminate and drop the unresolved ref rather than loop forever.
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": { "next": { "$ref": "#/$defs/Node" } }
+                }
+            },
+            "properties": { "root": { "$ref": "#/$defs/Node" } }
+        });
+
+        let sanitized = gemini_response_schema(&schema);
+        let serialized = serde_json::to_string(&sanitized).unwrap_or_default();
+        assert!(!serialized.contains("$defs"));
+        // Inlining stops at the depth limit; the deepest residual ref is dropped.
+        assert_eq!(sanitized["properties"]["root"]["type"], "object");
+    }
+
+    #[test]
+    fn test_convert_tools_to_config_sanitizes_parameters() {
+        let tools = vec![agent_sdk_foundation::llm::Tool {
+            name: "make".to_string(),
+            description: "build".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "$defs": { "Part": { "type": "string" } },
+                "properties": { "part": { "$ref": "#/$defs/Part" } },
+                "additionalProperties": false
+            }),
+            display_name: "Make".to_string(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }];
+
+        let config = convert_tools_to_config(tools);
+        let params = &config.function_declarations[0].parameters;
+        let serialized = serde_json::to_string(params).unwrap_or_default();
+        assert!(!serialized.contains("$ref"));
+        assert!(!serialized.contains("$defs"));
+        assert!(!serialized.contains("additionalProperties"));
+        assert_eq!(params["properties"]["part"]["type"], "string");
     }
 }

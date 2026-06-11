@@ -79,8 +79,26 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for EditToo
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
-        let input: EditInput =
-            serde_json::from_value(input).context("Invalid input for edit tool")?;
+        let input: EditInput = EditInput::deserialize(&input)
+            .with_context(|| format!("Invalid input for edit tool: {input}"))?;
+
+        // An empty old_string would match between every character, so
+        // `content.replace("", ..)` interleaves new_string across the whole
+        // file — silent corruption reported as success. Reject it and steer
+        // the model toward the Write tool instead.
+        if input.old_string.is_empty() {
+            return Ok(ToolResult::error(
+                "old_string must not be empty; use the Write tool to create or overwrite file content",
+            ));
+        }
+
+        // A no-op edit (old_string == new_string) reports success while
+        // changing nothing, which can loop the model. Reject it explicitly.
+        if input.old_string == input.new_string {
+            return Ok(ToolResult::error(
+                "old_string and new_string are identical; the edit would not change the file",
+            ));
+        }
 
         let path = self.ctx.environment.resolve_path(&input.path);
 
@@ -505,6 +523,83 @@ mod tests {
             truncate_string("this is a longer string", 10),
             "this is a ..."
         );
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_empty_old_string() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "ab").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "",
+                    "new_string": "x"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("old_string must not be empty"));
+
+        // The file must be untouched (no interleaving corruption).
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "ab");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_empty_old_string_with_replace_all() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "abc").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "",
+                    "new_string": "X",
+                    "replace_all": true
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("old_string must not be empty"));
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "abc");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_identical_old_and_new() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "hello world").await?;
+
+        let tool = create_test_tool(Arc::clone(&fs), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({
+                    "path": "/workspace/test.txt",
+                    "old_string": "world",
+                    "new_string": "world"
+                }),
+            )
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("identical"));
+
+        let content = fs.read_file("/workspace/test.txt").await?;
+        assert_eq!(content, "hello world");
+        Ok(())
     }
 
     #[tokio::test]

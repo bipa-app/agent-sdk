@@ -96,7 +96,13 @@ impl EventNotifier {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.channels.retain(|_, tx| tx.receiver_count() > 0);
+        // No full-map prune here: a per-call `O(all threads)` scan under
+        // the lock briefly stalls every concurrent `notify` on the hot
+        // commit path.  Dead channels are reaped opportunistically in
+        // `notify` instead, bounding the map by actively-notified
+        // threads.  Reusing a thread's surviving sender (even with zero
+        // current receivers) is correct: `subscribe` just adds a fresh
+        // receiver to it.
         let tx = guard
             .channels
             .entry(thread_id.0.clone())
@@ -115,15 +121,35 @@ impl EventNotifier {
         if events.is_empty() {
             return;
         }
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dead: Vec<String> = Vec::new();
         for event in events {
             if let Some(tx) = guard.channels.get(&event.thread_id.0) {
-                // If send fails (no receivers), that's fine — events
-                // are already durable.
-                let _ = tx.send(event.clone());
+                // `send` only errors when the channel has zero
+                // receivers.  Events are already durable, so the failure
+                // itself is fine — but it also tells us this thread's
+                // sender is dead, so prune it here on the hot path
+                // instead of waiting for a future `subscribe` to scan
+                // the whole map.
+                if tx.send(event.clone()).is_err() {
+                    dead.push(event.thread_id.0.clone());
+                }
+            }
+        }
+        for key in dead {
+            // Re-check under the same lock: only drop a sender that is
+            // still receiver-less (a `subscribe` cannot have raced in —
+            // it takes the same lock — but a later event in this batch
+            // could have re-validated it).
+            let still_dead = guard
+                .channels
+                .get(&key)
+                .is_some_and(|tx| tx.receiver_count() == 0);
+            if still_dead {
+                guard.channels.remove(&key);
             }
         }
         drop(guard);
@@ -262,20 +288,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_channels_are_pruned_on_subscribe() {
+    async fn dead_channels_are_pruned_on_notify() {
         let notifier = EventNotifier::new();
-        let thread_c = ThreadId::from_string("t-notifier-c");
 
-        // Subscribe to thread_a and drop the receiver.
+        // Subscribe to thread_a and drop the receiver: the channel is
+        // now receiver-less but still present.
         drop(notifier.subscribe(&thread_a()));
         assert_eq!(notifier.channel_count(), 1);
 
-        // Subscribing to thread_b prunes thread_a's dead channel.
-        drop(notifier.subscribe(&thread_b()));
+        // Notifying thread_a discovers the dead sender and prunes it on
+        // the hot path — no full-map scan in `subscribe`.
+        notifier.notify(&[sample_committed(&thread_a(), 0)]);
+        assert_eq!(notifier.channel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn notify_keeps_live_channels() {
+        let notifier = EventNotifier::new();
+
+        // Live receiver: notify must not prune its channel.
+        let _rx = notifier.subscribe(&thread_a());
+        notifier.notify(&[sample_committed(&thread_a(), 0)]);
         assert_eq!(notifier.channel_count(), 1);
 
-        // Subscribing to thread_c prunes thread_b's dead channel.
-        let _rx = notifier.subscribe(&thread_c);
+        // A dead sibling on the same batch is pruned while the live one
+        // survives.
+        drop(notifier.subscribe(&thread_b()));
+        notifier.notify(&[
+            sample_committed(&thread_a(), 1),
+            sample_committed(&thread_b(), 0),
+        ]);
         assert_eq!(notifier.channel_count(), 1);
     }
 

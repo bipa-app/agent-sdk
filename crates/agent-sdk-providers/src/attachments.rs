@@ -1,7 +1,12 @@
 use agent_sdk_foundation::llm::{ChatRequest, Content, ContentBlock};
 use anyhow::{Result, bail};
-use base64::Engine;
 
+// All size caps below are measured in **decoded** bytes. This is a single,
+// consistent semantic across every provider: it matches the per-image decoded
+// check and Gemini's historical accounting, and avoids the two validators
+// silently disagreeing on what "inline bytes" means. The decoded size is
+// computed arithmetically from the base64 length (see
+// [`decoded_attachment_len`]) rather than by allocating the decoded buffer.
 const ANTHROPIC_MAX_IMAGES_PER_REQUEST: usize = 100;
 const ANTHROPIC_MAX_DOCUMENTS_PER_REQUEST: usize = 5;
 const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
@@ -71,10 +76,35 @@ pub(crate) fn collect_attachments(request: &ChatRequest) -> Vec<AttachmentRef<'_
     attachments
 }
 
-pub(crate) fn decode_attachment_bytes(data: &str) -> Result<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|error| anyhow::anyhow!("invalid base64 attachment data: {error}"))
+/// Validate that `data` is well-formed standard (padded) base64 and return the
+/// number of **decoded** bytes it represents — without allocating the decoded
+/// buffer.
+///
+/// `validate_request_attachments` runs on every `chat`/`chat_stream` call over
+/// the entire message history, so fully base64-decoding each attachment (up to
+/// tens of MB) purely to read its length wasted CPU and allocations on the
+/// async runtime each turn. The decoded length is instead computed
+/// arithmetically from the encoded length and trailing padding.
+pub(crate) fn decoded_attachment_len(data: &str) -> Result<usize> {
+    let bytes = data.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    if !len.is_multiple_of(4) {
+        bail!("invalid base64 attachment data: length is not a multiple of 4");
+    }
+    let padding = bytes.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 {
+        bail!("invalid base64 attachment data: malformed padding");
+    }
+    for &b in &bytes[..len - padding] {
+        let valid = b.is_ascii_alphanumeric() || b == b'+' || b == b'/';
+        if !valid {
+            bail!("invalid base64 attachment data: unexpected character");
+        }
+    }
+    Ok((len / 4) * 3 - padding)
 }
 
 pub(crate) fn validate_request_attachments(
@@ -126,8 +156,8 @@ fn validate_anthropic_inline_attachments(attachments: &[AttachmentRef<'_>]) -> R
     let mut total_inline_bytes = 0;
 
     for attachment in attachments {
-        let decoded_bytes = decode_attachment_bytes(attachment.data)?;
-        total_inline_bytes += attachment.data.len();
+        let decoded_len = decoded_attachment_len(attachment.data)?;
+        total_inline_bytes += decoded_len;
         validate_media_type(
             attachment.kind,
             attachment.media_type,
@@ -137,11 +167,9 @@ fn validate_anthropic_inline_attachments(attachments: &[AttachmentRef<'_>]) -> R
         match attachment.kind {
             AttachmentKind::Image => {
                 image_count += 1;
-                if decoded_bytes.len() > ANTHROPIC_MAX_IMAGE_BYTES {
+                if decoded_len > ANTHROPIC_MAX_IMAGE_BYTES {
                     bail!(
-                        "image attachment exceeds Anthropic limit: {} bytes > {} bytes",
-                        decoded_bytes.len(),
-                        ANTHROPIC_MAX_IMAGE_BYTES
+                        "image attachment exceeds Anthropic limit: {decoded_len} bytes > {ANTHROPIC_MAX_IMAGE_BYTES} bytes"
                     );
                 }
             }
@@ -176,13 +204,13 @@ fn validate_gemini_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Resu
     let mut total_inline_bytes = 0;
 
     for attachment in attachments {
-        let decoded_bytes = decode_attachment_bytes(attachment.data)?;
+        let decoded_len = decoded_attachment_len(attachment.data)?;
         validate_media_type(
             attachment.kind,
             attachment.media_type,
             "Gemini/Vertex Gemini",
         )?;
-        total_inline_bytes += decoded_bytes.len();
+        total_inline_bytes += decoded_len;
     }
 
     if total_inline_bytes > GEMINI_MAX_INLINE_ATTACHMENT_BYTES {
@@ -196,22 +224,18 @@ fn validate_gemini_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Resu
 
 fn validate_openai_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Result<()> {
     for attachment in attachments {
-        let decoded_bytes = decode_attachment_bytes(attachment.data)?;
+        let decoded_len = decoded_attachment_len(attachment.data)?;
         validate_media_type(attachment.kind, attachment.media_type, "OpenAI")?;
 
         match attachment.kind {
-            AttachmentKind::Image if decoded_bytes.len() > OPENAI_MAX_IMAGE_BYTES => {
+            AttachmentKind::Image if decoded_len > OPENAI_MAX_IMAGE_BYTES => {
                 bail!(
-                    "image attachment exceeds OpenAI inline limit: {} bytes > {} bytes",
-                    decoded_bytes.len(),
-                    OPENAI_MAX_IMAGE_BYTES
+                    "image attachment exceeds OpenAI inline limit: {decoded_len} bytes > {OPENAI_MAX_IMAGE_BYTES} bytes"
                 );
             }
-            AttachmentKind::Document if decoded_bytes.len() > OPENAI_MAX_DOCUMENT_BYTES => {
+            AttachmentKind::Document if decoded_len > OPENAI_MAX_DOCUMENT_BYTES => {
                 bail!(
-                    "document attachment exceeds OpenAI inline limit: {} bytes > {} bytes",
-                    decoded_bytes.len(),
-                    OPENAI_MAX_DOCUMENT_BYTES
+                    "document attachment exceeds OpenAI inline limit: {decoded_len} bytes > {OPENAI_MAX_DOCUMENT_BYTES} bytes"
                 );
             }
             AttachmentKind::Image | AttachmentKind::Document => {}
@@ -225,6 +249,7 @@ fn validate_openai_inline_attachments(attachments: &[AttachmentRef<'_>]) -> Resu
 mod tests {
     use super::*;
     use agent_sdk_foundation::llm::{ContentSource, Message, Role};
+    use base64::Engine;
 
     fn request_with_blocks(blocks: Vec<ContentBlock>) -> ChatRequest {
         ChatRequest {
@@ -343,5 +368,56 @@ mod tests {
 
         validate_request_attachments("vertex", "gemini-2.5-pro", &request)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_decoded_attachment_len_matches_real_decode() -> anyhow::Result<()> {
+        // The arithmetic length must equal what a real decode would yield,
+        // across all three padding cases (0, 1, and 2 `=`).
+        for raw in [&b""[..], b"a", b"ab", b"abc", b"abcd", b"abcde"] {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+            assert_eq!(decoded_attachment_len(&encoded)?, raw.len(), "raw={raw:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decoded_attachment_len_distinguishes_encoded_from_decoded() -> anyhow::Result<()> {
+        // "AAAA" is 4 base64 chars -> 3 decoded bytes: the size cap counts the
+        // decoded measure, not the (larger) encoded string length.
+        assert_eq!(decoded_attachment_len("AAAA")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decoded_attachment_len_rejects_malformed() {
+        // Not a multiple of 4.
+        assert!(decoded_attachment_len("AAA").is_err());
+        // Illegal character.
+        assert!(decoded_attachment_len("AA*A").is_err());
+        // Too much padding.
+        assert!(decoded_attachment_len("A===").is_err());
+    }
+
+    #[test]
+    fn test_gemini_total_size_counts_decoded_bytes() {
+        // A payload whose decoded size exceeds the Gemini total cap is rejected
+        // with the total-size error (confirming decoded-byte accounting).
+        let oversized = vec![0_u8; GEMINI_MAX_INLINE_ATTACHMENT_BYTES + 1];
+        let request = request_with_blocks(vec![ContentBlock::Image {
+            source: ContentSource::new(
+                "image/png",
+                base64::engine::general_purpose::STANDARD.encode(oversized),
+            ),
+        }]);
+
+        let error = validate_request_attachments("gemini", "gemini-2.5-pro", &request)
+            .expect_err("expected total-size error");
+        assert!(
+            error
+                .to_string()
+                .contains("total inline attachment payload exceeds Gemini"),
+            "got: {error}"
+        );
     }
 }

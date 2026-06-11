@@ -212,11 +212,6 @@ impl PartialEq for AgentDefinition {
 impl Eq for AgentDefinition {}
 
 impl AgentDefinition {
-    /// Resolve the effective tool list for a turn, given the task's
-    /// caller metadata.
-    ///
-    /// Returns the output of [`tools_fn`](Self::tools_fn) when set,
-    /// otherwise a clone of [`tools`](Self::tools).
     /// Resolve the effective tool list for a turn.
     ///
     /// If a [`tools_fn`](Self::tools_fn) is set AND the task has

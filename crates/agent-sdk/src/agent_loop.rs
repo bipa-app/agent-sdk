@@ -143,8 +143,15 @@ async fn recv_run_state(
 /// Returned by [`AgentLoop::run_persistent`]. Allows the caller to send
 /// new messages to the running agent and cancel execution.
 pub struct AgentHandle {
-    /// Send new messages to the running agent. The agent will process
-    /// them as new user turns after completing the current turn.
+    /// Send new messages to the running agent. The agent processes them as new
+    /// user turns once it parks between turns.
+    ///
+    /// Only [`AgentInput::Text`] and [`AgentInput::Message`] are supported on
+    /// this channel — they are the only variants that represent a fresh user
+    /// turn. Injecting [`AgentInput::Resume`], [`AgentInput::SubmitToolResults`],
+    /// or [`AgentInput::Continue`] ends the run with [`AgentRunState::Error`]
+    /// (those belong to the single-turn `run_turn` flow, not the persistent
+    /// loop). Dropping the sender ends the run cleanly with `Done`.
     pub input_tx: mpsc::Sender<AgentInput>,
     /// Final run state (sent once when the agent completes).
     pub state_rx: oneshot::Receiver<AgentRunState>,
@@ -348,9 +355,15 @@ where
     /// returning an `AgentRunState::AwaitingConfirmation` that contains the
     /// state needed to resume.
     ///
-    /// When the `cancel_token` is cancelled, the agent will stop after the
-    /// current turn completes (no new turns will start). The final state will
-    /// be `AgentRunState::Cancelled`.
+    /// When the `cancel_token` is cancelled, the agent interrupts in-flight
+    /// work at the SDK boundary: the LLM stream and any non-streaming LLM call
+    /// are raced against the token (see `agent_loop/llm.rs`), and in-flight
+    /// tool executions are dropped with balanced `ToolResult`s synthesized so
+    /// the conversation history stays consistent. The run then ends with
+    /// `AgentRunState::Cancelled` — cancellation is *not* deferred to a turn
+    /// boundary. Tools that hold OS resources must honour the
+    /// [cooperative-cancel contract](crate::tools::Tool#cooperative-cancellation);
+    /// see the section below.
     ///
     /// # Arguments
     ///
@@ -598,9 +611,11 @@ where
     /// on the channel between turns instead of exiting on `Done`.
     ///
     /// The agent exits when:
-    /// - The `input_tx` sender is dropped (no more messages)
-    /// - The `cancel_token` is cancelled
-    /// - Max turns exceeded
+    /// - The `input_tx` sender is dropped (no more messages) — reports `Done`
+    /// - The `cancel_token` is cancelled — reports `Cancelled`
+    /// - Max turns exceeded — reports `Error`
+    /// - An unsupported input variant is injected, or appending an injected
+    ///   message fails — reports `Error` (see [`AgentHandle::input_tx`])
     pub fn run_persistent(
         &self,
         thread_id: ThreadId,
@@ -925,7 +940,10 @@ where
 
         // Snapshot the existing event count so we only assemble text emitted
         // by this call, not earlier turns persisted on the same thread.
-        let baseline = self.event_store.get_events(&thread_id).await?.len();
+        // `event_count` + `get_events_since` avoid materializing (and cloning)
+        // the entire thread history twice per call — repeated sends on a
+        // long-lived thread would otherwise be O(n^2) cumulative.
+        let baseline = self.event_store.event_count(&thread_id).await?;
 
         let state = self
             .run(
@@ -940,10 +958,12 @@ where
             return Err(anyhow::Error::new(error));
         }
 
-        let events = self.event_store.get_events(&thread_id).await?;
+        let events = self
+            .event_store
+            .get_events_since(&thread_id, baseline)
+            .await?;
         let reply = events
             .into_iter()
-            .skip(baseline)
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::Text { text, .. } => Some(text),
                 _ => None,

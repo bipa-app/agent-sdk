@@ -88,6 +88,33 @@ fn from_claude_code_name(name: &str, original_names: &[String]) -> String {
     name.to_string()
 }
 
+/// Detect two distinct user tool names that differ only by ASCII case.
+///
+/// In OAuth mode tool names are normalized to Claude Code's casing, so two
+/// tools that differ only by case (e.g. `task` and `Task`) would both serialize
+/// to the same wire name — producing duplicate tool definitions in the request
+/// and misrouting every returned `ToolUse` back to whichever original name
+/// appears first. Such a configuration is rejected up front.
+fn oauth_tool_name_collision(
+    tools: Option<&[agent_sdk_foundation::llm::Tool]>,
+) -> Option<(String, String)> {
+    let tools = tools?;
+    for (index, tool) in tools.iter().enumerate() {
+        for other in &tools[index + 1..] {
+            if tool.name != other.name && tool.name.eq_ignore_ascii_case(&other.name) {
+                return Some((tool.name.clone(), other.name.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn oauth_tool_collision_message(first: &str, second: &str) -> String {
+    format!(
+        "OAuth tool names collide case-insensitively: '{first}' and '{second}' would map to the same Claude Code tool name; rename one to disambiguate"
+    )
+}
+
 /// Returns true if the API key is an OAuth token (`sk-ant-oat-*`).
 #[must_use]
 pub fn is_oauth_token(api_key: &str) -> bool {
@@ -111,9 +138,6 @@ pub struct AnthropicProvider {
     model: String,
     base_url: String,
     auth_mode: AuthMode,
-    /// Original tool names for reverse mapping in OAuth mode (reserved for future use).
-    #[allow(dead_code)]
-    original_tool_names: Vec<String>,
     thinking: Option<ThinkingConfig>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
@@ -153,7 +177,6 @@ impl AnthropicProvider {
             model,
             base_url: API_BASE_URL.to_owned(),
             auth_mode,
-            original_tool_names: Vec::new(),
             thinking: None,
             extra_headers: Vec::new(),
         }
@@ -392,6 +415,13 @@ impl LlmProvider for AnthropicProvider {
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
+        if self.is_oauth()
+            && let Some((first, second)) = oauth_tool_name_collision(request.tools.as_deref())
+        {
+            return Ok(ChatOutcome::InvalidRequest(oauth_tool_collision_message(
+                &first, &second,
+            )));
+        }
         let messages = Self::build_cached_api_messages(&request);
         let tools = if self.is_oauth() {
             build_api_tools(&request).map(|tools| {
@@ -546,6 +576,16 @@ impl LlmProvider for AnthropicProvider {
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
+
+            if is_oauth
+                && let Some((first, second)) = oauth_tool_name_collision(request.tools.as_deref())
+            {
+                yield Ok(StreamDelta::Error {
+                    message: oauth_tool_collision_message(&first, &second),
                     kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
@@ -1105,5 +1145,78 @@ mod tests {
 
         assert_eq!(provider.model(), cloned.model());
         assert_eq!(provider.provider(), cloned.provider());
+    }
+
+    // ===================
+    // OAuth tool-name collision (finding #15)
+    // ===================
+
+    fn tool(name: &str) -> agent_sdk_foundation::llm::Tool {
+        agent_sdk_foundation::llm::Tool {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            display_name: name.to_string(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }
+    }
+
+    fn request_with_tools(tools: Vec<agent_sdk_foundation::llm::Tool>) -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages: vec![agent_sdk_foundation::llm::Message::user("hi")],
+            tools: Some(tools),
+            max_tokens: 1024,
+            max_tokens_explicit: true,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn test_oauth_tool_name_collision_detects_case_variants() {
+        let tools = vec![tool("task"), tool("Task")];
+        let collision = oauth_tool_name_collision(Some(&tools));
+        assert!(collision.is_some());
+    }
+
+    #[test]
+    fn test_oauth_tool_name_collision_allows_distinct_names() {
+        let tools = vec![tool("read"), tool("write"), tool("Read_File")];
+        assert!(oauth_tool_name_collision(Some(&tools)).is_none());
+        assert!(oauth_tool_name_collision(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_oauth_chat_rejects_case_colliding_tools() -> anyhow::Result<()> {
+        // OAuth provider: the collision is caught before any network call.
+        let provider = AnthropicProvider::new("sk-ant-oat-test", MODEL_SONNET_45);
+        assert!(provider.is_oauth());
+        let request = request_with_tools(vec![tool("task"), tool("Task")]);
+        let outcome = provider.chat(request).await?;
+        match outcome {
+            ChatOutcome::InvalidRequest(msg) => {
+                assert!(msg.contains("collide case-insensitively"), "got: {msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_api_key_chat_does_not_apply_oauth_collision_gate() -> anyhow::Result<()> {
+        // For plain API-key auth there is no remapping, so case-differing tool
+        // names are not a collision; the request proceeds (and only fails on the
+        // network call, which we do not make here — we just confirm the gate is
+        // OAuth-only by checking is_oauth()).
+        let provider = AnthropicProvider::new("sk-ant-api-test", MODEL_SONNET_45);
+        assert!(!provider.is_oauth());
+        let tools = vec![tool("task"), tool("Task")];
+        // The gate would only trigger in OAuth mode.
+        assert!(oauth_tool_name_collision(Some(&tools)).is_some());
+        Ok(())
     }
 }

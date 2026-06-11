@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span, Status, TraceContextExt};
@@ -412,10 +413,16 @@ pub struct RootTurnSpanParams<'a> {
 /// A started root-turn span plus the hex ids the worker persists so the
 /// turn's later tasks can re-parent their spans under it.
 pub struct StartedRootTurnSpan {
-    /// The live `invoke_agent` span. The worker holds it for the fresh
-    /// segment, finishing it with [`finish_root_turn_span`] on a
-    /// text-only terminal or letting it end on drop when the turn
-    /// suspends for tools.
+    /// The live `invoke_agent` span.
+    ///
+    /// Canonical lifecycle: hand this span straight to
+    /// [`stash_root_turn_span`] (keyed by task id) and finalize it later —
+    /// from whichever task reaches the terminal — via
+    /// [`finalize_root_turn_span`], so the exported span carries the
+    /// **full** turn duration across the suspend/resume hop. Only callers
+    /// that deliberately opt out of the registry hold this span directly
+    /// and finish it with [`finish_root_turn_span`] (or let it end on drop,
+    /// which truncates the duration to the fresh segment only).
     pub span: BoxedSpan,
     /// Hex-encoded `TraceId` — persist to
     /// `agent_sdk_turn_attempts.otel_trace_id`.
@@ -423,6 +430,16 @@ pub struct StartedRootTurnSpan {
     /// Hex-encoded root `SpanId` — persist to
     /// `agent_sdk_turn_attempts.otel_span_id`.
     pub span_id_hex: String,
+    /// The root span's real sampled bit, captured from its `SpanContext`
+    /// at creation.
+    ///
+    /// Persist this alongside the ids and pass it to
+    /// [`remote_parent_context_with_sampling`] /
+    /// [`traceparent_from_ids_with_sampling`] when re-parenting resumed
+    /// `chat` calls and child `execute_tool` spans, so those children
+    /// honour ratio sampling instead of being force-recorded under a
+    /// sampled-out root.
+    pub sampled: bool,
 }
 
 /// Start the daemon's root `invoke_agent` INTERNAL span and capture the
@@ -431,13 +448,27 @@ pub struct StartedRootTurnSpan {
 /// Mirrors the structural / `gen_ai.*` attributes of the in-process
 /// loop's root span (operation name, provider, model, conversation id)
 /// with the minimal parameter set the daemon worker supplies cheaply,
-/// and tags the same Langfuse `agent` observation. Pair a text-only
-/// terminal with [`finish_root_turn_span`]; on the tool-suspend path the
-/// span ends when dropped — its duration then covers the fresh segment
-/// only, because the `OTel` 0.32 `SpanBuilder` exposes no way to assign a
-/// span id, so a single span cannot be reopened on resume to span the
-/// whole turn. The persisted ids still re-parent every later span, so
-/// the turn remains one coherent trace tree.
+/// and tags the same Langfuse `agent` observation.
+///
+/// # Lifecycle
+///
+/// The `OTel` 0.32 `SpanBuilder` exposes no way to assign a span id, so a
+/// single span cannot be reopened on resume to cover the whole turn.
+/// The **canonical** pattern is therefore:
+///
+/// 1. Persist [`StartedRootTurnSpan::trace_id_hex`] /
+///    [`StartedRootTurnSpan::span_id_hex`] (and
+///    [`StartedRootTurnSpan::sampled`]) on the turn attempt so later tasks
+///    re-parent under the root via [`remote_parent_context_with_sampling`].
+/// 2. Hand [`StartedRootTurnSpan::span`] to [`stash_root_turn_span`]
+///    immediately, then [`finalize_root_turn_span`] it from whichever task
+///    reaches the terminal — even across tasks — so the span keeps the
+///    full turn duration (it legitimately stays open while tools run).
+///
+/// End-on-drop is reserved for callers that deliberately opt out of the
+/// registry; for them the span's duration covers only the fresh segment.
+/// A custom worker that skips [`stash_root_turn_span`] will export
+/// truncated root spans.
 #[must_use]
 pub fn start_root_turn_span(params: RootTurnSpanParams<'_>) -> StartedRootTurnSpan {
     let provider = provider_name::normalize(params.provider_id);
@@ -458,6 +489,7 @@ pub fn start_root_turn_span(params: RootTurnSpanParams<'_>) -> StartedRootTurnSp
     StartedRootTurnSpan {
         trace_id_hex: span_context.trace_id().to_string(),
         span_id_hex: span_context.span_id().to_string(),
+        sampled: span_context.is_sampled(),
         span,
     }
 }
@@ -475,6 +507,25 @@ pub fn start_root_turn_span(params: RootTurnSpanParams<'_>) -> StartedRootTurnSp
 #[must_use]
 pub fn remote_parent_context(trace_id_hex: &str, span_id_hex: &str) -> Option<Context> {
     let span_context = spans::remote_span_context(trace_id_hex, span_id_hex)?;
+    Some(Context::current().with_remote_span_context(span_context))
+}
+
+/// Re-parent a child onto a remote span, preserving the root's real sampled bit.
+///
+/// Like [`remote_parent_context`] but propagates the root span's **real**
+/// sampled bit (see [`StartedRootTurnSpan::sampled`]) instead of forcing
+/// SAMPLED, so a `ParentBased` sampler keeps or drops the re-parented child
+/// to match the root's sampling decision. Use this on the resume / child
+/// tool paths to stop ratio sampling being silently defeated for daemon
+/// workloads. Returns `None` when the ids are absent or malformed.
+#[must_use]
+pub fn remote_parent_context_with_sampling(
+    trace_id_hex: &str,
+    span_id_hex: &str,
+    sampled: bool,
+) -> Option<Context> {
+    let span_context =
+        spans::remote_span_context_with_sampling(trace_id_hex, span_id_hex, sampled)?;
     Some(Context::current().with_remote_span_context(span_context))
 }
 
@@ -571,13 +622,35 @@ pub fn context_from_traceparent(traceparent: &str) -> Option<Context> {
 /// attempt — is encoded here and stored on the child task's
 /// `otel_traceparent` so the child's `execute_tool` span nests under the
 /// turn root. Returns `None` for malformed / zero ids (validated via
-/// [`spans::remote_span_context`]). The `SAMPLED` flag is always set, to
-/// match the remote context the daemon reconstructs.
+/// [`spans::remote_span_context`]).
+///
+/// **Legacy entry point — always sets the `-01` (SAMPLED) flag.** That
+/// forces the child task's `execute_tool` span to be recorded even when the
+/// root turn was sampled out. Prefer [`traceparent_from_ids_with_sampling`]
+/// and pass the root span's real sampled bit so ratio sampling is honoured.
 #[must_use]
 pub fn traceparent_from_ids(trace_id_hex: &str, span_id_hex: &str) -> Option<String> {
+    traceparent_from_ids_with_sampling(trace_id_hex, span_id_hex, true)
+}
+
+/// Encode hex trace + span ids into a W3C `traceparent`, stamping the
+/// root span's **real** sampled bit in the flag byte (`-01` when sampled,
+/// `-00` otherwise).
+///
+/// A downstream [`context_from_traceparent`] parses this flag through the
+/// global propagator, so encoding the true bit keeps the child's sampling
+/// decision aligned with the root instead of force-recording every child.
+/// Returns `None` for malformed / zero ids.
+#[must_use]
+pub fn traceparent_from_ids_with_sampling(
+    trace_id_hex: &str,
+    span_id_hex: &str,
+    sampled: bool,
+) -> Option<String> {
     let span_context = spans::remote_span_context(trace_id_hex, span_id_hex)?;
+    let flag = if sampled { "01" } else { "00" };
     Some(format!(
-        "00-{}-{}-01",
+        "00-{}-{}-{flag}",
         span_context.trace_id(),
         span_context.span_id()
     ))
@@ -599,33 +672,108 @@ pub fn traceparent_from_ids(trace_id_hex: &str, span_id_hex: &str) -> Option<Str
 /// persisted on the turn attempt (see [`remote_parent_context`]), so the
 /// tree is correct regardless of whether the live span survives.
 ///
-/// Keyed by `AgentTask` id (stringified). An entry that is never
-/// finalized — the daemon crashed/restarted mid-turn, so a fresh process
-/// owns the resume — simply leaks its (small) span object until process
-/// exit; that turn's root span is the only one missing its terminal
-/// finalize, and its children still nest correctly.
-static LIVE_ROOT_SPANS: LazyLock<Mutex<HashMap<String, BoxedSpan>>> =
+/// Keyed by `AgentTask` id (stringified). An entry that is never finalized
+/// in this process — the daemon crashed/restarted mid-turn, or (in a
+/// horizontally-scaled deployment) the resume landed on a different replica
+/// so a fresh process owns the terminal — would otherwise leak its span
+/// object forever. To bound that leak the registry is swept on every
+/// [`stash_root_turn_span`]: entries older than [`MAX_STASH_AGE`] (and the
+/// oldest entries once the map reaches [`MAX_LIVE_ROOT_SPANS`]) are ended
+/// with an `abandoned` outcome so they still export rather than vanish.
+static LIVE_ROOT_SPANS: LazyLock<Mutex<HashMap<String, StashedRootSpan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A live root-turn span plus the instant it was stashed, so the registry
+/// can evict entries that were never finalized (see `LIVE_ROOT_SPANS`).
+struct StashedRootSpan {
+    span: BoxedSpan,
+    stashed_at: Instant,
+}
+
+/// Hard cap on the number of live root-turn spans retained at once. Once
+/// reached, the oldest entries are evicted (ended as `abandoned`) to make
+/// room. Sized generously: real concurrency is bounded by worker leases, so
+/// hitting this implies leaked (cross-replica / crashed) entries.
+const MAX_LIVE_ROOT_SPANS: usize = 1024;
+
+/// Maximum age a stashed root-turn span is kept before it is force-ended
+/// with an `abandoned` outcome. An upper bound on a single turn's
+/// wall-clock; anything older is a leaked entry whose terminal will never
+/// arrive in this process.
+const MAX_STASH_AGE: Duration = Duration::from_hours(1);
+
+/// Remove and return every entry older than [`MAX_STASH_AGE`]. The caller
+/// finalizes the returned spans (as `abandoned`) *after* releasing the
+/// registry lock so span / metric work never runs under it.
+fn take_stale(spans: &mut HashMap<String, StashedRootSpan>, now: Instant) -> Vec<StashedRootSpan> {
+    spans
+        .extract_if(|_, stashed| now.saturating_duration_since(stashed.stashed_at) >= MAX_STASH_AGE)
+        .map(|(_, stashed)| stashed)
+        .collect()
+}
+
+/// Remove and return the oldest entries until the map has room for one more
+/// entry under `cap`. The caller finalizes the returned spans.
+fn take_over_capacity(
+    spans: &mut HashMap<String, StashedRootSpan>,
+    cap: usize,
+) -> Vec<StashedRootSpan> {
+    let mut evicted = Vec::new();
+    while spans.len() >= cap {
+        let Some(oldest) = spans
+            .iter()
+            .min_by_key(|(_, stashed)| stashed.stashed_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(stashed) = spans.remove(&oldest) {
+            evicted.push(stashed);
+        }
+    }
+    evicted
+}
 
 /// Stash the live root-turn `span` under `task_id` so a later task can
 /// finalize it with the correct full duration (see `LIVE_ROOT_SPANS`).
 ///
 /// First write wins: a retry that re-opens the same turn keeps the
 /// original span (and its start time) rather than resetting the clock.
+///
+/// Sweeps the registry first (TTL + capacity) so leaked entries from
+/// crashed / cross-replica resumes cannot grow the map without bound; any
+/// evicted span is ended with an `abandoned` outcome (see `LIVE_ROOT_SPANS`).
 pub fn stash_root_turn_span(task_id: &str, span: BoxedSpan) {
-    let Ok(mut spans) = LIVE_ROOT_SPANS.lock() else {
-        log::warn!("live root-span registry poisoned; dropping root span for task {task_id}");
-        return;
+    let evicted = {
+        let Ok(mut spans) = LIVE_ROOT_SPANS.lock() else {
+            log::warn!("live root-span registry poisoned; dropping root span for task {task_id}");
+            return;
+        };
+        let now = Instant::now();
+        let mut evicted = take_stale(&mut spans, now);
+        evicted.extend(take_over_capacity(&mut spans, MAX_LIVE_ROOT_SPANS));
+        spans.entry(task_id.to_string()).or_insert(StashedRootSpan {
+            span,
+            stashed_at: now,
+        });
+        evicted
     };
-    spans.entry(task_id.to_string()).or_insert(span);
+    // Finalize evicted (leaked) spans outside the registry lock so the
+    // metric + export work never runs while holding it. Ending them with an
+    // `abandoned` outcome keeps them in the trace rather than vanishing.
+    for mut stashed in evicted {
+        finish_root_turn_span(&mut stashed.span, 0, None, "abandoned");
+    }
 }
 
 /// Finalize and end the stashed root-turn span for `task_id`, stamping
 /// run-outcome + usage attributes (see [`finish_root_turn_span`]).
 ///
 /// No-op when no span is stashed — the expected path when the daemon
-/// restarted mid-turn and a fresh process owns the terminal. The outcome
-/// counter is still recorded in that case so dashboards see every run.
+/// restarted mid-turn and a fresh process owns the terminal, or when the
+/// entry was already evicted by the registry's TTL / capacity sweep. The
+/// outcome counter is still recorded in that case so dashboards see every
+/// run.
 pub fn finalize_root_turn_span(
     task_id: &str,
     total_turns: usize,
@@ -637,7 +785,9 @@ pub fn finalize_root_turn_span(
         .ok()
         .and_then(|mut spans| spans.remove(task_id));
     match stashed {
-        Some(mut span) => finish_root_turn_span(&mut span, total_turns, total_usage, outcome),
+        Some(mut stashed) => {
+            finish_root_turn_span(&mut stashed.span, total_turns, total_usage, outcome);
+        }
         None => {
             // Live span lost (cross-restart resume). Still record the
             // run-outcome counter so the metric isn't undercounted.
@@ -661,9 +811,12 @@ pub fn discard_root_turn_span(task_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
+        Duration, Instant, MAX_STASH_AGE, StashedRootSpan, classify_llm_error,
         discard_root_turn_span, finalize_root_turn_span, spans, stash_root_turn_span,
-        traceparent_from_ids,
+        take_over_capacity, take_stale, traceparent_from_ids, traceparent_from_ids_with_sampling,
     };
+    use anyhow::Context as _;
+    use std::collections::HashMap;
 
     // W3C example ids (RFC trace-context), both non-zero / valid.
     const TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
@@ -676,11 +829,93 @@ mod tests {
     }
 
     #[test]
+    fn traceparent_encodes_real_sampled_bit() -> anyhow::Result<()> {
+        let sampled =
+            traceparent_from_ids_with_sampling(TRACE_HEX, SPAN_HEX, true).context("sampled")?;
+        assert!(sampled.ends_with("-01"), "sampled traceparent: {sampled}");
+        let unsampled =
+            traceparent_from_ids_with_sampling(TRACE_HEX, SPAN_HEX, false).context("unsampled")?;
+        assert!(
+            unsampled.ends_with("-00"),
+            "sampled-out root must not force -01: {unsampled}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn traceparent_from_malformed_or_zero_ids_is_none() {
         assert!(traceparent_from_ids("not-hex", SPAN_HEX).is_none());
         assert!(traceparent_from_ids(TRACE_HEX, "tooshort").is_none());
         // All-zero ids are rejected by `SpanContext::is_valid`.
         assert!(traceparent_from_ids(&"0".repeat(32), &"0".repeat(16)).is_none());
+    }
+
+    #[test]
+    fn classify_llm_error_vocabulary_is_stable() {
+        // Pins the daemon-side `error.type` vocabulary so any drift from the
+        // in-process `agent_loop::turn::classify_llm_error` byte-for-byte
+        // mirror is caught here (the two copies are not yet deduplicated).
+        assert_eq!(
+            classify_llm_error("Rate limited: slow down"),
+            "rate_limited"
+        );
+        assert_eq!(
+            classify_llm_error("Invalid request: bad"),
+            "invalid_request"
+        );
+        assert_eq!(classify_llm_error("Server error 500"), "server_error");
+        assert_eq!(classify_llm_error("Stream closed early"), "stream_error");
+        assert_eq!(classify_llm_error("something else entirely"), "_OTHER");
+    }
+
+    #[test]
+    fn take_stale_removes_entries_past_ttl() {
+        let mut map: HashMap<String, StashedRootSpan> = HashMap::new();
+        // Anchor everything to a single base instant and advance "now"
+        // forward (rather than subtracting from `now`) so the test never
+        // underflows the monotonic clock on a freshly-booted machine.
+        let base = Instant::now();
+        map.insert(
+            "old".to_string(),
+            StashedRootSpan {
+                span: spans::start_internal_span("test", Vec::new()),
+                stashed_at: base,
+            },
+        );
+        map.insert(
+            "fresh".to_string(),
+            StashedRootSpan {
+                span: spans::start_internal_span("test", Vec::new()),
+                stashed_at: base + MAX_STASH_AGE,
+            },
+        );
+        let eval_now = base + MAX_STASH_AGE + Duration::from_secs(1);
+        let evicted = take_stale(&mut map, eval_now);
+        assert_eq!(evicted.len(), 1, "exactly the stale entry is evicted");
+        assert!(!map.contains_key("old"), "stale entry must be removed");
+        assert!(map.contains_key("fresh"), "fresh entry must survive");
+    }
+
+    #[test]
+    fn take_over_capacity_trims_oldest_to_make_room() {
+        let mut map: HashMap<String, StashedRootSpan> = HashMap::new();
+        for i in 0u64..4 {
+            map.insert(
+                format!("t{i}"),
+                StashedRootSpan {
+                    span: spans::start_internal_span("test", Vec::new()),
+                    stashed_at: Instant::now() + Duration::from_millis(i),
+                },
+            );
+        }
+        let evicted = take_over_capacity(&mut map, 2);
+        assert!(!evicted.is_empty(), "over-capacity entries must be evicted");
+        // Leaves room for one more under the cap.
+        assert!(
+            map.len() < 2,
+            "map should be trimmed below cap, got {}",
+            map.len()
+        );
     }
 
     #[test]

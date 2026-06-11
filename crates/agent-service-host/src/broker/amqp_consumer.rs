@@ -55,7 +55,7 @@ use agent_server::journal::{TaskWakeupHandler, outbox_message::TaskWakeupPayload
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, ConfirmSelectOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions, ConfirmSelectOptions,
     ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
 use lapin::types::{FieldTable, ShortString};
@@ -66,7 +66,15 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::amqp::{AmqpBrokerConfig, AmqpExchangeKind};
+use super::amqp::AmqpBrokerConfig;
+
+/// Per-consumer prefetch bound (`basic.qos`).  Without it AMQP's
+/// default prefetch is unlimited, so after host downtime the broker
+/// pushes the entire queued backlog to a single consumer — defeating
+/// competing-consumer balancing across pods and buffering every
+/// delivery in process memory.  A small finite window keeps the
+/// in-flight set bounded while leaving room to pipeline.
+const CONSUMER_PREFETCH: u16 = 32;
 
 // ─────────────────────────────────────────────────────────────────────
 // Config
@@ -140,9 +148,10 @@ pub struct AmqpTaskWakeupConsumer {
 }
 
 struct ConnectionState {
-    // Kept alive so the channel stays usable.
-    #[allow(dead_code)]
-    connection: Connection,
+    // Held only to keep the connection (and therefore the channel)
+    // alive; never read. The leading underscore satisfies the
+    // dead-code lint without an `#[allow]`.
+    _connection: Connection,
     channel: Channel,
 }
 
@@ -318,16 +327,18 @@ impl AmqpTaskWakeupConsumer {
             .confirm_select(ConfirmSelectOptions::default())
             .await
             .context("enable publisher confirms on consumer channel")?;
+        // Bound the in-flight delivery window so the broker cannot dump
+        // an entire post-downtime backlog onto one consumer.
+        channel
+            .basic_qos(CONSUMER_PREFETCH, BasicQosOptions::default())
+            .await
+            .context("set basic.qos prefetch on wakeup consumer channel")?;
 
         if self.config.broker.declare_exchange {
             channel
                 .exchange_declare(
                     self.config.broker.exchange.as_str().into(),
-                    match self.config.broker.exchange_kind {
-                        AmqpExchangeKind::Topic => lapin::ExchangeKind::Topic,
-                        AmqpExchangeKind::Direct => lapin::ExchangeKind::Direct,
-                        AmqpExchangeKind::Fanout => lapin::ExchangeKind::Fanout,
-                    },
+                    self.config.broker.exchange_kind.into(),
                     ExchangeDeclareOptions {
                         durable: true,
                         ..ExchangeDeclareOptions::default()
@@ -344,7 +355,7 @@ impl AmqpTaskWakeupConsumer {
         }
 
         Ok(ConnectionState {
-            connection,
+            _connection: connection,
             channel,
         })
     }

@@ -186,7 +186,10 @@ pub enum IntentStatus {
     Started,
     /// Executor completed successfully.
     Completed,
-    /// Executor returned an error or the guard blocked execution.
+    /// Executor was invoked and returned an error. The guard-blocked
+    /// (fail-closed) path never persists a record — when intent
+    /// persistence itself fails the executor is never called and no row
+    /// is written — so `Failed` always means the executor ran.
     Failed,
 }
 
@@ -285,16 +288,35 @@ impl ExecutionIntent {
 /// it fails.
 #[async_trait]
 pub trait ExecutionIntentStore: Send + Sync {
-    /// Persist a new intent record. Must be atomic and durable
-    /// (i.e. a crash after this returns `Ok(())` must not lose the
-    /// record).
+    /// Atomically **claim** the operation by inserting a new intent
+    /// record **only if one does not already exist** for the
+    /// [`OperationId`]. Must be atomic and durable (a crash after this
+    /// returns `Ok(())` must not lose the record).
+    ///
+    /// This is insert-if-absent, **not** an upsert: a record that
+    /// already exists is never overwritten. When a record already exists
+    /// the call returns an **error** (a claim conflict), which is how a
+    /// concurrent re-acquiring worker is told the operation is already
+    /// owned — collapsing the prior check (`get_intent`) and the claim
+    /// into one atomic step so two workers can never both pass the
+    /// retry-safety gate and execute the same side-effecting tool.
+    /// [`guarded_tool_execution`] treats this error as fail-closed (it
+    /// does not execute). Legitimate status transitions on an existing
+    /// record go through [`update_intent`](Self::update_intent), never
+    /// through a second `persist_intent`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the record cannot be durably written.
+    /// Returns an error if the record already exists (claim conflict) or
+    /// if the record cannot be durably written.
     async fn persist_intent(&self, intent: &ExecutionIntent) -> anyhow::Result<()>;
 
     /// Update an existing intent record (status transitions).
+    ///
+    /// Unlike [`persist_intent`](Self::persist_intent) this is a blind
+    /// overwrite of the existing row's mutable fields — it is the
+    /// legitimate transition path (`Pending → Started → Completed /
+    /// Failed`) for the worker that already owns the claim.
     ///
     /// # Errors
     ///
@@ -347,11 +369,17 @@ impl ExecutionIntentStore for InMemoryExecutionIntentStore {
     async fn persist_intent(&self, intent: &ExecutionIntent) -> anyhow::Result<()> {
         let op_id = intent.operation_id.as_str().to_owned();
         let task_id = intent.child_task_id.0.clone();
-        self.intents
-            .write()
-            .ok()
-            .context("lock poisoned")?
-            .insert(op_id.clone(), intent.clone());
+        // Insert-if-absent under the write lock: the contains-check and
+        // the insert share one guard so two concurrent claims on the
+        // same operation id serialize and exactly one wins. The losing
+        // claim gets a conflict error and must NOT execute.
+        {
+            let mut intents = self.intents.write().ok().context("lock poisoned")?;
+            if intents.contains_key(&op_id) {
+                bail!("execution intent for operation {op_id} already claimed (conflict)");
+            }
+            intents.insert(op_id.clone(), intent.clone());
+        }
         self.task_index
             .write()
             .ok()
@@ -447,7 +475,11 @@ pub enum RetryDecision {
     NoPriorIntent,
     /// Previous execution completed — return the cached result.
     AlreadyCompleted(ExecutionIntent),
-    /// Previous execution failed before starting — safe to retry.
+    /// A previous execution of a **replay-safe** tool ran and returned
+    /// an error. Because replay-safe tools are deterministic and carry
+    /// no external side effects, re-executing is safe. Side-effecting
+    /// and resumable tools never take this branch — their `Failed`
+    /// status resolves to [`Self::AmbiguousInFlight`] instead.
     FailedBeforeStart(ExecutionIntent),
     /// Previous execution started but didn't complete — unsafe to
     /// retry automatically for side-effecting tools.
@@ -554,12 +586,74 @@ where
         .get_intent(&operation_id)
         .await
         .context("failed to check prior intent")?;
+    enforce_retry_safety(check_retry_safety(prior))?;
 
-    match check_retry_safety(prior) {
+    // ── Persist intent (fail-closed) ─────────────────────────────
+    let mut intent = ExecutionIntent::new(
+        operation_id,
+        effect_class,
+        &bootstrap.tool_call,
+        bootstrap.task_id.clone(),
+        now,
+    );
+
+    // The claim and the prior retry-safety read collapse into this one
+    // atomic insert-if-absent. An error here is either a durable write
+    // failure OR a claim conflict (a concurrent worker claimed the same
+    // operation id between our `get_intent` read and this insert, so the
+    // side-effecting tool may already be executing elsewhere). Both are
+    // fail-closed: never execute.
+    if let Err(persist_err) = deps.intent_store.persist_intent(&intent).await {
+        return fail_closed_on_claim_error(&bootstrap, deps.task_store, &intent, &persist_err, now)
+            .await;
+    }
+
+    // ── Mark started ─────────────────────────────────────────────
+    intent.mark_started(now);
+    // Best-effort: a failure here doesn't block execution since the
+    // Pending intent already provides the safety guarantee. Surface it
+    // so an operator can see a degraded intent store.
+    record_intent_update(deps.intent_store, &intent, "started", "Started").await;
+
+    // ── Execute ──────────────────────────────────────────────────
+    let outcome = execute_tool_task(
+        bootstrap,
+        deps.task_store,
+        deps.event_repo,
+        cancel,
+        executor,
+        now,
+    )
+    .await;
+
+    // ── Update intent to terminal status ─────────────────────────
+    apply_terminal_status(&mut intent, &outcome, now);
+    // Best-effort: the terminal update is not required for safety —
+    // the intent record already prevents unsafe retry. But a dropped
+    // terminal update leaves the intent stuck at `Started`, which
+    // classifies every future retry as `AmbiguousInFlight` ("manual
+    // intervention required") with no trace, so log it loudly.
+    record_intent_update(
+        deps.intent_store,
+        &intent,
+        &format!("{:?}", intent.status),
+        "terminal status",
+    )
+    .await;
+
+    outcome
+}
+
+/// Reject a retry the [`check_retry_safety`] decision deems unsafe.
+///
+/// `AlreadyCompleted` and `AmbiguousInFlight` bail; the safe-to-proceed
+/// decisions return `Ok(())`.
+fn enforce_retry_safety(decision: RetryDecision) -> anyhow::Result<()> {
+    match decision {
         RetryDecision::AlreadyCompleted(intent) => {
-            // Already done. Fail the child task with a note — the
-            // result was already committed on the first run. The
-            // caller should not have retried.
+            // Already done. The result was already committed on the first
+            // run, so refuse the duplicate — the caller should not have
+            // retried.
             bail!(
                 "operation {} already completed at {}; refusing duplicate execution",
                 intent.operation_id,
@@ -577,83 +671,76 @@ where
                 intent.effect_class,
             );
         }
-        RetryDecision::NoPriorIntent | RetryDecision::FailedBeforeStart(_) => {
-            // Safe to proceed.
-        }
+        RetryDecision::NoPriorIntent | RetryDecision::FailedBeforeStart(_) => Ok(()),
     }
+}
 
-    // ── Persist intent (fail-closed) ─────────────────────────────
-    let mut intent = ExecutionIntent::new(
-        operation_id,
-        effect_class,
-        &bootstrap.tool_call,
-        bootstrap.task_id.clone(),
-        now,
+/// Fail the child task without executing when the intent could not be
+/// atomically claimed (durable write failure or a concurrent claim).
+async fn fail_closed_on_claim_error(
+    bootstrap: &ToolTaskBootstrap,
+    task_store: &dyn AgentTaskStore,
+    intent: &ExecutionIntent,
+    persist_err: &anyhow::Error,
+    now: OffsetDateTime,
+) -> anyhow::Result<ToolTaskOutcome> {
+    // FAIL-CLOSED: intent could not be atomically claimed. Fail the
+    // child task without executing so the parent can handle it.
+    let error_msg = format!(
+        "fail-closed: could not claim execution intent for tool '{}' (operation {}): \
+         {persist_err:#}",
+        intent.tool_name, intent.operation_id,
     );
 
-    if let Err(persist_err) = deps.intent_store.persist_intent(&intent).await {
-        // FAIL-CLOSED: intent could not be durably written.
-        // Fail the child task so the parent can handle it.
-        let error_msg = format!(
-            "fail-closed: could not persist execution intent for tool '{}': {persist_err:#}",
-            intent.tool_name,
+    let task_id = &bootstrap.task_id;
+    let worker_id = &bootstrap.worker_id;
+    let lease_id = &bootstrap.lease_id;
+
+    let (child, parent) = task_store
+        .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
+        .await
+        .with_context(|| format!("fail_task after intent-claim failure for {task_id}"))?;
+
+    Ok(ToolTaskOutcome::Failed {
+        child,
+        parent,
+        error: error_msg,
+        committed_events: Vec::new(),
+    })
+}
+
+/// Transition `intent` to its terminal status based on the executor
+/// `outcome`.
+fn apply_terminal_status(
+    intent: &mut ExecutionIntent,
+    outcome: &anyhow::Result<ToolTaskOutcome>,
+    now: OffsetDateTime,
+) {
+    match outcome {
+        Ok(ToolTaskOutcome::Completed { .. }) => intent.mark_completed(now),
+        Ok(ToolTaskOutcome::Failed { error, .. }) => intent.mark_failed(error, now),
+        Ok(ToolTaskOutcome::Cancelled) => intent.mark_failed("execution cancelled", now),
+        Err(err) => intent.mark_failed(format!("{err:#}"), now),
+    }
+}
+
+/// Best-effort `update_intent`, logging a warning on failure.
+///
+/// `target_status` is the structured-log value; `transition` is the
+/// human label interpolated into the warning message.
+async fn record_intent_update(
+    intent_store: &dyn ExecutionIntentStore,
+    intent: &ExecutionIntent,
+    target_status: &str,
+    transition: &str,
+) {
+    if let Err(err) = intent_store.update_intent(intent).await {
+        log::warn!(
+            operation_id = intent.operation_id.as_str(),
+            target_status = target_status;
+            "failed to update execution intent to {transition}: {err:#}",
         );
-
-        let task_id = &bootstrap.task_id;
-        let worker_id = &bootstrap.worker_id;
-        let lease_id = &bootstrap.lease_id;
-
-        let (child, parent) = deps
-            .task_store
-            .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
-            .await
-            .with_context(|| format!("fail_task after intent-persist failure for {task_id}"))?;
-
-        return Ok(ToolTaskOutcome::Failed {
-            child,
-            parent,
-            error: error_msg,
-            committed_events: Vec::new(),
-        });
     }
-
-    // ── Mark started ─────────────────────────────────────────────
-    intent.mark_started(now);
-    // Best-effort: a failure here doesn't block execution since the
-    // Pending intent already provides the safety guarantee.
-    let _ = deps.intent_store.update_intent(&intent).await;
-
-    // ── Execute ──────────────────────────────────────────────────
-    let outcome = execute_tool_task(
-        bootstrap,
-        deps.task_store,
-        deps.event_repo,
-        cancel,
-        executor,
-        now,
-    )
-    .await;
-
-    // ── Update intent to terminal status ─────────────────────────
-    match &outcome {
-        Ok(ToolTaskOutcome::Completed { .. }) => {
-            intent.mark_completed(now);
-        }
-        Ok(ToolTaskOutcome::Failed { error, .. }) => {
-            intent.mark_failed(error, now);
-        }
-        Ok(ToolTaskOutcome::Cancelled) => {
-            intent.mark_failed("execution cancelled", now);
-        }
-        Err(err) => {
-            intent.mark_failed(format!("{err:#}"), now);
-        }
-    }
-    // Best-effort: the terminal update is not required for safety —
-    // the intent record already prevents unsafe retry.
-    let _ = deps.intent_store.update_intent(&intent).await;
-
-    outcome
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -990,6 +1077,70 @@ mod tests {
             .context("intent should be present")?;
         assert_eq!(loaded.operation_id, op);
         assert_eq!(loaded.status, IntentStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_persist_is_insert_if_absent() -> anyhow::Result<()> {
+        let store = InMemoryExecutionIntentStore::new();
+        let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
+        let tool = make_tool_call(ToolTier::Confirm, false);
+        let now = OffsetDateTime::now_utc();
+
+        let first = ExecutionIntent::new(
+            op.clone(),
+            ToolEffectClass::SideEffecting,
+            &tool,
+            AgentTaskId("t1".into()),
+            now,
+        );
+        // First claim wins.
+        store.persist_intent(&first).await?;
+
+        // A second claim on the same operation id (e.g. a stale worker
+        // racing the re-acquiring worker) must lose with a conflict error
+        // — never clobber the in-flight record.
+        let mut racing = first.clone();
+        racing.mark_started(now);
+        let err = store.persist_intent(&racing).await.unwrap_err();
+        assert!(
+            err.to_string().contains("conflict"),
+            "expected claim conflict, got: {err}"
+        );
+
+        // The original Pending record is untouched by the losing claim.
+        let loaded = store
+            .get_intent(&op)
+            .await?
+            .context("intent should be present")?;
+        assert_eq!(loaded.status, IntentStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_two_concurrent_claims_yield_one_winner() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        let store = Arc::new(InMemoryExecutionIntentStore::new());
+        let op = OperationId::new(&AgentTaskId("t1".into()), "c1");
+        let tool = make_tool_call(ToolTier::Confirm, false);
+        let now = OffsetDateTime::now_utc();
+        let intent = ExecutionIntent::new(
+            op,
+            ToolEffectClass::SideEffecting,
+            &tool,
+            AgentTaskId("t1".into()),
+            now,
+        );
+
+        let s1 = Arc::clone(&store);
+        let i1 = intent.clone();
+        let s2 = Arc::clone(&store);
+        let i2 = intent.clone();
+        let (a, b) = tokio::join!(async move { s1.persist_intent(&i1).await }, async move {
+            s2.persist_intent(&i2).await
+        },);
+        let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(winners, 1, "exactly one concurrent claim must win");
         Ok(())
     }
 

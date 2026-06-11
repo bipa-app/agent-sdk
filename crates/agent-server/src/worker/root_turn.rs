@@ -49,6 +49,7 @@ use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::definition::{AgentDefinition, ThinkingPolicy};
@@ -131,6 +132,25 @@ pub struct RootTurnDeps<'a> {
     /// `&MockTextProvider` — compiling unchanged; only hosts
     /// opting into compaction need to supply the Arc.
     pub compaction_provider: Option<&'a std::sync::Arc<dyn agent_sdk_providers::LlmProvider>>,
+    /// Optional cooperative-cancellation token for the root turn.
+    ///
+    /// When `Some` and the token is tripped (via `cancel_root_turn` /
+    /// `cancel_tree` or a host shutdown), the worker stops consuming the
+    /// LLM stream, aborts retry backoff sleeps, and skips
+    /// auto-compaction instead of running them to completion — so a
+    /// cancelled turn stops burning provider tokens and surfaces to the
+    /// user promptly rather than only failing at the final commit CAS.
+    ///
+    /// `None` (the default) preserves the prior "run to completion
+    /// regardless of cancellation" behaviour for every existing host.
+    pub cancel: Option<&'a CancellationToken>,
+}
+
+impl RootTurnDeps<'_> {
+    /// True when a cancellation token is wired and has been tripped.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.is_some_and(CancellationToken::is_cancelled)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -289,8 +309,6 @@ pub enum RootTurnOutcome {
 /// discarded when the `RootWorkerInputs` is dropped on the error path.
 /// This function handles the durable side: marking the task terminal
 /// and closing open attempts.
-///
-/// # Returns
 ///
 /// # Errors
 ///
@@ -763,6 +781,7 @@ async fn commit_text_only_turn(
         CompletedTurnCommit {
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
+            expected_turn: inputs.recovery_view.next_turn_number,
             turn_attempt_id: attempt.id.clone(),
             close_attempt_params: close_params,
             messages: drained_messages,
@@ -1034,6 +1053,11 @@ enum StreamAttemptError {
     /// retry will help.  The turn attempt was already closed with
     /// `InvalidRequest`.
     Fatal { message: String },
+    /// The root turn was cancelled mid-stream via the
+    /// [`RootTurnDeps::cancel`] token.  The turn attempt was already
+    /// closed with `Cancelled`; the retry wrapper bails immediately,
+    /// skipping both retry/backoff and the commit path.
+    Cancelled { message: String },
 }
 
 /// Bundle of context [`call_llm_with_retry`] needs to drive the
@@ -1071,9 +1095,12 @@ pub(crate) struct LlmRetryParams<'a> {
     /// LLM provider — borrowed because it can't be cloned cheaply.
     pub(crate) provider: &'a dyn LlmProvider,
     /// Chat request built once at the top of the turn and reused on
-    /// every retry.  Cloning per attempt is cheap because the
-    /// expensive parts (system prompt + staged history) are shared
-    /// `String` / `Vec<Message>` payloads.
+    /// every retry. NOTE: [`ChatRequest`] is fully owned, so the retry
+    /// loop deep-clones the system prompt, every message (including any
+    /// base64 image / document data), and every tool schema per attempt.
+    /// The common case is a single first-and-only attempt, so the clone
+    /// is paid even on the success path — tracked as a follow-up
+    /// optimization (avoid cloning on the first attempt / wrap in `Arc`).
     pub(crate) chat_request: ChatRequest,
     /// Initial [`TurnAttempt`] opened by the caller before streaming
     /// begins.  Subsequent attempts are minted by the wrapper.
@@ -1150,6 +1177,11 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
     let mut compaction_retries: u32 = 0;
 
     loop {
+        // Cooperative cancellation: bail before opening a (billed) LLM
+        // attempt when the root turn has been cancelled between retries.
+        if deps.is_cancelled() {
+            bail!("root turn cancelled before LLM attempt");
+        }
         let attempt_now = if retries == 0 && compaction_retries == 0 {
             now
         } else {
@@ -1209,6 +1241,12 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
                     attempt = next_attempt;
                     continue;
                 }
+                bail!("{message}");
+            }
+            Err(StreamAttemptError::Cancelled { message }) => {
+                // The turn was cancelled mid-stream — the attempt is
+                // already closed `Cancelled`. Bail immediately, skipping
+                // both retry/backoff and the commit path.
                 bail!("{message}");
             }
         }
@@ -1278,7 +1316,19 @@ async fn handle_recoverable_stream_error(
         message,
     )
     .await;
-    tokio::time::sleep(delay).await;
+    // Cooperative cancellation: abort the backoff promptly instead of
+    // sleeping out the full (up to 8s) delay on an already-cancelled
+    // turn.
+    match deps.cancel {
+        Some(cancel) => {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => bail!("root turn cancelled during retry backoff"),
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+        None => tokio::time::sleep(delay).await,
+    }
     open_attempt(
         inputs,
         definition,
@@ -1592,6 +1642,7 @@ async fn call_llm_once_instrumented(
                     (stream_error_kind_type(*kind), message.as_str())
                 }
                 StreamAttemptError::Fatal { message } => ("invalid_request", message.as_str()),
+                StreamAttemptError::Cancelled { message } => ("cancelled", message.as_str()),
             };
             loop_instrument::finish_chat_span_error(
                 &mut span,
@@ -1623,9 +1674,30 @@ const fn stream_error_kind_type(kind: StreamErrorKind) -> &'static str {
     }
 }
 
-/// Streaming/journal/retry body of [`call_llm_once`]. Carries the
-/// entire LLM-stream loop unchanged; the `chat {model}` span lives in
-/// the [`call_llm_once`] wrapper.
+/// Number of buffered streaming deltas that forces a coalesced
+/// [`EventRepository::commit_event_batch`] flush.
+///
+/// Committing each `TextDelta` / `ThinkingDelta` inline cost one full
+/// DB transaction per token chunk (BEGIN / SELECT MAX(seq) / INSERT /
+/// COMMIT) and serialized stream consumption behind each round-trip.
+/// Buffering and flushing in bounded batches turns hundreds of
+/// per-token transactions into a handful of batch commits. Replay
+/// completeness does not depend on these deltas — the consolidated
+/// `Text` / `Thinking` events at turn close carry the full content — so
+/// coalescing is purely an optimization.
+const STREAMING_DELTA_BATCH_SIZE: usize = 16;
+
+/// Maximum wall-clock a buffered delta waits before being flushed, so
+/// short responses (fewer than [`STREAMING_DELTA_BATCH_SIZE`] chunks)
+/// still reach live-tail subscribers promptly instead of only at turn
+/// close. The flush fires on whichever bound trips first.
+const STREAMING_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Streaming/journal/retry body of [`call_llm_once`]. Consumes the LLM
+/// stream, coalescing per-token delta events into batched commits,
+/// honouring cooperative cancellation, and requiring a completion
+/// marker before treating the turn as successful. The `chat {model}`
+/// span lives in the [`call_llm_once`] wrapper.
 async fn call_llm_once_inner(
     provider: &dyn LlmProvider,
     request: ChatRequest,
@@ -1637,9 +1709,43 @@ async fn call_llm_once_inner(
     let mut stream = std::pin::pin!(provider.chat_stream(request));
     let mut accumulator = StreamAccumulator::new();
     let mut content_ids = ContentIds::default();
-    let mut delta_count: u64 = 0;
+    // Buffered `TextDelta` / `ThinkingDelta` events awaiting a batched
+    // commit. Flushed when the buffer reaches `STREAMING_DELTA_BATCH_SIZE`
+    // or `STREAMING_DELTA_FLUSH_INTERVAL` elapses, at stream end, and
+    // before any early return so a failed/cancelled attempt still lands
+    // its partial transcript in the journal.
+    let mut pending_deltas: Vec<AgentEvent> = Vec::new();
+    let mut last_flush = std::time::Instant::now();
 
-    while let Some(result) = stream.next().await {
+    loop {
+        // Poll the next stream item, racing it against the cancellation
+        // token so a cancelled root turn stops consuming the (billed)
+        // stream promptly instead of draining it to completion.
+        let next = match deps.cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        flush_and_close(
+                            deps,
+                            thread_id,
+                            &mut pending_deltas,
+                            attempt,
+                            TurnAttemptOutcome::Cancelled,
+                            now,
+                        )
+                        .await;
+                        return Err(StreamAttemptError::Cancelled {
+                            message: "root turn cancelled mid-stream".to_owned(),
+                        });
+                    }
+                    next = stream.next() => next,
+                }
+            }
+            None => stream.next().await,
+        };
+        let Some(result) = next else { break };
+
         let delta = match result {
             Ok(delta) => delta,
             Err(error) => {
@@ -1648,10 +1754,12 @@ async fn call_llm_once_inner(
                 // they're the most common shape of "Anthropic SSE
                 // stream died mid-flight" and almost always succeed
                 // on retry.
-                close_attempt_with(
+                flush_and_close(
+                    deps,
+                    thread_id,
+                    &mut pending_deltas,
                     attempt,
                     TurnAttemptOutcome::ServerError,
-                    deps.attempt_store,
                     now,
                 )
                 .await;
@@ -1662,78 +1770,45 @@ async fn call_llm_once_inner(
             }
         };
 
-        delta_count = delta_count.saturating_add(1);
         accumulator.apply(&delta);
 
-        match &delta {
-            StreamDelta::TextDelta {
-                delta: text_chunk,
-                block_index,
-            } => {
-                if text_chunk.is_empty() {
-                    // Empty deltas carry no content; skipping them
-                    // also avoids allocating an id for blocks that
-                    // never produce non-empty text.
-                    continue;
-                }
-                let message_id = content_ids.text_id_for(*block_index);
-                commit_streaming_delta(
-                    deps,
-                    thread_id,
-                    AgentEvent::text_delta(message_id.to_string(), text_chunk.clone()),
-                    "text_delta",
-                    delta_count,
-                )
-                .await;
+        match buffer_stream_delta(&delta, &mut content_ids, &mut pending_deltas) {
+            DeltaStep::Skip => continue,
+            DeltaStep::Buffered => {}
+            DeltaStep::Fail(outcome, error) => {
+                flush_and_close(deps, thread_id, &mut pending_deltas, attempt, outcome, now).await;
+                return Err(error);
             }
-            StreamDelta::ThinkingDelta {
-                delta: thinking_chunk,
-                block_index,
-            } => {
-                if thinking_chunk.is_empty() {
-                    continue;
-                }
-                let thinking_id = content_ids.thinking_id_for(*block_index);
-                commit_streaming_delta(
-                    deps,
-                    thread_id,
-                    AgentEvent::thinking_delta(thinking_id.to_string(), thinking_chunk.clone()),
-                    "thinking_delta",
-                    delta_count,
-                )
-                .await;
-            }
-            StreamDelta::Error { message, kind } => {
-                // Map the kind directly onto the audit outcome so a
-                // genuine 5xx is recorded as `ServerError` (not
-                // `RateLimited`) and a validation rejection is
-                // recorded as `InvalidRequest` (not `ServerError`).
-                let outcome = match kind {
-                    StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
-                    StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
-                    // `StreamErrorKind::ServerError`, plus the
-                    // `#[non_exhaustive]` catch-all (`Unknown` / future kinds):
-                    // audited as a server error, the most conservative
-                    // non-rate-limit category.
-                    _ => TurnAttemptOutcome::ServerError,
-                };
-                close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
-                let message = message.clone();
-                let kind = *kind;
-                if kind.is_recoverable() {
-                    return Err(StreamAttemptError::Recoverable { kind, message });
-                }
-                return Err(StreamAttemptError::Fatal {
-                    message: format!("LLM stream error (kind={kind:?}): {message}"),
-                });
-            }
-            // Done / Usage / ToolUseStart / ToolInputDelta /
-            // SignatureDelta / RedactedThinking are handled by the
-            // accumulator and don't need to be re-emitted as events. The
-            // catch-all also covers future `#[non_exhaustive]` deltas, which
-            // the accumulator likewise consumes.
-            _ => {}
         }
+
+        maybe_flush_batch(deps, thread_id, &mut pending_deltas, &mut last_flush).await;
+    }
+
+    // Flush any deltas buffered since the last batch before closing.
+    flush_streaming_deltas(deps, thread_id, &mut pending_deltas).await;
+
+    // Require a completion marker before treating the stream as a
+    // successful turn. Some providers (e.g. the OpenAI-compatible impl)
+    // emit partial content when the connection ends without a terminal
+    // `[DONE]`, and the accumulator coerces unparseable streamed
+    // tool-input JSON to `{}` — so committing a `stop_reason`-less
+    // stream would durably record a cut-off assistant message or spawn
+    // tool children with empty inputs. Treat it as a recoverable error
+    // so `call_llm_with_retry` re-attempts instead.
+    if accumulator.stop_reason().is_none() {
+        close_attempt_with(
+            attempt,
+            TurnAttemptOutcome::ServerError,
+            deps.attempt_store,
+            now,
+        )
+        .await;
+        return Err(StreamAttemptError::Recoverable {
+            kind: StreamErrorKind::ServerError,
+            message: "LLM stream ended without a completion marker (stop_reason); \
+                      treating as a truncated response"
+                .to_owned(),
+        });
     }
 
     let response = synthesize_response(accumulator, provider, thread_id);
@@ -1741,6 +1816,93 @@ async fn call_llm_once_inner(
         response,
         content_ids,
     })
+}
+
+/// What [`call_llm_once_inner`] should do after classifying a single
+/// streamed delta.
+enum DeltaStep {
+    /// The delta was buffered (or carried no content); evaluate the
+    /// batch-flush bound and keep consuming.
+    Buffered,
+    /// Empty delta — skip the batch-flush check and poll the next item.
+    Skip,
+    /// Provider surfaced a stream error: flush, close the attempt with
+    /// `outcome`, and propagate `error`.
+    Fail(TurnAttemptOutcome, StreamAttemptError),
+}
+
+/// Classify one streamed [`StreamDelta`], buffering renderable text /
+/// thinking deltas into `pending_deltas` and allocating their per-block
+/// ids on first non-empty content.
+fn buffer_stream_delta(
+    delta: &StreamDelta,
+    content_ids: &mut ContentIds,
+    pending_deltas: &mut Vec<AgentEvent>,
+) -> DeltaStep {
+    match delta {
+        StreamDelta::TextDelta {
+            delta: text_chunk,
+            block_index,
+        } => {
+            if text_chunk.is_empty() {
+                // Empty deltas carry no content; skipping them also
+                // avoids allocating an id for blocks that never produce
+                // non-empty text.
+                return DeltaStep::Skip;
+            }
+            let message_id = content_ids.text_id_for(*block_index);
+            pending_deltas.push(AgentEvent::text_delta(
+                message_id.to_string(),
+                text_chunk.clone(),
+            ));
+            DeltaStep::Buffered
+        }
+        StreamDelta::ThinkingDelta {
+            delta: thinking_chunk,
+            block_index,
+        } => {
+            if thinking_chunk.is_empty() {
+                return DeltaStep::Skip;
+            }
+            let thinking_id = content_ids.thinking_id_for(*block_index);
+            pending_deltas.push(AgentEvent::thinking_delta(
+                thinking_id.to_string(),
+                thinking_chunk.clone(),
+            ));
+            DeltaStep::Buffered
+        }
+        StreamDelta::Error { message, kind } => {
+            // Map the kind directly onto the audit outcome so a genuine
+            // 5xx is recorded as `ServerError` (not `RateLimited`) and a
+            // validation rejection is recorded as `InvalidRequest` (not
+            // `ServerError`).
+            let outcome = match kind {
+                StreamErrorKind::RateLimited => TurnAttemptOutcome::RateLimited,
+                StreamErrorKind::InvalidRequest => TurnAttemptOutcome::InvalidRequest,
+                // `StreamErrorKind::ServerError`, plus the
+                // `#[non_exhaustive]` catch-all (`Unknown` / future kinds):
+                // audited as a server error, the most conservative
+                // non-rate-limit category.
+                _ => TurnAttemptOutcome::ServerError,
+            };
+            let kind = *kind;
+            let message = message.clone();
+            let error = if kind.is_recoverable() {
+                StreamAttemptError::Recoverable { kind, message }
+            } else {
+                StreamAttemptError::Fatal {
+                    message: format!("LLM stream error (kind={kind:?}): {message}"),
+                }
+            };
+            DeltaStep::Fail(outcome, error)
+        }
+        // Done / Usage / ToolUseStart / ToolInputDelta / SignatureDelta /
+        // RedactedThinking are handled by the accumulator and don't need
+        // to be re-emitted as events. The catch-all also covers future
+        // `#[non_exhaustive]` deltas, which the accumulator likewise
+        // consumes.
+        _ => DeltaStep::Buffered,
+    }
 }
 
 /// Build the synthetic [`llm::ChatResponse`] from a closed
@@ -1797,36 +1959,38 @@ fn synthesize_response(
     }
 }
 
-/// Commit a single streaming delta event with a freshly captured
-/// timestamp and best-effort live-tail notification.
+/// Flush buffered streaming delta events as a single coalesced
+/// [`EventRepository::commit_event_batch`], then notify live-tail
+/// subscribers. No-op when the buffer is empty.
 ///
 /// Delta commit failures are intentionally non-fatal: the consolidated
-/// `Text` / `Thinking` event committed at turn close still captures
-/// the full content for replay clients, so a transient journal error
-/// during streaming should not abort the turn.
-async fn commit_streaming_delta(
+/// `Text` / `Thinking` event committed at turn close still captures the
+/// full content for replay clients, so a transient journal error during
+/// streaming should not abort the turn. The whole batch shares one
+/// freshly captured timestamp rather than one per delta — coalescing
+/// trades exact per-delta arrival times for a fraction of the write
+/// amplification.
+async fn flush_streaming_deltas(
     deps: &RootTurnDeps<'_>,
     thread_id: &agent_sdk_foundation::ThreadId,
-    event: AgentEvent,
-    event_label: &str,
-    delta_count: u64,
+    buffer: &mut Vec<AgentEvent>,
 ) {
-    // Use a fresh timestamp per delta so the journal records true
-    // wall-clock arrival times, not the stale turn-open `now` shared
-    // by every delta in a long streaming response.
-    let delta_now = OffsetDateTime::now_utc();
+    if buffer.is_empty() {
+        return;
+    }
+    let batch = std::mem::take(buffer);
+    let batch_len = batch.len();
+    let flush_now = OffsetDateTime::now_utc();
     match deps
         .event_repo
-        .commit_event(thread_id, event, delta_now)
+        .commit_event_batch(thread_id, batch, flush_now)
         .await
     {
-        Ok(committed) => {
-            deps.event_notifier.notify(std::slice::from_ref(&committed));
-        }
+        Ok(committed) => deps.event_notifier.notify(&committed),
         Err(error) => {
             log::warn!(
-                "failed to commit {event_label} event for thread {thread_id} \
-                 (delta_count={delta_count}): {error:#}",
+                "failed to commit streaming delta batch for thread {thread_id} \
+                 (batch_len={batch_len}): {error:#}",
             );
         }
     }
@@ -1851,6 +2015,40 @@ async fn close_attempt_with(
     };
     // Best-effort: if closing fails, the primary error is more important.
     let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
+}
+
+/// Flush any buffered deltas, then close the turn attempt with `outcome`.
+///
+/// Used on every early-return path so a failed / cancelled attempt still
+/// lands its partial transcript before the audit row is closed.
+async fn flush_and_close(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    pending_deltas: &mut Vec<AgentEvent>,
+    attempt: &TurnAttempt,
+    outcome: TurnAttemptOutcome,
+    now: OffsetDateTime,
+) {
+    flush_streaming_deltas(deps, thread_id, pending_deltas).await;
+    close_attempt_with(attempt, outcome, deps.attempt_store, now).await;
+}
+
+/// Coalesce: flush buffered deltas once the count or time bound trips, so
+/// a long response issues a handful of batched commits rather than one DB
+/// transaction per token chunk while the time bound keeps short responses
+/// live.
+async fn maybe_flush_batch(
+    deps: &RootTurnDeps<'_>,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    pending_deltas: &mut Vec<AgentEvent>,
+    last_flush: &mut std::time::Instant,
+) {
+    if pending_deltas.len() >= STREAMING_DELTA_BATCH_SIZE
+        || (!pending_deltas.is_empty() && last_flush.elapsed() >= STREAMING_DELTA_FLUSH_INTERVAL)
+    {
+        flush_streaming_deltas(deps, thread_id, pending_deltas).await;
+        *last_flush = std::time::Instant::now();
+    }
 }
 
 async fn buffer_turn_messages(
@@ -1884,26 +2082,11 @@ async fn buffer_turn_messages(
         .await?
         .unwrap_or_else(|| AgentState::new(thread_id.clone()));
 
+    let mut total_usage = current_state.total_usage.clone();
+    total_usage.add(&response_token_usage(response));
     let updated_state = AgentState {
         turn_count: current_state.turn_count + 1,
-        total_usage: TokenUsage {
-            input_tokens: current_state
-                .total_usage
-                .input_tokens
-                .saturating_add(response.usage.input_tokens),
-            output_tokens: current_state
-                .total_usage
-                .output_tokens
-                .saturating_add(response.usage.output_tokens),
-            cached_input_tokens: current_state
-                .total_usage
-                .cached_input_tokens
-                .saturating_add(response.usage.cached_input_tokens),
-            cache_creation_input_tokens: current_state
-                .total_usage
-                .cache_creation_input_tokens
-                .saturating_add(response.usage.cache_creation_input_tokens),
-        },
+        total_usage,
         ..current_state
     };
     staged_state
@@ -2246,11 +2429,19 @@ async fn suspend_at_tool_boundary(
 /// classify the resulting per-call decisions into a single
 /// [`BatchRouting`] verdict.
 ///
-/// Returns [`BatchRouting::AllTools`] when no selector is wired, when
-/// the selector returns the wrong number of decisions, or when the
-/// selector itself errors — in every "something looked off" case we
-/// fall through to the legacy `spawn_tool_children` path so a broken
-/// selector cannot break a turn entirely.
+/// Returns [`BatchRouting::AllTools`] when no selector is wired or when
+/// the selector returns the wrong number of decisions (a defensive
+/// fallback for a count contract the trait does not enforce).
+///
+/// A selector **error**, however, is propagated as the turn error: the
+/// [`SubagentSpawnSelector`](super::subagent_spawn_selector::SubagentSpawnSelector)
+/// contract reserves `Err` for "genuinely unrecoverable conditions"
+/// and requires routing-level failures to resolve to
+/// [`SubagentSpawnDecision::SpawnAsTool`](super::subagent_spawn_selector::SubagentSpawnDecision::SpawnAsTool)
+/// instead. Swallowing the error into an `AllTools` reroute would both
+/// contradict that contract and risk divergent decisions across a
+/// lease-expiry retry (the selector is required to be deterministic),
+/// corrupting the durable parent/child linkage.
 async fn classify_batch_for_inputs(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
@@ -2260,16 +2451,15 @@ async fn classify_batch_for_inputs(
         return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
     };
     let pending = &continuation.payload.pending_tool_calls;
-    let decisions = match selector.decide(&inputs.bootstrap.thread_id, pending).await {
-        Ok(decisions) => decisions,
-        Err(error) => {
-            log::warn!(
-                "subagent spawn selector failed on thread {}: {error:#} — falling back to spawn_tool_children",
+    let decisions = selector
+        .decide(&inputs.bootstrap.thread_id, pending)
+        .await
+        .with_context(|| {
+            format!(
+                "subagent spawn selector failed on thread {} (unrecoverable per trait contract)",
                 inputs.bootstrap.thread_id,
-            );
-            return Ok(super::subagent_spawn_selector::BatchRouting::AllTools);
-        }
-    };
+            )
+        })?;
     if decisions.len() != pending.len() {
         log::warn!(
             "subagent spawn selector returned {} decisions for {} tool calls on thread {}; falling back to spawn_tool_children",
@@ -2331,8 +2521,8 @@ async fn spawn_single_subagent_invocation(
 /// subagent invocations under one parent transition.
 ///
 /// Mirrors [`spawn_single_subagent_invocation`] for the fan-out
-/// case. The shared [`SuspensionPayload`] flows once into every
-/// per-entry `SubagentInvocationSpawn`; the worker helper
+/// case. The shared [`SuspensionPayload`] is passed once (not cloned
+/// per entry); the worker helper
 /// [`super::subagent::spawn_subagent_batch_invocations`] then issues
 /// a single store call against
 /// [`AgentTaskStore::spawn_subagent_batch`](crate::journal::store::AgentTaskStore::spawn_subagent_batch).
@@ -2346,22 +2536,15 @@ async fn spawn_multi_subagent_invocations(
     payload: SuspensionPayload,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedSubagentBatch> {
-    let mut spawns = Vec::with_capacity(plans.len());
+    let mut entries = Vec::with_capacity(plans.len());
     for (spawn_index, plan) in plans {
         let spawn_index_u32 =
             u32::try_from(spawn_index).context("subagent spawn_index exceeds u32")?;
-        spawns.push(crate::journal::store::SubagentInvocationSpawn {
+        entries.push(super::subagent::SubagentBatchEntry {
             child_thread_id: plan.child_thread_id.clone(),
             spec: plan.spec.clone(),
             child_root_input: plan.child_root_input.clone(),
             spawn_index: spawn_index_u32,
-            // `spawn_subagent_batch_invocations` reads only the first
-            // entry's `payload.continuation` for index validation;
-            // the store-side primitive uses the explicit shared
-            // `payload` argument for the parent's suspension. Cloning
-            // keeps each `SubagentInvocationSpawn` self-contained so
-            // selector callers can construct them in any order.
-            payload: payload.clone(),
         });
     }
     let invocation_deps = super::subagent::SubagentInvocationDeps {
@@ -2373,7 +2556,8 @@ async fn spawn_multi_subagent_invocations(
         &inputs.bootstrap.task_id,
         &inputs.bootstrap.worker_id,
         &inputs.bootstrap.lease_id,
-        spawns,
+        entries,
+        payload,
         &invocation_deps,
         now,
     )
@@ -2583,31 +2767,10 @@ async fn build_continuation(
         .await?
         .unwrap_or_else(|| AgentState::new(thread_id.clone()));
 
-    let turn_usage = TokenUsage {
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
-        cached_input_tokens: response.usage.cached_input_tokens,
-        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-    };
+    let turn_usage = response_token_usage(response);
 
-    let total_usage = TokenUsage {
-        input_tokens: current_state
-            .total_usage
-            .input_tokens
-            .saturating_add(turn_usage.input_tokens),
-        output_tokens: current_state
-            .total_usage
-            .output_tokens
-            .saturating_add(turn_usage.output_tokens),
-        cached_input_tokens: current_state
-            .total_usage
-            .cached_input_tokens
-            .saturating_add(turn_usage.cached_input_tokens),
-        cache_creation_input_tokens: current_state
-            .total_usage
-            .cache_creation_input_tokens
-            .saturating_add(turn_usage.cache_creation_input_tokens),
-    };
+    let mut total_usage = current_state.total_usage.clone();
+    total_usage.add(&turn_usage);
 
     let updated_state = AgentState {
         turn_count: current_state.turn_count + 1,
@@ -2615,8 +2778,19 @@ async fn build_continuation(
         ..current_state
     };
 
-    let pending_tool_calls =
-        extract_pending_tool_calls(response, &inputs.bootstrap.definition.tools);
+    // Resolve the tier / display_name from the SAME per-turn tool list
+    // the LLM request was built from (`build_chat_request` →
+    // `definition.resolve_tools(caller_metadata)`), not the static
+    // `definition.tools`. A `tools_fn` that hardens a tool to `Confirm`
+    // for this caller (or exposes a tool absent from the static list)
+    // must drive the confirmation gate — resolving against the static
+    // list would silently weaken it. `resolve_tools` already falls back
+    // to `definition.tools` when no `tools_fn` / caller metadata exists.
+    let resolved_tools = inputs
+        .bootstrap
+        .definition
+        .resolve_tools(inputs.bootstrap.task.caller_metadata.as_ref());
+    let pending_tool_calls = extract_pending_tool_calls(response, &resolved_tools);
     let turn_number =
         usize::try_from(inputs.recovery_view.next_turn_number).context("turn number overflow")?;
 
@@ -2643,11 +2817,17 @@ async fn build_continuation(
 }
 
 /// Extract [`PendingToolCallInfo`] from each tool-use block in the
-/// LLM response, resolving `tier` and `display_name` from the
-/// authoritative tool definitions on the [`AgentDefinition`].
+/// LLM response, resolving `tier` and `display_name` from `tool_defs`.
+///
+/// `tool_defs` MUST be the same per-turn list the chat request was
+/// built from (`AgentDefinition::resolve_tools(caller_metadata)`), not
+/// the static `definition.tools` — otherwise a `tools_fn` that hardens
+/// a tool's tier (or exposes a tool absent from the static list) would
+/// be silently overridden and the host's confirmation gate (which keys
+/// on this tier) could be skipped. Tools missing from `tool_defs`
+/// conservatively default to [`ToolTier::Confirm`].
 ///
 /// [`PendingToolCallInfo`]: agent_sdk_foundation::PendingToolCallInfo
-/// [`AgentDefinition`]: super::definition::AgentDefinition
 fn extract_pending_tool_calls(
     response: &llm::ChatResponse,
     tool_defs: &[llm::Tool],
@@ -2769,8 +2949,30 @@ pub async fn resume_root_turn(
             agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
         });
 
-    // 2. Buffer the suspended messages (user prompt + assistant with
-    //    tool calls) and tool-result messages into the staged stores.
+    // 2. Pre-call auto-compaction — run BEFORE buffering the in-flight
+    //    suspended messages + tool results. The staged seed here is the
+    //    COMMITTED-ONLY checkpoint history (the resume path seeds via
+    //    `from_recovery_view_committed_only`), so compacting now keeps
+    //    the durable `replace_history` rewrite restricted to committed
+    //    messages. The uncommitted in-flight transcript never enters the
+    //    committed projection, so a later permanent failure + recovery
+    //    can't fold it in twice — once via the compacted projection and
+    //    once via the raw draft. No-op when `deps.compaction_config` is
+    //    `None`. (Reactive overflow compaction still folds the in-flight
+    //    transcript in, but `apply_compaction` clears the draft so that
+    //    path is duplication-safe too.)
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction (resume path)")?;
+
+    // 3. Buffer the suspended messages (user prompt + assistant with
+    //    tool calls) and tool-result messages into the staged stores,
+    //    on top of the (possibly compacted) committed seed.
     buffer_resume_messages(
         &inputs.staged_stores.messages,
         &inputs.staged_stores.state,
@@ -2782,34 +2984,34 @@ pub async fn resume_root_turn(
     .await
     .context("buffer resume messages")?;
 
+    // 4. Refresh the projection's draft slot with the completed child
+    //    results so recovery surfaces the full in-flight transcript.
+    //    Best-effort: the draft is purely a recovery aid that degrades
+    //    to committed-history-only, and the in-flight transcript is
+    //    independently reconstructable from the parent's ReadyToResume
+    //    state, so a transient store error must not abort an otherwise
+    //    healthy resume (matches the suspend paths' draft contract).
     let resumed_draft = build_resumed_draft_messages(&suspended_messages, &child_results);
-    deps.message_store
-        .set_draft(thread_id, resumed_draft, now)
-        .await
-        .context("refresh draft with completed child results before resume LLM call")?;
-
-    // 2.5 Pre-call auto-compaction.
-    //
-    //     The resume path's staged history already includes the
-    //     suspended messages + tool results buffered above, so
-    //     compacting here folds the prior turn's tool transcript
-    //     into the summary before the LLM sees it. No-op when
-    //     `deps.compaction_config` is `None`.
-    super::compaction::maybe_compact_staged_history(
+    snapshot_suspension_draft(
         deps,
-        &inputs.staged_stores.messages,
         thread_id,
+        &inputs.bootstrap.task_id,
+        resumed_draft,
         now,
+        "refresh draft with completed child results before resume LLM call",
     )
-    .await
-    .context("pre-call auto-compaction (resume path)")?;
+    .await;
 
-    // 3. Build the chat request from staged history — no extra user
-    //    prompt to append because everything is already buffered.
-    let chat_request = build_resume_chat_request(
+    // 5. Build the chat request from staged history. `resume_input` is
+    //    a resume sentinel whose `into_message()` returns `None`, so
+    //    `build_chat_request` appends no extra user prompt — everything
+    //    is already buffered. (This is why the resume path shares
+    //    `build_chat_request` rather than a near-duplicate helper.)
+    let chat_request = build_chat_request(
         definition,
         &inputs.staged_stores.messages,
         thread_id,
+        &resume_input,
         inputs.bootstrap.task.caller_metadata.as_ref(),
     )
     .await
@@ -2906,29 +3108,10 @@ async fn buffer_resumed_assistant(
     // Add resume LLM usage to the continuation's running total.
     // Do NOT increment turn_count — it was already counted at the
     // original suspension point.
+    let mut total_usage = continuation.state.total_usage.clone();
+    total_usage.add(&response_token_usage(response));
     let updated_state = AgentState {
-        total_usage: TokenUsage {
-            input_tokens: continuation
-                .state
-                .total_usage
-                .input_tokens
-                .saturating_add(response.usage.input_tokens),
-            output_tokens: continuation
-                .state
-                .total_usage
-                .output_tokens
-                .saturating_add(response.usage.output_tokens),
-            cached_input_tokens: continuation
-                .state
-                .total_usage
-                .cached_input_tokens
-                .saturating_add(response.usage.cached_input_tokens),
-            cache_creation_input_tokens: continuation
-                .state
-                .total_usage
-                .cache_creation_input_tokens
-                .saturating_add(response.usage.cache_creation_input_tokens),
-        },
+        total_usage,
         ..continuation.state.clone()
     };
     inputs
@@ -2944,21 +3127,10 @@ async fn buffer_resumed_assistant(
 /// Combine the prior continuation's per-turn usage with the new
 /// response's usage so the resume commit records cumulative token
 /// usage for the full turn (suspension + resume LLM calls).
-const fn merged_turn_usage(prior: &TokenUsage, response: &llm::ChatResponse) -> TokenUsage {
-    TokenUsage {
-        input_tokens: prior
-            .input_tokens
-            .saturating_add(response.usage.input_tokens),
-        output_tokens: prior
-            .output_tokens
-            .saturating_add(response.usage.output_tokens),
-        cached_input_tokens: prior
-            .cached_input_tokens
-            .saturating_add(response.usage.cached_input_tokens),
-        cache_creation_input_tokens: prior
-            .cache_creation_input_tokens
-            .saturating_add(response.usage.cache_creation_input_tokens),
-    }
+fn merged_turn_usage(prior: &TokenUsage, response: &llm::ChatResponse) -> TokenUsage {
+    let mut usage = prior.clone();
+    usage.add(&response_token_usage(response));
+    usage
 }
 
 /// Drain the staged message and state stores after a resumed turn so
@@ -3038,6 +3210,7 @@ async fn commit_resumed_turn(
         CompletedTurnCommit {
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
+            expected_turn: inputs.recovery_view.next_turn_number,
             turn_attempt_id: attempt.id.clone(),
             close_attempt_params: close_params,
             messages: drained_messages,
@@ -3153,52 +3326,6 @@ fn build_resumed_draft_messages(
     messages
 }
 
-/// Build a chat request for the resume path. Unlike the fresh-turn
-/// `build_chat_request`, this uses the staged history as-is (no
-/// additional user prompt to append).
-async fn build_resume_chat_request(
-    definition: &AgentDefinition,
-    staged_messages: &crate::journal::staged::StagedMessageStore,
-    thread_id: &agent_sdk_foundation::ThreadId,
-    caller_metadata: Option<&serde_json::Value>,
-) -> Result<ChatRequest> {
-    let messages = staged_messages
-        .get_history(thread_id)
-        .await
-        .context("get staged history for resume")?;
-
-    let thinking = match &definition.thinking {
-        ThinkingPolicy::Disabled => None,
-        ThinkingPolicy::Enabled { budget_tokens } => Some(llm::ThinkingConfig::new(*budget_tokens)),
-        ThinkingPolicy::Adaptive { effort } => {
-            let mut cfg = llm::ThinkingConfig::adaptive();
-            if let Some(e) = effort {
-                cfg = cfg.with_effort(*e);
-            }
-            Some(cfg)
-        }
-    };
-
-    let resolved_tools = definition.resolve_tools(caller_metadata);
-
-    Ok(ChatRequest {
-        system: definition.system_prompt.clone(),
-        messages,
-        tools: if resolved_tools.is_empty() {
-            None
-        } else {
-            Some(resolved_tools)
-        },
-        max_tokens: definition.max_tokens,
-        max_tokens_explicit: true,
-        session_id: None,
-        cached_content: None,
-        thinking,
-        tool_choice: None,
-        response_format: None,
-    })
-}
-
 /// Re-suspend a resumed turn when the LLM responds with more tool
 /// calls. Buffers the full conversation (original suspended messages +
 /// tool results + new assistant response) into the new suspension's
@@ -3312,55 +3439,27 @@ fn build_resume_continuation(
 ) -> Result<ContinuationEnvelope> {
     let thread_id = &inputs.bootstrap.thread_id;
 
-    let new_turn_usage = TokenUsage {
-        input_tokens: prior
-            .turn_usage
-            .input_tokens
-            .saturating_add(response.usage.input_tokens),
-        output_tokens: prior
-            .turn_usage
-            .output_tokens
-            .saturating_add(response.usage.output_tokens),
-        cached_input_tokens: prior
-            .turn_usage
-            .cached_input_tokens
-            .saturating_add(response.usage.cached_input_tokens),
-        cache_creation_input_tokens: prior
-            .turn_usage
-            .cache_creation_input_tokens
-            .saturating_add(response.usage.cache_creation_input_tokens),
-    };
+    let response_usage = response_token_usage(response);
 
-    let new_total_usage = TokenUsage {
-        input_tokens: prior
-            .state
-            .total_usage
-            .input_tokens
-            .saturating_add(response.usage.input_tokens),
-        output_tokens: prior
-            .state
-            .total_usage
-            .output_tokens
-            .saturating_add(response.usage.output_tokens),
-        cached_input_tokens: prior
-            .state
-            .total_usage
-            .cached_input_tokens
-            .saturating_add(response.usage.cached_input_tokens),
-        cache_creation_input_tokens: prior
-            .state
-            .total_usage
-            .cache_creation_input_tokens
-            .saturating_add(response.usage.cache_creation_input_tokens),
-    };
+    let mut new_turn_usage = prior.turn_usage.clone();
+    new_turn_usage.add(&response_usage);
+
+    let mut new_total_usage = prior.state.total_usage.clone();
+    new_total_usage.add(&response_usage);
 
     let updated_state = AgentState {
         total_usage: new_total_usage.clone(),
         ..prior.state.clone()
     };
 
-    let pending_tool_calls =
-        extract_pending_tool_calls(response, &inputs.bootstrap.definition.tools);
+    // Resolve tier / display_name from the per-turn tool list (see
+    // `build_continuation`) so a `tools_fn`-hardened tier drives the
+    // confirmation gate on the resumed turn as well.
+    let resolved_tools = inputs
+        .bootstrap
+        .definition
+        .resolve_tools(inputs.bootstrap.task.caller_metadata.as_ref());
+    let pending_tool_calls = extract_pending_tool_calls(response, &resolved_tools);
     let turn_number =
         usize::try_from(inputs.recovery_view.next_turn_number).context("turn number overflow")?;
 

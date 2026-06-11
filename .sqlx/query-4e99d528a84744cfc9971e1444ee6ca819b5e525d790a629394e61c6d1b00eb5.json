@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\nFROM agent_sdk_tasks\nWHERE root_id = $1\nORDER BY depth, created_at, id\nFOR UPDATE\n",
+  "query": "\nUPDATE agent_sdk_tasks\nSET lease_expires_at = $4, last_heartbeat_at = $5, updated_at = $5\nWHERE id = $1 AND status = 'running' AND worker_id = $2 AND lease_id = $3\nRETURNING\n    id,\n    kind,\n    status,\n    parent_id,\n    root_id,\n    depth,\n    thread_id,\n    submitted_input_json,\n    caller_metadata_json,\n    worker_id,\n    lease_id,\n    lease_expires_at,\n    last_heartbeat_at,\n    state_json,\n    attempt,\n    max_attempts,\n    last_error,\n    pending_child_count,\n    spawn_index,\n    result_payload,\n    otel_traceparent,\n    created_at,\n    updated_at,\n    completed_at\n",
   "describe": {
     "columns": [
       {
@@ -270,7 +270,11 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -300,5 +304,5 @@
       true
     ]
   },
-  "hash": "129e869922797ddd4177e1f0671e29839eee0b8b88b174052da3c7ea4cdeaaab"
+  "hash": "4e99d528a84744cfc9971e1444ee6ca819b5e525d790a629394e61c6d1b00eb5"
 }

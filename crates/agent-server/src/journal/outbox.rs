@@ -244,7 +244,11 @@ pub struct NewOutboxRow {
 ///   `TaskWakeup`).
 /// - `claim_pending` returns rows ordered by `next_attempt_at` so
 ///   older failures are retried before newer rows.
-/// - `mark_delivered` and `mark_failed` are idempotent on terminal rows.
+/// - `mark_delivered` and `mark_failed` only mutate a row still claimed
+///   by the calling `worker_id`; a row reclaimed by another worker
+///   yields an error so the stale worker cannot double-ack it. The
+///   owning worker may safely re-issue the call (it re-applies the same
+///   terminal/retry transition).
 /// - Terminal durable state never depends on successful relay.
 /// - Workers MUST NOT publish to a broker outside this contract; the
 ///   outbox is the only authoritative path.
@@ -273,15 +277,32 @@ pub trait OutboxStore: Send + Sync {
     ) -> Result<Vec<OutboxRow>>;
 
     /// Mark a claimed row as successfully delivered.
-    async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()>;
+    ///
+    /// The update is guarded on `claimed_by == worker_id`: only the worker
+    /// that currently holds the claim mutates the row. If the claim was lost
+    /// — reclaimed by another worker via
+    /// [`reclaim_expired_claims`](Self::reclaim_expired_claims), or the row
+    /// was cascade-deleted — the call is a safe no-op (the current owner acks
+    /// it), so a stale worker can never double-ack a row another worker owns.
+    async fn mark_delivered(
+        &self,
+        id: &OutboxRowId,
+        worker_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<()>;
 
     /// Mark a claimed row as failed.
     ///
     /// If the row's retry budget is exhausted, it transitions to
     /// `Expired` instead of returning to `Pending`.
+    ///
+    /// Guarded on `claimed_by == worker_id`: a lost/reclaimed (or
+    /// cascade-deleted) claim is a safe no-op rather than mutating a row
+    /// another worker now owns.
     async fn mark_failed(
         &self,
         id: &OutboxRowId,
+        worker_id: &str,
         error: &str,
         next_attempt_at: OffsetDateTime,
         now: OffsetDateTime,
@@ -447,15 +468,27 @@ impl OutboxStore for InMemoryOutboxStore {
         Ok(result)
     }
 
-    async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
+    async fn mark_delivered(
+        &self,
+        id: &OutboxRowId,
+        worker_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<()> {
         let mut inner = self.inner.write().await;
-        let row = inner
-            .rows
-            .get_mut(&id.0)
-            .ok_or_else(|| anyhow::anyhow!("outbox row not found: {id}"))?;
+        let Some(row) = inner.rows.get_mut(&id.0) else {
+            // Row gone (e.g. cascade-deleted with its thread): nothing to ack.
+            return Ok(());
+        };
 
-        if row.status.is_terminal() {
-            drop(inner);
+        // Only the worker that currently holds the claim may ack the row. A
+        // claim reclaimed by another worker (lease-expiry race) — or never
+        // held — is a no-op: the current owner will ack it, and acking here
+        // would double-process the row.
+        if row.claimed_by.as_deref() != Some(worker_id) {
+            log::debug!(
+                "mark_delivered no-op for outbox row {id}: claim held by {:?}, not worker {worker_id}",
+                row.claimed_by,
+            );
             return Ok(());
         }
 
@@ -468,18 +501,25 @@ impl OutboxStore for InMemoryOutboxStore {
     async fn mark_failed(
         &self,
         id: &OutboxRowId,
+        worker_id: &str,
         error: &str,
         next_attempt_at: OffsetDateTime,
         _now: OffsetDateTime,
     ) -> Result<()> {
         let mut inner = self.inner.write().await;
-        let row = inner
-            .rows
-            .get_mut(&id.0)
-            .ok_or_else(|| anyhow::anyhow!("outbox row not found: {id}"))?;
+        let Some(row) = inner.rows.get_mut(&id.0) else {
+            // Row gone (e.g. cascade-deleted with its thread): nothing to fail.
+            return Ok(());
+        };
 
-        if row.status.is_terminal() {
-            drop(inner);
+        // Only the worker that currently holds the claim may fail the row; a
+        // reclaimed/lost claim is a no-op rather than mutating a row another
+        // worker now owns.
+        if row.claimed_by.as_deref() != Some(worker_id) {
+            log::debug!(
+                "mark_failed no-op for outbox row {id}: claim held by {:?}, not worker {worker_id}",
+                row.claimed_by,
+            );
             return Ok(());
         }
 
@@ -727,7 +767,7 @@ mod tests {
         let claimed = store.claim_pending("worker-1", 10, t_plus(1)).await?;
         assert_eq!(claimed.len(), 1);
 
-        store.mark_delivered(id, t_plus(2)).await?;
+        store.mark_delivered(id, "worker-1", t_plus(2)).await?;
 
         let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
@@ -745,7 +785,7 @@ mod tests {
 
         store.claim_pending("worker-1", 10, t_plus(1)).await?;
         store
-            .mark_failed(id, "connection refused", t_plus(60), t_plus(2))
+            .mark_failed(id, "worker-1", "connection refused", t_plus(60), t_plus(2))
             .await?;
 
         let row = store.get(id).await?.context("row should exist")?;
@@ -766,7 +806,7 @@ mod tests {
 
         store.claim_pending("worker-1", 10, t_plus(1)).await?;
         store
-            .mark_failed(id, "timeout", t_plus(60), t_plus(2))
+            .mark_failed(id, "worker-1", "timeout", t_plus(60), t_plus(2))
             .await?;
 
         let row = store.get(id).await?.context("row should exist")?;
@@ -784,11 +824,66 @@ mod tests {
         let id = &rows[0].id;
 
         store.claim_pending("worker-1", 10, t_plus(1)).await?;
-        store.mark_delivered(id, t_plus(2)).await?;
-        store.mark_delivered(id, t_plus(3)).await?;
+        store.mark_delivered(id, "worker-1", t_plus(2)).await?;
+        store.mark_delivered(id, "worker-1", t_plus(3)).await?;
 
         let row = store.get(id).await?.context("row should exist")?;
         assert_eq!(row.status, OutboxStatus::Delivered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_delivered_is_noop_for_non_owning_worker() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        // worker-1 holds the claim; a different worker must not be able to ack
+        // the row out from under it. A non-owning ack is a safe no-op (Ok) —
+        // the current owner will ack it; the `claimed_by` guard is what
+        // prevents the stale worker from double-acking.
+        store.claim_pending("worker-1", 10, t_plus(1)).await?;
+        store.mark_delivered(id, "worker-2", t_plus(2)).await?;
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(
+            row.status,
+            OutboxStatus::Claimed,
+            "the row must stay claimed after a non-owning ack",
+        );
+
+        // The owning worker still succeeds.
+        store.mark_delivered(id, "worker-1", t_plus(3)).await?;
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.status, OutboxStatus::Delivered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_failed_is_noop_for_non_owning_worker() -> Result<()> {
+        let store = InMemoryOutboxStore::new();
+        let rows = store
+            .insert_batch(vec![sample_new_row(&thread_a(), 0, t0())?])
+            .await?;
+        let id = &rows[0].id;
+
+        store.claim_pending("worker-1", 10, t_plus(1)).await?;
+        // A non-owning fail is a safe no-op (Ok): it must not charge an attempt
+        // or mutate a row another worker now owns.
+        store
+            .mark_failed(id, "worker-2", "not my claim", t_plus(60), t_plus(2))
+            .await?;
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.attempt_count, 0);
+        assert_eq!(row.status, OutboxStatus::Claimed);
+
+        // The owning worker still succeeds.
+        store
+            .mark_failed(id, "worker-1", "transient", t_plus(60), t_plus(2))
+            .await?;
+        let row = store.get(id).await?.context("row should exist")?;
+        assert_eq!(row.attempt_count, 1);
         Ok(())
     }
 
@@ -805,7 +900,9 @@ mod tests {
         assert_eq!(store.count_pending(&thread_a()).await?, 2);
 
         let claimed = store.claim_pending("worker-1", 1, t_plus(1)).await?;
-        store.mark_delivered(&claimed[0].id, t_plus(2)).await?;
+        store
+            .mark_delivered(&claimed[0].id, "worker-1", t_plus(2))
+            .await?;
 
         assert_eq!(store.count_pending(&thread_a()).await?, 1);
         Ok(())
@@ -1007,7 +1104,7 @@ mod tests {
         let id = &rows[0].id;
 
         store.claim_pending("worker-1", 10, t_plus(1)).await?;
-        store.mark_delivered(id, t_plus(2)).await?;
+        store.mark_delivered(id, "worker-1", t_plus(2)).await?;
 
         let reclaimed = store
             .reclaim_expired_claims(t_plus(100), Duration::ZERO)
@@ -1030,7 +1127,7 @@ mod tests {
         // Simulate one failed delivery, then a crashed second attempt.
         store.claim_pending("worker-1", 10, t_plus(1)).await?;
         store
-            .mark_failed(id, "first failure", t_plus(30), t_plus(2))
+            .mark_failed(id, "worker-1", "first failure", t_plus(30), t_plus(2))
             .await?;
         // The first failure bumped attempt_count to 1; now claim again.
         store.claim_pending("worker-1", 10, t_plus(60)).await?;

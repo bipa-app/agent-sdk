@@ -4,7 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.8.x   | :white_check_mark: |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -43,7 +44,7 @@ Always use the minimum required capabilities for your use case.
 
 ### Tool Execution
 
-- Tools are categorized by tier (`ToolTier::Observe`, `ToolTier::Confirm`, `ToolTier::RequiresPin`)
+- Tools are categorized by tier (`ToolTier::Observe`, `ToolTier::Confirm`)
 - Implement `AgentHooks` to add confirmation flows for sensitive operations
 - Review tool inputs before execution in production environments
 

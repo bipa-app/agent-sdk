@@ -6,10 +6,10 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
-    ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, ResponseFormat,
+    StopReason, ThinkingConfig, ThinkingMode, ToolChoice, Usage,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -19,14 +19,36 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
+/// Connect timeout for the HTTP and WebSocket transports.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on a single WebSocket frame read / send. A peer that stops sending must
+/// not wedge the turn (and, before the lock was released per-turn, the whole
+/// session) indefinitely.
+const WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_mins(2);
+/// Upper bound on the number of cached WebSocket sessions retained at once.
+const MAX_WEBSOCKET_SESSIONS: usize = 512;
+
+/// Build an HTTP client with a connect/keepalive timeout, matching the sibling
+/// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
+/// connect timeout, so a black-holed connect would wedge `chat`/`chat_stream`.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
 const OPENAI_CODEX_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_CODEX_RESPONSES_BETA_HEADER: &str = "responses=experimental";
@@ -83,6 +105,14 @@ struct WebsocketSessionState {
     turn_state: Option<String>,
     prewarmed: bool,
     websocket_disabled: bool,
+    /// Set while a turn is mid-flight on this session and cleared when it
+    /// completes cleanly. If a turn's stream is dropped (cancellation), this
+    /// stays set; the next turn detects the abandoned turn on lock acquisition,
+    /// discards the half-consumed connection + stale incremental baseline, and
+    /// reconnects so the cancelled turn can't poison it.
+    in_flight: bool,
+    /// Last time this session was touched, for LRU eviction of the bounded map.
+    last_used: Option<Instant>,
 }
 
 impl OpenAICodexResponsesProvider {
@@ -90,7 +120,7 @@ impl OpenAICodexResponsesProvider {
     #[must_use]
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key,
             model,
             base_url: DEFAULT_BASE_URL.to_owned(),
@@ -104,7 +134,7 @@ impl OpenAICodexResponsesProvider {
     #[must_use]
     pub fn with_base_url(api_key: String, model: String, base_url: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key,
             model,
             base_url,
@@ -245,6 +275,9 @@ impl OpenAICodexResponsesProvider {
 
     async fn websocket_session(&self, session_id: &str) -> Arc<Mutex<WebsocketSessionState>> {
         let mut sessions = self.websocket_sessions.lock().await;
+        if !sessions.contains_key(session_id) && sessions.len() >= MAX_WEBSOCKET_SESSIONS {
+            evict_idle_sessions(&mut sessions);
+        }
         sessions
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(WebsocketSessionState::default())))
@@ -265,8 +298,9 @@ impl OpenAICodexResponsesProvider {
             .context("failed to build OpenAI Codex websocket request")?;
         request.headers_mut().extend(headers);
 
-        let (stream, response) = connect_async(request)
+        let (stream, response) = timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
+            .context("OpenAI Codex websocket connect timed out")?
             .context("failed to connect OpenAI Codex websocket")?;
         let turn_state = response
             .headers()
@@ -336,6 +370,11 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             .as_ref()
             .map(|ts| ts.iter().cloned().map(convert_tool).collect());
         let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        let text_format = request
+            .response_format
+            .as_ref()
+            .map(ApiResponseTextFormat::from);
+        let tool_choice = codex_tool_choice(request.tool_choice.as_ref());
 
         let api_request = ApiResponsesRequest {
             model: &self.model,
@@ -344,11 +383,12 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             tools: tools.as_deref(),
             max_output_tokens,
             reasoning,
-            tool_choice: Some("auto"),
+            tool_choice: Some(tool_choice),
             parallel_tool_calls: parallel_tool_calls.then_some(true),
             store: false,
             text: Some(ApiTextSettings {
                 verbosity: "medium",
+                format: text_format,
             }),
             include: Some(&["reasoning.encrypted_content"]),
             prompt_cache_key,
@@ -400,6 +440,19 @@ impl LlmProvider for OpenAICodexResponsesProvider {
         let api_response: ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
 
+        // The Responses API reports generation failures as HTTP 200 with
+        // status=failed plus an error object. Surface that as a server error
+        // instead of a successful turn with empty content (mirrors the streaming
+        // `response.failed` handling).
+        if matches!(api_response.status, Some(ApiStatus::Failed)) {
+            let message = api_response
+                .error
+                .and_then(|error| error.message)
+                .unwrap_or_else(|| "OpenAI Codex reported status=failed".to_owned());
+            log::error!("OpenAI Codex generation failed: {message}");
+            return Ok(ChatOutcome::ServerError(message));
+        }
+
         Ok(ChatOutcome::Success(Self::map_response(api_response)))
     }
 
@@ -432,6 +485,8 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 .as_ref()
                 .map(|ts| ts.iter().cloned().map(convert_tool).collect());
             let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
+            let text_format = request.response_format.as_ref().map(ApiResponseTextFormat::from);
+            let tool_choice = codex_tool_choice(request.tool_choice.as_ref());
             let api_request = ApiStreamingRequest {
                 model: self.model.clone(),
                 instructions: request.system.clone(),
@@ -439,10 +494,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 tools,
                 max_output_tokens,
                 reasoning,
-                tool_choice: Some("auto".to_string()),
+                tool_choice: Some(tool_choice),
                 parallel_tool_calls: parallel_tool_calls.then_some(true),
                 store: false,
-                text: Some(ApiTextSettings { verbosity: "medium" }),
+                text: Some(ApiTextSettings { verbosity: "medium", format: text_format }),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
                 prompt_cache_key: request.session_id.clone(),
                 stream: true,
@@ -455,6 +510,23 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             if let Some(session_id) = request.session_id.as_deref() {
                 let session = self.websocket_session(session_id).await;
                 let mut websocket_session = session.lock().await;
+
+                // If the previous turn for this session was abandoned mid-flight
+                // (its stream was dropped — the SDK's cancellation mechanism), its
+                // half-consumed connection and incremental baseline are stale.
+                // Discard them so we reconnect fresh and never read the cancelled
+                // turn's trailing frames or pair a new request with its response id.
+                if websocket_session.in_flight {
+                    log::warn!(
+                        "OpenAI Codex session {session_id} had an abandoned in-flight turn; resetting websocket state"
+                    );
+                    reset_websocket_connection(&mut websocket_session);
+                    websocket_session.last_request = None;
+                    websocket_session.last_response_id = None;
+                    websocket_session.last_response_items.clear();
+                }
+                websocket_session.in_flight = true;
+                websocket_session.last_used = Some(Instant::now());
 
                 if !websocket_session.websocket_disabled {
                     'websocket_attempts: for attempt in 0..2 {
@@ -508,7 +580,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             let warmup_send_result = if let Some(connection) =
                                 websocket_session.connection.as_mut()
                             {
-                                connection.send(WebSocketMessage::Text(warmup_payload.into())).await
+                                timeout(
+                                    WEBSOCKET_IO_TIMEOUT,
+                                    connection.send(WebSocketMessage::Text(warmup_payload.into())),
+                                )
+                                .await
+                                .unwrap_or(Err(
+                                    tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                                ))
                             } else {
                                 Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
                             };
@@ -532,7 +611,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 let message_result = if let Some(connection) =
                                     websocket_session.connection.as_mut()
                                 {
-                                    connection.next().await
+                                    timeout(WEBSOCKET_IO_TIMEOUT, connection.next()).await.unwrap_or_else(|_| {
+                                        log::warn!("OpenAI Codex websocket warmup read timed out");
+                                        None
+                                    })
                                 } else {
                                     None
                                 };
@@ -747,7 +829,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         };
 
                         let send_result = if let Some(connection) = websocket_session.connection.as_mut() {
-                            connection.send(WebSocketMessage::Text(request_payload.into())).await
+                            timeout(
+                                WEBSOCKET_IO_TIMEOUT,
+                                connection.send(WebSocketMessage::Text(request_payload.into())),
+                            )
+                            .await
+                            .unwrap_or(Err(
+                                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                            ))
                         } else {
                             Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
                         };
@@ -774,7 +863,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             let message_result = if let Some(connection) =
                                 websocket_session.connection.as_mut()
                             {
-                                connection.next().await
+                                timeout(WEBSOCKET_IO_TIMEOUT, connection.next()).await.unwrap_or_else(|_| {
+                                    log::warn!("OpenAI Codex websocket read timed out");
+                                    None
+                                })
                             } else {
                                 None
                             };
@@ -858,12 +950,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 if let (Some(call_id), Some(delta)) =
                                                     (event.call_id, event.delta)
                                                 {
+                                                    let order = tool_calls.len();
                                                     let acc = tool_calls
                                                         .entry(call_id.clone())
                                                         .or_insert_with(|| ToolCallAccumulator {
                                                             id: call_id,
                                                             name: event.name.unwrap_or_default(),
                                                             arguments: String::new(),
+                                                            order,
                                                         });
                                                     acc.arguments.push_str(&delta);
                                                 }
@@ -902,6 +996,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 websocket_session.last_response_id = response_id;
                                                 websocket_session.last_response_items = response_items;
                                                 websocket_session.prewarmed = false;
+                                                // Clean completion: the turn is no
+                                                // longer in flight, so the next turn
+                                                // may reuse this connection/baseline.
+                                                websocket_session.in_flight = false;
                                                 yield Ok(StreamDelta::Done {
                                                     stop_reason: Some(stop_reason_from_stream_state(
                                                         &tool_calls,
@@ -979,12 +1077,14 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     if let (Some(call_id), Some(delta)) =
                                                         (event.call_id, event.delta)
                                                     {
+                                                        let order = tool_calls.len();
                                                         let acc = tool_calls
                                                             .entry(call_id.clone())
                                                             .or_insert_with(|| ToolCallAccumulator {
                                                                 id: call_id,
                                                                 name: event.name.unwrap_or_default(),
                                                                 arguments: String::new(),
+                                                                order,
                                                             });
                                                         acc.arguments.push_str(&delta);
                                                     }
@@ -1031,6 +1131,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     websocket_session.last_response_items =
                                                         response_items;
                                                     websocket_session.prewarmed = false;
+                                                    // Clean completion: the turn is no
+                                                    // longer in flight, so the next
+                                                    // turn may reuse the connection.
+                                                    websocket_session.in_flight = false;
                                                     yield Ok(StreamDelta::Done {
                                                         stop_reason: Some(
                                                             stop_reason_from_stream_state(
@@ -1106,6 +1210,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         }
                     }
                 }
+                // The websocket turn did not complete (disabled, or attempts
+                // exhausted); the turn now falls through to the HTTP SSE path, so
+                // no websocket turn is in flight.
+                websocket_session.in_flight = false;
                 sse_turn_state = websocket_session.turn_state.clone();
                 drop(websocket_session);
             }
@@ -1164,7 +1272,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                 }
             }
 
-            let mut buffer = String::new();
+            let mut sse = SseLineBuffer::new();
             let mut stream = response.bytes_stream();
             let mut usage: Option<Usage> = None;
             let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
@@ -1175,11 +1283,10 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     yield Err(anyhow::anyhow!("stream error"));
                     return;
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                sse.extend(&chunk);
 
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                while let Some(line) = sse.next_line() {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
@@ -1210,11 +1317,13 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             }
                             "response.function_call_arguments.delta" => {
                                 if let (Some(call_id), Some(delta)) = (event.call_id, event.delta) {
+                                    let order = tool_calls.len();
                                     let acc = tool_calls.entry(call_id.clone()).or_insert_with(|| {
                                         ToolCallAccumulator {
                                             id: call_id,
                                             name: event.name.unwrap_or_default(),
                                             arguments: String::new(),
+                                            order,
                                         }
                                     });
                                     acc.arguments.push_str(&delta);
@@ -1368,7 +1477,12 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
 }
 
 /// Recursively fix a JSON schema for `OpenAI` strict mode.
-/// Adds `additionalProperties: false` and ensures all properties are required.
+///
+/// Adds `additionalProperties: false`, marks every property required, and — to
+/// keep previously-optional properties from being forced to fabricated values —
+/// wraps optional properties in `anyOf: [..., {"type": "null"}]`. This mirrors
+/// the sibling `openai_responses` provider so a tool schema behaves identically
+/// across both providers.
 fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;
@@ -1385,6 +1499,32 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
             "additionalProperties".to_owned(),
             serde_json::Value::Bool(false),
         );
+
+        // Ensure properties and required exist (strict mode needs them even if empty)
+        obj.entry("properties".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        obj.entry("required".to_owned())
+            .or_insert_with(|| serde_json::json!([]));
+
+        // Collect the set of originally required keys
+        let originally_required: std::collections::HashSet<String> = obj
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Wrap previously-optional properties in anyOf with null
+        if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
+            for (key, prop_schema) in props.iter_mut() {
+                if !originally_required.contains(key) {
+                    make_nullable(prop_schema);
+                }
+            }
+        }
 
         // Ensure all properties are marked as required
         if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
@@ -1422,20 +1562,96 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
     }
 }
 
+/// Wrap a schema in `anyOf: [{original}, {"type": "null"}]` so the property
+/// accepts its original type OR null. Appends the null variant when an `anyOf`
+/// already exists.
+fn make_nullable(schema: &mut serde_json::Value) {
+    if let Some(any_of) = schema
+        .as_object_mut()
+        .and_then(|o| o.get_mut("anyOf"))
+        .and_then(|v| v.as_array_mut())
+    {
+        let has_null = any_of
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"));
+        if !has_null {
+            any_of.push(serde_json::json!({"type": "null"}));
+        }
+        return;
+    }
+
+    let original = schema.clone();
+    *schema = serde_json::json!({
+        "anyOf": [original, {"type": "null"}]
+    });
+}
+
+/// Check whether a JSON schema contains any object-typed schema without a
+/// `properties` map (a free-form object). These are incompatible with
+/// `OpenAI` strict mode and must disable it.
+fn has_freeform_object(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+
+    let is_object = obj
+        .get("type")
+        .is_some_and(|t| t.as_str() == Some("object"));
+
+    if is_object && !obj.contains_key("properties") {
+        return true;
+    }
+
+    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
+        for prop in props.values() {
+            if has_freeform_object(prop) {
+                return true;
+            }
+        }
+    }
+
+    if let Some(items) = obj.get("items")
+        && has_freeform_object(items)
+    {
+        return true;
+    }
+
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if has_freeform_object(item) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn convert_tool(tool: agent_sdk_foundation::llm::Tool) -> ApiTool {
-    // The Responses API with strict: true requires:
-    // 1. additionalProperties: false on all object schemas
-    // 2. All properties must be in the required array
-    // These requirements apply recursively to nested schemas
+    // Strict mode requires additionalProperties: false on all objects and every
+    // property in required, which is incompatible with free-form object schemas
+    // (objects with no defined properties). Detect and skip strict for those —
+    // matching the sibling openai_responses provider.
     let mut schema = tool.input_schema;
-    fix_schema_for_strict_mode(&mut schema);
+    let use_strict = if has_freeform_object(&schema) {
+        log::debug!(
+            "Tool '{}' has free-form object schema — disabling strict mode",
+            tool.name
+        );
+        None
+    } else {
+        fix_schema_for_strict_mode(&mut schema);
+        Some(true)
+    };
 
     ApiTool {
         r#type: "function".to_owned(),
         name: tool.name,
         description: Some(tool.description),
         parameters: Some(schema),
-        strict: Some(true),
+        strict: use_strict,
     }
 }
 
@@ -1593,6 +1809,9 @@ struct ToolCallAccumulator {
     id: String,
     name: String,
     arguments: String,
+    /// Registration order, used to assign deterministic, distinct block indices
+    /// when emitting (`HashMap` iteration order is otherwise nondeterministic).
+    order: usize,
 }
 
 fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
@@ -1610,9 +1829,16 @@ fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
 fn emit_accumulated_tool_calls(
     tool_calls: &HashMap<String, ToolCallAccumulator>,
 ) -> Vec<StreamDelta> {
-    let block_index = usize::from(!tool_calls.is_empty());
-    let mut deltas = Vec::new();
-    for acc in tool_calls.values() {
+    // Assign distinct, monotonically increasing block indices in registration
+    // order. The previous code gave every call the same index (1) and iterated
+    // HashMap::values(), so StreamAccumulator's stable sort preserved
+    // nondeterministic insertion order for multi-tool turns.
+    let mut accs: Vec<&ToolCallAccumulator> = tool_calls.values().collect();
+    accs.sort_by_key(|acc| acc.order);
+
+    let mut deltas = Vec::with_capacity(accs.len() * 2);
+    for (idx, acc) in accs.iter().enumerate() {
+        let block_index = idx + 1;
         deltas.push(StreamDelta::ToolUseStart {
             id: acc.id.clone(),
             name: acc.name.clone(),
@@ -1651,6 +1877,29 @@ fn reset_websocket_connection(session: &mut WebsocketSessionState) {
         session.last_response_items.clear();
     }
     session.prewarmed = false;
+}
+
+/// Bound the websocket-session map by evicting idle (not in-flight) sessions,
+/// oldest-first by last use. The map exists for cross-turn reuse, so completed
+/// sessions retain a cached baseline indefinitely; without eviction a host
+/// serving many distinct sessions would leak memory and open sockets without
+/// bound. Sessions whose lock is currently held (in use) or that are mid-turn
+/// are retained.
+fn evict_idle_sessions(sessions: &mut HashMap<String, Arc<Mutex<WebsocketSessionState>>>) {
+    let mut candidates: Vec<(String, Option<Instant>)> = Vec::new();
+    for (key, state) in sessions.iter() {
+        if let Ok(guard) = state.try_lock()
+            && !guard.in_flight
+        {
+            candidates.push((key.clone(), guard.last_used));
+        }
+    }
+    // Oldest first; `None` (never used) sorts before `Some`.
+    candidates.sort_by_key(|a| a.1);
+    let evict_count = candidates.len().min(sessions.len() / 2 + 1);
+    for (key, _) in candidates.into_iter().take(evict_count) {
+        sessions.remove(&key);
+    }
 }
 
 fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, String)> {
@@ -1764,7 +2013,7 @@ struct ApiResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     store: bool,
@@ -1789,7 +2038,7 @@ struct ApiStreamingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
+    tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     store: bool,
@@ -1819,7 +2068,7 @@ struct ApiWebsocketRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ApiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
+    tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     store: bool,
@@ -1848,7 +2097,7 @@ impl From<&ApiStreamingRequest> for ApiWebsocketRequest {
             tool_choice: request.tool_choice.clone(),
             parallel_tool_calls: request.parallel_tool_calls,
             store: request.store,
-            text: request.text,
+            text: request.text.clone(),
             include: request.include.clone(),
             prompt_cache_key: request.prompt_cache_key.clone(),
             stream: request.stream,
@@ -1857,9 +2106,60 @@ impl From<&ApiStreamingRequest> for ApiWebsocketRequest {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 struct ApiTextSettings {
     verbosity: &'static str,
+    /// Structured-output schema (`text.format`), set when the request carries a
+    /// `response_format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<ApiResponseTextFormat>,
+}
+
+#[derive(Clone, PartialEq, Serialize)]
+struct ApiResponseTextFormat {
+    #[serde(rename = "type")]
+    format_type: &'static str,
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
+}
+
+impl From<&ResponseFormat> for ApiResponseTextFormat {
+    fn from(rf: &ResponseFormat) -> Self {
+        Self {
+            format_type: "json_schema",
+            name: rf.name.clone(),
+            schema: rf.schema.clone(),
+            strict: rf.strict,
+        }
+    }
+}
+
+/// Responses API `tool_choice` wire format.
+///
+/// - `"auto"` — model decides (the Codex default).
+/// - `{"type": "function", "name": "<name>"}` — force a specific function.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+enum ApiToolChoice {
+    Mode(&'static str),
+    Function {
+        #[serde(rename = "type")]
+        choice_type: &'static str,
+        name: String,
+    },
+}
+
+/// Map an optional [`ToolChoice`] onto the Codex wire `tool_choice`, defaulting
+/// to `"auto"` (the historical Codex behavior) when unset.
+fn codex_tool_choice(tool_choice: Option<&ToolChoice>) -> ApiToolChoice {
+    match tool_choice {
+        Some(ToolChoice::Tool(name)) => ApiToolChoice::Function {
+            choice_type: "function",
+            name: name.clone(),
+        },
+        _ => ApiToolChoice::Mode("auto"),
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize)]
@@ -1969,6 +2269,8 @@ struct ApiResponse {
     status: Option<ApiStatus>,
     #[serde(default)]
     usage: Option<ApiUsage>,
+    #[serde(default)]
+    error: Option<ApiErrorBody>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -2238,11 +2540,12 @@ mod tests {
             tools: None,
             max_output_tokens: None,
             reasoning: None,
-            tool_choice: Some("auto".to_string()),
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
             parallel_tool_calls: Some(true),
             store: false,
             text: Some(ApiTextSettings {
                 verbosity: "medium",
+                format: None,
             }),
             include: Some(vec!["reasoning.encrypted_content".to_string()]),
             prompt_cache_key: Some("session-123".to_string()),
@@ -2278,11 +2581,12 @@ mod tests {
             tools: None,
             max_output_tokens: None,
             reasoning: None,
-            tool_choice: Some("auto".to_string()),
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
             parallel_tool_calls: None,
             store: false,
             text: Some(ApiTextSettings {
                 verbosity: "medium",
+                format: None,
             }),
             include: Some(vec!["reasoning.encrypted_content".to_string()]),
             prompt_cache_key: Some("thread-1".to_string()),
@@ -2308,6 +2612,8 @@ mod tests {
             turn_state: None,
             prewarmed: false,
             websocket_disabled: false,
+            in_flight: false,
+            last_used: None,
         };
 
         let websocket_request = prepare_websocket_request(&request, &session, false);
@@ -2359,11 +2665,12 @@ mod tests {
             tools: None,
             max_output_tokens: None,
             reasoning: None,
-            tool_choice: Some("auto".to_string()),
+            tool_choice: Some(ApiToolChoice::Mode("auto")),
             parallel_tool_calls: None,
             store: false,
             text: Some(ApiTextSettings {
                 verbosity: "medium",
+                format: None,
             }),
             include: Some(vec!["reasoning.encrypted_content".to_string()]),
             prompt_cache_key: Some("thread-1".to_string()),
@@ -2377,6 +2684,8 @@ mod tests {
             turn_state: None,
             prewarmed: true,
             websocket_disabled: false,
+            in_flight: false,
+            last_used: None,
         };
 
         let websocket_request = prepare_websocket_request(&request, &session, true);
@@ -2549,6 +2858,144 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(
             matches!(&blocks[0], ContentBlock::ToolUse { id, name, .. } if id == "call_123" && name == "test_tool")
+        );
+    }
+
+    #[test]
+    fn test_request_serializes_response_format_text_and_forced_tool_choice() {
+        let request = ApiStreamingRequest {
+            model: MODEL_GPT53_CODEX.to_string(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tool_choice: Some(codex_tool_choice(Some(&ToolChoice::Tool(
+                "respond".to_owned(),
+            )))),
+            parallel_tool_calls: None,
+            store: false,
+            text: Some(ApiTextSettings {
+                verbosity: "medium",
+                format: Some(ApiResponseTextFormat::from(&ResponseFormat::new(
+                    "person",
+                    serde_json::json!({"type": "object"}),
+                ))),
+            }),
+            include: None,
+            prompt_cache_key: None,
+            stream: true,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["text"]["format"]["type"], "json_schema");
+        assert_eq!(json["text"]["format"]["name"], "person");
+        assert_eq!(json["text"]["format"]["strict"], true);
+        assert_eq!(json["tool_choice"]["type"], "function");
+        assert_eq!(json["tool_choice"]["name"], "respond");
+    }
+
+    #[test]
+    fn test_codex_tool_choice_defaults_to_auto() {
+        assert_eq!(
+            serde_json::to_value(codex_tool_choice(None)).unwrap(),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(codex_tool_choice(Some(&ToolChoice::Auto))).unwrap(),
+            serde_json::json!("auto")
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_makes_optional_params_nullable() {
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "req": {"type": "string"},
+                    "opt": {"type": "string"}
+                },
+                "required": ["req"]
+            }),
+            display_name: "T".to_string(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        };
+
+        let api_tool = convert_tool(tool);
+        assert_eq!(api_tool.strict, Some(true));
+        let schema = api_tool.parameters.unwrap();
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"req"));
+        assert!(required.contains(&"opt"));
+
+        // The previously-optional `opt` must be wrapped in anyOf with a null
+        // variant so the model is not forced to fabricate a value for it.
+        let any_of = schema["properties"]["opt"]["anyOf"].as_array().unwrap();
+        assert!(
+            any_of
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"))
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_disables_strict_for_freeform_object() {
+        let tool = agent_sdk_foundation::llm::Tool {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            display_name: "T".to_string(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        };
+
+        let api_tool = convert_tool(tool);
+        assert_eq!(api_tool.strict, None);
+    }
+
+    #[test]
+    fn test_emit_accumulated_tool_calls_assigns_distinct_ordered_indices() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(
+            "b".to_string(),
+            ToolCallAccumulator {
+                id: "b".to_string(),
+                name: "second".to_string(),
+                arguments: "{}".to_string(),
+                order: 1,
+            },
+        );
+        tool_calls.insert(
+            "a".to_string(),
+            ToolCallAccumulator {
+                id: "a".to_string(),
+                name: "first".to_string(),
+                arguments: "{}".to_string(),
+                order: 0,
+            },
+        );
+
+        let deltas = emit_accumulated_tool_calls(&tool_calls);
+        let starts: Vec<(String, usize)> = deltas
+            .iter()
+            .filter_map(|d| match d {
+                StreamDelta::ToolUseStart {
+                    name, block_index, ..
+                } => Some((name.clone(), *block_index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![("first".to_string(), 1), ("second".to_string(), 2)]
         );
     }
 }

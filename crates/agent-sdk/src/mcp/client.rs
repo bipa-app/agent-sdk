@@ -20,6 +20,30 @@ use super::transport::McpTransport;
 /// server selects during the handshake — see [`McpClient::protocol_version`].
 pub const MCP_PROTOCOL_VERSION: &str = PREFERRED_PROTOCOL_VERSION;
 
+/// Upper bound on pages followed by a cursor-paginated list call.
+///
+/// Bounds the loop in case a misbehaving server returns a non-empty cursor
+/// forever; legitimate servers terminate well before this.
+const MAX_LIST_PAGES: usize = 10_000;
+
+/// Decide whether to continue paginating.
+///
+/// Returns `Ok(Some(cursor))` to fetch another page, `Ok(None)` to stop (no
+/// further cursor), and increments/guards the page counter. Errors if the
+/// server exceeds [`MAX_LIST_PAGES`] (likely a cursor that never terminates).
+fn next_cursor_or_stop(next: Option<String>, pages: &mut usize) -> Result<Option<String>> {
+    *pages += 1;
+    match next {
+        Some(cursor) if !cursor.is_empty() => {
+            if *pages >= MAX_LIST_PAGES {
+                bail!("MCP list pagination exceeded {MAX_LIST_PAGES} pages; aborting");
+            }
+            Ok(Some(cursor))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// MCP client for communicating with MCP servers.
 ///
 /// The client handles the MCP protocol, including initialization,
@@ -230,18 +254,35 @@ impl<T: McpTransport> McpClient<T> {
     }
 
     async fn list_tools_inner(&self) -> Result<Vec<McpToolDefinition>> {
-        let request = JsonRpcRequest::new("tools/list", None, 0);
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
 
-        let response = self.transport.send(request).await?;
+        loop {
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let request = JsonRpcRequest::new("tools/list", params, 0);
+            let response = self.transport.send(request).await?;
 
-        let result: ToolsListResult = response
-            .result
-            .map(serde_json::from_value)
-            .transpose()
-            .context("Failed to parse tools/list response")?
-            .context("tools/list response missing result")?;
+            let value = response
+                .result
+                .context("tools/list response missing result")?;
+            // `ToolsListResult` does not model `nextCursor`, so read it from the
+            // raw value before deserializing the typed page.
+            let next = value
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            let result: ToolsListResult =
+                serde_json::from_value(value).context("Failed to parse tools/list response")?;
+            all.extend(result.tools);
 
-        Ok(result.tools)
+            match next_cursor_or_stop(next, &mut pages)? {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(all)
     }
 
     /// Call a tool on the server.
@@ -367,15 +408,29 @@ impl<T: McpTransport> McpClient<T> {
     }
 
     async fn list_resources_inner(&self) -> Result<Vec<McpResource>> {
-        let request = JsonRpcRequest::new("resources/list", None, 0);
-        let response = self.transport.send(request).await?;
-        let result: ResourcesListResult = response
-            .result
-            .map(serde_json::from_value)
-            .transpose()
-            .context("Failed to parse resources/list response")?
-            .context("resources/list response missing result")?;
-        Ok(result.resources)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let request = JsonRpcRequest::new("resources/list", params, 0);
+            let response = self.transport.send(request).await?;
+            let result: ResourcesListResult = response
+                .result
+                .map(serde_json::from_value)
+                .transpose()
+                .context("Failed to parse resources/list response")?
+                .context("resources/list response missing result")?;
+            all.extend(result.resources);
+
+            match next_cursor_or_stop(result.next_cursor, &mut pages)? {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(all)
     }
 
     /// Read a resource by URI (`resources/read`).
@@ -461,15 +516,29 @@ impl<T: McpTransport> McpClient<T> {
     }
 
     async fn list_prompts_inner(&self) -> Result<Vec<McpPrompt>> {
-        let request = JsonRpcRequest::new("prompts/list", None, 0);
-        let response = self.transport.send(request).await?;
-        let result: PromptsListResult = response
-            .result
-            .map(serde_json::from_value)
-            .transpose()
-            .context("Failed to parse prompts/list response")?
-            .context("prompts/list response missing result")?;
-        Ok(result.prompts)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let request = JsonRpcRequest::new("prompts/list", params, 0);
+            let response = self.transport.send(request).await?;
+            let result: PromptsListResult = response
+                .result
+                .map(serde_json::from_value)
+                .transpose()
+                .context("Failed to parse prompts/list response")?
+                .context("prompts/list response missing result")?;
+            all.extend(result.prompts);
+
+            match next_cursor_or_stop(result.next_cursor, &mut pages)? {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(all)
     }
 
     /// Fetch and render a prompt by name (`prompts/get`).
@@ -658,6 +727,68 @@ fn finish_mcp_call_tool_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::protocol::JsonRpcResponse;
+    use async_trait::async_trait;
+
+    /// Transport that serves a two-page `tools/list`, gated by the `cursor`
+    /// param, so pagination can be exercised with no live server.
+    struct PagingTransport;
+
+    #[async_trait]
+    impl McpTransport for PagingTransport {
+        async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let cursor = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("cursor"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+
+            let result = match request.method.as_str() {
+                "tools/list" => match cursor.as_deref() {
+                    None => json!({
+                        "tools": [{"name": "alpha", "inputSchema": {"type": "object"}}],
+                        "nextCursor": "page2",
+                    }),
+                    Some("page2") => json!({
+                        "tools": [{"name": "beta", "inputSchema": {"type": "object"}}],
+                    }),
+                    Some(other) => bail!("unexpected cursor {other}"),
+                },
+                other => bail!("unexpected method {other}"),
+            };
+
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: Some(result),
+                error: None,
+                id: request.id,
+            })
+        }
+
+        async fn send_notification(&self, _request: JsonRpcRequest) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression test for finding 6: `list_tools` must follow `nextCursor` and
+    /// merge every page, not silently return only page 1.
+    #[tokio::test]
+    async fn list_tools_follows_pagination() -> Result<()> {
+        let client = McpClient::new_uninitialized(Arc::new(PagingTransport), "test".to_string());
+        let tools = client.list_tools().await?;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "beta"],
+            "both pages must be merged in order"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_mcp_protocol_version() {

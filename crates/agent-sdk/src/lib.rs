@@ -409,7 +409,7 @@
 //! A minimal Anthropic-only build pulls no WebSocket, HTML, or YAML crates:
 //!
 //! ```toml
-//! agent-sdk = { version = "0.8", default-features = false, features = ["anthropic"] }
+//! agent-sdk = { version = "0.9", default-features = false, features = ["anthropic"] }
 //! ```
 //!
 //! When `otel` is enabled, the SDK emits OpenTelemetry spans for agent
@@ -494,13 +494,13 @@ pub use types::{
 // agent-sdk-tools (via thin modules)
 pub use environment::{Environment, ExecResult, FileEntry, GrepMatch, NullEnvironment};
 pub use hooks::{
-    AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, NoopAuditSink, ToolAuditSink,
-    ToolDecision,
+    AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, NoopAuditSink, RequestDecision,
+    ResponseDecision, ToolAuditSink, ToolDecision,
 };
 pub use seed::{DefaultContextFactory, ToolContextSeed};
 pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
-    StateStore, StoredTurnEvents, ToolExecutionStore,
+    ObservingEventStore, StateStore, StoredTurnEvents, ToolExecutionStore,
 };
 pub use tools::{
     AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,

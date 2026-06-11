@@ -17,20 +17,31 @@
 //!   durable commit and are never stalled by slow subscribers.
 //! - Lag detection transitions a subscriber from `Healthy` to `Lagging`
 //!   when `try_send` fails with a full buffer.
-//! - Once lag is detected, the subscriber is **doomed** — it will be
-//!   disconnected after the grace period expires.  During the grace
-//!   period the hub stops delivering events to the lagging subscriber
-//!   (events are durable and recoverable via replay), giving the
-//!   subscriber time to drain its existing buffer.
-//! - On disconnection, the hub signals `replay_required` through shared
-//!   out-of-band state and drops the sender half.  The receiver drains
-//!   any remaining buffered events, then returns
+//! - Once lag is detected, the subscriber is **doomed**: the hub
+//!   immediately records `last_delivered_sequence` and sets
+//!   `replay_required` so the receiver can surface
+//!   [`LiveTailEvent::ReplayRequired`] as soon as it drains its buffer,
+//!   even if the thread goes quiet and never publishes again.  Delivery
+//!   to a lagging subscriber has already stopped (its sequence is
+//!   frozen); the grace period therefore only delays *handle cleanup*
+//!   (and the [`LiveTailHub::subscriber_count`] it backs), not
+//!   recovery.  The handle is removed on the next publish once the
+//!   grace period elapses (or immediately if the receiver was dropped).
+//! - The receiver drains any remaining buffered events, then returns
 //!   [`LiveTailEvent::ReplayRequired`] with the last successfully
 //!   delivered sequence.
 //! - The subscriber reconnects via
 //!   [`stream_events`](super::event_stream::stream_events) with
 //!   `after_sequence` set to the last-delivered sequence, seamlessly
 //!   recovering the missed committed envelopes.
+//!
+//! Note: [`EventNotifier`](super::event_notifier::EventNotifier) — not
+//! this hub — is the live-tail path wired into the service host; the
+//! reconnect handoff in
+//! [`stream_events`](super::event_stream::stream_events) consumes an
+//! `EventNotifier` receiver.  `LiveTailHub` is a self-contained
+//! per-subscriber backpressure surface retained for its tests and the
+//! regression suite.
 //!
 //! # Workers never block
 //!
@@ -44,8 +55,12 @@ use agent_sdk_foundation::ThreadId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `tokio::time::Instant` (not `std::time::Instant`) so grace-period
+// expiry can be virtualised under `tokio::time::pause()` in tests
+// instead of depending on real wall-clock windows.
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────
 // Configuration
@@ -117,10 +132,38 @@ impl LiveTailReceiver {
     /// the hub disconnects this subscriber due to lag.
     /// Returns `None` when the hub is dropped (normal shutdown).
     pub async fn recv(&mut self) -> Option<LiveTailEvent> {
-        if let Some(event) = self.rx.recv().await {
-            return Some(LiveTailEvent::Event(Box::new(event)));
+        if self.replay_signaled {
+            return None;
         }
 
+        // Drain anything already buffered without awaiting.
+        match self.rx.try_recv() {
+            Ok(event) => return Some(LiveTailEvent::Event(Box::new(event))),
+            Err(mpsc::error::TryRecvError::Disconnected) => return self.finish(),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+
+        // Buffer is drained.  If the hub has already doomed this
+        // subscriber (lag was detected on a prior publish), surface
+        // `ReplayRequired` *now* rather than blocking on `recv()` — a
+        // quiescent thread may never publish again, and delivery has
+        // already stopped.  This is the visibility the lag/grace state
+        // machine previously deferred to the next publish.
+        if self.shared.replay_required.load(Ordering::Acquire) {
+            return self.finish();
+        }
+
+        // Otherwise wait for the next live event (or channel close).
+        self.rx.recv().await.map_or_else(
+            || self.finish(),
+            |event| Some(LiveTailEvent::Event(Box::new(event))),
+        )
+    }
+
+    /// Resolve a drained channel: yield `ReplayRequired` exactly once if
+    /// the hub doomed this subscriber, otherwise `None` (clean
+    /// shutdown).
+    fn finish(&mut self) -> Option<LiveTailEvent> {
         if self.replay_signaled {
             return None;
         }
@@ -345,6 +388,20 @@ impl LiveTailHub {
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         handle.lag_state = LagState::Lagging { since: now };
+                        // Doom the subscriber at lag-detection time: freeze
+                        // its last-delivered sequence and raise
+                        // `replay_required` so its receiver surfaces
+                        // `ReplayRequired` after draining, without waiting
+                        // for a later publish on this (possibly quiescent)
+                        // thread.  The handle itself is reclaimed by the
+                        // grace-period sweep below.
+                        *handle
+                            .shared
+                            .last_delivered_sequence
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            handle.last_delivered_sequence;
+                        handle.shared.replay_required.store(true, Ordering::Release);
                         break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -575,9 +632,12 @@ mod tests {
         Ok(())
     }
 
-    // ── Grace period delays disconnect ─────────────────────────────
+    // ── Grace period delays handle cleanup ─────────────────────────
 
-    #[tokio::test]
+    // `start_paused` virtualises `tokio::time::Instant` so grace expiry
+    // is driven by `tokio::time::advance` instead of a real-clock sleep
+    // that flakes on a loaded CI runner.
+    #[tokio::test(start_paused = true)]
     async fn grace_period_delays_disconnect() -> anyhow::Result<()> {
         let hub = LiveTailHub::with_config(LiveTailConfig {
             buffer_capacity: 2,
@@ -594,23 +654,25 @@ mod tests {
         // Trigger lag.
         hub.publish(&[sample_committed(&thread_a(), 2)]);
 
-        // Immediately publish more — within grace period.
+        // Immediately publish more — within grace period (no time has
+        // advanced), so the handle is retained.
         hub.publish(&[sample_committed(&thread_a(), 3)]);
         assert_eq!(
             hub.subscriber_count(&thread_a()),
             1,
-            "subscriber should still be connected during grace period"
+            "handle should still be present during grace period"
         );
 
-        // Wait for grace period to expire.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Advance virtual time past the grace period.
+        tokio::time::advance(Duration::from_millis(250)).await;
 
-        // Next publish triggers the grace-period check.
+        // Next publish triggers the grace-period sweep and removes the
+        // handle.
         hub.publish(&[sample_committed(&thread_a(), 4)]);
         assert_eq!(
             hub.subscriber_count(&thread_a()),
             0,
-            "subscriber should be disconnected after grace period"
+            "handle should be removed after grace period"
         );
 
         // Drain buffered events.
@@ -630,6 +692,54 @@ mod tests {
             }) => {
                 assert_eq!(last_delivered_sequence, Some(1));
             }
+            other => panic!("expected ReplayRequired, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    // ── Doomed subscriber on a quiescent thread ────────────────────
+
+    // Regression: a subscriber doomed by lag must learn it has to
+    // replay even if the thread never publishes again.  Before the fix
+    // the receiver parked on `recv()` forever because disconnect only
+    // happened on a *later* publish.  `start_paused` makes the timeout
+    // guard deterministic — if a regression reintroduces the hang the
+    // runtime auto-advances to the deadline and the test fails fast.
+    #[tokio::test(start_paused = true)]
+    async fn doomed_subscriber_on_quiescent_thread_yields_replay_required() -> anyhow::Result<()> {
+        // Long grace period: the handle is never swept, so nothing but
+        // the lag-detection doom signal can unblock the receiver.
+        let hub = LiveTailHub::with_config(LiveTailConfig {
+            buffer_capacity: 2,
+            lag_grace_period: Duration::from_hours(1),
+        });
+        let mut rx = hub.subscribe(&thread_a());
+
+        // Fill the buffer (capacity 2): seq 0 and 1 delivered.
+        hub.publish(&[
+            sample_committed(&thread_a(), 0),
+            sample_committed(&thread_a(), 1),
+        ]);
+
+        // Overflow once: seq 2 hits a full buffer → lag detected. The
+        // thread then goes silent — no further publish ever arrives.
+        hub.publish(&[sample_committed(&thread_a(), 2)]);
+
+        // Drain the two buffered events.
+        for expected in 0..2u64 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(LiveTailEvent::Event(e))) => assert_eq!(e.sequence, expected),
+                other => panic!("expected Event({expected}), got {other:?}"),
+            }
+        }
+
+        // The subscriber must now learn it is doomed without any
+        // additional publish.
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(LiveTailEvent::ReplayRequired {
+                last_delivered_sequence,
+            })) => assert_eq!(last_delivered_sequence, Some(1)),
             other => panic!("expected ReplayRequired, got {other:?}"),
         }
 

@@ -16,9 +16,11 @@
 //! let read_tool = TodoReadTool::new(state);
 //! ```
 
+use std::ffi::OsString;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
@@ -143,23 +145,41 @@ impl TodoState {
 
     /// Saves todos to storage if path is set.
     ///
+    /// The write is atomic: the JSON is written to a uniquely-named temp file
+    /// in the same directory and then renamed over the target (atomic on
+    /// POSIX). A crash or a cancelled future mid-write can therefore never
+    /// leave a truncated/invalid file in place, which [`load`](Self::load)
+    /// would otherwise fail to parse permanently.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
+    /// Returns an error if the file cannot be written or renamed into place.
     pub async fn save(&self) -> Result<()> {
-        if let Some(ref path) = self.storage_path {
-            // Ensure parent directory exists
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create todos directory")?;
-            }
-            let content =
-                serde_json::to_string_pretty(&self.items).context("Failed to serialize todos")?;
-            tokio::fs::write(path, content)
+        let Some(path) = self.storage_path.as_ref() else {
+            return Ok(());
+        };
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
                 .await
-                .context("Failed to write todos file")?;
+                .context("Failed to create todos directory")?;
         }
+
+        let content =
+            serde_json::to_string_pretty(&self.items).context("Failed to serialize todos")?;
+
+        let tmp_path = temp_sibling_path(path)?;
+        tokio::fs::write(&tmp_path, content)
+            .await
+            .context("Failed to write temp todos file")?;
+
+        if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+            // Best-effort cleanup so a failed rename doesn't leak the temp file.
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).context("Failed to atomically replace todos file");
+        }
+
         Ok(())
     }
 
@@ -240,6 +260,30 @@ impl TodoState {
     pub const fn len(&self) -> usize {
         self.items.len()
     }
+}
+
+/// Builds a unique sibling path (same directory as `target`) for the
+/// write-then-rename in [`TodoState::save`]. Uniqueness combines the process
+/// id with a monotonic counter so concurrent saves never collide on the temp
+/// name.
+fn temp_sibling_path(target: &Path) -> Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = target
+        .file_name()
+        .context("storage path has no file name")?;
+    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{}.{nonce}", std::process::id()));
+
+    Ok(
+        match target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => parent.join(tmp_name),
+            None => PathBuf::from(tmp_name),
+        },
+    )
 }
 
 /// Tool for writing/updating the TODO list.
@@ -341,17 +385,24 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
             })
             .collect();
 
-        let display = {
-            let mut state = self.state.write().await;
-            state.set_items(items);
-
-            // Save to storage if configured
-            if let Err(e) = state.save().await {
-                log::warn!("Failed to save todos: {e}");
-            }
-
-            state.format_display()
+        // Update the shared state, then snapshot what needs persisting and
+        // drop the write guard *before* the (potentially slow) disk I/O. This
+        // keeps `TodoReadTool` unblocked during the save.
+        let mut state = self.state.write().await;
+        state.set_items(items);
+        let snapshot = TodoState {
+            items: state.items.clone(),
+            storage_path: state.storage_path.clone(),
         };
+        let display = state.format_display();
+        drop(state);
+
+        if let Err(e) = snapshot.save().await {
+            log::warn!("Failed to persist todos: {e}");
+            return Ok(ToolResult::error(format!(
+                "TODO list updated in memory, but persisting to storage failed: {e}\n\n{display}"
+            )));
+        }
 
         Ok(ToolResult::success(format!(
             "TODO list updated.\n\n{display}"
@@ -509,5 +560,71 @@ mod tests {
 
         let parsed: TodoStatus = serde_json::from_str("\"completed\"").unwrap();
         assert_eq!(parsed, TodoStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips_through_storage() -> Result<()> {
+        let dir = tempfile::tempdir().context("create temp dir")?;
+        let path = dir.path().join("todos.json");
+
+        let mut state = TodoState::with_storage(path.clone());
+        state.add(TodoItem::with_status(
+            "Fix bug",
+            "Fixing bug",
+            TodoStatus::InProgress,
+        ));
+        state.add(TodoItem::with_status(
+            "Write tests",
+            "Writing tests",
+            TodoStatus::Pending,
+        ));
+        state.save().await?;
+
+        assert!(path.exists(), "target file should exist after save");
+
+        // The atomic write must not leave its temp sibling behind.
+        let mut entries = tokio::fs::read_dir(dir.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains(".tmp."), "temp file leaked: {name}");
+        }
+
+        let mut loaded = TodoState::with_storage(path);
+        loaded.load().await?;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.items[0].content, "Fix bug");
+        assert_eq!(loaded.items[1].status, TodoStatus::Pending);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_overwrites_existing_file_atomically() -> Result<()> {
+        let dir = tempfile::tempdir().context("create temp dir")?;
+        let path = dir.path().join("todos.json");
+
+        let mut first = TodoState::with_storage(path.clone());
+        first.add(TodoItem::new("Old task", "Doing old task"));
+        first.save().await?;
+
+        let mut second = TodoState::with_storage(path.clone());
+        second.add(TodoItem::new("New task", "Doing new task"));
+        second.save().await?;
+
+        let mut loaded = TodoState::with_storage(path);
+        loaded.load().await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.items[0].content, "New task");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_is_noop_without_storage_path() -> Result<()> {
+        let mut state = TodoState::new();
+        state.add(TodoItem::new("Task", "Doing task"));
+        state.save().await?;
+        Ok(())
     }
 }

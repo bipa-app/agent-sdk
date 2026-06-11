@@ -611,4 +611,196 @@ mod tests {
         assert_eq!(serde_json::to_string(&StopReason::Unknown)?, "\"unknown\"");
         Ok(())
     }
+
+    // ── ContentBlock wire format ────────────────────────────────
+    //
+    // `ContentBlock` is persisted durably (AgentContinuation.response_content,
+    // AgentEvent::UserInput), so its tag strings and optional-field omission
+    // are part of the wire contract. A tag rename or variant reorder must fail
+    // a test here, not silently corrupt persisted threads.
+
+    #[test]
+    fn content_block_text_wire_format() -> Result<(), serde_json::Error> {
+        let json = serde_json::to_value(ContentBlock::Text { text: "hi".into() })?;
+        assert_eq!(json, serde_json::json!({"type": "text", "text": "hi"}));
+        Ok(())
+    }
+
+    #[test]
+    fn content_block_thinking_omits_none_signature() -> Result<(), serde_json::Error> {
+        let none = serde_json::to_value(ContentBlock::Thinking {
+            thinking: "t".into(),
+            signature: None,
+        })?;
+        assert_eq!(
+            none,
+            serde_json::json!({"type": "thinking", "thinking": "t"})
+        );
+
+        let some = serde_json::to_value(ContentBlock::Thinking {
+            thinking: "t".into(),
+            signature: Some("sig".into()),
+        })?;
+        assert_eq!(
+            some,
+            serde_json::json!({"type": "thinking", "thinking": "t", "signature": "sig"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_block_tool_use_omits_none_thought_signature() -> Result<(), serde_json::Error> {
+        let none = serde_json::to_value(ContentBlock::ToolUse {
+            id: "i".into(),
+            name: "n".into(),
+            input: serde_json::json!({"a": 1}),
+            thought_signature: None,
+        })?;
+        assert_eq!(
+            none,
+            serde_json::json!({"type": "tool_use", "id": "i", "name": "n", "input": {"a": 1}})
+        );
+
+        let some = serde_json::to_value(ContentBlock::ToolUse {
+            id: "i".into(),
+            name: "n".into(),
+            input: serde_json::json!({}),
+            thought_signature: Some("ts".into()),
+        })?;
+        assert_eq!(
+            some.get("thought_signature").and_then(|v| v.as_str()),
+            Some("ts")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_block_tool_result_omits_none_is_error() -> Result<(), serde_json::Error> {
+        let none = serde_json::to_value(ContentBlock::ToolResult {
+            tool_use_id: "t".into(),
+            content: "out".into(),
+            is_error: None,
+        })?;
+        assert_eq!(
+            none,
+            serde_json::json!({"type": "tool_result", "tool_use_id": "t", "content": "out"})
+        );
+
+        let some = serde_json::to_value(ContentBlock::ToolResult {
+            tool_use_id: "t".into(),
+            content: "out".into(),
+            is_error: Some(true),
+        })?;
+        assert_eq!(
+            some.get("is_error").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_block_remaining_variant_tags() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::to_value(ContentBlock::RedactedThinking { data: "d".into() })?,
+            serde_json::json!({"type": "redacted_thinking", "data": "d"})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Image {
+                source: ContentSource::new("image/png", "b64"),
+            })?,
+            serde_json::json!({"type": "image", "source": {"media_type": "image/png", "data": "b64"}})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Document {
+                source: ContentSource::new("application/pdf", "b64"),
+            })?,
+            serde_json::json!({"type": "document", "source": {"media_type": "application/pdf", "data": "b64"}})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_block_every_tag_round_trips() -> Result<(), serde_json::Error> {
+        let blocks = vec![
+            ContentBlock::Text { text: "t".into() },
+            ContentBlock::Thinking {
+                thinking: "th".into(),
+                signature: Some("s".into()),
+            },
+            ContentBlock::RedactedThinking { data: "d".into() },
+            ContentBlock::ToolUse {
+                id: "i".into(),
+                name: "n".into(),
+                input: serde_json::json!({"x": 1}),
+                thought_signature: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t".into(),
+                content: "c".into(),
+                is_error: Some(true),
+            },
+            ContentBlock::Image {
+                source: ContentSource::new("image/png", "b"),
+            },
+            ContentBlock::Document {
+                source: ContentSource::new("application/pdf", "b"),
+            },
+        ];
+        for block in blocks {
+            let json = serde_json::to_value(&block)?;
+            let back: ContentBlock = serde_json::from_value(json.clone())?;
+            assert_eq!(serde_json::to_value(&back)?, json);
+        }
+        Ok(())
+    }
+
+    // ── Content (untagged) wire format ──────────────────────────
+
+    #[test]
+    fn content_text_serializes_as_bare_string() -> Result<(), serde_json::Error> {
+        let json = serde_json::to_value(Content::Text("hello".into()))?;
+        assert_eq!(json, serde_json::json!("hello"));
+        let back: Content = serde_json::from_value(serde_json::json!("hello"))?;
+        assert!(matches!(back, Content::Text(s) if s == "hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn content_blocks_serialize_as_array_including_empty() -> Result<(), serde_json::Error> {
+        let json = serde_json::to_value(Content::Blocks(vec![ContentBlock::Text {
+            text: "x".into(),
+        }]))?;
+        assert_eq!(json, serde_json::json!([{"type": "text", "text": "x"}]));
+
+        // Empty blocks → `[]` and must round-trip back to `Blocks`, not `Text`,
+        // even though `Text` is the first untagged variant.
+        let empty = serde_json::to_value(Content::Blocks(vec![]))?;
+        assert_eq!(empty, serde_json::json!([]));
+        let back: Content = serde_json::from_value(empty)?;
+        assert!(matches!(back, Content::Blocks(b) if b.is_empty()));
+        Ok(())
+    }
+
+    // ── Message wire format ─────────────────────────────────────
+
+    #[test]
+    fn message_wire_format_text_and_blocks() -> Result<(), serde_json::Error> {
+        let user = serde_json::to_value(Message::user("hi"))?;
+        assert_eq!(user, serde_json::json!({"role": "user", "content": "hi"}));
+
+        let assistant =
+            serde_json::to_value(Message::assistant_with_content(vec![ContentBlock::Text {
+                text: "yo".into(),
+            }]))?;
+        assert_eq!(
+            assistant,
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "yo"}]})
+        );
+
+        let back: Message =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "hi"}))?;
+        assert_eq!(back.role, Role::User);
+        assert!(matches!(back.content, Content::Text(s) if s == "hi"));
+        Ok(())
+    }
 }

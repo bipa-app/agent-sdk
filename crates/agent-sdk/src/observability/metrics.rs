@@ -10,8 +10,12 @@
 //! ## Lifecycle
 //!
 //! Instruments are bound to whichever meter provider is current at the
-//! first call to [`Metrics::global`] / [`Metrics::init`]. Tests that
-//! swap in a fresh `opentelemetry_sdk::metrics::SdkMeterProvider`
+//! first call to [`Metrics::global`] / [`Metrics::init`].
+//! `agent_sdk_otel::install_global_provider` calls [`Metrics::rebind`]
+//! right after installing the global meter provider so the singleton binds
+//! to the real provider even if an earlier code path lazily built it
+//! against the no-op meter (or a previous provider was replaced). Tests
+//! that swap in a fresh `opentelemetry_sdk::metrics::SdkMeterProvider`
 //! between cases must call [`Metrics::reset_for_testing`] so the next
 //! lookup rebuilds the cache against the new provider.
 //!
@@ -131,18 +135,28 @@ impl Metrics {
         Self::init(env!("CARGO_PKG_NAME"))
     }
 
+    /// Drop the cached instrument singleton so the next
+    /// [`Metrics::global`] call rebuilds against the **currently
+    /// installed** global meter provider.
+    ///
+    /// `agent_sdk_otel::install_global_provider` calls this immediately
+    /// after `global::set_meter_provider`. Without it, any telemetry path
+    /// that lazily built the singleton before the provider was installed
+    /// (or before a re-install) would stay bound to the no-op meter — or a
+    /// now-shut-down provider — for the rest of the process, silently
+    /// dropping every counter / histogram. Calling it at install time is
+    /// safe because no real data points exist yet; it must NOT be used
+    /// mid-run, where rebuilding would lose in-flight aggregation.
+    pub fn rebind() {
+        clear_cache();
+    }
+
     /// Drop the cached singleton.
     ///
-    /// Test-only escape hatch. Production code never calls this — the
-    /// instruments are bound to whichever meter provider was current
-    /// when [`init`](Self::init) ran, and rebuilding them against a
-    /// different provider mid-run would silently lose data points.
+    /// Test-only escape hatch so tests that rotate the global meter
+    /// provider between cases force a rebuild against the fresh provider.
     pub fn reset_for_testing() {
-        let mut guard = match METRICS.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = None;
+        clear_cache();
     }
 
     /// Record the `gen_ai.client.token.usage` histogram for a chat
@@ -394,6 +408,14 @@ pub fn tool_duration_ms_to_f64(ms: u64) -> f64 {
     f64::from(u32::MAX)
 }
 
+fn clear_cache() {
+    let mut guard = match METRICS.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
 fn read_cached() -> Option<Arc<Metrics>> {
     let guard = match METRICS.read() {
         Ok(g) => g,
@@ -413,4 +435,23 @@ fn write_cached(value: Arc<Metrics>) {
     // If a concurrent caller raced us in, drop the freshly-built
     // handle on the floor. Both copies are functionally equivalent
     // (same scope, same global meter), so the duplicate is harmless.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+
+    #[test]
+    fn rebind_forces_fresh_instruments_against_current_provider() {
+        // Populate the cache, then rebind: the next `global()` must rebuild
+        // a distinct handle bound to whatever provider is now installed,
+        // rather than returning the stale (possibly no-op-bound) singleton.
+        let first = Metrics::global();
+        Metrics::rebind();
+        let second = Metrics::global();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "rebind must clear the cache so the next global() rebuilds"
+        );
+    }
 }

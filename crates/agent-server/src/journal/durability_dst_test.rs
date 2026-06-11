@@ -552,6 +552,80 @@ async fn replay_seed_42_long_horizon() -> Result<()> {
         .context("long-horizon replay of seed 42 violated an invariant")
 }
 
+/// Randomized exploration lane (finding #30).
+///
+/// The fixed-seed loop above replays the *same* ~16k schedules on every
+/// run, so it can only catch regressions on schedules it already covered
+/// — it can never *discover* a new interleaving bug. This lane lets a
+/// nightly / on-demand run explore fresh schedules while staying
+/// **deterministic-by-default** for the PR lane:
+///
+/// - With no env var set, the lane is a no-op (so a normal `cargo nextest
+///   run` only executes the fixed-seed baseline above — same coverage,
+///   same speed, fully reproducible).
+/// - `AGENT_DST_SEED=<u64>` runs exactly that one seed. This is the
+///   **replay** entry point: when the lane below prints a failing seed,
+///   re-run with this var to reproduce it deterministically.
+/// - `AGENT_DST_RANDOM=<N>` draws `N` fresh seeds (mixed from the wall
+///   clock so each invocation explores new schedules) and prints **every
+///   seed before running it**, so any failure names a seed the operator
+///   can feed back through `AGENT_DST_SEED` for a deterministic replay.
+/// - `AGENT_DST_OPS=<K>` overrides the per-seed operation count
+///   (default 2000, matching the fixed baseline).
+///
+/// The seed generator is the same `SplitMix64` `Prng` the simulation
+/// uses, so the only nondeterminism introduced is the *initial* clock
+/// mix — and that is always printed, collapsing back to a fixed seed.
+#[tokio::test]
+async fn randomized_dst_exploration_lane() -> Result<()> {
+    let ops = std::env::var("AGENT_DST_OPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(2_000);
+
+    // Explicit single-seed replay path — highest priority so a printed
+    // failing seed reproduces with one env var and nothing else.
+    if let Some(seed) = std::env::var("AGENT_DST_SEED")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        println!("DST replay: AGENT_DST_SEED={seed} ops={ops}");
+        return run_simulation(seed, ops)
+            .await
+            .with_context(|| format!("DST replay failed; reproduce with AGENT_DST_SEED={seed}"));
+    }
+
+    let Some(count) = std::env::var("AGENT_DST_RANDOM")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|count| *count > 0)
+    else {
+        // Deterministic-by-default: no env var means no exploration, so
+        // the PR lane stays fast and reproducible on the fixed seeds.
+        return Ok(());
+    };
+
+    // Mix the wall clock into a base seed so each invocation explores a
+    // new region of the schedule space; the drawn seeds are printed so a
+    // failure is always reproducible via AGENT_DST_SEED.
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos() % u128::from(u64::MAX)).ok())
+        .unwrap_or(0x1234_5678_9ABC_DEF0);
+    let mut seed_source = Prng::new(base ^ 0x9E37_79B9_7F4A_7C15);
+    for run in 0..count {
+        let seed = seed_source.next_u64();
+        println!(
+            "DST exploration run {run}/{count}: seed={seed} ops={ops} (replay: AGENT_DST_SEED={seed})"
+        );
+        run_simulation(seed, ops).await.with_context(|| {
+            format!("randomized DST lane failed; reproduce with AGENT_DST_SEED={seed} AGENT_DST_OPS={ops}")
+        })?;
+    }
+    Ok(())
+}
+
 /// The PRNG is deterministic: the same seed yields the same sequence,
 /// which is what makes "print the seed on failure" a real replay
 /// guarantee and not a hopeful suggestion.

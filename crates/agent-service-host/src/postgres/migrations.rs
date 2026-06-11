@@ -55,6 +55,14 @@ const OUTBOX_MESSAGE_KIND_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0005_outbox_message_kind.sql"
 ));
+const TASK_CALLER_METADATA_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0006_task_caller_metadata.sql"
+));
+const MESSAGE_HEAD_DRAFTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0007_message_head_drafts.sql"
+));
 const TURN_ATTEMPT_OTEL_IDS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0008_turn_attempt_otel_ids.sql"
@@ -63,11 +71,15 @@ const IDEMPOTENCY_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0009_idempotency.sql"
 ));
+const TASK_OTEL_TRACEPARENT_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0010_task_otel_traceparent.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 7] = [
+const MIGRATIONS: [PostgresMigration; 10] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -94,6 +106,16 @@ const MIGRATIONS: [PostgresMigration; 7] = [
         sql: OUTBOX_MESSAGE_KIND_SQL,
     },
     PostgresMigration {
+        version: "0006",
+        summary: "per-turn caller metadata captured on tasks at submission time",
+        sql: TASK_CALLER_METADATA_SQL,
+    },
+    PostgresMigration {
+        version: "0007",
+        summary: "in-flight draft message slots on message heads for resume-buffer surfacing",
+        sql: MESSAGE_HEAD_DRAFTS_SQL,
+    },
+    PostgresMigration {
         version: "0008",
         summary: "Phase 9 A7 turn attempt OTel trace + span ids for replay-link emission",
         sql: TURN_ATTEMPT_OTEL_IDS_SQL,
@@ -102,6 +124,11 @@ const MIGRATIONS: [PostgresMigration; 7] = [
         version: "0009",
         summary: "Phase 10 E durable at-least-once idempotency records",
         sql: IDEMPOTENCY_SQL,
+    },
+    PostgresMigration {
+        version: "0010",
+        summary: "per-task OTel traceparent for distributed-trace continuation",
+        sql: TASK_OTEL_TRACEPARENT_SQL,
     },
 ];
 
@@ -151,6 +178,24 @@ pub const fn outbox_message_kind_migration() -> &'static str {
     OUTBOX_MESSAGE_KIND_SQL
 }
 
+/// The reviewable per-turn caller-metadata migration SQL.
+#[must_use]
+pub const fn task_caller_metadata_migration() -> &'static str {
+    TASK_CALLER_METADATA_SQL
+}
+
+/// The reviewable message-head drafts migration SQL.
+#[must_use]
+pub const fn message_head_drafts_migration() -> &'static str {
+    MESSAGE_HEAD_DRAFTS_SQL
+}
+
+/// The reviewable per-task `OTel` traceparent migration SQL.
+#[must_use]
+pub const fn task_otel_traceparent_migration() -> &'static str {
+    TASK_OTEL_TRACEPARENT_SQL
+}
+
 /// The reviewable Phase 9 A7 turn-attempt OTel-ids migration SQL.
 #[must_use]
 pub const fn turn_attempt_otel_ids_migration() -> &'static str {
@@ -161,4 +206,47 @@ pub const fn turn_attempt_otel_ids_migration() -> &'static str {
 #[must_use]
 pub const fn idempotency_migration() -> &'static str {
     IDEMPOTENCY_SQL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DURABLE_CORE_MIGRATOR, durable_core_migrations};
+
+    /// Guard against the finding-#20 regression: the reviewable
+    /// [`durable_core_migrations`] array silently omitted 0006/0007/0010,
+    /// so the schema-contract tests (which concatenate only the reviewable
+    /// bundle) skipped the columns and constraints those migrations
+    /// introduce. Pin the reviewable bundle to the executable migrator so
+    /// a future migration can never again drop out of the contract checks
+    /// undetected.
+    #[test]
+    fn reviewable_bundle_covers_every_executable_migration() {
+        let reviewable = durable_core_migrations().len();
+        let executable = DURABLE_CORE_MIGRATOR.migrations.len();
+        assert_eq!(
+            reviewable, executable,
+            "reviewable MIGRATIONS array ({reviewable}) must list every executable migration \
+             ({executable}); a missing entry hides that migration's schema from the contract tests",
+        );
+    }
+
+    /// The reviewable bundle's declared versions must match the executable
+    /// migrator's versions one-for-one and in order, so the summaries stay
+    /// aligned with the SQL the migrator actually applies.
+    #[test]
+    fn reviewable_versions_match_executable_versions_in_order() {
+        let reviewable: Vec<String> = durable_core_migrations()
+            .iter()
+            .map(|migration| migration.version.to_owned())
+            .collect();
+        let executable: Vec<String> = DURABLE_CORE_MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| format!("{:04}", migration.version))
+            .collect();
+        assert_eq!(
+            reviewable, executable,
+            "reviewable migration versions must match the executable migrator's, in order",
+        );
+    }
 }

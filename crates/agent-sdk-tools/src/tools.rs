@@ -12,23 +12,30 @@
 //!
 //! # Implementing a Tool
 //!
-//! ```ignore
-//! use agent_sdk::{Tool, ToolContext, ToolResult, ToolTier, PrimitiveToolName};
+//! ```
+//! use agent_sdk_tools::tools::{Tool, ToolContext, DynamicToolName};
+//! use agent_sdk_foundation::types::{ToolResult, ToolTier};
+//! use serde_json::{json, Value};
+//! use std::future::Future;
 //!
 //! struct MyTool;
 //!
 //! // No #[async_trait] needed - Rust 1.75+ supports native async traits
-//! impl Tool<MyContext> for MyTool {
-//!     type Name = PrimitiveToolName;
+//! impl Tool<()> for MyTool {
+//!     type Name = DynamicToolName;
 //!
-//!     fn name(&self) -> PrimitiveToolName { PrimitiveToolName::Read }
-//!     fn display_name(&self) -> &'static str { "My Tool" }
+//!     fn name(&self) -> DynamicToolName { DynamicToolName::new("my_tool") }
+//!     // `display_name` defaults to "" — override it for nicer UI.
 //!     fn description(&self) -> &'static str { "Does something useful" }
 //!     fn input_schema(&self) -> Value { json!({ "type": "object" }) }
 //!     fn tier(&self) -> ToolTier { ToolTier::Observe }
 //!
-//!     async fn execute(&self, ctx: &ToolContext<MyContext>, input: Value) -> Result<ToolResult> {
-//!         Ok(ToolResult::success("Done!"))
+//!     fn execute(
+//!         &self,
+//!         _ctx: &ToolContext<()>,
+//!         _input: Value,
+//!     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
+//!         async move { Ok(ToolResult::success("Done!")) }
 //!     }
 //! }
 //! ```
@@ -90,10 +97,16 @@ pub fn tool_name_to_string<N: ToolName>(name: &N) -> String {
 
 /// Parse a tool name from string via serde.
 ///
+/// The input is encoded as a JSON string with `serde_json::to_string` (not
+/// interpolated with `format!`) so names containing quotes or backslashes —
+/// possible for [`DynamicToolName`]s bridged from remote MCP servers — are
+/// escaped correctly and round-trip with [`tool_name_to_string`].
+///
 /// # Errors
 /// Returns error if the string doesn't match a valid tool name.
 pub fn tool_name_from_str<N: ToolName>(s: &str) -> Result<N, serde_json::Error> {
-    serde_json::from_str(&format!("\"{s}\""))
+    let json = serde_json::to_string(s)?;
+    serde_json::from_str(&json)
 }
 
 /// Tool names for SDK's built-in primitive tools.
@@ -163,14 +176,14 @@ pub trait ProgressStage: Clone + Send + Sync + Serialize + DeserializeOwned + 's
 
 /// Helper to get string representation of a progress stage via serde.
 ///
-/// # Panics
-///
-/// Panics if the stage cannot be serialized to a string. This should
-/// never happen with properly implemented `ProgressStage` types.
+/// Returns `"<unknown_stage>"` if serialization fails (should never happen with
+/// properly implemented `ProgressStage` types). This mirrors
+/// [`tool_name_to_string`]'s non-panicking fallback so a failing `Serialize`
+/// impl cannot panic the turn loop on the async-tool progress hot path.
 #[must_use]
 pub fn stage_to_string<S: ProgressStage>(stage: &S) -> String {
     serde_json::to_string(stage)
-        .expect("ProgressStage must serialize to string")
+        .unwrap_or_else(|_| "\"<unknown_stage>\"".to_string())
         .trim_matches('"')
         .to_string()
 }
@@ -394,18 +407,33 @@ impl<Ctx> ToolContext<Ctx> {
     where
         Ctx: Sync,
     {
-        if let Some((store, authority, thread_id, turn)) = self
+        let Some((store, authority, thread_id, turn)) = self
             .event_store
             .as_ref()
             .zip(self.event_authority.as_ref())
             .zip(self.event_thread_id.as_ref())
             .zip(self.event_turn)
             .map(|(((store, authority), thread_id), turn)| (store, authority, thread_id, turn))
-        {
-            let envelope = authority.wrap(event);
-            store.append(thread_id, turn, envelope).await?;
-        }
-        Ok(())
+        else {
+            // Surface the misconfiguration instead of silently dropping the
+            // event: a tool written for the durable host but run under a
+            // hand-built `ToolContext::new()` would otherwise lose every
+            // emitted event with no trace, undermining the audit trail.
+            let kind = serde_json::to_value(&event)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(|t| t.as_str().map(ToOwned::to_owned))
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            log::warn!(
+                "ToolContext::emit_event called on an unbound context; dropping {kind} event \
+                 (no event store/authority/thread/turn bound)"
+            );
+            return Ok(());
+        };
+        let envelope = authority.wrap(event);
+        store.append(thread_id, turn, envelope).await
     }
 
     /// Get a clone of the event authority (if set).
@@ -515,8 +543,10 @@ pub trait Tool<Ctx>: Send + Sync {
 
     /// Human-readable display name for UI (e.g., "Read File" vs "read").
     ///
-    /// Defaults to empty string. Override for better UX.
-    fn display_name(&self) -> &'static str;
+    /// Defaults to the empty string. Override for better UX.
+    fn display_name(&self) -> &'static str {
+        ""
+    }
 
     /// Human-readable description of what the tool does.
     fn description(&self) -> &'static str;
@@ -525,8 +555,13 @@ pub trait Tool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
 
     /// Permission tier for this tool.
+    ///
+    /// Defaults to [`ToolTier::Confirm`] (fail-closed): a tool author who
+    /// forgets to declare a tier gets confirmation gating, not silent
+    /// auto-execution. Read-only tools should explicitly opt in to
+    /// [`ToolTier::Observe`].
     fn tier(&self) -> ToolTier {
-        ToolTier::Observe
+        ToolTier::Confirm
     }
 
     /// Execute the tool with the given input.
@@ -650,9 +685,10 @@ pub trait TypedTool<Ctx>: Send + Sync {
     /// is useful (descriptions, examples, provider-specific keywords).
     fn input_schema(&self) -> Value;
 
-    /// Permission tier for this tool. Defaults to [`ToolTier::Observe`].
+    /// Permission tier for this tool. Defaults to [`ToolTier::Confirm`]
+    /// (fail-closed); read-only tools should opt in to [`ToolTier::Observe`].
     fn tier(&self) -> ToolTier {
-        ToolTier::Observe
+        ToolTier::Confirm
     }
 
     /// Execute the tool with the already-validated, typed input.
@@ -900,9 +936,10 @@ pub trait SimpleTool<Ctx>: Send + Sync {
     /// JSON schema for the tool's input parameters.
     fn input_schema(&self) -> Value;
 
-    /// Permission tier for this tool. Defaults to [`ToolTier::Observe`].
+    /// Permission tier for this tool. Defaults to [`ToolTier::Confirm`]
+    /// (fail-closed); read-only tools should opt in to [`ToolTier::Observe`].
     fn tier(&self) -> ToolTier {
-        ToolTier::Observe
+        ToolTier::Confirm
     }
 
     /// Execute the tool with the given input.
@@ -1031,8 +1068,10 @@ pub trait AsyncTool<Ctx>: Send + Sync {
     /// Returns the tool's strongly-typed name.
     fn name(&self) -> Self::Name;
 
-    /// Human-readable display name for UI.
-    fn display_name(&self) -> &'static str;
+    /// Human-readable display name for UI. Defaults to the empty string.
+    fn display_name(&self) -> &'static str {
+        ""
+    }
 
     /// Human-readable description of what the tool does.
     fn description(&self) -> &'static str;
@@ -1040,9 +1079,10 @@ pub trait AsyncTool<Ctx>: Send + Sync {
     /// JSON schema for the tool's input parameters.
     fn input_schema(&self) -> Value;
 
-    /// Permission tier for this tool.
+    /// Permission tier for this tool. Defaults to [`ToolTier::Confirm`]
+    /// (fail-closed); read-only tools should opt in to [`ToolTier::Observe`].
     fn tier(&self) -> ToolTier {
-        ToolTier::Observe
+        ToolTier::Confirm
     }
 
     /// Execute the tool. Returns immediately with one of:
@@ -1087,8 +1127,10 @@ pub trait ListenExecuteTool<Ctx>: Send + Sync {
     /// Returns the tool's strongly-typed name.
     fn name(&self) -> Self::Name;
 
-    /// Human-readable display name for UI.
-    fn display_name(&self) -> &'static str;
+    /// Human-readable display name for UI. Defaults to the empty string.
+    fn display_name(&self) -> &'static str {
+        ""
+    }
 
     /// Human-readable description of what the tool does.
     fn description(&self) -> &'static str;
@@ -1473,18 +1515,82 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         }
     }
 
+    /// Evict any existing registration for `name` across **all three** maps so
+    /// a name lives in exactly one map, then warn about the replacement.
+    ///
+    /// Without this, re-registering a name silently replaced the tool, and the
+    /// same name registered as both (say) a sync and a listen tool coexisted —
+    /// [`len`](ToolRegistry::len) double-counted it and
+    /// [`to_llm_tools`](ToolRegistry::to_llm_tools) emitted two definitions with
+    /// identical names (which providers reject). A remote MCP server could also
+    /// silently shadow a vetted built-in (`read`, `bash`). We keep the
+    /// non-breaking last-registration-wins behavior but make it loud; callers
+    /// that need fail-closed semantics should use the `try_register*` variants.
+    fn evict_existing(&mut self, name: &str, new_kind: &str) {
+        // Evict from all three maps (each is side-effecting and must run); a
+        // name lives in at most one map, so the listen > async > sync ordering
+        // only disambiguates the pathological double-registration case.
+        let previous_kind = [
+            (self.listen_tools.remove(name).is_some(), "listen"),
+            (self.async_tools.remove(name).is_some(), "async"),
+            (self.tools.remove(name).is_some(), "sync"),
+        ]
+        .into_iter()
+        .find_map(|(removed, kind)| removed.then_some(kind));
+        if let Some(previous_kind) = previous_kind {
+            log::warn!(
+                "tool registry: name {name:?} already registered as a {previous_kind} tool; \
+                 replacing it with a {new_kind} tool (last registration wins)"
+            );
+        }
+    }
+
+    /// Error if `name` is already registered in any of the three maps.
+    fn ensure_unique(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.tools.contains_key(name)
+                && !self.async_tools.contains_key(name)
+                && !self.listen_tools.contains_key(name),
+            "tool {name:?} is already registered",
+        );
+        Ok(())
+    }
+
     /// Register a synchronous tool in the registry.
     ///
     /// The tool's name is converted to a string via serde serialization
-    /// and used as the lookup key.
+    /// and used as the lookup key. If the name is already registered (in any
+    /// map), the previous tool is evicted and a warning is logged; use
+    /// [`try_register`](ToolRegistry::try_register) for fail-closed semantics.
     pub fn register<T>(&mut self, tool: T) -> &mut Self
     where
         T: Tool<Ctx> + 'static,
     {
         let wrapper = ToolWrapper::new(tool);
         let name = wrapper.name_str().to_string();
+        self.evict_existing(&name, "sync");
         self.tools.insert(name, Arc::new(wrapper));
         self
+    }
+
+    /// Register a synchronous tool, returning an error on name collision.
+    ///
+    /// Unlike [`register`](ToolRegistry::register), this never silently
+    /// replaces an existing tool — it checks all three maps and fails if the
+    /// name is taken. Useful for registering untrusted (e.g. MCP-supplied)
+    /// tools without letting them squat over vetted built-ins.
+    ///
+    /// # Errors
+    /// Returns an error if a tool with the same name is already registered.
+    pub fn try_register<T>(&mut self, tool: T) -> Result<&mut Self>
+    where
+        T: Tool<Ctx> + 'static,
+    {
+        let wrapper = ToolWrapper::new(tool);
+        let name = wrapper.name_str().to_string();
+        self.ensure_unique(&name)?;
+        self.tools.insert(name, Arc::new(wrapper));
+        Ok(self)
     }
 
     /// Register a [`SimpleTool`] — a tool whose name is a plain `&str` and
@@ -1526,8 +1632,26 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     {
         let wrapper = AsyncToolWrapper::new(tool);
         let name = wrapper.name_str().to_string();
+        self.evict_existing(&name, "async");
         self.async_tools.insert(name, Arc::new(wrapper));
         self
+    }
+
+    /// Register an async tool, returning an error on name collision.
+    ///
+    /// The fail-closed counterpart to [`register_async`](ToolRegistry::register_async).
+    ///
+    /// # Errors
+    /// Returns an error if a tool with the same name is already registered.
+    pub fn try_register_async<T>(&mut self, tool: T) -> Result<&mut Self>
+    where
+        T: AsyncTool<Ctx> + 'static,
+    {
+        let wrapper = AsyncToolWrapper::new(tool);
+        let name = wrapper.name_str().to_string();
+        self.ensure_unique(&name)?;
+        self.async_tools.insert(name, Arc::new(wrapper));
+        Ok(self)
     }
 
     /// Register a listen/execute tool in the registry.
@@ -1540,8 +1664,26 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     {
         let wrapper = ListenToolWrapper::new(tool);
         let name = wrapper.name_str().to_string();
+        self.evict_existing(&name, "listen");
         self.listen_tools.insert(name, Arc::new(wrapper));
         self
+    }
+
+    /// Register a listen/execute tool, returning an error on name collision.
+    ///
+    /// The fail-closed counterpart to [`register_listen`](ToolRegistry::register_listen).
+    ///
+    /// # Errors
+    /// Returns an error if a tool with the same name is already registered.
+    pub fn try_register_listen<T>(&mut self, tool: T) -> Result<&mut Self>
+    where
+        T: ListenExecuteTool<Ctx> + 'static,
+    {
+        let wrapper = ListenToolWrapper::new(tool);
+        let name = wrapper.name_str().to_string();
+        self.ensure_unique(&name)?;
+        self.listen_tools.insert(name, Arc::new(wrapper));
+        Ok(self)
     }
 
     /// Get a synchronous tool by name.
@@ -1640,32 +1782,58 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     /// sort cost is negligible compared to a single LLM call.
     #[must_use]
     pub fn to_llm_tools(&self) -> Vec<llm::Tool> {
+        /// Build the LLM tool descriptor from the accessors every erased tool
+        /// trait shares. Extracted so the five-field `llm::Tool` literal —
+        /// whose byte content is prompt-cache load-bearing — exists in exactly
+        /// one place across the sync / async / listen iterators.
+        fn descriptor(
+            name: &str,
+            display_name: &str,
+            description: &str,
+            input_schema: Value,
+            tier: ToolTier,
+        ) -> llm::Tool {
+            llm::Tool {
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema,
+                display_name: display_name.to_string(),
+                tier,
+            }
+        }
+
         let mut tools: Vec<_> = self
             .tools
             .values()
-            .map(|tool| llm::Tool {
-                name: tool.name_str().to_string(),
-                description: tool.description().to_string(),
-                input_schema: tool.input_schema(),
-                display_name: tool.display_name().to_string(),
-                tier: tool.tier(),
+            .map(|tool| {
+                descriptor(
+                    tool.name_str(),
+                    tool.display_name(),
+                    tool.description(),
+                    tool.input_schema(),
+                    tool.tier(),
+                )
             })
             .collect();
 
-        tools.extend(self.async_tools.values().map(|tool| llm::Tool {
-            name: tool.name_str().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
-            display_name: tool.display_name().to_string(),
-            tier: tool.tier(),
+        tools.extend(self.async_tools.values().map(|tool| {
+            descriptor(
+                tool.name_str(),
+                tool.display_name(),
+                tool.description(),
+                tool.input_schema(),
+                tool.tier(),
+            )
         }));
 
-        tools.extend(self.listen_tools.values().map(|tool| llm::Tool {
-            name: tool.name_str().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
-            display_name: tool.display_name().to_string(),
-            tier: tool.tier(),
+        tools.extend(self.listen_tools.values().map(|tool| {
+            descriptor(
+                tool.name_str(),
+                tool.display_name(),
+                tool.description(),
+                tool.input_schema(),
+                tool.tier(),
+            )
         }));
 
         tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2114,6 +2282,176 @@ mod tests {
         assert!(!result.success);
         assert!(result.output.contains("greet"));
         assert!(result.output.contains("call the tool again"));
+        Ok(())
+    }
+
+    // ── Fail-closed tier + display_name defaults (findings 8 & 19) ───────
+
+    /// A tool that overrides neither `tier()` nor `display_name()`, exercising
+    /// the trait defaults.
+    struct DefaultsTool;
+
+    impl Tool<()> for DefaultsTool {
+        type Name = DynamicToolName;
+
+        fn name(&self) -> DynamicToolName {
+            DynamicToolName::new("defaults")
+        }
+
+        fn description(&self) -> &'static str {
+            "uses trait defaults"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, _input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success("ok"))
+        }
+    }
+
+    #[test]
+    fn tool_trait_defaults_are_fail_closed() {
+        let tool = DefaultsTool;
+        // display_name defaults to "" (finding 19: the doc-claimed default now
+        // actually exists).
+        assert_eq!(Tool::display_name(&tool), "");
+        // tier defaults to Confirm so a side-effecting tool whose author forgot
+        // to declare a tier is gated, not auto-run (finding 8).
+        assert_eq!(Tool::tier(&tool), ToolTier::Confirm);
+    }
+
+    // ── Registry name-collision handling (findings 9 & 10) ───────────────
+
+    #[test]
+    fn re_registering_same_name_replaces_without_duplicates() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool);
+        registry.register(MockTool); // same name "mock_tool"
+
+        assert_eq!(registry.len(), 1, "re-register must replace, not add");
+        let names: Vec<String> = registry
+            .to_llm_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["mock_tool"]);
+    }
+
+    #[test]
+    fn cross_kind_name_collision_keeps_single_entry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool); // sync "mock_tool"
+        registry.register_listen(ListenMockTool); // listen "mock_tool"
+
+        // The listen registration evicts the sync one — a name lives in exactly
+        // one map, so `len()` and `to_llm_tools()` never double-count it.
+        assert_eq!(registry.len(), 1);
+        assert!(registry.is_listen("mock_tool"));
+        assert!(
+            registry.get("mock_tool").is_none(),
+            "the shadowed sync tool must be evicted"
+        );
+        let names: Vec<String> = registry
+            .to_llm_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["mock_tool"], "no duplicate LLM definitions");
+    }
+
+    #[test]
+    fn try_register_rejects_name_collision() {
+        let mut registry = ToolRegistry::new();
+        registry.register(MockTool); // "mock_tool"
+
+        assert!(
+            registry.try_register(MockTool).is_err(),
+            "duplicate sync name must be rejected"
+        );
+        assert!(
+            registry.try_register_listen(ListenMockTool).is_err(),
+            "cross-map duplicate (squatting) must be rejected"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "rejected registrations must not be stored"
+        );
+    }
+
+    // ── Non-panicking serde helpers (findings 16 & 17) ───────────────────
+
+    #[derive(Clone)]
+    struct FailingStage;
+
+    impl Serialize for FailingStage {
+        fn serialize<S>(&self, _serializer: S) -> core::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("intentionally unserializable"))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for FailingStage {
+        fn deserialize<D>(_deserializer: D) -> core::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Ok(Self)
+        }
+    }
+
+    impl ProgressStage for FailingStage {}
+
+    #[test]
+    fn stage_to_string_falls_back_instead_of_panicking() {
+        // A ProgressStage whose Serialize impl fails must not panic the turn
+        // loop on the async-tool progress hot path.
+        assert_eq!(stage_to_string(&FailingStage), "<unknown_stage>");
+    }
+
+    #[test]
+    fn tool_name_from_str_round_trips_special_characters() -> Result<()> {
+        // Names with quotes/backslashes (possible from remote MCP servers) must
+        // be JSON-escaped, not interpolated raw, so parsing succeeds.
+        let name: DynamicToolName =
+            tool_name_from_str("weird\"name\\with-escapes").context("must parse escaped name")?;
+        assert_eq!(name.as_str(), "weird\"name\\with-escapes");
+        Ok(())
+    }
+
+    // ── emit_event surfaces unbound misuse instead of silently dropping ──
+
+    #[tokio::test]
+    async fn emit_event_persists_when_bound_and_is_noop_when_unbound() -> Result<()> {
+        use crate::stores::InMemoryEventStore;
+        use agent_sdk_foundation::types::ThreadId;
+
+        let store = Arc::new(InMemoryEventStore::new());
+        let thread_id = ThreadId::new();
+        let authority: Arc<dyn EventAuthority> = Arc::new(LocalEventAuthority::new());
+
+        let bound =
+            ToolContext::new(()).with_event_store(store.clone(), thread_id.clone(), 1, authority);
+        bound.emit_event(AgentEvent::text("m1", "hi")).await?;
+        assert_eq!(
+            store.event_count(&thread_id).await?,
+            1,
+            "a bound context persists the event"
+        );
+
+        // An unbound context is a no-op (the fix also logs a warning) — it must
+        // not silently append elsewhere or error.
+        let unbound = ToolContext::new(());
+        unbound.emit_event(AgentEvent::text("m2", "lost")).await?;
+        assert_eq!(
+            store.event_count(&thread_id).await?,
+            1,
+            "an unbound context changes nothing"
+        );
         Ok(())
     }
 }

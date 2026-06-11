@@ -130,7 +130,7 @@ pub(super) fn extract_content(response: &ChatResponse) -> ExtractedContent {
                 } else {
                     input.clone()
                 };
-                tool_uses.push((id.clone(), name.clone(), input.clone()));
+                tool_uses.push((id.clone(), name.clone(), input));
             }
             // Remaining blocks (and future `#[non_exhaustive]` variants) yield
             // no thinking/text/tool-use content, so they are skipped.

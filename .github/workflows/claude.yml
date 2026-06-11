@@ -66,11 +66,33 @@ jobs:
       id-token: write
       actions: read
     steps:
+      # Pwn-request guard: the author_association gate only vets the COMMENTER,
+      # not the PR author. A trusted maintainer typing `@claude` on a fork PR
+      # would otherwise make this write-scoped job check out and process
+      # attacker-controlled diff/file content. Block any PR whose head is not in
+      # this same repository BEFORE the untrusted code is ever checked out.
+      # Uses the default read token; runs no PR code.
+      - name: Restrict to same-repo PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_repo=$(gh api \
+            "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" \
+            --jq '.head.repo.full_name')
+          echo "PR head repo: $head_repo"
+          if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "::error::Refusing to run the write-scoped Claude job on a fork PR ($head_repo)."
+            exit 1
+          fi
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: refs/pull/${{ github.event.issue.number }}/head
+          # Do not leave the write-scoped token in .git/config, so injected
+          # instructions in the (now same-repo) diff cannot reuse ambient
+          # credentials to push to base-repo branches via the Bash git tool.
+          persist-credentials: false
       - name: Run Claude Code
         uses: anthropics/claude-code-action@v1
         with:
@@ -84,4 +106,7 @@ jobs:
             USER QUERY: ${{ github.event.comment.body }}
 
             IMPORTANT: Before committing any code changes, you MUST run `cargo fmt` to format the code.
-          claude_args: '--allowedTools "Bash(git:*),Bash(cargo fmt:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+          # Narrow git tooling to the specific subcommands needed to stage and
+          # commit changes (no broad `Bash(git:*)`, which would also permit
+          # `git remote`/`git config`/arbitrary push targets).
+          claude_args: '--allowedTools "Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git restore:*),Bash(cargo fmt:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'

@@ -11,8 +11,8 @@ use super::listen::{
     wait_for_listen_ready,
 };
 use super::types::{
-    ConfirmedToolExecutionContext, ListenReady, ListenUpdateContext, ListenWaitParams,
-    ToolCallExecutionContext, ToolExecutionOutcome,
+    ListenReady, ListenUpdateContext, ListenWaitParams, ToolCallExecutionContext,
+    ToolExecutionOutcome,
 };
 use crate::authority::EventAuthority;
 use crate::events::AgentEvent;
@@ -1540,7 +1540,7 @@ where
 pub(super) async fn execute_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
     rejection_reason: Option<String>,
-    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
 ) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1607,7 +1607,7 @@ where
 
 pub(super) async fn handle_confirmed_tool_rejection<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
-    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
     reason: String,
 ) -> Result<ToolResult, AgentError>
 where
@@ -1684,7 +1684,7 @@ where
 
 pub(super) async fn execute_confirmed_tool_inner<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
-    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
 ) -> Result<ToolResult, AgentError>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -1773,7 +1773,7 @@ where
 
 pub(super) async fn finish_confirmed_tool<Ctx, H>(
     awaiting_tool: &PendingToolCallInfo,
-    ctx: &ConfirmedToolExecutionContext<'_, Ctx, H>,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
     result: ToolResult,
 ) -> Result<ToolResult, AgentError>
 where

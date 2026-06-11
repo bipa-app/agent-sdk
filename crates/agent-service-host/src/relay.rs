@@ -129,11 +129,11 @@ fn default_worker_id() -> String {
 /// [`OutboxStore`] for per-thread pending counts when computing the
 /// backlog signal — without modifying the [`Publisher`] trait.
 ///
-/// The set grows monotonically across ticks.  In typical deploys the
-/// thread-id cardinality is bounded by active threads on the box, so
-/// the memory cost is modest; tests assert the wiring works end to
-/// end.  An explicit eviction strategy can be added later if a deploy
-/// finds the working set unbounded.
+/// `publish_row` inserts each thread id; the scheduler's backlog
+/// observation evicts any thread whose pending count has drained to
+/// zero, so the set stays bounded by the *currently-backlogged* thread
+/// cardinality rather than every thread ever published over the host's
+/// lifetime. A later publish re-adds a thread if it accrues new work.
 struct TrackingPublisher {
     inner: Arc<dyn Publisher>,
     observed: Arc<AsyncMutex<HashSet<ThreadId>>>,
@@ -358,92 +358,118 @@ impl RelayScheduler {
         now_fn: impl Fn() -> OffsetDateTime,
     ) {
         info!(worker_id = %self.config.worker_id, "relay steady state starting");
-        let mut reclaim_timer = tokio::time::interval(self.config.reclaim_interval);
         let already_degraded = self
             .health
             .as_ref()
             .is_some_and(|health| health.snapshot().latency_layer == LatencyLayerHealth::Degraded);
         let mut reclaim_degraded = already_degraded;
-        // The first tick fires immediately — skip it so we don't
-        // reclaim right after the startup reclaim already ran.
-        reclaim_timer.tick().await;
+        let mut backlog_breached = false;
+        // The startup reclaim already ran in `run()`, so defer the first
+        // steady-state reclaim by one interval (matching the old
+        // skip-the-immediate-tick behaviour).
+        let mut last_reclaim = Instant::now();
 
         loop {
-            tokio::select! {
+            if cancel.is_cancelled() {
+                info!("relay steady state shutting down");
+                return;
+            }
+
+            // Reclaim + backlog observation run *between* ticks, never in
+            // the same `select!` as a tick. This keeps a reclaim timer
+            // from dropping an in-flight claim→publish→mark tick (which
+            // stranded `Claimed` rows behind the claim-lease and caused
+            // duplicate republishes + spurious "worker crashed" warnings),
+            // and rate-limits the O(observed-threads) backlog sampling to
+            // the reclaim cadence instead of every idle poll tick.
+            if last_reclaim.elapsed() >= self.config.reclaim_interval {
+                reclaim_degraded = self.reclaim_once(now_fn()).await;
+                backlog_breached = self.observe_backlog().await;
+                last_reclaim = Instant::now();
+            }
+
+            // Run the tick to completion, racing only cancellation so no
+            // other timer can drop it mid-flight.
+            let result = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     info!("relay steady state shutting down");
                     return;
                 }
-                _ = reclaim_timer.tick() => {
-                    match self
-                        .store
-                        .reclaim_expired_claims(now_fn(), self.config.claim_lease)
-                        .await
-                    {
-                        Ok(count) if count > 0 => {
-                            warn!(
-                                reclaimed = count,
-                                "reclaimed stale outbox claims — other worker likely crashed",
-                            );
-                            self.metrics.record_relay_reclaim(count);
-                            reclaim_degraded = false;
+                result = self.tick_with_metrics(now_fn()) => result,
+            };
+
+            match result {
+                Ok(tick) if tick.claimed == 0 => {
+                    if backlog_breached {
+                        self.mark_degraded();
+                    } else if !reclaim_degraded {
+                        self.mark_healthy();
+                    }
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            info!("relay steady state shutting down");
+                            return;
                         }
-                        Ok(count) => {
-                            self.metrics.record_relay_reclaim(count);
-                            reclaim_degraded = false;
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "claim reclaim failed");
-                            reclaim_degraded = true;
-                            self.mark_degraded();
-                        }
+                        () = tokio::time::sleep(self.config.poll_interval) => {}
                     }
                 }
-                result = self.tick_with_metrics(now_fn()) => {
-                    match result {
-                        Ok(tick) if tick.claimed == 0 => {
-                            let backlog_breached = self.observe_backlog().await;
-                            if backlog_breached {
-                                self.mark_degraded();
-                            } else if !reclaim_degraded {
-                                self.mark_healthy();
-                            }
-                            tokio::select! {
-                                () = cancel.cancelled() => {
-                                    info!("relay steady state shutting down");
-                                    return;
-                                }
-                                () = tokio::time::sleep(self.config.poll_interval) => {}
-                            }
-                        }
-                        Ok(tick) => {
-                            debug!(
-                                delivered = tick.delivered,
-                                failed = tick.failed,
-                                expired = tick.expired,
-                                claimed = tick.claimed,
-                                "relay steady-state tick",
-                            );
-                            if tick.failed > 0 || tick.expired > 0 {
-                                self.mark_degraded();
-                            } else if !reclaim_degraded {
-                                self.mark_healthy();
-                            }
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "relay tick failed");
-                            self.mark_degraded();
-                            tokio::select! {
-                                () = cancel.cancelled() => {
-                                    info!("relay steady state shutting down");
-                                    return;
-                                }
-                                () = tokio::time::sleep(self.config.poll_interval) => {}
-                            }
-                        }
+                Ok(tick) => {
+                    debug!(
+                        delivered = tick.delivered,
+                        failed = tick.failed,
+                        expired = tick.expired,
+                        claimed = tick.claimed,
+                        "relay steady-state tick",
+                    );
+                    if tick.failed > 0 || tick.expired > 0 {
+                        self.mark_degraded();
+                    } else if !reclaim_degraded {
+                        self.mark_healthy();
                     }
                 }
+                Err(err) => {
+                    warn!(error = %err, "relay tick failed");
+                    self.mark_degraded();
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            info!("relay steady state shutting down");
+                            return;
+                        }
+                        () = tokio::time::sleep(self.config.poll_interval) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run one claim-reclaim sweep and report it to the metrics
+    /// recorder. Returns `true` if the sweep failed and the latency
+    /// layer was degraded as a result.
+    async fn reclaim_once(&self, now: OffsetDateTime) -> bool {
+        match self
+            .store
+            .reclaim_expired_claims(now, self.config.claim_lease)
+            .await
+        {
+            Ok(count) if count > 0 => {
+                warn!(
+                    reclaimed = count,
+                    "reclaimed stale outbox claims — other worker likely crashed",
+                );
+                self.metrics.record_relay_reclaim(count);
+                false
+            }
+            Ok(count) => {
+                self.metrics.record_relay_reclaim(count);
+                false
+            }
+            Err(err) => {
+                warn!(error = %err, "claim reclaim failed");
+                self.mark_degraded();
+                true
             }
         }
     }
@@ -532,8 +558,13 @@ impl RelayScheduler {
             lock.iter().cloned().collect()
         };
         let mut total: u64 = 0;
+        // Threads whose backlog has fully drained are evicted from the
+        // observed set so it cannot grow without bound over the host's
+        // lifetime; a later publish re-adds a thread if it accrues work.
+        let mut drained: Vec<ThreadId> = Vec::new();
         for thread in &threads {
             match self.store.count_pending(thread).await {
+                Ok(0) => drained.push(thread.clone()),
                 Ok(count) => total = total.saturating_add(count),
                 Err(err) => {
                     warn!(
@@ -542,6 +573,12 @@ impl RelayScheduler {
                         "count_pending failed during backlog observation",
                     );
                 }
+            }
+        }
+        if !drained.is_empty() {
+            let mut lock = observed.lock().await;
+            for thread in &drained {
+                lock.remove(thread);
             }
         }
         let soft = self.backlog_threshold.map(|t| t.soft);
@@ -969,20 +1006,22 @@ mod tests {
         async fn mark_delivered(
             &self,
             id: &agent_server::journal::outbox::OutboxRowId,
+            worker_id: &str,
             now: OffsetDateTime,
         ) -> Result<()> {
-            self.inner.mark_delivered(id, now).await
+            self.inner.mark_delivered(id, worker_id, now).await
         }
 
         async fn mark_failed(
             &self,
             id: &agent_server::journal::outbox::OutboxRowId,
+            worker_id: &str,
             error: &str,
             next_attempt_at: OffsetDateTime,
             now: OffsetDateTime,
         ) -> Result<()> {
             self.inner
-                .mark_failed(id, error, next_attempt_at, now)
+                .mark_failed(id, worker_id, error, next_attempt_at, now)
                 .await
         }
 

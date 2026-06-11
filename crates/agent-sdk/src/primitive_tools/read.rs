@@ -7,11 +7,24 @@ use std::sync::Arc;
 
 use super::PrimitiveToolContext;
 
-/// Maximum characters per line before truncation.
+/// Maximum bytes per line before truncation.
 const MAX_LINE_LENGTH: usize = 500;
+
+/// Marker appended to a line that was truncated at `MAX_LINE_LENGTH`.
+const LINE_TRUNCATION_MARKER: &str = "... [line truncated]";
 
 /// Default maximum number of lines to return.
 const DEFAULT_LIMIT: usize = 2000;
+
+/// Maximum size (in bytes) of a text file the tool will read into memory.
+/// Larger files are rejected to avoid loading multi-GB files / dumping huge
+/// payloads into the model context.
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum size (in bytes) of a media file (image/PDF) that will be
+/// base64-encoded and attached. Kept smaller than `MAX_FILE_BYTES` because
+/// base64 inflates the payload (~1.33x) before it reaches the model context.
+const MAX_MEDIA_BYTES: usize = 5 * 1024 * 1024;
 
 pub struct ReadTool<E: Environment> {
     ctx: PrimitiveToolContext<E>,
@@ -100,7 +113,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
-        let input: ReadInput = serde_json::from_value(input.clone())
+        let input: ReadInput = ReadInput::deserialize(&input)
             .with_context(|| format!("Invalid input for read tool: {input}"))?;
 
         if input.offset == 0 {
@@ -152,11 +165,27 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
         // Handle images and PDFs as document attachments (like codex-rs view_image).
         if let Some(media_type) = detect_media_type(&path) {
+            // Cap media attachments before base64-encoding so an oversized
+            // binary cannot be inflated into the model context.
+            if bytes.len() > MAX_MEDIA_BYTES {
+                return Ok(ToolResult::error(format!(
+                    "Media file '{path}' is {} bytes, which exceeds the {MAX_MEDIA_BYTES}-byte attachment limit",
+                    bytes.len()
+                )));
+            }
             let encoded = base64_encode(&bytes);
             return Ok(
                 ToolResult::success(format!("Read {media_type} file: '{path}'"))
                     .with_documents(vec![ContentSource::new(media_type, encoded)]),
             );
+        }
+
+        // Cap text files before formatting them line-by-line.
+        if bytes.len() > MAX_FILE_BYTES {
+            return Ok(ToolResult::error(format!(
+                "File '{path}' is {} bytes, which exceeds the {MAX_FILE_BYTES}-byte read limit; use offset/limit on a smaller range or a different tool",
+                bytes.len()
+            )));
         }
 
         // Text files: lossy UTF-8, line numbers, truncation.
@@ -172,8 +201,10 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 }
 
 fn read_lines(content: &str, offset: usize, limit: usize) -> Vec<String> {
+    let total_lines = content.split('\n').count();
     let mut collected = Vec::new();
     let mut line_number = 0usize;
+    let mut last_emitted = 0usize;
 
     for raw_line in content.split('\n') {
         line_number += 1;
@@ -190,21 +221,28 @@ fn read_lines(content: &str, offset: usize, limit: usize) -> Vec<String> {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let display = truncate_line(line);
         collected.push(format!("L{line_number}: {display}"));
+        last_emitted = line_number;
+    }
+
+    // Unlike a silent stop, tell the model the file continues so it can read
+    // further with offset/limit instead of assuming it saw everything.
+    if !collected.is_empty() && last_emitted < total_lines {
+        collected.push(format!(
+            "... [showing lines {offset}-{last_emitted} of {total_lines}; use offset/limit to read more]"
+        ));
     }
 
     collected
 }
 
-fn truncate_line(line: &str) -> &str {
+fn truncate_line(line: &str) -> String {
     if line.len() <= MAX_LINE_LENGTH {
-        line
+        line.to_string()
     } else {
-        // Find the nearest char boundary at or before MAX_LINE_LENGTH
-        let mut end = MAX_LINE_LENGTH;
-        while end > 0 && !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        &line[..end]
+        format!(
+            "{}{LINE_TRUNCATION_MARKER}",
+            super::truncate_str(line, MAX_LINE_LENGTH)
+        )
     }
 }
 
@@ -290,7 +328,8 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert_eq!(result.output, "L1: alpha\nL2: beta");
+        assert!(result.output.starts_with("L1: alpha\nL2: beta"));
+        assert!(result.output.contains("showing lines 1-2 of 3"));
         Ok(())
     }
 
@@ -309,7 +348,8 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert_eq!(result.output, "L2: beta\nL3: gamma");
+        assert!(result.output.starts_with("L2: beta\nL3: gamma"));
+        assert!(result.output.contains("showing lines 2-3 of 5"));
         Ok(())
     }
 
@@ -327,7 +367,8 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert_eq!(result.output, "L2: beta");
+        assert!(result.output.starts_with("L2: beta"));
+        assert!(result.output.contains("showing lines 2-2 of 3"));
         Ok(())
     }
 
@@ -494,7 +535,8 @@ mod tests {
 
         assert!(result.success);
         let expected = "x".repeat(MAX_LINE_LENGTH);
-        assert_eq!(result.output, format!("L1: {expected}"));
+        assert!(result.output.starts_with(&format!("L1: {expected}")));
+        assert!(result.output.contains(LINE_TRUNCATION_MARKER));
         Ok(())
     }
 
@@ -534,7 +576,12 @@ mod tests {
             .await?;
 
         assert!(result.success);
-        assert_eq!(result.output, "L50: line 50\nL51: line 51\nL52: line 52");
+        assert!(
+            result
+                .output
+                .starts_with("L50: line 50\nL51: line 51\nL52: line 52")
+        );
+        assert!(result.output.contains("showing lines 50-52 of 100"));
         Ok(())
     }
 
@@ -568,7 +615,27 @@ mod tests {
     #[test]
     fn read_lines_with_offset_and_limit() {
         let lines = read_lines("a\nb\nc\nd\ne", 2, 2);
-        assert_eq!(lines, vec!["L2: b".to_string(), "L3: c".to_string()]);
+        assert_eq!(
+            lines,
+            vec![
+                "L2: b".to_string(),
+                "L3: c".to_string(),
+                "... [showing lines 2-3 of 5; use offset/limit to read more]".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_lines_no_continuation_marker_when_complete() {
+        let lines = read_lines("a\nb\nc", 1, 2000);
+        assert_eq!(
+            lines,
+            vec![
+                "L1: a".to_string(),
+                "L2: b".to_string(),
+                "L3: c".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -637,5 +704,52 @@ mod tests {
         assert!(result.success);
         assert!(result.documents.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_text_file() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let big = vec![b'a'; MAX_FILE_BYTES + 1];
+        fs.write_file_bytes("big.txt", &big).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/big.txt"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("read limit"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_media_file() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let big = vec![0u8; MAX_MEDIA_BYTES + 1];
+        fs.write_file_bytes("big.png", &big).await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/big.png"}))
+            .await?;
+
+        // Must fail before base64-encoding and never attach a document.
+        assert!(!result.success);
+        assert!(result.output.contains("attachment limit"));
+        assert!(result.documents.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_line_appends_marker() {
+        let long = "x".repeat(MAX_LINE_LENGTH + 10);
+        let out = truncate_line(&long);
+        assert!(out.starts_with(&"x".repeat(MAX_LINE_LENGTH)));
+        assert!(out.ends_with(LINE_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn truncate_line_short_unchanged() {
+        assert_eq!(truncate_line("short"), "short");
     }
 }
