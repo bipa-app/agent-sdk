@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.2...agent-sdk-providers-v0.10.0) - 2026-06-11
+
+### Added
+
+- [**breaking**] deep-review fix sweep — 272 findings across all crates ([#306](https://github.com/bipa-app/agent-sdk/pull/306))
+
+### Fixed
+
+- *(providers)* preserve streamed openai usage ([#305](https://github.com/bipa-app/agent-sdk/pull/305))
+
+### Other
+
+- release v0.9.3 ([#307](https://github.com/bipa-app/agent-sdk/pull/307))
+
 ## [0.9.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.1...agent-sdk-providers-v0.9.2) - 2026-06-09
 
 ### Added

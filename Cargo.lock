@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "agent-sdk-foundation",
  "agent-sdk-macros",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-cli"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-foundation"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "insta",
  "proptest",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-macros"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-otel"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "agent-sdk",
  "anyhow",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-providers"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk-tools"
-version = "0.9.2"
+version = "0.10.0"
 dependencies = [
  "agent-sdk-foundation",
  "anyhow",
@@ -691,9 +691,9 @@ dependencies = [
 
 [[package]]
 name = "block-buffer"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
 ]
@@ -1169,7 +1169,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
- "block-buffer 0.12.0",
+ "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -2075,9 +2075,9 @@ dependencies = [
 
 [[package]]
 name = "insta"
-version = "1.47.2"
+version = "1.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4a6248eb93a4401ed2f37dfe8ea592d3cf05b7cf4f8efa867b6895af7e094e"
+checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
 dependencies = [
  "console",
  "once_cell",
@@ -5628,18 +5628,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.51"
+version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e5361301a1d9e5dd94c524eb99365fbaed5b237e831d7f45e2ddea11ffe8627"
+checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.51"
+version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "422033a2245cb4b6ff8def11b2dfaf184a2ab2573f5af28082a163a68889af0e"
+checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
 dependencies = [
  "proc-macro2",
  "quote",
