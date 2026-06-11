@@ -41,13 +41,18 @@ const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 ///
 /// Without this, a streamable-HTTP server that holds an SSE stream open (with
 /// keep-alive comments) would block a request forever. Matches the stdio
-/// transport's default response timeout.
-const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
+/// transport's default response timeout. Override per poster with
+/// [`ReqwestPoster::with_timeout`].
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Overall deadline applied around each [`HttpPoster::post`] call in
-/// [`StreamableHttpTransport`], independent of the underlying client's own
-/// timeout, so `send`/`send_notification` always have a cancellation path.
-const SEND_DEADLINE: Duration = Duration::from_mins(1);
+/// Default per-request send deadline for [`StreamableHttpTransport`] (60s).
+///
+/// Applied around each [`HttpPoster::post`] call, independent of the underlying
+/// client's own timeout, so `send`/`send_notification` always have a
+/// cancellation path. Override per transport with
+/// [`StreamableHttpTransport::with_request_timeout`] or
+/// [`StreamableHttpTransport::with_timeout`].
+pub const DEFAULT_SEND_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Maximum response body the [`ReqwestPoster`] will buffer. An endless SSE
 /// stream would otherwise grow memory without bound.
@@ -159,6 +164,10 @@ pub struct StreamableHttpTransport {
     session_id: RwLock<Option<String>>,
     /// Protocol revision negotiated during `initialize`.
     protocol_version: RwLock<Option<String>>,
+    /// Overall deadline applied around each [`HttpPoster::post`] call so a
+    /// slow, hung, or keep-alive SSE server can never wedge a turn. Defaults to
+    /// [`DEFAULT_SEND_DEADLINE`]; set via [`StreamableHttpTransport::with_request_timeout`].
+    send_deadline: Duration,
 }
 
 impl StreamableHttpTransport {
@@ -169,6 +178,29 @@ impl StreamableHttpTransport {
     /// Returns an error if the underlying HTTP client cannot be built.
     pub fn new(endpoint: impl Into<String>, auth: McpAuth) -> Result<Arc<Self>> {
         Ok(Arc::new(Self::builder(endpoint, auth)?))
+    }
+
+    /// Create a transport over real HTTP with a custom per-request timeout.
+    ///
+    /// Sets *both* the underlying reqwest client's request timeout and the
+    /// transport-level send deadline to `request_timeout`, so a slow or hung
+    /// streamable-HTTP server trips this deadline instead of the
+    /// [`DEFAULT_SEND_DEADLINE`] / [`DEFAULT_HTTP_TIMEOUT`] defaults. MCP tool
+    /// calls routinely exceed 60s (builds, codegen); raise the timeout for
+    /// those servers, or lower it for latency-sensitive ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be built.
+    pub fn with_timeout(
+        endpoint: impl Into<String>,
+        auth: McpAuth,
+        request_timeout: Duration,
+    ) -> Result<Arc<Self>> {
+        let poster = ReqwestPoster::with_timeout(endpoint, request_timeout)?;
+        Ok(Arc::new(
+            Self::with_poster_owned(Arc::new(poster), auth).with_request_timeout(request_timeout),
+        ))
     }
 
     /// Create a transport backed by a custom [`HttpPoster`].
@@ -218,6 +250,7 @@ impl StreamableHttpTransport {
             next_id: AtomicU64::new(1),
             session_id: RwLock::new(None),
             protocol_version: RwLock::new(None),
+            send_deadline: DEFAULT_SEND_DEADLINE,
         }
     }
 
@@ -229,6 +262,21 @@ impl StreamableHttpTransport {
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the overall per-request send deadline (default
+    /// [`DEFAULT_SEND_DEADLINE`]).
+    ///
+    /// This bounds every [`McpTransport::send`] / `send_notification` call
+    /// regardless of the underlying [`HttpPoster`]'s own timeout, so a custom
+    /// poster (or a [`ReqwestPoster`] whose client timeout is longer) still has
+    /// a guaranteed cancellation path. Call it on an un-wrapped transport from
+    /// [`StreamableHttpTransport::builder`] or
+    /// [`StreamableHttpTransport::with_poster_owned`] before wrapping in `Arc`.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.send_deadline = request_timeout;
         self
     }
 
@@ -254,6 +302,15 @@ impl StreamableHttpTransport {
                 *guard = Some(sid.clone());
             }
         }
+    }
+
+    /// Overall send deadline configured on this transport.
+    ///
+    /// Test-only accessor used to assert the builder stores the caller's value
+    /// (or the documented default when none is given).
+    #[cfg(test)]
+    const fn send_deadline(&self) -> Duration {
+        self.send_deadline
     }
 }
 
@@ -353,7 +410,7 @@ impl McpTransport for StreamableHttpTransport {
         let body = serde_json::to_string(&request).context("failed to serialize MCP request")?;
         let http_request = self.build_http_request(body).await;
         // Overall deadline so a hung/keep-alive server can never wedge a turn.
-        let reply = tokio::time::timeout(SEND_DEADLINE, self.poster.post(http_request))
+        let reply = tokio::time::timeout(self.send_deadline, self.poster.post(http_request))
             .await
             .context("MCP HTTP request timed out")??;
         self.capture_session_id(&reply).await;
@@ -374,7 +431,7 @@ impl McpTransport for StreamableHttpTransport {
         request.id = RequestId::Number(id);
         let body = notification_body(&request)?;
         let http_request = self.build_http_request(body).await;
-        let reply = tokio::time::timeout(SEND_DEADLINE, self.poster.post(http_request))
+        let reply = tokio::time::timeout(self.send_deadline, self.poster.post(http_request))
             .await
             .context("MCP HTTP request timed out")??;
         self.capture_session_id(&reply).await;
@@ -409,8 +466,18 @@ impl ReqwestPoster {
     ///
     /// Returns an error if the HTTP client cannot be constructed.
     pub fn new(endpoint: impl Into<String>) -> Result<Self> {
+        Self::with_timeout(endpoint, DEFAULT_HTTP_TIMEOUT)
+    }
+
+    /// Build a reqwest-backed poster for `endpoint` with a custom request
+    /// timeout instead of [`DEFAULT_HTTP_TIMEOUT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be constructed.
+    pub fn with_timeout(endpoint: impl Into<String>, timeout: Duration) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(DEFAULT_HTTP_TIMEOUT)
+            .timeout(timeout)
             .build()
             .context("failed to build MCP HTTP client")?;
         Ok(Self {
@@ -557,6 +624,71 @@ mod tests {
         let reply = HttpReply::event_stream(body.to_string());
         let resp = parse_reply(&reply, &RequestId::Number(4)).expect("parse");
         assert_eq!(resp.id, RequestId::Number(4));
+    }
+
+    /// The transport defaults to the documented send deadline, and
+    /// `with_request_timeout` overrides it.
+    #[test]
+    fn send_deadline_defaults_and_overrides() {
+        let poster = Arc::new(CapturingPoster {
+            last_body: std::sync::Mutex::new(None),
+        });
+        let default = StreamableHttpTransport::with_poster_owned(poster.clone(), McpAuth::None);
+        assert_eq!(default.send_deadline(), DEFAULT_SEND_DEADLINE);
+
+        let custom = StreamableHttpTransport::with_poster_owned(poster, McpAuth::None)
+            .with_request_timeout(Duration::from_millis(250));
+        assert_eq!(custom.send_deadline(), Duration::from_millis(250));
+    }
+
+    /// `ReqwestPoster::with_timeout` and `StreamableHttpTransport::with_timeout`
+    /// must build successfully and the transport must record the configured
+    /// deadline.
+    #[test]
+    fn reqwest_with_timeout_builds_and_transport_records_deadline() -> Result<()> {
+        ReqwestPoster::with_timeout("https://example.com/mcp", Duration::from_secs(5))?;
+        let transport = StreamableHttpTransport::with_timeout(
+            "https://example.com/mcp",
+            McpAuth::None,
+            Duration::from_secs(5),
+        )?;
+        assert_eq!(transport.send_deadline(), Duration::from_secs(5));
+        Ok(())
+    }
+
+    /// A poster that stalls forever must trip the configured send deadline
+    /// quickly rather than blocking for the full default minute.
+    #[tokio::test]
+    async fn configured_send_deadline_fails_fast() -> Result<()> {
+        struct StallingPoster;
+
+        #[async_trait]
+        impl HttpPoster for StallingPoster {
+            async fn post(&self, _request: HttpRequest) -> Result<HttpReply> {
+                // Far longer than the configured deadline; the outer timeout
+                // cancels this future well before it resolves.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(HttpReply::json("{}"))
+            }
+        }
+
+        let transport = Arc::new(
+            StreamableHttpTransport::with_poster_owned(Arc::new(StallingPoster), McpAuth::None)
+                .with_request_timeout(Duration::from_millis(50)),
+        );
+
+        let started = std::time::Instant::now();
+        let result = transport.send(JsonRpcRequest::new("ping", None, 0)).await;
+        assert!(
+            result.is_err(),
+            "a stalled server must trip the configured send deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must fail fast at the configured deadline, not wait the default minute (elapsed {:?})",
+            started.elapsed(),
+        );
+        Ok(())
     }
 
     #[test]
