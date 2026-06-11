@@ -26,15 +26,32 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
-use super::transport::McpTransport;
+use super::transport::{McpTransport, notification_body};
 
 /// Header carrying the MCP session id assigned by the server.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 /// Header carrying the negotiated MCP protocol revision.
 const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+
+/// Default request timeout for the reqwest client backing [`ReqwestPoster`].
+///
+/// Without this, a streamable-HTTP server that holds an SSE stream open (with
+/// keep-alive comments) would block a request forever. Matches the stdio
+/// transport's default response timeout.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Overall deadline applied around each [`HttpPoster::post`] call in
+/// [`StreamableHttpTransport`], independent of the underlying client's own
+/// timeout, so `send`/`send_notification` always have a cancellation path.
+const SEND_DEADLINE: Duration = Duration::from_mins(1);
+
+/// Maximum response body the [`ReqwestPoster`] will buffer. An endless SSE
+/// stream would otherwise grow memory without bound.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// A single HTTP response from an MCP endpoint, normalised across the two
 /// streamable-HTTP body shapes.
@@ -151,8 +168,7 @@ impl StreamableHttpTransport {
     ///
     /// Returns an error if the underlying HTTP client cannot be built.
     pub fn new(endpoint: impl Into<String>, auth: McpAuth) -> Result<Arc<Self>> {
-        let poster = ReqwestPoster::new(endpoint)?;
-        Ok(Self::with_poster(Arc::new(poster), auth))
+        Ok(Arc::new(Self::builder(endpoint, auth)?))
     }
 
     /// Create a transport backed by a custom [`HttpPoster`].
@@ -161,17 +177,55 @@ impl StreamableHttpTransport {
     /// network.
     #[must_use]
     pub fn with_poster(poster: Arc<dyn HttpPoster>, auth: McpAuth) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::with_poster_owned(poster, auth))
+    }
+
+    /// Create an un-wrapped transport over real HTTP for further builder-style
+    /// configuration (e.g. [`StreamableHttpTransport::with_header`]).
+    ///
+    /// Wrap the result in `Arc` before handing it to `McpClient::new`:
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use agent_sdk::mcp::{McpAuth, StreamableHttpTransport};
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let transport = Arc::new(
+    ///     StreamableHttpTransport::builder("https://example.com/mcp", McpAuth::None)?
+    ///         .with_header("X-Tenant-Id", "acme"),
+    /// );
+    /// # let _ = transport;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be built.
+    pub fn builder(endpoint: impl Into<String>, auth: McpAuth) -> Result<Self> {
+        let poster = ReqwestPoster::new(endpoint)?;
+        Ok(Self::with_poster_owned(Arc::new(poster), auth))
+    }
+
+    /// Create an un-wrapped transport backed by a custom [`HttpPoster`], for
+    /// further builder-style configuration before wrapping in `Arc`.
+    #[must_use]
+    pub fn with_poster_owned(poster: Arc<dyn HttpPoster>, auth: McpAuth) -> Self {
+        Self {
             poster,
             auth,
             extra_headers: Vec::new(),
             next_id: AtomicU64::new(1),
             session_id: RwLock::new(None),
             protocol_version: RwLock::new(None),
-        })
+        }
     }
 
     /// Add a static custom header sent on every request (e.g. a tenant id).
+    ///
+    /// Call this on an un-wrapped transport from [`StreamableHttpTransport::builder`]
+    /// (or [`StreamableHttpTransport::with_poster_owned`]) before wrapping it in
+    /// `Arc`.
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
@@ -218,31 +272,55 @@ fn parse_reply(reply: &HttpReply, id: &RequestId) -> Result<JsonRpcResponse> {
     }
 }
 
+/// Compare two JSON-RPC ids, tolerating a server that echoes a numeric id as a
+/// string (or vice-versa) — but nothing looser.
+fn ids_match(a: &RequestId, b: &RequestId) -> bool {
+    match (a, b) {
+        (RequestId::Number(x), RequestId::Number(y)) => x == y,
+        (RequestId::String(x), RequestId::String(y)) => x == y,
+        (RequestId::Number(n), RequestId::String(s))
+        | (RequestId::String(s), RequestId::Number(n)) => s.parse::<u64>().ok() == Some(*n),
+    }
+}
+
 /// Extract the matching JSON-RPC response from an SSE body.
+///
+/// Returns the first `data:` payload that parses as a [`JsonRpcResponse`] whose
+/// `id` matches `id`. Server-initiated requests/notifications carried on the
+/// same stream (sampling, roots/list, elicitation — all of which include a
+/// `method` field) are skipped, and a message whose id does not match is *not*
+/// substituted as a fallback: if nothing matches, this is an error rather than
+/// silently returning the wrong message as the reply.
 fn parse_sse_response(body: &str, id: &RequestId) -> Result<JsonRpcResponse> {
     let mut data_buf = String::new();
-    let mut last_parsed: Option<JsonRpcResponse> = None;
 
-    let flush =
-        |data: &mut String, last: &mut Option<JsonRpcResponse>| -> Option<JsonRpcResponse> {
-            if data.is_empty() {
-                return None;
-            }
-            let raw = std::mem::take(data);
-            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(raw.trim()) {
-                if &resp.id == id {
-                    return Some(resp);
-                }
-                *last = Some(resp);
-            }
-            None
-        };
+    let try_match = |data: &mut String| -> Option<JsonRpcResponse> {
+        if data.is_empty() {
+            return None;
+        }
+        let raw = std::mem::take(data);
+        let trimmed = raw.trim();
+        // Skip server-initiated requests/notifications: those carry a `method`
+        // and are not a reply to our request, even though they deserialize into
+        // `JsonRpcResponse` (result/error both optional, unknown fields ignored).
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && value.get("method").is_some()
+        {
+            return None;
+        }
+        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed)
+            && ids_match(&resp.id, id)
+        {
+            return Some(resp);
+        }
+        None
+    };
 
     for line in body.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             // Event boundary: attempt to resolve the accumulated data block.
-            if let Some(resp) = flush(&mut data_buf, &mut last_parsed) {
+            if let Some(resp) = try_match(&mut data_buf) {
                 return Ok(resp);
             }
             continue;
@@ -258,11 +336,11 @@ fn parse_sse_response(body: &str, id: &RequestId) -> Result<JsonRpcResponse> {
         // Other SSE fields (`event:`, `id:`, comments) are ignored.
     }
     // Flush any trailing event with no terminating blank line.
-    if let Some(resp) = flush(&mut data_buf, &mut last_parsed) {
+    if let Some(resp) = try_match(&mut data_buf) {
         return Ok(resp);
     }
 
-    last_parsed.context("SSE stream contained no JSON-RPC response matching the request id")
+    bail!("SSE stream contained no JSON-RPC response matching the request id")
 }
 
 #[async_trait]
@@ -274,7 +352,10 @@ impl McpTransport for StreamableHttpTransport {
 
         let body = serde_json::to_string(&request).context("failed to serialize MCP request")?;
         let http_request = self.build_http_request(body).await;
-        let reply = self.poster.post(http_request).await?;
+        // Overall deadline so a hung/keep-alive server can never wedge a turn.
+        let reply = tokio::time::timeout(SEND_DEADLINE, self.poster.post(http_request))
+            .await
+            .context("MCP HTTP request timed out")??;
         self.capture_session_id(&reply).await;
 
         let response = parse_reply(&reply, &request_id)?;
@@ -286,13 +367,16 @@ impl McpTransport for StreamableHttpTransport {
     }
 
     async fn send_notification(&self, mut request: JsonRpcRequest) -> Result<()> {
-        // Notifications carry no id per JSON-RPC, but our request type requires
-        // one for serialization; the server ignores it for notification methods.
+        // Advance the shared id counter so request ids stay monotonic across the
+        // connection, but strip the id on the wire: JSON-RPC 2.0 / MCP
+        // notifications must not carry one.
         let id = self.next_request_id();
         request.id = RequestId::Number(id);
-        let body = serde_json::to_string(&request).context("failed to serialize MCP request")?;
+        let body = notification_body(&request)?;
         let http_request = self.build_http_request(body).await;
-        let reply = self.poster.post(http_request).await?;
+        let reply = tokio::time::timeout(SEND_DEADLINE, self.poster.post(http_request))
+            .await
+            .context("MCP HTTP request timed out")??;
         self.capture_session_id(&reply).await;
         Ok(())
     }
@@ -316,11 +400,17 @@ pub struct ReqwestPoster {
 impl ReqwestPoster {
     /// Build a reqwest-backed poster for `endpoint`.
     ///
+    /// The client is given a default request timeout
+    /// (`DEFAULT_HTTP_TIMEOUT`) so a slow, hung, or keep-alive SSE server
+    /// cannot block a request forever. Use [`ReqwestPoster::with_client`] to
+    /// supply a client with different settings.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be constructed.
     pub fn new(endpoint: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()
             .context("failed to build MCP HTTP client")?;
         Ok(Self {
@@ -366,7 +456,7 @@ impl HttpPoster for ReqwestPoster {
             builder = builder.header(name, value);
         }
 
-        let response = builder
+        let mut response = builder
             .send()
             .await
             .context("MCP HTTP request failed to send")?;
@@ -386,10 +476,20 @@ impl HttpPoster for ReqwestPoster {
                 |s| s.split(';').next().unwrap_or(s).trim().to_lowercase(),
             );
 
-        let body = response
-            .text()
+        // Read the body incrementally with a hard cap so an endless SSE stream
+        // (kept open with keep-alive comments) cannot grow memory without bound.
+        let mut body_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("failed to read MCP HTTP response body")?;
+            .context("failed to read MCP HTTP response body")?
+        {
+            if body_bytes.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+                bail!("MCP HTTP response body exceeds {MAX_RESPONSE_BODY_BYTES} bytes");
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
         if !status.is_success() {
             bail!("MCP HTTP request returned status {status}: {body}");
@@ -466,5 +566,157 @@ mod tests {
             McpAuth::Bearer("tok".to_string()).header_value().as_deref(),
             Some("Bearer tok"),
         );
+    }
+
+    /// Regression test for finding 8: an SSE stream that contains no message
+    /// matching the request id must error, not return a non-matching message as
+    /// a fallback (which previously masked server-initiated messages as the
+    /// reply).
+    #[test]
+    fn parse_sse_no_matching_id_is_error() {
+        let body = format!(
+            "data: {}\n\n",
+            ok_response(99, &serde_json::json!({"x": 1}))
+        );
+        let reply = HttpReply::event_stream(body);
+        let result = parse_reply(&reply, &RequestId::Number(3));
+        assert!(
+            result.is_err(),
+            "a stream with no matching id must error rather than return a fallback"
+        );
+    }
+
+    /// Regression test for finding 8: a server-initiated request carried on the
+    /// stream (it has a `method` and even shares our id) must be skipped, and
+    /// the real reply returned.
+    #[test]
+    fn parse_sse_skips_server_request_with_method() -> Result<()> {
+        let server_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "sampling/createMessage",
+            "params": {},
+        })
+        .to_string();
+        let body = format!(
+            "data: {server_request}\n\ndata: {}\n\n",
+            ok_response(3, &serde_json::json!({"answer": 42})),
+        );
+        let reply = HttpReply::event_stream(body);
+        let resp = parse_reply(&reply, &RequestId::Number(3))?;
+        assert_eq!(resp.id, RequestId::Number(3));
+        assert!(
+            resp.result().is_some(),
+            "must return the real reply, not the server request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ids_match_coerces_numeric_string() {
+        assert!(ids_match(&RequestId::Number(5), &RequestId::Number(5)));
+        assert!(ids_match(
+            &RequestId::Number(5),
+            &RequestId::String("5".to_string())
+        ));
+        assert!(ids_match(
+            &RequestId::String("5".to_string()),
+            &RequestId::Number(5)
+        ));
+        assert!(!ids_match(
+            &RequestId::Number(5),
+            &RequestId::String("six".to_string())
+        ));
+        assert!(!ids_match(&RequestId::Number(5), &RequestId::Number(6)));
+    }
+
+    /// Poster that records the most recent body it was asked to POST.
+    struct CapturingPoster {
+        last_body: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl HttpPoster for CapturingPoster {
+        async fn post(&self, request: HttpRequest) -> Result<HttpReply> {
+            *self
+                .last_body
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.body);
+            Ok(HttpReply::json(ok_response(1, &serde_json::json!({}))))
+        }
+    }
+
+    /// Regression test for finding 13: HTTP notifications must be serialized
+    /// without an `id`.
+    #[tokio::test]
+    async fn send_notification_omits_id() -> Result<()> {
+        let poster = Arc::new(CapturingPoster {
+            last_body: std::sync::Mutex::new(None),
+        });
+        let transport = StreamableHttpTransport::with_poster(poster.clone(), McpAuth::None);
+
+        transport
+            .send_notification(JsonRpcRequest::new("notifications/initialized", None, 0))
+            .await?;
+
+        let body = poster
+            .last_body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .context("no body captured")?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        assert!(
+            value.get("id").is_none(),
+            "notification must not carry an id, got: {body}"
+        );
+        assert_eq!(
+            value.get("method").and_then(serde_json::Value::as_str),
+            Some("notifications/initialized")
+        );
+        Ok(())
+    }
+
+    /// `with_header` must be reachable via the builder and the header must be
+    /// forwarded on requests (finding 7).
+    #[tokio::test]
+    async fn builder_with_header_is_forwarded() -> Result<()> {
+        struct HeaderCapturingPoster {
+            headers: std::sync::Mutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl HttpPoster for HeaderCapturingPoster {
+            async fn post(&self, request: HttpRequest) -> Result<HttpReply> {
+                *self
+                    .headers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = request.extra_headers;
+                Ok(HttpReply::json(ok_response(1, &serde_json::json!({}))))
+            }
+        }
+
+        let poster = Arc::new(HeaderCapturingPoster {
+            headers: std::sync::Mutex::new(Vec::new()),
+        });
+        let transport = Arc::new(
+            StreamableHttpTransport::with_poster_owned(poster.clone(), McpAuth::None)
+                .with_header("X-Tenant-Id", "acme"),
+        );
+
+        transport.send(JsonRpcRequest::new("ping", None, 0)).await?;
+
+        let headers = poster
+            .headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "X-Tenant-Id" && v == "acme"),
+            "custom header set via builder must be forwarded, got: {headers:?}"
+        );
+        Ok(())
     }
 }

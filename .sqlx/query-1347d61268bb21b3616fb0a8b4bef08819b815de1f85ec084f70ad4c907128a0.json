@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)\n               VALUES (?1, ?2, ?3, ?4, ?5)\n               ON CONFLICT (request_id) DO UPDATE\n                   SET result_json = excluded.result_json\n                   WHERE result_json = 'null'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "1347d61268bb21b3616fb0a8b4bef08819b815de1f85ec084f70ad4c907128a0"
+}

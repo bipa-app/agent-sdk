@@ -26,6 +26,10 @@
 //!     environment: fs,
 //!     capabilities: AgentCapabilities::full_access(),
 //!     todo_state: Some(Arc::new(RwLock::new(TodoState::new()))),
+//!     // `link_fetch` only exists when the `web` feature is enabled, so the
+//!     // field is gated to keep this example compiling under default features
+//!     // (`cargo test --doc -p agent-sdk`).
+//!     #[cfg(feature = "web")]
 //!     link_fetch: true,
 //! });
 //! ```

@@ -5,9 +5,67 @@
 //! and [`StreamAccumulator`] helps collect these events into a final response.
 
 use agent_sdk_foundation::llm::{ContentBlock, StopReason, Usage};
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+use bytes::BytesMut;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
+
+/// Upper bound on the block index [`StreamAccumulator`] will materialize.
+///
+/// `block_index` is taken verbatim from provider wire data (the SSE `index`
+/// field) and `base_url` is user-configurable (any OpenAI-compatible endpoint),
+/// so a corrupted or hostile event carrying a huge index could otherwise drive
+/// an unbounded `Vec` allocation and exhaust host memory. Text/thinking deltas
+/// whose index exceeds this bound are dropped with a warning rather than grown
+/// into.
+const MAX_BLOCK_INDEX: usize = 4096;
+
+/// Incremental splitter for line-delimited SSE byte streams.
+///
+/// `reqwest`'s `bytes_stream` yields arbitrary byte boundaries, so a multi-byte
+/// UTF-8 character can land split across two network chunks. Decoding each raw
+/// chunk independently with `String::from_utf8_lossy` permanently corrupts such
+/// characters into `U+FFFD` in user-visible text deltas. This buffer instead
+/// accumulates raw bytes and only UTF-8-decodes *complete* lines (terminated by
+/// `\n`); because a newline byte (`0x0A`) can never be part of a multi-byte
+/// UTF-8 sequence, the end of a complete line is always a valid character
+/// boundary and decodes losslessly.
+///
+/// It also avoids the quadratic `buffer = buffer[pos + 1..].to_string()` copy of
+/// the naive splitter: [`BytesMut::split_to`] advances the read cursor without
+/// copying the unconsumed tail, so splitting is amortized O(1) per line instead
+/// of O(remaining-buffer).
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+#[derive(Debug, Default)]
+pub(crate) struct SseLineBuffer {
+    buf: BytesMut,
+}
+
+#[cfg(any(feature = "openai", feature = "openai-codex"))]
+impl SseLineBuffer {
+    /// Create an empty buffer.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a freshly received network chunk.
+    pub(crate) fn extend(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Pop the next complete line (without its trailing `\n`), or `None` when no
+    /// full line is buffered yet. Incomplete trailing bytes — including a
+    /// multi-byte character split across a chunk boundary — stay buffered for the
+    /// next call.
+    pub(crate) fn next_line(&mut self) -> Option<String> {
+        let newline = self.buf.iter().position(|&b| b == b'\n')?;
+        let mut line = self.buf.split_to(newline + 1);
+        line.truncate(newline);
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+}
 
 /// Events yielded during streaming LLM responses.
 ///
@@ -183,12 +241,24 @@ impl StreamAccumulator {
     pub fn apply(&mut self, delta: &StreamDelta) {
         match delta {
             StreamDelta::TextDelta { delta, block_index } => {
+                if *block_index > MAX_BLOCK_INDEX {
+                    log::warn!(
+                        "dropping TextDelta with out-of-range block_index {block_index} (max {MAX_BLOCK_INDEX})"
+                    );
+                    return;
+                }
                 while self.text_blocks.len() <= *block_index {
                     self.text_blocks.push(String::new());
                 }
                 self.text_blocks[*block_index].push_str(delta);
             }
             StreamDelta::ThinkingDelta { delta, block_index } => {
+                if *block_index > MAX_BLOCK_INDEX {
+                    log::warn!(
+                        "dropping ThinkingDelta with out-of-range block_index {block_index} (max {MAX_BLOCK_INDEX})"
+                    );
+                    return;
+                }
                 while self.thinking_blocks.len() <= *block_index {
                     self.thinking_blocks.push(String::new());
                 }
@@ -566,5 +636,67 @@ mod tests {
         let blocks = acc.into_content_blocks();
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
+    }
+
+    #[test]
+    fn test_accumulator_ignores_out_of_range_block_index() {
+        // A hostile/corrupted event with a huge block_index must not drive an
+        // unbounded Vec allocation. The delta is dropped, leaving the accumulator
+        // tiny rather than allocating billions of empty Strings.
+        let mut acc = StreamAccumulator::new();
+
+        acc.apply(&StreamDelta::TextDelta {
+            delta: "ok".to_string(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::TextDelta {
+            delta: "boom".to_string(),
+            block_index: usize::MAX,
+        });
+        acc.apply(&StreamDelta::ThinkingDelta {
+            delta: "boom".to_string(),
+            block_index: usize::MAX,
+        });
+
+        let blocks = acc.into_content_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "ok"));
+    }
+
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    #[test]
+    fn test_sse_line_buffer_splits_multiple_lines() {
+        let mut buf = SseLineBuffer::new();
+        buf.extend(b"data: one\ndata: two\n");
+        assert_eq!(buf.next_line().as_deref(), Some("data: one"));
+        assert_eq!(buf.next_line().as_deref(), Some("data: two"));
+        assert_eq!(buf.next_line(), None);
+    }
+
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    #[test]
+    fn test_sse_line_buffer_buffers_partial_line_until_newline() {
+        let mut buf = SseLineBuffer::new();
+        buf.extend(b"data: par");
+        assert_eq!(buf.next_line(), None);
+        buf.extend(b"tial\n");
+        assert_eq!(buf.next_line().as_deref(), Some("data: partial"));
+    }
+
+    #[cfg(any(feature = "openai", feature = "openai-codex"))]
+    #[test]
+    fn test_sse_line_buffer_handles_utf8_split_across_chunks() {
+        // "café" — the 'é' is the two bytes 0xC3 0xA9. Split the chunk boundary
+        // *inside* that character: the naive per-chunk from_utf8_lossy would emit
+        // a U+FFFD replacement char; the line buffer must decode it losslessly
+        // because it only decodes the complete line.
+        let mut buf = SseLineBuffer::new();
+        let line = "data: café\n";
+        let bytes = line.as_bytes();
+        let split = bytes.len() - 2; // between 0xC3 and 0xA9
+        buf.extend(&bytes[..split]);
+        assert_eq!(buf.next_line(), None);
+        buf.extend(&bytes[split..]);
+        assert_eq!(buf.next_line().as_deref(), Some("data: café"));
     }
 }

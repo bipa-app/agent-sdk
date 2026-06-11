@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk-macros"
-version = "0.9.3"
+version = "0.9.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,15 @@ authors.workspace = true
 # it must be on crates.io for `agent-sdk` to publish. release-plz publishes it
 # before `agent-sdk` in dependency order.
 description = "Ergonomic derive/declarative macros for the Agent SDK (#[derive(Tool)], #[derive(TypedTool)], tool!, #[derive(ToolName)])"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "macros"]
 categories = ["development-tools::procedural-macro-helpers"]
+
+# docs.rs builds every feature and turns on the `--cfg docsrs` feature-badge
+# annotations, matching the other published crates.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 proc-macro = true

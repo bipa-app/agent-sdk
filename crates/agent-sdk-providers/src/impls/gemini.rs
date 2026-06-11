@@ -20,6 +20,30 @@ use reqwest::StatusCode;
 
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// Connect timeout for the HTTP client (matches Anthropic/Vertex).
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// TCP keepalive interval to keep long streaming connections from dropping.
+const TCP_KEEPALIVE_SECS: u64 = 30;
+/// Per-request read timeout for the **non-streaming** `chat()` path. Bounds a
+/// black-holed endpoint so a single turn cannot hang the agent loop forever.
+/// Streaming requests intentionally have no overall timeout.
+const CHAT_READ_TIMEOUT_SECS: u64 = 300;
+
+/// Build the shared HTTP client with connect + keepalive timeouts, falling back
+/// to a default client (with a logged warning) if the builder fails.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .tcp_keepalive(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .build()
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "failed to build Gemini HTTP client with timeouts ({error}); using default client"
+            );
+            reqwest::Client::new()
+        })
+}
+
 // Gemini 3.1 series
 pub const MODEL_GEMINI_31_PRO: &str = "gemini-3.1-pro-preview";
 pub const MODEL_GEMINI_31_FLASH_LITE: &str = "gemini-3.1-flash-lite-preview";
@@ -61,13 +85,27 @@ impl GeminiProvider {
     #[must_use]
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: API_BASE_URL.to_owned(),
             thinking: None,
             use_header_auth: true,
             extra_headers: Vec::new(),
+        }
+    }
+
+    /// Effective output-token budget for a request.
+    ///
+    /// Mirrors the Anthropic provider: when the caller did not explicitly set
+    /// `max_tokens`, substitute the provider/model default
+    /// ([`default_max_tokens`](LlmProvider::default_max_tokens)) instead of
+    /// silently capping at `ChatRequest::DEFAULT_MAX_TOKENS`.
+    fn effective_max_tokens(&self, request: &ChatRequest) -> u32 {
+        if request.max_tokens_explicit {
+            request.max_tokens
+        } else {
+            self.default_max_tokens()
         }
     }
 
@@ -183,7 +221,10 @@ impl LlmProvider for GeminiProvider {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
         let contents = build_api_contents(&request.messages);
-        let tools = request.tools.map(convert_tools_to_config);
+        let tools = request
+            .tools
+            .as_ref()
+            .map(|t| convert_tools_to_config(t.clone()));
         let tool_config = request
             .tool_choice
             .as_ref()
@@ -209,13 +250,14 @@ impl LlmProvider for GeminiProvider {
                 )
             });
 
+        let max_tokens = self.effective_max_tokens(&request);
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
             system_instruction: system_instruction.as_ref(),
             tools: tools.as_ref().map(std::slice::from_ref),
             tool_config,
             generation_config: Some(ApiGenerationConfig {
-                max_output_tokens: Some(request.max_tokens),
+                max_output_tokens: Some(max_tokens),
                 thinking_config,
                 response_mime_type,
                 response_schema,
@@ -226,7 +268,7 @@ impl LlmProvider for GeminiProvider {
         log::debug!(
             "Gemini LLM request model={} max_tokens={}",
             self.model,
-            request.max_tokens
+            max_tokens
         );
 
         let builder = self
@@ -235,7 +277,8 @@ impl LlmProvider for GeminiProvider {
                 "{}/models/{}:generateContent",
                 self.base_url, self.model
             ))
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS));
         let response = self
             .apply_auth(builder)
             .json(&api_request)
@@ -336,7 +379,10 @@ impl LlmProvider for GeminiProvider {
                 return;
             }
             let contents = build_api_contents(&request.messages);
-            let tools = request.tools.map(convert_tools_to_config);
+            let tools = request
+            .tools
+            .as_ref()
+            .map(|t| convert_tools_to_config(t.clone()));
             let tool_config = request
                 .tool_choice
                 .as_ref()
@@ -364,13 +410,14 @@ impl LlmProvider for GeminiProvider {
                     )
                 });
 
+            let max_tokens = self.effective_max_tokens(&request);
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
                 system_instruction: system_instruction.as_ref(),
                 tools: tools.as_ref().map(std::slice::from_ref),
                 tool_config,
                 generation_config: Some(ApiGenerationConfig {
-                    max_output_tokens: Some(request.max_tokens),
+                    max_output_tokens: Some(max_tokens),
                     thinking_config,
                     response_mime_type,
                     response_schema,
@@ -381,7 +428,7 @@ impl LlmProvider for GeminiProvider {
             log::debug!(
                 "Gemini streaming LLM request model={} max_tokens={}",
                 self.model,
-                request.max_tokens
+                max_tokens
             );
 
             let stream_builder = self
@@ -392,14 +439,18 @@ impl LlmProvider for GeminiProvider {
                 ))
                 .header("Content-Type", "application/json")
                 .query(&[("alt", "sse")]);
-            let Ok(response) = self
+            let response = match self
                 .apply_auth(stream_builder)
                 .json(&api_request)
                 .send()
                 .await
-            else {
-                yield Err(anyhow::anyhow!("request failed"));
-                return;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Include the cause so 401 detection / diagnostics survive.
+                    yield Err(anyhow::anyhow!("request failed: {e}"));
+                    return;
+                }
             };
 
             let status = response.status();
@@ -529,5 +580,39 @@ mod tests {
 
         assert_eq!(provider.model(), cloned.model());
         assert_eq!(provider.provider(), cloned.provider());
+    }
+
+    fn request_with_max_tokens(max_tokens: u32, explicit: bool) -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages: vec![agent_sdk_foundation::llm::Message::user("hi")],
+            tools: None,
+            max_tokens,
+            max_tokens_explicit: explicit,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_max_tokens_honors_explicit_budget() {
+        let provider = GeminiProvider::pro("test-api-key".to_string());
+        let request = request_with_max_tokens(123, true);
+        assert_eq!(provider.effective_max_tokens(&request), 123);
+    }
+
+    #[test]
+    fn test_effective_max_tokens_uses_default_when_implicit() {
+        // An implicit budget must fall back to the provider/model default, not
+        // be silently capped at ChatRequest::DEFAULT_MAX_TOKENS.
+        let provider = GeminiProvider::pro("test-api-key".to_string());
+        let request = request_with_max_tokens(4096, false);
+        assert_eq!(
+            provider.effective_max_tokens(&request),
+            provider.default_max_tokens()
+        );
     }
 }

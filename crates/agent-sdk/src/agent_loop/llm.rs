@@ -1,5 +1,8 @@
 use super::helpers::{calculate_backoff_delay, send_event};
-use super::types::{LlmEventContext, LlmOutcome, LlmStreamIds, StreamError};
+use super::types::{
+    LLM_CALL_TOTAL_TIMEOUT, LLM_STREAM_INACTIVITY_TIMEOUT, LlmEventContext, LlmOutcome,
+    LlmStreamIds, StreamError,
+};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
 use crate::llm::{
@@ -173,9 +176,21 @@ where
             log::info!("LLM call cancelled (turn={})", event_ctx.turn);
             ProviderCall::Cancelled
         }
-        res = provider.chat(request.clone()) => match res {
-            Ok(outcome) => ProviderCall::Outcome(outcome),
-            Err(e) => ProviderCall::Error(AgentError::new(format!("LLM error: {e}"), false)),
+        res = tokio::time::timeout(LLM_CALL_TOTAL_TIMEOUT, provider.chat(request.clone())) => match res {
+            Ok(Ok(outcome)) => ProviderCall::Outcome(outcome),
+            Ok(Err(e)) => ProviderCall::Error(AgentError::new(format!("LLM error: {e}"), false)),
+            Err(_elapsed) => {
+                // The non-streaming call stalled past the overall deadline.
+                // Surface it as a retryable server error so the retry loop
+                // re-attempts instead of hanging the turn indefinitely.
+                warn!(
+                    "LLM call exceeded inactivity deadline (turn={}), treating as server error",
+                    event_ctx.turn
+                );
+                ProviderCall::Outcome(ChatOutcome::ServerError(
+                    "LLM call timed out (no response within deadline)".to_string(),
+                ))
+            }
         },
     }
 }
@@ -366,7 +381,8 @@ pub(super) async fn call_llm_streaming<P, H>(
     request: ChatRequest,
     config: &AgentConfig,
     event_ctx: &LlmEventContext<'_, H>,
-    stream_ids: LlmStreamIds<'_>,
+    message_id: &mut String,
+    thinking_id: &mut String,
     #[cfg(feature = "otel")] mut span_observer: Option<LlmSpanObserver<'_>>,
 ) -> (LlmOutcome, u32)
 where
@@ -377,6 +393,14 @@ where
     let mut attempt = 0u32;
 
     loop {
+        // Each attempt streams under the *current* ids. On a recoverable
+        // retry below we regenerate them, so the just-failed attempt's
+        // partial deltas stay isolated under their own (abandoned) id rather
+        // than being duplicated under one id with the successful attempt.
+        let stream_ids = LlmStreamIds {
+            message_id: message_id.as_str(),
+            thinking_id: thinking_id.as_str(),
+        };
         let result = process_stream(
             provider,
             &request,
@@ -425,6 +449,12 @@ where
                 {
                     return (LlmOutcome::Cancelled, attempt);
                 }
+                // Fresh ids for the retry attempt so its deltas land under a
+                // distinct message_id. Consumers concatenating TextDelta by
+                // message_id therefore never see the failed attempt's prefix
+                // duplicated into the surviving message.
+                *message_id = uuid::Uuid::new_v4().to_string();
+                *thinking_id = uuid::Uuid::new_v4().to_string();
             }
             Err(StreamError::Fatal(msg)) => {
                 error!("Streaming error (non-recoverable): {msg}");
@@ -458,18 +488,13 @@ where
     let mut stream = std::pin::pin!(provider.chat_stream(request.clone()));
     let mut accumulator = StreamAccumulator::new();
     let mut delta_count: u64 = 0;
+    // `chunk_timing` advances once per *content* delta: the first content
+    // delta emits TTFC and seeds the per-chunk clock; every subsequent
+    // content delta records `now - last_chunk_at` to TPOC. Sentinel frames
+    // (`Usage`, `Done`) are excluded so the distribution stays meaningful —
+    // those are metadata, not output chunks.
     #[cfg(feature = "otel")]
-    let stream_started_at = std::time::Instant::now();
-    #[cfg(feature = "otel")]
-    let mut first_chunk_recorded = false;
-    // `last_chunk_at` advances once per *content* delta. The first
-    // content delta initialises it (and emits TTFC); every subsequent
-    // content delta records `now - last_chunk_at` to TPOC.
-    // Sentinel frames (`Usage`, `Done`) are excluded so the
-    // distribution stays meaningful — those are metadata, not output
-    // chunks.
-    #[cfg(feature = "otel")]
-    let mut last_chunk_at: Option<std::time::Instant> = None;
+    let mut chunk_timing = StreamChunkTiming::start();
 
     log::debug!("Starting to consume LLM stream");
 
@@ -494,9 +519,26 @@ where
                 }
                 return Err(StreamError::Cancelled);
             }
-            next = stream.next() => match next {
-                Some(result) => result,
-                None => break,
+            next = tokio::time::timeout(LLM_STREAM_INACTIVITY_TIMEOUT, stream.next()) => match next {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    // No frame arrived within the inactivity window — the
+                    // provider connection is stalled (half-open). Surface a
+                    // recoverable error so the retry loop re-establishes the
+                    // stream instead of hanging the turn forever.
+                    warn!(
+                        "LLM stream inactivity timeout (turn={}, delta_count={delta_count})",
+                        event_ctx.turn
+                    );
+                    #[cfg(feature = "otel")]
+                    if let Some(observer) = span_observer.as_mut() {
+                        observer.record_dropped("inactivity_timeout", delta_count, "stream_error");
+                    }
+                    return Err(StreamError::Recoverable(
+                        "stream inactivity timeout: no frame within deadline".to_string(),
+                    ));
+                }
             },
         };
 
@@ -519,28 +561,14 @@ where
         delta_count += 1;
         accumulator.apply(&delta);
 
-        // The first content delta records TTFC + initialises the
-        // per-chunk clock; every later content delta records TPOC
-        // against the prior tick. A single `Instant::now()` per
-        // content iteration keeps the per-chunk overhead at one
-        // syscall plus three label allocations (the metric labels
-        // themselves).
+        // The first content delta records TTFC + seeds the per-chunk
+        // clock; every later content delta records TPOC against the
+        // prior tick. A single `Instant::now()` per content iteration
+        // keeps the per-chunk overhead at one syscall plus the metric
+        // label allocations.
         #[cfg(feature = "otel")]
         if is_content_delta(&delta) {
-            let now = std::time::Instant::now();
-            if !first_chunk_recorded {
-                first_chunk_recorded = true;
-                if let Some(observer) = span_observer.as_mut() {
-                    let ttfc_secs = stream_started_at.elapsed().as_secs_f64();
-                    observer.record_first_chunk(event_ctx.turn, true, ttfc_secs);
-                }
-            } else if let Some(prev) = last_chunk_at
-                && let Some(observer) = span_observer.as_ref()
-            {
-                let tpoc_secs = now.duration_since(prev).as_secs_f64();
-                observer.record_subsequent_chunk(tpoc_secs);
-            }
-            last_chunk_at = Some(now);
+            chunk_timing.record_content_delta(span_observer.as_deref_mut(), event_ctx.turn);
         }
 
         if let Some(stream_err) = dispatch_stream_delta(
@@ -560,17 +588,71 @@ where
     log::debug!("Stream while loop exited normally at delta_count={delta_count}");
 
     #[cfg(feature = "otel")]
-    if let Some(observer) = span_observer.as_mut() {
-        let duration_ms =
-            u64::try_from(stream_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        observer.record_completed(delta_count, duration_ms);
-    }
+    chunk_timing.record_completed(span_observer, delta_count);
 
     Ok(finalize_stream_response(
         accumulator,
         provider.model(),
         delta_count,
     ))
+}
+
+/// Per-stream chunk-latency bookkeeping for the `OTel` `GenAI`
+/// `time_to_first_chunk` / `time_per_output_chunk` histograms.
+///
+/// One `Instant::now()` is taken per content delta: the first records
+/// TTFC and seeds the per-chunk clock; each later one records TPOC
+/// against the previous tick. Extracted from [`process_stream`] to keep
+/// it under the clippy line ceiling.
+#[cfg(feature = "otel")]
+struct StreamChunkTiming {
+    stream_started_at: std::time::Instant,
+    first_chunk_recorded: bool,
+    last_chunk_at: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "otel")]
+impl StreamChunkTiming {
+    fn start() -> Self {
+        Self {
+            stream_started_at: std::time::Instant::now(),
+            first_chunk_recorded: false,
+            last_chunk_at: None,
+        }
+    }
+
+    /// Record TTFC on the first content delta and TPOC on each later
+    /// one, advancing the per-chunk clock even when no observer is set.
+    fn record_content_delta(
+        &mut self,
+        mut observer: Option<&mut LlmSpanObserver<'_>>,
+        turn: usize,
+    ) {
+        let now = std::time::Instant::now();
+        if !self.first_chunk_recorded {
+            self.first_chunk_recorded = true;
+            if let Some(observer) = observer.as_deref_mut() {
+                let ttfc_secs = self.stream_started_at.elapsed().as_secs_f64();
+                observer.record_first_chunk(turn, true, ttfc_secs);
+            }
+        } else if let Some(prev) = self.last_chunk_at
+            && let Some(observer) = observer
+        {
+            let tpoc_secs = now.duration_since(prev).as_secs_f64();
+            observer.record_subsequent_chunk(tpoc_secs);
+        }
+        self.last_chunk_at = Some(now);
+    }
+
+    /// Emit the `llm.stream.completed` span event with the total stream
+    /// duration when an observer is present.
+    fn record_completed(&self, observer: Option<&mut LlmSpanObserver<'_>>, delta_count: u64) {
+        if let Some(observer) = observer {
+            let duration_ms =
+                u64::try_from(self.stream_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            observer.record_completed(delta_count, duration_ms);
+        }
+    }
 }
 
 /// Assemble the final [`ChatResponse`] from a fully-consumed stream

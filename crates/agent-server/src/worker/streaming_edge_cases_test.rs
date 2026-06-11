@@ -116,6 +116,7 @@ impl Stores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            cancel: None,
         }
     }
 }
@@ -445,44 +446,55 @@ async fn acquire_existing_task_id(stores: &Stores) -> Result<crate::journal::tas
 // Edge case 4 — stream ends without a Done delta
 // ─────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn stream_ends_without_done_still_commits_text_turn() -> Result<()> {
+// Regression for finding #8: a stream that ends without a completion
+// marker is a *truncated* response, not a successful turn. The worker
+// must NOT commit it as Completed — it retries, and a clean follow-up
+// attempt completes the turn.
+#[tokio::test(start_paused = true)]
+async fn stream_ends_without_done_is_retried_then_completes() -> Result<()> {
     let stores = Stores::new();
-    // The stream yields text + usage but the connection ends before a
-    // `Done`. The accumulator has no stop_reason; the worker must still
-    // synthesize and commit a well-formed text turn (no tool calls →
-    // Completed), never hang or panic.
-    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
-        StreamDelta::TextDelta {
-            delta: "no done marker".into(),
-            block_index: 0,
-        },
-        StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
-            input_tokens: 5,
-            output_tokens: 4,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        }),
-        // no StreamDelta::Done
-    ]));
+    let provider = StreamingScriptedProvider::new(vec![
+        // Attempt 1: text + usage but the connection ends before a
+        // `Done`. No stop_reason → treated as truncated → retried.
+        TurnScript::from_deltas(vec![
+            StreamDelta::TextDelta {
+                delta: "no done marker".into(),
+                block_index: 0,
+            },
+            StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
+                input_tokens: 5,
+                output_tokens: 4,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            // no StreamDelta::Done
+        ]),
+        // Attempt 2: a complete, well-formed text turn.
+        TurnScript::text("complete answer"),
+    ]);
 
     let outcome = run_turn(&stores, &provider).await?;
     let RootTurnOutcome::Completed { response_text, .. } = outcome else {
-        panic!("expected Completed even without a Done delta");
+        panic!("expected Completed after the truncated stream is retried");
     };
-    assert_eq!(response_text, "no done marker");
+    assert_eq!(response_text, "complete answer");
 
+    // The retry envelope is visible in the journal, and the final turn
+    // closes cleanly with the second (complete) attempt's content.
     let journal = stores.events.get_events(&thread_id()).await?;
+    let kinds = event_kinds(&journal);
+    assert!(
+        kinds.contains(&"AutoRetryStart"),
+        "expected an AutoRetryStart from the truncated-stream retry: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"AutoRetryEnd"),
+        "expected an AutoRetryEnd after the retry succeeded: {kinds:?}"
+    );
     assert_eq!(
-        event_kinds(&journal),
-        vec![
-            "UserInput",
-            "Start",
-            "TextDelta",
-            "Text",
-            "TurnComplete",
-            "Done"
-        ],
+        kinds.last().copied(),
+        Some("Done"),
+        "the completed turn must still close with Done: {kinds:?}"
     );
     assert_contiguous(&journal);
 
@@ -493,22 +505,25 @@ async fn stream_ends_without_done_still_commits_text_turn() -> Result<()> {
 // Edge case 5 — stream truncated after ToolUseStart, before ToolInputDelta
 // ─────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn truncated_after_tool_start_yields_wellformed_tool_call() -> Result<()> {
+// Regression for finding #8: a stream truncated after `ToolUseStart`
+// (before any `ToolInputDelta` or `Done`) has no completion marker, so
+// the worker must retry rather than spawn a child task with an empty
+// `{}` input. A clean follow-up attempt then suspends correctly.
+#[tokio::test(start_paused = true)]
+async fn truncated_tool_stream_is_retried_then_suspends() -> Result<()> {
     let stores = Stores::new();
-    // The stream announces a tool use then dies before any input JSON
-    // arrives and before `Done`. The synthesized tool call must be
-    // well-formed (empty-object input), never a half-parsed fragment,
-    // so the suspended turn's continuation is API-valid.
-    let provider = StreamingScriptedProvider::single(TurnScript::from_deltas(vec![
-        StreamDelta::ToolUseStart {
+    let provider = StreamingScriptedProvider::new(vec![
+        // Attempt 1: announces a tool use then dies before any input
+        // JSON and before `Done`. No stop_reason → truncated → retried.
+        TurnScript::from_deltas(vec![StreamDelta::ToolUseStart {
             id: "tc_trunc".into(),
             name: "get_weather".into(),
             block_index: 0,
             thought_signature: None,
-        },
-        // truncated: no ToolInputDelta, no Done
-    ]));
+        }]),
+        // Attempt 2: a complete tool call with real input JSON.
+        TurnScript::tool_calls(&[("tc_ok", "get_weather", serde_json::json!({"city": "SF"}))]),
+    ]);
 
     let outcome = run_turn(&stores, &provider).await?;
     let RootTurnOutcome::Suspended {
@@ -517,29 +532,24 @@ async fn truncated_after_tool_start_yields_wellformed_tool_call() -> Result<()> 
         ..
     } = outcome
     else {
-        panic!("expected Suspended on a tool-use turn");
+        panic!("expected Suspended after the truncated tool stream is retried");
     };
     assert_eq!(child_tasks.len(), 1);
-    assert_eq!(
-        event_kinds(&committed_events),
-        vec!["UserInput", "Start", "ToolCallStart"],
-    );
 
-    // The spawned child tool task carries a well-formed (empty-object)
-    // input rather than a half-parsed JSON fragment.
+    // The spawned child carries the second (complete) attempt's
+    // well-formed input — never the truncated attempt's empty `{}`.
     let start = committed_events
         .iter()
         .find_map(|e| match &e.event {
-            AgentEvent::ToolCallStart { input, name, .. } => Some((name.clone(), input.clone())),
+            AgentEvent::ToolCallStart {
+                id, input, name, ..
+            } => Some((id.clone(), name.clone(), input.clone())),
             _ => None,
         })
         .context("a ToolCallStart event")?;
-    assert_eq!(start.0, "get_weather");
-    assert_eq!(
-        start.1,
-        serde_json::json!({}),
-        "truncated tool input must synthesize to an empty object, not garbage",
-    );
+    assert_eq!(start.0, "tc_ok");
+    assert_eq!(start.1, "get_weather");
+    assert_eq!(start.2, serde_json::json!({"city": "SF"}));
 
     Ok(())
 }

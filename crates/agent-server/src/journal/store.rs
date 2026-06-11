@@ -495,16 +495,23 @@ pub trait AgentTaskStore: Send + Sync {
         params: SubmitRootTurnParams,
     ) -> std::result::Result<SubmitRootTurnOutcome, SubmitRootTurnError>;
 
-    /// Claim a `request_id` for a non-submission control-plane operation
-    /// (`CreateThread`, `ForkThread`, `DecideConfirmation`) against the
-    /// durable idempotency table.
+    /// Atomically claim a `request_id` for a non-submission control-plane
+    /// operation (`CreateThread`, `ForkThread`, `DecideConfirmation`)
+    /// against the durable idempotency table.
     ///
-    /// Returns [`IdempotencyClaim::Fresh`] when the key was unused (the
-    /// caller now owns it and must run the effect, then call
-    /// [`Self::record_idempotency`] to persist the result),
-    /// [`IdempotencyClaim::Replay`] when a matching record exists, and
-    /// [`IdempotencyClaim::Conflict`] when the key was used for a
-    /// different kind or payload fingerprint.
+    /// This is an **atomic reservation**: the first caller inserts a
+    /// placeholder row (`result_json = JSON null`) inside the same
+    /// lock/transaction that checks for an existing row, so two
+    /// concurrent retries of the same key can never both run the effect.
+    ///
+    /// Returns [`IdempotencyClaim::Fresh`] only for the caller that won
+    /// the reservation (it now owns the key, must run the effect, then
+    /// call [`Self::record_idempotency`] to fill in the result),
+    /// [`IdempotencyClaim::Replay`] when a matching record with a
+    /// recorded result already exists, and [`IdempotencyClaim::Conflict`]
+    /// when the key was used for a different kind/fingerprint **or** is
+    /// still reserved by a concurrent in-flight claim (placeholder not
+    /// yet filled). A `Conflict` caller must not run the effect.
     ///
     /// # Errors
     /// Returns an error if the store cannot be queried.
@@ -518,9 +525,13 @@ pub trait AgentTaskStore: Send + Sync {
     /// Persist the durable references for a freshly-completed
     /// non-submission idempotent operation.
     ///
-    /// Idempotent on the key: a second call with the same `request_id`
-    /// and a matching kind/fingerprint is a no-op (so a retry that races
-    /// past [`Self::claim_idempotency`] cannot corrupt the record).
+    /// Fills the reservation placeholder written by
+    /// [`Self::claim_idempotency`]: it sets `result_json` on the existing
+    /// row only when that row is still the placeholder (`JSON null`).
+    /// Idempotent on the key — a second call once a real result has been
+    /// recorded is a no-op, so a retry that races past
+    /// [`Self::claim_idempotency`] cannot corrupt the record. If no prior
+    /// claim row exists (defensive), the full record is inserted.
     ///
     /// # Errors
     /// Returns an error if the store write fails.
@@ -1318,6 +1329,15 @@ struct Inner {
     /// Mirrors the `agent_sdk_idempotency` row the SQL backends own so
     /// in-memory tests exercise the same dedup contract.
     idempotency: HashMap<String, IdempotencyRecord>,
+    /// Phase 7.6 reverse index: `child_root_task_id → invocation task id`
+    /// for every live [`TaskKind::Subagent`] invocation. Lets
+    /// [`Inner::resume_linked_subagent_invocation`] wake the parked
+    /// parent invocation in `O(1)` instead of scanning every row in
+    /// `by_id` under the global write lock on every terminal child-root
+    /// transition (e.g. each `cancel_tree` fan-out, each fail-closed
+    /// sweep). Populated when an invocation row is indexed and pruned
+    /// when it is resumed or reaches a terminal state.
+    invocation_by_child_root: HashMap<AgentTaskId, AgentTaskId>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -1368,6 +1388,16 @@ impl Inner {
                     .or_default()
                     .insert((task.created_at, task.id.clone()));
             }
+        }
+
+        // Phase 7.6 reverse index: map the subagent invocation's linked
+        // child-thread root id back to the invocation so a terminal
+        // child root can wake the parent invocation in O(1).
+        if task.kind == TaskKind::Subagent
+            && let Some(invocation) = task.state.subagent_invocation()
+        {
+            self.invocation_by_child_root
+                .insert(invocation.child_root_task_id.clone(), task.id.clone());
         }
 
         // Phase 2.3 global runnable / lease-expiry indexes are
@@ -1460,6 +1490,57 @@ impl Inner {
             .map_or(0, |queue| u32::try_from(queue.len()).unwrap_or(u32::MAX))
     }
 
+    /// Promote the FIFO head of `thread_id`'s queued-root list to
+    /// `Pending`, if the thread has no blocking root, under the caller's
+    /// existing write lock.
+    ///
+    /// This is the lock-held core shared by
+    /// [`AgentTaskStore::promote_next_queued_root`] and the in-store
+    /// terminal-transition paths ([`Self::fail_row_closed`],
+    /// [`Self::cancel_row_in_place`], and the root-turn branch of
+    /// [`Self::propagate_terminal_child_transition`]). Promoting inside
+    /// the same locked scope as the root's terminal transition is what
+    /// makes promotion crash-safe: a queued root can never be stranded
+    /// behind a root that was failed closed by a recovery sweep or
+    /// cancelled by `cancel_tree`.
+    fn promote_next_queued_root_locked(
+        &mut self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        // If the slot is still held, the active root is retrying or
+        // waiting on something and no promotion may fire — retries of
+        // the active root must never be overtaken by queued roots.
+        if self.thread_has_blocking_root(thread_id) {
+            return Ok(None);
+        }
+
+        // Pop the FIFO head. `BTreeSet` iterates in ascending key order,
+        // and the key is `(created_at, id)` so the earliest submission
+        // wins, with `id` breaking ties deterministically.
+        let head_key = self
+            .queued_roots_by_thread
+            .get(thread_id)
+            .and_then(|q| q.iter().next().cloned());
+        let Some((_, id)) = head_key else {
+            return Ok(None);
+        };
+
+        let queued_row = self
+            .by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("promote rejected: queue head {id} missing from by_id"))?;
+        let promoted = queued_row
+            .clone()
+            .promote_to_pending(now)
+            .context("promote rejected: promotion transition failed")?;
+
+        self.rebalance_after_row_change(&queued_row, &promoted);
+        self.by_id.insert(id, promoted.clone());
+        Ok(Some(promoted))
+    }
+
     /// Rebalance every secondary index after mutating a row from `old`
     /// into `new`. Assumes both rows share the same row invariants
     /// (`id`, `kind`, `parent_id`, `root_id`, `depth`, `thread_id`,
@@ -1504,6 +1585,17 @@ impl Inner {
                     .or_default()
                     .insert((new.created_at, new.id.clone()));
             }
+        }
+
+        // Phase 7.6 reverse index: once an invocation reaches a terminal
+        // state its child-root linkage can no longer wake it, so drop the
+        // entry to keep the index bounded and free of stale rows.
+        if old.kind == TaskKind::Subagent
+            && new.status.is_terminal()
+            && let Some(invocation) = old.state.subagent_invocation()
+        {
+            self.invocation_by_child_root
+                .remove(&invocation.child_root_task_id);
         }
     }
 
@@ -1731,6 +1823,15 @@ impl Inner {
                 Ok(Some(old_parent))
             }
         } else if new_child.kind == TaskKind::RootTurn && new_child.is_root() {
+            // A terminal root turn frees the thread's active-root slot.
+            // Promote the next queued FIFO head in the SAME locked scope
+            // as the terminal transition so a queued root can never be
+            // stranded by a store-side terminal transition — recovery
+            // fail-close (`fail_row_closed`) or `cancel_tree`
+            // (`cancel_row_in_place`) — not only the host's post-commit
+            // promotion path. Promotion is idempotent, so the host's
+            // later `promote_next_queued_root` becomes a no-op.
+            let _promoted = self.promote_next_queued_root_locked(&new_child.thread_id, now)?;
             self.resume_linked_subagent_invocation(new_child, now, error_prefix)
         } else {
             Ok(None)
@@ -1743,20 +1844,28 @@ impl Inner {
         now: OffsetDateTime,
         error_prefix: &'static str,
     ) -> Result<Option<AgentTask>> {
-        let Some(old_invocation) =
-            self.by_id
-                .values()
-                .find(|task| {
-                    task.kind == TaskKind::Subagent
-                        && task.status == TaskStatus::WaitingOnChildren
-                        && task.state.subagent_invocation().is_some_and(|invocation| {
-                            invocation.child_root_task_id == child_root.id
-                        })
-                })
-                .cloned()
-        else {
+        // O(1) reverse-index lookup instead of scanning every row in
+        // `by_id` under the global write lock.
+        let Some(invocation_id) = self.invocation_by_child_root.get(&child_root.id).cloned() else {
             return Ok(None);
         };
+        let Some(old_invocation) = self.by_id.get(&invocation_id).cloned() else {
+            // Stale index entry (the invocation row was removed); prune
+            // it and treat as no linked invocation.
+            self.invocation_by_child_root.remove(&child_root.id);
+            return Ok(None);
+        };
+        // Verify the linkage still holds and the invocation is still
+        // parked — the index is a hint, the row state is authoritative.
+        if old_invocation.kind != TaskKind::Subagent
+            || old_invocation.status != TaskStatus::WaitingOnChildren
+            || old_invocation
+                .state
+                .subagent_invocation()
+                .is_none_or(|invocation| invocation.child_root_task_id != child_root.id)
+        {
+            return Ok(None);
+        }
 
         let new_invocation = old_invocation
             .clone()
@@ -1767,6 +1876,9 @@ impl Inner {
         self.rebalance_after_row_change(&old_invocation, &new_invocation);
         self.by_id
             .insert(new_invocation.id.clone(), new_invocation.clone());
+        // The invocation has been woken; the child-root linkage is
+        // consumed, so drop the reverse-index entry.
+        self.invocation_by_child_root.remove(&child_root.id);
         Ok(Some(new_invocation))
     }
 
@@ -2306,11 +2418,33 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         kind: IdempotencyKind,
         fingerprint: &[u8],
     ) -> Result<IdempotencyClaim> {
-        let inner = self.inner.read().await;
-        let claim = match inner.idempotency.get(request_id) {
-            None => IdempotencyClaim::Fresh,
+        // Write lock: the existence check and the placeholder insert must
+        // be one atomic step so two concurrent retries on the same key
+        // cannot both observe `Fresh` and both run the effect.
+        let mut inner = self.inner.write().await;
+        let existing = inner.idempotency.get(request_id).cloned();
+        let claim = match existing {
+            None => {
+                // Reserve the key with a placeholder. `JSON null` marks
+                // "claimed, effect in flight, result not yet recorded".
+                inner.idempotency.insert(
+                    request_id.to_owned(),
+                    IdempotencyRecord {
+                        request_id: request_id.to_owned(),
+                        kind,
+                        fingerprint: fingerprint.to_vec(),
+                        result_json: serde_json::Value::Null,
+                    },
+                );
+                IdempotencyClaim::Fresh
+            }
             Some(record) if record.kind == kind && record.fingerprint == fingerprint => {
-                IdempotencyClaim::Replay(Box::new(record.clone()))
+                if record.result_json.is_null() {
+                    // Reserved by a concurrent in-flight claim; fail closed.
+                    IdempotencyClaim::Conflict
+                } else {
+                    IdempotencyClaim::Replay(Box::new(record))
+                }
             }
             Some(_) => IdempotencyClaim::Conflict,
         };
@@ -2320,12 +2454,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
     async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()> {
         let mut inner = self.inner.write().await;
-        // Insert-if-absent: a record committed by a racing retry that
-        // already claimed the key must not be clobbered.
-        inner
+        // Check placeholder state with a short-lived immutable borrow so
+        // the `insert` below doesn't overlap a `get_mut` borrow.
+        let existing_is_placeholder = inner
             .idempotency
-            .entry(record.request_id.clone())
-            .or_insert(record);
+            .get(&record.request_id)
+            .map(|existing| existing.result_json.is_null());
+        match existing_is_placeholder {
+            // Fill the reservation placeholder written by `claim`.
+            Some(true) => {
+                if let Some(existing) = inner.idempotency.get_mut(&record.request_id) {
+                    existing.result_json = record.result_json;
+                }
+            }
+            // A real result is already recorded — idempotent no-op so a
+            // racing retry cannot clobber it.
+            Some(false) => {}
+            // No prior claim (defensive): insert the full record.
+            None => {
+                inner.idempotency.insert(record.request_id.clone(), record);
+            }
+        }
         drop(inner);
         Ok(())
     }
@@ -2349,42 +2498,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let mut inner = self.inner.write().await;
-
-        // If the slot is still held, the active root is retrying or
-        // waiting on something and no promotion may fire — retries of
-        // the active root must never be overtaken by queued roots.
-        if inner.thread_has_blocking_root(thread_id) {
-            return Ok(None);
-        }
-
-        // Pop the FIFO head. `BTreeSet` iterates in ascending key order,
-        // and the key is `(created_at, id)` so the earliest submission
-        // wins, with `id` breaking ties deterministically.
-        let head_key = inner
-            .queued_roots_by_thread
-            .get(thread_id)
-            .and_then(|q| q.iter().next().cloned());
-        let Some((_, id)) = head_key else {
-            return Ok(None);
-        };
-
-        // Load the row, run the pure promotion transition, and commit
-        // via the shared rebalance helper so the runnable index picks
-        // up the newly-Pending row.
-        let queued_row = inner
-            .by_id
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow!("promote rejected: queue head {id} missing from by_id"))?;
-        let promoted = queued_row
-            .clone()
-            .promote_to_pending(now)
-            .context("promote rejected: promotion transition failed")?;
-
-        inner.rebalance_after_row_change(&queued_row, &promoted);
-        inner.by_id.insert(id, promoted.clone());
+        let promoted = inner.promote_next_queued_root_locked(thread_id, now)?;
         drop(inner);
-        Ok(Some(promoted))
+        Ok(promoted)
     }
 
     async fn try_acquire_task(
@@ -3262,6 +3378,81 @@ mod tests {
         AgentTask::new_root_turn(thread(name), t_plus(secs), 3)
     }
 
+    // ── idempotency claim atomicity (Phase 10 · E) ───────────────
+
+    #[tokio::test]
+    async fn claim_idempotency_reserves_then_replays_after_record() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let fp: &[u8] = b"fp-1";
+
+        // First claim wins and reserves the key.
+        assert!(matches!(
+            store
+                .claim_idempotency("req-1", IdempotencyKind::CreateThread, fp)
+                .await?,
+            IdempotencyClaim::Fresh
+        ));
+
+        // A second claim before the effect records its result must NOT
+        // also be Fresh — the placeholder reservation makes it Conflict.
+        assert!(matches!(
+            store
+                .claim_idempotency("req-1", IdempotencyKind::CreateThread, fp)
+                .await?,
+            IdempotencyClaim::Conflict
+        ));
+
+        // Once the winner records the durable references, retries replay.
+        store
+            .record_idempotency(IdempotencyRecord {
+                request_id: "req-1".into(),
+                kind: IdempotencyKind::CreateThread,
+                fingerprint: fp.to_vec(),
+                result_json: serde_json::json!({ "thread_id": "th-1" }),
+            })
+            .await?;
+
+        match store
+            .claim_idempotency("req-1", IdempotencyKind::CreateThread, fp)
+            .await?
+        {
+            IdempotencyClaim::Replay(record) => {
+                assert_eq!(
+                    record.result_json,
+                    serde_json::json!({ "thread_id": "th-1" })
+                );
+            }
+            other => panic!("expected Replay, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_concurrent_claims_yield_exactly_one_fresh() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let fp: &[u8] = b"fp-x";
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let (a, b) = tokio::join!(
+            async move {
+                s1.claim_idempotency("req-c", IdempotencyKind::CreateThread, b"fp-x")
+                    .await
+            },
+            async move {
+                s2.claim_idempotency("req-c", IdempotencyKind::CreateThread, b"fp-x")
+                    .await
+            },
+        );
+        let fresh = [a?, b?]
+            .into_iter()
+            .filter(|c| matches!(c, IdempotencyClaim::Fresh))
+            .count();
+        assert_eq!(fresh, 1, "exactly one concurrent claim must be Fresh");
+        let _ = fp;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn insert_and_get_round_trip() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
@@ -3951,6 +4142,94 @@ mod tests {
             .await
             .context("queued after")?;
         assert!(queued.is_empty());
+        Ok(())
+    }
+
+    /// Regression for finding #4/#8: a store-side terminal transition
+    /// that frees the active-root slot must promote the queued FIFO head
+    /// in the SAME locked scope — not rely on the host's post-commit
+    /// promotion path. `cancel_tree` (the `cancel_row_in_place` path)
+    /// must auto-promote the successor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_tree_of_active_root_auto_promotes_queued_successor() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+
+        // Cancel the active root. No explicit promote call follows.
+        let cancelled = store
+            .cancel_tree(&first.id, t_plus(10))
+            .await
+            .context("cancel_tree")?;
+        assert_eq!(cancelled, vec![first.id.clone()]);
+
+        // The queued successor must already be Pending and hold the slot.
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot should be held by the promoted successor")?;
+        assert_eq!(active.id, second.id);
+        assert_eq!(active.status, TaskStatus::Pending);
+        assert!(
+            store
+                .list_queued_roots(&thread("t1"))
+                .await
+                .context("queued")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Regression for finding #4/#8: failing the active root closed (the
+    /// recovery / `fail_task` terminal path) must auto-promote the queued
+    /// FIFO head without an explicit promotion call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_of_active_root_auto_promotes_queued_successor() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let first = fresh_root_at("t1", 0);
+        let second = fresh_root_at("t1", 1);
+
+        store
+            .submit_root_turn(first.clone())
+            .await
+            .context("first")?;
+        store
+            .submit_root_turn(second.clone())
+            .await
+            .context("second")?;
+
+        // Drive `first` to Running, then fail it closed via the CAS path.
+        running_root(&store, first.clone())
+            .await
+            .context("running")?;
+        store
+            .fail_task(
+                &first.id,
+                &WorkerId::from_string("w1"),
+                &LeaseId::from_string("l1"),
+                "budget exhausted".into(),
+                t_plus(10),
+            )
+            .await
+            .context("fail_task")?;
+
+        let active = store
+            .active_root_for_thread(&thread("t1"))
+            .await
+            .context("active")?
+            .context("slot should be held by the promoted successor")?;
+        assert_eq!(active.id, second.id);
+        assert_eq!(active.status, TaskStatus::Pending);
         Ok(())
     }
 
@@ -9054,14 +9333,24 @@ mod tests {
             .await
             .context("cancel tree")?;
 
-        // The slot is free: `promote_next_queued_root` fires.
-        let promoted = store
+        // Finding #4/#8: cancelling the blocking root auto-promotes the
+        // queued successor in the SAME locked scope, so `second` is
+        // already Pending and holds the slot — no explicit promote needed.
+        let active = store
+            .active_root_for_thread(&thread("t-tree-promote"))
+            .await
+            .context("active")?
+            .context("slot should be held by the auto-promoted successor")?;
+        assert_eq!(active.id, second.id);
+        assert_eq!(active.status, TaskStatus::Pending);
+
+        // A redundant explicit promote is an idempotent no-op now that the
+        // slot is held by the freshly-promoted root.
+        let redundant = store
             .promote_next_queued_root(&thread("t-tree-promote"), t_plus(3))
             .await
-            .context("promote")?
-            .context("promotion fired")?;
-        assert_eq!(promoted.id, second.id);
-        assert_eq!(promoted.status, TaskStatus::Pending);
+            .context("redundant promote")?;
+        assert!(redundant.is_none());
         Ok(())
     }
 

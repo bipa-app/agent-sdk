@@ -101,6 +101,11 @@ pub async fn maybe_compact_staged_history(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<()> {
+    // Cooperative cancellation: skip the (billed) summarisation LLM call
+    // when the root turn has already been cancelled.
+    if deps.is_cancelled() {
+        return Ok(());
+    }
     let Some(cfg) = deps.compaction_config else {
         return Ok(());
     };
@@ -160,6 +165,11 @@ pub async fn compact_after_overflow(
     thread_id: &agent_sdk_foundation::ThreadId,
     now: OffsetDateTime,
 ) -> Result<bool> {
+    // Cooperative cancellation: skip emergency compaction (and its LLM
+    // call) on an already-cancelled turn; the caller bails on `false`.
+    if deps.is_cancelled() {
+        return Ok(false);
+    }
     let Some(cfg) = deps.compaction_config else {
         return Ok(false);
     };
@@ -212,6 +222,22 @@ async fn apply_compaction(
         .replace_history(thread_id, result.messages.clone(), now)
         .await
         .context("replace durable projection history")?;
+
+    // Drop the in-flight draft once the projection has been rewritten.
+    //
+    // On the resume path the draft can hold the same suspended /
+    // tool-result messages that a reactive (overflow-driven) compaction
+    // just folded into the committed projection. Leaving it in place
+    // would make `recover_thread` fold those messages in twice — once
+    // via the compacted projection, once via the raw draft. Clearing it
+    // here keeps that path duplication-safe. The draft is purely a
+    // recovery aid (reconstructable from the parent's ReadyToResume
+    // state), so dropping it is harmless on every other path; the
+    // pre-call resume compaction re-sets a fresh draft immediately
+    // afterwards. Best-effort: a clear failure must not poison the turn.
+    if let Err(error) = deps.message_store.clear_draft(thread_id, now).await {
+        log::warn!("failed to clear draft after compaction for thread {thread_id}: {error:#}");
+    }
 
     staged_messages
         .replace_history(thread_id, result.messages.clone())

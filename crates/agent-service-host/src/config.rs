@@ -628,7 +628,13 @@ impl RetentionConfig {
 ///   sampler: parentbased_traceidratio
 ///   sample_ratio: 1.0
 /// ```
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand (not derived) so the secret-bearing
+/// `otlp_headers` field is rendered as a count, never as its values —
+/// the whole `ServiceConfig` is `Debug`-logged at startup
+/// (`main.rs`), so a derived impl would leak vendor auth tokens into
+/// the logs.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
     /// Master switch.  When `false`, the host skips every step of the
@@ -668,6 +674,24 @@ pub struct ObservabilityConfig {
     /// Whether `gen_ai.input.messages` / `gen_ai.output.messages` may
     /// be captured as span attributes.  Default-deny.
     pub capture_payloads: bool,
+}
+
+impl std::fmt::Debug for ObservabilityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObservabilityConfig")
+            .field("enabled", &self.enabled)
+            .field("service_name", &self.service_name)
+            .field("service_instance_id", &self.service_instance_id)
+            .field("deployment_environment", &self.deployment_environment)
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            // Secret-bearing: render only the count, never the values.
+            .field("otlp_headers", &self.otlp_headers.len())
+            .field("sampler", &self.sampler)
+            .field("sample_ratio", &self.sample_ratio)
+            .field("propagated_baggage_keys", &self.propagated_baggage_keys)
+            .field("capture_payloads", &self.capture_payloads)
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1126,6 +1150,49 @@ admission:
             16 * 1024 * 1024
         );
         Ok(())
+    }
+
+    #[test]
+    fn full_service_config_debug_redacts_secrets() {
+        // The whole ServiceConfig is Debug-logged at startup
+        // (`main.rs`). A fully-populated config must never surface AMQP
+        // credentials or OTLP auth-header values in its Debug output.
+        let mut config = ServiceConfig::default();
+        config.observability.otlp_headers = vec![
+            (
+                "authorization".to_string(),
+                "Bearer super-secret-token".to_string(),
+            ),
+            ("x-api-key".to_string(), "another-secret-value".to_string()),
+        ];
+
+        #[cfg(feature = "amqp")]
+        {
+            config.relay.broker = BrokerConfig::Amqp(crate::broker::amqp::AmqpBrokerConfig {
+                url: Some("amqp://rabbit:hunter2@broker.internal:5672/prod".into()),
+                ..crate::broker::amqp::AmqpBrokerConfig::default()
+            });
+            config.wakeup.amqp_consumer.config.broker.url =
+                Some("amqp://wakeup:wakeup-pass@broker.internal:5672/prod".into());
+            config.watch.amqp_consumer.config.broker.url =
+                Some("amqp://watch:watch-pass@broker.internal:5672/prod".into());
+        }
+
+        let rendered = format!("{config:?}");
+        for secret in [
+            "super-secret-token",
+            "another-secret-value",
+            "hunter2",
+            "wakeup-pass",
+            "watch-pass",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "secret '{secret}' leaked in ServiceConfig Debug output: {rendered}"
+            );
+        }
+        // The redacted header count is still observable for diagnostics.
+        assert!(rendered.contains("otlp_headers: 2"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// Capabilities that control what the agent can do.
 ///
@@ -8,14 +9,25 @@ use serde::{Deserialize, Serialize};
 /// By default, everything is allowed — the SDK is unopinionated and leaves
 /// security policy to the client. Use the builder methods to configure restrictions.
 ///
+/// # Path matching
+///
+/// Primitive tools resolve the model-supplied path to an **absolute** path
+/// (against the environment root) *before* consulting these rules, so path
+/// patterns are matched against that resolved absolute path — not the raw
+/// relative input. Prefer `**/`-prefixed patterns (e.g. `**/src/**`) or
+/// absolute patterns over bare relative ones like `src/**`, which never match
+/// the absolute paths the tools produce.
+///
 /// # Example
 ///
 /// ```rust
 /// use agent_sdk::AgentCapabilities;
 ///
-/// // Read-only agent that can only access src/ directory
+/// // Read-only agent restricted to the `src/` tree. Because tools check the
+/// // resolved absolute path, use a `**/`-prefixed pattern rather than `src/**`.
 /// let caps = AgentCapabilities::read_only()
-///     .with_allowed_paths(vec!["src/**/*".into()]);
+///     .with_allowed_paths(vec!["**/src/**".into()]);
+/// assert!(caps.can_read("/workspace/src/main.rs"));
 ///
 /// // Full access agent with some restrictions
 /// let caps = AgentCapabilities::full_access()
@@ -30,13 +42,40 @@ pub struct AgentCapabilities {
     /// Can execute shell commands
     pub exec: bool,
     /// Allowed path patterns (glob). Empty means all paths allowed.
+    ///
+    /// Matched against the resolved **absolute** path produced by primitive
+    /// tools — see the type-level "Path matching" note.
     pub allowed_paths: Vec<String>,
     /// Denied path patterns (glob). Takes precedence over `allowed_paths`.
+    ///
+    /// Matched against the resolved **absolute** path produced by primitive
+    /// tools — see the type-level "Path matching" note.
     pub denied_paths: Vec<String>,
     /// Allowed commands (regex patterns). Empty means all commands allowed when `exec=true`.
     pub allowed_commands: Vec<String>,
     /// Denied commands (regex patterns). Takes precedence over `allowed_commands`.
     pub denied_commands: Vec<String>,
+    /// Lazily-compiled patterns, cached so per-result hot paths (grep/glob call
+    /// `check_read` once per match) do not recompile regexes on every check.
+    ///
+    /// Populated on first use from the pattern lists above and reset by the
+    /// `with_*` builder methods. Mutating the public pattern `Vec`s directly
+    /// (instead of via the builders) will not refresh this cache.
+    #[serde(skip)]
+    compiled: OnceLock<CompiledPatterns>,
+}
+
+/// Pre-compiled forms of the pattern lists, built once per configuration.
+///
+/// Each entry is `None` when its source pattern failed to compile; matching
+/// then falls back to the pattern list's documented fail-open (allow) or
+/// fail-closed (deny) behaviour.
+#[derive(Clone, Debug, Default)]
+struct CompiledPatterns {
+    allowed_paths: Vec<Option<regex::Regex>>,
+    denied_paths: Vec<Option<regex::Regex>>,
+    allowed_commands: Vec<Option<regex::Regex>>,
+    denied_commands: Vec<Option<regex::Regex>>,
 }
 
 impl Default for AgentCapabilities {
@@ -57,6 +96,7 @@ impl AgentCapabilities {
             denied_paths: vec![],
             allowed_commands: vec![],
             denied_commands: vec![],
+            compiled: OnceLock::new(),
         }
     }
 
@@ -71,6 +111,7 @@ impl AgentCapabilities {
             denied_paths: vec![],
             allowed_commands: vec![],
             denied_commands: vec![],
+            compiled: OnceLock::new(),
         }
     }
 
@@ -85,6 +126,7 @@ impl AgentCapabilities {
             denied_paths: vec![],
             allowed_commands: vec![],
             denied_commands: vec![],
+            compiled: OnceLock::new(),
         }
     }
 
@@ -113,6 +155,7 @@ impl AgentCapabilities {
     #[must_use]
     pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
         self.allowed_paths = paths;
+        self.compiled = OnceLock::new();
         self
     }
 
@@ -120,6 +163,7 @@ impl AgentCapabilities {
     #[must_use]
     pub fn with_denied_paths(mut self, paths: Vec<String>) -> Self {
         self.denied_paths = paths;
+        self.compiled = OnceLock::new();
         self
     }
 
@@ -127,6 +171,7 @@ impl AgentCapabilities {
     #[must_use]
     pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
         self.allowed_commands = commands;
+        self.compiled = OnceLock::new();
         self
     }
 
@@ -134,6 +179,7 @@ impl AgentCapabilities {
     #[must_use]
     pub fn with_denied_commands(mut self, commands: Vec<String>) -> Self {
         self.denied_commands = commands;
+        self.compiled = OnceLock::new();
         self
     }
 
@@ -202,9 +248,12 @@ impl AgentCapabilities {
     /// Returns the denial reason when the path matches a denied pattern
     /// or is not in the allowed list.
     pub fn check_path(&self, path: &str) -> Result<(), String> {
-        // Denied patterns take precedence
-        for pattern in &self.denied_paths {
-            if glob_match(pattern, path) {
+        let compiled = self.compiled();
+
+        // Denied patterns take precedence. Glob denies fail OPEN: a pattern
+        // that did not compile (`None`) simply does not match.
+        for (pattern, regex) in self.denied_paths.iter().zip(&compiled.denied_paths) {
+            if regex.as_ref().is_some_and(|re| re.is_match(path)) {
                 return Err(format!("path matches denied pattern '{pattern}'"));
             }
         }
@@ -215,8 +264,8 @@ impl AgentCapabilities {
         }
 
         // Check if path matches any allowed pattern
-        for pattern in &self.allowed_paths {
-            if glob_match(pattern, path) {
+        for regex in &compiled.allowed_paths {
+            if regex.as_ref().is_some_and(|re| re.is_match(path)) {
                 return Ok(());
             }
         }
@@ -246,9 +295,13 @@ impl AgentCapabilities {
     /// Returns the denial reason when the command matches a denied pattern
     /// or is not in the allowed list.
     pub fn check_command(&self, command: &str) -> Result<(), String> {
-        // Denied patterns take precedence. Invalid patterns fail CLOSED.
-        for pattern in &self.denied_commands {
-            if regex_match_deny(pattern, command) {
+        let compiled = self.compiled();
+
+        // Denied patterns take precedence. Deny rules fail CLOSED: a pattern
+        // that did not compile (`None`) blocks everything to prevent a
+        // misconfigured deny rule from silently allowing dangerous commands.
+        for (pattern, regex) in self.denied_commands.iter().zip(&compiled.denied_commands) {
+            if regex.as_ref().is_none_or(|re| re.is_match(command)) {
                 return Err(format!("command matches denied pattern '{pattern}'"));
             }
         }
@@ -258,9 +311,10 @@ impl AgentCapabilities {
             return Ok(());
         }
 
-        // Check if command matches any allowed pattern
-        for pattern in &self.allowed_commands {
-            if regex_match(pattern, command) {
+        // Check if command matches any allowed pattern. Allow rules fail OPEN:
+        // an invalid pattern (`None`) does not grant access.
+        for regex in &compiled.allowed_commands {
+            if regex.as_ref().is_some_and(|re| re.is_match(command)) {
                 return Ok(());
             }
         }
@@ -270,17 +324,48 @@ impl AgentCapabilities {
             self.allowed_commands.join(", ")
         ))
     }
+
+    /// Return the lazily-compiled patterns, building them once on first use.
+    fn compiled(&self) -> &CompiledPatterns {
+        self.compiled.get_or_init(|| CompiledPatterns {
+            allowed_paths: self
+                .allowed_paths
+                .iter()
+                .map(|p| compile_glob(p.as_str()))
+                .collect(),
+            denied_paths: self
+                .denied_paths
+                .iter()
+                .map(|p| compile_glob(p.as_str()))
+                .collect(),
+            allowed_commands: self
+                .allowed_commands
+                .iter()
+                .map(|p| regex::Regex::new(p.as_str()).ok())
+                .collect(),
+            denied_commands: self
+                .denied_commands
+                .iter()
+                .map(|p| regex::Regex::new(p.as_str()).ok())
+                .collect(),
+        })
+    }
 }
 
-/// Simple glob matching (supports * and ** wildcards)
-fn glob_match(pattern: &str, path: &str) -> bool {
-    // Handle special case: pattern is just **
+/// Convert a glob pattern (supporting `*` and `**` wildcards) into an anchored
+/// regex string.
+///
+/// - `**/` (prefix/middle): zero or more leading path components.
+/// - `/**` (suffix): everything below a directory.
+/// - `*`: any run of non-`/` characters.
+fn glob_to_regex(pattern: &str) -> String {
+    // Special case: a bare `**` matches everything (including across `/`).
     if pattern == "**" {
-        return true; // Matches everything
+        return "^.*$".to_string();
     }
 
-    // Escape regex special characters except * and ?
-    let mut escaped = String::new();
+    // Escape regex special characters except the glob wildcards `*` and `?`.
+    let mut escaped = String::with_capacity(pattern.len());
     for c in pattern.chars() {
         match c {
             '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
@@ -291,32 +376,28 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         }
     }
 
-    // Handle glob patterns:
-    // - **/ at start or middle: zero or more path components (including leading /)
-    // - /** at end: matches everything after
-    // - * : matches any characters except /
-    let pattern = escaped
+    let body = escaped
         .replace("**/", "\x00") // **/ -> placeholder
         .replace("/**", "\x01") // /** -> placeholder
         .replace('*', "[^/]*") // * -> match non-slash characters
         .replace('\x00', "(.*/)?") // **/ as optional prefix (handles absolute paths)
         .replace('\x01', "(/.*)?"); // /** as optional suffix
 
-    let regex = format!("^{pattern}$");
-    regex_match(&regex, path)
+    format!("^{body}$")
 }
 
-/// Simple regex matching (returns false on invalid patterns).
-/// Used for allow rules — an invalid allow pattern should not grant access.
-fn regex_match(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern).is_ok_and(|re| re.is_match(text))
+/// Compile a glob pattern to a regex, returning `None` if it does not compile.
+fn compile_glob(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(&glob_to_regex(pattern)).ok()
 }
 
-/// Regex matching for deny rules — fails CLOSED on invalid patterns.
-/// An invalid deny pattern blocks everything to prevent misconfigured
-/// deny rules from silently allowing dangerous commands.
-fn regex_match_deny(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern).map_or(true, |re| re.is_match(text))
+/// Simple glob matching (supports `*` and `**` wildcards).
+///
+/// Returns `false` on patterns that fail to compile (fail open). Used by the
+/// unit tests; production checks go through the cached [`AgentCapabilities`].
+#[cfg(test)]
+fn glob_match(pattern: &str, path: &str) -> bool {
+    compile_glob(pattern).is_some_and(|re| re.is_match(path))
 }
 
 #[cfg(test)]
@@ -389,6 +470,36 @@ mod tests {
         assert!(caps.check_path("tests/integration.rs").is_ok());
         assert!(caps.check_path("config/settings.toml").is_err());
         assert!(caps.check_path("README.md").is_err());
+    }
+
+    #[test]
+    fn allowed_paths_match_resolved_absolute_paths() {
+        // Primitive tools resolve inputs to absolute paths before checking, so
+        // a `**/`-prefixed pattern must permit the absolute paths they produce.
+        let caps = AgentCapabilities::read_only().with_allowed_paths(vec!["**/src/**".into()]);
+
+        assert!(caps.check_read("/workspace/src/main.rs").is_ok());
+        assert!(caps.check_read("/workspace/src/lib/mod.rs").is_ok());
+        assert!(caps.can_read("/Users/dev/project/src/deep/nested.rs"));
+
+        // Paths outside the allowed tree are still denied.
+        assert!(caps.check_read("/workspace/README.md").is_err());
+        assert!(caps.check_read("/workspace/tests/it.rs").is_err());
+    }
+
+    #[test]
+    fn rebuilding_patterns_invalidates_compiled_cache() {
+        // First check populates the compiled-pattern cache for the empty list.
+        let caps = AgentCapabilities::full_access();
+        assert!(caps.check_path("/workspace/.env").is_ok());
+
+        // A capability rebuilt via a `with_*` builder must honor the new deny
+        // list — i.e. the builder resets the cached compiled patterns.
+        let restricted = caps.with_denied_paths(vec!["**/.env".into()]);
+        assert!(restricted.check_path("/workspace/.env").is_err());
+        assert!(restricted.check_path("/workspace/src/main.rs").is_ok());
+        // Repeated checks (which reuse the cache) stay consistent.
+        assert!(restricted.check_path("/workspace/.env").is_err());
     }
 
     #[test]

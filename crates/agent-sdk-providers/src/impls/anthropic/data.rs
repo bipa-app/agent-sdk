@@ -730,13 +730,18 @@ fn parse_sse_fields(event_block: &str) -> (Option<String>, Option<String>) {
     }
 
     let data = (!data_lines.is_empty()).then(|| data_lines.join("\n"));
-    let inferred_event_type = data.as_deref().and_then(|data| {
-        serde_json::from_str::<SseTypeOnly>(data)
-            .ok()
-            .map(|event| event.event_type)
+    // Infer the type from the JSON payload only when the `event:` line was
+    // absent — for Anthropic it is always present, so this avoids an eager,
+    // redundant full JSON parse (`SseTypeOnly`) on the streaming hot path.
+    let event_type = event_type.or_else(|| {
+        data.as_deref().and_then(|data| {
+            serde_json::from_str::<SseTypeOnly>(data)
+                .ok()
+                .map(|event| event.event_type)
+        })
     });
 
-    (event_type.or(inferred_event_type), data)
+    (event_type, data)
 }
 
 pub fn take_next_sse_event(buffer: &mut String) -> Option<String> {

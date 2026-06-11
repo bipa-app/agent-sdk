@@ -18,11 +18,11 @@
 //!
 //! Callers that do not need redaction — including existing call sites
 //! that have not adopted the detector yet — should use
-//! [`PayloadRedactor::noop`] (or the module-level free functions,
-//! which delegate to it). Financial and other PII-sensitive
+//! [`PayloadRedactor::noop`]. Financial and other PII-sensitive
 //! integrations should construct a redactor with
 //! [`agent_sdk_foundation::privacy::BaselineDetector`] or a custom
-//! detector.
+//! detector. Routing every conversion through the [`PayloadRedactor`]
+//! type keeps the unredacted-egress surface to a single audited path.
 
 use crate::llm::{ChatRequest, ChatResponse, Content, ContentBlock, Message, Role};
 use agent_sdk_foundation::privacy::{NoopDetector, PiiDetector, mask_spans};
@@ -46,13 +46,17 @@ use super::attrs::finish_reason_str;
 #[derive(Clone)]
 pub struct PayloadRedactor {
     detector: Arc<dyn PiiDetector>,
+    is_noop: bool,
 }
 
 impl PayloadRedactor {
     /// Wrap an existing detector.
     #[must_use]
     pub fn new(detector: Arc<dyn PiiDetector>) -> Self {
-        Self { detector }
+        Self {
+            detector,
+            is_noop: false,
+        }
     }
 
     /// Redactor that performs no masking — produces byte-identical
@@ -61,7 +65,20 @@ impl PayloadRedactor {
     pub fn noop() -> Self {
         Self {
             detector: Arc::new(NoopDetector),
+            is_noop: true,
         }
+    }
+
+    /// Whether this redactor performs no masking.
+    ///
+    /// `true` for [`PayloadRedactor::noop`] / [`Default`]. The
+    /// payload-capture gate uses this to refuse `Inline` payloads from a
+    /// store that attested PII redaction but left the default noop redactor
+    /// in place — the attestation alone is not sufficient evidence that PII
+    /// is actually being masked.
+    #[must_use]
+    pub const fn is_noop(&self) -> bool {
+        self.is_noop
     }
 
     /// Convert system instructions, masking PII in the system prompt.
@@ -220,35 +237,6 @@ impl Default for PayloadRedactor {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Free function façade — delegate to `PayloadRedactor::noop`.
-// Existing callers keep their call sites untouched; new integrations
-// should construct a `PayloadRedactor` explicitly.
-// ─────────────────────────────────────────────────────────────────────
-
-/// Convert system instructions from a `ChatRequest` into semconv JSON.
-///
-/// Returns `None` if the system prompt is empty.
-#[must_use]
-pub fn convert_system_instructions(request: &ChatRequest) -> Option<Value> {
-    PayloadRedactor::noop().convert_system_instructions(request)
-}
-
-/// Convert input messages from a `ChatRequest` into semconv JSON.
-#[must_use]
-pub fn convert_input_messages(request: &ChatRequest) -> Value {
-    PayloadRedactor::noop().convert_input_messages(request)
-}
-
-/// Convert a `ChatResponse` into semconv output messages JSON.
-///
-/// Returns a JSON array with one assistant message per response
-/// (the SDK currently returns a single candidate).
-#[must_use]
-pub fn convert_output_messages(response: &ChatResponse) -> Value {
-    PayloadRedactor::noop().convert_output_messages(response)
-}
-
 /// Decide whether a User-role message is actually a `tool` message
 /// (SDK batches tool results as User messages).
 fn determine_user_message_role(message: &Message) -> &'static str {
@@ -289,14 +277,22 @@ mod tests {
     #[test]
     fn empty_system_returns_none() {
         let request = empty_request("", vec![]);
-        assert!(convert_system_instructions(&request).is_none());
+        assert!(
+            PayloadRedactor::noop()
+                .convert_system_instructions(&request)
+                .is_none()
+        );
     }
 
     #[test]
-    fn system_instructions_wraps_in_text_array() {
+    fn system_instructions_wraps_in_text_array() -> anyhow::Result<()> {
+        use anyhow::Context as _;
         let request = empty_request("You are helpful.", vec![]);
-        let result = convert_system_instructions(&request).expect("should be Some");
+        let result = PayloadRedactor::noop()
+            .convert_system_instructions(&request)
+            .context("should be Some")?;
         assert_eq!(result, json!([{"text": "You are helpful."}]));
+        Ok(())
     }
 
     #[test]
@@ -440,7 +436,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
             },
         };
-        let result = convert_output_messages(&response);
+        let result = PayloadRedactor::noop().convert_output_messages(&response);
         let msg = &result[0];
         assert_eq!(msg["role"], "assistant");
         assert_eq!(msg["finish_reason"], "stop");
@@ -466,7 +462,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
             },
         };
-        let result = convert_output_messages(&response);
+        let result = PayloadRedactor::noop().convert_output_messages(&response);
         assert_eq!(result[0]["finish_reason"], "tool_call");
     }
 
@@ -494,7 +490,7 @@ mod tests {
                 Message::user("third"),
             ],
         );
-        let result = convert_input_messages(&request);
+        let result = PayloadRedactor::noop().convert_input_messages(&request);
         let arr = result.as_array().expect("array");
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "user");
@@ -638,17 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn noop_redactor_produces_same_output_as_free_functions() {
-        // Spot-check: a payload with no PII should serialize identically
-        // via the noop redactor and the free functions.
-        let request = empty_request("System text", vec![Message::user("Hello, world")]);
-        assert_eq!(
-            PayloadRedactor::noop().convert_input_messages(&request),
-            convert_input_messages(&request),
-        );
-        assert_eq!(
-            PayloadRedactor::noop().convert_system_instructions(&request),
-            convert_system_instructions(&request),
+    fn is_noop_reflects_constructor() {
+        assert!(PayloadRedactor::noop().is_noop());
+        assert!(PayloadRedactor::default().is_noop());
+        assert!(
+            !baseline_redactor().is_noop(),
+            "a detector-backed redactor must not report as noop"
         );
     }
 }

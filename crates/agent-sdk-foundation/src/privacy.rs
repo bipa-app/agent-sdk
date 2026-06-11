@@ -67,10 +67,31 @@
 //!   [`mask_spans`] will silently skip those spans rather than
 //!   panic.
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 
 pub mod redaction;
+
+/// Credential value prefixes recognised for *wholesale* redaction.
+///
+/// Single source of truth for the baseline [`RedactionPolicy`](redaction::RedactionPolicy)
+/// `sensitive_value_prefixes` list, which is built from this slice. The
+/// [`SecretDetector`] covers the same credential families through its richer
+/// regex (each with per-prefix body and length rules); when adding a new
+/// family, update both so they do not drift.
+pub(crate) const SECRET_PREFIXES: &[&str] = &[
+    "Bearer ",
+    "sk-",
+    "pk-",
+    "xox",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "github_pat_",
+    "AKIA",
+    "AIza",
+];
 
 pub use redaction::{
     REDACTED_MARKER, RedactionLevel, RedactionPolicy, redact_error, redact_for_observability,
@@ -362,6 +383,23 @@ impl Default for CategorySet {
     }
 }
 
+/// Source patterns for each entity category, ordered to match the
+/// [`DetectCategory`] discriminants (`Email = 0` … `Jwt = 7`).
+///
+/// Both the individual [`Regex`] fields and the [`RegexSet`] prefilter are
+/// built from these so the two can never drift; the prefilter's match indices
+/// line up 1:1 with `DetectCategory as usize`.
+const ENTITY_PATTERNS: [&str; 8] = [
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+    r"\+[1-9]\d{7,14}",
+    r"\b(?:\d[ \-]?){12,18}\d\b",
+    r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b",
+    r"\b(?:\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})\b",
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+    r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|1?\d\d?)\b",
+    r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
+];
+
 /// Entity-aware detector using regex patterns plus check-digit
 /// validation where applicable.
 ///
@@ -369,6 +407,10 @@ impl Default for CategorySet {
 /// mod-11 algorithm. This sharply reduces false positives on random
 /// numeric strings (invoice numbers, order IDs, etc.) that share
 /// the same shape as real identifiers.
+///
+/// A [`RegexSet`] prefilter runs first: one multi-pattern pass identifies
+/// which categories appear at all, so a clean string (the common case) pays a
+/// single scan instead of eight independent `find_iter` passes.
 #[derive(Debug)]
 pub struct EntityDetector {
     email: Regex,
@@ -379,6 +421,7 @@ pub struct EntityDetector {
     pix_uuid: Regex,
     ipv4: Regex,
     jwt: Regex,
+    prefilter: RegexSet,
     enabled: CategorySet,
 }
 
@@ -390,20 +433,23 @@ impl EntityDetector {
     /// compile.
     pub fn new(enabled: CategorySet) -> Result<Self, regex::Error> {
         Ok(Self {
-            email: Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")?,
-            phone: Regex::new(r"\+[1-9]\d{7,14}")?,
-            credit_card: Regex::new(r"\b(?:\d[ \-]?){12,18}\d\b")?,
-            cpf: Regex::new(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b")?,
-            cnpj: Regex::new(r"\b(?:\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})\b")?,
-            pix_uuid: Regex::new(
-                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
-            )?,
-            ipv4: Regex::new(
-                r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|1?\d\d?)\b",
-            )?,
-            jwt: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")?,
+            email: Regex::new(ENTITY_PATTERNS[DetectCategory::Email as usize])?,
+            phone: Regex::new(ENTITY_PATTERNS[DetectCategory::Phone as usize])?,
+            credit_card: Regex::new(ENTITY_PATTERNS[DetectCategory::CreditCard as usize])?,
+            cpf: Regex::new(ENTITY_PATTERNS[DetectCategory::Cpf as usize])?,
+            cnpj: Regex::new(ENTITY_PATTERNS[DetectCategory::Cnpj as usize])?,
+            pix_uuid: Regex::new(ENTITY_PATTERNS[DetectCategory::PixUuid as usize])?,
+            ipv4: Regex::new(ENTITY_PATTERNS[DetectCategory::Ipv4 as usize])?,
+            jwt: Regex::new(ENTITY_PATTERNS[DetectCategory::Jwt as usize])?,
+            prefilter: RegexSet::new(ENTITY_PATTERNS)?,
             enabled,
         })
+    }
+
+    /// Whether `category` is both enabled and reported as present by the
+    /// prefilter pass — gates the per-category `find_iter`.
+    fn should_scan(&self, matches: &regex::SetMatches, category: DetectCategory) -> bool {
+        self.enabled.contains(category) && matches.matched(category as usize)
     }
 
     /// Baseline detector with all categories enabled.
@@ -419,27 +465,32 @@ impl PiiDetector for EntityDetector {
     fn detect(&self, text: &str) -> Vec<PiiSpan> {
         let mut spans = Vec::new();
 
-        if self.enabled.contains(DetectCategory::Email) {
+        // One multi-pattern pass tells us which categories appear at all;
+        // a clean string short-circuits here without any per-category scan.
+        let matches = self.prefilter.matches(text);
+        if !matches.matched_any() {
+            return spans;
+        }
+
+        if self.should_scan(&matches, DetectCategory::Email) {
             for m in self.email.find_iter(text) {
                 spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::Email));
             }
         }
 
-        if self.enabled.contains(DetectCategory::Phone) {
+        if self.should_scan(&matches, DetectCategory::Phone) {
             for m in self.phone.find_iter(text) {
                 spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::Phone));
             }
         }
 
-        if self.enabled.contains(DetectCategory::CreditCard) {
+        if self.should_scan(&matches, DetectCategory::CreditCard) {
             for m in self.credit_card.find_iter(text) {
-                if luhn_is_valid(m.as_str()) {
-                    spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::CreditCard));
-                }
+                push_credit_card_spans(m.as_str(), m.start(), &mut spans);
             }
         }
 
-        if self.enabled.contains(DetectCategory::Cpf) {
+        if self.should_scan(&matches, DetectCategory::Cpf) {
             for m in self.cpf.find_iter(text) {
                 if cpf_is_valid(m.as_str()) {
                     spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::Cpf));
@@ -447,7 +498,7 @@ impl PiiDetector for EntityDetector {
             }
         }
 
-        if self.enabled.contains(DetectCategory::Cnpj) {
+        if self.should_scan(&matches, DetectCategory::Cnpj) {
             for m in self.cnpj.find_iter(text) {
                 if cnpj_is_valid(m.as_str()) {
                     spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::Cnpj));
@@ -455,25 +506,93 @@ impl PiiDetector for EntityDetector {
             }
         }
 
-        if self.enabled.contains(DetectCategory::PixUuid) {
+        if self.should_scan(&matches, DetectCategory::PixUuid) {
             for m in self.pix_uuid.find_iter(text) {
                 spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::PixKey));
             }
         }
 
-        if self.enabled.contains(DetectCategory::Ipv4) {
+        if self.should_scan(&matches, DetectCategory::Ipv4) {
             for m in self.ipv4.find_iter(text) {
                 spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::IpAddress));
             }
         }
 
-        if self.enabled.contains(DetectCategory::Jwt) {
+        if self.should_scan(&matches, DetectCategory::Jwt) {
             for m in self.jwt.find_iter(text) {
                 spans.push(PiiSpan::new(m.start(), m.end(), PiiCategory::Jwt));
             }
         }
 
         spans
+    }
+}
+
+/// Emit credit-card spans for one regex match's text.
+///
+/// `matched` is the matched run (it starts and ends with a digit; digits may
+/// be separated by single spaces or dashes). `base` is the byte offset of
+/// `matched` within the source text.
+///
+/// A clean PAN — the whole run passes Luhn — yields one span. Otherwise the
+/// run carried extra digits (e.g. `4111 1111 1111 1111 150`, a PAN followed by
+/// an amount): the greedy regex grabbed all of them and a single Luhn check on
+/// the combined digits fails, which previously let the real PAN leak unmasked.
+/// Instead, slide a 13-19 digit window that begins at a digit-group boundary
+/// (the run start or just after a separator) and emit the leftmost-longest
+/// Luhn-valid, non-overlapping sub-windows. Anchoring window starts to group
+/// boundaries keeps sequential filler like `1234 5678 9012 3456` from matching
+/// a coincidental interior sub-window.
+fn push_credit_card_spans(matched: &str, base: usize, out: &mut Vec<PiiSpan>) {
+    if luhn_is_valid(matched) {
+        out.push(PiiSpan::new(
+            base,
+            base + matched.len(),
+            PiiCategory::CreditCard,
+        ));
+        return;
+    }
+
+    let bytes = matched.as_bytes();
+    let digit_offsets: Vec<usize> = matched
+        .bytes()
+        .enumerate()
+        .filter(|(_, b)| b.is_ascii_digit())
+        .map(|(i, _)| i)
+        .collect();
+    let n = digit_offsets.len();
+
+    let is_group_start = |di: usize| -> bool {
+        let off = digit_offsets[di];
+        off == 0 || !bytes[off - 1].is_ascii_digit()
+    };
+
+    let mut di = 0;
+    while di < n {
+        if !is_group_start(di) {
+            di += 1;
+            continue;
+        }
+        let max_len = (n - di).min(19);
+        let mut emitted = None;
+        if max_len >= 13 {
+            for len in (13..=max_len).rev() {
+                let start_off = digit_offsets[di];
+                // ASCII digits are one byte, so `+ 1` lands on a char boundary.
+                let end_off = digit_offsets[di + len - 1] + 1;
+                if luhn_is_valid(&matched[start_off..end_off]) {
+                    out.push(PiiSpan::new(
+                        base + start_off,
+                        base + end_off,
+                        PiiCategory::CreditCard,
+                    ));
+                    emitted = Some(len);
+                    break;
+                }
+            }
+        }
+        // Skip past an emitted window; otherwise advance one digit and retry.
+        di += emitted.unwrap_or(1);
     }
 }
 
@@ -548,9 +667,18 @@ impl PiiDetector for BaselineDetector {
 // Span utilities
 // ─────────────────────────────────────────────────────────────────────
 
-/// Sort spans by start (asc) then length (desc), then drop any span
-/// that overlaps an earlier kept span or is empty. Non-overlapping
-/// spans are preserved in left-to-right order.
+/// Sort spans by start (asc) then length (desc), drop empties, and **merge**
+/// overlapping spans into a single covering interval.
+///
+/// The earlier span's category wins. Non-overlapping spans are preserved in
+/// left-to-right order.
+///
+/// Merging (rather than dropping the later span, as a previous version did) is
+/// a masking-safety requirement: a span that starts inside a kept span but
+/// extends past its end would otherwise be discarded wholesale, leaving its
+/// non-overlapping tail (`kept.end..span.end`) in cleartext. With custom
+/// detectors composed via [`CompositeDetector`], that tail can be the bulk of
+/// a credential or email — so it must be covered, not dropped.
 pub fn dedup_overlapping(spans: &mut Vec<PiiSpan>) {
     spans.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.len().cmp(&a.len())));
     let mut kept: Vec<PiiSpan> = Vec::with_capacity(spans.len());
@@ -558,9 +686,13 @@ pub fn dedup_overlapping(spans: &mut Vec<PiiSpan>) {
         if span.is_empty() {
             continue;
         }
-        let overlaps_kept = kept.last().is_some_and(|prev| prev.end > span.start);
-        if !overlaps_kept {
-            kept.push(span);
+        match kept.last_mut() {
+            // Overlaps the previously kept span: extend it to cover both so no
+            // tail leaks. The first span's category is retained.
+            Some(prev) if prev.end > span.start => {
+                prev.end = prev.end.max(span.end);
+            }
+            _ => kept.push(span),
         }
     }
     *spans = kept;
@@ -592,22 +724,48 @@ pub fn mask_with<F>(text: &str, spans: &[PiiSpan], f: F) -> String
 where
     F: Fn(&PiiSpan, &str) -> String,
 {
+    // Fast path: the common production callers (baseline / composite
+    // detectors) already hand us sorted, non-empty, non-overlapping spans, so
+    // mask straight from the borrowed slice and skip the clone + sort + dedup.
+    if spans_are_clean(spans) {
+        return mask_sorted(text, spans, &f);
+    }
     let mut sorted = spans.to_vec();
     dedup_overlapping(&mut sorted);
+    mask_sorted(text, &sorted, &f)
+}
 
+/// Whether `spans` are already sorted by start, non-empty, and
+/// non-overlapping (touching is allowed) — i.e. safe to mask without a
+/// dedup pass.
+fn spans_are_clean(spans: &[PiiSpan]) -> bool {
+    spans.iter().all(|s| !s.is_empty()) && spans.windows(2).all(|w| w[0].end <= w[1].start)
+}
+
+/// Mask `text` using pre-sorted, non-overlapping `spans`.
+///
+/// A span whose start *or* end is not a UTF-8 char boundary is skipped
+/// entirely: the matched slice is fetched **before** any output is written, so
+/// a valid-start / invalid-end span never duplicates the prefix nor leaks the
+/// bytes it was meant to mask.
+fn mask_sorted<F>(text: &str, sorted: &[PiiSpan], f: &F) -> String
+where
+    F: Fn(&PiiSpan, &str) -> String,
+{
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for span in &sorted {
+    for span in sorted {
         if span.start < cursor {
             continue;
         }
-        if let Some(prefix) = text.get(cursor..span.start) {
-            out.push_str(prefix);
-        }
-        if let Some(matched) = text.get(span.start..span.end) {
-            out.push_str(&f(span, matched));
-            cursor = span.end;
-        }
+        let (Some(prefix), Some(matched)) =
+            (text.get(cursor..span.start), text.get(span.start..span.end))
+        else {
+            continue;
+        };
+        out.push_str(prefix);
+        out.push_str(&f(span, matched));
+        cursor = span.end;
     }
     if let Some(suffix) = text.get(cursor..) {
         out.push_str(suffix);
@@ -1168,6 +1326,93 @@ mod tests {
         let masked = mask_with(text, &spans, |_, _| "X".to_owned());
         // Either unchanged or prefix kept — what matters is no panic.
         assert!(masked.contains("abc"));
+    }
+
+    #[test]
+    fn mask_with_skips_span_with_valid_start_invalid_end() {
+        // `span.start` is a char boundary (between 'a' and 'b') but `span.end`
+        // lands inside the multi-byte 'é'. The span must be skipped without
+        // duplicating the already-emitted prefix or leaking PII bytes.
+        let text = "ab é"; // bytes: a=0 b=1 ' '=2 é=3..5
+        let spans = vec![PiiSpan::new(1, 4, PiiCategory::Email)];
+        let masked = mask_with(text, &spans, |_, _| "X".to_owned());
+        assert_eq!(masked, "ab é");
+    }
+
+    // ── credit-card sliding window (PAN + trailing digits) ─────
+
+    #[test]
+    fn detects_pan_followed_by_trailing_digits() -> TestResult {
+        // A valid 16-digit PAN followed by an amount: the greedy regex grabs
+        // all 19 digits and a single Luhn check on the run fails. The real PAN
+        // is a Luhn-valid sub-window and must still be masked, not leaked.
+        let d = EntityDetector::new(CategorySet::none().with(DetectCategory::CreditCard))?;
+        let text = "card 4111 1111 1111 1111 150";
+        let spans = d.detect(text);
+        let pan_spans = spans
+            .iter()
+            .filter(|s| s.category == PiiCategory::CreditCard)
+            .count();
+        assert_eq!(pan_spans, 1, "expected the embedded PAN: {spans:?}");
+        let masked = mask_spans(text, &spans);
+        assert!(
+            !masked.contains("4111 1111 1111 1111"),
+            "PAN leaked: {masked}"
+        );
+        assert!(masked.contains("[REDACTED:credit_card]"), "got: {masked}");
+        Ok(())
+    }
+
+    #[test]
+    fn sequential_filler_digits_do_not_false_positive() -> TestResult {
+        // Sliding must not flag a coincidental interior Luhn-valid sub-window
+        // in obviously-sequential filler that is not a PAN.
+        let d = EntityDetector::new(CategorySet::none().with(DetectCategory::CreditCard))?;
+        assert!(d.detect("order 1234 5678 9012 3456 processed").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn entity_detector_clean_string_via_prefilter() -> TestResult {
+        // The RegexSet prefilter short-circuits a string with no PII.
+        let d = EntityDetector::baseline()?;
+        assert!(
+            d.detect("a perfectly ordinary sentence with no pii")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    // ── dedup_overlapping: merge (no leaked tail) ──────────────
+
+    #[test]
+    fn dedup_merges_overlapping_tail_instead_of_dropping() {
+        // A later span that starts inside the kept span but extends past its
+        // end must be merged (covering interval), not dropped — otherwise the
+        // tail bytes stay unmasked.
+        let mut spans = vec![
+            PiiSpan::new(0, 6, PiiCategory::Secret),
+            PiiSpan::new(4, 12, PiiCategory::Email),
+        ];
+        dedup_overlapping(&mut spans);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, 12, "tail must be covered, not dropped");
+        assert_eq!(spans[0].category, PiiCategory::Secret);
+    }
+
+    #[test]
+    fn mask_with_overlapping_spans_leaks_no_tail() {
+        // Concrete leak case: a secret span overlapping an email span. The
+        // overlapping tail ('@example.com') must not survive masking.
+        let text = "Bearer abc123def.ana@example.com";
+        // 'Bearer abc123def.ana' = bytes 0..20, 'ana@example.com' = 17..32.
+        let spans = vec![
+            PiiSpan::new(0, 20, PiiCategory::Secret),
+            PiiSpan::new(17, 32, PiiCategory::Email),
+        ];
+        let masked = mask_spans(text, &spans);
+        assert!(!masked.contains("@example.com"), "tail leaked: {masked}");
     }
 
     // ── mask_pan ──────────────────────────────────────────────

@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk-otel"
-version = "0.9.3"
+version = "0.9.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "OpenTelemetry bootstrap helpers for the Agent SDK (OTLP exporter wiring + propagators)"
+readme = "README.md"
 keywords = ["agent", "llm", "opentelemetry", "otlp", "observability"]
 categories = ["development-tools::profiling"]
 

@@ -1484,6 +1484,7 @@ async fn commit_one_turn<S: JournalStore>(
         CompletedTurnCommit {
             thread_id: thread.clone(),
             task_id: task_id.clone(),
+            expected_turn: turn_number,
             turn_attempt_id: attempt.id.clone(),
             close_attempt_params: CloseAttemptParams {
                 response_blob: serde_json::json!({ "id": format!("msg_{turn_number}") }),

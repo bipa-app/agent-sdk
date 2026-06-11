@@ -210,23 +210,59 @@ impl RelayWorker for OutboxRelayWorker {
             ..RelayTick::default()
         };
 
+        // A store error on one row must NOT abort the whole tick: the
+        // remaining claimed rows would otherwise sit `Claimed` until the
+        // full claim-lease expires (`reclaim_expired_claims` is the only
+        // rescue), and metrics for the tick would be lost.  Contain
+        // per-row store failures, keep processing, surface metrics, and
+        // return the first error only after every claimed row has been
+        // attempted.
+        let mut first_error: Option<anyhow::Error> = None;
+
         for row in claimed_rows {
-            match self.publisher.publish_row(&row).await {
-                Ok(()) => {
-                    self.store.mark_delivered(&row.id, now).await?;
-                    tick.delivered += 1;
-                }
-                Err(err) => {
-                    let next_attempt = self.backoff.next_attempt_at(now, row.attempt_count + 1);
-                    let error_message = format!("{err:#}");
-                    self.store
-                        .mark_failed(&row.id, &error_message, next_attempt, now)
-                        .await?;
-                    if row.attempt_count + 1 >= row.max_attempts {
-                        tick.expired += 1;
-                    } else {
-                        tick.failed += 1;
+            let row_result = match self.publisher.publish_row(&row).await {
+                Ok(()) => match self.store.mark_delivered(&row.id, worker_id, now).await {
+                    Ok(()) => {
+                        tick.delivered += 1;
+                        Ok(())
                     }
+                    Err(err) => {
+                        Err(err.context(format!("mark_delivered for outbox row {}", row.id)))
+                    }
+                },
+                Err(publish_err) => {
+                    let next_attempt = self.backoff.next_attempt_at(now, row.attempt_count + 1);
+                    let error_message = format!("{publish_err:#}");
+                    match self
+                        .store
+                        .mark_failed(&row.id, worker_id, &error_message, next_attempt, now)
+                        .await
+                    {
+                        Ok(()) => {
+                            if row.attempt_count + 1 >= row.max_attempts {
+                                tick.expired += 1;
+                            } else {
+                                tick.failed += 1;
+                            }
+                            Ok(())
+                        }
+                        Err(err) => {
+                            Err(err.context(format!("mark_failed for outbox row {}", row.id)))
+                        }
+                    }
+                }
+            };
+
+            if let Err(err) = row_result {
+                let detail = format!("{err:#}");
+                log::warn!(
+                    outbox_row = row.id.as_str(),
+                    error = detail.as_str();
+                    "relay tick: store update failed for a claimed row; \
+                     continuing with the rest of the batch",
+                );
+                if first_error.is_none() {
+                    first_error = Some(err);
                 }
             }
         }
@@ -234,7 +270,7 @@ impl RelayWorker for OutboxRelayWorker {
         #[cfg(feature = "otel")]
         crate::observability::ServerMetrics::global().record_relay_tick(&tick);
 
-        Ok(tick)
+        first_error.map_or_else(|| Ok(tick), Err)
     }
 }
 
@@ -588,6 +624,137 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    // ── Per-row store error containment ───────────────────────────
+
+    /// Wraps an [`InMemoryOutboxStore`] and fails the first
+    /// `mark_delivered` call, succeeding afterwards.  Everything else
+    /// delegates to the inner store.
+    struct FlakyMarkStore {
+        inner: InMemoryOutboxStore,
+        fail_remaining: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl OutboxStore for FlakyMarkStore {
+        async fn insert_batch(&self, rows: Vec<NewOutboxRow>) -> Result<Vec<OutboxRow>> {
+            self.inner.insert_batch(rows).await
+        }
+
+        async fn claim_pending(
+            &self,
+            worker_id: &str,
+            limit: u32,
+            now: OffsetDateTime,
+        ) -> Result<Vec<OutboxRow>> {
+            self.inner.claim_pending(worker_id, limit, now).await
+        }
+
+        async fn mark_delivered(
+            &self,
+            id: &OutboxRowId,
+            worker_id: &str,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            use std::sync::atomic::Ordering;
+            if self.fail_remaining.load(Ordering::SeqCst) > 0 {
+                self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                anyhow::bail!("simulated mark_delivered store failure");
+            }
+            self.inner.mark_delivered(id, worker_id, now).await
+        }
+
+        async fn mark_failed(
+            &self,
+            id: &OutboxRowId,
+            worker_id: &str,
+            error: &str,
+            next_attempt_at: OffsetDateTime,
+            now: OffsetDateTime,
+        ) -> Result<()> {
+            self.inner
+                .mark_failed(id, worker_id, error, next_attempt_at, now)
+                .await
+        }
+
+        async fn reclaim_expired_claims(
+            &self,
+            now: OffsetDateTime,
+            claim_lease: TimeDuration,
+        ) -> Result<u64> {
+            self.inner.reclaim_expired_claims(now, claim_lease).await
+        }
+
+        async fn get(&self, id: &OutboxRowId) -> Result<Option<OutboxRow>> {
+            self.inner.get(id).await
+        }
+
+        async fn list_by_thread(&self, thread_id: &ThreadId) -> Result<Vec<OutboxRow>> {
+            self.inner.list_by_thread(thread_id).await
+        }
+
+        async fn count_pending(&self, thread_id: &ThreadId) -> Result<u64> {
+            self.inner.count_pending(thread_id).await
+        }
+
+        async fn min_unpublished_sequence(&self, thread_id: &ThreadId) -> Result<Option<u64>> {
+            self.inner.min_unpublished_sequence(thread_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_continues_after_per_row_store_error() -> Result<()> {
+        use crate::journal::outbox::OutboxStatus;
+
+        let store: Arc<dyn OutboxStore> = Arc::new(FlakyMarkStore {
+            inner: InMemoryOutboxStore::new(),
+            fail_remaining: std::sync::atomic::AtomicU32::new(1),
+        });
+        let broker = InMemoryBrokerAdapter::new();
+        let publisher: Arc<dyn Publisher> =
+            Arc::new(BrokerPublisher::new(Arc::new(broker.clone())));
+        let worker = OutboxRelayWorker::new(
+            store.clone(),
+            publisher,
+            16,
+            RetryBackoff::fixed_seconds(30),
+        );
+
+        // Two claimable rows.  The publisher succeeds for both; the
+        // store fails `mark_delivered` for whichever row is processed
+        // first, then succeeds for the second.
+        let id_a = seed_thread_events_row(&store, &thread_a(), 0, 3, t0()).await?;
+        let id_b = seed_thread_events_row(&store, &thread_a(), 1, 3, t0()).await?;
+
+        // The tick surfaces the store error but only AFTER attempting
+        // every claimed row.
+        let result = worker.tick("worker-a", t_plus(1)).await;
+        assert!(result.is_err(), "tick must surface the store error");
+
+        // Both rows were published despite the store error.
+        assert_eq!(broker.published_count().await, 2);
+
+        // Exactly one row reached Delivered; the other stayed Claimed
+        // (its mark_delivered failed) — not stranded across the rest of
+        // the batch.
+        let row_a = store.get(&id_a).await?.context("row a missing")?;
+        let row_b = store.get(&id_b).await?.context("row b missing")?;
+        let statuses = [row_a.status, row_b.status];
+        let delivered = statuses
+            .iter()
+            .filter(|s| **s == OutboxStatus::Delivered)
+            .count();
+        let claimed = statuses
+            .iter()
+            .filter(|s| **s == OutboxStatus::Claimed)
+            .count();
+        assert_eq!(delivered, 1, "one row should be delivered");
+        assert_eq!(
+            claimed, 1,
+            "the failed row should remain claimed, not be skipped"
+        );
         Ok(())
     }
 }

@@ -27,7 +27,7 @@ use agent_server::worker::{
 use anyhow::{Context, Result};
 use async_stream::try_stream;
 use base64::Engine as _;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use prost::Message as ProstMessage;
 use prost_types::{
     Duration as ProtoDuration, ListValue as ProtoListValue, Struct as ProtoStruct,
@@ -191,12 +191,23 @@ impl GrpcShared {
         &self,
         thread: &agent_server::Thread,
     ) -> Result<pb::ThreadSnapshot, Status> {
-        let events = self
+        // Read the two boundary sequences with cheap watermark/min
+        // queries instead of materialising the entire event journal —
+        // this snapshot is embedded in every SubmitThreadWork / GetThread
+        // / CreateThread / ForkThread response, so an O(journal-length)
+        // read here scales unboundedly with thread age.
+        let next_sequence = self
             .stores
             .event_repo
-            .get_events(&thread.thread_id)
+            .next_sequence(&thread.thread_id)
             .await
-            .map_err(internal_status("loading thread events"))?;
+            .map_err(internal_status("reading thread event watermark"))?;
+        let earliest_available_event_sequence = self
+            .stores
+            .event_repo
+            .min_sequence_at_or_after(&thread.thread_id, OffsetDateTime::UNIX_EPOCH)
+            .await
+            .map_err(internal_status("reading earliest thread event sequence"))?;
 
         Ok(pb::ThreadSnapshot {
             thread_id: thread.thread_id.0.clone(),
@@ -205,8 +216,8 @@ impl GrpcShared {
             total_usage: Some(map_token_usage(&thread.total_usage)),
             created_at: Some(map_timestamp(thread.created_at)?),
             updated_at: Some(map_timestamp(thread.updated_at)?),
-            latest_event_sequence: events.last().map(|event| event.sequence),
-            earliest_available_event_sequence: events.first().map(|event| event.sequence),
+            latest_event_sequence: next_sequence.checked_sub(1),
+            earliest_available_event_sequence,
         })
     }
 
@@ -348,82 +359,23 @@ impl GrpcShared {
         let bootstrap = resolve_tool_bootstrap(acquired, self.stores.task_store.as_ref())
             .await
             .context("bootstrapping approved confirmation task")?;
-        let executor_bootstrap = bootstrap.clone();
-        let publish_thread_id = bootstrap.thread_id.clone();
-        let running_task_id = bootstrap.task_id.clone();
-        let running_worker_id = bootstrap.worker_id.clone();
-        let running_lease_id = bootstrap.lease_id.clone();
-        let tool_executor = Arc::clone(self.runtime.tool_executor());
-        let cancel = self.shutdown.clone();
-        let deps = GuardedExecutionDeps {
-            task_store: self.stores.task_store.as_ref(),
-            intent_store: self.stores.execution_intent_store.as_ref(),
-            event_repo: self.stores.event_repo.as_ref(),
-        };
 
-        match Box::pin(resume_confirmed_tool(
+        // Decouple the side-effecting tool from the RPC lifetime. A
+        // Confirm-tier tool can run longer than one lease, so driving it
+        // inline (a) lost its lease to the sweep mid-flight → re-acquired
+        // by a worker → double execution, and (b) was cancelled outright
+        // if the gRPC client disconnected (tonic drops the handler
+        // future). Run it on a detached task under a heartbeat loop
+        // instead; the tool's events land on the live/replay stream and
+        // the RPC returns the task in its Running state.
+        tokio::spawn(drive_approved_confirmation(DriveApprovedConfirmation {
+            stores: self.stores.clone(),
+            runtime: Arc::clone(&self.runtime),
+            shutdown: self.shutdown.clone(),
             bootstrap,
-            &deps,
-            self.runtime.confirmation_policy().as_ref(),
-            &self.shutdown,
-            move |_tool_call, collector| {
-                let tool_executor = Arc::clone(&tool_executor);
-                let executor_bootstrap = executor_bootstrap.clone();
-                let cancel = cancel.clone();
-                async move {
-                    tool_executor
-                        .execute_tool_call(&executor_bootstrap, collector, cancel)
-                        .await
-                }
-            },
-            now,
-        ))
-        .await
-        {
-            Ok(
-                ConfirmationResumeOutcome::Executed(_)
-                | ConfirmationResumeOutcome::PolicyDenied { .. },
-            ) => {}
-            Err(error) => {
-                warn!(?error, task_id = %task_id, "approved confirmation resume failed");
-                let _ = self
-                    .stores
-                    .task_store
-                    .fail_task(
-                        &running_task_id,
-                        &running_worker_id,
-                        &running_lease_id,
-                        format!("{error:#}"),
-                        now,
-                    )
-                    .await;
-            }
-        }
-
-        self.publish_committed_after(&publish_thread_id, watermark)
-            .await
-            .context("publishing approved confirmation events")?;
-        Ok(())
-    }
-
-    async fn publish_committed_after(
-        &self,
-        thread_id: &ThreadId,
-        start_sequence: u64,
-    ) -> Result<()> {
-        let events = self
-            .stores
-            .event_repo
-            .get_events(thread_id)
-            .await
-            .context("loading committed events for publish")?;
-        let to_publish: Vec<_> = events
-            .into_iter()
-            .filter(|event| event.sequence >= start_sequence)
-            .collect();
-        if !to_publish.is_empty() {
-            self.stores.event_notifier.notify(&to_publish);
-        }
+            watermark,
+            lease_duration: self.lease_duration,
+        }));
         Ok(())
     }
 
@@ -454,6 +406,135 @@ impl GrpcShared {
             }
         }
         Ok(())
+    }
+}
+
+/// Inputs for the detached task that drives an approved confirmation's
+/// tool to completion (see [`drive_approved_confirmation`]).
+struct DriveApprovedConfirmation {
+    stores: StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+    shutdown: CancellationToken,
+    bootstrap: agent_server::worker::ToolTaskBootstrap,
+    watermark: u64,
+    lease_duration: time::Duration,
+}
+
+/// Derive a heartbeat interval for a one-off resumed execution from the
+/// lease duration, mirroring the worker pool's default 1:3 ratio
+/// (10s heartbeat / 30s lease) and never returning a zero interval (a
+/// zero interval would panic `tokio::time::interval`).
+fn heartbeat_interval_for(lease_duration: time::Duration) -> std::time::Duration {
+    let lease_secs = lease_duration.whole_seconds().max(1);
+    let interval_secs = u64::try_from(lease_secs / 3).unwrap_or(1).max(1);
+    std::time::Duration::from_secs(interval_secs)
+}
+
+/// Drive an approved confirmation's resumed tool to completion on a
+/// detached task, holding the lease open with a heartbeat loop and
+/// publishing the committed tail to live subscribers.
+///
+/// This is spawned (not awaited) from the `DecideConfirmation` RPC so a
+/// long-running Confirm-tier tool neither loses its lease to the sweep
+/// nor gets cancelled by a client disconnect.
+async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
+    let DriveApprovedConfirmation {
+        stores,
+        runtime,
+        shutdown,
+        bootstrap,
+        watermark,
+        lease_duration,
+    } = params;
+
+    let task_id = bootstrap.task_id.clone();
+    let thread_id = bootstrap.thread_id.clone();
+    let worker_id = bootstrap.worker_id.clone();
+    let lease_id = bootstrap.lease_id.clone();
+
+    // Extend the lease for the lifetime of the tool call. The child
+    // token is rooted at the server shutdown token, so a host shutdown
+    // still tears the heartbeat down.
+    let heartbeat_cancel = shutdown.child_token();
+    let heartbeat_handle = tokio::spawn(crate::host::heartbeat_loop(
+        crate::host::HeartbeatLoopParams {
+            stores: stores.clone(),
+            task_id: task_id.clone(),
+            thread_id: thread_id.clone(),
+            worker_id: worker_id.clone(),
+            lease_id: lease_id.clone(),
+            lease_duration,
+            heartbeat_interval: heartbeat_interval_for(lease_duration),
+            cancel: heartbeat_cancel.clone(),
+        },
+    ));
+
+    let now = OffsetDateTime::now_utc();
+    let executor_bootstrap = bootstrap.clone();
+    let tool_executor = Arc::clone(runtime.tool_executor());
+    let exec_cancel = shutdown.clone();
+    let deps = GuardedExecutionDeps {
+        task_store: stores.task_store.as_ref(),
+        intent_store: stores.execution_intent_store.as_ref(),
+        event_repo: stores.event_repo.as_ref(),
+    };
+
+    let outcome = Box::pin(resume_confirmed_tool(
+        bootstrap,
+        &deps,
+        runtime.confirmation_policy().as_ref(),
+        &shutdown,
+        move |_tool_call, collector| {
+            let tool_executor = Arc::clone(&tool_executor);
+            let executor_bootstrap = executor_bootstrap.clone();
+            let cancel = exec_cancel.clone();
+            async move {
+                tool_executor
+                    .execute_tool_call(&executor_bootstrap, collector, cancel)
+                    .await
+            }
+        },
+        now,
+    ))
+    .await;
+
+    heartbeat_cancel.cancel();
+    if let Err(join_err) = heartbeat_handle.await {
+        warn!(task_id = %task_id, error = %join_err, "approved confirmation heartbeat join failed");
+    }
+
+    match outcome {
+        Ok(
+            ConfirmationResumeOutcome::Executed(_) | ConfirmationResumeOutcome::PolicyDenied { .. },
+        ) => {}
+        Err(error) => {
+            warn!(?error, task_id = %task_id, "approved confirmation resume failed");
+            if let Err(fail_err) = stores
+                .task_store
+                .fail_task(&task_id, &worker_id, &lease_id, format!("{error:#}"), now)
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %fail_err,
+                    "failed to mark approved confirmation task failed after resume error",
+                );
+            }
+        }
+    }
+
+    match crate::host::committed_events_from(stores.event_repo.as_ref(), &thread_id, watermark)
+        .await
+    {
+        Ok(events) if !events.is_empty() => stores.event_notifier.notify(&events),
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                thread_id = %thread_id,
+                ?error,
+                "loading committed events for approved confirmation publish failed",
+            );
+        }
     }
 }
 
@@ -845,6 +926,7 @@ impl GrpcControlService {
                     task_id,
                     other,
                     self.shared.stores.task_store.as_ref(),
+                    self.shared.stores.event_repo.as_ref(),
                     now,
                 )
                 .await
@@ -1282,7 +1364,6 @@ type EventStream =
     Pin<Box<dyn Stream<Item = Result<pb::StreamThreadEventsResponse, Status>> + Send>>;
 
 struct ReplayState {
-    all_events: Vec<agent_server::CommittedEvent>,
     earliest_available: Option<u64>,
     latest_available: Option<u64>,
     next_sequence: u64,
@@ -1297,7 +1378,10 @@ impl GrpcEventService {
     ) -> EventStream {
         let shared = Arc::clone(&self.shared);
         let stream = try_stream! {
-            let mut live_rx = shared.stores.event_notifier.subscribe(&thread_id);
+            // Subscribe before reading the journal watermark so no event
+            // committed during replay setup slips through the gap between
+            // the read and the live subscription.
+            let live_rx = shared.stores.event_notifier.subscribe(&thread_id);
             let replay = load_replay_state(shared.as_ref(), &thread_id).await?;
             if has_retention_gap(after_sequence, replay.earliest_available) {
                 yield retention_gap_response(
@@ -1317,7 +1401,18 @@ impl GrpcEventService {
                 follow_mode,
             );
 
-            let replay_events = select_replay_events(replay.all_events, after_sequence);
+            // Fetch only the suffix the client needs: a bounded range
+            // query for a reconnect near the head, the full history only
+            // for replay-from-start. The retention-gap check above ran on
+            // cheap watermark/min metadata, so a below-floor reconnect
+            // never pays for a journal read it would discard.
+            let replay_events = fetch_replay_events(
+                shared.as_ref(),
+                &thread_id,
+                after_sequence,
+                replay.latest_available,
+            )
+            .await?;
             let mut last_delivered_sequence = after_sequence;
             for event in &replay_events {
                 last_delivered_sequence = Some(event.sequence);
@@ -1331,26 +1426,137 @@ impl GrpcEventService {
             );
 
             let last_replayed_done = replay_events.last().is_some_and(is_done_event);
-            if follow_mode == pb::FollowMode::ReplayOnly {
-                yield closed_stream_response(
-                    &thread_id,
-                    pb::StreamCloseReason::ReplayExhausted,
-                    last_delivered_sequence,
-                );
-                return;
-            }
-            if last_replayed_done {
-                yield closed_stream_response(
-                    &thread_id,
-                    pb::StreamCloseReason::ThreadCompleted,
-                    last_delivered_sequence,
-                );
+            if let Some(reason) = post_replay_close_reason(follow_mode, last_replayed_done) {
+                yield closed_stream_response(&thread_id, reason, last_delivered_sequence);
                 return;
             }
 
-            loop {
-                tokio::select! {
-                    () = shared.shutdown.cancelled() => {
+            // Re-yield the live follow phase. Splitting it into its own
+            // stream keeps the yields (and their exact ordering) identical
+            // while moving the loop body out of this function.
+            let live = follow_live_events(
+                Arc::clone(&shared),
+                thread_id.clone(),
+                live_rx,
+                last_delivered_sequence,
+            );
+            let mut live = std::pin::pin!(live);
+            while let Some(item) = live.next().await {
+                yield item?;
+            }
+        };
+
+        Box::pin(stream)
+    }
+}
+
+/// Close reason for a stream once replay catch-up finishes, or `None`
+/// when the stream should transition to the live follow phase.
+const fn post_replay_close_reason(
+    follow_mode: pb::FollowMode,
+    last_replayed_done: bool,
+) -> Option<pb::StreamCloseReason> {
+    if matches!(follow_mode, pb::FollowMode::ReplayOnly) {
+        Some(pb::StreamCloseReason::ReplayExhausted)
+    } else if last_replayed_done {
+        Some(pb::StreamCloseReason::ThreadCompleted)
+    } else {
+        None
+    }
+}
+
+/// Live follow phase: deliver newly-committed events in order, backfilling
+/// any gap the unordered broadcast skipped, until the thread completes,
+/// the subscriber lags, or the server shuts down.
+fn follow_live_events(
+    shared: Arc<GrpcShared>,
+    thread_id: ThreadId,
+    mut live_rx: agent_server::EventReceiver,
+    mut last_delivered_sequence: Option<u64>,
+) -> impl Stream<Item = Result<pb::StreamThreadEventsResponse, Status>> + Send {
+    try_stream! {
+        loop {
+            tokio::select! {
+                () = shared.shutdown.cancelled() => {
+                    yield closed_stream_response(
+                        &thread_id,
+                        pb::StreamCloseReason::ServerShutdown,
+                        last_delivered_sequence,
+                    );
+                    return;
+                }
+                received = live_rx.recv() => match received {
+                    Ok(event) => {
+                        // Already delivered (duplicate or stale broadcast).
+                        if last_delivered_sequence.is_some_and(|sequence| event.sequence <= sequence) {
+                            continue;
+                        }
+                        // Gap detection: publishers notify the broadcast
+                        // channel without a shared ordering lock, so a
+                        // later range can arrive before an earlier one on
+                        // a thread with parallel writers. If this event
+                        // skips ahead of the contiguous frontier, re-read
+                        // the missed range from the durable journal and
+                        // deliver it in order before the out-of-order
+                        // event — otherwise those sequences are dropped
+                        // permanently until the client reconnects.
+                        let expected_next =
+                            last_delivered_sequence.map_or(0, |sequence| sequence + 1);
+                        if event.sequence > expected_next {
+                            let Ok(missed) = fetch_missed_range(
+                                shared.as_ref(),
+                                &thread_id,
+                                last_delivered_sequence,
+                                event.sequence,
+                            )
+                            .await
+                            else {
+                                // Can't backfill the gap from the
+                                // journal; force the client to
+                                // reconnect and replay so no sequence
+                                // is silently lost.
+                                yield replay_required_response(
+                                    &thread_id,
+                                    last_delivered_sequence,
+                                );
+                                return;
+                            };
+                            for missed_event in &missed {
+                                if last_delivered_sequence
+                                    .is_some_and(|sequence| missed_event.sequence <= sequence)
+                                {
+                                    continue;
+                                }
+                                last_delivered_sequence = Some(missed_event.sequence);
+                                let is_done = is_done_event(missed_event);
+                                yield event_stream_response(missed_event)?;
+                                if is_done {
+                                    yield closed_stream_response(
+                                        &thread_id,
+                                        pb::StreamCloseReason::ThreadCompleted,
+                                        last_delivered_sequence,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        last_delivered_sequence = Some(event.sequence);
+                        let is_done = is_done_event(&event);
+                        yield event_stream_response(&event)?;
+                        if is_done {
+                            yield closed_stream_response(
+                                &thread_id,
+                                pb::StreamCloseReason::ThreadCompleted,
+                                last_delivered_sequence,
+                            );
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        yield replay_required_response(&thread_id, last_delivered_sequence);
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         yield closed_stream_response(
                             &thread_id,
                             pb::StreamCloseReason::ServerShutdown,
@@ -1358,41 +1564,9 @@ impl GrpcEventService {
                         );
                         return;
                     }
-                    received = live_rx.recv() => match received {
-                        Ok(event) => {
-                            if last_delivered_sequence.is_some_and(|sequence| event.sequence <= sequence) {
-                                continue;
-                            }
-                            last_delivered_sequence = Some(event.sequence);
-                            let is_done = is_done_event(&event);
-                            yield event_stream_response(&event)?;
-                            if is_done {
-                                yield closed_stream_response(
-                                    &thread_id,
-                                    pb::StreamCloseReason::ThreadCompleted,
-                                    last_delivered_sequence,
-                                );
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            yield replay_required_response(&thread_id, last_delivered_sequence);
-                            return;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            yield closed_stream_response(
-                                &thread_id,
-                                pb::StreamCloseReason::ServerShutdown,
-                                last_delivered_sequence,
-                            );
-                            return;
-                        }
-                    }
                 }
             }
-        };
-
-        Box::pin(stream)
+        }
     }
 }
 
@@ -1417,25 +1591,94 @@ impl AgentEventService for GrpcEventService {
 }
 
 async fn load_replay_state(shared: &GrpcShared, thread_id: &ThreadId) -> RpcResult<ReplayState> {
+    // Cheap boundary metadata only — the actual replay events are
+    // fetched (bounded) after the retention-gap check passes so a
+    // below-floor reconnect never materialises the journal.
     let next_sequence = shared
         .stores
         .event_repo
         .next_sequence(thread_id)
         .await
         .map_err(as_stream_status("capturing event watermark"))?;
-    let all_events = shared
+    let earliest_available = shared
         .stores
         .event_repo
-        .get_events(thread_id)
+        .min_sequence_at_or_after(thread_id, OffsetDateTime::UNIX_EPOCH)
         .await
-        .map_err(as_stream_status("loading replay events"))?;
+        .map_err(as_stream_status("reading earliest available event"))?;
 
     Ok(ReplayState {
-        earliest_available: all_events.first().map(|event| event.sequence),
-        latest_available: all_events.last().map(|event| event.sequence),
-        all_events,
+        earliest_available,
+        latest_available: next_sequence.checked_sub(1),
         next_sequence,
     })
+}
+
+/// Fetch the events a freshly-opened stream must replay.
+///
+/// `after_sequence = Some(n)` is the reconnect-near-the-head case: only
+/// the suffix `(n, watermark]` is read via `get_events_in_range`, so a
+/// client resuming at sequence 10,000 does not reload and discard 10,000
+/// rows. `None` (replay-from-start) is the only path that reads the full
+/// history.
+async fn fetch_replay_events(
+    shared: &GrpcShared,
+    thread_id: &ThreadId,
+    after_sequence: Option<u64>,
+    latest_available: Option<u64>,
+) -> Result<Vec<agent_server::CommittedEvent>, Status> {
+    match after_sequence {
+        Some(after) => {
+            let up_to = latest_available.unwrap_or(0);
+            shared
+                .stores
+                .event_repo
+                .get_events_in_range(thread_id, after, up_to)
+                .await
+                .map_err(as_stream_status("loading replay events in range"))
+        }
+        None => shared
+            .stores
+            .event_repo
+            .get_events(thread_id)
+            .await
+            .map_err(as_stream_status("loading replay events")),
+    }
+}
+
+/// Re-read the contiguous range of events the live broadcast skipped,
+/// `(last_delivered, incoming_sequence)` exclusive on both ends, so an
+/// out-of-order delivery never silently drops the events between the
+/// frontier and the event that overtook them.
+async fn fetch_missed_range(
+    shared: &GrpcShared,
+    thread_id: &ThreadId,
+    last_delivered: Option<u64>,
+    incoming_sequence: u64,
+) -> Result<Vec<agent_server::CommittedEvent>, Status> {
+    let up_to = incoming_sequence.saturating_sub(1);
+    match last_delivered {
+        // Bounded range read of the gap.
+        Some(after) => shared
+            .stores
+            .event_repo
+            .get_events_in_range(thread_id, after, up_to)
+            .await
+            .map_err(as_stream_status("re-reading missed live range")),
+        // Nothing delivered yet: the gap starts at sequence 0, which the
+        // exclusive-lower range query cannot express. The journal is at
+        // most `incoming_sequence` events long here, so a bounded full
+        // read filtered to the prefix is cheap.
+        None => Ok(shared
+            .stores
+            .event_repo
+            .get_events(thread_id)
+            .await
+            .map_err(as_stream_status("re-reading missed live prefix"))?
+            .into_iter()
+            .filter(|event| event.sequence < incoming_sequence)
+            .collect()),
+    }
 }
 
 const fn has_retention_gap(after_sequence: Option<u64>, earliest_available: Option<u64>) -> bool {
@@ -1443,19 +1686,6 @@ const fn has_retention_gap(after_sequence: Option<u64>, earliest_available: Opti
         (after_sequence, earliest_available),
         (Some(requested_after), Some(earliest)) if requested_after < earliest.saturating_sub(1)
     )
-}
-
-fn select_replay_events(
-    all_events: Vec<agent_server::CommittedEvent>,
-    after_sequence: Option<u64>,
-) -> Vec<agent_server::CommittedEvent> {
-    match after_sequence {
-        Some(after_sequence) => all_events
-            .into_iter()
-            .filter(|event| event.sequence > after_sequence)
-            .collect(),
-        None => all_events,
-    }
 }
 
 fn retention_gap_response(
@@ -2641,6 +2871,115 @@ mod tests {
             tool_executor,
             Arc::new(AllowAllConfirmationPolicy),
         )))
+    }
+
+    fn event_test_shared() -> Result<Arc<GrpcShared>> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::in_memory(registry);
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Arc::new(NoopToolExecutor),
+        )?;
+        Ok(Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            AdmissionConfig::default(),
+        )))
+    }
+
+    async fn seed_events(shared: &GrpcShared, thread_id: &ThreadId, count: u32) -> Result<()> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for i in 0..count {
+            shared
+                .stores
+                .event_repo
+                .commit_event(
+                    thread_id,
+                    agent_sdk_foundation::events::AgentEvent::text(format!("m{i}"), "x"),
+                    now,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_snapshot_reports_boundaries_without_full_scan() -> Result<()> {
+        // Regression: thread_snapshot must read the two boundary
+        // sequences from cheap watermark/min queries rather than loading
+        // the whole journal.
+        let shared = event_test_shared()?;
+        let thread_id = ThreadId::from_string("t-snapshot-bounds");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let thread = shared
+            .stores
+            .thread_store
+            .get_or_create(&thread_id, now)
+            .await?;
+        seed_events(&shared, &thread_id, 4).await?;
+
+        let snapshot = shared.thread_snapshot(&thread).await?;
+        assert_eq!(snapshot.latest_event_sequence, Some(3));
+        assert_eq!(snapshot.earliest_available_event_sequence, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_replay_events_reads_only_the_suffix() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread_id = ThreadId::from_string("t-replay-suffix");
+        seed_events(&shared, &thread_id, 6).await?;
+        let latest_available = Some(5);
+
+        // Reconnect after sequence 3 → only the missed suffix 4,5.
+        let suffix =
+            fetch_replay_events(shared.as_ref(), &thread_id, Some(3), latest_available).await?;
+        assert_eq!(
+            suffix
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![4, 5],
+        );
+
+        // Replay-from-start (None) is the only path that reads it all.
+        let all = fetch_replay_events(shared.as_ref(), &thread_id, None, latest_available).await?;
+        assert_eq!(all.len(), 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_missed_range_recovers_skipped_events() -> Result<()> {
+        let shared = event_test_shared()?;
+        let thread_id = ThreadId::from_string("t-missed-range");
+        seed_events(&shared, &thread_id, 6).await?;
+
+        // Frontier at sequence 2, an out-of-order live event for sequence
+        // 5 arrives → the dropped gap is [3, 4].
+        let missed = fetch_missed_range(shared.as_ref(), &thread_id, Some(2), 5).await?;
+        assert_eq!(
+            missed
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+        );
+
+        // Nothing delivered yet and event 3 arrives → prefix [0, 1, 2].
+        let prefix = fetch_missed_range(shared.as_ref(), &thread_id, None, 3).await?;
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+        Ok(())
     }
 
     async fn connect_clients(endpoint: &str) -> Result<(ControlClient, EventClient)> {

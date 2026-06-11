@@ -18,7 +18,7 @@ use time::{Duration, OffsetDateTime};
 use super::subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
-    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentBatchEntry, SubagentCapabilityProfile,
     SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentSandboxPolicy,
     SubagentSpawnPolicy, SubagentSpawnRequest, resolve_subagent_spec,
     spawn_subagent_batch_invocations, spawn_subagent_invocation,
@@ -968,15 +968,14 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
     let tasks = vec!["explore A", "explore B", "explore C"];
     let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
 
-    let spawns: Vec<SubagentInvocationSpawn> = tasks
+    let entries: Vec<SubagentBatchEntry> = tasks
         .iter()
         .enumerate()
-        .map(|(idx, task)| SubagentInvocationSpawn {
+        .map(|(idx, task)| SubagentBatchEntry {
             child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: u32::try_from(idx).expect("test idx fits in u32"),
-            payload: payload.clone(),
         })
         .collect();
 
@@ -984,7 +983,8 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
         &parent.id,
         &worker,
         &lease,
-        spawns,
+        entries,
+        payload,
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1045,12 +1045,16 @@ async fn spawn_batch_rejects_empty_input() -> Result<()> {
     let thread_store = InMemoryThreadStore::new();
     let event_repo = InMemoryEventRepository::new();
     let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    // Payload content is irrelevant here: the empty-batch guard fires
+    // before the payload is inspected. Supply a well-formed one anyway.
+    let payload = parent_suspension_payload_with_tools(&parent.thread_id, &["unused"]);
 
     let err = spawn_subagent_batch_invocations(
         &parent.id,
         &worker,
         &lease,
         Vec::new(),
+        payload,
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1077,20 +1081,18 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
     let tasks = vec!["A", "B"]; // 2 pending tool calls
     let payload = parent_suspension_payload_with_tools(&parent.thread_id, &tasks);
 
-    let spawns = vec![
-        SubagentInvocationSpawn {
+    let entries = vec![
+        SubagentBatchEntry {
             child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec("A"),
             child_root_input: child_root_input("A"),
             spawn_index: 0,
-            payload: payload.clone(),
         },
-        SubagentInvocationSpawn {
+        SubagentBatchEntry {
             child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec("ghost"),
             child_root_input: child_root_input("ghost"),
             spawn_index: 5, // out of bounds — only 2 pending tool calls
-            payload: payload.clone(),
         },
     ];
 
@@ -1098,7 +1100,8 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
         &parent.id,
         &worker,
         &lease,
-        spawns,
+        entries,
+        payload,
         &SubagentInvocationDeps {
             task_store: &task_store,
             thread_store: &thread_store,
@@ -1399,5 +1402,28 @@ async fn spawn_flow_rejects_non_confirm_tier_subagent_tools() -> Result<()> {
         error_text(&err).contains("must remain confirm-tier"),
         "unexpected error: {err:#}"
     );
+    Ok(())
+}
+
+// Finding #20: a requested-but-disallowed model resolves to the
+// inherited default (loud fallback) rather than erroring or being
+// passed through.
+#[test]
+fn resolve_model_falls_back_to_default_for_disallowed_model() -> Result<()> {
+    let constraints = sample_constraints();
+    let policy = ServerSubagentSpawnPolicy;
+
+    // A model outside the inherited allow-list resolves to the default.
+    let resolved = policy.resolve_model(Some("gpt-4o-not-allowed"), &constraints)?;
+    assert_eq!(resolved, "claude-sonnet-4-5-20250929");
+
+    // An allowed model is preserved unchanged.
+    let allowed = policy.resolve_model(Some("claude-opus-4-5-20250929"), &constraints)?;
+    assert_eq!(allowed, "claude-opus-4-5-20250929");
+
+    // No requested model → inherited default.
+    let defaulted = policy.resolve_model(None, &constraints)?;
+    assert_eq!(defaulted, "claude-sonnet-4-5-20250929");
+
     Ok(())
 }

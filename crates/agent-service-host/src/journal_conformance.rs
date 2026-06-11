@@ -18,7 +18,10 @@
 #[cfg(test)]
 mod tests {
     use agent_server::journal::conformance::{ConformanceReport, run_journal_store_conformance};
-    use anyhow::{Context, Result};
+    use anyhow::Result;
+    // `Context` is only used by the Postgres-gated setup helpers below.
+    #[cfg(feature = "postgres")]
+    use anyhow::Context;
 
     /// Assert the report shape every backend must satisfy: every
     /// mandatory case ran, and the only recorded skip is the

@@ -4,8 +4,9 @@ use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
 use crate::types::{ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::client::McpClient;
 use super::protocol::{McpContent, McpToolDefinition};
@@ -48,18 +49,42 @@ pub struct McpToolBridge<T: McpTransport> {
     cached_description: &'static str,
 }
 
+/// Intern a string into a process-global table, returning a `&'static str`.
+///
+/// The `Tool` trait requires `&'static str` for `display_name`/`description`.
+/// MCP advertises `listChanged`, so tools are re-listed and re-bridged over a
+/// connection's lifetime; interning by content means reconstructing a bridge
+/// for the same tool reuses the prior allocation instead of leaking a fresh one
+/// on every construction. Total leaked memory is bounded by the set of distinct
+/// names/descriptions, not by the number of (re-)registrations.
+fn intern(s: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let table = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&existing) = guard.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    guard.insert(s.to_owned(), leaked);
+    leaked
+}
+
 impl<T: McpTransport> McpToolBridge<T> {
     /// Create a new MCP tool bridge.
     ///
     /// Sanitizes the tool description at construction time to prevent prompt
-    /// injection via MCP tool definitions. The description is cached as a
-    /// `&'static str` once (not leaked on every call).
+    /// injection via MCP tool definitions. The name and sanitized description
+    /// are interned in a process-global table (see `intern`) so reconstructing
+    /// a bridge for the same tool reuses the existing allocation rather than
+    /// leaking on every construction.
     #[must_use]
     pub fn new(client: Arc<McpClient<T>>, definition: McpToolDefinition) -> Self {
-        let cached_display_name = Box::leak(definition.name.clone().into_boxed_str());
+        let cached_display_name = intern(&definition.name);
         let raw_desc = definition.description.clone().unwrap_or_default();
         let sanitized = sanitize_mcp_description(&raw_desc);
-        let cached_description = Box::leak(sanitized.into_boxed_str());
+        let cached_description = intern(&sanitized);
 
         Self {
             client,
@@ -119,10 +144,20 @@ impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToo
         // Convert MCP content to output string
         let output = format_mcp_content(&result.content);
 
+        // Preserve the structured result as `data`. On the (unexpected)
+        // serialization failure, log it rather than silently substituting null.
+        let data = match serde_json::to_value(&result) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::warn!("failed to serialize MCP tool result to JSON: {err}");
+                None
+            }
+        };
+
         Ok(ToolResult {
             success: !result.is_error,
             output,
-            data: Some(serde_json::to_value(&result).unwrap_or_default()),
+            data,
             documents: Vec::new(),
             duration_ms: None,
         })
@@ -135,11 +170,21 @@ impl<T: McpTransport + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for McpToo
 /// (e.g., `<system-reminder>`, `<system-instruction>`) and enforces a maximum
 /// length to prevent oversized descriptions from dominating the LLM context.
 fn sanitize_mcp_description(desc: &str) -> String {
-    let re = regex::Regex::new(r"</?system[^>]*>").unwrap_or_else(|_| {
-        // Fallback: this regex should always compile
-        regex::Regex::new(r"$^").expect("Fallback regex should compile")
-    });
-    let sanitized = re.replace_all(desc, "").to_string();
+    // Compiled once. The pattern is a statically-known-good literal; if it ever
+    // failed to compile we log and pass the description through unmodified
+    // rather than panicking, but that branch is effectively unreachable.
+    static SYSTEM_TAG_RE: LazyLock<Option<regex::Regex>> =
+        LazyLock::new(|| regex::Regex::new(r"</?system[^>]*>").ok());
+
+    let sanitized = SYSTEM_TAG_RE.as_ref().map_or_else(
+        || {
+            log::error!(
+                "MCP description sanitizer regex failed to compile; passing description through unmodified"
+            );
+            desc.to_string()
+        },
+        |re| re.replace_all(desc, "").into_owned(),
+    );
 
     if sanitized.len() <= MAX_DESCRIPTION_LENGTH {
         sanitized
@@ -203,10 +248,14 @@ fn format_mcp_content(content: &[McpContent]) -> String {
 /// let mut registry = ToolRegistry::new();
 /// register_mcp_tools(&mut registry, client).await?;
 /// ```
-pub async fn register_mcp_tools<T: McpTransport + 'static>(
-    registry: &mut ToolRegistry<()>,
+pub async fn register_mcp_tools<Ctx, T>(
+    registry: &mut ToolRegistry<Ctx>,
     client: Arc<McpClient<T>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    Ctx: Send + Sync + 'static,
+    T: McpTransport + 'static,
+{
     let tools = client
         .list_tools()
         .await
@@ -231,12 +280,13 @@ pub async fn register_mcp_tools<T: McpTransport + 'static>(
 /// # Errors
 ///
 /// Returns an error if listing tools fails.
-pub async fn register_mcp_tools_with_tiers<T, F>(
-    registry: &mut ToolRegistry<()>,
+pub async fn register_mcp_tools_with_tiers<Ctx, T, F>(
+    registry: &mut ToolRegistry<Ctx>,
     client: Arc<McpClient<T>>,
     tier_fn: F,
 ) -> Result<()>
 where
+    Ctx: Send + Sync + 'static,
     T: McpTransport + 'static,
     F: Fn(&McpToolDefinition) -> ToolTier,
 {
@@ -356,5 +406,23 @@ mod tests {
         let desc = "A tool that fetches weather data from the API";
         let sanitized = sanitize_mcp_description(desc);
         assert_eq!(sanitized, desc);
+    }
+
+    /// Regression test for the per-construction `Box::leak` leak (findings 17 &
+    /// 18). Interning the same string twice must return the *same* `&'static
+    /// str` allocation, so re-bridging a tool (listChanged / reconnect) reuses
+    /// memory instead of leaking a fresh copy each time.
+    #[test]
+    fn interned_strings_are_reused_not_releaked() {
+        let first = intern("mcp-tool-xyz-unique");
+        let second = intern("mcp-tool-xyz-unique");
+        assert!(
+            std::ptr::eq(first, second),
+            "interning the same value must reuse the prior allocation"
+        );
+
+        // Distinct values get distinct allocations.
+        let other = intern("mcp-tool-xyz-different");
+        assert!(!std::ptr::eq(first, other));
     }
 }

@@ -127,6 +127,7 @@ impl TestStores {
             subagent_spawn_selector: None,
             compaction_config: None,
             compaction_provider: None,
+            cancel: None,
         }
     }
 }
@@ -223,8 +224,8 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     // `UserInput → Start → Text → TurnComplete → Done` (5 events).
     // The streamed `TextDelta` is committed to the journal during
     // streaming but is *not* threaded back into the outcome vec (it is
-    // committed out-of-band by `commit_streaming_delta`), so the outcome
-    // carries only the consolidated content + lifecycle edges.
+    // committed out-of-band by the streaming delta-batch flush), so the
+    // outcome carries only the consolidated content + lifecycle edges.
     assert_eq!(committed_events.len(), 5, "expected 5 outcome events");
     assert!(
         matches!(&committed_events[0].event, AgentEvent::UserInput { .. }),
@@ -786,7 +787,7 @@ async fn committed_events_returned_in_outcome_types() -> Result<()> {
     // Post-streaming-refactor invariant: the outcome's `committed_events`
     // is the consolidated/lifecycle projection of the turn and does *not*
     // include the per-delta `TextDelta` events committed out-of-band by
-    // `commit_streaming_delta`.  So the journal carries exactly one more
+    // the streaming delta-batch flush.  So the journal carries exactly one more
     // event (the streamed `TextDelta`) than the outcome, and the outcome
     // events are a *subsequence* of the journal — matched by event_id —
     // with a sequence gap where the delta was dropped.

@@ -208,19 +208,6 @@ impl RootSpanEventSink {
         Self(std::sync::Arc::new(std::sync::Mutex::new(span)))
     }
 
-    /// Reclaim ownership of the wrapped span at the end of the run.
-    ///
-    /// Returns `None` when there are still outstanding clones of the
-    /// `Arc`, meaning some child task captured the sink and outlived
-    /// the run. Callers fall back to emitting events on the orphaned
-    /// span via [`add_event`](Self::add_event); see `end_root_span`.
-    pub(crate) fn into_inner(self) -> Option<opentelemetry::global::BoxedSpan> {
-        let Self(arc) = self;
-        std::sync::Arc::try_unwrap(arc)
-            .ok()
-            .and_then(|mu| mu.into_inner().ok())
-    }
-
     fn add_event(&self, name: &'static str, attrs: Vec<KeyValue>) {
         let Ok(mut span) = self.0.lock() else {
             log::warn!("root span sink mutex poisoned; dropping event {name}");
@@ -233,9 +220,13 @@ impl RootSpanEventSink {
     }
 
     /// Run `op` against the wrapped span while holding the inner
-    /// mutex. Used by [`flush_root_trace_state`] so the
-    /// `RootTraceState` can stamp its accumulated narrative on the
-    /// span without taking ownership of the sink.
+    /// mutex, returning `None` only if the mutex is poisoned.
+    ///
+    /// Used by [`flush_root_trace_state`] (to stamp the accumulated
+    /// `RootTraceState` narrative) and by `end_root_span` (to stamp the
+    /// terminal outcome / usage attributes and end the span). Mutating
+    /// through the mutex — rather than reclaiming sole ownership — means
+    /// outstanding sink clones never block finalization.
     pub(crate) fn with_span_mut<R>(
         &self,
         op: impl FnOnce(&mut opentelemetry::global::BoxedSpan) -> R,
@@ -344,6 +335,14 @@ pub(crate) fn build_root_trace_state(
 /// [`trace_io::RootTraceState::flush`] before calling this, so the
 /// final `langfuse.trace.output` is a single attribute on the
 /// exported span.
+///
+/// Attributes are stamped through [`RootSpanEventSink::with_span_mut`]
+/// (the shared mutex) rather than reclaiming sole ownership, so the
+/// outcome / usage attributes still land even when a sink clone is alive
+/// — e.g. a tool or user task that captured `Context::current()` and
+/// outlived the run. Any such leaked clone is harmless after this:
+/// [`RootSpanEventSink::add_event`] checks `is_recording`, which turns
+/// false once [`opentelemetry::trace::Span::end`] runs below.
 pub(crate) fn end_root_span(
     sink: RootSpanEventSink,
     total_turns: usize,
@@ -358,38 +357,40 @@ pub(crate) fn end_root_span(
         .runs_outcome
         .add(1, &[KeyValue::new(attrs::SDK_OUTCOME, outcome)]);
 
-    let Some(mut span) = sink.into_inner() else {
-        log::warn!(
-            "root span sink still has outstanding clones at end_root_span; \
-             dropping outcome attributes",
-        );
-        return;
-    };
-    span.set_attribute(KeyValue::new(
-        attrs::SDK_TOTAL_TURNS,
-        i64::try_from(total_turns).unwrap_or(0),
-    ));
-    span.set_attribute(KeyValue::new(
-        attrs::GEN_AI_USAGE_INPUT_TOKENS,
-        i64::from(total_usage.input_tokens),
-    ));
-    span.set_attribute(KeyValue::new(
-        attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
-        i64::from(total_usage.output_tokens),
-    ));
-    span.set_attribute(KeyValue::new(
-        attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-        i64::from(total_usage.cached_input_tokens),
-    ));
-    span.set_attribute(KeyValue::new(
-        attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-        i64::from(total_usage.cache_creation_input_tokens),
-    ));
-    span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
-    if outcome == "error" {
-        spans::set_span_error(&mut span, "agent_error", "agent invocation failed");
+    let stamped = sink.with_span_mut(|span| {
+        span.set_attribute(KeyValue::new(
+            attrs::SDK_TOTAL_TURNS,
+            i64::try_from(total_turns).unwrap_or(0),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_USAGE_INPUT_TOKENS,
+            i64::from(total_usage.input_tokens),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_USAGE_OUTPUT_TOKENS,
+            i64::from(total_usage.output_tokens),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            i64::from(total_usage.cached_input_tokens),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            i64::from(total_usage.cache_creation_input_tokens),
+        ));
+        span.set_attribute(KeyValue::new(attrs::SDK_OUTCOME, outcome));
+        if outcome == "error" {
+            spans::set_span_error(span, "agent_error", "agent invocation failed");
+        }
+        span.end();
+    });
+    if stamped.is_none() {
+        log::warn!("root span sink mutex poisoned at end_root_span; dropping outcome attributes");
     }
-    span.end();
+    // Release the run's sink clone now that the span is ended; any other
+    // outstanding clone is inert (its `add_event` short-circuits on the
+    // now-non-recording span).
+    drop(sink);
 }
 
 /// Flush any pending [`trace_io::RootTraceState`] onto the live root
@@ -424,5 +425,43 @@ pub(crate) const fn turn_outcome_str(outcome: &crate::types::TurnOutcome) -> &'s
         crate::types::TurnOutcome::PendingToolCalls { .. } => "pending_tool_calls",
         crate::types::TurnOutcome::Cancelled { .. } => "cancelled",
         crate::types::TurnOutcome::Error(_) => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RootSpanEventSink, end_root_span};
+    use crate::observability::spans;
+    use crate::types::TokenUsage;
+    use opentelemetry::trace::Span as _;
+
+    #[test]
+    fn with_span_mut_runs_despite_outstanding_clone() {
+        // A leaked sink clone (e.g. a tool task that captured
+        // `Context::current()` and outlived the run) must NOT prevent the
+        // root span from being stamped and ended. The previous
+        // `Arc::try_unwrap` path returned `None` in exactly this case and
+        // silently dropped all outcome / usage attributes.
+        let sink = RootSpanEventSink::new(spans::start_internal_span("test", Vec::new()));
+        let _leaked = sink.clone();
+        let ran = sink.with_span_mut(|span| {
+            span.end();
+            42
+        });
+        assert_eq!(
+            ran,
+            Some(42),
+            "with_span_mut must mutate the span through the mutex even with a live clone"
+        );
+    }
+
+    #[test]
+    fn end_root_span_finalizes_with_clone_alive() {
+        // Exercises the full terminal path with a clone still outstanding:
+        // it must complete (record the counter, stamp attributes, end the
+        // span) rather than bail early.
+        let sink = RootSpanEventSink::new(spans::start_internal_span("test", Vec::new()));
+        let _leaked = sink.clone();
+        end_root_span(sink, 3, &TokenUsage::default(), "done");
     }
 }

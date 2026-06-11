@@ -133,6 +133,33 @@ pub(super) const MAX_LISTEN_UPDATES: usize = 240;
 pub(super) const LISTEN_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const LISTEN_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Maximum time the SDK waits for the *next* streaming frame before treating
+/// the provider connection as stalled.
+///
+/// `process_stream` otherwise only races `stream.next()` against the cancel
+/// token, so a half-open connection (provider HTTP clients set at most a
+/// connect timeout) would pin the turn forever. Expiry is surfaced as a
+/// recoverable stream error so the retry loop re-establishes the stream.
+/// Mirrors the listen-tool per-update bound (`LISTEN_UPDATE_TIMEOUT`); kept
+/// generous so legitimate long thinking pauses between chunks are not cut off.
+///
+/// Reduced under `cfg(test)` so the in-crate unit tests can exercise the
+/// stalled-stream path deterministically without `tokio` test-util / a long
+/// real wait. The production value applies to integration tests and real
+/// builds (where `agent-sdk` is linked as a non-test dependency).
+#[cfg(not(test))]
+pub(super) const LLM_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_mins(2);
+#[cfg(test)]
+pub(super) const LLM_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// Overall deadline for a single non-streaming LLM call.
+///
+/// A stalled non-streaming provider exposes no per-token progress to observe,
+/// so without a deadline the call hangs the turn until an explicit cancel.
+/// Expiry is reported as a retryable server error. Mirrors
+/// `LISTEN_TOTAL_TIMEOUT`.
+pub(super) const LLM_CALL_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
+
 pub(super) struct ListenReady {
     pub(super) operation_id: String,
     pub(super) revision: u64,
@@ -191,17 +218,19 @@ pub(super) struct ToolCallExecutionContext<'a, Ctx, H> {
     pub(super) provenance: &'a AuditProvenance,
 }
 
-pub(super) struct ConfirmedToolExecutionContext<'a, Ctx, H> {
-    pub(super) tool_context: &'a ToolContext<Ctx>,
+/// Snapshot inputs used to build an `AgentContinuation` when a tool outcome
+/// pauses the turn for confirmation.
+///
+/// Groups the turn-scoped values `handle_tool_outcome` needs so the function
+/// takes a single context reference instead of ten positional arguments.
+pub(super) struct ToolOutcomeContext<'a> {
     pub(super) thread_id: &'a ThreadId,
-    pub(super) tools: &'a ToolRegistry<Ctx>,
-    pub(super) hooks: &'a Arc<H>,
-    pub(super) event_store: &'a Arc<dyn EventStore>,
     pub(super) turn: usize,
-    pub(super) authority: &'a Arc<dyn EventAuthority>,
-    pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
-    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
-    pub(super) provenance: &'a AuditProvenance,
+    pub(super) total_usage: &'a TokenUsage,
+    pub(super) turn_usage: &'a TokenUsage,
+    pub(super) state: &'a AgentState,
+    pub(super) response_id: Option<&'a str>,
+    pub(super) stop_reason: Option<StopReason>,
 }
 
 /// Error type for stream processing.
@@ -289,23 +318,6 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
 }
 
 pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
-    pub(super) resume_data: ResumeData,
-    pub(super) turn: usize,
-    pub(super) total_usage: &'a TokenUsage,
-    pub(super) state: &'a AgentState,
-    pub(super) thread_id: &'a ThreadId,
-    pub(super) tool_context: &'a ToolContext<Ctx>,
-    pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
-    pub(super) hooks: &'a Arc<H>,
-    pub(super) event_store: &'a Arc<dyn EventStore>,
-    pub(super) authority: &'a Arc<dyn EventAuthority>,
-    pub(super) message_store: &'a Arc<M>,
-    pub(super) execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
-    pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
-    pub(super) provenance: &'a AuditProvenance,
-}
-
-pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
     pub(super) resume_data: ResumeData,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
@@ -476,8 +488,12 @@ pub(super) struct LlmCallParams<'a, P, H> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) thread_id: &'a ThreadId,
     pub(super) turn: usize,
-    pub(super) message_id: &'a str,
-    pub(super) thinking_id: &'a str,
+    /// Mutable so the streaming retry loop can regenerate the ids per
+    /// attempt — isolating each attempt's deltas under a distinct id — and
+    /// hand the final attempt's ids back to the caller for the post-stream
+    /// Text/Refusal events. The non-streaming path leaves them untouched.
+    pub(super) message_id: &'a mut String,
+    pub(super) thinking_id: &'a mut String,
     /// Run-level cancellation token, raced against the provider call
     /// (streaming + non-streaming) so a cancel mid-stream or before
     /// the first token stops the LLM phase promptly instead of waiting

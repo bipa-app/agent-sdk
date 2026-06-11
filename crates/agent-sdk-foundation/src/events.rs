@@ -20,6 +20,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
 
+/// Serde adapter encoding a [`Duration`] as a millisecond integer
+/// (`duration_ms`) instead of serde's default `{secs,nanos}` object.
+mod duration_ms_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        serializer.serialize_u64(ms)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let ms = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(ms))
+    }
+}
+
 /// Events emitted by the agent loop during execution.
 /// These are streamed to the client for real-time UI updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +145,14 @@ pub enum AgentEvent {
         thread_id: ThreadId,
         total_turns: usize,
         total_usage: TokenUsage,
+        /// Wall-clock run duration.
+        ///
+        /// Serialized on the wire as `duration_ms` (a millisecond integer) to
+        /// match [`TurnSummary::duration_ms`](crate::types::TurnSummary) — the
+        /// flattened envelope previously encoded this as a nested
+        /// `{"secs":..,"nanos":..}` object, inconsistent with the rest of the
+        /// streaming contract. The Rust field keeps the `Duration` type.
+        #[serde(rename = "duration_ms", with = "duration_ms_serde")]
         duration: Duration,
     },
 
@@ -726,5 +757,236 @@ mod tests {
         // Should parse as RFC 3339
         time::OffsetDateTime::parse(ts_str, &time::format_description::well_known::Rfc3339)
             .expect("timestamp should be valid RFC 3339");
+    }
+
+    #[test]
+    fn done_event_serializes_duration_as_millis() -> serde_json::Result<()> {
+        let seq = SequenceCounter::new();
+        let envelope = AgentEventEnvelope::wrap(
+            AgentEvent::done(
+                ThreadId::from_string("t"),
+                3,
+                TokenUsage::default(),
+                Duration::from_millis(2500),
+            ),
+            &seq,
+        );
+        let json = serde_json::to_value(&envelope)?;
+
+        // Flat millisecond integer, matching `TurnSummary::duration_ms` — not
+        // the old nested `{"secs":..,"nanos":..}` object under `duration`.
+        assert_eq!(
+            json.get("duration_ms").and_then(serde_json::Value::as_u64),
+            Some(2500)
+        );
+        assert!(
+            json.get("duration").is_none(),
+            "old `duration` key must be gone: {json}"
+        );
+
+        let restored: AgentEventEnvelope = serde_json::from_value(json)?;
+        match restored.event {
+            AgentEvent::Done { duration, .. } => {
+                assert_eq!(duration, Duration::from_millis(2500));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// One representative value of every [`AgentEvent`] variant, so the
+    /// envelope round-trip test exercises the full streaming contract.
+    ///
+    /// The variants are produced by a few cohesive builders concatenated
+    /// in the original order, so the round-trip test still sees the exact
+    /// same set of values.
+    fn sample_all_variants() -> Vec<AgentEvent> {
+        let thread = ThreadId::from_string("thread-1");
+        let usage = TokenUsage::default();
+        let mut events = session_open_events(&thread);
+        events.extend(streamed_content_events());
+        events.extend(tool_call_events());
+        events.extend(turn_completion_events(&thread, &usage));
+        events.extend(failure_and_retry_events());
+        events.extend(auxiliary_events(&usage));
+        events
+    }
+
+    /// `Start` / `UserInput`: the events opening a thread turn.
+    fn session_open_events(thread: &ThreadId) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::Start {
+                thread_id: thread.clone(),
+                turn: 1,
+            },
+            AgentEvent::UserInput {
+                thread_id: thread.clone(),
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+        ]
+    }
+
+    /// Streamed assistant content: consolidated and delta forms of
+    /// thinking and text.
+    fn streamed_content_events() -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::Thinking {
+                message_id: "m".into(),
+                text: "t".into(),
+            },
+            AgentEvent::ThinkingDelta {
+                message_id: "m".into(),
+                delta: "d".into(),
+            },
+            AgentEvent::TextDelta {
+                message_id: "m".into(),
+                delta: "d".into(),
+            },
+            AgentEvent::Text {
+                message_id: "m".into(),
+                text: "t".into(),
+            },
+        ]
+    }
+
+    /// Tool-call lifecycle: start, end, progress, and confirmation.
+    fn tool_call_events() -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::ToolCallStart {
+                id: "id".into(),
+                name: "n".into(),
+                display_name: "N".into(),
+                input: serde_json::json!({}),
+                tier: ToolTier::Observe,
+            },
+            AgentEvent::ToolCallEnd {
+                id: "id".into(),
+                name: "n".into(),
+                display_name: "N".into(),
+                result: ToolResult::success("ok"),
+            },
+            AgentEvent::ToolProgress {
+                id: "id".into(),
+                name: "n".into(),
+                display_name: "N".into(),
+                stage: "s".into(),
+                message: "m".into(),
+                data: None,
+            },
+            AgentEvent::ToolRequiresConfirmation {
+                id: "id".into(),
+                name: "n".into(),
+                display_name: "N".into(),
+                input: serde_json::json!({}),
+                description: "d".into(),
+            },
+        ]
+    }
+
+    /// Turn-completion summaries: `TurnComplete` and the terminal `Done`.
+    fn turn_completion_events(thread: &ThreadId, usage: &TokenUsage) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::TurnComplete {
+                turn: 1,
+                usage: usage.clone(),
+            },
+            AgentEvent::Done {
+                thread_id: thread.clone(),
+                total_turns: 2,
+                total_usage: usage.clone(),
+                duration: Duration::from_millis(1500),
+            },
+        ]
+    }
+
+    /// Error and auto-retry signalling events.
+    fn failure_and_retry_events() -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::Error {
+                message: "e".into(),
+                recoverable: true,
+            },
+            AgentEvent::AutoRetryStart {
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: 100,
+                error_message: "rate limited".into(),
+            },
+            AgentEvent::AutoRetryEnd {
+                attempt: 1,
+                success: true,
+                final_error: None,
+            },
+        ]
+    }
+
+    /// Remaining auxiliary events: refusal, cancellation, compaction,
+    /// and subagent progress.
+    fn auxiliary_events(usage: &TokenUsage) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::Refusal {
+                message_id: "m".into(),
+                text: Some("no".into()),
+            },
+            AgentEvent::Cancelled {
+                turn: 1,
+                usage: usage.clone(),
+            },
+            AgentEvent::ContextCompacted {
+                original_count: 10,
+                new_count: 5,
+                original_tokens: 100,
+                new_tokens: 50,
+            },
+            AgentEvent::SubagentProgress {
+                subagent_id: "s".into(),
+                subagent_name: "explore".into(),
+                nickname: None,
+                child_thread_id: None,
+                child_root_task_id: None,
+                subagent_task_id: None,
+                max_turns: None,
+                current_turn: None,
+                model: None,
+                tool_name: "t".into(),
+                tool_context: "c".into(),
+                completed: false,
+                success: false,
+                tool_count: 0,
+                total_tokens: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_variant_envelope_has_flat_keys_and_round_trips() -> serde_json::Result<()> {
+        let seq = SequenceCounter::new();
+        for event in sample_all_variants() {
+            let label = format!("{event:?}");
+            let envelope = AgentEventEnvelope::wrap(event, &seq);
+            let json = serde_json::to_value(&envelope)?;
+
+            // Envelope metadata + the event discriminant are all flat keys.
+            for key in ["event_id", "sequence", "timestamp", "type"] {
+                assert!(
+                    json.get(key).is_some(),
+                    "{label}: missing flat key `{key}` in {json}"
+                );
+            }
+            // The `#[serde(flatten)]` must not leave a nested wrapper, and no
+            // variant field may collide with an envelope key.
+            assert!(
+                json.get("event").is_none(),
+                "{label}: unexpected nested `event` key in {json}"
+            );
+
+            let restored: AgentEventEnvelope = serde_json::from_value(json.clone())?;
+            assert_eq!(
+                serde_json::to_value(&restored)?,
+                json,
+                "{label}: envelope round-trip changed the wire form"
+            );
+        }
+        Ok(())
     }
 }

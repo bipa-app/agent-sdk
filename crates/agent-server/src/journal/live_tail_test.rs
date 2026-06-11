@@ -316,27 +316,54 @@ async fn batch_commit_flows_through_live_tail() -> Result<()> {
 /// Even with many slow subscribers, committing and publishing events
 /// completes without blocking.  This validates the acceptance criterion
 /// that slow subscribers do not stall task execution.
+///
+/// `publish` is a synchronous, lock-then-`try_send` call with no
+/// `.await`, so it *cannot* block on subscriber backpressure by
+/// construction.  Rather than time a wall-clock window (flaky under CI
+/// load), we assert the structural guarantee directly: the full
+/// producer loop runs to completion, and every slow subscriber is
+/// bounded to its buffer capacity then doomed — never applying
+/// backpressure to the producer.
 #[tokio::test]
 async fn workers_never_blocked_during_overflow() -> Result<()> {
     let repo = InMemoryEventRepository::new();
     let hub = LiveTailHub::with_config(LiveTailConfig {
         buffer_capacity: 5,
+        // Long grace so handles are never swept mid-test; the producer
+        // is bounded by per-subscriber buffers, not handle cleanup.
         lag_grace_period: Duration::from_mins(1),
     });
 
     // Create 10 subscribers that never read.
-    let _subscribers: Vec<_> = (0..10).map(|_| hub.subscribe(&thread_a())).collect();
+    let mut subscribers: Vec<_> = (0..10).map(|_| hub.subscribe(&thread_a())).collect();
 
-    let start = std::time::Instant::now();
+    // The whole producer loop completes — no publish stalls behind a
+    // slow subscriber.
     for i in 0..50 {
         commit_and_publish(&repo, &hub, &thread_a(), i).await?;
     }
-    let elapsed = start.elapsed();
 
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "commit+publish took too long with slow subscribers: {elapsed:?}",
-    );
+    // All subscribers remain registered (grace has not elapsed) yet
+    // each absorbed only `buffer_capacity` events before being doomed.
+    assert_eq!(hub.subscriber_count(&thread_a()), 10);
+
+    let mut drained = Vec::new();
+    let probe = &mut subscribers[0];
+    loop {
+        match probe.recv().await {
+            Some(LiveTailEvent::Event(e)) => drained.push(e.sequence),
+            Some(LiveTailEvent::ReplayRequired {
+                last_delivered_sequence,
+            }) => {
+                assert_eq!(last_delivered_sequence, Some(4));
+                break;
+            }
+            None => panic!("expected ReplayRequired before channel close"),
+        }
+    }
+    // Bounded to the 5-slot buffer; the remaining 45 events were shed
+    // without ever stalling the producer.
+    assert_eq!(drained, vec![0, 1, 2, 3, 4]);
 
     Ok(())
 }

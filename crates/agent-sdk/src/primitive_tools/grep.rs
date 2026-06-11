@@ -84,8 +84,8 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
-        let input: GrepInput =
-            serde_json::from_value(input).context("Invalid input for grep tool")?;
+        let input: GrepInput = GrepInput::deserialize(&input)
+            .with_context(|| format!("Invalid input for grep tool: {input}"))?;
 
         let search_path = input.path.as_ref().map_or_else(
             || self.ctx.environment.root().to_string(),
@@ -105,6 +105,22 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
         } else {
             input.pattern.clone()
         };
+
+        // The pattern is the model's own input, so validate the regex up front
+        // and report a syntax error as a correctable tool error rather than an
+        // infrastructure failure. Genuine I/O errors from `grep` still surface
+        // as `anyhow::Err`.
+        if let Err(err) = regex::Regex::new(&pattern) {
+            return Ok(ToolResult::error(format!(
+                "Invalid pattern '{}': {err:#}",
+                input.pattern
+            )));
+        }
+
+        // NOTE: `Environment::grep` implementations MUST enforce read
+        // permissions per traversed path; the root-only capability check above
+        // plus the per-result filter below are defense-in-depth, not a
+        // substitute.
 
         // Execute grep
         let matches = self
@@ -428,6 +444,23 @@ mod tests {
         // Missing required pattern field
         let result = tool.execute(&tool_ctx(), json!({})).await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grep_invalid_pattern() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "content").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        // An unbalanced char class is invalid; the model should get a
+        // correctable tool error, not an infrastructure failure.
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "[unclosed"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Invalid pattern"));
         Ok(())
     }
 

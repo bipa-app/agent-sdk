@@ -5,14 +5,16 @@
 # commits, and (on merge, in a separate, human-gated workflow) publishes the
 # crates to crates.io in dependency order.
 #
-# IMPORTANT: the actual crates.io publish + git tag are HITL. This config
-# makes the workspace release-ready; wiring an auto-publish workflow with a
-# CARGO_REGISTRY_TOKEN is a deliberate later step (see the commented workflow
-# stub in .github/workflows/). Nothing here publishes on its own.
+# IMPORTANT: the actual crates.io publish + git tag are HITL. This config only
+# drives the release-PR (version bump + changelog) on push; publishing runs in a
+# separate, manually-dispatched `release` job in
+# `.github/workflows/release-plz.yml` (guarded to `main`). Nothing here
+# publishes on its own.
 
 [workspace]
 # A single PR/changelog for the whole SDK keeps the version line in lockstep
-# across the published crates (they share `version = "0.8.0"`).
+# across the published crates (they share one version — 0.9.2 as of this
+# writing).
 changelog_update = true
 # Dependent crates get their intra-workspace dependency bumped when a
 # dependency releases.
@@ -28,9 +30,8 @@ publish = false
 # These are the only crates release-plz manages. They all share
 # `version_group = "agent-sdk"`, so release-plz assigns every one of them the
 # SAME version — the highest next version across the group. This keeps the
-# published SDK on a single version line: all crates release as 0.9.0 together,
-# rather than `agent-sdk` bumping to 0.9.0 while the first-publish sub-crates
-# stay at 0.8.0.
+# published SDK on a single version line: the whole group is on 0.9.x today and
+# bumps together (e.g. all crates went 0.9.1 → 0.9.2 in one PR).
 
 [[package]]
 name = "agent-sdk-foundation"

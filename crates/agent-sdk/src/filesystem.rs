@@ -11,6 +11,56 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+/// Maximum bytes captured from a single `exec` output stream before the rest is
+/// drained and discarded. Bounds in-process memory for verbose commands.
+const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Maximum size of a file that recursive grep will read into memory. Larger
+/// files (typically build artifacts / media) are skipped rather than loaded.
+const MAX_GREP_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read an async stream into memory, capping the retained bytes at
+/// [`MAX_EXEC_OUTPUT_BYTES`]. Bytes past the cap are drained (so the child's
+/// pipe never blocks) but discarded. Returns the captured bytes and whether
+/// truncation occurred.
+async fn read_capped<R>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        if captured.len() < MAX_EXEC_OUTPUT_BYTES {
+            let remaining = MAX_EXEC_OUTPUT_BYTES - captured.len();
+            let take = remaining.min(read);
+            captured.extend_from_slice(&chunk[..take]);
+            if take < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((captured, truncated))
+}
+
+/// Render captured exec output as lossy UTF-8, appending a truncation marker
+/// when the byte cap was hit.
+fn render_capped_output(bytes: &[u8], truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        text.push_str("\n[output truncated: exceeded 1 MiB cap]");
+    }
+    text
+}
+
 /// Local filesystem implementation using `std::fs`
 pub struct LocalFileSystem {
     root: PathBuf,
@@ -168,25 +218,52 @@ impl Environment for LocalFileSystem {
 
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(120_000));
 
-        let output = tokio::time::timeout(
-            timeout,
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&self.root)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .context("Command timed out")?
-        .context("Failed to execute command")?;
+        // `kill_on_drop(true)` ensures the child is reclaimed if this future is
+        // dropped (the agent loop's cancel/timeout boundary) or if our own
+        // timeout fires — otherwise the spawned `sh -c <command>` would keep
+        // running and mutating the world after we report a failure.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to execute command")?;
 
-        Ok(ExecResult {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code().unwrap_or(-1),
-        })
+        let stdout = child.stdout.take().context("missing stdout pipe")?;
+        let stderr = child.stderr.take().context("missing stderr pipe")?;
+
+        // Read stdout/stderr with a byte cap so a chatty or hostile command
+        // (e.g. `cat large.bin`, `yes`) cannot exhaust memory before the
+        // higher-level truncation runs.
+        let run = async {
+            let (out, err, status) =
+                tokio::join!(read_capped(stdout), read_capped(stderr), child.wait());
+            anyhow::Ok((out?, err?, status?))
+        };
+
+        // Bind the result first so the (child-borrowing) timeout future is
+        // dropped before we touch `child` again in the timeout arm.
+        let outcome = tokio::time::timeout(timeout, Box::pin(run)).await;
+
+        match outcome {
+            Ok(joined) => {
+                let ((stdout_bytes, stdout_truncated), (stderr_bytes, stderr_truncated), status) =
+                    joined.context("Failed to execute command")?;
+                Ok(ExecResult {
+                    stdout: render_capped_output(&stdout_bytes, stdout_truncated),
+                    stderr: render_capped_output(&stderr_bytes, stderr_truncated),
+                    exit_code: status.code().unwrap_or(-1),
+                })
+            }
+            Err(_elapsed) => {
+                // Reclaim the child eagerly (kill_on_drop is the backstop).
+                let _ = child.start_kill();
+                anyhow::bail!("Command timed out after {}ms", timeout.as_millis())
+            }
+        }
     }
 
     fn root(&self) -> &str {
@@ -207,8 +284,21 @@ impl LocalFileSystem {
         regex: &regex::Regex,
         matches: &mut Vec<GrepMatch>,
     ) -> Result<()> {
-        let content = tokio::fs::read_to_string(path).await?;
-        for (line_num, line) in content.lines().enumerate() {
+        // Read the file once as bytes and scan the same buffer (an earlier
+        // version read it twice: once to sniff for binary, once to grep).
+        let content = tokio::fs::read(path).await?;
+        Self::grep_bytes(path, &content, regex, matches);
+        Ok(())
+    }
+
+    /// Scan an already-loaded buffer for regex matches, skipping files that look
+    /// binary (a NUL byte in the first 1 KiB).
+    fn grep_bytes(path: &Path, content: &[u8], regex: &regex::Regex, matches: &mut Vec<GrepMatch>) {
+        if content.iter().take(1024).any(|&b| b == 0) {
+            return; // Skip binary
+        }
+        let text = String::from_utf8_lossy(content);
+        for (line_num, line) in text.lines().enumerate() {
             if let Some(m) = regex.find(line) {
                 matches.push(GrepMatch {
                     path: path.to_string_lossy().to_string(),
@@ -219,7 +309,6 @@ impl LocalFileSystem {
                 });
             }
         }
-        Ok(())
     }
 
     async fn grep_dir(
@@ -244,13 +333,17 @@ impl LocalFileSystem {
                 };
 
                 if metadata.is_file() {
-                    // Skip binary files (simple heuristic)
-                    if let Ok(content) = tokio::fs::read(&path).await
-                        && content.iter().take(1024).any(|&b| b == 0)
-                    {
-                        continue; // Skip binary
+                    // Skip oversized files (likely build artifacts / media)
+                    // before loading them — bounds memory for huge files that
+                    // would otherwise be read in full only to be skipped.
+                    if metadata.len() > MAX_GREP_FILE_BYTES {
+                        continue;
                     }
-                    let _ = self.grep_file(&path, regex, matches).await;
+                    // Read the file exactly once; `grep_bytes` does the binary
+                    // sniff and the scan over the same buffer.
+                    if let Ok(content) = tokio::fs::read(&path).await {
+                        Self::grep_bytes(&path, &content, regex, matches);
+                    }
                 } else if metadata.is_dir() && recursive {
                     dirs_to_process.push(path);
                 }
@@ -602,8 +695,25 @@ impl Environment for InMemoryFileSystem {
     async fn glob(&self, pattern: &str) -> Result<Vec<String>> {
         let pattern = self.normalize_path(pattern);
 
+        // Escape regex metacharacters (except the glob wildcards `*`/`?` and the
+        // char-class delimiters `[`/`]`) so a literal `.`/`(`/`+` matches
+        // literally instead of acting as a regex operator. `[`/`]` pass through
+        // so a balanced class like `[abc]` works as a glob char class, while an
+        // unbalanced `[` makes `Regex::new` fail and surfaces as an "Invalid
+        // glob pattern" error (matching real glob implementations).
+        let mut escaped = String::with_capacity(pattern.len());
+        for c in pattern.chars() {
+            match c {
+                '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '\\' => {
+                    escaped.push('\\');
+                    escaped.push(c);
+                }
+                _ => escaped.push(c),
+            }
+        }
+
         // Simple glob matching
-        let regex_pattern = pattern
+        let regex_pattern = escaped
             .replace("**", "\x00")
             .replace('*', "[^/]*")
             .replace('\x00', ".*")
@@ -732,6 +842,110 @@ mod tests {
 
         fs.delete_file("test.txt").await?;
         assert!(!fs.exists("test.txt").await?);
+        Ok(())
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("agent_sdk_fs_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn test_exec_timeout_kills_child_no_leak() -> Result<()> {
+        let tmp = unique_temp_dir("exec_leak");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let marker = tmp.join("marker.txt");
+
+        let fs = LocalFileSystem::new(tmp.clone());
+        // The child sleeps past the timeout, then would create the marker.
+        // A leaked (un-killed) child creates it; a reclaimed one never does.
+        let command = format!("sleep 1; touch '{}'", marker.display());
+        let result = fs.exec(&command, Some(50)).await;
+
+        let Err(error) = result else {
+            anyhow::bail!("exec should have timed out");
+        };
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("timed out"), "got: {rendered}");
+
+        // Wait well past the child's sleep; the marker must never appear.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !tokio::fs::try_exists(&marker).await.unwrap_or(false),
+            "child process leaked: marker created after timeout"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_caps_large_output() -> Result<()> {
+        let tmp = unique_temp_dir("exec_cap");
+        tokio::fs::create_dir_all(&tmp).await?;
+        let fs = LocalFileSystem::new(tmp.clone());
+
+        // Emit ~2 MB, well over the 1 MiB cap.
+        let result = fs
+            .exec(
+                "dd if=/dev/zero bs=1000000 count=2 2>/dev/null",
+                Some(10_000),
+            )
+            .await?;
+
+        assert!(
+            result.stdout.contains("[output truncated"),
+            "expected truncation marker in capped output"
+        );
+        // Captured bytes are bounded near the cap (not the full 2 MiB).
+        assert!(
+            result.stdout.len() <= MAX_EXEC_OUTPUT_BYTES + 64,
+            "captured output exceeded the cap: {} bytes",
+            result.stdout.len()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_local_grep_skips_binary_and_matches_text() -> Result<()> {
+        let tmp = unique_temp_dir("grep");
+        tokio::fs::create_dir_all(&tmp).await?;
+        tokio::fs::write(tmp.join("code.rs"), "fn TODO_here() {}\nlet x = 1;\n").await?;
+        // Binary file that also contains the search term but starts with a NUL.
+        let mut binary = vec![0u8, 1, 2, 3];
+        binary.extend_from_slice(b"TODO_here\n");
+        tokio::fs::write(tmp.join("blob.bin"), &binary).await?;
+
+        let fs = LocalFileSystem::new(tmp.clone());
+        let matches = fs.grep("TODO_here", ".", true).await?;
+
+        assert_eq!(matches.len(), 1, "binary file must be skipped: {matches:?}");
+        assert!(matches[0].path.ends_with("code.rs"));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_glob_escapes_regex_metacharacters() -> Result<()> {
+        let fs = InMemoryFileSystem::new("/workspace");
+        fs.write_file("main.rs", "x").await?;
+        fs.write_file("mainXrs", "x").await?;
+
+        // `.` in the pattern must be literal: `mainXrs` must NOT match `*.rs`.
+        let matches = fs.glob("/workspace/*.rs").await?;
+        assert_eq!(matches, vec!["/workspace/main.rs".to_string()]);
+
+        // A pattern with regex metacharacters must not yield an invalid regex
+        // (previously `+`/`[` would either over-match or fail the whole call).
+        fs.write_file("a+b.txt", "x").await?;
+        let plus = fs.glob("/workspace/a+b.txt").await?;
+        assert_eq!(plus, vec!["/workspace/a+b.txt".to_string()]);
+
         Ok(())
     }
 }

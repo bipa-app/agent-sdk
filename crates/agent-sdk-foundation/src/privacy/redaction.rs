@@ -85,7 +85,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock};
 
-use super::{BaselineDetector, NoopDetector, PiiDetector, mask_spans};
+use super::{BaselineDetector, NoopDetector, PiiDetector, SECRET_PREFIXES, mask_spans};
 
 /// Redaction marker used for wholesale redaction (sensitive key
 /// match or full-string secret prefix). Entity-level masks use
@@ -220,16 +220,10 @@ impl RedactionPolicy {
                 "social_security".into(),
                 "social_security_number".into(),
             ],
-            sensitive_value_prefixes: vec![
-                "Bearer ".into(),
-                "sk-".into(),
-                "pk-".into(),
-                "xox".into(),
-                "ghp_".into(),
-                "gho_".into(),
-                "github_pat_".into(),
-                "AKIA".into(),
-            ],
+            // Built from the single shared prefix list so this and
+            // `SecretDetector` cannot drift (previously this list was missing
+            // `ghs_`, `ghu_`, and `AIza`).
+            sensitive_value_prefixes: SECRET_PREFIXES.iter().map(|p| (*p).to_owned()).collect(),
             detector: default_detector(),
         }
     }
@@ -325,19 +319,33 @@ impl RedactionPolicy {
     }
 
     fn redact_baseline_in_place(&self, value: &mut serde_json::Value) {
+        self.redact_baseline_in_place_with(value, &*self.detector);
+    }
+
+    /// The single baseline tree walk, parameterised on the detector.
+    ///
+    /// Both the in-place entry point (using `self.detector`) and the cloning
+    /// [`redact_baseline_with_detector`] (using a caller-supplied detector)
+    /// funnel through here, so a redaction-rule change is made in exactly one
+    /// place and the two entry points can never silently diverge.
+    fn redact_baseline_in_place_with(
+        &self,
+        value: &mut serde_json::Value,
+        detector: &dyn PiiDetector,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
                     if self.is_sensitive_key(key) {
                         *val = serde_json::json!(REDACTED_MARKER);
                     } else {
-                        self.redact_baseline_in_place(val);
+                        self.redact_baseline_in_place_with(val, detector);
                     }
                 }
             }
             serde_json::Value::Array(arr) => {
                 for v in arr.iter_mut() {
-                    self.redact_baseline_in_place(v);
+                    self.redact_baseline_in_place_with(v, detector);
                 }
             }
             serde_json::Value::String(s) => {
@@ -345,7 +353,7 @@ impl RedactionPolicy {
                     *value = serde_json::json!(REDACTED_MARKER);
                     return;
                 }
-                let spans = self.detector.detect(s);
+                let spans = detector.detect(s);
                 if !spans.is_empty() {
                     *s = mask_spans(s, &spans);
                 }
@@ -356,12 +364,16 @@ impl RedactionPolicy {
 
     /// Check whether a JSON key matches any sensitive key pattern
     /// (case-insensitive substring match).
+    ///
+    /// Uses an allocation-free ASCII case-insensitive comparison: the baseline
+    /// patterns are all lowercase ASCII, so a per-key `to_lowercase()` (heap
+    /// allocation + full Unicode folding) buys nothing on the hot redaction
+    /// path. Non-ASCII keys never match an ASCII pattern and are handled safely.
     #[must_use]
     fn is_sensitive_key(&self, key: &str) -> bool {
-        let lower = key.to_lowercase();
         self.sensitive_key_patterns
             .iter()
-            .any(|pattern| lower.contains(pattern.as_str()))
+            .any(|pattern| ascii_contains_ignore_case(key, pattern))
     }
 
     /// Check whether a string value matches any sensitive value prefix.
@@ -514,48 +526,42 @@ fn redact_baseline(value: &serde_json::Value, policy: &RedactionPolicy) -> serde
     redact_baseline_with_detector(value, policy, &*policy.detector)
 }
 
-/// Baseline redaction with an externally supplied detector. Recursively
-/// walks JSON and redacts sensitive keys (wholesale), sensitive value
-/// prefixes (wholesale), and any entity-level PII detected within
-/// remaining string leaves (span-level).
+/// Baseline redaction with an externally supplied detector. Clones `value`,
+/// then applies the single in-place baseline walk
+/// ([`RedactionPolicy::redact_baseline_in_place_with`]) so the cloning and
+/// in-place entry points share one implementation.
 fn redact_baseline_with_detector(
     value: &serde_json::Value,
     policy: &RedactionPolicy,
     detector: &dyn PiiDetector,
 ) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut redacted = serde_json::Map::new();
-            for (key, val) in map {
-                if policy.is_sensitive_key(key) {
-                    redacted.insert(key.clone(), serde_json::json!(REDACTED_MARKER));
-                } else {
-                    redacted.insert(
-                        key.clone(),
-                        redact_baseline_with_detector(val, policy, detector),
-                    );
-                }
-            }
-            serde_json::Value::Object(redacted)
-        }
-        serde_json::Value::Array(arr) => serde_json::Value::Array(
-            arr.iter()
-                .map(|v| redact_baseline_with_detector(v, policy, detector))
-                .collect(),
-        ),
-        serde_json::Value::String(s) => {
-            if policy.is_sensitive_value(s) {
-                return serde_json::json!(REDACTED_MARKER);
-            }
-            let spans = detector.detect(s);
-            if spans.is_empty() {
-                value.clone()
-            } else {
-                serde_json::Value::String(mask_spans(s, &spans))
-            }
-        }
-        _ => value.clone(),
+    let mut cloned = value.clone();
+    policy.redact_baseline_in_place_with(&mut cloned, detector);
+    cloned
+}
+
+/// Allocation-free ASCII case-insensitive substring search.
+///
+/// `needle` is assumed to be ASCII (all baseline patterns are stored lowercase
+/// ASCII). Bytes `>= 0x80` never compare equal to an ASCII needle byte, so a
+/// match only ever lands on a genuine ASCII subsequence — making this
+/// equivalent to `haystack.to_lowercase().contains(needle)` for ASCII needles,
+/// without the per-call allocation.
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
     }
+    let haystack = haystack.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(h, n)| h.eq_ignore_ascii_case(n))
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1132,6 +1138,52 @@ mod tests {
             !result.contains("[REDACTED:"),
             "false positive on non-PAN digits: {result}"
         );
+    }
+
+    #[test]
+    fn baseline_masks_pan_followed_by_amount() {
+        // A real PAN trailed by an amount must not leak: the greedy match
+        // fails Luhn over all 19 digits, but the 16-digit PAN sub-window does
+        // not — it must still be masked.
+        let policy = RedactionPolicy::baseline();
+        let output = "charged card 4111 1111 1111 1111 150 successfully";
+        let result = redact_string(output, &policy);
+        assert!(result.contains("[REDACTED:credit_card]"), "got: {result}");
+        assert!(
+            !result.contains("4111 1111 1111 1111"),
+            "PAN leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn baseline_value_prefixes_track_shared_const() {
+        // The baseline value-prefix list is derived from the single shared
+        // `SECRET_PREFIXES` const (no hand-maintained second copy), and the
+        // previously-drifted prefixes are now present.
+        let policy = RedactionPolicy::baseline();
+        let expected: Vec<String> = crate::privacy::SECRET_PREFIXES
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect();
+        assert_eq!(policy.sensitive_value_prefixes, expected);
+        for p in ["ghs_", "ghu_", "AIza"] {
+            assert!(
+                policy.sensitive_value_prefixes.iter().any(|x| x == p),
+                "missing prefix {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_sensitive_key_ascii_case_insensitive_without_alloc() {
+        let policy = RedactionPolicy::baseline();
+        // Mixed-case ASCII keys match the lowercase patterns.
+        assert!(policy.is_sensitive_key("API_KEY"));
+        assert!(policy.is_sensitive_key("Api_Key"));
+        assert!(policy.is_sensitive_key("xXpasswordXx"));
+        // Non-ASCII keys never match an ASCII pattern and never panic.
+        assert!(!policy.is_sensitive_key("naïve_field"));
+        assert!(!policy.is_sensitive_key("contraseña"));
     }
 
     #[test]

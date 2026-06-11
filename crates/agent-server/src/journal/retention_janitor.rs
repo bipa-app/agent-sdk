@@ -59,7 +59,18 @@ pub struct RetentionJanitorDeps<'a> {
 /// Summary of a single janitor sweep cycle.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JanitorCycleReport {
+    /// Threads on which the cycle performed useful work (a floor
+    /// advance and/or a standalone checkpoint prune).
     pub threads_scanned: u32,
+    /// Number of sequences the retention floor advanced past this cycle
+    /// (summed across threads).
+    ///
+    /// This is a **floor-advance delta**, not a count of physically
+    /// deleted rows.  On durable backends the delta equals the rows
+    /// deleted in the same transaction; against the cursor-only
+    /// [`InMemoryRetentionStore`](super::retention::InMemoryRetentionStore)
+    /// no rows are actually removed, so the count reflects logical
+    /// reclamation only.
     pub events_purged: u64,
     pub checkpoints_pruned: u64,
     pub floors_advanced: u32,
@@ -117,12 +128,6 @@ pub async fn run_janitor_cycle(
             // vanished, or outbox rows pinning the floor) must remain
             // eligible for Pass 2's standalone checkpoint sweep and
             // must not consume batch budget on no-op work.
-            let outbox_bound = deps
-                .outbox_store
-                .min_unpublished_sequence(thread_id)
-                .await
-                .context("read outbox safety bound")?;
-
             let candidate_seq = deps
                 .event_repo
                 .max_sequence_before(thread_id, cutoff)
@@ -148,14 +153,32 @@ pub async fn run_janitor_cycle(
 
             let candidate_floor = first_live_seq.map_or(max_seq + 1, |live| live.min(max_seq + 1));
 
-            let safe_floor =
-                outbox_bound.map_or(candidate_floor, |min_unpub| candidate_floor.min(min_unpub));
-
             let current_floor = deps
                 .retention_store
                 .effective_floor(thread_id)
                 .await
                 .context("read current retention floor")?;
+
+            // Read the outbox safety bound LAST — immediately before the
+            // advance decision — so any unpublished row that became
+            // visible *after* the event-sequence reads above still pins
+            // the floor.  Reading it first opens a TOCTOU window: under
+            // clock skew a worker can commit a batch (with a caller-
+            // supplied `now` older than the cutoff) plus its Pending
+            // outbox row between the stale bound read and the sequence
+            // reads, so `max_sequence_before` includes those events while
+            // the bound fails to pin them — and the advance would purge
+            // events still referenced by an unpublished advisory.
+            // Durable backends should additionally re-check this bound
+            // inside the `advance_floor` transaction.
+            let outbox_bound = deps
+                .outbox_store
+                .min_unpublished_sequence(thread_id)
+                .await
+                .context("read outbox safety bound")?;
+
+            let safe_floor =
+                outbox_bound.map_or(candidate_floor, |min_unpub| candidate_floor.min(min_unpub));
 
             if safe_floor <= current_floor {
                 continue;
@@ -869,6 +892,159 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].turn_number, 4);
         assert_eq!(remaining[1].turn_number, 5);
+        Ok(())
+    }
+
+    // Wrapper that injects an outbox row during the janitor's final
+    // event-sequence read (`min_sequence_at_or_after`), simulating a
+    // worker that commits a batch plus its Pending outbox row mid-cycle.
+    // Hoisted to module scope so each method stays small.
+    struct RacingEventRepo {
+        inner: std::sync::Arc<InMemoryEventRepository>,
+        outbox: std::sync::Arc<InMemoryOutboxStore>,
+        injected: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl EventRepository for RacingEventRepo {
+        fn atomic_event_outbox_committer(
+            &self,
+        ) -> Option<&dyn crate::journal::event_outbox_transaction::AtomicEventOutboxCommitter>
+        {
+            None
+        }
+
+        async fn commit_event(
+            &self,
+            thread_id: &ThreadId,
+            event: AgentEvent,
+            now: OffsetDateTime,
+        ) -> Result<crate::journal::committed_event::CommittedEvent> {
+            self.inner.commit_event(thread_id, event, now).await
+        }
+
+        async fn commit_event_batch(
+            &self,
+            thread_id: &ThreadId,
+            events: Vec<AgentEvent>,
+            now: OffsetDateTime,
+        ) -> Result<Vec<crate::journal::committed_event::CommittedEvent>> {
+            self.inner.commit_event_batch(thread_id, events, now).await
+        }
+
+        async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+            self.inner.next_sequence(thread_id).await
+        }
+
+        async fn get_events(
+            &self,
+            thread_id: &ThreadId,
+        ) -> Result<Vec<crate::journal::committed_event::CommittedEvent>> {
+            self.inner.get_events(thread_id).await
+        }
+
+        async fn get_events_in_range(
+            &self,
+            thread_id: &ThreadId,
+            after_sequence: u64,
+            up_to_sequence: u64,
+        ) -> Result<Vec<crate::journal::committed_event::CommittedEvent>> {
+            self.inner
+                .get_events_in_range(thread_id, after_sequence, up_to_sequence)
+                .await
+        }
+
+        async fn threads_with_events_before(
+            &self,
+            cutoff: OffsetDateTime,
+            limit: u32,
+        ) -> Result<Vec<ThreadId>> {
+            self.inner.threads_with_events_before(cutoff, limit).await
+        }
+
+        async fn max_sequence_before(
+            &self,
+            thread_id: &ThreadId,
+            cutoff: OffsetDateTime,
+        ) -> Result<Option<u64>> {
+            self.inner.max_sequence_before(thread_id, cutoff).await
+        }
+
+        async fn min_sequence_at_or_after(
+            &self,
+            thread_id: &ThreadId,
+            cutoff: OffsetDateTime,
+        ) -> Result<Option<u64>> {
+            use crate::journal::outbox::{NewOutboxRow, OutboxStore};
+            use crate::journal::outbox_message::{
+                OutboxMessage, OutboxMessageKind, ThreadEventsAvailablePayload,
+            };
+            use std::sync::atomic::Ordering;
+            if !self.injected.swap(true, Ordering::SeqCst) {
+                let payload = OutboxMessage::ThreadEventsAvailable(ThreadEventsAvailablePayload {
+                    thread_id: thread_id.clone(),
+                    last_sequence: 1,
+                })
+                .to_payload_json()?;
+                self.outbox
+                    .insert_batch(vec![NewOutboxRow {
+                        kind: OutboxMessageKind::ThreadEventsAvailable,
+                        thread_id: thread_id.clone(),
+                        event_id: Some(uuid::Uuid::now_v7()),
+                        sequence: Some(1),
+                        payload_json: payload,
+                        max_attempts: 3,
+                        now: t0(),
+                    }])
+                    .await?;
+            }
+            self.inner.min_sequence_at_or_after(thread_id, cutoff).await
+        }
+    }
+
+    // Regression for the outbox-bound TOCTOU: the safety bound is read
+    // last, so a row that becomes visible *during* the event reads still
+    // pins the floor.  Under the old ordering (bound read first) the
+    // injected row would be invisible and the floor would advance over
+    // it, purging an event still referenced by an unpublished advisory.
+    #[tokio::test]
+    async fn outbox_bound_inserted_after_event_reads_still_pins_floor() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let inner = Arc::new(InMemoryEventRepository::new());
+        let outbox = Arc::new(InMemoryOutboxStore::new());
+        let retention = InMemoryRetentionStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
+
+        // Three expired events at t0 (sequences 0, 1, 2).
+        for i in 0..3u64 {
+            inner
+                .commit_event(&thread_a(), AgentEvent::text(format!("m{i}"), "old"), t0())
+                .await?;
+        }
+
+        let events = RacingEventRepo {
+            inner: Arc::clone(&inner),
+            outbox: Arc::clone(&outbox),
+            injected: AtomicBool::new(false),
+        };
+
+        let report = run_janitor_cycle(
+            &policy_with_ttl(3600),
+            &RetentionJanitorDeps {
+                event_repo: &events,
+                retention_store: &retention,
+                outbox_store: outbox.as_ref(),
+                checkpoint_store: &checkpoints,
+            },
+            t_plus(7200),
+        )
+        .await?;
+
+        // The row injected mid-cycle (seq 1) must pin the floor at 1.
+        assert_eq!(retention.effective_floor(&thread_a()).await?, 1);
+        assert_eq!(report.events_purged, 1);
         Ok(())
     }
 }

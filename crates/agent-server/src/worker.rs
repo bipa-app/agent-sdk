@@ -139,7 +139,7 @@ pub use root_turn::{
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
     InheritedSubagentConstraints, InheritedSubagentPolicy, ServerSubagentSpawnPolicy,
-    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentCapabilityProfile,
+    SpawnedSubagentBatch, SpawnedSubagentInvocation, SubagentBatchEntry, SubagentCapabilityProfile,
     SubagentCapabilityRequest, SubagentInvocationDeps, SubagentMcpRequest, SubagentResult,
     SubagentResultDeps, SubagentSandboxMode, SubagentSandboxPolicy, SubagentSpawnPolicy,
     SubagentSpawnRequest, SubagentSummary, SubagentTaskBootstrap, SubagentTaskOutcome,

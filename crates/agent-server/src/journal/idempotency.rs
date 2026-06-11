@@ -90,17 +90,36 @@ pub struct IdempotencyRecord {
 
 /// Outcome of claiming a `request_id` against the durable idempotency
 /// table.
+///
+/// `claim_idempotency` is an **atomic reservation**, not a plain read:
+/// the first caller to claim a key inserts a placeholder
+/// (`result_json = JSON null`) under the same lock/transaction that
+/// checks for an existing row, so two concurrent retries of the same
+/// `request_id` can never both observe [`Fresh`](Self::Fresh). The
+/// winning claim runs the effect and then fills the placeholder via
+/// `record_idempotency`; the loser observes the placeholder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdempotencyClaim {
-    /// No record existed; the caller now owns the key and must run the
-    /// effect.
+    /// No record existed and this caller just inserted the reservation
+    /// placeholder. The caller now **owns** the key and must run the
+    /// effect, then call `record_idempotency` to fill in the durable
+    /// references.
     Fresh,
-    /// A record already exists with a matching kind + fingerprint. The
-    /// caller should reconstruct the original response from the stored
-    /// references rather than re-running the effect.
+    /// A record already exists with a matching kind + fingerprint **and**
+    /// its result has been recorded. The caller should reconstruct the
+    /// original response from the stored references rather than
+    /// re-running the effect.
     Replay(Box<IdempotencyRecord>),
-    /// A record exists under this key but for a different kind or
-    /// payload fingerprint — a caller contract violation.
+    /// The claim could not be granted. Either:
+    /// - a record exists under this key for a *different* kind or payload
+    ///   fingerprint (a caller contract violation), or
+    /// - the key is *reserved by a concurrent in-flight claim* whose
+    ///   effect has not finished recording yet (the placeholder is still
+    ///   `JSON null`).
+    ///
+    /// In both cases the caller must **not** run the effect. A retry
+    /// after the in-flight original completes will observe
+    /// [`Replay`](Self::Replay) instead.
     Conflict,
 }
 

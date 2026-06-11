@@ -1,16 +1,18 @@
 use super::test_utils::*;
 use super::*;
+use crate::context::{CompactionConfig, CompactionResult, ContextCompactor};
 use crate::events::{AgentEvent, AgentEventEnvelope};
 use crate::hooks::{AgentHooks, AllowAllHooks, ToolDecision};
-use crate::llm::{ChatOutcome, Content, ContentBlock};
+use crate::llm::{ChatOutcome, Content, ContentBlock, Message, Role, StreamDelta, StreamErrorKind};
 use crate::stores::{
-    EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StoredTurnEvents,
+    EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StateStore, StoredTurnEvents,
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolResult,
     ToolTier, TurnOptions, TurnOutcome,
 };
+use crate::types::{AgentState, RetryConfig};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
@@ -98,6 +100,10 @@ where
 enum EventStoreFailureMode {
     Append,
     FinishTurn,
+    /// Fail both `append` and `finish_turn` — models the common case where
+    /// the same store outage that rejected the event append also rejects the
+    /// turn-close barrier.
+    Both,
 }
 
 #[derive(Clone)]
@@ -123,14 +129,20 @@ impl EventStore for FailingEventStore {
         turn: usize,
         envelope: AgentEventEnvelope,
     ) -> anyhow::Result<()> {
-        if matches!(self.failure_mode, EventStoreFailureMode::Append) {
+        if matches!(
+            self.failure_mode,
+            EventStoreFailureMode::Append | EventStoreFailureMode::Both
+        ) {
             anyhow::bail!("append failure");
         }
         self.inner.append(thread_id, turn, envelope).await
     }
 
     async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
-        if matches!(self.failure_mode, EventStoreFailureMode::FinishTurn) {
+        if matches!(
+            self.failure_mode,
+            EventStoreFailureMode::FinishTurn | EventStoreFailureMode::Both
+        ) {
             anyhow::bail!("finish failure");
         }
         self.inner.finish_turn(thread_id, turn).await
@@ -4508,4 +4520,826 @@ fn assert_summary_llm_metadata_matches(
         got.tool_call_count, expected.tool_call_count,
         "{label} must report the same tool call count as the pre-pause summary",
     );
+}
+
+// =====================================================================
+// core-loop regression fixtures
+// =====================================================================
+
+/// A context compactor that replaces the whole history with a single short
+/// summary message and never calls the provider — so overflow-recovery tests
+/// don't have to interleave a summarization round-trip into the mock script.
+struct ShrinkCompactor;
+
+#[async_trait]
+impl ContextCompactor for ShrinkCompactor {
+    async fn compact(&self, _messages: &[Message]) -> anyhow::Result<String> {
+        Ok("[summary]".to_string())
+    }
+
+    fn estimate_tokens(&self, _messages: &[Message]) -> usize {
+        0
+    }
+
+    fn needs_compaction(&self, _messages: &[Message]) -> bool {
+        // Threshold compaction never fires; only the explicit overflow path
+        // (which calls `compact_history` directly) exercises this compactor.
+        false
+    }
+
+    async fn compact_history(&self, messages: Vec<Message>) -> anyhow::Result<CompactionResult> {
+        let original_count = messages.len();
+        Ok(CompactionResult {
+            messages: vec![Message::user("[summary]")],
+            original_count,
+            new_count: 1,
+            original_tokens: 1_000,
+            new_tokens: 10,
+        })
+    }
+}
+
+/// A state store whose `save` always fails — drives the strict-durability
+/// hard-error path.
+#[derive(Clone, Default)]
+struct FailingStateStore;
+
+#[async_trait]
+impl StateStore for FailingStateStore {
+    async fn save(&self, _state: &AgentState) -> anyhow::Result<()> {
+        anyhow::bail!("state store unavailable");
+    }
+
+    async fn load(&self, _thread_id: &ThreadId) -> anyhow::Result<Option<AgentState>> {
+        Ok(None)
+    }
+
+    async fn delete(&self, _thread_id: &ThreadId) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A hook that requires confirmation only for a specific `tool_call_id` and
+/// allows everything else — used to pause one element of a parallel batch.
+struct ConfirmToolCallHook {
+    target: &'static str,
+}
+
+#[async_trait]
+impl AgentHooks for ConfirmToolCallHook {
+    async fn pre_tool_use(&self, invocation: &ToolInvocation) -> ToolDecision {
+        if invocation.tool_call_id == self.target {
+            ToolDecision::RequiresConfirmation("confirm".to_string())
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+/// An Observe-tier tool that records the `tag` of every `execute` call so a
+/// test can detect double execution.
+struct CountingTool {
+    executions: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CounterToolName {
+    Counter,
+}
+
+impl crate::tools::ToolName for CounterToolName {}
+
+impl crate::tools::Tool<()> for CountingTool {
+    type Name = CounterToolName;
+
+    fn name(&self) -> CounterToolName {
+        CounterToolName::Counter
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Counter"
+    }
+
+    fn description(&self) -> &'static str {
+        "Records each execution by tag."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": { "tag": { "type": "string" } } })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let tag = input
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        if let Ok(mut guard) = self.executions.lock() {
+            guard.push(tag.clone());
+        }
+        Ok(ToolResult::success(format!("counted {tag}")))
+    }
+}
+
+/// Poll the event store until `turn` is recorded as finished, yielding to the
+/// spawned run task between checks. Deterministic (no wall-clock sleeps).
+async fn wait_for_turn_finished(
+    store: &dyn EventStore,
+    thread_id: &ThreadId,
+    turn: usize,
+) -> anyhow::Result<()> {
+    for _ in 0..100_000 {
+        let turns = store.get_turns(thread_id).await?;
+        if turns.iter().any(|t| t.turn == turn && t.finished) {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    anyhow::bail!("turn {turn} never finished")
+}
+
+// --- #3: second looping run on a thread keys under the next turn ------
+
+#[tokio::test]
+async fn second_text_run_on_thread_continues_turn_keys() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::text_response("first reply"),
+        MockProvider::text_response("second reply"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let (state_1, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("one".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state_1, AgentRunState::Done { .. }));
+
+    // The second Text run on the SAME thread must succeed — before the fix it
+    // failed with "turn 1 is already finished" because the turn key restarted
+    // at 0 and collided with the prior run's finished turn.
+    let (state_2, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("two".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(
+        matches!(state_2, AgentRunState::Done { .. }),
+        "second run on the thread should succeed, got {state_2:?}"
+    );
+
+    let turns = agent.event_store.get_turns(&thread_id).await?;
+    let mut turn_numbers: Vec<usize> = turns.iter().map(|t| t.turn).collect();
+    turn_numbers.sort_unstable();
+    assert_eq!(
+        turn_numbers,
+        vec![1, 2],
+        "the two runs must occupy consecutive turns"
+    );
+    assert!(
+        turns.iter().all(|t| t.finished),
+        "both turns should be finished"
+    );
+    Ok(())
+}
+
+// --- #2: AgentInput::Message recovers an orphaned tool_use ------------
+
+#[tokio::test]
+async fn message_input_recovers_orphaned_tool_use() -> anyhow::Result<()> {
+    let message_store = InMemoryStore::new();
+    let thread_id = ThreadId::new();
+
+    // Seed a crash-orphaned assistant tool_use with no following tool_result.
+    message_store
+        .append(
+            &thread_id,
+            Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![ContentBlock::ToolUse {
+                    id: "orphan_1".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({ "message": "x" }),
+                    thought_signature: None,
+                }]),
+            },
+        )
+        .await?;
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("recovered")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(AllowAllHooks)
+        .message_store(message_store.clone())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let (state, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Message(vec![ContentBlock::Text {
+            text: "continue".to_string(),
+        }]),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    // The fix runs crash recovery for Message inputs, synthesizing an error
+    // tool_result for the orphaned tool_use before appending the user message.
+    let history = message_store.get_history(&thread_id).await?;
+    let has_recovery = history.iter().any(|m| match &m.content {
+        Content::Blocks(blocks) => blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult { is_error: Some(true), content, .. }
+                    if content.contains("interrupted by a crash")
+            )
+        }),
+        Content::Text(_) => false,
+    });
+    assert!(
+        has_recovery,
+        "Message input must trigger orphaned tool_use recovery; history={history:?}"
+    );
+    Ok(())
+}
+
+// --- #5: overflow -> compaction -> EndTurn completes ------------------
+
+#[tokio::test]
+async fn context_overflow_then_compaction_completes() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::context_window_exceeded(),
+        MockProvider::text_response("recovered"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_compaction(CompactionConfig::default())
+        .with_custom_compactor(ShrinkCompactor)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let (state, _) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    // Before the fix this returned Error("turn 1 is already finished") because
+    // the recovery decremented the turn counter and replayed a closed key.
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "overflow recovery should complete the run, got {state:?}"
+    );
+
+    let turns = agent.event_store.get_turns(&thread_id).await?;
+    let mut turn_numbers: Vec<usize> = turns.iter().map(|t| t.turn).collect();
+    turn_numbers.sort_unstable();
+    assert_eq!(
+        turn_numbers,
+        vec![1, 2],
+        "overflow retry must run as the next monotonic turn"
+    );
+    assert!(turns.iter().all(|t| t.finished));
+    Ok(())
+}
+
+// --- #4: compaction_retries resets after a successful turn ------------
+
+#[tokio::test]
+async fn non_consecutive_overflows_recover_after_retry_reset() -> anyhow::Result<()> {
+    // Four overflows, each separated by a successful turn. The retry budget
+    // must reset between episodes so none of them hard-fails.
+    let provider = MockProvider::new(vec![
+        MockProvider::context_window_exceeded(),
+        MockProvider::tool_use_response("t1", "echo", json!({ "message": "a" })),
+        MockProvider::context_window_exceeded(),
+        MockProvider::tool_use_response("t2", "echo", json!({ "message": "b" })),
+        MockProvider::context_window_exceeded(),
+        MockProvider::tool_use_response("t3", "echo", json!({ "message": "c" })),
+        MockProvider::context_window_exceeded(),
+        MockProvider::text_response("all done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .with_compaction(CompactionConfig::default())
+        .with_custom_compactor(ShrinkCompactor)
+        .event_store(new_event_store())
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "non-consecutive overflows must each recover after the retry reset, got {state:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn consecutive_overflows_exhaust_retry_budget() -> anyhow::Result<()> {
+    // Four consecutive overflows with no intervening success: the consecutive
+    // retry budget (MAX_COMPACTION_RETRIES = 3) is exhausted on the fourth.
+    let provider = MockProvider::new(vec![
+        MockProvider::context_window_exceeded(),
+        MockProvider::context_window_exceeded(),
+        MockProvider::context_window_exceeded(),
+        MockProvider::context_window_exceeded(),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_compaction(CompactionConfig::default())
+        .with_custom_compactor(ShrinkCompactor)
+        .event_store(new_event_store())
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Error(_)),
+        "four consecutive overflows should exhaust the retry budget, got {state:?}"
+    );
+    Ok(())
+}
+
+// --- #16: strict durability checkpoint failure is a hard error --------
+
+#[tokio::test]
+async fn strict_durability_checkpoint_failure_errors() {
+    let provider = MockProvider::new(vec![MockProvider::text_response("hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(FailingStateStore)
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions {
+            strict_durability: true,
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Error(_)),
+        "a failed strict-durability checkpoint must abort the turn, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_strict_checkpoint_failure_does_not_error() {
+    // Without strict durability, a failed state checkpoint is only a warning.
+    let provider = MockProvider::new(vec![MockProvider::text_response("hi")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(AllowAllHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(FailingStateStore)
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let outcome = Box::pin(agent.run_turn(
+        ThreadId::new(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+        TurnOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(outcome, TurnOutcome::Done { .. }),
+        "non-strict checkpoint failures must not abort the turn, got {outcome:?}"
+    );
+}
+
+// --- #12: finish_turn failure preserves the original turn error -------
+
+#[tokio::test]
+async fn finish_turn_failure_preserves_original_error() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("hi")]);
+    let event_store = FailingEventStore::new(EventStoreFailureMode::Both);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(event_store)
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    match state {
+        AgentRunState::Error(error) => assert!(
+            error.message.contains("Failed to append event"),
+            "the original append error must survive a finish_turn failure, got: {}",
+            error.message
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    Ok(())
+}
+
+// --- #15: parallel batch confirmation drains completed siblings -------
+
+#[tokio::test]
+async fn parallel_batch_confirmation_does_not_re_execute_siblings() -> anyhow::Result<()> {
+    let executions = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("t1", "counter", json!({ "tag": "a" })),
+            ("t2", "counter", json!({ "tag": "b" })),
+            ("t3", "counter", json!({ "tag": "c" })),
+        ]),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingTool {
+        executions: Arc::clone(&executions),
+    });
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(ConfirmToolCallHook { target: "t2" })
+        .tools(tools)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let state_1 = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    let (continuation, tool_call_id) = match state_1 {
+        AgentRunState::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("expected AwaitingConfirmation, got {other:?}"),
+    };
+    assert_eq!(
+        tool_call_id, "t2",
+        "the middle tool should be the one paused"
+    );
+
+    let state_2 = agent
+        .run(
+            thread_id.clone(),
+            AgentInput::Resume {
+                continuation,
+                tool_call_id,
+                confirmed: true,
+                rejection_reason: None,
+            },
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(matches!(state_2, AgentRunState::Done { .. }));
+
+    let mut execs = executions
+        .lock()
+        .ok()
+        .context("executions mutex poisoned")?
+        .clone();
+    execs.sort();
+    // Each tool runs exactly once: the already-completed sibling `c` must not
+    // be re-executed on resume (the bug double-ran it).
+    assert_eq!(
+        execs,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        "each tool must execute exactly once; got {execs:?}"
+    );
+    Ok(())
+}
+
+// --- #8: streaming retry isolates deltas under a fresh message_id -----
+
+#[tokio::test]
+async fn streaming_retry_uses_fresh_message_id_per_attempt() -> anyhow::Result<()> {
+    let provider = StreamScriptProvider::new(vec![
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "Hello ".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Error {
+                message: "transient blip".to_string(),
+                kind: StreamErrorKind::ServerError,
+            },
+        ]),
+        StreamScriptStep::Frames(vec![
+            StreamDelta::TextDelta {
+                delta: "Hello ".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::TextDelta {
+                delta: "world".to_string(),
+                block_index: 0,
+            },
+            StreamDelta::Done {
+                stop_reason: Some(crate::llm::StopReason::EndTurn),
+            },
+        ]),
+    ]);
+    let config = AgentConfig {
+        streaming: true,
+        // Zero-delay retry: exercises the recoverable retry path with no
+        // real backoff sleep.
+        retry: RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        },
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let (state, events) = run_recorded(
+        &agent,
+        ThreadId::new(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+    assert!(matches!(state, AgentRunState::Done { .. }));
+
+    let deltas: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::TextDelta { message_id, delta } => {
+                Some((message_id.clone(), delta.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<&String> = deltas.iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "each stream attempt must use a distinct message_id; got {deltas:?}"
+    );
+
+    let final_text_id = events
+        .iter()
+        .find_map(|e| match &e.event {
+            AgentEvent::Text { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        })
+        .context("expected a final Text event")?;
+    // The surviving (successful) attempt's deltas are the ones correlated with
+    // the final assembled Text — and the failed attempt's partial is isolated
+    // under its own id rather than duplicated under the surviving id.
+    let surviving: Vec<&String> = deltas
+        .iter()
+        .filter(|(id, _)| *id == final_text_id)
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(
+        surviving,
+        vec!["Hello ", "world"],
+        "the surviving message must contain only the successful attempt's deltas"
+    );
+    let abandoned = deltas.iter().filter(|(id, _)| *id != final_text_id).count();
+    assert_eq!(
+        abandoned, 1,
+        "the failed attempt's partial delta must stay isolated under its own id"
+    );
+    Ok(())
+}
+
+// --- #10: stalled stream surfaces an inactivity timeout ---------------
+
+#[tokio::test]
+async fn stalled_stream_times_out_and_errors() -> anyhow::Result<()> {
+    // A stream that never yields a frame must not hang the run forever; the
+    // per-frame inactivity timeout (reduced to 20ms under cfg(test)) surfaces a
+    // recoverable error, and with no retries the run ends in error rather than
+    // stalling. The stall is permanent, so the timeout firing is deterministic.
+    let provider = StreamScriptProvider::new(vec![StreamScriptStep::FramesThenStall(vec![])]);
+    let config = AgentConfig {
+        streaming: true,
+        retry: RetryConfig::no_retry(),
+        ..Default::default()
+    };
+    let agent = builder::<()>()
+        .provider(provider)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let state = agent
+        .run(
+            ThreadId::new(),
+            AgentInput::Text("go".to_string()),
+            ToolContext::new(()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(state, AgentRunState::Error(_)),
+        "a stalled stream must end the run in error, got {state:?}"
+    );
+    Ok(())
+}
+
+// --- #1 / #11: run_persistent behavioral coverage ---------------------
+
+#[tokio::test]
+async fn run_persistent_processes_injected_turns_then_done_on_drop() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::text_response("first"),
+        MockProvider::text_response("second"),
+        MockProvider::text_response("third"),
+    ]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let handle = agent.run_persistent(
+        thread_id.clone(),
+        AgentInput::Text("first".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let AgentHandle {
+        input_tx, state_rx, ..
+    } = handle;
+
+    input_tx
+        .send(AgentInput::Text("second".to_string()))
+        .await?;
+    input_tx.send(AgentInput::Text("third".to_string())).await?;
+    drop(input_tx);
+
+    let state = state_rx.await?;
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "dropping input_tx should end the run as Done, got {state:?}"
+    );
+
+    let turns = agent.event_store.get_turns(&thread_id).await?;
+    let mut turn_numbers: Vec<usize> = turns.iter().map(|t| t.turn).collect();
+    turn_numbers.sort_unstable();
+    assert_eq!(
+        turn_numbers,
+        vec![1, 2, 3],
+        "initial + two injected turns should occupy three consecutive turns"
+    );
+    assert!(
+        turns.iter().all(|t| t.finished),
+        "every persistent turn must be finished"
+    );
+
+    // Sequences are globally continuous across the persistent turns.
+    let mut sequences: Vec<u64> = agent
+        .event_store
+        .get_events(&thread_id)
+        .await?
+        .into_iter()
+        .map(|envelope| envelope.sequence)
+        .collect();
+    sequences.sort_unstable();
+    for pair in sequences.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "persistent-mode event sequences must be continuous: {sequences:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_persistent_cancel_between_turns_is_cancelled() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("first")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+    let cancel = CancellationToken::new();
+
+    let handle = agent.run_persistent(
+        thread_id.clone(),
+        AgentInput::Text("first".to_string()),
+        ToolContext::new(()),
+        cancel.clone(),
+    );
+
+    // Wait until the agent has finished turn 1 and is parked on the input
+    // channel, then cancel.
+    wait_for_turn_finished(agent.event_store.as_ref(), &thread_id, 1).await?;
+    cancel.cancel();
+
+    let state = handle.state_rx.await?;
+    assert!(
+        matches!(state, AgentRunState::Cancelled { .. }),
+        "cancelling while parked should yield Cancelled, got {state:?}"
+    );
+
+    // The terminal Cancelled event is keyed under turn+1 (turn 1 was finished),
+    // and that turn is itself finished.
+    let turn_2 = agent
+        .event_store
+        .get_turn(&thread_id, 2)
+        .await?
+        .context("expected a turn 2 carrying the terminal Cancelled event")?;
+    assert!(turn_2.finished, "the cancel turn must be finished");
+    assert!(
+        turn_2
+            .events
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::Cancelled { .. })),
+        "turn 2 must carry the Cancelled event"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_persistent_unsupported_input_errors() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("first")]);
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(new_event_store())
+        .build();
+    let thread_id = ThreadId::new();
+
+    let handle = agent.run_persistent(
+        thread_id,
+        AgentInput::Text("first".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let AgentHandle {
+        input_tx, state_rx, ..
+    } = handle;
+
+    // `Continue` is not a valid persistent-channel input — it must end the run
+    // with Error rather than silently reporting Done.
+    input_tx.send(AgentInput::Continue).await?;
+    drop(input_tx);
+
+    let state = state_rx.await?;
+    assert!(
+        matches!(state, AgentRunState::Error(_)),
+        "injecting Continue should error the run, got {state:?}"
+    );
+    Ok(())
 }

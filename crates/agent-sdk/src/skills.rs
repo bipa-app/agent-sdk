@@ -56,7 +56,10 @@ pub struct Skill {
     pub system_prompt: String,
 
     /// List of tool names that should be enabled for this skill.
-    /// If empty, all registered tools are available.
+    ///
+    /// If empty, all registered tools are available. If non-empty, it acts as a
+    /// whitelist: only the listed tools (unioned with `allowed_tools`, and minus
+    /// `denied_tools`) are available. See [`Skill::is_tool_allowed`].
     pub tools: Vec<String>,
 
     /// Optional list of tools explicitly allowed (whitelist).
@@ -117,24 +120,37 @@ impl Skill {
 
     /// Check if a tool is allowed by this skill.
     ///
-    /// Returns true if:
-    /// - The tool is not in `denied_tools`, AND
-    /// - Either `allowed_tools` is None, or the tool is in `allowed_tools`
+    /// Resolution order:
+    /// - If the tool is in `denied_tools`, it is denied (highest precedence).
+    /// - Otherwise, if any whitelist is configured — either `allowed_tools` or
+    ///   a non-empty `tools` list — the tool must appear in the union of those
+    ///   lists. A non-empty `tools` list therefore restricts access, matching
+    ///   the documented skill-file format (`tools: [read, grep]`).
+    /// - If no whitelist is configured at all, the tool is allowed.
     #[must_use]
     pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
-        // Check denied list first
+        // Check denied list first — it always wins.
         if let Some(ref denied) = self.denied_tools
             && denied.iter().any(|t| t == tool_name)
         {
             return false;
         }
 
-        // Check allowed list if set
-        if let Some(ref allowed) = self.allowed_tools {
-            return allowed.iter().any(|t| t == tool_name);
+        // A non-empty `tools` list acts as a whitelist, unioned with any
+        // explicit `allowed_tools` whitelist.
+        let has_allowed_tools = self.allowed_tools.is_some();
+        let has_tools_whitelist = !self.tools.is_empty();
+
+        if has_allowed_tools || has_tools_whitelist {
+            let in_allowed = self
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| allowed.iter().any(|t| t == tool_name));
+            let in_tools = self.tools.iter().any(|t| t == tool_name);
+            return in_allowed || in_tools;
         }
 
-        // No whitelist, tool is allowed
+        // No whitelist of any kind, tool is allowed.
         true
     }
 }
@@ -197,5 +213,38 @@ mod tests {
 
         assert!(skill.is_tool_allowed("read"));
         assert!(!skill.is_tool_allowed("bash")); // Denied takes precedence
+    }
+
+    #[test]
+    fn test_is_tool_allowed_tools_acts_as_whitelist() {
+        // A skill declaring only `tools: [read]` must NOT grant every
+        // registered tool. `with_skill` filters via `is_tool_allowed`, so this
+        // restriction flows through to the agent's tool set.
+        let skill = Skill::new("test", "prompt").with_tools(vec!["read".into()]);
+
+        assert!(skill.is_tool_allowed("read"));
+        assert!(!skill.is_tool_allowed("write"));
+        assert!(!skill.is_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn test_is_tool_allowed_tools_unions_with_allowed_tools() {
+        let skill = Skill::new("test", "prompt")
+            .with_tools(vec!["read".into()])
+            .with_allowed_tools(vec!["grep".into()]);
+
+        assert!(skill.is_tool_allowed("read")); // from tools
+        assert!(skill.is_tool_allowed("grep")); // from allowed_tools
+        assert!(!skill.is_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn test_is_tool_allowed_denied_overrides_tools_whitelist() {
+        let skill = Skill::new("test", "prompt")
+            .with_tools(vec!["read".into(), "bash".into()])
+            .with_denied_tools(vec!["bash".into()]);
+
+        assert!(skill.is_tool_allowed("read"));
+        assert!(!skill.is_tool_allowed("bash")); // denied wins over tools whitelist
     }
 }

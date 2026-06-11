@@ -357,53 +357,38 @@ pub fn chat(args: ChatArgs) -> Result<()> {
     runtime.block_on(chat_async(args))
 }
 
+/// Which interaction mode a provider session runs in.
+enum Session {
+    /// Single-shot: send one prompt, stream the reply, exit.
+    Run { prompt: String },
+    /// Interactive REPL keeping conversation history for the process lifetime.
+    Chat,
+}
+
 async fn run_async(args: RunArgs) -> Result<()> {
     let RunArgs {
         prompt,
         system,
         provider,
     } = args;
-
-    // `match` on the provider enum so each arm monomorphizes the generic
-    // helper for its concrete provider type. The builder requires a concrete
-    // `P: LlmProvider` (there is no `Arc<dyn LlmProvider>` path on this
-    // branch), so this is the clean way to support runtime selection.
-    match provider.provider {
-        Provider::Anthropic => {
-            let key = require_env(
-                "ANTHROPIC_API_KEY",
-                "export your Anthropic API key to run an agent",
-            )?;
-            let model = provider.model.as_deref().unwrap_or(DEFAULT_ANTHROPIC_MODEL);
-            run_with(anthropic_provider(key, model), prompt, system).await
-        }
-        Provider::Openai => {
-            let key = require_env(
-                "OPENAI_API_KEY",
-                "export your OpenAI API key to run an agent",
-            )?;
-            let model = provider
-                .model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_owned());
-            run_with(OpenAIProvider::new(key, model), prompt, system).await
-        }
-        Provider::Gemini => {
-            let key = require_gemini_key()?;
-            let model = provider
-                .model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_owned());
-            run_with(GeminiProvider::new(key, model), prompt, system).await
-        }
-        Provider::Vertex => run_with(build_vertex(&provider)?, prompt, system).await,
-        Provider::Cloudflare => run_with(build_cloudflare(&provider)?, prompt, system).await,
-    }
+    dispatch(&provider, system, Session::Run { prompt }).await
 }
 
 async fn chat_async(args: ChatArgs) -> Result<()> {
     let ChatArgs { system, provider } = args;
+    dispatch(&provider, system, Session::Chat).await
+}
 
+/// Resolve credentials + the default model for the selected provider — one
+/// match arm per provider — then run the chosen [`Session`].
+///
+/// `run` and `chat` share this single dispatch so a new provider or credential
+/// change is wired in exactly one place. `match`ing on the provider enum lets
+/// each arm monomorphize the generic [`session_with`] for its concrete provider
+/// type: the builder requires a concrete `P: LlmProvider` (there is no
+/// `Arc<dyn LlmProvider>` path here), so this is the clean way to support
+/// runtime selection.
+async fn dispatch(provider: &ProviderArgs, system: String, session: Session) -> Result<()> {
     match provider.provider {
         Provider::Anthropic => {
             let key = require_env(
@@ -411,7 +396,7 @@ async fn chat_async(args: ChatArgs) -> Result<()> {
                 "export your Anthropic API key to run an agent",
             )?;
             let model = provider.model.as_deref().unwrap_or(DEFAULT_ANTHROPIC_MODEL);
-            chat_with(anthropic_provider(key, model), system).await
+            session_with(anthropic_provider(key, model), system, session).await
         }
         Provider::Openai => {
             let key = require_env(
@@ -422,7 +407,7 @@ async fn chat_async(args: ChatArgs) -> Result<()> {
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_owned());
-            chat_with(OpenAIProvider::new(key, model), system).await
+            session_with(OpenAIProvider::new(key, model), system, session).await
         }
         Provider::Gemini => {
             let key = require_gemini_key()?;
@@ -430,10 +415,22 @@ async fn chat_async(args: ChatArgs) -> Result<()> {
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_owned());
-            chat_with(GeminiProvider::new(key, model), system).await
+            session_with(GeminiProvider::new(key, model), system, session).await
         }
-        Provider::Vertex => chat_with(build_vertex(&provider)?, system).await,
-        Provider::Cloudflare => chat_with(build_cloudflare(&provider)?, system).await,
+        Provider::Vertex => session_with(build_vertex(provider)?, system, session).await,
+        Provider::Cloudflare => session_with(build_cloudflare(provider)?, system, session).await,
+    }
+}
+
+/// Run a constructed provider in the requested [`Session`] mode.
+async fn session_with<P: LlmProvider + 'static>(
+    provider: P,
+    system: String,
+    session: Session,
+) -> Result<()> {
+    match session {
+        Session::Run { prompt } => run_with(provider, prompt, system).await,
+        Session::Chat => chat_with(provider, system).await,
     }
 }
 
@@ -503,7 +500,11 @@ async fn chat_with<P: LlmProvider + 'static>(provider: P, system: String) -> Res
         stdout.write_all(b"\nagent> ").await?;
         stdout.flush().await?;
 
-        let _ = agent
+        // Don't propagate a failed turn out of the REPL: conversation history
+        // lives only in this process's in-memory store, so a transient provider
+        // error (rate limit, network blip, momentary 5xx) must not destroy the
+        // whole interactive session. Report it and keep the loop alive.
+        if let Err(err) = agent
             .run(
                 thread_id.clone(),
                 AgentInput::Text(prompt.to_string()),
@@ -511,7 +512,10 @@ async fn chat_with<P: LlmProvider + 'static>(provider: P, system: String) -> Res
                 CancellationToken::new(),
             )
             .await
-            .context("agent run failed")?;
+        {
+            eprintln!("\nagent run failed: {err:#}");
+            continue;
+        }
 
         // Terminate the streamed (delta) line.
         stdout.write_all(b"\n").await?;

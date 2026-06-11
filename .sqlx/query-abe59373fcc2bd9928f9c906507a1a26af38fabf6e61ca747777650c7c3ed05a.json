@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)\n               VALUES ($1, $2, $3, $4, $5)\n               ON CONFLICT (request_id) DO UPDATE\n                   SET result_json = EXCLUDED.result_json\n                   WHERE agent_sdk_idempotency.result_json = 'null'::jsonb",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "abe59373fcc2bd9928f9c906507a1a26af38fabf6e61ca747777650c7c3ed05a"
+}

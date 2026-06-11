@@ -123,6 +123,9 @@ impl ReplayStores {
         Ok(CompletedTurnCommit {
             thread_id: thread(),
             task_id: turn.task_id.clone(),
+            // History is replayed in order (attempt_number == i + 1), so
+            // each turn is committed_turns + 1 at commit time.
+            expected_turn: attempt_number,
             turn_attempt_id: attempt.id,
             close_attempt_params: CloseAttemptParams {
                 response_blob: serde_json::json!({"id": "msg", "content": []}),

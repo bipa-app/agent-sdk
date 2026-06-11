@@ -41,7 +41,8 @@ use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::task::SubmittedInputItem;
 use crate::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, CommittedEvent, EventRepository, LeaseId,
-    SubagentInvocationSpawn, TaskKind, TaskStatus, Thread, ThreadStore, WorkerId,
+    SubagentInvocationSpawn, SuspensionPayload, TaskKind, TaskStatus, Thread, ThreadStore,
+    WorkerId,
 };
 
 /// Typed durable request to spawn a subagent.
@@ -805,6 +806,15 @@ impl SubagentSpawnPolicy for ServerSubagentSpawnPolicy {
         if constraints.policy.allowed_models.contains(requested_model) {
             Ok(requested_model.to_owned())
         } else {
+            // Loud fallback so the substitution is searchable in
+            // operational logs — the caller's requested model is
+            // otherwise only recoverable by diffing request.model
+            // against the resolved spec.model after the fact.
+            log::warn!(
+                "subagent requested disallowed model {requested_model:?}; \
+                 substituting inherited default {:?}",
+                constraints.policy.default_model,
+            );
             Ok(constraints.policy.default_model.clone())
         }
     }
@@ -1403,6 +1413,31 @@ pub struct SpawnedSubagentBatch {
     pub invocations: Vec<SpawnedSubagentInvocation>,
 }
 
+/// One entry in a fan-out subagent batch.
+///
+/// Unlike the store-level [`SubagentInvocationSpawn`], this carries no
+/// `SuspensionPayload`: every entry in a batch shares the *same* parent
+/// suspension, so it is passed exactly once to
+/// [`spawn_subagent_batch_invocations`] — mirroring the store primitive
+/// [`AgentTaskStore::spawn_subagent_batch`], which already takes the shared
+/// payload explicitly. Removing the
+/// per-entry payload makes the previously-implicit "every entry's
+/// payload equals `spawns[0]`" assumption unrepresentable, so a
+/// divergent payload from an external caller can no longer be silently
+/// dropped.
+#[derive(Clone, Debug)]
+pub struct SubagentBatchEntry {
+    /// Pre-allocated child-thread identifier (reused across retries).
+    pub child_thread_id: ThreadId,
+    /// Authoritative resolved spec for the child.
+    pub spec: EffectiveSubagentSpec,
+    /// Initial input for the child's first root turn. Empty means
+    /// "derive it from `spec.prompt + spec.task`".
+    pub child_root_input: Vec<SubmittedInputItem>,
+    /// Index into the shared continuation's `pending_tool_calls`.
+    pub spawn_index: u32,
+}
+
 /// Persist N durable subagent invocations atomically under one parent
 /// transition.
 ///
@@ -1413,10 +1448,11 @@ pub struct SpawnedSubagentBatch {
 /// `WaitingOnChildren { pending_child_count: N }` exactly once — no
 /// partial fan-out is observable from concurrent readers.
 ///
-/// `spawns` must be non-empty; every entry's `spawn_index` must point
-/// at the matching `pending_tool_calls` slot in the shared
-/// continuation envelope (taken from `spawns[0].payload`); every
-/// `child_thread_id` must be unique across the batch.
+/// `entries` must be non-empty; every entry's `spawn_index` must point
+/// at the matching `pending_tool_calls` slot in the shared `payload`'s
+/// continuation envelope; every `child_thread_id` must be unique across
+/// the batch. The `payload` (the parent suspension) is passed once and
+/// applies to all entries.
 ///
 /// # Errors
 ///
@@ -1436,25 +1472,21 @@ pub struct SpawnedSubagentBatch {
 /// One bad `spawn_index` rejects the whole batch up front so we don't
 /// orphan child thread rows after partial materialization.
 fn validate_batch_spawns(
-    spawns: &[SubagentInvocationSpawn],
+    payload: &SuspensionPayload,
+    entries: &[SubagentBatchEntry],
 ) -> Result<Vec<agent_sdk_foundation::PendingToolCallInfo>> {
-    let pending_tool_count = spawns[0]
-        .payload
-        .continuation
-        .payload
-        .pending_tool_calls
-        .len();
+    let pending_tool_count = payload.continuation.payload.pending_tool_calls.len();
     let mut pending_tools_by_entry: Vec<agent_sdk_foundation::PendingToolCallInfo> =
-        Vec::with_capacity(spawns.len());
-    for spawn in spawns {
+        Vec::with_capacity(entries.len());
+    for entry in entries {
         let spawn_index_usize =
-            usize::try_from(spawn.spawn_index).context("subagent spawn_index exceeds usize")?;
+            usize::try_from(entry.spawn_index).context("subagent spawn_index exceeds usize")?;
         ensure!(
             spawn_index_usize < pending_tool_count,
             "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
         );
         let pending_tool =
-            spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
+            payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone();
         ensure_confirm_tier_subagent_tool(&pending_tool)?;
         pending_tools_by_entry.push(pending_tool);
     }
@@ -1466,18 +1498,18 @@ fn validate_batch_spawns(
 /// shape so the child's first root turn always has at least one
 /// `SubmittedInputItem`.
 async fn materialize_batch_child_threads(
-    spawns: &mut [SubagentInvocationSpawn],
+    entries: &mut [SubagentBatchEntry],
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<Vec<Thread>> {
-    let mut child_threads = Vec::with_capacity(spawns.len());
-    for spawn in spawns.iter_mut() {
-        if spawn.child_root_input.is_empty() {
-            spawn.child_root_input = build_child_root_input(&spawn.spec);
+    let mut child_threads = Vec::with_capacity(entries.len());
+    for entry in entries.iter_mut() {
+        if entry.child_root_input.is_empty() {
+            entry.child_root_input = build_child_root_input(&entry.spec);
         }
         let child_thread = deps
             .thread_store
-            .get_or_create(&spawn.child_thread_id, now)
+            .get_or_create(&entry.child_thread_id, now)
             .await
             .context("materialize child thread projection")?;
         child_threads.push(child_thread);
@@ -1586,7 +1618,8 @@ async fn build_batch_invocation(
 ///
 /// `child_thread_id` on every entry must be pre-allocated by the
 /// caller and reused across retries (same idempotency contract as
-/// `spawn_subagent_invocation`).
+/// `spawn_subagent_invocation`). `payload` is the shared parent
+/// suspension and applies to every entry.
 ///
 /// # Errors
 ///
@@ -1600,34 +1633,42 @@ pub async fn spawn_subagent_batch_invocations(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
     lease: &LeaseId,
-    mut spawns: Vec<SubagentInvocationSpawn>,
+    mut entries: Vec<SubagentBatchEntry>,
+    payload: SuspensionPayload,
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentBatch> {
-    ensure!(!spawns.is_empty(), "subagent batch must be non-empty");
+    ensure!(!entries.is_empty(), "subagent batch must be non-empty");
 
     // Validate every entry against the shared continuation envelope
-    // before we start materializing child threads. The entries in
-    // `spawns` all share one parent suspension, so
-    // `payload.continuation.payload.pending_tool_calls` is the same
-    // list for everyone — one bad spawn_index should reject the whole
-    // batch up front, not after we've created N-1 child threads.
-    let pending_tools_by_entry = validate_batch_spawns(&spawns)?;
+    // before we start materializing child threads. All entries share
+    // the one `payload`, so `payload.continuation.payload.pending_tool_calls`
+    // is the same list for everyone — one bad spawn_index should reject
+    // the whole batch up front, not after we've created N-1 child threads.
+    let pending_tools_by_entry = validate_batch_spawns(&payload, &entries)?;
 
     // Per-entry: derive the default child input if blank, and
     // materialize the child thread row before the store sees it.
-    let child_threads = materialize_batch_child_threads(&mut spawns, deps, now).await?;
+    let child_threads = materialize_batch_child_threads(&mut entries, deps, now).await?;
 
-    // The store primitive expects one shared SuspensionPayload and
-    // ignores the per-entry payloads — but the trait stores the
-    // shared one explicitly for clarity. Take the first entry's
-    // payload (every entry must agree on it; they originated from
-    // the same parent suspension).
-    let shared_payload = spawns[0].payload.clone();
+    // Assemble the store-level spawns. The store primitive takes the
+    // shared `payload` explicitly and ignores the per-entry payload
+    // field, so we fill that (frozen, non-optional) field from the
+    // shared payload — there is no per-entry payload to diverge.
+    let spawns: Vec<SubagentInvocationSpawn> = entries
+        .into_iter()
+        .map(|entry| SubagentInvocationSpawn {
+            child_thread_id: entry.child_thread_id,
+            spec: entry.spec,
+            child_root_input: entry.child_root_input,
+            spawn_index: entry.spawn_index,
+            payload: payload.clone(),
+        })
+        .collect();
 
     let (parent_task, prepared) = deps
         .task_store
-        .spawn_subagent_batch(parent_id, worker, lease, spawns, shared_payload, now)
+        .spawn_subagent_batch(parent_id, worker, lease, spawns, payload, now)
         .await
         .context("persist subagent batch invocation tasks")?;
 

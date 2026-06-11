@@ -33,7 +33,7 @@ use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, StopReason, Usage,
 };
 use agent_sdk_providers::LlmProvider;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use time::Duration;
 use time::OffsetDateTime;
@@ -198,6 +198,7 @@ impl Fixtures {
             subagent_spawn_selector: None,
             compaction_config: Some(config),
             compaction_provider: Some(provider),
+            cancel: None,
         }
     }
 }
@@ -354,6 +355,71 @@ async fn pre_call_threshold_triggers_compaction() -> Result<()> {
     Ok(())
 }
 
+/// Finding #4: when compaction folds history into the committed
+/// projection, the in-flight draft must be cleared — otherwise a turn
+/// that later fails (so the commit path never clears the draft) leaves
+/// recovery folding the same messages in twice (compacted projection +
+/// raw draft). Here the turn's LLM call fails *after* the pre-call
+/// compaction; the draft must still be empty.
+#[tokio::test]
+async fn compaction_clears_draft_even_when_turn_then_fails() -> Result<()> {
+    let fixtures = Fixtures::new();
+    seed_projection_history(&fixtures.messages, &thread_id(), 12, &"x".repeat(200)).await?;
+
+    // Precondition: the draft slot is populated.
+    let before = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection should exist after seeding")?;
+    assert!(before.has_draft(), "precondition: draft seeded");
+
+    let cfg = CompactionConfig::default().with_threshold_tokens(10);
+    // call 1 → compactor summarisation; call 2 → turn LLM, which fails
+    // with a non-retryable InvalidRequest so the turn never commits.
+    let scripted = Arc::new(ScriptedProvider::new(vec![
+        ok_response("[summary]"),
+        ChatOutcome::InvalidRequest("bad request".into()),
+    ]));
+    let provider: Arc<dyn LlmProvider> = scripted.clone();
+    let deps = fixtures.deps_with_compaction(&cfg, &provider);
+
+    let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &fixtures.threads,
+        &fixtures.checkpoints,
+        &fixtures.messages,
+        t0(),
+    )
+    .await?;
+
+    let result = execute_root_turn(
+        inputs,
+        "go",
+        provider.as_ref(),
+        &deps,
+        t0() + Duration::seconds(1),
+    )
+    .await;
+    assert!(result.is_err(), "the InvalidRequest turn must fail");
+
+    // The pre-call compaction cleared the draft; the failed turn never
+    // ran the commit path, so this is the *only* thing that could have
+    // cleared it.
+    let after = fixtures
+        .messages
+        .get(&thread_id())
+        .await?
+        .context("projection should still exist")?;
+    assert!(
+        !after.has_draft(),
+        "compaction must clear the in-flight draft so recovery does not double-fold it",
+    );
+
+    Ok(())
+}
+
 /// Post-failure path: the provider returns
 /// `InvalidRequest("prompt is too long: …")` on the first attempt,
 /// the worker should run emergency compaction and retry with the
@@ -459,6 +525,7 @@ async fn prompt_too_long_without_config_still_goes_fatal() -> Result<()> {
         subagent_spawn_selector: None,
         compaction_config: None,
         compaction_provider: None,
+        cancel: None,
     };
 
     let task = create_and_acquire_root_task(&fixtures.tasks, &thread_id()).await?;

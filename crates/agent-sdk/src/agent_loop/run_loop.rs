@@ -2,11 +2,11 @@ use super::helpers::{pending_tool_index, send_event, turns_to_u32};
 use super::tool_execution::{append_tool_results, execute_confirmed_tool, execute_tool_call};
 use super::turn::execute_turn;
 use super::types::{
-    ConfirmedToolExecutionContext, ConvertTurnResultParams, ExecuteTurnParameters,
-    InitializedState, InternalTurnResult, PersistentDoneParams, ResumeData,
-    ResumeProcessingParameters, ResumeProcessingResult, ResumeSummaryMetrics, RunLoopParameters,
-    RunLoopResumeParams, RunLoopTurnResultParams, RunLoopTurnsParams, SingleTurnResumeParams,
-    ToolCallExecutionContext, ToolExecutionOutcome, TurnContext, TurnParameters,
+    ConvertTurnResultParams, ExecuteTurnParameters, InitializedState, InternalTurnResult,
+    PersistentDoneParams, ResumeData, ResumeProcessingParameters, ResumeProcessingResult,
+    ResumeSummaryMetrics, RunLoopParameters, RunLoopTurnResultParams, RunLoopTurnsParams,
+    SingleTurnResumeParams, ToolCallExecutionContext, ToolExecutionOutcome, TurnContext,
+    TurnParameters,
 };
 
 use crate::types::TurnOptions;
@@ -80,6 +80,7 @@ where
             initialize_from_message(msg, thread_id, message_store, state_store).await
         }
         AgentInput::Message(blocks) => {
+            recover_orphaned_tool_use(thread_id, message_store).await?;
             let msg = Message::user_with_content(blocks);
             initialize_from_message(msg, thread_id, message_store, state_store).await
         }
@@ -166,7 +167,15 @@ where
 }
 
 /// Shared initialization for `Text` and `Message` inputs: load or create state,
-/// append the user message, and return a fresh turn-zero `InitializedState`.
+/// append the user message, and return an `InitializedState` keyed off the
+/// loaded state's `turn_count`.
+///
+/// The turn counter is seeded from `state.turn_count` (exactly like the
+/// `Continue` arm), not hardcoded to 0: a second `Text`/`Message` run on a
+/// thread whose earlier turns were already closed via `finish_turn` must key
+/// its new events under the next turn, or the event store rejects the append
+/// to an already-finished turn. The accumulated usage is likewise carried
+/// forward so `state.total_usage` stays monotonic across runs on the thread.
 async fn initialize_from_message<M, S>(
     user_msg: Message,
     thread_id: &ThreadId,
@@ -193,8 +202,8 @@ where
     }
 
     Ok(InitializedState {
-        turn: 0,
-        total_usage: TokenUsage::default(),
+        turn: state.turn_count,
+        total_usage: state.total_usage.clone(),
         state,
         resume_data: None,
     })
@@ -594,7 +603,7 @@ where
     let mut tool_results = cont.completed_results.clone();
     let rejection =
         (!confirmed).then(|| rejection_reason.unwrap_or_else(|| "User rejected".to_string()));
-    let confirmed_ctx = ConfirmedToolExecutionContext {
+    let confirmed_ctx = ToolCallExecutionContext {
         tool_context,
         thread_id,
         tools,
@@ -731,6 +740,14 @@ where
         provenance,
     };
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
+        // A parallel Observe batch may have already executed this tool before
+        // pausing for confirmation on an earlier sibling; its result was
+        // carried forward in the continuation's `completed_results` (and is
+        // therefore already in `tool_results`). Skip re-execution to avoid
+        // duplicate side effects, tool_call events, and audit records.
+        if tool_results.iter().any(|(id, _)| id == &pending.id) {
+            continue;
+        }
         match execute_tool_call(pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
                 tool_results.push((tool_id, result));
@@ -776,66 +793,6 @@ where
     Ok(None)
 }
 
-pub(super) async fn handle_run_loop_resume<Ctx, H, M>(
-    RunLoopResumeParams {
-        resume_data,
-        turn,
-        total_usage,
-        state,
-        thread_id,
-        tool_context,
-        tools,
-        hooks,
-        event_store,
-        authority,
-        message_store,
-        execution_store,
-        audit_sink,
-        provenance,
-    }: RunLoopResumeParams<'_, Ctx, H, M>,
-) -> Result<Option<AgentRunState>, AgentError>
-where
-    Ctx: Send + Sync + Clone + 'static,
-    H: AgentHooks,
-    M: MessageStore,
-{
-    match process_resume(ResumeProcessingParameters {
-        resume_data,
-        turn,
-        total_usage,
-        state,
-        thread_id,
-        tool_context,
-        tools,
-        hooks,
-        event_store,
-        authority,
-        message_store,
-        execution_store,
-        audit_sink,
-        provenance,
-    })
-    .await?
-    {
-        ResumeProcessingResult::Completed { .. } => Ok(None),
-        ResumeProcessingResult::AwaitingConfirmation {
-            tool_call_id,
-            tool_name,
-            display_name,
-            input,
-            description,
-            continuation,
-        } => Ok(Some(AgentRunState::AwaitingConfirmation {
-            tool_call_id,
-            tool_name,
-            display_name,
-            input,
-            description,
-            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
-        })),
-    }
-}
-
 async fn finish_turn_or_error(
     event_store: &Arc<dyn EventStore>,
     thread_id: &ThreadId,
@@ -876,7 +833,7 @@ where
 }
 
 async fn handle_run_loop_resume_state<Ctx, H, M>(
-    params: RunLoopResumeParams<'_, Ctx, H, M>,
+    params: ResumeProcessingParameters<'_, Ctx, H, M>,
 ) -> Option<AgentRunState>
 where
     Ctx: Send + Sync + Clone + 'static,
@@ -889,9 +846,23 @@ where
     let hooks = params.hooks;
     let authority = params.authority;
 
-    match handle_run_loop_resume(params).await {
-        Ok(Some(outcome)) => Some(outcome),
-        Ok(None) => {
+    match process_resume(params).await {
+        Ok(ResumeProcessingResult::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation,
+        }) => Some(AgentRunState::AwaitingConfirmation {
+            tool_call_id,
+            tool_name,
+            display_name,
+            input,
+            description,
+            continuation: Box::new(ContinuationEnvelope::wrap(*continuation)),
+        }),
+        Ok(ResumeProcessingResult::Completed { .. }) => {
             if let Err(store_error) = finish_turn_or_error(event_store, thread_id, turn).await {
                 return Some(AgentRunState::Error(store_error));
             }
@@ -1255,7 +1226,10 @@ where
                     let user_msg = Message::user(&text);
                     if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
                         warn!("Failed to append injected message: {error}");
-                        return Some(done_run_state(ctx));
+                        return Some(AgentRunState::Error(AgentError::new(
+                            format!("Failed to append injected message: {error}"),
+                            false,
+                        )));
                     }
                     None
                 }
@@ -1263,11 +1237,34 @@ where
                     let user_msg = Message::user_with_content(blocks);
                     if let Err(error) = message_store.append(&ctx.thread_id, user_msg).await {
                         warn!("Failed to append injected message: {error}");
-                        return Some(done_run_state(ctx));
+                        return Some(AgentRunState::Error(AgentError::new(
+                            format!("Failed to append injected message: {error}"),
+                            false,
+                        )));
                     }
                     None
                 }
-                _ => Some(done_run_state(ctx)),
+                // `Resume` / `SubmitToolResults` / `Continue` carry no meaning
+                // between injected user turns. Surface a clear error rather
+                // than treating them like a closed channel and reporting a
+                // misleading `Done`.
+                Some(other) => {
+                    let kind = match other {
+                        AgentInput::Resume { .. } => "Resume",
+                        AgentInput::SubmitToolResults { .. } => "SubmitToolResults",
+                        AgentInput::Continue => "Continue",
+                        AgentInput::Text(_) | AgentInput::Message(_) => "unsupported",
+                    };
+                    Some(AgentRunState::Error(AgentError::new(
+                        format!(
+                            "AgentHandle::input_tx received an unsupported input variant ({kind}); \
+                             only Text and Message may be injected between turns"
+                        ),
+                        false,
+                    )))
+                }
+                // Sender dropped — no more injected messages. Exit cleanly.
+                None => Some(done_run_state(ctx)),
             }
         }
         () = cancel_token.cancelled() => {
@@ -1357,11 +1354,17 @@ where
             }
         }
         InternalTurnResult::Refusal => {
-            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
-                .await
-                .map_or_else(std::convert::identity, |()| {
-                    RunLoopTurnAction::Return(refusal_run_state(ctx))
-                })
+            // A failed `finish_turn` must not replace the terminal Refusal
+            // state — log it and still return the refusal.
+            if let Err(store_error) =
+                finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
+            {
+                warn!(
+                    "Failed to finish turn {current_turn} after refusal (preserving refusal state): {}",
+                    store_error.message
+                );
+            }
+            RunLoopTurnAction::Return(refusal_run_state(ctx))
         }
         InternalTurnResult::Cancelled { .. } => {
             // The LLM call or compaction was cancelled mid-turn. The
@@ -1408,11 +1411,19 @@ where
             )))
         }),
         InternalTurnResult::Error(error) => {
-            finish_turn_or_run_state(event_store, &ctx.thread_id, current_turn)
-                .await
-                .map_or_else(std::convert::identity, |()| {
-                    RunLoopTurnAction::Return(AgentRunState::Error(error))
-                })
+            // The turn already produced an error. A failed `finish_turn` —
+            // common when the same store rejection that broke the append
+            // also rejects the finish — must not mask the real cause. Log
+            // the finish failure and return the original turn error.
+            if let Err(store_error) =
+                finish_turn_or_error(event_store, &ctx.thread_id, current_turn).await
+            {
+                warn!(
+                    "Failed to finish turn {current_turn} after turn error (preserving original error): {}",
+                    store_error.message
+                );
+            }
+            RunLoopTurnAction::Return(AgentRunState::Error(error))
         }
     }
 }
@@ -1940,7 +1951,7 @@ where
             turn,
             Arc::clone(&authority),
         );
-        if let Some(outcome) = handle_run_loop_resume_state(RunLoopResumeParams {
+        if let Some(outcome) = handle_run_loop_resume_state(ResumeProcessingParameters {
             resume_data,
             turn,
             total_usage: &total_usage,

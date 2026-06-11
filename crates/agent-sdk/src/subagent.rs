@@ -48,9 +48,35 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Return the (display name, description) pair for a subagent of the given
+/// name, interning the leaked `&'static str`s so repeated construction with the
+/// same name reuses one allocation.
+///
+/// `SubagentFactory` builds a fresh `SubagentTool` per request, so leaking on
+/// every construction (the previous approach) grew memory without bound in
+/// long-running hosts. Interning bounds the leak to the number of distinct
+/// subagent names.
+fn cached_tool_strings(name: &str) -> (&'static str, &'static str) {
+    static CACHE: OnceLock<Mutex<HashMap<String, (&'static str, &'static str)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(entry) = map.get(name) {
+        return *entry;
+    }
+    let display: &'static str = Box::leak(format!("Subagent: {name}").into_boxed_str());
+    let description: &'static str = Box::leak(
+        format!(
+            "Spawn a subagent named '{name}' to handle a task. The subagent will work independently and return only its final response."
+        )
+        .into_boxed_str(),
+    );
+    *map.entry(name.to_string())
+        .or_insert((display, description))
+}
 
 /// Metadata key for tracking the current subagent nesting depth.
 ///
@@ -235,15 +261,9 @@ where
     where
         EF: Fn() -> Arc<dyn EventStore> + Send + Sync + 'static,
     {
-        // Cache leaked strings at construction time (bounded by number of tools)
-        let cached_display_name = Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
-        let cached_description = Box::leak(
-            format!(
-                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
-                config.name
-            )
-            .into_boxed_str(),
-        );
+        // Intern the leaked strings so repeated construction with the same
+        // name reuses one allocation (factories build a tool per request).
+        let (cached_display_name, cached_description) = cached_tool_strings(&config.name);
         Self {
             config,
             provider,
@@ -360,8 +380,9 @@ where
             agent_config,
         );
 
-        // Create tool context
-        let tool_ctx = ToolContext::new(());
+        // Derive the child context from the parent so the subagent-depth guard
+        // and the concurrency semaphore actually propagate into nested runs.
+        let tool_ctx = build_subagent_child_context(parent_ctx);
 
         // Run with a child cancellation token so parent cancellation propagates.
         // Use `run_abortable` so we can abort the spawned task on timeout
@@ -403,69 +424,30 @@ where
     }
 }
 
-fn mark_subagent_timeout(
-    config: &SubagentConfig,
-    final_response: &mut String,
-    error_details: &mut Option<String>,
-    success: &mut bool,
-) {
-    *final_response = "Subagent timed out".to_string();
-    *error_details = Some(format!(
-        "Subagent '{}' timed out after {}ms",
-        config.name,
-        config.timeout_ms.unwrap_or(0)
-    ));
-    *success = false;
-}
+/// Derive the tool context for a subagent run from its parent.
+///
+/// Copies the parent metadata (so host-set policy such as
+/// [`METADATA_MAX_SUBAGENT_DEPTH`] carries through), increments
+/// [`METADATA_SUBAGENT_DEPTH`] by one, and propagates the shared subagent
+/// concurrency semaphore. Without this the depth guard is dead code and nested
+/// spawning is unbounded.
+fn build_subagent_child_context<Ctx>(parent_ctx: &ToolContext<Ctx>) -> ToolContext<()> {
+    let parent_depth = parent_ctx
+        .metadata
+        .get(METADATA_SUBAGENT_DEPTH)
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
-fn mark_subagent_disconnected(
-    config: &SubagentConfig,
-    final_response: &mut String,
-    error_details: &mut Option<String>,
-    success: &mut bool,
-) {
-    *final_response = "Subagent ended unexpectedly".to_string();
-    *error_details = Some(format!(
-        "Subagent '{}' ended before returning a final state",
-        config.name
-    ));
-    *success = false;
-}
+    let mut child = ToolContext::new(());
+    child.metadata.clone_from(&parent_ctx.metadata);
+    child
+        .metadata
+        .insert(METADATA_SUBAGENT_DEPTH.to_string(), json!(parent_depth + 1));
 
-fn mark_subagent_cancelled(
-    config: &SubagentConfig,
-    final_response: &mut String,
-    error_details: &mut Option<String>,
-    success: &mut bool,
-) {
-    *final_response = "Subagent cancelled".to_string();
-    *error_details = Some(format!("Subagent '{}' was cancelled", config.name));
-    *success = false;
-}
-
-fn mark_subagent_awaiting_confirmation(
-    config: &SubagentConfig,
-    final_response: &mut String,
-    error_details: &mut Option<String>,
-    success: &mut bool,
-) {
-    *final_response = "Subagent requires confirmation".to_string();
-    *error_details = Some(format!(
-        "Subagent '{}' requested confirmation, which is not supported in nested runs",
-        config.name
-    ));
-    *success = false;
-}
-
-fn mark_subagent_agent_error(
-    final_response: &mut String,
-    error_details: &mut Option<String>,
-    success: &mut bool,
-    message: &str,
-) {
-    *final_response = message.to_string();
-    *error_details = Some(message.to_string());
-    *success = false;
+    if let Some(semaphore) = parent_ctx.subagent_semaphore() {
+        child = child.with_subagent_semaphore(semaphore);
+    }
+    child
 }
 
 type SubagentWaitResult = Result<
@@ -475,6 +457,10 @@ type SubagentWaitResult = Result<
 
 struct SubagentExecutionState {
     final_response: String,
+    /// Message id whose text currently populates `final_response`. Used to keep
+    /// only the **last** assistant message's text (the documented contract),
+    /// rather than concatenating every interim turn's commentary.
+    final_response_message_id: Option<String>,
     total_turns: usize,
     tool_count: u32,
     tool_logs: Vec<ToolCallLog>,
@@ -489,6 +475,7 @@ impl SubagentExecutionState {
     fn new() -> Self {
         Self {
             final_response: String::new(),
+            final_response_message_id: None,
             total_turns: 0,
             tool_count: 0,
             tool_logs: Vec::new(),
@@ -498,6 +485,14 @@ impl SubagentExecutionState {
             error_details: None,
             failed_tool: None,
         }
+    }
+
+    /// Record a failure: set the parent-visible response, the detailed error,
+    /// and clear the success flag.
+    fn fail(&mut self, response: impl Into<String>, details: String) {
+        self.final_response = response.into();
+        self.error_details = Some(details);
+        self.success = false;
     }
 
     fn into_result(self, name: String, start: Instant) -> SubagentResult {
@@ -590,64 +585,44 @@ fn apply_subagent_wait_outcome(
     task_handle: &tokio::task::JoinHandle<()>,
     state: &mut SubagentExecutionState,
 ) -> bool {
-    match outcome {
-        SubagentWaitOutcome::ReplayEvents => true,
-        SubagentWaitOutcome::TimedOut => {
-            timeout_cancel.cancel();
-            task_handle.abort();
-            mark_subagent_timeout(
-                config,
-                &mut state.final_response,
-                &mut state.error_details,
-                &mut state.success,
-            );
-            false
-        }
-        SubagentWaitOutcome::Disconnected => {
-            timeout_cancel.cancel();
-            task_handle.abort();
-            mark_subagent_disconnected(
-                config,
-                &mut state.final_response,
-                &mut state.error_details,
-                &mut state.success,
-            );
-            false
-        }
-        SubagentWaitOutcome::Cancelled => {
-            timeout_cancel.cancel();
-            task_handle.abort();
-            mark_subagent_cancelled(
-                config,
-                &mut state.final_response,
-                &mut state.error_details,
-                &mut state.success,
-            );
-            false
-        }
-        SubagentWaitOutcome::AwaitingConfirmation => {
-            timeout_cancel.cancel();
-            task_handle.abort();
-            mark_subagent_awaiting_confirmation(
-                config,
-                &mut state.final_response,
-                &mut state.error_details,
-                &mut state.success,
-            );
-            false
-        }
-        SubagentWaitOutcome::Error(error) => {
-            timeout_cancel.cancel();
-            task_handle.abort();
-            mark_subagent_agent_error(
-                &mut state.final_response,
-                &mut state.error_details,
-                &mut state.success,
-                &error.message,
-            );
-            false
-        }
-    }
+    // Compute the (parent-visible response, detailed error) for the failure
+    // arms; a successful replay returns early and leaves the finished task be.
+    let (response, details) = match outcome {
+        SubagentWaitOutcome::ReplayEvents => return true,
+        SubagentWaitOutcome::TimedOut => (
+            "Subagent timed out".to_string(),
+            format!(
+                "Subagent '{}' timed out after {}ms",
+                config.name,
+                config.timeout_ms.unwrap_or(0)
+            ),
+        ),
+        SubagentWaitOutcome::Disconnected => (
+            "Subagent ended unexpectedly".to_string(),
+            format!(
+                "Subagent '{}' ended before returning a final state",
+                config.name
+            ),
+        ),
+        SubagentWaitOutcome::Cancelled => (
+            "Subagent cancelled".to_string(),
+            format!("Subagent '{}' was cancelled", config.name),
+        ),
+        SubagentWaitOutcome::AwaitingConfirmation => (
+            "Subagent requires confirmation".to_string(),
+            format!(
+                "Subagent '{}' requested confirmation, which is not supported in nested runs",
+                config.name
+            ),
+        ),
+        SubagentWaitOutcome::Error(error) => (error.message.clone(), error.message),
+    };
+
+    // Every failure path reclaims the spawned run before reporting.
+    timeout_cancel.cancel();
+    task_handle.abort();
+    state.fail(response, details);
+    false
 }
 
 async fn replay_subagent_events<Ctx: Send + Sync + 'static>(
@@ -660,10 +635,16 @@ async fn replay_subagent_events<Ctx: Send + Sync + 'static>(
 ) -> Result<()> {
     for envelope in event_store.get_events(thread_id).await? {
         match envelope.event {
-            AgentEvent::Text {
-                message_id: _,
-                text,
-            } => {
+            AgentEvent::Text { message_id, text } => {
+                // Keep only the last assistant message's text. A new message id
+                // means a new assistant message, so reset the accumulator;
+                // multiple text blocks within one message still concatenate.
+                // This honors the documented contract that the parent receives
+                // "only the final text response", not interim commentary.
+                if state.final_response_message_id.as_deref() != Some(message_id.as_str()) {
+                    state.final_response.clear();
+                    state.final_response_message_id = Some(message_id);
+                }
                 state.final_response.push_str(&text);
             }
             AgentEvent::ToolCallStart {
@@ -1914,6 +1895,181 @@ mod tests {
         assert!(!state.success);
         assert_eq!(state.final_response, "subagent boom");
         assert_eq!(state.error_details.as_deref(), Some("subagent boom"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_keeps_only_final_message_text() -> Result<()> {
+        let event_store: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
+        let thread_id = ThreadId::new();
+        let authority = LocalEventAuthority::new();
+
+        // Interim commentary in an early assistant message.
+        event_store
+            .append(
+                &thread_id,
+                1,
+                authority.wrap(AgentEvent::Text {
+                    message_id: "m1".to_string(),
+                    text: "Let me check the repo...".to_string(),
+                }),
+            )
+            .await?;
+        // The final answer in a later message, split across two text blocks.
+        event_store
+            .append(
+                &thread_id,
+                2,
+                authority.wrap(AgentEvent::Text {
+                    message_id: "m2".to_string(),
+                    text: "Final answer ".to_string(),
+                }),
+            )
+            .await?;
+        event_store
+            .append(
+                &thread_id,
+                2,
+                authority.wrap(AgentEvent::Text {
+                    message_id: "m2".to_string(),
+                    text: "part two".to_string(),
+                }),
+            )
+            .await?;
+        event_store
+            .append(
+                &thread_id,
+                2,
+                authority.wrap(AgentEvent::done(
+                    thread_id.clone(),
+                    2,
+                    TokenUsage::default(),
+                    Duration::from_millis(1),
+                )),
+            )
+            .await?;
+
+        let mut state = SubagentExecutionState::new();
+        replay_subagent_events(
+            &event_store,
+            &thread_id,
+            &ToolContext::new(()),
+            &SubagentConfig::new("worker"),
+            "subagent_final",
+            &mut state,
+        )
+        .await?;
+
+        // Interim commentary must not be glued onto the final answer; only the
+        // last assistant message's text is returned.
+        assert_eq!(state.final_response, "Final answer part two");
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_subagent_child_context_increments_depth_and_propagates_semaphore() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let parent = ToolContext::new(())
+            .with_metadata(METADATA_SUBAGENT_DEPTH, json!(2))
+            .with_metadata(METADATA_MAX_SUBAGENT_DEPTH, json!(5))
+            .with_subagent_semaphore(Arc::clone(&semaphore));
+
+        let child = build_subagent_child_context(&parent);
+
+        assert_eq!(
+            child
+                .metadata
+                .get(METADATA_SUBAGENT_DEPTH)
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        // Host-set max-depth carries through unchanged.
+        assert_eq!(
+            child
+                .metadata
+                .get(METADATA_MAX_SUBAGENT_DEPTH)
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        // The shared concurrency semaphore propagates into the child run.
+        assert!(child.subagent_semaphore().is_some());
+    }
+
+    #[test]
+    fn cached_tool_strings_are_interned_per_name() {
+        let a = cached_tool_strings("worker");
+        let b = cached_tool_strings("worker");
+        // The same name reuses a single leaked allocation rather than leaking
+        // afresh on every construction.
+        assert!(std::ptr::eq(a.0, b.0));
+        assert!(std::ptr::eq(a.1, b.1));
+        assert_eq!(a.0, "Subagent: worker");
+
+        let c = cached_tool_strings("a-different-name");
+        assert!(!std::ptr::eq(a.0, c.0));
+    }
+
+    #[tokio::test]
+    async fn test_nested_subagent_depth_limit_propagates() -> Result<()> {
+        use crate::hooks::AllowAllHooks;
+
+        // The inner subagent must never run: the depth guard fires first.
+        let inner = SubagentTool::new(
+            SubagentConfig::new("inner"),
+            Arc::new(TestProvider::new(vec![TestProvider::text_response(
+                "inner ran (should not happen)",
+            )])),
+            Arc::new(ToolRegistry::<()>::new()),
+            || -> Arc<dyn EventStore> { Arc::new(InMemoryEventStore::new()) },
+        );
+        let mut middle_tools = ToolRegistry::new();
+        middle_tools.register(inner);
+
+        // The outer subagent tries to spawn the nested subagent, then finishes.
+        // `AllowAllHooks` auto-approves the Confirm-tier nested spawn so it
+        // actually reaches the depth guard.
+        let outer = SubagentTool::new(
+            SubagentConfig::new("outer"),
+            Arc::new(TestProvider::new(vec![
+                TestProvider::tool_use_response(
+                    "call_inner",
+                    "subagent_inner",
+                    json!({ "task": "go deeper" }),
+                ),
+                TestProvider::text_response("outer done"),
+            ])),
+            Arc::new(middle_tools),
+            || -> Arc<dyn EventStore> { Arc::new(InMemoryEventStore::new()) },
+        )
+        .with_hooks(Arc::new(AllowAllHooks));
+
+        // Cap nesting at depth 1: the outer runs at depth 1, so its nested
+        // spawn (which would be depth 1 >= max 1) must be rejected.
+        let parent_ctx = ToolContext::new(()).with_metadata(METADATA_MAX_SUBAGENT_DEPTH, json!(1));
+
+        let result = outer
+            .execute(&parent_ctx, json!({ "task": "start" }))
+            .await?;
+
+        assert!(result.success, "outer subagent should still complete");
+        assert_eq!(result.output, "outer done");
+
+        let subresult: SubagentResult =
+            serde_json::from_value(result.data.context("missing subagent result data")?)
+                .context("subagent result should deserialize")?;
+        let nested = subresult
+            .tool_logs
+            .iter()
+            .find(|log| log.name == "subagent_inner")
+            .context("missing nested subagent tool log")?;
+        assert!(!nested.success, "nested spawn must be rejected");
+        assert!(
+            nested.result.contains("depth limit"),
+            "nested failure should be the depth-limit error; got: {}",
+            nested.result
+        );
 
         Ok(())
     }

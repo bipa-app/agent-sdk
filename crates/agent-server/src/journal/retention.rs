@@ -71,8 +71,26 @@ pub struct RetentionCursor {
 /// - The floor only moves forward (monotonically increasing).
 /// - A thread with no cursor has an implicit floor of 0 (all events
 ///   retained).
-/// - Advancing the floor and purging events below it must happen
-///   atomically in a single transaction.
+/// - On a durable backend, advancing the floor and physically deleting
+///   the committed events below it MUST happen atomically in a single
+///   transaction, so a remote instance can never replay an event the
+///   floor claims is gone.
+///
+/// # In-memory divergence
+///
+/// [`InMemoryRetentionStore`] is a **cursor-only reference**: it tracks
+/// the floor but does not — and cannot — delete events, because the
+/// committed log lives in a separate
+/// [`EventRepository`](super::event_repository::EventRepository) it
+/// holds no handle to (the trait exposes no delete hook).  Events below
+/// the floor therefore remain physically readable in the in-memory
+/// repository; the floor is a logical watermark the replay path honours
+/// (sub-floor reads yield a `RetentionGap`).  A consequence is that the
+/// in-memory janitor may re-scan a swept thread on later cycles and
+/// [`JanitorCycleReport::events_purged`](super::retention_janitor::JanitorCycleReport::events_purged)
+/// counts floor-advance deltas rather than physical row deletions.
+/// Conformance coverage that asserts sub-floor unreadability belongs to
+/// the durable backends, which honour the atomic delete.
 #[async_trait]
 pub trait RetentionStore: Send + Sync {
     /// Get the retention cursor for a thread.
@@ -83,8 +101,10 @@ pub trait RetentionStore: Send + Sync {
     /// Advance the retention floor for a thread.
     ///
     /// The new floor must be greater than or equal to the current floor.
-    /// In the Postgres backend, this also deletes committed events below
-    /// the new floor in the same transaction.
+    /// On durable backends (Postgres / `SQLite`) this also deletes
+    /// committed events below the new floor in the same transaction.
+    /// The in-memory reference is cursor-only and does not delete (see
+    /// the trait-level "In-memory divergence" note).
     ///
     /// Returns the updated cursor.
     async fn advance_floor(
@@ -117,6 +137,16 @@ struct InMemoryRetentionStoreInner {
 /// In-memory reference implementation of [`RetentionStore`].
 ///
 /// Cloning shares the same underlying state.
+///
+/// **Cursor-only:** [`advance_floor`](InMemoryRetentionStore::advance_floor)
+/// records the new floor but does **not** delete committed events — it
+/// holds no handle to the event repository, and the
+/// [`EventRepository`](super::event_repository::EventRepository) trait
+/// exposes no delete hook.  Events below the floor stay physically
+/// present and the replay path is responsible for refusing to serve
+/// them (via `RetentionGap`).  Durable backends perform the atomic
+/// delete the trait contract describes; this reference deliberately
+/// diverges.  See the [`RetentionStore`] "In-memory divergence" note.
 #[derive(Clone, Default)]
 pub struct InMemoryRetentionStore {
     inner: Arc<RwLock<InMemoryRetentionStoreInner>>,

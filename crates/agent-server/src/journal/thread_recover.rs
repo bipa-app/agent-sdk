@@ -385,10 +385,18 @@ mod tests {
             at: OffsetDateTime,
         ) -> Result<super::super::commit::CommitOutcome> {
             let attempt_id = self.open_attempt(task_id, 1).await?;
+            let expected_turn = self
+                .threads
+                .get(thread_id)
+                .await
+                .context("read committed turns for expected-turn guard")?
+                .map_or(0, |thread| thread.committed_turns)
+                .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
                     thread_id: thread_id.clone(),
                     task_id: task_id.clone(),
+                    expected_turn,
                     turn_attempt_id: attempt_id,
                     close_attempt_params: sample_close_params(),
                     messages,

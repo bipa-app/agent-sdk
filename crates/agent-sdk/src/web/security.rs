@@ -1,7 +1,7 @@
 //! URL validation and SSRF protection.
 
 use anyhow::{Context, Result, bail};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use url::Url;
 
 /// Default blocked hostnames for SSRF protection.
@@ -45,6 +45,24 @@ pub struct UrlValidator {
     max_redirects: usize,
     /// Require HTTPS (default: true).
     require_https: bool,
+}
+
+/// A URL that has passed SSRF validation, together with the exact IP addresses
+/// it resolved to.
+///
+/// The caller must connect to one of [`ValidatedUrl::addresses`] (e.g. by
+/// pinning them via [`reqwest::ClientBuilder::resolve_to_addrs`]) rather than
+/// re-resolving the host. Re-resolving opens a DNS-rebinding TOCTOU hole: the
+/// attacker-controlled record can pass validation here and then rebind to a
+/// blocked address (`169.254.169.254`, `127.0.0.1`, …) before the connection is
+/// made.
+#[derive(Clone, Debug)]
+pub struct ValidatedUrl {
+    /// The validated URL.
+    pub url: Url,
+    /// The vetted socket addresses the host resolved to. Pin these for the
+    /// actual request so the connection targets exactly what was validated.
+    pub addresses: Vec<SocketAddr>,
 }
 
 impl Default for UrlValidator {
@@ -110,7 +128,12 @@ impl UrlValidator {
         self.max_redirects
     }
 
-    /// Validate a URL string.
+    /// Validate a URL string and return it alongside its vetted IP addresses.
+    ///
+    /// DNS resolution runs on the tokio runtime via [`tokio::net::lookup_host`]
+    /// (not the blocking `getaddrinfo` on a worker thread), and the resolved
+    /// addresses are returned so the caller can pin them for the actual request
+    /// — closing the DNS-rebinding TOCTOU window. See [`ValidatedUrl`].
     ///
     /// # Errors
     ///
@@ -121,7 +144,7 @@ impl UrlValidator {
     /// - The host is blocked
     /// - The host resolves to a private/blocked IP
     /// - The domain is not in the allowed list
-    pub fn validate(&self, url_str: &str) -> Result<Url> {
+    pub async fn validate(&self, url_str: &str) -> Result<ValidatedUrl> {
         let url = Url::parse(url_str).context("Invalid URL format")?;
 
         // Check scheme
@@ -155,21 +178,25 @@ impl UrlValidator {
             }
         }
 
-        // Resolve and check IP
-        self.validate_resolved_ip(host)?;
+        // Resolve and check IP — using the URL's real port so the pinned
+        // addresses connect to the right place.
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addresses = self.validate_resolved_ip(host, port).await?;
 
-        Ok(url)
+        Ok(ValidatedUrl { url, addresses })
     }
 
-    /// Validate that the resolved IP addresses are safe.
+    /// Resolve `host` (asynchronously) and verify every resolved IP is safe,
+    /// returning the vetted socket addresses.
     ///
     /// Fails closed: if DNS resolution returns no results (or fails), the host
     /// is blocked to prevent DNS-rebinding attacks that rely on transient lookup
     /// failures.
-    fn validate_resolved_ip(&self, host: &str) -> Result<()> {
-        // Try to resolve the hostname — fail closed on empty/error
-        let addrs: Vec<_> = format!("{host}:80")
-            .to_socket_addrs()
+    async fn validate_resolved_ip(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        // Resolve on the runtime (no blocking getaddrinfo on a worker thread).
+        // `"{host}:{port}"` parses bracketed IPv6 literals correctly too.
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
             .map(Iterator::collect)
             .unwrap_or_default();
 
@@ -177,7 +204,7 @@ impl UrlValidator {
             bail!("Could not resolve host '{host}' — blocking unresolvable URLs for safety");
         }
 
-        for addr in addrs {
+        for addr in &addrs {
             let ip = addr.ip();
             if !self.allow_private_ips && is_private_ip(&ip) {
                 bail!("Access to private IP address {ip} is blocked");
@@ -190,7 +217,7 @@ impl UrlValidator {
             }
         }
 
-        Ok(())
+        Ok(addrs)
     }
 }
 
@@ -281,61 +308,80 @@ const fn is_link_local(ip: &IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_https_url() {
+    #[tokio::test]
+    async fn test_valid_https_url() {
         let validator = UrlValidator::new();
-        assert!(validator.validate("https://example.com").is_ok());
-        assert!(validator.validate("https://example.com/path").is_ok());
+        assert!(validator.validate("https://example.com").await.is_ok());
+        assert!(validator.validate("https://example.com/path").await.is_ok());
     }
 
-    #[test]
-    fn test_http_blocked_by_default() {
+    #[tokio::test]
+    async fn test_validate_returns_vetted_addresses() -> Result<()> {
+        // The validated result must carry the resolved addresses so the caller
+        // can pin them and avoid a re-resolution (DNS-rebinding) window.
         let validator = UrlValidator::new();
-        let result = validator.validate("http://example.com");
+        let validated = validator
+            .validate("https://example.com")
+            .await
+            .context("example.com should validate")?;
+        assert!(
+            !validated.addresses.is_empty(),
+            "validation must return the vetted IP addresses for pinning"
+        );
+        // The port carried in the pinned addresses must be the URL's port.
+        assert!(validated.addresses.iter().all(|a| a.port() == 443));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http_blocked_by_default() {
+        let validator = UrlValidator::new();
+        let result = validator.validate("http://example.com").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("HTTPS required"));
     }
 
-    #[test]
-    fn test_http_allowed_with_flag() {
+    #[tokio::test]
+    async fn test_http_allowed_with_flag() {
         let validator = UrlValidator::new().with_allow_http();
-        assert!(validator.validate("http://example.com").is_ok());
+        assert!(validator.validate("http://example.com").await.is_ok());
     }
 
-    #[test]
-    fn test_localhost_blocked() {
+    #[tokio::test]
+    async fn test_localhost_blocked() {
         let validator = UrlValidator::new().with_allow_http();
-        assert!(validator.validate("http://localhost").is_err());
-        assert!(validator.validate("http://127.0.0.1").is_err());
-        assert!(validator.validate("http://[::1]").is_err());
+        assert!(validator.validate("http://localhost").await.is_err());
+        assert!(validator.validate("http://127.0.0.1").await.is_err());
+        assert!(validator.validate("http://[::1]").await.is_err());
     }
 
-    #[test]
-    fn test_metadata_endpoints_blocked() {
+    #[tokio::test]
+    async fn test_metadata_endpoints_blocked() {
         let validator = UrlValidator::new().with_allow_http();
-        assert!(validator.validate("http://169.254.169.254").is_err());
+        assert!(validator.validate("http://169.254.169.254").await.is_err());
         assert!(
             validator
                 .validate("http://metadata.google.internal")
+                .await
                 .is_err()
         );
     }
 
-    #[test]
-    fn test_invalid_url() {
+    #[tokio::test]
+    async fn test_invalid_url() {
         let validator = UrlValidator::new();
-        assert!(validator.validate("not-a-url").is_err());
-        assert!(validator.validate("").is_err());
-        assert!(validator.validate("ftp://example.com").is_err());
+        assert!(validator.validate("not-a-url").await.is_err());
+        assert!(validator.validate("").await.is_err());
+        assert!(validator.validate("ftp://example.com").await.is_err());
     }
 
-    #[test]
-    fn test_allowed_domains() {
+    #[tokio::test]
+    async fn test_allowed_domains() {
         let validator = UrlValidator::new().with_allowed_domains(vec!["example.com".to_string()]);
 
-        assert!(validator.validate("https://example.com").is_ok());
+        assert!(validator.validate("https://example.com").await.is_ok());
 
-        let result = validator.validate("https://other.com");
+        let result = validator.validate("https://other.com").await;
         assert!(result.is_err());
         assert!(
             result
@@ -345,11 +391,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_blocked_hosts() {
+    #[tokio::test]
+    async fn test_blocked_hosts() {
         let validator = UrlValidator::new().with_blocked_hosts(vec!["blocked.com".to_string()]);
 
-        let result = validator.validate("https://blocked.com");
+        let result = validator.validate("https://blocked.com").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("blocked"));
     }
@@ -385,10 +431,12 @@ mod tests {
         assert_eq!(validator.max_redirects, 3);
     }
 
-    #[test]
-    fn test_unresolvable_host_blocked() {
+    #[tokio::test]
+    async fn test_unresolvable_host_blocked() {
         let validator = UrlValidator::new();
-        let result = validator.validate("https://this-domain-does-not-exist-xyz123.example");
+        let result = validator
+            .validate("https://this-domain-does-not-exist-xyz123.example")
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(

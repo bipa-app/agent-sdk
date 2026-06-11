@@ -41,7 +41,45 @@ use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+/// Process-wide monotonic counter for generating question correlation ids.
+static QUESTION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique correlation id for an outgoing question.
+fn next_request_id() -> String {
+    let seq = QUESTION_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("ask-{seq}")
+}
+
+/// Receive the response matching `request_id`, discarding stale answers (e.g.
+/// late replies to a previously cancelled question). Returns `None` if the run
+/// is cancelled before a matching answer arrives.
+async fn await_matching_response(
+    rx: &mut mpsc::Receiver<QuestionResponse>,
+    request_id: &str,
+    cancel_token: &CancellationToken,
+) -> Result<Option<QuestionResponse>> {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel_token.cancelled() => return Ok(None),
+            received = rx.recv() => {
+                let response = received
+                    .context("Failed to receive answer from UI - channel closed")?;
+                // Accept the matching answer. An empty id comes from a legacy
+                // UI that does not echo correlation ids, so accept it rather
+                // than hang. Any other non-matching id is a stale answer to a
+                // different (cancelled) question — discard it and keep waiting.
+                if response.request_id.is_empty() || response.request_id == request_id {
+                    return Ok(Some(response));
+                }
+            }
+        }
+    }
+}
 
 /// Request for user confirmation of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +143,15 @@ pub enum ConfirmationResponse {
 /// Request for user to answer a question from the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionRequest {
+    /// Correlation id assigned by the tool when the question is dispatched.
+    ///
+    /// The UI must echo this value back on the matching [`QuestionResponse`] so
+    /// answers can be paired to their question even when multiple questions are
+    /// in flight or an earlier question was cancelled. An empty value means the
+    /// request has not been dispatched yet (or a legacy UI that does not echo).
+    #[serde(default)]
+    pub request_id: String,
+
     /// The question text to display.
     pub question: String,
 
@@ -124,6 +171,7 @@ impl QuestionRequest {
     #[must_use]
     pub fn new(question: impl Into<String>) -> Self {
         Self {
+            request_id: String::new(),
             question: question.into(),
             header: None,
             options: Vec::new(),
@@ -135,6 +183,7 @@ impl QuestionRequest {
     #[must_use]
     pub fn with_options(question: impl Into<String>, options: Vec<QuestionOption>) -> Self {
         Self {
+            request_id: String::new(),
             question: question.into(),
             header: None,
             options,
@@ -190,6 +239,15 @@ impl QuestionOption {
 /// Response to a question request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResponse {
+    /// Correlation id copied from the [`QuestionRequest`] this answers.
+    ///
+    /// The tool discards responses whose id does not match the question it is
+    /// currently awaiting (e.g. a late answer to a cancelled question). An
+    /// empty value is accepted for backward compatibility with UIs that do not
+    /// echo the id.
+    #[serde(default)]
+    pub request_id: String,
+
     /// The user's answer (text or selected option labels).
     pub answer: String,
 
@@ -202,6 +260,7 @@ impl QuestionResponse {
     #[must_use]
     pub fn success(answer: impl Into<String>) -> Self {
         Self {
+            request_id: String::new(),
             answer: answer.into(),
             cancelled: false,
         }
@@ -211,9 +270,17 @@ impl QuestionResponse {
     #[must_use]
     pub const fn cancelled() -> Self {
         Self {
+            request_id: String::new(),
             answer: String::new(),
             cancelled: true,
         }
+    }
+
+    /// Sets the correlation id that pairs this response to its question.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = request_id.into();
+        self
     }
 }
 
@@ -359,13 +426,16 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
         ToolTier::Observe
     }
 
-    async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         // Parse input
         let input: AskUserInput =
             serde_json::from_value(input).context("Invalid input for ask_user tool")?;
 
-        // Build request
+        // Build request with a fresh correlation id so its answer can be paired
+        // back even if other questions are in flight or this one is cancelled.
+        let request_id = next_request_id();
         let request = QuestionRequest {
+            request_id: request_id.clone(),
             question: input.question.clone(),
             header: input.header,
             options: input
@@ -379,29 +449,35 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
             multi_select: input.multi_select,
         };
 
-        // Send question to UI
-        self.question_tx
-            .send(request)
-            .await
-            .context("Failed to send question to UI - channel closed")?;
+        // A fresh token never fires, so questions without a configured cancel
+        // token simply wait for the answer.
+        let cancel_token = ctx.cancel_token().unwrap_or_default();
 
-        // Wait for response
+        // Hold the receiver lock across send+recv so concurrent `ask_user`
+        // calls are serialized: only one question is outstanding at a time and
+        // its answer cannot be consumed by a sibling call.
         let response = {
             let mut rx = self.question_rx.lock().await;
-            rx.recv()
+
+            self.question_tx
+                .send(request)
                 .await
-                .context("Failed to receive answer from UI - channel closed")?
+                .context("Failed to send question to UI - channel closed")?;
+
+            await_matching_response(&mut rx, &request_id, &cancel_token).await?
         };
 
-        if response.cancelled {
-            Ok(ToolResult::error(
+        match response {
+            Some(response) if response.cancelled => Ok(ToolResult::error(
                 "User cancelled the question without providing an answer.",
-            ))
-        } else {
-            Ok(ToolResult::success(format!(
+            )),
+            Some(response) => Ok(ToolResult::success(format!(
                 "User answered: {}",
                 response.answer
-            )))
+            ))),
+            None => Ok(ToolResult::error(
+                "Question cancelled before the user answered.",
+            )),
         }
     }
 }
@@ -580,5 +656,69 @@ mod tests {
         handle.await.unwrap();
         assert!(!result.success);
         assert!(result.output.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_user_discards_stale_response() -> Result<()> {
+        let (tool, mut request_rx, response_tx) = AskUserQuestionTool::with_channels(10);
+
+        // A late answer to a previously cancelled question is already queued
+        // when the next question is asked.
+        response_tx
+            .send(QuestionResponse::success("STALE").with_request_id("stale-request"))
+            .await
+            .ok()
+            .context("seed stale response")?;
+
+        let responder = response_tx.clone();
+        let handle = tokio::spawn(async move {
+            let request = request_rx.recv().await.context("no question received")?;
+            // Echo the live correlation id so the tool accepts this answer.
+            responder
+                .send(QuestionResponse::success("CORRECT").with_request_id(request.request_id))
+                .await
+                .ok()
+                .context("send live response")?;
+            anyhow::Ok(())
+        });
+
+        let ctx = ToolContext::new(());
+        let result = tool
+            .execute(&ctx, json!({ "question": "Which one?" }))
+            .await?;
+
+        handle.await.context("responder task panicked")??;
+
+        assert!(result.success);
+        assert!(result.output.contains("CORRECT"), "got: {}", result.output);
+        assert!(
+            !result.output.contains("STALE"),
+            "stale answer must be discarded: {}",
+            result.output
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ask_user_returns_on_cancel() -> Result<()> {
+        // Keep the channel endpoints alive so the question send succeeds even
+        // though no UI ever answers.
+        let (tool, _request_rx, _response_tx) = AskUserQuestionTool::with_channels(10);
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let ctx = ToolContext::new(()).with_cancel_token(token);
+
+        let result = tool
+            .execute(&ctx, json!({ "question": "Hang forever?" }))
+            .await?;
+
+        assert!(!result.success);
+        assert!(
+            result.output.to_lowercase().contains("cancel"),
+            "got: {}",
+            result.output
+        );
+        Ok(())
     }
 }

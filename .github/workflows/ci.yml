@@ -107,8 +107,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+      # Prebuilt sqlx-cli binary (matching nextest / cargo-deny / cargo-audit),
+      # instead of `cargo install sqlx-cli` which rebuilds from source on every
+      # run (rust-cache does not cache ~/.cargo/bin). The standard binary
+      # supports both the Postgres and SQLite backends used in the checks below.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
       # Migration check: apply the Postgres migrations against the live
       # service DB and ensure they're a no-op on re-run (idempotent).
       # SQLX_OFFLINE=false so sqlx talks to the real DB. This is the CI
@@ -122,18 +127,43 @@ jobs:
         run: |
           cargo sqlx migrate run --source crates/agent-service-host/migrations/postgres
           cargo sqlx migrate run --source crates/agent-service-host/migrations/postgres
+      # Validate the committed .sqlx offline cache so a stale entry (same SQL
+      # text, changed column type after a migration) fails CI instead of only
+      # blowing up at runtime. `--check` regenerates query metadata against the
+      # live DB and exits non-zero if it differs from what is committed.
+      # This mirrors `scripts/postgres18-dev.sh prepare` (Postgres) and
+      # `scripts/sqlite-dev.sh prepare` (SQLite), in check-only mode.
+      - name: Verify Postgres .sqlx cache is current
+        env:
+          SQLX_OFFLINE: "false"
+        run: >-
+          cargo sqlx prepare --check --workspace
+          -- -p agent-service-host --all-targets
+      - name: Verify SQLite .sqlx cache is current
+        env:
+          SQLX_OFFLINE: "false"
+          DATABASE_URL: "sqlite:${{ github.workspace }}/target/sqlx-sqlite-ci.db?mode=rwc"
+        run: |
+          cargo sqlx migrate run --source crates/agent-service-host/migrations/sqlite
+          cargo sqlx prepare --check --workspace \
+            -- -p agent-service-host --no-default-features --features sqlite --all-targets
       # Run the previously-skipped Postgres tests against the live DB. With
       # TEST_DATABASE_URL set, the store tests exercise real FOR UPDATE /
       # SKIP LOCKED / txn-atomicity paths, and `--run-ignored all` also runs
       # the `#[ignore = "requires TEST_DATABASE_URL"]` host integration tests.
       # `otel` is required because the host integration test files are
       # `#![cfg(feature = "otel")]`-gated; without it they compile out and
-      # the ignored DB tests would silently not exist. The `db` nextest
-      # test-group serializes these so they don't race on the shared DB.
+      # the ignored DB tests would silently not exist. `failpoints` compiles
+      # in the `fail-rs` crash-injection points so the Postgres crash-recovery
+      # test (`postgres_crash_replays_idempotently_after_reopen`, gated on
+      # `cfg(all(feature = "postgres", feature = "failpoints"))`) actually runs
+      # — without it that test silently compiles out. The `db` and `failpoints`
+      # nextest test-groups serialize these so they don't race on the shared DB
+      # or the process-global `fail-rs` registry.
       - name: Run Postgres-backed tests
         run: >-
           cargo nextest run --profile ci -p agent-service-host
-          --features postgres,otel --run-ignored all
+          --features postgres,otel,failpoints --run-ignored all
 
   clippy:
     name: Clippy
@@ -208,6 +238,62 @@ jobs:
       - run: cargo check -p ${{ matrix.crate }} ${{ matrix.features }}
 
   # ───────────────────────────────────────────────────────────────────
+  # Host feature matrix — agent-service-host backend combos.
+  #
+  # The main `check` job builds `--all-features`, which always co-enables
+  # `postgres`. The single-backend combos a real deployment (or
+  # `scripts/sqlite-dev.sh prepare`) actually builds are never type-checked
+  # there: `--no-default-features --features sqlite` (SQLite-only, no
+  # postgres) and `--no-default-features --features postgres` (no amqp).
+  # Both compile offline against the committed `.sqlx` cache, so no service
+  # container is needed. Keep the list in sync with the `[features]` section
+  # of `crates/agent-service-host/Cargo.toml`.
+  host-feature-matrix:
+    name: Host feature matrix (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features sqlite"
+          - "--no-default-features --features postgres"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p agent-service-host --all-targets ${{ matrix.features }}
+
+  # ───────────────────────────────────────────────────────────────────
+  # Loom concurrency models — exhaustive interleaving check for the durable
+  # journal's lock-free hot spots (agent-server-loom/tests/loom_models.rs).
+  #
+  # The whole suite is gated behind `#![cfg(loom)]` and only compiles/runs
+  # under `RUSTFLAGS="--cfg loom"`, which no other job sets — so without this
+  # job the models silently bit-rot (plain `cargo check`/`test` compiles them
+  # away). A cheap `--no-run` compile check runs on every push/PR to prevent
+  # rot; the full (expensive) model run is reserved for the nightly cron and
+  # manual dispatch.
+  loom:
+    name: Loom models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Always: compile the models under --cfg loom so they cannot rot.
+      - name: Compile loom models (--cfg loom)
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test -p agent-server-loom --test loom_models --no-run
+      # Nightly / on-demand: run the full exhaustive model check.
+      - name: Run loom models
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          RUSTFLAGS: "--cfg loom"
+          LOOM_MAX_PREEMPTIONS: "3"
+        run: cargo test -p agent-server-loom --test loom_models
+
+  # ───────────────────────────────────────────────────────────────────
   # Tier-C provider live smoke — NIGHTLY / SECRETS ONLY.
   #
   # This is the *only* job that uses real provider API keys. It is gated
@@ -216,10 +302,20 @@ jobs:
   # job above already runs Tier-A unit + Tier-B deterministic wiremock
   # integration with no keys / no live network).
   #
-  # Each provider gets one round-trip: a streamed turn, a non-streaming
-  # completion, and a tool call. Tests are doubly guarded: `#[ignore]`
-  # plus an `AGENT_SDK_LIVE_SMOKE=1` env check, so a missing key makes
-  # them a clean no-op rather than a failure.
+  # COVERAGE CAVEAT: today the only Tier-C test is Anthropic-specific
+  # (`tier_c_live_completion_and_stream_and_tool` in
+  # `crates/agent-sdk-providers/tests/provider_tiers.rs`), and the Tier-B
+  # wiremock cassettes (`tests/cassettes/`) cover Anthropic only. OpenAI,
+  # Responses/Codex, Gemini, Vertex, and Cloudflare have NO live or
+  # wiremock integration tests yet. The extra provider secrets below are
+  # wired as forward-looking scaffolding so that adding per-provider
+  # Tier-C tests needs no workflow change — but until those tests land,
+  # only Anthropic actually round-trips here. Extending the Tier-B
+  # harness + adding per-provider Tier-C tests is a tracked follow-up.
+  #
+  # Tests are doubly guarded: `#[ignore]` plus an `AGENT_SDK_LIVE_SMOKE=1`
+  # env check, so a missing key makes them a clean no-op rather than a
+  # failure.
   live-smoke:
     name: Provider live smoke (Tier C)
     runs-on: ubuntu-latest
@@ -227,11 +323,26 @@ jobs:
     env:
       AGENT_SDK_LIVE_SMOKE: "1"
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Scaffolding for the per-provider Tier-C tests (not yet written —
+      # see the coverage caveat above). Inert until those tests read them.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # Make silent no-ops visible: print which provider keys are present
+      # so a missing secret shows up in the run log instead of a quiet skip.
+      - name: Report which provider keys are available
+        run: |
+          echo "Provider key availability for this Tier-C run:"
+          echo "  anthropic  : ${ANTHROPIC_API_KEY:+present}"
+          echo "  openai     : ${OPENAI_API_KEY:+present}"
+          echo "  gemini     : ${GEMINI_API_KEY:+present}"
+          echo "  cloudflare : ${CLOUDFLARE_API_KEY:+present}"
+          echo "(empty = secret not set; that provider's Tier-C tests no-op)"
       # `--run-ignored all` opts the Tier-C tests in; they still no-op
       # for any provider whose key secret is absent.
       - name: Run Tier-C live smoke

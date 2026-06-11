@@ -17,6 +17,16 @@ agent-sdk-providers = { workspace = true }
 # LlmContextCompactor}` so the daemon worker can run auto-compaction
 # (proactive threshold trigger + post-failure overflow recovery) without
 # duplicating the in-process loop's compactor implementation.
+#
+# LAYERING FOLLOW-UP (deferred — large refactor): this crate documents itself as
+# "built on the narrow SDK crates ... rather than the public-facing façade", yet
+# depending on `agent-sdk` (with default features) inverts that boundary and
+# forces the in-process loop + primitive tools + subagent code into the
+# provider-agnostic server engine and host. The fix is to move the `context`
+# compactor/config/estimator (and the `loop_instrument` span helpers under
+# `otel`) into `agent-sdk-providers` or a new narrow crate and re-export from the
+# façade, then drop this dependency. Tracked separately; out of scope for the
+# docs/CI sweep.
 agent-sdk = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

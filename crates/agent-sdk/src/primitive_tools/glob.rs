@@ -22,7 +22,9 @@ impl<E: Environment> GlobTool<E> {
 
 #[derive(Debug, Deserialize)]
 struct GlobInput {
-    /// Glob pattern to match files (e.g., "**/*.rs", "src/*.ts")
+    /// Glob pattern to match files (e.g., "**/*.rs", "src/*.ts").
+    /// Relative patterns are resolved against `path` (or the environment root);
+    /// an absolute pattern (starting with `/`) is used as-is.
     pattern: String,
     /// Optional directory to search in (defaults to environment root)
     #[serde(default)]
@@ -54,7 +56,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern to match files (e.g., '**/*.rs', 'src/**/*.ts')"
+                    "description": "Glob pattern to match files (e.g., '**/*.rs', 'src/**/*.ts'). Relative to 'path' (or the environment root); an absolute pattern starting with '/' is used as-is. Must not contain '..' segments."
                 },
                 "path": {
                     "type": "string",
@@ -66,17 +68,37 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
-        let input: GlobInput =
-            serde_json::from_value(input).context("Invalid input for glob tool")?;
+        let input: GlobInput = GlobInput::deserialize(&input)
+            .with_context(|| format!("Invalid input for glob tool: {input}"))?;
 
-        // Build the full pattern. The base directory is a literal filesystem
-        // path, but `glob` uses `/` as its separator on every platform and
-        // treats `\` as an escape character — so a Windows base such as
-        // `C:\Users\…` would be parsed as escape sequences. Normalise the
-        // base's separators to `/` before joining (a no-op on Unix, where the
-        // base never contains a backslash); the user's `pattern` is left as-is
-        // so its glob metacharacters keep their meaning.
-        let pattern = if let Some(ref base_path) = input.path {
+        // The raw pattern is concatenated onto the (normalized) base and passed
+        // straight to `Environment::glob`, so `..` segments could escape the
+        // search root in a custom Environment that does not re-normalize. Reject
+        // them up front rather than relying solely on the per-result filter.
+        if pattern_has_parent_segment(&input.pattern) {
+            return Ok(ToolResult::error(
+                "pattern must not contain '..' path segments; use the 'path' parameter to choose a search directory",
+            ));
+        }
+
+        // Build the full pattern.
+        //
+        // - An absolute pattern (leading `/`) is used as-is; each result is
+        //   still gated by the per-path `check_read` filter below.
+        // - A relative pattern is joined onto the resolved base. The base is a
+        //   literal filesystem path, but `glob` uses `/` as its separator on
+        //   every platform and treats `\` as an escape character — so a Windows
+        //   base such as `C:\Users\…` would be parsed as escape sequences.
+        //   Normalise the base's separators to `/` before joining (a no-op on
+        //   Unix); the user's `pattern` is left as-is so its glob
+        //   metacharacters keep their meaning.
+        //
+        // NOTE: `Environment::glob`/`grep` implementations MUST enforce read
+        // permissions per traversed path; the root-only capability check plus
+        // the per-result filter here are defense-in-depth, not a substitute.
+        let pattern = if input.pattern.starts_with('/') {
+            input.pattern.clone()
+        } else if let Some(ref base_path) = input.path {
             let base = self
                 .ctx
                 .environment
@@ -100,13 +122,17 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
             )));
         }
 
-        // Execute glob
-        let matches = self
-            .ctx
-            .environment
-            .glob(&pattern)
-            .await
-            .context("Failed to execute glob")?;
+        // Execute glob. A malformed pattern is the model's own input, so report
+        // it as a correctable tool error rather than an infrastructure failure.
+        let matches = match self.ctx.environment.glob(&pattern).await {
+            Ok(matches) => matches,
+            Err(err) => {
+                return Ok(ToolResult::error(format!(
+                    "Invalid glob pattern '{}': {err:#}",
+                    input.pattern
+                )));
+            }
+        };
 
         // Filter out files that the agent can't read
         let accessible_matches: Vec<_> = matches
@@ -133,6 +159,11 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GlobToo
 
         Ok(ToolResult::success(output))
     }
+}
+
+/// Returns true if any `/`-separated component of the pattern is exactly `..`.
+fn pattern_has_parent_segment(pattern: &str) -> bool {
+    pattern.split('/').any(|segment| segment == "..")
 }
 
 #[cfg(test)]
@@ -360,6 +391,59 @@ mod tests {
         // Missing required pattern field
         let result = tool.execute(&tool_ctx(), json!({})).await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_absolute_pattern() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+        fs.write_file("src/lib.rs", "pub mod foo;").await?;
+        fs.write_file("README.md", "# README").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        // An absolute pattern must NOT be re-joined onto the root (which would
+        // produce '/workspace//workspace/src/*.rs' and match nothing).
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "/workspace/src/*.rs"}))
+            .await?;
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 2 files"));
+        assert!(result.output.contains("main.rs"));
+        assert!(result.output.contains("lib.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_rejects_parent_segment() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "../*.rs"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains(".."));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_invalid_pattern() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/main.rs", "fn main() {}").await?;
+
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        // An unbalanced char class is invalid; the model should get a
+        // correctable tool error, not an infrastructure failure.
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "[unclosed"}))
+            .await?;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Invalid glob pattern"));
         Ok(())
     }
 

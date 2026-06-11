@@ -36,6 +36,7 @@ use agent_server::journal::event_outbox_transaction::{
 };
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
+use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::message::MessageProjection;
 use agent_server::journal::message_store::MessageProjectionStore;
@@ -1448,6 +1449,22 @@ WHERE parent_id = $1
         error_prefix: &str,
     ) -> Result<()> {
         let Some(parent_id) = &child.parent_id else {
+            // Parentless terminal row. A child-thread root turn has no
+            // `parent_id` but is logically linked to a parent-thread
+            // `Subagent` invocation via
+            // `state.subagent_invocation.child_root_task_id`. Mirror the
+            // in-memory store and `apply_task_terminal_transition_tx`:
+            // wake that invocation so a fail-closed child root (e.g. a
+            // recovery sweep / lease-expiry fail-close) does not leave
+            // the parent stuck in `WaitingOnChildren` forever (a durable
+            // liveness deadlock on the very crash-recovery path the
+            // durable backend exists for). Also promote this thread's
+            // next queued root in the same transaction so a sweep-failed
+            // root never strands its queued successors.
+            if child.kind == TaskKind::RootTurn && child.is_root() {
+                Self::resume_linked_subagent_invocation_tx(tx, &child.id, now).await?;
+                Self::promote_next_queued_root_tx(tx, &child.thread_id, now).await?;
+            }
             return Ok(());
         };
         let old_parent = Self::load_task_tx(tx, parent_id, true)
@@ -1543,7 +1560,14 @@ WHERE parent_id = $1
             // thread completes, `execute_subagent_task` never runs,
             // and the parent thread's `SubagentProgress { completed:
             // true }` event never fires.
-            Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?
+            let resumed =
+                Self::resume_linked_subagent_invocation_tx(tx, &new_child.id, now).await?;
+            // Crash-safe queued-root promotion: a terminal root frees the
+            // thread's active-root slot, so promote the FIFO head in the
+            // SAME transaction rather than relying solely on the host's
+            // post-commit promotion (which a crash could skip).
+            Self::promote_next_queued_root_tx(tx, &new_child.thread_id, now).await?;
+            resumed
         } else {
             None
         };
@@ -1629,11 +1653,42 @@ FOR UPDATE SKIP LOCKED
         Ok(Some(new_invocation))
     }
 
-    async fn load_subtree_tx(
+    /// Promote the FIFO head of `thread_id`'s queued-root list to
+    /// `Pending` inside `tx`, if the thread has no blocking root, and
+    /// emit the promoted root's durable `task_wakeup` advisory outbox row
+    /// (Phase 10 · D — a cross-process worker is nudged even after host
+    /// death).
+    ///
+    /// Shared by [`AgentTaskStore::promote_next_queued_root`] and every
+    /// in-transaction root-turn terminal path (terminal CAS, recovery
+    /// fail-close, cancel) so a queued root is never stranded behind a
+    /// root that reached a terminal state without the host's post-commit
+    /// promotion firing.
+    async fn promote_next_queued_root_tx(
         tx: &mut Transaction<'_, Postgres>,
-        root_id: &AgentTaskId,
-    ) -> Result<Vec<AgentTask>> {
-        let records = sqlx::query_as!(
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let blocking_root = sqlx::query_scalar!(
+            r"
+SELECT id
+FROM agent_sdk_tasks
+WHERE thread_id = $1
+  AND kind = 'root_turn'
+  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
+LIMIT 1
+FOR UPDATE
+",
+            thread_key(thread_id),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("check blocking root for {thread_id}"))?;
+        if blocking_root.is_some() {
+            return Ok(None);
+        }
+
+        let queued = sqlx::query_as!(
             TaskRecord,
             r"
 SELECT
@@ -1662,16 +1717,94 @@ SELECT
     updated_at,
     completed_at
 FROM agent_sdk_tasks
-WHERE root_id = $1
-ORDER BY depth, created_at, id
+WHERE thread_id = $1
+  AND kind = 'root_turn'
+  AND status = 'queued'
+ORDER BY created_at, id
+LIMIT 1
 FOR UPDATE
 ",
-            root_id.as_str(),
+            thread_key(thread_id),
         )
-        .fetch_all(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
-        .with_context(|| format!("load subtree rooted at {root_id}"))?;
-        records.into_iter().map(TryInto::try_into).collect()
+        .with_context(|| format!("load queue head for {thread_id}"))?;
+        let Some(queued) = queued else {
+            return Ok(None);
+        };
+        let queued = AgentTask::try_from(queued)?;
+        let promoted = queued
+            .clone()
+            .promote_to_pending(now)
+            .context("promote rejected: promotion transition failed")?;
+        Self::update_task_tx(tx, &promoted).await?;
+
+        // The promoted root is now runnable — emit its durable wakeup in
+        // the same transaction so the promotion survives host death.
+        Self::insert_task_wakeup_outbox_row_tx(
+            tx,
+            &promoted.id,
+            &promoted.thread_id,
+            TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS,
+            now,
+        )
+        .await?;
+        Ok(Some(promoted))
+    }
+
+    /// Collect `start_id` plus every descendant, mirroring the in-memory
+    /// `collect_subtree`: a children-BFS (following `parent_id`) that also
+    /// follows `SubagentInvocation` linkage across thread boundaries.
+    ///
+    /// Unlike a `root_id = $1` scan, this walks from the *given* id, so a
+    /// mid-tree task id cancels its own subtree (matching the in-memory
+    /// reference store) instead of silently no-opping.
+    ///
+    /// Reads are **non-locking** (no `FOR UPDATE`): the cancel path takes
+    /// its per-row locks at `UPDATE` time in a deterministic deepest-first
+    /// order, so it acquires child locks before parent locks — the same
+    /// order as the `complete_task` / `fail_task` terminal paths. That
+    /// consistent ordering removes the lock-order inversion that could
+    /// deadlock (Postgres SQLSTATE 40P01) a concurrent
+    /// `cancel_tree(root)` + `complete_task(child)`.
+    async fn collect_subtree_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        start_id: &AgentTaskId,
+    ) -> Result<Vec<AgentTask>> {
+        use std::collections::{BTreeSet, VecDeque};
+        let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
+        let mut out: Vec<AgentTask> = Vec::new();
+        let mut frontier: VecDeque<AgentTaskId> = VecDeque::new();
+        frontier.push_back(start_id.clone());
+        while let Some(id) = frontier.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(task) = Self::load_task_tx(tx, &id, false).await? else {
+                continue;
+            };
+            if let Some(invocation) = task.state.subagent_invocation() {
+                let child_root = invocation.child_root_task_id.clone();
+                if !visited.contains(&child_root) {
+                    frontier.push_back(child_root);
+                }
+            }
+            let child_ids = sqlx::query_scalar!(
+                "SELECT id FROM agent_sdk_tasks WHERE parent_id = $1 ORDER BY created_at, id",
+                id.as_str(),
+            )
+            .fetch_all(&mut **tx)
+            .await
+            .with_context(|| format!("load children of {id}"))?;
+            for child in child_ids {
+                let child_id = AgentTaskId::from_string(child);
+                if !visited.contains(&child_id) {
+                    frontier.push_back(child_id);
+                }
+            }
+            out.push(task);
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -1682,6 +1815,86 @@ FOR UPDATE
     ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params, fail_after)
             .await
+    }
+
+    /// Atomic fork transaction for Postgres (mirror of
+    /// `SqliteDurableStore::commit_fork_atomic_inner`).
+    ///
+    /// Wraps the entire fork write set (thread aggregate bootstrap +
+    /// `committed_turns` mirroring + projection rewrite + checkpoint
+    /// insert + event re-commit) inside one transaction. A crash or
+    /// rolled-back transaction leaves the destination thread in the
+    /// not-created state — never partially-built — so the gRPC handler's
+    /// idempotency replay can safely retry under the same `request_id`
+    /// without seeing a half-finished fork (which would otherwise inflate
+    /// `committed_turns` / `total_usage` on replay or hit a checkpoint
+    /// uniqueness conflict).
+    async fn commit_fork_atomic_inner(&self, params: ForkCommitParams) -> Result<()> {
+        let mut tx = self.begin().await?;
+
+        // 1. Bootstrap the destination thread aggregate, exactly as
+        //    `CreateThread` / `commit_completed_turn` would.
+        Self::bootstrap_thread_row_tx(&mut tx, &params.new_thread_id, params.now).await?;
+
+        // 2. Mirror `committed_turns` by repeatedly applying
+        //    `Thread::apply_committed_turn`. Only the final iteration
+        //    carries the full `cumulative_total_usage` so the
+        //    destination lands at exactly the source's snapshot total.
+        let mut thread_row = Self::lock_thread_tx(&mut tx, &params.new_thread_id)
+            .await?
+            .context("forked thread row missing after bootstrap")?;
+        if params.committed_turns > 0 {
+            let zero = TokenUsage::default();
+            for turn_index in 0..params.committed_turns {
+                let usage_for_this_turn = if turn_index + 1 == params.committed_turns {
+                    &params.cumulative_total_usage
+                } else {
+                    &zero
+                };
+                thread_row = thread_row
+                    .apply_committed_turn(usage_for_this_turn, params.now)
+                    .context(
+                        "advancing forked thread aggregate inside postgres fork transaction",
+                    )?;
+            }
+            Self::upsert_thread_tx(&mut tx, &thread_row).await?;
+        }
+
+        // 3. Seed the projection via `replace_history` so the bumped
+        //    `version` is consistent with `recover_thread`'s expectations.
+        if !params.messages.is_empty() {
+            let projection_before =
+                Self::lock_message_head_tx(&mut tx, &params.new_thread_id, params.now).await?;
+            let updated_projection =
+                MessageProjection::replace_history(projection_before, params.messages, params.now);
+            Self::upsert_message_head_tx(&mut tx, &updated_projection).await?;
+        }
+
+        // 4. Mirror the source's checkpoint at the fork-point turn.
+        if let Some(checkpoint_params) = params.checkpoint {
+            let checkpoint =
+                Checkpoint::new(checkpoint_params).context("constructing forked checkpoint")?;
+            Self::insert_checkpoint_tx(&mut tx, &checkpoint).await?;
+        }
+
+        // 5. Re-commit events under the new thread id with fresh
+        //    sequences (a freshly-bootstrapped thread starts at 0).
+        if !params.events.is_empty() {
+            let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
+            Self::insert_events_tx(
+                &mut tx,
+                &params.new_thread_id,
+                params.events,
+                start_seq,
+                params.now,
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .context("commit postgres fork transaction")?;
+        Ok(())
     }
 
     async fn commit_completed_turn_atomic_inner(
@@ -1704,6 +1917,18 @@ FOR UPDATE
         let old_thread = Self::lock_thread_tx(&mut tx, &params.thread_id)
             .await?
             .context("thread missing after bootstrap")?;
+        // Stale turn double-commit guard. The thread row is locked
+        // FOR UPDATE; assert it is still positioned to produce
+        // `expected_turn` before incrementing. A stale-lease worker that
+        // lost the race to another worker fails here instead of durably
+        // double-committing the turn (pure in-Rust comparison on the
+        // already-locked row — no extra query).
+        ensure!(
+            old_thread.committed_turns.saturating_add(1) == params.expected_turn,
+            "stale turn commit: expected {}, thread at {}",
+            params.expected_turn,
+            old_thread.committed_turns,
+        );
         let thread = old_thread
             .apply_committed_turn(&params.turn_usage, params.now)
             .context("advance thread aggregate inside postgres completed-turn transaction")?;
@@ -2130,18 +2355,44 @@ SELECT EXISTS (
         kind: IdempotencyKind,
         fingerprint: &[u8],
     ) -> Result<IdempotencyClaim> {
-        let existing = sqlx::query!(
+        // Atomic reservation: insert a placeholder (`result_json = JSON
+        // null`) if absent. `RETURNING` yields a row only when *this*
+        // statement inserted, so a non-empty result means we won the
+        // claim and a concurrent retry cannot also observe `Fresh`.
+        let inserted = sqlx::query!(
+            r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
+               VALUES ($1, $2, $3, 'null'::jsonb, $4)
+               ON CONFLICT (request_id) DO NOTHING
+               RETURNING request_id"#,
+            request_id,
+            kind.as_str(),
+            fingerprint,
+            OffsetDateTime::now_utc(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("idempotency claim for {request_id}"))?;
+
+        if inserted.is_some() {
+            return Ok(IdempotencyClaim::Fresh);
+        }
+
+        // Lost the race (or a prior row exists): inspect the existing row.
+        let row = sqlx::query!(
             r#"SELECT kind, fingerprint, result_json FROM agent_sdk_idempotency WHERE request_id = $1"#,
             request_id,
         )
         .fetch_optional(&self.pool)
         .await
-        .with_context(|| format!("idempotency lookup for {request_id}"))?;
+        .with_context(|| format!("idempotency lookup for {request_id}"))?
+        .ok_or_else(|| anyhow!("idempotency row for {request_id} vanished after claim conflict"))?;
 
-        let Some(row) = existing else {
-            return Ok(IdempotencyClaim::Fresh);
-        };
         if row.kind != kind.as_str() || row.fingerprint != fingerprint {
+            return Ok(IdempotencyClaim::Conflict);
+        }
+        if row.result_json.is_null() {
+            // Reserved by a concurrent in-flight claim that hasn't
+            // recorded its result yet — fail closed.
             return Ok(IdempotencyClaim::Conflict);
         }
         let stored_kind = IdempotencyKind::from_wire(&row.kind)
@@ -2155,12 +2406,17 @@ SELECT EXISTS (
     }
 
     async fn record_idempotency(&self, record: IdempotencyRecord) -> Result<()> {
-        // Insert-if-absent: a record committed by a racing retry that
-        // already claimed the key must not be clobbered.
+        // Fill the reservation placeholder written by `claim_idempotency`.
+        // The `WHERE result_json = 'null'::jsonb` guard fills only the
+        // placeholder and never overwrites a real recorded result, so a
+        // racing retry cannot clobber it. With no prior claim row the
+        // INSERT lands the full record (defensive path).
         sqlx::query!(
             r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
                VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (request_id) DO NOTHING"#,
+               ON CONFLICT (request_id) DO UPDATE
+                   SET result_json = EXCLUDED.result_json
+                   WHERE agent_sdk_idempotency.result_json = 'null'::jsonb"#,
             record.request_id,
             record.kind.as_str(),
             record.fingerprint,
@@ -2169,7 +2425,7 @@ SELECT EXISTS (
         )
         .execute(&self.pool)
         .await
-        .with_context(|| format!("insert idempotency record for {}", record.request_id))?;
+        .with_context(|| format!("record idempotency result for {}", record.request_id))?;
         Ok(())
     }
 
@@ -2404,82 +2660,21 @@ ORDER BY created_at, id
         let mut tx = self.begin().await?;
         Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
         let _ = Self::lock_thread_tx(&mut tx, thread_id).await?;
-
-        let blocking_root = sqlx::query_scalar!(
-            r"
-SELECT id
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-  AND kind = 'root_turn'
-  AND status IN ('pending', 'running', 'waiting_on_children', 'awaiting_confirmation')
-LIMIT 1
-FOR UPDATE
-",
-            thread_key(thread_id),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| format!("check blocking root for {thread_id}"))?;
-        if blocking_root.is_some() {
-            tx.rollback().await.context("rollback blocked promote")?;
-            return Ok(None);
+        let promoted = Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
+        // Explicit terminal disposition (never leave a FOR UPDATE
+        // transaction parked idle-in-transaction): commit on a real
+        // promotion, roll back otherwise.
+        match &promoted {
+            Some(_) => tx
+                .commit()
+                .await
+                .context("commit promote_next_queued_root")?,
+            None => tx
+                .rollback()
+                .await
+                .context("rollback promote_next_queued_root")?,
         }
-
-        let queued = sqlx::query_as!(
-            TaskRecord,
-            r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at
-FROM agent_sdk_tasks
-WHERE thread_id = $1
-  AND kind = 'root_turn'
-  AND status = 'queued'
-ORDER BY created_at, id
-LIMIT 1
-FOR UPDATE
-",
-            thread_key(thread_id),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| format!("load queue head for {thread_id}"))?;
-        let Some(queued) = queued else {
-            tx.rollback().await.context("rollback empty promote")?;
-            return Ok(None);
-        };
-        let queued = AgentTask::try_from(queued)?;
-        let promoted = queued
-            .clone()
-            .promote_to_pending(now)
-            .context("promote rejected: promotion transition failed")?;
-        Self::update_task_tx(&mut tx, &promoted).await?;
-        tx.commit()
-            .await
-            .context("commit promote_next_queued_root")?;
-        Ok(Some(promoted))
+        Ok(promoted)
     }
 
     async fn try_acquire_task(
@@ -2645,16 +2840,72 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id, true)
-            .await?
-            .ok_or_else(|| anyhow!("heartbeat rejected: task {id} does not exist"))?;
-        let mut refreshed = old.clone();
-        refreshed
-            .touch_heartbeat(worker, lease, expires_at, now)
-            .context("heartbeat rejected")?;
-        Self::update_task_tx(&mut tx, &refreshed).await?;
-        tx.commit().await.context("commit heartbeat_task")?;
-        Ok(refreshed)
+        // Single guarded UPDATE of only the lease columns — never reload
+        // (FOR UPDATE) and rewrite the whole 24-column row (re-serialising
+        // submitted_input / state JSON blobs) on a per-tick heartbeat.
+        // `RETURNING` hands back the refreshed row in one round trip.
+        let updated = sqlx::query_as!(
+            TaskRecord,
+            r"
+UPDATE agent_sdk_tasks
+SET lease_expires_at = $4, last_heartbeat_at = $5, updated_at = $5
+WHERE id = $1 AND status = 'running' AND worker_id = $2 AND lease_id = $3
+RETURNING
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at
+",
+            id.as_str(),
+            worker.as_str(),
+            lease.as_str(),
+            expires_at,
+            now,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("heartbeat update for {id}"))?;
+
+        if let Some(record) = updated {
+            let refreshed = AgentTask::try_from(record)?;
+            tx.commit().await.context("commit heartbeat_task")?;
+            return Ok(refreshed);
+        }
+
+        // CAS rejection: one diagnostic SELECT to produce a precise error.
+        let existing = Self::load_task_tx(&mut tx, id, false).await?;
+        tx.rollback().await.context("rollback rejected heartbeat")?;
+        Err(match existing {
+            None => anyhow!("heartbeat rejected: task {id} does not exist"),
+            Some(task) if task.status != TaskStatus::Running => {
+                let status = task.status;
+                anyhow!("heartbeat rejected: task {id} is not running (status {status:?})")
+            }
+            Some(task) if task.worker_id.as_ref() != Some(worker) => {
+                anyhow!("heartbeat rejected: worker mismatch on task {id}")
+            }
+            Some(_) => anyhow!("heartbeat rejected: lease mismatch on task {id}"),
+        })
     }
 
     async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
@@ -2691,6 +2942,7 @@ FROM agent_sdk_tasks
 WHERE status = 'running'
   AND lease_expires_at <= $1
 ORDER BY lease_expires_at, id
+LIMIT 256
 FOR UPDATE SKIP LOCKED
 ",
             now,
@@ -3097,58 +3349,57 @@ FOR UPDATE SKIP LOCKED
         now: OffsetDateTime,
     ) -> Result<Vec<AgentTaskId>> {
         let mut tx = self.begin().await?;
-        let Some(_) = Self::load_task_tx(&mut tx, root_id, true).await? else {
+        let Some(_) = Self::load_task_tx(&mut tx, root_id, false).await? else {
             return Err(anyhow!(
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
 
-        // Phase 7.6: iteratively load subtrees, following
-        // SubagentInvocation linkage across thread boundaries.
-        // Each pass loads one root_id's subtree; any
-        // SubagentInvocation tasks in that subtree contribute
-        // their child_root_task_id to the next frontier.
-        let mut visited_roots: std::collections::BTreeSet<AgentTaskId> =
+        // Collect the given task + descendants (mirror in-memory
+        // `collect_subtree`: children-BFS, root-first, following
+        // SubagentInvocation linkage across threads). A mid-tree id
+        // cancels only its own subtree instead of no-opping on a
+        // `root_id = $1` scan.
+        let all_tasks = Self::collect_subtree_tx(&mut tx, root_id).await?;
+
+        // Apply the cancel UPDATEs deepest-first so the per-row locks are
+        // taken in the same child-then-parent order as the terminal
+        // transition paths (`complete_task` / `fail_task`), removing the
+        // lock-order inversion that could deadlock (40P01) a concurrent
+        // `cancel_tree(root)` + `complete_task(child-of-root)`. The
+        // returned `transitioned` slice is still built in BFS (root-first)
+        // order so the observable result matches the in-memory store.
+        let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
+        cancel_order.sort_by_key(|t| std::cmp::Reverse(t.depth));
+
+        let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
             std::collections::BTreeSet::new();
-        let mut frontier: std::collections::VecDeque<AgentTaskId> =
-            std::collections::VecDeque::new();
-        frontier.push_back(root_id.clone());
-        let mut all_tasks: Vec<AgentTask> = Vec::new();
-
-        while let Some(subtree_root) = frontier.pop_front() {
-            if !visited_roots.insert(subtree_root.clone()) {
-                continue;
-            }
-            let subtree = Self::load_subtree_tx(&mut tx, &subtree_root).await?;
-            for task in &subtree {
-                if let Some(invocation) = task.state.subagent_invocation() {
-                    let child_root = &invocation.child_root_task_id;
-                    if !visited_roots.contains(child_root) {
-                        frontier.push_back(child_root.clone());
-                    }
-                }
-            }
-            all_tasks.extend(subtree);
-        }
-
-        let mut transitioned = Vec::with_capacity(all_tasks.len());
-        // Track cancelled root-turn roots so we can wake their
-        // linked invocations afterward.
+        // Track cancelled root-turn roots (and their threads) so we can
+        // wake their linked invocations and promote queued successors.
         let mut cancelled_root_ids: Vec<AgentTaskId> = Vec::new();
-        for row in all_tasks {
+        let mut cancelled_root_threads: Vec<ThreadId> = Vec::new();
+        for row in cancel_order {
             if row.status.is_terminal() {
                 continue;
             }
             let is_root_turn_root = row.kind == TaskKind::RootTurn && row.is_root();
             let cancelled = row
+                .clone()
                 .cancel(now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(&mut tx, &cancelled).await?;
+            cancelled_ids.insert(cancelled.id.clone());
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
+                cancelled_root_threads.push(row.thread_id.clone());
             }
-            transitioned.push(cancelled.id);
         }
+        // Build the returned slice in BFS (root-first) order for parity.
+        let transitioned: Vec<AgentTaskId> = all_tasks
+            .iter()
+            .filter(|task| cancelled_ids.contains(&task.id))
+            .map(|task| task.id.clone())
+            .collect();
 
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
@@ -3157,6 +3408,14 @@ FOR UPDATE SKIP LOCKED
         // so it must NOT be added to the transitioned vec.
         for cancelled_child_root in &cancelled_root_ids {
             Self::resume_linked_subagent_invocation_tx(&mut tx, cancelled_child_root, now).await?;
+        }
+
+        // Each cancelled root frees its thread's active-root slot; promote
+        // the next queued root in the same transaction (emitting its
+        // durable wakeup) so cancelling the active root never strands its
+        // queued successors.
+        for thread_id in &cancelled_root_threads {
+            Self::promote_next_queued_root_tx(&mut tx, thread_id, now).await?;
         }
 
         tx.commit().await.context("commit cancel_tree")?;
@@ -3293,6 +3552,10 @@ CASCADE
 #[async_trait]
 impl ThreadStore for PostgresDurableStore {
     fn atomic_completed_turn_committer(&self) -> Option<&dyn AtomicCompletedTurnCommitter> {
+        Some(self)
+    }
+
+    fn atomic_fork_committer(&self) -> Option<&dyn AtomicForkCommitter> {
         Some(self)
     }
 
@@ -3688,6 +3951,13 @@ impl AtomicCompletedTurnCommitter for PostgresDurableStore {
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params, None).await
+    }
+}
+
+#[async_trait]
+impl AtomicForkCommitter for PostgresDurableStore {
+    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<()> {
+        self.commit_fork_atomic_inner(params).await
     }
 }
 
@@ -4285,36 +4555,46 @@ RETURNING id, kind, thread_id, event_id, sequence, status, payload_json,
         Ok(rows)
     }
 
-    async fn mark_delivered(&self, id: &OutboxRowId, now: OffsetDateTime) -> Result<()> {
-        let result = sqlx::query!(
+    async fn mark_delivered(
+        &self,
+        id: &OutboxRowId,
+        worker_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        // Guard on `claimed_by`: only the worker that still holds the claim
+        // may ack the row. A claim reclaimed by another worker (or a
+        // cascade-deleted row) matches zero rows here — a safe no-op, because
+        // the current owner will ack it and acking here would double-process.
+        // The guard is what prevents a stale worker from double-acking.
+        sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET status = 'delivered', delivered_at = $2
-WHERE id = $1 AND status <> 'delivered' AND status <> 'expired'
+WHERE id = $1 AND claimed_by = $3
 ",
             id.as_str(),
             now,
+            worker_id,
         )
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} delivered"))?;
-
-        if result.rows_affected() == 0 {
-            return Ok(());
-        }
         Ok(())
     }
 
     async fn mark_failed(
         &self,
         id: &OutboxRowId,
+        worker_id: &str,
         error: &str,
         next_attempt_at: OffsetDateTime,
         _now: OffsetDateTime,
     ) -> Result<()> {
         // last_error must be NULL for pending rows per the
         // agent_sdk_outbox_error_check constraint.
-        let result = sqlx::query!(
+        // `claimed_by = $4` guard: a reclaimed or cascade-deleted row matches
+        // zero rows — a safe no-op (the current owner handles it).
+        sqlx::query!(
             r"
 UPDATE agent_sdk_outbox
 SET
@@ -4339,19 +4619,16 @@ SET
         WHEN attempt_count + 1 >= max_attempts THEN claimed_at
         ELSE NULL
     END
-WHERE id = $1 AND status NOT IN ('delivered', 'expired')
+WHERE id = $1 AND claimed_by = $4
 ",
             id.as_str(),
             error,
             next_attempt_at,
+            worker_id,
         )
         .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
-
-        if result.rows_affected() == 0 {
-            return Ok(());
-        }
         Ok(())
     }
 
@@ -4558,16 +4835,21 @@ impl ExecutionIntentStore for PostgresDurableStore {
         let effect_class_wire = enum_to_wire(&intent.effect_class)?;
         let status_wire = enum_to_wire(&intent.status)?;
 
-        sqlx::query!(
+        // Atomic claim: insert-if-absent. `ON CONFLICT DO NOTHING` keeps
+        // an existing in-flight record intact, and the affected-row count
+        // distinguishes the winning claim (1 row) from a concurrent loser
+        // (0 rows). A blind upsert here would let a stale worker downgrade
+        // a `Started` record back to `Pending` and double-execute the
+        // side-effecting tool — the exact harm this guard prevents. A
+        // conflict (0 rows) returns an error so `guarded_tool_execution`
+        // fails the child closed.
+        let result = sqlx::query!(
             r"
 INSERT INTO agent_sdk_execution_intents (
     operation_id, effect_class, tool_call_id, child_task_id,
     tool_name, input, status, error, created_at, updated_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-ON CONFLICT (operation_id) DO UPDATE SET
-    status     = EXCLUDED.status,
-    error      = EXCLUDED.error,
-    updated_at = EXCLUDED.updated_at
+ON CONFLICT (operation_id) DO NOTHING
 ",
             intent.operation_id.as_str(),
             effect_class_wire,
@@ -4583,6 +4865,12 @@ ON CONFLICT (operation_id) DO UPDATE SET
         .execute(&self.pool)
         .await
         .with_context(|| format!("persist execution intent {}", intent.operation_id))?;
+
+        ensure!(
+            result.rows_affected() == 1,
+            "execution intent for operation {} already claimed (conflict)",
+            intent.operation_id,
+        );
         Ok(())
     }
 
@@ -5656,6 +5944,7 @@ mod tests {
                 CompletedTurnCommit {
                     thread_id: running.thread_id.clone(),
                     task_id: running.id.clone(),
+                    expected_turn: 1,
                     turn_attempt_id: attempt.id.clone(),
                     close_attempt_params: close_params(),
                     messages: vec![llm::Message::user("hello"), llm::Message::assistant("hi")],
@@ -5732,6 +6021,7 @@ mod tests {
         let commit_params = |now| CompletedTurnCommit {
             thread_id: thread_id.clone(),
             task_id: running.id.clone(),
+            expected_turn: 1,
             turn_attempt_id: attempt.id.clone(),
             close_attempt_params: close_params(),
             messages: vec![llm::Message::user("hello"), llm::Message::assistant("hi")],
@@ -5818,6 +6108,7 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: running.thread_id.clone(),
                 task_id: running.id.clone(),
+                expected_turn: 1,
                 turn_attempt_id: attempt.id.clone(),
                 close_attempt_params: close_params(),
                 messages: vec![llm::Message::user("hi"), llm::Message::assistant("there")],
@@ -6001,25 +6292,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_intent_duplicate_persist_is_upsert_safe() -> Result<()> {
+    async fn execution_intent_duplicate_persist_is_insert_if_absent() -> Result<()> {
         let Some((store, _guard)) = test_store().await? else {
             return Ok(());
         };
 
-        let mut intent = make_test_intent("upsert", 25);
+        let mut intent = make_test_intent("claim", 25);
         store.persist_intent(&intent).await?;
 
-        // Persist again with updated status — ON CONFLICT should succeed.
+        // A second claim on the same operation id must lose with a
+        // conflict error and must NOT clobber the in-flight record.
+        // Status transitions go through `update_intent`.
         intent.mark_started(t_plus(26));
-        store.persist_intent(&intent).await?;
+        let err = store.persist_intent(&intent).await.unwrap_err();
+        assert!(
+            err.to_string().contains("conflict"),
+            "expected claim conflict, got: {err}"
+        );
 
         let loaded = store
             .get_intent(&intent.operation_id)
             .await?
-            .context("should exist after upsert")?;
+            .context("should exist after claim")?;
         assert_eq!(
             loaded.status,
-            agent_server::journal::execution_intent::IntentStatus::Started
+            agent_server::journal::execution_intent::IntentStatus::Pending
         );
 
         Ok(())
@@ -6518,7 +6815,7 @@ mod tests {
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
 
-        OutboxStore::mark_delivered(&store, &row_id, t_plus(2)).await?;
+        OutboxStore::mark_delivered(&store, &row_id, "relay-worker", t_plus(2)).await?;
         Ok(())
     }
 
@@ -6553,7 +6850,15 @@ mod tests {
         RetentionStore::advance_floor(&store, &thread_id, 1, t_plus(1)).await?;
         assert!(OutboxStore::get(&store, &row_id).await?.is_none());
 
-        OutboxStore::mark_failed(&store, &row_id, "timeout", t_plus(3), t_plus(2)).await?;
+        OutboxStore::mark_failed(
+            &store,
+            &row_id,
+            "relay-worker",
+            "timeout",
+            t_plus(3),
+            t_plus(2),
+        )
+        .await?;
         Ok(())
     }
 

@@ -3,9 +3,9 @@ use super::llm::{call_llm_streaming, call_llm_with_retry};
 use super::tool_execution::{append_tool_results, execute_tool_call};
 use super::types::{
     ExecuteTurnParameters, InternalTurnResult, LlmCallParams, LlmEventContext, LlmOutcome,
-    LlmStreamIds, ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
-    ToolExecutionOutcome, TurnCompletionParams, TurnContext, TurnMessageLoadParams,
-    TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
+    ProcessedTurnResponse, ToolBatchExecutionParams, ToolCallExecutionContext,
+    ToolExecutionOutcome, ToolOutcomeContext, TurnCompletionParams, TurnContext,
+    TurnMessageLoadParams, TurnResponseProcessingParams, TurnStopReasonParams, TurnToolPhaseParams,
 };
 
 use crate::authority::EventAuthority;
@@ -629,6 +629,24 @@ where
     })
 }
 
+/// Summarize a tool-call input JSON for debug logging without writing the
+/// payload itself.
+///
+/// Returns the serialized byte length and the top-level object field names
+/// (key names only, never their values) so an operator can size and shape a
+/// call without the log persisting whatever PII / credentials the model
+/// embedded in the input.
+fn tool_input_shape(input: &serde_json::Value) -> String {
+    let len = serde_json::to_string(input).map_or(0, |s| s.len());
+    input.as_object().map_or_else(
+        || format!("len={len}, non_object"),
+        |map| {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            format!("len={len}, top_level_keys={keys:?}")
+        },
+    )
+}
+
 pub(super) fn log_chat_request(request: &ChatRequest) {
     debug!(
         "ChatRequest built: system_prompt_len={} num_messages={} num_tools={} max_tokens={} cached_content={}",
@@ -668,8 +686,15 @@ pub(super) fn log_chat_request(request: &ChatRequest) {
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
+                            // Never log the raw input payload: tool inputs
+                            // routinely carry user PII, file contents, or
+                            // credentials/tokens the model passes to tools.
+                            // Log only a redaction-safe shape summary (byte
+                            // length + top-level field names), matching the
+                            // length-only treatment of the Text/ToolResult arms.
                             debug!(
-                                "    block[{block_idx}]: ToolUse(id={id}, name={name}, input={input})"
+                                "    block[{block_idx}]: ToolUse(id={id}, name={name}, input_shape=[{}])",
+                                tool_input_shape(input)
                             );
                         }
                         ContentBlock::ToolResult {
@@ -756,10 +781,8 @@ where
             request,
             config,
             &event_ctx,
-            LlmStreamIds {
-                message_id,
-                thinking_id,
-            },
+            message_id,
+            thinking_id,
             #[cfg(feature = "otel")]
             Some(super::llm::LlmSpanObserver {
                 span: &mut llm_span,
@@ -1303,6 +1326,15 @@ where
         audit_sink,
         provenance,
     };
+    let outcome_ctx = ToolOutcomeContext {
+        thread_id,
+        turn,
+        total_usage,
+        turn_usage,
+        state,
+        response_id: response_id.as_deref(),
+        stop_reason,
+    };
 
     // Tool calls are walked in the order the model emitted them. Adjacent
     // `ToolTier::Observe` calls are run concurrently via `join_all` because
@@ -1321,30 +1353,46 @@ where
 
         if first_tier == ToolTier::Observe {
             let end = observe_run_end(&pending_tool_calls, idx);
-            let batch = &pending_tool_calls[idx..end];
 
             // Borrow the slice for the duration of `join_all` only — the
             // borrow ends before we touch `pending_tool_calls` mutably below.
             let outcomes = futures::future::join_all(
-                batch.iter().map(|p| execute_tool_call(p, &execution_ctx)),
+                pending_tool_calls[idx..end]
+                    .iter()
+                    .map(|p| execute_tool_call(p, &execution_ctx)),
             )
             .await;
 
-            for outcome in outcomes {
-                if let Some(early) = handle_tool_outcome(
+            let mut outcomes = outcomes.into_iter();
+            while let Some(outcome) = outcomes.next() {
+                let Some(mut early) = handle_tool_outcome(
                     outcome,
                     &mut pending_tool_calls,
                     &mut tool_results,
-                    thread_id,
-                    turn,
-                    total_usage,
-                    turn_usage,
-                    state,
-                    response_id.as_deref(),
-                    stop_reason,
-                ) {
-                    return Err(early);
+                    &outcome_ctx,
+                ) else {
+                    continue;
+                };
+                // If this batch element paused for confirmation, the sibling
+                // tools *after* it in the same parallel batch already ran to
+                // completion (their futures resolved inside `join_all`). Drain
+                // their finished results into the continuation so they are not
+                // dropped and re-executed on resume — double execution would
+                // re-emit tool_call events, duplicate audit Completed records,
+                // and repeat side effects. Resume skips any pending tool whose
+                // result is already carried in `completed_results`.
+                if let InternalTurnResult::AwaitingConfirmation { continuation, .. } = &mut early {
+                    for sibling in outcomes.by_ref() {
+                        if let ToolExecutionOutcome::Completed { tool_id, result } = sibling {
+                            continuation.completed_results.push((tool_id, result));
+                        }
+                        // A sibling still awaiting confirmation has not run its
+                        // `execute()` yet, and an infra error re-surfaces when
+                        // the tool is retried on resume — neither yielded a
+                        // result to capture here.
+                    }
                 }
+                return Err(early);
             }
             idx = end;
         } else {
@@ -1353,13 +1401,7 @@ where
                 outcome,
                 &mut pending_tool_calls,
                 &mut tool_results,
-                thread_id,
-                turn,
-                total_usage,
-                turn_usage,
-                state,
-                response_id.as_deref(),
-                stop_reason,
+                &outcome_ctx,
             ) {
                 return Err(early);
             }
@@ -1387,18 +1429,11 @@ fn observe_run_end(pending: &[PendingToolCallInfo], start: usize) -> usize {
 ///
 /// Pulled out of the main loop so the parallel and serial paths share one
 /// implementation of the confirmation snapshot.
-#[allow(clippy::too_many_arguments)]
 fn handle_tool_outcome(
     outcome: ToolExecutionOutcome,
     pending_tool_calls: &mut [PendingToolCallInfo],
     tool_results: &mut Vec<(String, ToolResult)>,
-    thread_id: &ThreadId,
-    turn: usize,
-    total_usage: &TokenUsage,
-    turn_usage: &TokenUsage,
-    state: &crate::types::AgentState,
-    response_id: Option<&str>,
-    stop_reason: Option<StopReason>,
+    ctx: &ToolOutcomeContext<'_>,
 ) -> Option<InternalTurnResult> {
     match outcome {
         ToolExecutionOutcome::Completed { tool_id, result } => {
@@ -1422,16 +1457,16 @@ fn handle_tool_outcome(
             }
 
             let continuation = AgentContinuation {
-                thread_id: thread_id.clone(),
-                turn,
-                total_usage: total_usage.clone(),
-                turn_usage: turn_usage.clone(),
+                thread_id: ctx.thread_id.clone(),
+                turn: ctx.turn,
+                total_usage: ctx.total_usage.clone(),
+                turn_usage: ctx.turn_usage.clone(),
                 pending_tool_calls: pending_tool_calls.to_vec(),
                 awaiting_index: pending_idx,
                 completed_results: std::mem::take(tool_results),
-                state: state.clone(),
-                response_id: response_id.map(str::to_string),
-                stop_reason,
+                state: ctx.state.clone(),
+                response_id: ctx.response_id.map(str::to_string),
+                stop_reason: ctx.stop_reason,
                 response_content: Vec::new(),
             };
 
@@ -1778,7 +1813,12 @@ where
             }
             Err(error) => return InternalTurnResult::Error(error),
         }
-        ctx.turn = ctx.turn.saturating_sub(1);
+        // Keep the turn counter monotonic. The overflow turn was opened by
+        // `begin_turn` and is closed by the looping result handler's
+        // `Continue` arm; decrementing here would make the next iteration
+        // recompute the same turn key and re-`begin_turn` on an
+        // already-finished turn, which the event store rejects. The retry
+        // simply runs as the next turn against the freshly compacted history.
         return InternalTurnResult::Continue { turn_usage };
     }
 
@@ -1851,13 +1891,34 @@ where
                 return Some(InternalTurnResult::Error(compact_err));
             }
         }
-        // Don't count the failed attempt as a turn
-        ctx.turn = ctx.turn.saturating_sub(1);
+        // Keep the turn counter monotonic (see `handle_context_window_exceeded`):
+        // the turn was already opened via `begin_turn`, so the retry runs as the
+        // next turn against the compacted history rather than replaying this
+        // turn's already-finished event key.
         return Some(InternalTurnResult::Continue {
             turn_usage: TokenUsage::default(),
         });
     }
     None
+}
+
+/// Persist a strict-durability state checkpoint, mapping a save failure
+/// onto the hard `InternalTurnResult::Error` the turn must surface.
+async fn save_strict_checkpoint<S>(
+    state_store: &Arc<S>,
+    state: &crate::types::AgentState,
+    checkpoint: &str,
+) -> Result<(), InternalTurnResult>
+where
+    S: StateStore,
+{
+    if let Err(error) = state_store.save(state).await {
+        return Err(InternalTurnResult::Error(AgentError::new(
+            format!("Strict durability: failed to save {checkpoint} state checkpoint: {error}"),
+            false,
+        )));
+    }
+    Ok(())
 }
 
 pub(super) async fn execute_turn<Ctx, P, H, M, S>(
@@ -2125,51 +2186,38 @@ where
     };
     log_chat_request(&request);
 
-    let message_id = uuid::Uuid::new_v4().to_string();
-    let thinking_id = uuid::Uuid::new_v4().to_string();
-    let response = match request_llm_response(LlmCallParams {
-        provider,
+    // Strict durability: checkpoint before the LLM call. `begin_turn` has
+    // already advanced `turn_count`, so persisting here lets a crash during
+    // the (potentially long) LLM round-trip resume from the correct turn.
+    if turn_options.strict_durability
+        && let Err(result) = save_strict_checkpoint(state_store, &ctx.state, "pre-LLM").await
+    {
+        return result;
+    }
+
+    let TurnLlmResponse {
+        response,
+        message_id,
+        thinking_id,
+    } = match request_turn_response(TurnLlmRequestParams {
+        ctx: &mut *ctx,
         request,
         config,
+        provider,
+        message_store,
+        compaction_config,
+        compactor,
         event_store,
         hooks,
         authority,
-        thread_id: &ctx.thread_id,
-        turn: ctx.turn,
-        message_id: &message_id,
-        thinking_id: &thinking_id,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
     })
     .await
     {
-        LlmOutcome::Response(response) => response,
-        LlmOutcome::Cancelled => {
-            // The cancel was honored before any assistant message was
-            // persisted, so there is no orphan `tool_use` to balance —
-            // history is already consistent. Surface a partial-usage
-            // `Cancelled` so the run closes with the terminal event.
-            return InternalTurnResult::Cancelled {
-                turn_usage: TokenUsage::default(),
-            };
-        }
-        LlmOutcome::Error(error) => {
-            if let Some(result) = try_recover_prompt_too_long(
-                &error,
-                ctx,
-                compaction_config,
-                compactor,
-                provider,
-                message_store,
-                cancel_token,
-            )
-            .await
-            {
-                return result;
-            }
-            return InternalTurnResult::Error(error);
-        }
+        Ok(response) => response,
+        Err(result) => return result,
     };
 
     process_response_and_run_tools(
@@ -2194,6 +2242,145 @@ where
         cancel_token,
     )
     .await
+}
+
+/// The LLM response for a turn, paired with the final-attempt streaming
+/// ids the caller reuses for the post-stream Text/Refusal events.
+struct TurnLlmResponse {
+    response: ChatResponse,
+    message_id: String,
+    thinking_id: String,
+}
+
+struct TurnLlmRequestParams<'a, P, H, M> {
+    ctx: &'a mut TurnContext,
+    request: ChatRequest,
+    config: &'a AgentConfig,
+    provider: &'a Arc<P>,
+    message_store: &'a Arc<M>,
+    compaction_config: Option<&'a CompactionConfig>,
+    compactor: Option<&'a Arc<dyn ContextCompactor>>,
+    event_store: &'a Arc<dyn EventStore>,
+    hooks: &'a Arc<H>,
+    authority: &'a Arc<dyn EventAuthority>,
+    cancel_token: &'a CancellationToken,
+    #[cfg(feature = "otel")]
+    observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
+}
+
+/// Generate the per-attempt streaming ids, call the LLM, and decode the
+/// outcome.
+///
+/// `message_id` / `thinking_id` are regenerated per attempt by the
+/// streaming retry loop (see `call_llm_streaming`) so each attempt's
+/// deltas land under a distinct id; the returned ids are the final
+/// attempt's, which the post-stream Text/Refusal events reuse so they
+/// stay correlated with the surviving deltas. A cancellation, or an
+/// unrecoverable error (after attempting an emergency compaction for a
+/// prompt-too-long error), is mapped onto the `InternalTurnResult` the
+/// caller should return.
+async fn request_turn_response<P, H, M>(
+    TurnLlmRequestParams {
+        ctx,
+        request,
+        config,
+        provider,
+        message_store,
+        compaction_config,
+        compactor,
+        event_store,
+        hooks,
+        authority,
+        cancel_token,
+        #[cfg(feature = "otel")]
+        observability_store,
+    }: TurnLlmRequestParams<'_, P, H, M>,
+) -> Result<TurnLlmResponse, InternalTurnResult>
+where
+    P: LlmProvider,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let mut message_id = uuid::Uuid::new_v4().to_string();
+    let mut thinking_id = uuid::Uuid::new_v4().to_string();
+    let response = match request_llm_response(LlmCallParams {
+        provider,
+        request,
+        config,
+        event_store,
+        hooks,
+        authority,
+        thread_id: &ctx.thread_id,
+        turn: ctx.turn,
+        message_id: &mut message_id,
+        thinking_id: &mut thinking_id,
+        cancel_token,
+        #[cfg(feature = "otel")]
+        observability_store,
+    })
+    .await
+    {
+        LlmOutcome::Response(response) => response,
+        LlmOutcome::Cancelled => {
+            // The cancel was honored before any assistant message was
+            // persisted, so there is no orphan `tool_use` to balance —
+            // history is already consistent. Surface a partial-usage
+            // `Cancelled` so the run closes with the terminal event.
+            return Err(InternalTurnResult::Cancelled {
+                turn_usage: TokenUsage::default(),
+            });
+        }
+        LlmOutcome::Error(error) => {
+            if let Some(result) = try_recover_prompt_too_long(
+                &error,
+                ctx,
+                compaction_config,
+                compactor,
+                provider,
+                message_store,
+                cancel_token,
+            )
+            .await
+            {
+                return Err(result);
+            }
+            return Err(InternalTurnResult::Error(error));
+        }
+    };
+
+    Ok(TurnLlmResponse {
+        response,
+        message_id,
+        thinking_id,
+    })
+}
+
+/// Build the `PendingToolCalls` result that hands an external tool
+/// runtime the pending calls (and a resumable continuation) instead of
+/// executing them inline.
+fn external_pending_tool_calls_result(
+    ctx: &TurnContext,
+    turn_usage: TokenUsage,
+    pending_tool_calls: Vec<PendingToolCallInfo>,
+) -> InternalTurnResult {
+    let continuation = AgentContinuation {
+        thread_id: ctx.thread_id.clone(),
+        turn: ctx.turn,
+        total_usage: ctx.total_usage.clone(),
+        turn_usage: turn_usage.clone(),
+        pending_tool_calls: pending_tool_calls.clone(),
+        awaiting_index: 0,
+        completed_results: Vec::new(),
+        state: ctx.state.clone(),
+        response_id: ctx.response_id.clone(),
+        stop_reason: ctx.stop_reason,
+        response_content: Vec::new(),
+    };
+    InternalTurnResult::PendingToolCalls {
+        turn_usage,
+        pending_tool_calls,
+        continuation: Box::new(continuation),
+    }
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -2252,12 +2439,25 @@ where
     // the summary can report it without reparsing the message history.
     ctx.tool_call_count = pending_tool_calls.len();
 
+    // A successful, non-overflow LLM call resets the consecutive
+    // context-overflow retry budget. `MAX_COMPACTION_RETRIES` is meant to
+    // bound a single overflow *episode* (repeated failed compaction retries
+    // for the same oversized prompt), not the whole run: without this reset
+    // the Nth overflow anywhere in a long run hard-fails even when every
+    // prior compaction succeeded and many turns ran in between.
+    if stop_reason != Some(StopReason::ModelContextWindowExceeded) {
+        ctx.compaction_retries = 0;
+    }
+
     let had_tool_calls = !pending_tool_calls.is_empty();
 
     // Strict durability: checkpoint after LLM response, before tool execution.
+    // A failed checkpoint in strict mode violates the crash-safe contract — a
+    // crash here would resume from stale state (wrong turn_count / usage) — so
+    // it is surfaced as a hard error rather than warn-and-continue.
     if turn_options.strict_durability {
-        if let Err(error) = state_store.save(&ctx.state).await {
-            warn!("Strict durability: failed to save post-LLM state: {error}");
+        if let Err(result) = save_strict_checkpoint(state_store, &ctx.state, "post-LLM").await {
+            return result;
         }
     } else if had_tool_calls && let Err(error) = state_store.save(&ctx.state).await {
         warn!("Failed to save pre-tool state checkpoint: {error}");
@@ -2266,24 +2466,7 @@ where
     // External tool runtime: return pending tool calls to the caller instead
     // of executing them inline.
     if had_tool_calls && turn_options.tool_runtime == ToolRuntime::External {
-        let continuation = AgentContinuation {
-            thread_id: ctx.thread_id.clone(),
-            turn: ctx.turn,
-            total_usage: ctx.total_usage.clone(),
-            turn_usage: turn_usage.clone(),
-            pending_tool_calls: pending_tool_calls.clone(),
-            awaiting_index: 0,
-            completed_results: Vec::new(),
-            state: ctx.state.clone(),
-            response_id: ctx.response_id.clone(),
-            stop_reason: ctx.stop_reason,
-            response_content: Vec::new(),
-        };
-        return InternalTurnResult::PendingToolCalls {
-            turn_usage,
-            pending_tool_calls,
-            continuation: Box::new(continuation),
-        };
+        return external_pending_tool_calls_result(ctx, turn_usage, pending_tool_calls);
     }
 
     if let Err(outcome) = execute_turn_tool_phase(TurnToolPhaseParams {
@@ -2310,11 +2493,13 @@ where
         return outcome;
     }
 
-    // Strict durability: checkpoint after tool execution.
+    // Strict durability: checkpoint after tool execution. As with the
+    // post-LLM checkpoint, a failed save in strict mode is a hard error so
+    // the server never proceeds believing a checkpoint exists when it does not.
     if turn_options.strict_durability
-        && let Err(error) = state_store.save(&ctx.state).await
+        && let Err(result) = save_strict_checkpoint(state_store, &ctx.state, "post-tool").await
     {
-        warn!("Strict durability: failed to save post-tool state: {error}");
+        return result;
     }
 
     handle_turn_stop_reason(TurnStopReasonParams {

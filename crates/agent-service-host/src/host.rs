@@ -183,6 +183,23 @@ impl ServiceHost {
             config.worker.acquisition_interval_secs > 0,
             "worker.acquisition_interval_secs must be > 0"
         );
+        // A zero heartbeat interval makes `tokio::time::interval` panic
+        // inside the spawned heartbeat task, leaving every task with no
+        // lease extension (leases expire → tasks double-execute). A zero
+        // lease duration yields instantly-expired leases with the same
+        // effect. Fail fast at startup instead.
+        anyhow::ensure!(
+            config.worker.heartbeat_interval_secs > 0,
+            "worker.heartbeat_interval_secs must be > 0"
+        );
+        anyhow::ensure!(
+            config.worker.lease_duration_secs > 0,
+            "worker.lease_duration_secs must be > 0"
+        );
+        anyhow::ensure!(
+            config.worker.lease_duration_secs > config.worker.heartbeat_interval_secs,
+            "worker.lease_duration_secs must exceed worker.heartbeat_interval_secs so a lease survives between heartbeats"
+        );
         if matches!(
             config.storage.backend,
             super::config::StorageBackend::Postgres
@@ -978,18 +995,18 @@ async fn run_task_with_heartbeat(
     }
 }
 
-struct HeartbeatLoopParams {
-    stores: StoreRegistry,
-    task_id: agent_server::journal::task::AgentTaskId,
-    thread_id: agent_sdk_foundation::ThreadId,
-    worker_id: WorkerId,
-    lease_id: LeaseId,
-    lease_duration: time::Duration,
-    heartbeat_interval: std::time::Duration,
-    cancel: CancellationToken,
+pub(crate) struct HeartbeatLoopParams {
+    pub(crate) stores: StoreRegistry,
+    pub(crate) task_id: agent_server::journal::task::AgentTaskId,
+    pub(crate) thread_id: agent_sdk_foundation::ThreadId,
+    pub(crate) worker_id: WorkerId,
+    pub(crate) lease_id: LeaseId,
+    pub(crate) lease_duration: time::Duration,
+    pub(crate) heartbeat_interval: std::time::Duration,
+    pub(crate) cancel: CancellationToken,
 }
 
-async fn heartbeat_loop(params: HeartbeatLoopParams) {
+pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
     let HeartbeatLoopParams {
         stores,
         task_id,
@@ -1020,18 +1037,52 @@ async fn heartbeat_loop(params: HeartbeatLoopParams) {
             .await
         {
             Ok(_) => {}
-            Err(err) => {
+            Err(err) if heartbeat_error_is_terminal(&err) => {
+                // Lease rejection (not-running / worker-mismatch /
+                // lease-mismatch): the row is no longer ours, so further
+                // heartbeats can only fail. Exit cleanly.
                 warn!(
                     %worker_id,
                     task_id = %task_id,
                     thread_id = %thread_id,
                     error = %err,
-                    "heartbeat failed; ticker exiting (lease rejection or transient store error — see run_task_with_heartbeat docs)",
+                    "heartbeat rejected; ticker exiting (lease no longer owned)",
                 );
                 return;
             }
+            Err(err) => {
+                // Transient store error (e.g. a DB blip). Exiting here
+                // would drop all subsequent beats and let the lease
+                // expire, opening a double-execution window. Keep
+                // retrying on the next tick until the lease is rejected
+                // or `cancel` fires.
+                warn!(
+                    %worker_id,
+                    task_id = %task_id,
+                    thread_id = %thread_id,
+                    error = %err,
+                    "heartbeat hit a transient store error; retrying on next tick",
+                );
+            }
         }
     }
+}
+
+/// Classify an `AgentTaskStore::heartbeat_task` error as a terminal
+/// lease rejection (the row is no longer owned by this worker) versus a
+/// transient store error worth retrying.
+///
+/// The store trait returns `anyhow::Error` (no typed error), so the
+/// classification keys off the canonical `"heartbeat rejected"` marker
+/// that every backend stamps on a CAS rejection — the in-memory store
+/// via `.context("heartbeat rejected")` over a typed `TaskSchemaError`,
+/// the SQL backends via an explicit `"heartbeat rejected: …"` message.
+/// Transient errors (connection resets, commit failures) carry other
+/// contexts and are treated as retryable. Using a typed error instead
+/// would require changing the frozen store trait.
+fn heartbeat_error_is_terminal(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("heartbeat rejected"))
 }
 
 async fn execute_acquired_task(
@@ -1324,14 +1375,52 @@ async fn newly_committed_events(
     thread_id: &agent_sdk_foundation::ThreadId,
     watermark: u64,
 ) -> Result<Vec<CommittedEvent>> {
-    Ok(stores
-        .event_repo
-        .get_events(thread_id)
+    committed_events_from(stores.event_repo.as_ref(), thread_id, watermark)
         .await
-        .context("read committed events after failure")?
-        .into_iter()
-        .filter(|event| event.sequence >= watermark)
-        .collect())
+        .context("read committed events after failure")
+}
+
+/// Load committed events with `sequence >= start_sequence` using a
+/// bounded range query rather than materialising the entire journal.
+///
+/// Shared by the watermark-tail publish paths ([`newly_committed_events`]
+/// here and the gRPC approved-confirmation drive) so a thread whose
+/// journal is thousands of events long does not pay an O(journal-length)
+/// read just to publish a handful of tail events.
+pub(crate) async fn committed_events_from(
+    event_repo: &dyn agent_server::journal::event_repository::EventRepository,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    start_sequence: u64,
+) -> Result<Vec<CommittedEvent>> {
+    match start_sequence.checked_sub(1) {
+        // start_sequence >= 1: bounded range query — no full-journal
+        // load. `get_events_in_range` is exclusive on its lower bound, so
+        // `after = start_sequence - 1` yields `sequence >= start_sequence`.
+        Some(after) => {
+            let next = event_repo
+                .next_sequence(thread_id)
+                .await
+                .context("reading event watermark")?;
+            let Some(up_to) = next.checked_sub(1) else {
+                return Ok(Vec::new());
+            };
+            if up_to <= after {
+                return Ok(Vec::new());
+            }
+            event_repo
+                .get_events_in_range(thread_id, after, up_to)
+                .await
+                .context("reading committed events in range")
+        }
+        // start_sequence == 0: the thread had no events when the
+        // watermark was captured, so the journal is just the new tail —
+        // a full read is cheap, and the exclusive-lower range query
+        // cannot express "from sequence 0 inclusive".
+        None => event_repo
+            .get_events(thread_id)
+            .await
+            .context("reading committed events from start"),
+    }
 }
 
 async fn promote_next_root(
@@ -1944,6 +2033,111 @@ mod tests {
             "heartbeat must exit on lease mismatch"
         );
         handle.await?;
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_lease_rejection_is_terminal() {
+        // The canonical CAS-rejection marker every backend stamps.
+        let terminal = anyhow::anyhow!("heartbeat rejected: lease mismatch on task task_1");
+        assert!(heartbeat_error_is_terminal(&terminal));
+
+        // The in-memory backend wraps a typed error with `.context`.
+        let wrapped = anyhow::anyhow!("worker mismatch")
+            .context("heartbeat rejected")
+            .context("heartbeating task");
+        assert!(heartbeat_error_is_terminal(&wrapped));
+    }
+
+    #[test]
+    fn heartbeat_transient_store_error_is_not_terminal() {
+        // A DB blip carries store context, never the CAS-rejection
+        // marker, so the loop must keep retrying rather than exit and
+        // let the lease expire.
+        let transient =
+            anyhow::anyhow!("connection reset by peer").context("heartbeat update for task_1");
+        assert!(!heartbeat_error_is_terminal(&transient));
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_heartbeat_interval() {
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                heartbeat_interval_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match ServiceHost::validate_config(&config) {
+            Ok(()) => panic!("zero heartbeat_interval_secs must fail validation"),
+            Err(err) => assert!(err.to_string().contains("heartbeat_interval_secs")),
+        }
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_lease_duration() {
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                lease_duration_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match ServiceHost::validate_config(&config) {
+            Ok(()) => panic!("zero lease_duration_secs must fail validation"),
+            Err(err) => assert!(err.to_string().contains("lease_duration_secs")),
+        }
+    }
+
+    #[test]
+    fn validate_config_rejects_lease_not_exceeding_heartbeat() {
+        let config = ServiceConfig {
+            worker: crate::config::WorkerConfig {
+                lease_duration_secs: 10,
+                heartbeat_interval_secs: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match ServiceHost::validate_config(&config) {
+            Ok(()) => panic!("lease_duration_secs <= heartbeat_interval_secs must fail validation"),
+            Err(err) => assert!(err.to_string().contains("must exceed")),
+        }
+    }
+
+    #[test]
+    fn validate_config_accepts_default_worker_settings() -> Result<()> {
+        ServiceHost::validate_config(&ServiceConfig::default())
+    }
+
+    #[tokio::test]
+    async fn committed_events_from_reads_bounded_tail() -> Result<()> {
+        use agent_sdk_foundation::events::AgentEvent;
+        use agent_server::journal::event_repository::{EventRepository, InMemoryEventRepository};
+
+        let repo = InMemoryEventRepository::new();
+        let thread = agent_sdk_foundation::ThreadId::from_string("t-committed-from");
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        for i in 0..5u32 {
+            repo.commit_event(&thread, AgentEvent::text(format!("msg_{i}"), "hi"), now)
+                .await?;
+        }
+        // Events occupy sequences 0..=4.
+        let tail = committed_events_from(&repo, &thread, 3).await?;
+        assert_eq!(
+            tail.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![3, 4],
+        );
+
+        // start_sequence == 0 returns the whole journal.
+        assert_eq!(committed_events_from(&repo, &thread, 0).await?.len(), 5);
+
+        // A start beyond the head returns nothing (no full-journal scan).
+        assert!(committed_events_from(&repo, &thread, 99).await?.is_empty());
+
+        // Unknown thread returns empty.
+        let other = agent_sdk_foundation::ThreadId::from_string("t-committed-none");
+        assert!(committed_events_from(&repo, &other, 0).await?.is_empty());
         Ok(())
     }
 

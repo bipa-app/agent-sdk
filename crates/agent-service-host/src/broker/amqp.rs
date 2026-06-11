@@ -63,7 +63,12 @@ use tracing::{debug, info, warn};
 // ─────────────────────────────────────────────────────────────────────
 
 /// AMQP broker adapter configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand (not derived) so the credential-bearing
+/// `url` (`amqp://user:pass@host`) is redacted: the whole `ServiceConfig`
+/// is `Debug`-logged at startup, and this config is reachable from there
+/// via `relay.broker`, `wakeup.amqp_consumer`, and `watch.amqp_consumer`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AmqpBrokerConfig {
     /// Broker URL (e.g. `amqp://user:pass@host:5672/vhost`).
@@ -95,6 +100,19 @@ impl Default for AmqpBrokerConfig {
             declare_exchange: false,
             routing_key_prefix: "agent_sdk.outbox".into(),
         }
+    }
+}
+
+impl std::fmt::Debug for AmqpBrokerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmqpBrokerConfig")
+            // Credential-bearing: redact userinfo before logging.
+            .field("url", &self.url.as_deref().map(redact_url))
+            .field("exchange", &self.exchange)
+            .field("exchange_kind", &self.exchange_kind)
+            .field("declare_exchange", &self.declare_exchange)
+            .field("routing_key_prefix", &self.routing_key_prefix)
+            .finish()
     }
 }
 
@@ -153,8 +171,10 @@ pub struct AmqpBrokerAdapter {
 }
 
 struct ChannelState {
-    #[allow(dead_code)] // kept alive so channel stays usable
-    connection: Connection,
+    // Held only to keep the connection (and therefore the channel)
+    // alive; never read. The leading underscore documents that and
+    // satisfies the dead-code lint without an `#[allow]`.
+    _connection: Connection,
     channel: Channel,
     exchange_declared: bool,
 }
@@ -187,7 +207,12 @@ impl AmqpBrokerAdapter {
         &'a self,
         slot: &'a mut Option<ChannelState>,
     ) -> Result<&'a mut ChannelState> {
-        if slot.is_none() {
+        // Bind the freshly-inserted state via `Option::insert` (returns
+        // `&mut T`) instead of re-borrowing with `expect` — no panic
+        // path, satisfying the repo's no-`expect` rule.
+        let state = if let Some(state) = slot {
+            state
+        } else {
             info!(url = %redact_url(&self.url), "opening AMQP connection");
             let connection = Connection::connect(&self.url, ConnectionProperties::default())
                 .await
@@ -205,14 +230,13 @@ impl AmqpBrokerAdapter {
                 .await
                 .context("enable publisher confirms")?;
 
-            *slot = Some(ChannelState {
-                connection,
+            slot.insert(ChannelState {
+                _connection: connection,
                 channel,
                 exchange_declared: false,
-            });
-        }
+            })
+        };
 
-        let state = slot.as_mut().expect("channel slot populated above");
         if self.config.declare_exchange && !state.exchange_declared {
             state
                 .channel
@@ -411,6 +435,18 @@ mod tests {
     fn redact_url_handles_credential_free_urls() {
         let url = "amqp://broker.internal:5672/prod";
         assert_eq!(redact_url(url), "amqp://broker.internal:5672/prod");
+    }
+
+    #[test]
+    fn debug_redacts_credentials_in_url() {
+        let config = AmqpBrokerConfig {
+            url: Some("amqp://rabbit:hunter2@broker.internal:5672/prod".into()),
+            ..AmqpBrokerConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"), "password leaked: {rendered}");
+        assert!(!rendered.contains("rabbit"), "username leaked: {rendered}");
+        assert!(rendered.contains("broker.internal"));
     }
 
     #[test]

@@ -152,6 +152,13 @@ pub fn install_global_provider(cfg: &OtelConfig) -> Result<OtelGuard> {
     global::set_tracer_provider(tracer_provider.clone());
     global::set_meter_provider(meter_provider.clone());
 
+    // Rebind the SDK's cached metric instruments to the meter provider we
+    // just installed. Without this, any agent run or `finalize_root_turn_span`
+    // that lazily built the `Metrics` singleton before this point (or before
+    // a re-install) stays bound to the no-op / previous provider for the rest
+    // of the process and silently drops every counter and histogram.
+    agent_sdk::observability::metrics::Metrics::rebind();
+
     // Wrap the upstream `BaggagePropagator` with an exact-match
     // allow-list so non-allow-listed baggage entries
     // never leave the process. An empty

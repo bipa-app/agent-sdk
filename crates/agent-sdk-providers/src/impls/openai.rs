@@ -4,12 +4,25 @@
 //! Chat Completions API. It also supports `OpenAI`-compatible APIs (Ollama, vLLM, etc.)
 //! via the `with_base_url` constructor.
 //!
-//! Legacy models that require the Responses API (like `gpt-5.2-codex`) are automatically
-//! routed to the correct endpoint.
+//! # Transparent Responses-API reroute
+//!
+//! Some requests cannot be served by Chat Completions and are transparently
+//! rerouted to the `OpenAI` Responses API
+//! ([`OpenAIResponsesProvider`]). The reroute (`should_use_responses_api`) fires
+//! when:
+//!
+//! - the model only exists on the Responses surface (e.g. `gpt-5.2-codex`), or
+//! - the request carries attachments (images / documents), or
+//! - the request is *agentic* (has tools or tool-use/tool-result blocks) against
+//!   the official `api.openai.com` base URL.
+//!
+//! The reroute forwards the provider's pooled HTTP client and `extra_headers`
+//! (the BYOK / gateway auth mechanism) so a rerouted request keeps connection
+//! reuse and authenticates identically to a non-rerouted one.
 
 use crate::attachments::{request_has_attachments, validate_request_attachments};
 use crate::provider::LlmProvider;
-use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
+use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
     ThinkingConfig, ThinkingMode, Usage,
@@ -20,10 +33,23 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::openai_responses::OpenAIResponsesProvider;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Build an HTTP client with connect/keepalive timeouts matching the sibling
+/// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
+/// connect timeout, so a black-holed connect would wedge `chat`/`chat_stream`
+/// forever.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
 
 /// Check if a model requires the Responses API instead of Chat Completions.
 fn requires_responses_api(model: &str) -> bool {
@@ -120,7 +146,7 @@ impl OpenAIProvider {
     #[must_use]
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
@@ -162,7 +188,7 @@ impl OpenAIProvider {
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
@@ -347,22 +373,33 @@ impl OpenAIProvider {
             .iter()
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
+
+    /// Build the `OpenAIResponsesProvider` used for the transparent Responses-API
+    /// reroute, forwarding this provider's pooled client, thinking config, and
+    /// extra headers so the rerouted request reuses connections and authenticates
+    /// identically (critical for BYOK / gateway setups with an empty `api_key`).
+    fn responses_reroute(&self) -> OpenAIResponsesProvider {
+        let mut provider = OpenAIResponsesProvider::with_base_url(
+            self.api_key.clone(),
+            self.model.clone(),
+            self.base_url.clone(),
+        )
+        .with_client(self.client.clone())
+        .with_extra_headers(self.extra_headers.clone());
+        if let Some(thinking) = self.thinking.clone() {
+            provider = provider.with_thinking(thinking);
+        }
+        provider
+    }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
-        // Route official OpenAI agentic flows to the Responses API.
+        // Route official OpenAI agentic flows to the Responses API, preserving
+        // the pooled client and extra_headers (BYOK / gateway auth).
         if should_use_responses_api(&self.base_url, &self.model, &request) {
-            let mut responses_provider = OpenAIResponsesProvider::with_base_url(
-                self.api_key.clone(),
-                self.model.clone(),
-                self.base_url.clone(),
-            );
-            if let Some(thinking) = self.thinking.clone() {
-                responses_provider = responses_provider.with_thinking(thinking);
-            }
-            return responses_provider.chat(request).await;
+            return self.responses_reroute().chat(request).await;
         }
 
         let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
@@ -432,18 +469,11 @@ impl LlmProvider for OpenAIProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
-        // Route official OpenAI agentic flows to the Responses API.
+        // Route official OpenAI agentic flows to the Responses API, preserving
+        // the pooled client and extra_headers (BYOK / gateway auth).
         if should_use_responses_api(&self.base_url, &self.model, &request) {
-            let api_key = self.api_key.clone();
-            let model = self.model.clone();
-            let base_url = self.base_url.clone();
-            let thinking = self.thinking.clone();
+            let responses_provider = self.responses_reroute();
             return Box::pin(async_stream::stream! {
-                let mut responses_provider =
-                    OpenAIResponsesProvider::with_base_url(api_key, model, base_url);
-                if let Some(thinking) = thinking {
-                    responses_provider = responses_provider.with_thinking(thinking);
-                }
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
                 while let Some(item) = futures::StreamExt::next(&mut stream).await {
                     yield item;
@@ -498,9 +528,8 @@ impl LlmProvider for OpenAIProvider {
                 stream_options: include_stream_usage.then_some(ApiStreamOptions {
                     include_usage: true,
                 }),
-                usage: include_openrouter_usage.then_some(ApiOpenRouterUsageOptions {
-                    include: true,
-                }),
+                usage: include_openrouter_usage
+                    .then_some(ApiOpenRouterUsageOptions { include: true }),
                 stream: true,
             };
 
@@ -536,49 +565,51 @@ impl LlmProvider for OpenAIProvider {
             }
 
             // Track tool call state across deltas
-            let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
-                std::collections::HashMap::new();
+            let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
             let mut usage: Option<Usage> = None;
+            // The stop reason from `finish_reason`. With stream_options.include_usage
+            // (official OpenAI) the usage arrives in a SEPARATE trailing chunk
+            // (choices: []) AFTER finish_reason and before [DONE], so we record the
+            // stop reason and keep consuming until [DONE] / stream end rather than
+            // returning early and dropping that usage chunk.
             let mut stop_reason: Option<StopReason> = None;
-            let mut buffer = String::new();
+            let mut sse = SseLineBuffer::new();
             let mut stream = response.bytes_stream();
 
             while let Some(chunk_result) = stream.next().await {
-                let Ok(chunk) = chunk_result else {
-                    yield Err(anyhow::anyhow!("stream error: {}", chunk_result.unwrap_err()));
-                    return;
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield Err(anyhow::anyhow!("stream error: {error}"));
+                        return;
+                    }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                sse.extend(&chunk);
 
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                while let Some(line) = sse.next_line() {
+                    let line = line.trim();
                     if line.is_empty() { continue; }
                     let Some(data) = line.strip_prefix("data: ") else { continue; };
 
-                    for result in process_sse_data(data) {
-                        match result {
-                            SseProcessResult::TextDelta(c) => yield Ok(StreamDelta::TextDelta { delta: c, block_index: 0 }),
-                            SseProcessResult::ThinkingDelta(c) => yield Ok(StreamDelta::ThinkingDelta { delta: c, block_index: 0 }),
-                            SseProcessResult::ToolCallUpdate { index, id, name, arguments } => apply_tool_call_update(&mut tool_calls, index, id, name, arguments),
-                            SseProcessResult::Usage(u) => usage = Some(u),
-                            SseProcessResult::Done(sr) => {
-                                stop_reason = Some(sr);
-                            }
-                            SseProcessResult::Sentinel => {
-                                let sr = stop_reason
-                                    .unwrap_or_else(|| fallback_stream_stop_reason(&tool_calls));
-                                for d in build_stream_end_deltas(&tool_calls, usage.take(), sr) { yield Ok(d); }
-                                return;
-                            }
-                        }
+                    let outcome = step_completion_stream(
+                        data,
+                        &mut tool_calls,
+                        &mut usage,
+                        &mut stop_reason,
+                    );
+                    for delta in outcome.immediate { yield Ok(delta); }
+                    if let Some(terminal) = outcome.terminal {
+                        for delta in terminal { yield Ok(delta); }
+                        return;
                     }
                 }
             }
 
-            // Stream ended without [DONE] - emit what we have
+            // Stream ended without [DONE] - emit what we have. Infer the stop
+            // reason from accumulated tool calls (same heuristic as the [DONE]
+            // arm) so a stream that dies mid-tool-call doesn't report EndTurn.
             let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(&tool_calls));
-            for delta in build_stream_end_deltas(&tool_calls, usage, sr) {
+            for delta in build_stream_end_deltas(&tool_calls, usage.take(), sr) {
                 yield Ok(delta);
             }
         })
@@ -623,6 +654,68 @@ fn apply_tool_call_update(
     }
 }
 
+/// Immediate + terminal deltas produced by feeding one SSE `data:` line to the
+/// Chat Completions streaming state.
+struct SseLineOutcome {
+    /// Deltas to yield immediately (text / thinking).
+    immediate: Vec<StreamDelta>,
+    /// When `Some`, the stream finished ([DONE] received): yield these terminal
+    /// deltas (tool calls + usage + Done) and stop.
+    terminal: Option<Vec<StreamDelta>>,
+}
+
+/// Feed one SSE `data:` payload to the streaming state, accumulating tool calls,
+/// usage, and the stop reason.
+///
+/// Text/thinking deltas are returned for immediate emission. A `finish_reason`
+/// only records the stop reason (it does NOT finalize) so a trailing usage-only
+/// chunk that official `OpenAI` sends after `finish_reason` is still folded in;
+/// finalization happens on the `[DONE]` sentinel.
+fn step_completion_stream(
+    data: &str,
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    usage: &mut Option<Usage>,
+    stop_reason: &mut Option<StopReason>,
+) -> SseLineOutcome {
+    let mut immediate = Vec::new();
+    for result in process_sse_data(data) {
+        match result {
+            SseProcessResult::TextDelta(c) => {
+                immediate.push(StreamDelta::TextDelta {
+                    delta: c,
+                    block_index: 0,
+                });
+            }
+            SseProcessResult::ThinkingDelta(c) => {
+                immediate.push(StreamDelta::ThinkingDelta {
+                    delta: c,
+                    block_index: 0,
+                });
+            }
+            SseProcessResult::ToolCallUpdate {
+                index,
+                id,
+                name,
+                arguments,
+            } => apply_tool_call_update(tool_calls, index, id, name, arguments),
+            SseProcessResult::Usage(u) => *usage = Some(u),
+            SseProcessResult::Done(sr) => *stop_reason = Some(sr),
+            SseProcessResult::Sentinel => {
+                let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(tool_calls));
+                let terminal = build_stream_end_deltas(tool_calls, usage.take(), sr);
+                return SseLineOutcome {
+                    immediate,
+                    terminal: Some(terminal),
+                };
+            }
+        }
+    }
+    SseLineOutcome {
+        immediate,
+        terminal: None,
+    }
+}
+
 /// Helper to emit tool call deltas and done event.
 fn build_stream_end_deltas(
     tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
@@ -631,18 +724,21 @@ fn build_stream_end_deltas(
 ) -> Vec<StreamDelta> {
     let mut deltas = Vec::new();
 
-    // Emit tool calls
+    // Emit tool calls. `idx` comes from the wire `tool_calls[].index`; use
+    // saturating_add so a hostile `usize::MAX` index cannot overflow-panic in
+    // debug builds. StreamAccumulator sorts by index so order stays stable.
     for (idx, tool) in tool_calls {
+        let block_index = idx.saturating_add(1);
         deltas.push(StreamDelta::ToolUseStart {
             id: tool.id.clone(),
             name: tool.name.clone(),
-            block_index: *idx + 1,
+            block_index,
             thought_signature: None,
         });
         deltas.push(StreamDelta::ToolInputDelta {
             id: tool.id.clone(),
             delta: tool.arguments.clone(),
-            block_index: *idx + 1,
+            block_index,
         });
     }
 
@@ -657,16 +753,6 @@ fn build_stream_end_deltas(
     });
 
     deltas
-}
-
-fn fallback_stream_stop_reason(
-    tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
-) -> StopReason {
-    if tool_calls.is_empty() {
-        StopReason::EndTurn
-    } else {
-        StopReason::ToolUse
-    }
 }
 
 /// Result of processing an SSE chunk.
@@ -767,12 +853,31 @@ fn use_max_tokens_alias(base_url: &str) -> bool {
         || base_url.contains("minimax.io")
 }
 
+/// Every `OpenAI`-compatible endpoint accepts `stream_options.include_usage`;
+/// requesting it everywhere ensures `OpenRouter` / `Baseten` / local streams
+/// carry a usage frame so `total_usage` and downstream cost ledgers are
+/// populated (issue #302), not just first-party `api.openai.com` turns.
 const fn use_stream_usage_options(_base_url: &str) -> bool {
     true
 }
 
+/// `OpenRouter` requires a separate top-level `usage: { include: true }` flag
+/// (distinct from `stream_options.include_usage`) to emit a usage frame.
 fn use_openrouter_usage_options(base_url: &str) -> bool {
     base_url.contains("openrouter.ai")
+}
+
+/// Infer the stream stop reason when the provider never sent an explicit
+/// `finish_reason` (truncated stream / EOF): a turn with accumulated tool
+/// calls is a `ToolUse`, otherwise a plain `EndTurn`.
+fn fallback_stream_stop_reason(
+    tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
+) -> StopReason {
+    if tool_calls.is_empty() {
+        StopReason::EndTurn
+    } else {
+        StopReason::ToolUse
+    }
 }
 
 /// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
@@ -1193,6 +1298,8 @@ struct ApiStreamOptions {
     include_usage: bool,
 }
 
+/// `OpenRouter`'s top-level usage-accounting flag (`usage: { include: true }`),
+/// distinct from `stream_options.include_usage`.
 #[derive(Clone, Copy, Serialize)]
 struct ApiOpenRouterUsageOptions {
     include: bool,
@@ -1341,6 +1448,9 @@ struct ToolCallAccumulator {
 /// A single chunk in `OpenAI`'s SSE stream.
 #[derive(Deserialize)]
 struct SseChunk {
+    // A usage-only frame (OpenAI's trailing chunk, OpenRouter, etc.) may omit
+    // `choices` entirely; without `default` it fails to deserialize and the
+    // usage frame is dropped silently.
     #[serde(default)]
     choices: Vec<SseChoice>,
     #[serde(default)]
@@ -2461,127 +2571,6 @@ mod tests {
     }
 
     #[test]
-    fn test_process_sse_data_reads_usage_when_choices_are_omitted() {
-        let results = process_sse_data(
-            r#"{
-                "usage": {
-                    "prompt_tokens": 42,
-                    "completion_tokens": 7,
-                    "prompt_tokens_details": {
-                        "cached_tokens": 10
-                    }
-                }
-            }"#,
-        );
-
-        assert!(matches!(
-            results.as_slice(),
-            [SseProcessResult::Usage(Usage {
-                input_tokens: 42,
-                output_tokens: 7,
-                cached_input_tokens: 10,
-                cache_creation_input_tokens: 0,
-            })]
-        ));
-    }
-
-    #[test]
-    fn test_fallback_stream_stop_reason_uses_tool_use_when_tool_calls_accumulated() {
-        let mut tool_calls = std::collections::HashMap::new();
-        assert_eq!(
-            fallback_stream_stop_reason(&tool_calls),
-            StopReason::EndTurn
-        );
-
-        tool_calls.insert(
-            0,
-            ToolCallAccumulator {
-                id: "call_123".to_owned(),
-                name: "search".to_owned(),
-                arguments: "{}".to_owned(),
-            },
-        );
-
-        assert_eq!(
-            fallback_stream_stop_reason(&tool_calls),
-            StopReason::ToolUse
-        );
-    }
-
-    #[tokio::test]
-    async fn test_chat_stream_reads_trailing_usage_after_finish_reason() -> anyhow::Result<()> {
-        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
-
-        let server = MockServer::start().await;
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
-            "data: [DONE]\n\n",
-        );
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/chat/completions"))
-            .and(matchers::body_partial_json(serde_json::json!({
-                "stream_options": {
-                    "include_usage": true,
-                },
-            })))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(body),
-            )
-            .mount(&server)
-            .await;
-
-        let provider = OpenAIProvider::with_base_url(
-            "test-key-not-a-secret",
-            "custom-compatible-model",
-            server.uri(),
-        );
-        let request = ChatRequest {
-            system: String::new(),
-            messages: vec![agent_sdk_foundation::llm::Message::user("hello")],
-            tools: None,
-            max_tokens: 16,
-            max_tokens_explicit: true,
-            session_id: None,
-            cached_content: None,
-            thinking: None,
-            tool_choice: None,
-            response_format: None,
-        };
-
-        let mut stream = std::pin::pin!(provider.chat_stream(request));
-        let mut saw_usage = false;
-        let mut saw_done = false;
-        while let Some(item) = stream.next().await {
-            match item.context("stream delta")? {
-                StreamDelta::Usage(Usage {
-                    input_tokens: 12,
-                    output_tokens: 3,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                }) => {
-                    assert!(!saw_done);
-                    saw_usage = true;
-                }
-                StreamDelta::Done { stop_reason } => {
-                    assert!(saw_usage);
-                    assert_eq!(stop_reason, Some(StopReason::EndTurn));
-                    saw_done = true;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(saw_usage);
-        assert!(saw_done);
-        Ok(())
-    }
-
-    #[test]
     fn test_sse_delta_deserializes_reasoning_fields() -> anyhow::Result<()> {
         // The streaming delta struct must accept DeepSeek `reasoning_content`
         // and OpenRouter-normalized `reasoning` so reasoning tokens are not
@@ -2705,22 +2694,6 @@ mod tests {
         assert!(use_max_tokens_alias(BASE_URL_KIMI));
         assert!(use_max_tokens_alias(BASE_URL_ZAI));
         assert!(use_max_tokens_alias(BASE_URL_MINIMAX));
-    }
-
-    #[test]
-    fn test_use_stream_usage_options_is_always_enabled() {
-        assert!(use_stream_usage_options(""));
-        assert!(use_stream_usage_options(DEFAULT_BASE_URL));
-        assert!(use_stream_usage_options("https://api.openai.com/v1"));
-        assert!(use_stream_usage_options("http://localhost:11434/v1"));
-        assert!(use_stream_usage_options("https://gateway.example.test/v1"));
-    }
-
-    #[test]
-    fn test_use_openrouter_usage_options_only_for_openrouter() {
-        assert!(use_openrouter_usage_options("https://openrouter.ai/api/v1"));
-        assert!(!use_openrouter_usage_options(DEFAULT_BASE_URL));
-        assert!(!use_openrouter_usage_options("http://localhost:11434/v1"));
     }
 
     #[test]
@@ -2890,6 +2863,68 @@ mod tests {
     }
 
     #[test]
+    fn stream_usage_is_requested_for_every_endpoint() {
+        // issue #302: usage must be requested on ALL OpenAI-compatible
+        // endpoints, not just api.openai.com, so OpenRouter/Baseten/local
+        // turns report token usage to cost ledgers and budgets.
+        assert!(use_stream_usage_options("https://api.openai.com/v1"));
+        assert!(use_stream_usage_options("https://openrouter.ai/api/v1"));
+        assert!(use_stream_usage_options("https://host.baseten.co/v1"));
+        assert!(use_stream_usage_options("http://localhost:1234/v1"));
+    }
+
+    #[test]
+    fn openrouter_usage_flag_only_for_openrouter() {
+        assert!(use_openrouter_usage_options("https://openrouter.ai/api/v1"));
+        assert!(!use_openrouter_usage_options("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn streaming_request_serializes_openrouter_usage_flag() -> anyhow::Result<()> {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("hi".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let request = ApiChatRequestStreaming {
+            model: "anthropic/claude-3.5",
+            messages: &messages,
+            max_completion_tokens: Some(16),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+            stream_options: Some(ApiStreamOptions {
+                include_usage: true,
+            }),
+            usage: Some(ApiOpenRouterUsageOptions { include: true }),
+            stream: true,
+        };
+        let json = serde_json::to_string(&request)?;
+        assert!(json.contains("\"usage\":{\"include\":true}"));
+        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_only_chunk_without_choices_deserializes() -> anyhow::Result<()> {
+        // OpenAI's trailing usage frame (and some OpenRouter frames) omit
+        // `choices` entirely; the chunk must still deserialize so the usage is
+        // captured instead of being silently dropped (issue #302).
+        let no_choices: SseChunk = serde_json::from_str("{}")?;
+        assert!(no_choices.choices.is_empty());
+
+        let usage_only: SseChunk =
+            serde_json::from_str(r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#)?;
+        assert!(usage_only.choices.is_empty());
+        assert!(usage_only.usage.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn test_streaming_request_serialization_with_max_tokens_alias() {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
@@ -2908,9 +2943,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
-            stream_options: Some(ApiStreamOptions {
-                include_usage: true,
-            }),
+            stream_options: None,
             usage: None,
             stream: true,
         };
@@ -2918,40 +2951,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
-        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
-        assert!(!json.contains("\"usage\""));
-    }
-
-    #[test]
-    fn test_streaming_request_serialization_with_openrouter_usage_options() -> anyhow::Result<()> {
-        let messages = vec![ApiMessage {
-            role: ApiRole::User,
-            content: Some("Hello".to_string()),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-        }];
-
-        let request = ApiChatRequestStreaming {
-            model: "openrouter/model",
-            messages: &messages,
-            max_completion_tokens: Some(1024),
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            response_format: None,
-            stream_options: Some(ApiStreamOptions {
-                include_usage: true,
-            }),
-            usage: Some(ApiOpenRouterUsageOptions { include: true }),
-            stream: true,
-        };
-
-        let json = serde_json::to_string(&request).context("serialize streaming request")?;
-        assert!(json.contains("\"stream_options\":{\"include_usage\":true}"));
-        assert!(json.contains("\"usage\":{\"include\":true}"));
-        Ok(())
+        assert!(!json.contains("\"stream_options\""));
     }
 
     #[test]
@@ -3017,6 +3017,55 @@ mod tests {
             json["response_format"]["json_schema"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn test_step_completion_stream_emits_trailing_usage_after_finish_reason() {
+        // Official OpenAI with stream_options.include_usage sends the usage in a
+        // SEPARATE chunk (choices: []) AFTER the finish_reason chunk, then [DONE].
+        // The streaming loop must keep consuming past finish_reason so that usage
+        // is captured and emitted (previously it returned early on Done, dropping
+        // the usage entirely).
+        let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
+        let mut usage: Option<Usage> = None;
+        let mut stop_reason: Option<StopReason> = None;
+
+        // Chunk 1: text delta + finish_reason — must NOT finalize.
+        let o1 = step_completion_stream(
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            &mut tool_calls,
+            &mut usage,
+            &mut stop_reason,
+        );
+        assert!(o1.terminal.is_none());
+        assert!(matches!(stop_reason, Some(StopReason::EndTurn)));
+
+        // Chunk 2: usage-only trailing chunk (choices: []).
+        let o2 = step_completion_stream(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            &mut tool_calls,
+            &mut usage,
+            &mut stop_reason,
+        );
+        assert!(o2.terminal.is_none());
+
+        // Chunk 3: [DONE] sentinel finalizes and must carry the trailing usage.
+        let o3 = step_completion_stream("[DONE]", &mut tool_calls, &mut usage, &mut stop_reason);
+        let terminal = o3.terminal.expect("[DONE] finalizes the stream");
+        assert!(terminal.iter().any(|d| matches!(
+            d,
+            StreamDelta::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..
+            })
+        )));
+        assert!(terminal.iter().any(|d| matches!(
+            d,
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::EndTurn)
+            }
+        )));
     }
 
     #[test]

@@ -10,7 +10,7 @@ reason, call tools, and take actions through a streaming, event-driven loop.
 
 ```toml
 [dependencies]
-agent-sdk = "0.8"
+agent-sdk = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -63,7 +63,7 @@ the `anthropic` provider and the core runtime — no `sqlx`, `tonic`, `lapin`,
 | `otel` | OpenTelemetry spans |
 
 ```toml
-agent-sdk = { version = "0.8", features = ["openai", "gemini", "web", "mcp"] }
+agent-sdk = { version = "0.9", features = ["openai", "gemini", "web", "mcp"] }
 ```
 
 ## Cookbook

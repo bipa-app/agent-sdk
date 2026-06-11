@@ -80,13 +80,19 @@ impl SkillLoader for FileSkillLoader {
     async fn load(&self, name: &str) -> Result<Skill> {
         let path = self.skill_path(name)?;
 
-        if !path.exists() {
-            bail!("Skill file not found: {}", path.display());
-        }
-
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read skill file: {}", path.display()))?;
+        // Read directly and map the NotFound error to a friendly message. This
+        // drops the redundant `exists()` stat (one fewer syscall) and closes
+        // the TOCTOU window between the pre-check and the read.
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                bail!("Skill file not found: {}", path.display());
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to read skill file: {}", path.display()));
+            }
+        };
 
         let skill = parse_skill_file(&content)
             .with_context(|| format!("Failed to parse skill file: {}", path.display()))?;
@@ -131,6 +137,15 @@ impl SkillLoader for FileSkillLoader {
 
         skills.sort();
         Ok(skills)
+    }
+
+    async fn exists(&self, name: &str) -> bool {
+        // Cheap existence check: stat the file instead of reading, parsing, and
+        // sanitizing it via the default `load(..).is_ok()` implementation.
+        let Ok(path) = self.skill_path(name) else {
+            return false;
+        };
+        tokio::fs::try_exists(&path).await.unwrap_or(false)
     }
 }
 

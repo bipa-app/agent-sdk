@@ -22,7 +22,7 @@ use crate::impls::gemini::data::{
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ResponseFormat, ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,6 +38,15 @@ pub const MODEL_GEMINI_3_PRO: &str = "gemini-3.0-pro";
 /// The Anthropic API version used for Claude models on Vertex AI.
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+/// Connect timeout for the HTTP client (matches Anthropic).
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// TCP keepalive interval to keep long streaming connections from dropping.
+const TCP_KEEPALIVE_SECS: u64 = 30;
+/// Per-request read timeout for the **non-streaming** chat paths. Bounds a
+/// black-holed endpoint so a single turn cannot hang the agent loop forever.
+/// Streaming requests intentionally have no overall timeout.
+const CHAT_READ_TIMEOUT_SECS: u64 = 300;
 
 const fn vertex_cache_control() -> anthropic_data::ApiCacheControl {
     anthropic_data::ApiCacheControl::ephemeral()
@@ -66,10 +75,15 @@ impl VertexProvider {
     #[must_use]
     pub fn new(access_token: String, project_id: String, region: String, model: String) -> Self {
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .tcp_keepalive(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                log::warn!(
+                    "failed to build Vertex HTTP client with timeouts ({error}); using default client"
+                );
+                reqwest::Client::new()
+            });
 
         Self {
             client,
@@ -157,6 +171,20 @@ impl VertexProvider {
         system: &str,
     ) -> Option<anthropic_data::ApiSystemPrompt<'_>> {
         anthropic_data::build_api_system_prompt(system, Some(vertex_cache_control()))
+    }
+
+    /// Effective output-token budget for a request.
+    ///
+    /// Mirrors the Anthropic provider: an implicit budget falls back to the
+    /// provider/model default ([`default_max_tokens`](LlmProvider::default_max_tokens),
+    /// which clamps to Vertex's safe ceiling) instead of silently capping at
+    /// `ChatRequest::DEFAULT_MAX_TOKENS`.
+    fn effective_max_tokens(&self, request: &ChatRequest) -> u32 {
+        if request.max_tokens_explicit {
+            request.max_tokens
+        } else {
+            self.default_max_tokens()
+        }
     }
 
     fn map_claude_response(api_response: anthropic_data::ApiResponse) -> ChatResponse {
@@ -283,7 +311,10 @@ impl VertexProvider {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
         let contents = build_api_contents(&request.messages);
-        let tools = request.tools.map(convert_tools_to_config);
+        let tools = request
+            .tools
+            .as_ref()
+            .map(|t| convert_tools_to_config(t.clone()));
         let tool_config = request
             .tool_choice
             .as_ref()
@@ -309,13 +340,14 @@ impl VertexProvider {
                 )
             });
 
+        let max_tokens = self.effective_max_tokens(&request);
         let api_request = ApiGenerateContentRequest {
             contents: &contents,
             system_instruction: system_instruction.as_ref(),
             tools: tools.as_ref().map(std::slice::from_ref),
             tool_config,
             generation_config: Some(ApiGenerationConfig {
-                max_output_tokens: Some(request.max_tokens),
+                max_output_tokens: Some(max_tokens),
                 thinking_config,
                 response_mime_type,
                 response_schema,
@@ -326,7 +358,7 @@ impl VertexProvider {
         log::debug!(
             "Vertex AI LLM request model={} max_tokens={}",
             self.model,
-            request.max_tokens
+            max_tokens
         );
 
         let url = format!("{}:generateContent", self.base_url("google"));
@@ -335,6 +367,7 @@ impl VertexProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS))
             .bearer_auth(&self.access_token)
             .json(&api_request)
             .send()
@@ -433,42 +466,29 @@ impl VertexProvider {
                 });
                 return;
             }
+
             let contents = build_api_contents(&request.messages);
-            let tools = request.tools.map(convert_tools_to_config);
+            let tools = request
+                .tools
+                .as_ref()
+                .map(|t| convert_tools_to_config(t.clone()));
             let tool_config = request
                 .tool_choice
                 .as_ref()
                 .map(ApiFunctionCallingConfig::from_tool_choice);
-            let system_instruction = if request.system.is_empty() {
-                None
-            } else {
-                Some(ApiContent {
-                    role: None,
-                    parts: vec![ApiPart::Text {
-                        text: request.system.clone(),
-                        thought_signature: None,
-                    }],
-                })
-            };
-
+            let system_instruction = build_gemini_system_instruction(&request.system);
             let thinking_config = thinking.as_ref().map(map_thinking_config);
-            let (response_mime_type, response_schema) = request
-                .response_format
-                .as_ref()
-                .map_or((None, None), |rf| {
-                    (
-                        Some("application/json"),
-                        Some(gemini_response_schema(&rf.schema)),
-                    )
-                });
+            let (response_mime_type, response_schema) =
+                gemini_response_format(request.response_format.as_ref());
 
+            let max_tokens = self.effective_max_tokens(&request);
             let api_request = ApiGenerateContentRequest {
                 contents: &contents,
                 system_instruction: system_instruction.as_ref(),
                 tools: tools.as_ref().map(std::slice::from_ref),
                 tool_config,
                 generation_config: Some(ApiGenerationConfig {
-                    max_output_tokens: Some(request.max_tokens),
+                    max_output_tokens: Some(max_tokens),
                     thinking_config,
                     response_mime_type,
                     response_schema,
@@ -479,41 +499,18 @@ impl VertexProvider {
             log::debug!(
                 "Vertex AI streaming LLM request model={} max_tokens={}",
                 self.model,
-                request.max_tokens
+                max_tokens
             );
 
             let url = format!("{}:streamGenerateContent?alt=sse", self.base_url("google"));
 
-            let Ok(response) = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .bearer_auth(&self.access_token)
-                .json(&api_request)
-                .send()
-                .await
-            else {
-                yield Err(anyhow::anyhow!("request failed"));
-                return;
+            let response = match self.send_gemini_stream_request(&url, &api_request).await {
+                Ok(response) => response,
+                Err(item) => {
+                    yield item;
+                    return;
+                }
             };
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                    StreamErrorKind::RateLimited
-                } else if status.is_server_error() {
-                    StreamErrorKind::ServerError
-                } else {
-                    StreamErrorKind::InvalidRequest
-                };
-                log::warn!("Vertex AI error status={status} body={body}");
-                yield Ok(StreamDelta::Error {
-                    message: body,
-                    kind,
-                });
-                return;
-            }
 
             let mut inner = stream_gemini_response(response);
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
@@ -521,6 +518,81 @@ impl VertexProvider {
             }
         })
     }
+
+    /// Issue the Vertex Gemini streaming request, returning the raw response on
+    /// success or a ready-to-`yield` stream item describing the failure.
+    ///
+    /// The `Err` payload is the exact `StreamBox` item to `yield`: an
+    /// `anyhow::Error` for a transport failure, or a classified
+    /// [`StreamDelta::Error`] for a non-success HTTP status. This keeps the
+    /// generator's failure handling to a single `yield`.
+    async fn send_gemini_stream_request(
+        &self,
+        url: &str,
+        api_request: &ApiGenerateContentRequest<'_>,
+    ) -> Result<reqwest::Response, anyhow::Result<StreamDelta>> {
+        let response = match self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(&self.access_token)
+            .json(api_request)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            // Include the cause so 401 detection / diagnostics survive.
+            Err(e) => return Err(Err(anyhow::anyhow!("request failed: {e}"))),
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                StreamErrorKind::RateLimited
+            } else if status.is_server_error() {
+                StreamErrorKind::ServerError
+            } else {
+                StreamErrorKind::InvalidRequest
+            };
+            log::warn!("Vertex AI error status={status} body={body}");
+            return Err(Ok(StreamDelta::Error {
+                message: body,
+                kind,
+            }));
+        }
+
+        Ok(response)
+    }
+}
+
+/// Build the Gemini `system_instruction` content from the request system prompt,
+/// or `None` when the prompt is empty.
+fn build_gemini_system_instruction(system: &str) -> Option<ApiContent> {
+    if system.is_empty() {
+        None
+    } else {
+        Some(ApiContent {
+            role: None,
+            parts: vec![ApiPart::Text {
+                text: system.to_owned(),
+                thought_signature: None,
+            }],
+        })
+    }
+}
+
+/// Map an optional response format into Gemini's `(responseMimeType,
+/// responseSchema)` pair, sanitizing the schema to the subset Gemini accepts.
+fn gemini_response_format(
+    response_format: Option<&ResponseFormat>,
+) -> (Option<&'static str>, Option<serde_json::Value>) {
+    response_format.map_or((None, None), |rf| {
+        (
+            Some("application/json"),
+            Some(gemini_response_schema(&rf.schema)),
+        )
+    })
 }
 
 // ============================================================================
@@ -551,9 +623,10 @@ impl VertexProvider {
             .as_ref()
             .map(anthropic_data::ApiToolChoice::from_tool_choice);
 
+        let max_tokens = self.effective_max_tokens(&request);
         let api_request = anthropic_data::ApiMessagesRequest {
             model: None, // model is in the URL for Vertex
-            max_tokens: request.max_tokens,
+            max_tokens,
             system,
             messages: &messages,
             tools: tools.as_deref(),
@@ -567,7 +640,7 @@ impl VertexProvider {
         log::debug!(
             "Vertex AI (Claude) LLM request model={} max_tokens={}",
             self.model,
-            request.max_tokens
+            max_tokens
         );
 
         if log::log_enabled!(log::Level::Debug) {
@@ -583,6 +656,7 @@ impl VertexProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(CHAT_READ_TIMEOUT_SECS))
             .bearer_auth(&self.access_token)
             .json(&api_request)
             .send()
@@ -670,9 +744,10 @@ impl VertexProvider {
                 .as_ref()
                 .map(anthropic_data::ApiToolChoice::from_tool_choice);
 
+            let max_tokens = self.effective_max_tokens(&request);
             let api_request = anthropic_data::ApiMessagesRequest {
                 model: None, // model is in the URL for Vertex
-                max_tokens: request.max_tokens,
+                max_tokens,
                 system,
                 messages: &messages,
                 tools: tools.as_deref(),
@@ -686,7 +761,7 @@ impl VertexProvider {
             log::debug!(
                 "Vertex AI (Claude) streaming request model={} max_tokens={}",
                 self.model,
-                request.max_tokens
+                max_tokens
             );
 
             if log::log_enabled!(log::Level::Debug) {
@@ -757,9 +832,13 @@ impl VertexProvider {
             let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
 
             while let Some(chunk_result) = stream.next().await {
-                let Ok(chunk) = chunk_result else {
-                    yield Err(anyhow::anyhow!("stream error"));
-                    return;
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Include the cause so 401 detection / diagnostics survive.
+                        yield Err(anyhow::anyhow!("stream error: {e}"));
+                        return;
+                    }
                 };
 
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -1030,5 +1109,49 @@ mod tests {
         assert_eq!(MODEL_GEMINI_3_FLASH, "gemini-3-flash-preview");
         assert_eq!(MODEL_GEMINI_31_PRO, "gemini-3.1-pro-preview");
         assert_eq!(MODEL_GEMINI_3_PRO, "gemini-3.0-pro");
+    }
+
+    fn request_with_max_tokens(max_tokens: u32, explicit: bool) -> ChatRequest {
+        ChatRequest {
+            system: String::new(),
+            messages: vec![agent_sdk_foundation::llm::Message::user("hi")],
+            tools: None,
+            max_tokens,
+            max_tokens_explicit: explicit,
+            session_id: None,
+            cached_content: None,
+            thinking: None,
+            tool_choice: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_max_tokens_honors_explicit_budget() {
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_SONNET_46.to_string(),
+        );
+        let request = request_with_max_tokens(1234, true);
+        assert_eq!(provider.effective_max_tokens(&request), 1234);
+    }
+
+    #[test]
+    fn test_effective_max_tokens_uses_clamped_default_when_implicit() {
+        // An implicit budget for a Claude-on-Vertex model must fall back to the
+        // clamped default (<= 32k), not the unclamped capability ceiling and
+        // not ChatRequest::DEFAULT_MAX_TOKENS.
+        let provider = VertexProvider::new(
+            "token".to_string(),
+            "project".to_string(),
+            "global".to_string(),
+            MODEL_SONNET_46.to_string(),
+        );
+        let request = request_with_max_tokens(4096, false);
+        let effective = provider.effective_max_tokens(&request);
+        assert_eq!(effective, provider.default_max_tokens());
+        assert!(effective <= DEFAULT_SAFE_MAX_OUTPUT_TOKENS);
     }
 }

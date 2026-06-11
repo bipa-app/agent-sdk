@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nUPDATE agent_sdk_outbox\nSET status = 'delivered', delivered_at = $2\nWHERE id = $1 AND claimed_by = $3\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c26bbd05a8b44eb964098b268acf7ee0d2a032ca7a46fa3d3ffb51ad8a8f2137"
+}

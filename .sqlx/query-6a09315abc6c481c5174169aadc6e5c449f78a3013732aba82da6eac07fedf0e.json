@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nUPDATE agent_sdk_outbox\nSET\n    attempt_count = attempt_count + 1,\n    status = CASE\n        WHEN attempt_count + 1 >= max_attempts THEN 'expired'\n        ELSE 'pending'\n    END,\n    last_error = CASE\n        WHEN attempt_count + 1 >= max_attempts THEN $2\n        ELSE NULL\n    END,\n    next_attempt_at = CASE\n        WHEN attempt_count + 1 >= max_attempts THEN next_attempt_at\n        ELSE $3\n    END,\n    claimed_by = CASE\n        WHEN attempt_count + 1 >= max_attempts THEN claimed_by\n        ELSE NULL\n    END,\n    claimed_at = CASE\n        WHEN attempt_count + 1 >= max_attempts THEN claimed_at\n        ELSE NULL\n    END\nWHERE id = $1 AND claimed_by = $4\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6a09315abc6c481c5174169aadc6e5c449f78a3013732aba82da6eac07fedf0e"
+}

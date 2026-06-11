@@ -314,6 +314,9 @@ mod tests {
             CompletedTurnCommit {
                 thread_id: thread.clone(),
                 task_id: task_id.clone(),
+                // Every caller of this helper commits the thread's first
+                // turn (a fresh thread, or a crash-and-retry of turn 1).
+                expected_turn: 1,
                 turn_attempt_id: attempt.id,
                 close_attempt_params: CloseAttemptParams {
                     response_blob: serde_json::json!({"id": "msg", "content": []}),

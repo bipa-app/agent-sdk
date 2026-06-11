@@ -1,10 +1,13 @@
 use crate::events::AgentEventEnvelope;
-use crate::llm::{ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage};
+use crate::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, StreamBox, StreamDelta, Usage,
+};
 use crate::stores::{EventStore, InMemoryEventStore};
 use crate::tools::{ListenExecuteTool, ListenStopReason, ListenToolUpdate, Tool, ToolContext};
 use crate::types::{ThreadId, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -68,6 +71,24 @@ impl MockProvider {
         })
     }
 
+    /// A successful response whose stop reason signals the model's context
+    /// window was exceeded. Drives the overflow-recovery / compaction-retry
+    /// path in `handle_turn_stop_reason`.
+    pub fn context_window_exceeded() -> ChatOutcome {
+        ChatOutcome::Success(ChatResponse {
+            id: "msg_overflow".to_string(),
+            content: vec![],
+            model: "mock-model".to_string(),
+            stop_reason: Some(StopReason::ModelContextWindowExceeded),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        })
+    }
+
     pub fn tool_uses_response(tool_uses: Vec<(&str, &str, serde_json::Value)>) -> ChatOutcome {
         let content = tool_uses
             .into_iter()
@@ -104,6 +125,73 @@ impl crate::llm::LlmProvider for MockProvider {
         } else {
             // Default: end conversation
             Ok(Self::text_response("Done"))
+        }
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// One `chat_stream` attempt's scripted behaviour for [`StreamScriptProvider`].
+#[derive(Clone)]
+pub enum StreamScriptStep {
+    /// Yield these frames (as `Ok`) in order, then end the stream.
+    Frames(Vec<StreamDelta>),
+    /// Yield these frames, then never complete — simulates a half-open
+    /// connection that stalls mid-stream so the inactivity timeout fires.
+    FramesThenStall(Vec<StreamDelta>),
+}
+
+/// A streaming provider whose `chat_stream` returns a different scripted
+/// sequence of [`StreamDelta`]s per call. Lets streaming-retry and
+/// inactivity-timeout behaviour be driven deterministically.
+pub struct StreamScriptProvider {
+    steps: RwLock<Vec<StreamScriptStep>>,
+    call_count: AtomicUsize,
+}
+
+impl StreamScriptProvider {
+    pub fn new(steps: Vec<StreamScriptStep>) -> Self {
+        Self {
+            steps: RwLock::new(steps),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::llm::LlmProvider for StreamScriptProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        // Streaming tests set `config.streaming = true`, so `chat` is only a
+        // fallback (e.g. if a non-streaming path is reached unexpectedly).
+        Ok(MockProvider::text_response("Done"))
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let step = self
+            .steps
+            .read()
+            .ok()
+            .and_then(|steps| steps.get(idx).cloned());
+        match step {
+            Some(StreamScriptStep::Frames(frames)) => {
+                Box::pin(futures::stream::iter(frames.into_iter().map(Ok)))
+            }
+            Some(StreamScriptStep::FramesThenStall(frames)) => Box::pin(
+                futures::stream::iter(frames.into_iter().map(Ok))
+                    .chain(futures::stream::pending::<Result<StreamDelta>>()),
+            ),
+            None => Box::pin(futures::stream::iter(std::iter::once(Ok(
+                StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            )))),
         }
     }
 

@@ -57,7 +57,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
-use crate::provider::LlmProvider;
+use crate::model_capabilities::ModelCapabilities;
+use crate::provider::{LlmProvider, StructuredOutputSupport};
 use crate::streaming::{StreamBox, StreamDelta};
 
 /// Wraps a provider with host-driven credential refresh on 401.
@@ -66,23 +67,31 @@ use crate::streaming::{StreamBox, StreamDelta};
 /// atomically when the refresh callback produces a new provider. Cloning a
 /// wrapper is cheap — clones share the same inner state.
 ///
-/// Metadata (`model`, `provider`, `configured_thinking`) is captured from the
-/// initial provider at construction time and assumed constant across
-/// refreshes (the refresh callback rebuilds the same provider shape with a
-/// fresh token, not a different model).
+/// Metadata (`model`, `provider`, `configured_thinking`) and capability shaping
+/// (`capabilities`, `default_max_tokens`, `validate_thinking_config`,
+/// `structured_output_support`) are captured from the initial provider at
+/// construction time and assumed constant across refreshes (the refresh
+/// callback rebuilds the same provider shape with a fresh token, not a
+/// different model).
 pub struct RefreshingProvider<P, F> {
     inner: Arc<Mutex<P>>,
     refresh: Arc<F>,
+    /// A clone of the initial provider kept solely for delegating the
+    /// **synchronous** capability methods (which never touch credentials), so
+    /// wrapping a provider never changes how requests are shaped. The async
+    /// `chat`/`chat_stream` paths still go through the refreshable `inner`.
+    template: P,
     model: String,
     provider: &'static str,
     thinking: Option<ThinkingConfig>,
 }
 
-impl<P, F> Clone for RefreshingProvider<P, F> {
+impl<P: Clone, F> Clone for RefreshingProvider<P, F> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             refresh: Arc::clone(&self.refresh),
+            template: self.template.clone(),
             model: self.model.clone(),
             provider: self.provider,
             thinking: self.thinking.clone(),
@@ -108,9 +117,11 @@ where
         let model = inner.model().to_string();
         let provider = inner.provider();
         let thinking = inner.configured_thinking().cloned();
+        let template = inner.clone();
         Self {
             inner: Arc::new(Mutex::new(inner)),
             refresh: Arc::new(refresh),
+            template,
             model,
             provider,
             thinking,
@@ -258,6 +269,28 @@ where
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
     }
+
+    // Delegate capability shaping to the wrapped provider so that wrapping
+    // never silently changes request shaping (e.g. losing Vertex's max-token
+    // clamp or a provider's adaptive-thinking validation). These methods are
+    // synchronous and credential-independent, so they go through the captured
+    // `template` rather than locking the async-refreshable `inner`.
+
+    fn capabilities(&self) -> Option<&'static ModelCapabilities> {
+        self.template.capabilities()
+    }
+
+    fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+        self.template.validate_thinking_config(thinking)
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        self.template.default_max_tokens()
+    }
+
+    fn structured_output_support(&self) -> StructuredOutputSupport {
+        self.template.structured_output_support()
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +401,24 @@ mod tests {
         fn provider(&self) -> &'static str {
             self.provider_name
         }
+
+        // Sentinel capability overrides used to prove the wrapper delegates
+        // rather than falling back to trait defaults.
+        fn default_max_tokens(&self) -> u32 {
+            32_000
+        }
+
+        fn structured_output_support(&self) -> StructuredOutputSupport {
+            StructuredOutputSupport::Native
+        }
+
+        fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
+            if thinking.is_some() {
+                Err(anyhow::anyhow!("mock rejects thinking"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn success_response() -> ChatResponse {
@@ -428,6 +479,28 @@ mod tests {
             Box::pin(async move { Err(anyhow::anyhow!(error)) })
         });
         RefreshingProvider::new(mock.clone(), cb)
+    }
+
+    // Test 0: capability delegation (finding #12)
+    #[test]
+    fn wrapper_delegates_capability_overrides_to_inner() {
+        let mock = MockProvider::new();
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+
+        // Without delegation these would return trait defaults (4096 / Native
+        // is coincidental / Ok), masking per-provider clamps and validation.
+        assert_eq!(wrapped.default_max_tokens(), 32_000);
+        assert_eq!(
+            wrapped.structured_output_support(),
+            StructuredOutputSupport::Native
+        );
+        assert!(
+            wrapped
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_err()
+        );
+        assert!(wrapped.validate_thinking_config(None).is_ok());
     }
 
     // Test 1

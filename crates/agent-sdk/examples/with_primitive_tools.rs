@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("ANTHROPIC_API_KEY environment variable must be set");
+        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable must be set"))?;
 
     // Create an in-memory filesystem for this example
     // In production, you'd use LocalFileSystem
@@ -119,9 +119,10 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentEvent::ToolCallEnd { name, result, .. } => {
                 if result.success {
-                    // Truncate long outputs
-                    let output = if result.output.len() > 200 {
-                        format!("{}...", &result.output[..200])
+                    // Truncate long outputs on a char boundary so multi-byte
+                    // UTF-8 tool output never panics the demo.
+                    let output = if result.output.chars().count() > 200 {
+                        format!("{}...", result.output.chars().take(200).collect::<String>())
                     } else {
                         result.output.clone()
                     };

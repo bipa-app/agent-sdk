@@ -56,7 +56,14 @@ jobs:
   release:
     name: Publish to crates.io (manual)
     runs-on: ubuntu-latest
-    if: github.repository == 'bipa-app/agent-sdk' && github.event_name == 'workflow_dispatch'
+    # Branch guard: workflow_dispatch lets the operator pick ANY ref, so without
+    # `github.ref == 'refs/heads/main'` a dispatch from a stale or feature
+    # branch would run `release-plz release` against that branch's manifests and
+    # publish unreviewed code to crates.io. Only ever publish from `main`.
+    if: >-
+      github.repository == 'bipa-app/agent-sdk'
+      && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
         with:

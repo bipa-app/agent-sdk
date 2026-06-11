@@ -37,36 +37,40 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-  # cargo-semver-checks: guards the published crates against accidental
-  # API-breaking changes by diffing each publishable crate against its
-  # crates.io baseline. That baseline does not exist until the (deliberately
-  # deferred) first publish, so the check can only error today — running it on
-  # every PR would be permanent red noise for a gate that is, by definition,
-  # premature pre-publish.
-  #
-  # It therefore runs on-demand only (workflow_dispatch) — invoke it as part of
-  # release preparation once a published baseline exists. At that point, remove
-  # the `if:` guard (and `continue-on-error`) to make it a hard per-PR/release
-  # gate. See ENG-8728 / the COOKBOOK release section.
+  # cargo-semver-checks: diffs each publishable crate against its crates.io
+  # baseline to surface API-breaking changes. This is ADVISORY
+  # (continue-on-error), not a hard gate: release-plz owns versioning, so a
+  # feature PR legitimately carries a breaking change WITHOUT bumping the
+  # version in-PR — release-plz proposes the correct (minor, for 0.x) bump in
+  # its release PR from the conventional-commit/`BREAKING CHANGE:` markers. A
+  # blocking gate here would reject every breaking PR before release-plz can
+  # bump it. The report still runs so reviewers see the break; the version
+  # decision happens on the release PR. See ENG-8728 / the COOKBOOK release
+  # section.
   semver-checks:
-    name: cargo-semver-checks (public API)
+    name: cargo-semver-checks (public API, advisory)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
       # Only the publishable crates are checked; the internal server/host
-      # crates carry no semver contract.
-      - run: >-
-          cargo semver-checks check-release
-          --package agent-sdk-foundation
-          --package agent-sdk-tools
-          --package agent-sdk-providers
-          --package agent-sdk
-          --package agent-sdk-otel
-          --package agent-sdk-cli
+      # crates carry no semver contract. ADVISORY: the report runs but never
+      # fails the check — a feature PR legitimately carries a breaking change
+      # without bumping the version (release-plz proposes the bump on its
+      # release PR). On a break, we surface a GitHub ::warning:: annotation so
+      # reviewers see it, but the check stays green and never blocks merge.
+      - name: cargo-semver-checks (advisory; warns, never fails)
+        run: |
+          if ! cargo semver-checks check-release \
+            --package agent-sdk-foundation \
+            --package agent-sdk-tools \
+            --package agent-sdk-providers \
+            --package agent-sdk \
+            --package agent-sdk-otel \
+            --package agent-sdk-cli; then
+            echo "::warning title=cargo-semver-checks::Public-API breaking change detected. This is advisory — confirm the release-plz version bump is a major/minor as appropriate (0.x breaking -> minor)."
+          fi
 
   # MSRV: the published crates must build on the pinned minimum toolchain
   # declared in [workspace.package] rust-version. The internal

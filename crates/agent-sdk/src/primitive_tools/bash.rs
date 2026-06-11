@@ -39,6 +39,15 @@ struct BashInput {
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
 
+/// Hard upper bound on the command timeout. Larger requests are clamped to this
+/// value (and the clamp is surfaced in the tool result).
+const MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+
+/// Maximum size (in bytes) of the combined stdout/stderr output before it is
+/// truncated. The truncation notice and exit-code line are accounted for so the
+/// final result stays within this bound.
+const MAX_OUTPUT_BYTES: usize = 30_000;
+
 impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashTool<E> {
     type Name = PrimitiveToolName;
 
@@ -71,7 +80,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashToo
                         {"type": "integer"},
                         {"type": "string", "pattern": "^[0-9]+$"}
                     ],
-                    "description": "Timeout in milliseconds. Accepts either an integer or a numeric string. Default: 120000 (2 minutes)"
+                    "description": "Timeout in milliseconds. Accepts either an integer or a numeric string. Default: 120000 (2 minutes). Maximum: 600000 (10 minutes); larger values are clamped."
                 }
             },
             "required": ["command"]
@@ -79,7 +88,11 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashToo
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
-        let input: BashInput = serde_json::from_value(input.clone())
+        // Headroom reserved for the truncation notice appended below, so the
+        // final result stays within `MAX_OUTPUT_BYTES`.
+        const TRUNCATION_NOTICE_RESERVE: usize = 80;
+
+        let input: BashInput = BashInput::deserialize(&input)
             .with_context(|| format!("Invalid input for bash tool: {input}"))?;
 
         // Check exec capability and command allow/deny rules
@@ -90,8 +103,10 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashToo
             )));
         }
 
-        // Validate timeout
-        let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(600_000); // Max 10 minutes
+        // Validate timeout. Requests above the maximum are clamped; the clamp is
+        // surfaced in the result so the model knows its value was reduced.
+        let requested_timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let timeout_ms = requested_timeout_ms.min(MAX_TIMEOUT_MS);
 
         // Execute command
         let result = self
@@ -119,18 +134,27 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for BashToo
             output = "(no output)".to_string();
         }
 
-        // Truncate if too long (UTF-8 safe)
-        let max_output_len = 30_000;
-        if output.len() > max_output_len {
-            let truncated = super::truncate_str(&output, max_output_len);
-            output = format!(
-                "{truncated}...\n\n(output truncated, {} total characters)",
-                output.len()
-            );
+        // Truncate if too long (UTF-8 safe). Reserve room for the exit-code line
+        // and the truncation notice so the final result stays within the cap.
+        let exit_suffix = format!("\n\nExit code: {}", result.exit_code);
+        let content_budget =
+            MAX_OUTPUT_BYTES.saturating_sub(exit_suffix.len() + TRUNCATION_NOTICE_RESERVE);
+        if output.len() > content_budget {
+            let original_len = output.len();
+            let truncated = super::truncate_str(&output, content_budget);
+            output = format!("{truncated}...\n\n(output truncated, {original_len} total bytes)");
         }
 
         // Include exit code in output
-        let _ = write!(output, "\n\nExit code: {}", result.exit_code);
+        output.push_str(&exit_suffix);
+
+        // Tell the model when its requested timeout was reduced to the maximum.
+        if requested_timeout_ms > MAX_TIMEOUT_MS {
+            let _ = write!(
+                output,
+                "\n\n(requested timeout {requested_timeout_ms}ms exceeds the maximum of {MAX_TIMEOUT_MS}ms; clamped to {MAX_TIMEOUT_MS}ms)"
+            );
+        }
 
         let tool_result = if result.success() {
             ToolResult::success(output)
@@ -164,6 +188,9 @@ mod tests {
         root: String,
         // Map of command to (stdout, stderr, exit_code)
         commands: RwLock<HashMap<String, (String, String, i32)>>,
+        // Records the timeout forwarded to the most recent `exec` call so tests
+        // can assert default/parsed/clamped values are passed through.
+        last_timeout_ms: RwLock<Option<u64>>,
     }
 
     impl MockBashEnvironment {
@@ -171,14 +198,20 @@ mod tests {
             Self {
                 root: "/workspace".to_string(),
                 commands: RwLock::new(HashMap::new()),
+                last_timeout_ms: RwLock::new(None),
             }
         }
 
-        fn add_command(&self, cmd: &str, stdout: &str, stderr: &str, exit_code: i32) {
-            self.commands.write().unwrap().insert(
+        fn add_command(&self, cmd: &str, stdout: &str, stderr: &str, exit_code: i32) -> Result<()> {
+            self.commands.write().ok().context("lock poisoned")?.insert(
                 cmd.to_string(),
                 (stdout.to_string(), stderr.to_string(), exit_code),
             );
+            Ok(())
+        }
+
+        fn recorded_timeout(&self) -> Result<Option<u64>> {
+            Ok(*self.last_timeout_ms.read().ok().context("lock poisoned")?)
         }
     }
 
@@ -241,8 +274,9 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn exec(&self, command: &str, _timeout_ms: Option<u64>) -> Result<ExecResult> {
-            let commands = self.commands.read().unwrap();
+        async fn exec(&self, command: &str, timeout_ms: Option<u64>) -> Result<ExecResult> {
+            *self.last_timeout_ms.write().ok().context("lock poisoned")? = timeout_ms;
+            let commands = self.commands.read().ok().context("lock poisoned")?;
             if let Some((stdout, stderr, exit_code)) = commands.get(command) {
                 Ok(ExecResult {
                     stdout: stdout.clone(),
@@ -282,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_simple_command() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("echo hello", "hello\n", "", 0);
+        env.add_command("echo hello", "hello\n", "", 0)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool
@@ -298,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_command_with_stderr() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("cmd", "stdout output", "stderr output", 0);
+        env.add_command("cmd", "stdout output", "stderr output", 0)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool.execute(&tool_ctx(), json!({"command": "cmd"})).await?;
@@ -312,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_command_nonzero_exit() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("failing_cmd", "", "error occurred", 1);
+        env.add_command("failing_cmd", "", "error occurred", 1)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool
@@ -386,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_allowed_commands_restriction() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("cargo build", "Compiling...", "", 0);
+        env.add_command("cargo build", "Compiling...", "", 0)?;
 
         // Only allow cargo and git commands
         let caps = AgentCapabilities::full_access()
@@ -417,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_empty_output() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("true", "", "", 0);
+        env.add_command("true", "", "", 0)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool
@@ -432,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_custom_timeout() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("slow_cmd", "done", "", 0);
+        env.add_command("slow_cmd", "done", "", 0)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool
@@ -475,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_null_timeout_ms() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("echo hello", "hello", "", 0);
+        env.add_command("echo hello", "hello", "", 0)?;
         let tool = create_test_tool(env, AgentCapabilities::full_access());
 
         // Model may send explicit null for optional fields — must not fail
@@ -493,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_missing_timeout_uses_default() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("echo hi", "hi", "", 0);
+        env.add_command("echo hi", "hi", "", 0)?;
         let tool = create_test_tool(env, AgentCapabilities::full_access());
 
         // Omitted timeout_ms should use the default
@@ -508,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_string_timeout_ms() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
-        env.add_command("echo timeout", "ok", "", 0);
+        env.add_command("echo timeout", "ok", "", 0)?;
         let tool = create_test_tool(env, AgentCapabilities::full_access());
 
         let result = tool
@@ -526,7 +560,7 @@ mod tests {
     async fn test_bash_long_output_truncated() -> anyhow::Result<()> {
         let env = Arc::new(MockBashEnvironment::new());
         let long_output = "x".repeat(40_000);
-        env.add_command("long_output_cmd", &long_output, "", 0);
+        env.add_command("long_output_cmd", &long_output, "", 0)?;
 
         let tool = create_test_tool(env, AgentCapabilities::full_access());
         let result = tool
@@ -535,7 +569,76 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("output truncated"));
-        assert!(result.output.len() < 35_000); // Should be truncated
+        assert!(result.output.contains("total bytes"));
+        // The truncation notice and exit-code line are accounted for, so the
+        // final result stays within the cap.
+        assert!(result.output.len() <= MAX_OUTPUT_BYTES);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_default_timeout_forwarded() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hi", "hi", "", 0)?;
+
+        let tool = create_test_tool(Arc::clone(&env), AgentCapabilities::full_access());
+        tool.execute(&tool_ctx(), json!({"command": "echo hi"}))
+            .await?;
+
+        // Omitted timeout forwards the default.
+        assert_eq!(env.recorded_timeout()?, Some(DEFAULT_TIMEOUT_MS));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_explicit_timeout_forwarded() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hi", "hi", "", 0)?;
+
+        let tool = create_test_tool(Arc::clone(&env), AgentCapabilities::full_access());
+        tool.execute(
+            &tool_ctx(),
+            json!({"command": "echo hi", "timeout_ms": 5000}),
+        )
+        .await?;
+
+        assert_eq!(env.recorded_timeout()?, Some(5000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_string_timeout_forwarded() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hi", "hi", "", 0)?;
+
+        let tool = create_test_tool(Arc::clone(&env), AgentCapabilities::full_access());
+        tool.execute(
+            &tool_ctx(),
+            json!({"command": "echo hi", "timeout_ms": "5000"}),
+        )
+        .await?;
+
+        // Numeric strings are parsed before being forwarded.
+        assert_eq!(env.recorded_timeout()?, Some(5000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout_clamped_to_max() -> anyhow::Result<()> {
+        let env = Arc::new(MockBashEnvironment::new());
+        env.add_command("echo hi", "hi", "", 0)?;
+
+        let tool = create_test_tool(Arc::clone(&env), AgentCapabilities::full_access());
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"command": "echo hi", "timeout_ms": 999_999_999_u64}),
+            )
+            .await?;
+
+        // Oversized requests are clamped to the maximum and the clamp is surfaced.
+        assert_eq!(env.recorded_timeout()?, Some(MAX_TIMEOUT_MS));
+        assert!(result.output.contains("clamped"));
         Ok(())
     }
 

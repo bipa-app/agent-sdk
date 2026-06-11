@@ -307,20 +307,30 @@ pub async fn pause_tool_for_confirmation(
 ///   worker on re-acquisition.
 /// - **Rejected**: fails the child via
 ///   [`AgentTaskStore::reject_confirmation`] with a canonical
-///   `confirmation_rejected:` error prefix.
+///   `confirmation_rejected:` error prefix, then commits a failure
+///   `ToolCallEnd` event so the tool lifecycle closes in the event
+///   stream (mirroring the policy-denied path).
 /// - **Timeout**: fails the child via
 ///   [`AgentTaskStore::reject_confirmation`] with a canonical
-///   `confirmation_timeout:` error prefix.
+///   `confirmation_timeout:` error prefix, then commits a failure
+///   `ToolCallEnd` event for the same reason.
+///
+/// Without the terminal `ToolCallEnd`, the journal would hold a
+/// `ToolCallStart` + `ToolRequiresConfirmation` with no close, so
+/// replay and live clients would render the tool as running forever.
 ///
 /// # Errors
 ///
 /// Returns an error if the child does not exist, is not in
 /// [`TaskStatus::AwaitingConfirmation`](crate::journal::task::TaskStatus::AwaitingConfirmation), or if the store transition
-/// fails.
+/// fails. The closing `ToolCallEnd` commit is best-effort (logged on
+/// failure) — the child is already durably failed by then, so an event
+/// commit blip must not override that outcome.
 pub async fn apply_confirmation_decision(
     child_id: &AgentTaskId,
     decision: ConfirmationDecision,
     task_store: &dyn AgentTaskStore,
+    event_repo: &dyn EventRepository,
     now: OffsetDateTime,
 ) -> anyhow::Result<ConfirmationDecisionOutcome> {
     match decision {
@@ -339,11 +349,16 @@ pub async fn apply_confirmation_decision(
             })
         }
         ConfirmationDecision::Rejected { reason } => {
+            // Read the tool-call info before the reject clears the
+            // child's typed state, so we can close the lifecycle below.
+            let tool_call = paused_tool_call(child_id, task_store).await;
             let error = format!("{CONFIRMATION_REJECTED_PREFIX} {reason}");
             let (child, parent) = task_store
-                .reject_confirmation(child_id, error, now)
+                .reject_confirmation(child_id, error.clone(), now)
                 .await
                 .with_context(|| format!("failed to reject child {child_id}"))?;
+
+            emit_confirmation_tool_call_end(event_repo, tool_call, error, now).await;
 
             Ok(ConfirmationDecisionOutcome::Rejected {
                 child,
@@ -352,16 +367,81 @@ pub async fn apply_confirmation_decision(
             })
         }
         ConfirmationDecision::Timeout => {
+            let tool_call = paused_tool_call(child_id, task_store).await;
             let error = format!(
                 "{CONFIRMATION_TIMEOUT_PREFIX} no decision received within the allowed window"
             );
             let (child, parent) = task_store
-                .reject_confirmation(child_id, error, now)
+                .reject_confirmation(child_id, error.clone(), now)
                 .await
                 .with_context(|| format!("failed to time out child {child_id}"))?;
 
+            emit_confirmation_tool_call_end(event_repo, tool_call, error, now).await;
+
             Ok(ConfirmationDecisionOutcome::TimedOut { child, parent })
         }
+    }
+}
+
+/// Read the [`PendingToolCallInfo`] (and the thread it belongs to) for
+/// an `AwaitingConfirmation` child from its persisted continuation, so
+/// the Rejected / Timeout arms can close the tool lifecycle with a
+/// `ToolCallEnd` event.
+///
+/// Best-effort: returns `None` (the caller then skips the terminal
+/// event) when the child is missing, no longer paused, carries no
+/// continuation, or its `spawn_index` is out of range. The decision
+/// itself still applies in those rare cases — observers just miss the
+/// closing event.
+async fn paused_tool_call(
+    child_id: &AgentTaskId,
+    task_store: &dyn AgentTaskStore,
+) -> Option<(agent_sdk_foundation::ThreadId, PendingToolCallInfo)> {
+    let child = task_store.get(child_id).await.ok()??;
+    let continuation = child.state.continuation()?;
+    let spawn_index = usize::try_from(child.spawn_index?).ok()?;
+    let tool_call = continuation
+        .payload
+        .pending_tool_calls
+        .get(spawn_index)?
+        .clone();
+    Some((child.thread_id.clone(), tool_call))
+}
+
+/// Commit a failure `ToolCallEnd` closing a rejected / timed-out
+/// confirmation's tool lifecycle. No-op when `tool_call` is `None`.
+///
+/// Best-effort: the child is already durably failed, so an event-commit
+/// failure is logged rather than propagated (it must not override the
+/// reject outcome).
+async fn emit_confirmation_tool_call_end(
+    event_repo: &dyn EventRepository,
+    tool_call: Option<(agent_sdk_foundation::ThreadId, PendingToolCallInfo)>,
+    error: String,
+    now: OffsetDateTime,
+) {
+    let Some((thread_id, tool_call)) = tool_call else {
+        return;
+    };
+    let error_result = ToolResult {
+        success: false,
+        output: error,
+        data: None,
+        documents: Vec::new(),
+        duration_ms: None,
+    };
+    let end_event = AgentEvent::tool_call_end(
+        &tool_call.id,
+        &tool_call.name,
+        &tool_call.display_name,
+        error_result,
+    );
+    if let Err(error) = event_repo.commit_event(&thread_id, end_event, now).await {
+        log::warn!(
+            "failed to commit ToolCallEnd after confirmation rejection/timeout \
+             for tool {} on thread {thread_id}: {error:#}",
+            tool_call.id,
+        );
     }
 }
 
