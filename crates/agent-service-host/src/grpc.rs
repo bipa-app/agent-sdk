@@ -1363,6 +1363,52 @@ impl AgentControlService for GrpcControlService {
                 .await?,
         ))
     }
+
+    async fn cancel_task(
+        &self,
+        request: Request<pb::CancelTaskRequest>,
+    ) -> Result<Response<pb::CancelTaskResponse>, Status> {
+        let request = request.into_inner();
+        let task_id = parse_task_id(&request.task_id)?;
+
+        // Resolve the task first so an unknown id surfaces a clean
+        // NOT_FOUND (matching `GetTask`) instead of the INTERNAL that
+        // `cancel_tree`'s own existence-check error would map to. The
+        // loaded row also carries the thread id for the cancellation log.
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading task for cancellation"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+
+        info!(
+            task_id = %task_id,
+            thread_id = %task.thread_id,
+            reason = %request.reason,
+            "cancelling task tree",
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let cancelled = self
+            .shared
+            .stores
+            .task_store
+            .cancel_tree(&task_id, now)
+            .await
+            .map_err(internal_status("cancelling task tree"))?;
+
+        let cancelled_task_ids: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
+        let cancelled_count = u32::try_from(cancelled_task_ids.len())
+            .map_err(|_| Status::internal("cancelled task count out of range"))?;
+
+        Ok(Response::new(pb::CancelTaskResponse {
+            cancelled_task_ids,
+            cancelled_count,
+        }))
+    }
 }
 
 type EventStream =
@@ -4764,5 +4810,142 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    /// Create a thread and admit one root turn through the in-process
+    /// control service. No host/worker runs in this fixture, so the
+    /// returned root turn stays non-terminal (`Pending`) until a cancel
+    /// transitions it — exactly the state `CancelTask` must handle.
+    ///
+    /// Returns `(thread_id, root_task_id)`.
+    async fn seed_pending_root(
+        service: &GrpcControlService,
+        label: &str,
+    ) -> Result<(String, String)> {
+        let thread = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: format!("{label}-create"),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+        let task = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: format!("{label}-submit"),
+                thread_id: thread.clone(),
+                input: vec![text_input("do work")],
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("submit_thread_work missing task")?;
+        Ok((thread, task.task_id))
+    }
+
+    /// `CancelTask` transitions a queued/running root turn to
+    /// `CANCELLED` and reports the ids it cancelled.
+    #[tokio::test]
+    async fn cancel_task_cancels_a_pending_root_turn() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-pending").await?;
+
+        let cancel = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: "user aborted".into(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![task_id.clone()]);
+        assert_eq!(cancel.cancelled_count, 1);
+
+        let after = service
+            .get_task(Request::new(pb::GetTaskRequest {
+                task_id: task_id.clone(),
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("get_task missing task")?;
+        assert_eq!(after.status, pb::TaskStatus::Cancelled as i32, "{after:?}");
+        Ok(())
+    }
+
+    /// Cancelling an unknown task id is a clean `NOT_FOUND`, not the
+    /// INTERNAL that `cancel_tree`'s own existence check would surface.
+    #[tokio::test]
+    async fn cancel_task_returns_not_found_for_unknown_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "00000000-0000-7000-8000-000000000000".into(),
+                reason: String::new(),
+            }))
+            .await
+            .expect_err("cancel on unknown task must error");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        Ok(())
+    }
+
+    /// A blank `task_id` is rejected up front with `INVALID_ARGUMENT`.
+    #[tokio::test]
+    async fn cancel_task_rejects_blank_task_id() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "   ".into(),
+                reason: String::new(),
+            }))
+            .await
+            .expect_err("blank task_id must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        Ok(())
+    }
+
+    /// Re-cancelling an already-terminal subtree is a no-op: the second
+    /// call succeeds and reports zero newly-cancelled ids.
+    #[tokio::test]
+    async fn cancel_task_is_idempotent_on_already_terminal_subtree() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-idem").await?;
+
+        let first = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first.cancelled_count, 1);
+
+        let second = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert!(
+            second.cancelled_task_ids.is_empty(),
+            "{:?}",
+            second.cancelled_task_ids,
+        );
+        assert_eq!(second.cancelled_count, 0);
+        Ok(())
     }
 }

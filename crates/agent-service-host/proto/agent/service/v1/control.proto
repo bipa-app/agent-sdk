@@ -209,6 +209,45 @@ message DecideConfirmationResponse {
   TaskSnapshot parent_task = 2;
 }
 
+// Cancel a queued or running task and its entire descendant subtree.
+//
+// Cancellation cascades from `task_id` through every live descendant
+// (tool-runtime children, and across subagent-invocation links into
+// child threads) by way of the durable `cancel_tree` transition. Each
+// cancelled row drops its worker lease, so any worker still holding the
+// row fails its next heartbeat / complete / fail CAS.
+//
+// The call is idempotent: rows already in a terminal state
+// (`COMPLETED` / `FAILED` / `CANCELLED`) are left untouched and are
+// not reported back, so retrying a cancel on an already-settled subtree
+// returns an empty `cancelled_task_ids`.
+//
+// # Errors
+//
+// * `INVALID_ARGUMENT` for a blank `task_id`.
+// * `NOT_FOUND` if `task_id` doesn't resolve to a known task.
+message CancelTaskRequest {
+  // The task whose subtree should be cancelled. Any task in the tree may
+  // be supplied — passing a root turn cancels the whole tree, while
+  // passing an interior task cancels only that task and its descendants.
+  string task_id = 1;
+
+  // Optional human-readable reason recorded for observability. May be
+  // empty; it does not alter cancellation behaviour.
+  string reason = 2;
+}
+
+message CancelTaskResponse {
+  // Ids of the tasks actually transitioned to `CANCELLED`, in
+  // cancellation order (`[root, child_1, ..., grandchildren, ...]`).
+  // Rows that were already terminal before the call are omitted, so an
+  // empty list means the subtree was already settled.
+  repeated string cancelled_task_ids = 1;
+
+  // Convenience count of `cancelled_task_ids`.
+  uint32 cancelled_count = 2;
+}
+
 service AgentControlService {
   // Allocate a new active thread and return its committed snapshot.
   rpc CreateThread(CreateThreadRequest) returns (CreateThreadResponse);
@@ -241,4 +280,8 @@ service AgentControlService {
 
   // Apply a durable confirmation decision to an awaiting task.
   rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);
+
+  // Cancel a queued or running task and its entire descendant subtree
+  // via the durable cancellation-tree transition.
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }
