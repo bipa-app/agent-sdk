@@ -69,7 +69,8 @@ pub mod transport;
 
 pub use client::McpClient;
 pub use http::{
-    HttpPoster, HttpReply, HttpRequest, McpAuth, ReqwestPoster, StreamableHttpTransport,
+    DEFAULT_HTTP_TIMEOUT, DEFAULT_SEND_DEADLINE, HttpPoster, HttpReply, HttpRequest, McpAuth,
+    ReqwestPoster, StreamableHttpTransport,
 };
 pub use protocol::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpContent, McpPrompt, McpPromptArgument,
