@@ -166,6 +166,12 @@ impl LlmProvider for FallbackProvider {
         })
     }
 
+    /// Delegate live model discovery to the primary provider so wrapping in a
+    /// fallback never silently loses `list_models`.
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        self.primary.list_models().await
+    }
+
     fn model(&self) -> &str {
         self.primary.model()
     }
@@ -228,6 +234,15 @@ mod tests {
                 .map_err(|_| anyhow!("results lock poisoned"))?
                 .pop_front()
                 .unwrap_or_else(|| Ok(ChatOutcome::ServerError("exhausted".to_owned())))
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+            Ok(vec![crate::provider::ModelInfo {
+                id: format!("{}-model", self.name),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+            }])
         }
 
         fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
@@ -351,6 +366,19 @@ mod tests {
 
         let outcome = fb.chat(request()).await?;
         assert!(matches!(outcome, ChatOutcome::ServerError(msg) if msg == "b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_models_delegates_to_primary() -> Result<()> {
+        let primary = ScriptedProvider::chat_only("primary", vec![]);
+        let secondary = ScriptedProvider::chat_only("secondary", vec![]);
+        let fb = FallbackProvider::new(primary).with_fallback(secondary);
+
+        let models = fb.list_models().await?;
+        // Discovery is served by the primary, not the default "unsupported".
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "primary-model");
         Ok(())
     }
 

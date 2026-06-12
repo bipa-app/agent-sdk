@@ -241,8 +241,18 @@ struct OpenRouterResponse {
 }
 
 /// Convert an `OpenRouter` USD-per-token price string to USD per million tokens.
+///
+/// `OpenRouter` uses `"-1"` (and other non-positive values) as a sentinel for
+/// "no fixed price" on routed/aggregate models like `openrouter/auto`. Those
+/// must be treated as *absent* pricing, not real negative prices — a negative
+/// `PricePoint` would make [`estimate_cost_usd`](ModelRegistry::estimate_cost_usd)
+/// return a negative cost. Any value that is unparseable, non-finite, or `<= 0`
+/// yields `None`.
 fn openrouter_price_per_million(value: &str) -> Option<PricePoint> {
     let per_token: f64 = value.trim().parse().ok()?;
+    if !per_token.is_finite() || per_token <= 0.0 {
+        return None;
+    }
     Some(PricePoint::new(per_token * 1_000_000.0))
 }
 
@@ -251,6 +261,27 @@ fn openrouter_price_per_million(value: &str) -> Option<PricePoint> {
 /// `OpenRouter` vendors line up with our provider names except for `google`,
 /// which we call `gemini`. Ids without a slash fall back to the whole id as the
 /// model with an empty provider.
+///
+/// # Keying limitation
+///
+/// The resulting `model` segment is `OpenRouter`'s own slug, which does **not**
+/// always match the model id our chat endpoints expect:
+///
+/// - `OpenRouter` slugs use dots where the first-party providers use dashes
+///   (e.g. `claude-opus-4.8` here vs `claude-opus-4-8` on the Anthropic API),
+///   and they sometimes carry extra route suffixes (`:free`, `:beta`,
+///   `-thinking`).
+/// - Aggregate/routed ids such as `openrouter/auto` have no first-party
+///   equivalent at all.
+///
+/// We deliberately do **not** rewrite the slug here: there is no lossless,
+/// general normalization back to each provider's native id, so a guessed
+/// mapping would silently mis-key entries. As a result, a model whose slug
+/// differs from its native id will not be resolved by [`ModelRegistry`] when
+/// looked up by the native `(provider, model)` pair. Prefer
+/// [`ModelsDevSource`], which keys on bare native ids, when feed coverage of
+/// first-party models matters; use [`OpenRouterSource`] mainly for models
+/// routed through `OpenRouter` under their `OpenRouter` slug.
 fn split_openrouter_id(id: &str) -> (String, String) {
     match id.split_once('/') {
         Some((vendor, model)) => {
@@ -316,6 +347,12 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
 }
 
 /// An alternative public feed: <https://openrouter.ai/api/v1/models> (no key).
+///
+/// Note: `OpenRouter` keys models by its own `vendor/model` slug, which does not
+/// always match the native id our chat endpoints expect (dotted vs dashed
+/// versions, route suffixes, aggregate ids like `openrouter/auto`). See
+/// [`split_openrouter_id`] for the keying limitation and why we do not rewrite
+/// slugs. Prefer [`ModelsDevSource`] for first-party model coverage.
 pub struct OpenRouterSource {
     client: reqwest::Client,
     url: String,
@@ -593,6 +630,23 @@ mod tests {
       ]
     }"#;
 
+    // `openrouter/auto` reports `"-1"` for every price — a sentinel for
+    // "no fixed price", not a real negative cost.
+    const OPENROUTER_SENTINEL_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "id": "openrouter/auto",
+          "name": "Auto Router",
+          "context_length": 2000000,
+          "pricing": {
+            "prompt": "-1",
+            "completion": "-1",
+            "input_cache_read": "-1"
+          }
+        }
+      ]
+    }"#;
+
     fn find<'a>(entries: &'a [CatalogEntry], provider: &str, model: &str) -> &'a CatalogEntry {
         entries
             .iter()
@@ -665,6 +719,38 @@ mod tests {
         // `google/...` is split + remapped to our `gemini` provider name.
         let gemini = find(&entries, "gemini", "gemini-2.5-pro");
         assert_eq!(gemini.context_window, Some(1_048_576));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parse_openrouter_treats_minus_one_sentinel_prices_as_absent() -> Result<()> {
+        let entries = parse_openrouter(OPENROUTER_SENTINEL_FIXTURE)?;
+        assert_eq!(entries.len(), 1);
+
+        let auto = find(&entries, "openrouter", "auto");
+        // The `"-1"` sentinel must collapse to no pricing at all, never a
+        // negative `PricePoint` (which would make estimate_cost_usd go negative).
+        assert!(
+            auto.pricing.is_none(),
+            "sentinel `-1` prices must yield None pricing, got {:?}",
+            auto.pricing
+        );
+        // Non-price metadata is still captured.
+        assert_eq!(auto.context_window, Some(2_000_000));
+
+        // And a registry built from this feed never returns a negative cost.
+        let registry = ModelRegistry::new();
+        registry.refresh(&StaticSource(entries)).await?;
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        assert_eq!(
+            registry.estimate_cost_usd("openrouter", "auto", &usage),
+            None
+        );
         Ok(())
     }
 

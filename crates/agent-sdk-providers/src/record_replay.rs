@@ -211,6 +211,17 @@ impl LlmProvider for RecordReplayProvider {
         }
     }
 
+    /// Delegate live model discovery to the inner provider when one is present
+    /// (record mode) so wrapping never silently loses `list_models`. In replay
+    /// mode there is no inner provider and no recorded model list, so this
+    /// reports the operation as unsupported.
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        match &self.inner {
+            Some(inner) => inner.list_models().await,
+            None => bail!("list_models is not supported in replay mode (no inner provider)"),
+        }
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -534,6 +545,15 @@ mod tests {
             Ok(self.chat_outcome.clone())
         }
 
+        async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+            Ok(vec![crate::provider::ModelInfo {
+                id: "inner-discovered-model".to_owned(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+            }])
+        }
+
         fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
             let deltas = self.deltas.clone();
             Box::pin(async_stream::stream! {
@@ -612,6 +632,35 @@ mod tests {
             .chat(ChatRequest::new("other", vec![Message::user("nope")]))
             .await;
         assert!(missing.is_err());
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_models_delegates_in_record_and_errors_in_replay() -> Result<()> {
+        let path = temp_cassette_path();
+        let inner = Arc::new(InnerProvider {
+            model: "inner-model",
+            chat_outcome: success_outcome("x"),
+            deltas: Vec::new(),
+        });
+
+        // Record mode delegates discovery to the inner provider instead of
+        // returning the trait-default "unsupported" error.
+        let recorder = RecordReplayProvider::record(inner, &path);
+        let models = recorder.list_models().await?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "inner-discovered-model");
+
+        // Persist a cassette so replay has a file to load (list_models is not
+        // captured to the cassette).
+        recorder.chat(request()).await?;
+
+        // Replay mode has no inner provider and no recorded model list, so it
+        // reports the operation as unsupported rather than panicking.
+        let player = RecordReplayProvider::replay(&path)?;
+        assert!(player.list_models().await.is_err());
 
         let _ = std::fs::remove_file(&path);
         Ok(())

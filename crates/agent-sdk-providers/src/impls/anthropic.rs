@@ -27,6 +27,12 @@ const API_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const DEFAULT_SAFE_MAX_OUTPUT_TOKENS: u32 = 32_000;
+/// Max page size the Anthropic `GET /v1/models` endpoint accepts.
+const MODELS_PAGE_LIMIT: u32 = 1000;
+/// Upper bound on pages followed by `list_models`, guarding against a server
+/// that never clears `has_more`. At `MODELS_PAGE_LIMIT` rows/page this covers
+/// far more models than any provider ships.
+const MODELS_MAX_PAGES: usize = 100;
 
 pub const MODEL_HAIKU_35: &str = "claude-3-5-haiku-20241022";
 pub const MODEL_SONNET_35: &str = "claude-3-5-sonnet-20241022";
@@ -122,15 +128,29 @@ pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
 }
 
-/// Parse the Anthropic `GET /v1/models` response body into [`ModelInfo`] rows.
+/// One page of the Anthropic `GET /v1/models` response: the model rows plus the
+/// cursor fields used to follow pagination.
+struct AnthropicModelsPage {
+    models: Vec<crate::provider::ModelInfo>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+/// Parse one page of the Anthropic `GET /v1/models` response body.
 ///
 /// The Messages API list endpoint returns `{ "data": [{ "id", "display_name",
-/// ... }] }`. It does not report token limits, so those fields stay `None`.
-fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
+/// ... }], "has_more": bool, "last_id": "..." }`. It paginates with a default
+/// `limit` of 20; `has_more` + `last_id` drive the next request. It does not
+/// report token limits, so those fields stay `None`.
+fn parse_models_page(body: &str) -> Result<AnthropicModelsPage> {
     #[derive(serde::Deserialize)]
     struct ListResponse {
         #[serde(default)]
         data: Vec<ModelRow>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default)]
+        last_id: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct ModelRow {
@@ -140,7 +160,7 @@ fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
     }
     let parsed: ListResponse = serde_json::from_str(body)
         .map_err(|e| anyhow::anyhow!("failed to parse Anthropic models list: {e}"))?;
-    Ok(parsed
+    let models = parsed
         .data
         .into_iter()
         .map(|row| crate::provider::ModelInfo {
@@ -149,7 +169,12 @@ fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
             context_window: None,
             max_output_tokens: None,
         })
-        .collect())
+        .collect();
+    Ok(AnthropicModelsPage {
+        models,
+        has_more: parsed.has_more,
+        last_id: parsed.last_id,
+    })
 }
 
 /// Cache-control breakpoints resolved for the three cacheable prefixes of an
@@ -985,26 +1010,48 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
-        let builder = self
-            .client
-            .get(format!("{}/v1/models", self.base_url))
-            .header("Content-Type", "application/json");
-        let response = self
-            .apply_auth(builder)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Anthropic list_models returned HTTP {status}: {body}"
-            ));
+        // The endpoint paginates (default `limit=20`). Request the max page size
+        // and follow `has_more` / `last_id` until exhausted, capped to avoid an
+        // unbounded loop if the server never clears `has_more`.
+        let mut models = Vec::new();
+        let mut after_id: Option<String> = None;
+        for _ in 0..MODELS_MAX_PAGES {
+            let mut query: Vec<(&str, String)> = vec![("limit", MODELS_PAGE_LIMIT.to_string())];
+            if let Some(after) = &after_id {
+                query.push(("after_id", after.clone()));
+            }
+            let builder = self
+                .client
+                .get(format!("{}/v1/models", self.base_url))
+                .header("Content-Type", "application/json")
+                .query(&query);
+            let response = self
+                .apply_auth(builder)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
+            if !status.is_success() {
+                return Err(anyhow::anyhow!(
+                    "Anthropic list_models returned HTTP {status}: {body}"
+                ));
+            }
+            let page = parse_models_page(&body)?;
+            models.extend(page.models);
+            if !page.has_more {
+                return Ok(models);
+            }
+            match page.last_id {
+                Some(last) => after_id = Some(last),
+                // `has_more` with no cursor: stop rather than refetch page 1.
+                None => return Ok(models),
+            }
         }
-        parse_models_list(&body)
+        Ok(models)
     }
 
     fn model(&self) -> &str {
@@ -1044,14 +1091,74 @@ mod tests {
     }"#;
 
     #[test]
-    fn parse_models_list_reads_id_and_display_name() -> anyhow::Result<()> {
-        let models = parse_models_list(ANTHROPIC_MODELS_FIXTURE)?;
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "claude-opus-4-8");
-        assert_eq!(models[0].display_name.as_deref(), Some("Claude Opus 4.8"));
+    fn parse_models_page_reads_id_and_display_name() -> anyhow::Result<()> {
+        let page = parse_models_page(ANTHROPIC_MODELS_FIXTURE)?;
+        assert_eq!(page.models.len(), 2);
+        assert_eq!(page.models[0].id, "claude-opus-4-8");
+        assert_eq!(
+            page.models[0].display_name.as_deref(),
+            Some("Claude Opus 4.8")
+        );
         // Anthropic's listing endpoint reports no token limits.
-        assert_eq!(models[0].context_window, None);
-        assert_eq!(models[0].max_output_tokens, None);
+        assert_eq!(page.models[0].context_window, None);
+        assert_eq!(page.models[0].max_output_tokens, None);
+        // Single, final page.
+        assert!(!page.has_more);
+        assert_eq!(page.last_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_models_follows_pagination_across_pages() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Page 1: the first request has no `after_id` cursor; it returns
+        // `has_more: true` with `last_id` pointing at the next page.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param_is_missing("after_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+                  "data": [
+                    {"type": "model", "id": "claude-opus-4-8", "display_name": "Opus"},
+                    {"type": "model", "id": "claude-sonnet-4-5", "display_name": "Sonnet"}
+                  ],
+                  "has_more": true,
+                  "last_id": "claude-sonnet-4-5"
+                }"#,
+            ))
+            .mount(&server)
+            .await;
+
+        // Page 2: requested with `after_id=claude-sonnet-4-5`; final page.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("after_id", "claude-sonnet-4-5"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+                  "data": [
+                    {"type": "model", "id": "claude-haiku-4-5", "display_name": "Haiku"}
+                  ],
+                  "has_more": false,
+                  "last_id": "claude-haiku-4-5"
+                }"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new("test-key-not-a-secret", "claude-test")
+            .with_base_url(server.uri());
+        let models = provider.list_models().await?;
+
+        // All three models across both pages are returned — none dropped.
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"]
+        );
         Ok(())
     }
 
