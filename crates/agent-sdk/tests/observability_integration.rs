@@ -2541,10 +2541,10 @@ mod metrics {
         // after N retries" `AgentError`, which `classify_llm_error`
         // maps to `error.type=rate_limited`.
         let provider = TestProvider::new(vec![
-            ChatOutcome::RateLimited,
-            ChatOutcome::RateLimited,
-            ChatOutcome::RateLimited,
-            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited(None),
+            ChatOutcome::RateLimited(None),
+            ChatOutcome::RateLimited(None),
+            ChatOutcome::RateLimited(None),
         ]);
         let agent = builder::<()>()
             .provider(provider)
@@ -3295,7 +3295,7 @@ mod metrics {
         // `agent_sdk.llm.retries` increment with
         // `error.type=rate_limited`.
         let provider = TestProvider::new(vec![
-            ChatOutcome::RateLimited,
+            ChatOutcome::RateLimited(None),
             TestProvider::text_response("Done"),
         ]);
         let agent = builder::<()>()

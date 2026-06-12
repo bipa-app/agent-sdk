@@ -266,6 +266,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 

@@ -52,6 +52,11 @@ vertex = ["anthropic", "gemini"]
 # The Cloudflare AI Gateway provider is a thin proxy that wraps the
 # Anthropic, OpenAI, and Gemini providers, so it requires all three.
 cloudflare = ["anthropic", "openai", "gemini"]
+# Deterministic record/replay provider wrapper. Captures (request -> response)
+# pairs to a JSON cassette in record mode and serves them with no network in
+# replay mode. Gated because cassette (de)serialization pulls in extra
+# serde wiring most consumers never need.
+record-replay = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

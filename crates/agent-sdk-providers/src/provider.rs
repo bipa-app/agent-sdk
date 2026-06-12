@@ -97,7 +97,7 @@ pub trait LlmProvider: Send + Sync {
                             stop_reason: response.stop_reason,
                         });
                     }
-                    ChatOutcome::RateLimited => {
+                    ChatOutcome::RateLimited(_) => {
                         yield Ok(StreamDelta::Error {
                             message: "Rate limited".to_string(),
                             kind: StreamErrorKind::RateLimited,
@@ -268,7 +268,9 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
     // category at the construction site.
     if let Some((message, kind)) = last_error {
         return Ok(match kind {
-            StreamErrorKind::RateLimited => ChatOutcome::RateLimited,
+            // The streaming error channel does not carry a `Retry-After`, so
+            // the reconstructed outcome reports no server-supplied delay.
+            StreamErrorKind::RateLimited => ChatOutcome::RateLimited(None),
             StreamErrorKind::InvalidRequest => ChatOutcome::InvalidRequest(message),
             // `StreamErrorKind::ServerError`, plus the `#[non_exhaustive]`
             // catch-all (`Unknown` / future kinds): an unclassified error is

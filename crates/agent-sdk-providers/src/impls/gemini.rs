@@ -287,6 +287,12 @@ impl LlmProvider for GeminiProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed.
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -299,7 +305,7 @@ impl LlmProvider for GeminiProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
+            return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
         if status.is_server_error() {
@@ -594,6 +600,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 

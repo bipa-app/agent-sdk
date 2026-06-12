@@ -202,6 +202,12 @@ impl LlmProvider for OpenAIResponsesProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed.
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -213,7 +219,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             bytes.len()
         );
 
-        if let Some(outcome) = classify_responses_status(status, &bytes) {
+        if let Some(outcome) = classify_responses_status(status, &bytes, retry_after) {
             return Ok(outcome);
         }
 
@@ -820,9 +826,13 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
 ///
 /// Returns `None` when the status is a success and the body should instead be
 /// parsed as an [`ApiResponse`].
-fn classify_responses_status(status: StatusCode, bytes: &[u8]) -> Option<ChatOutcome> {
+fn classify_responses_status(
+    status: StatusCode,
+    bytes: &[u8],
+    retry_after: Option<std::time::Duration>,
+) -> Option<ChatOutcome> {
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return Some(ChatOutcome::RateLimited);
+        return Some(ChatOutcome::RateLimited(retry_after));
     }
     if status.is_server_error() {
         let body = String::from_utf8_lossy(bytes);

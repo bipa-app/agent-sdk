@@ -457,6 +457,7 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let outcome = self
@@ -474,7 +475,7 @@ impl<P: LlmProvider + ?Sized> LlmContextCompactor<P> {
                     .context("No text in summarization response")?;
                 Ok((text, truncated))
             }
-            ChatOutcome::RateLimited => {
+            ChatOutcome::RateLimited(_) => {
                 bail!("Rate limited during summarization")
             }
             ChatOutcome::InvalidRequest(msg) => {

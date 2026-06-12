@@ -71,11 +71,14 @@ pub struct ApiCacheControl {
 }
 
 impl ApiCacheControl {
+    /// An ephemeral cache-control with an optional explicit TTL (`"5m"` / `"1h"`).
+    ///
+    /// `ttl = None` requests the provider's default retention.
     #[must_use]
-    pub const fn ephemeral() -> Self {
+    pub const fn ephemeral_with_ttl(ttl: Option<&'static str>) -> Self {
         Self {
             control_type: "ephemeral",
-            ttl: None,
+            ttl,
         }
     }
 }
@@ -525,8 +528,16 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
     }
 }
 
-/// Build API tools from the chat request.
-pub fn build_api_tools(request: &ChatRequest) -> Option<Vec<ApiTool>> {
+/// Build API tools, marking the last tool with `cache_control` (so the entire
+/// tool prefix is cached) only when `cache_control` is `Some`.
+///
+/// Passing `None` emits no tool-list cache breakpoint, which is how the
+/// caller honours a request that opts out of caching or has spent its
+/// breakpoint budget.
+pub fn build_api_tools_with_cache(
+    request: &ChatRequest,
+    cache_control: Option<ApiCacheControl>,
+) -> Option<Vec<ApiTool>> {
     request.tools.clone().map(|ts| {
         let mut tools: Vec<ApiTool> = ts
             .into_iter()
@@ -537,9 +548,10 @@ pub fn build_api_tools(request: &ChatRequest) -> Option<Vec<ApiTool>> {
                 cache_control: None,
             })
             .collect();
-        // Mark the last tool with cache_control so the entire tool list is cached.
-        if let Some(last) = tools.last_mut() {
-            last.cache_control = Some(ApiCacheControl::ephemeral());
+        if let Some(cache_control) = cache_control
+            && let Some(last) = tools.last_mut()
+        {
+            last.cache_control = Some(cache_control);
         }
         tools
     })
@@ -1050,6 +1062,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let messages = build_api_messages(&request);
@@ -1089,6 +1102,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let messages = build_api_messages(&request);
@@ -1121,6 +1135,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let messages = build_api_messages(&request);

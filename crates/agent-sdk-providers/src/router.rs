@@ -108,6 +108,7 @@ where
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         match self.classifier.chat(classification_request).await? {
@@ -120,7 +121,7 @@ where
                 );
                 Ok(complexity)
             }
-            ChatOutcome::RateLimited => {
+            ChatOutcome::RateLimited(_) => {
                 log::warn!("Classifier rate limited, defaulting to Complex");
                 Ok(TaskComplexity::Complex)
             }
