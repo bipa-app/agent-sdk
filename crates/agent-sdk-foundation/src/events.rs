@@ -13,7 +13,7 @@
 //! 4. `Done` - Agent completed successfully, or `Error` if failed
 
 use crate::llm::ContentBlock;
-use crate::types::{ThreadId, TokenUsage, ToolResult, ToolTier};
+use crate::types::{BudgetLimitKind, ThreadId, TokenUsage, ToolResult, ToolTier};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,6 +154,30 @@ pub enum AgentEvent {
         /// streaming contract. The Rust field keeps the `Duration` type.
         #[serde(rename = "duration_ms", with = "duration_ms_serde")]
         duration: Duration,
+        /// Estimated cost of the run in USD, when the run's provider/model
+        /// has pricing metadata. Omitted from the wire form when `None` so
+        /// the streaming contract stays compatible with consumers that
+        /// predate cost accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_cost_usd: Option<f64>,
+    },
+
+    /// The run was stopped because a run-level usage budget was exceeded.
+    ///
+    /// This is a **terminal** event, emitted once on the budget-exceeded
+    /// return site in place of [`AgentEvent::Done`], so a streaming
+    /// consumer always receives a closing marker. `limit` identifies which
+    /// budget tripped.
+    BudgetExceeded {
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        /// Estimated cost of the run in USD at the moment the budget was
+        /// hit, when pricing metadata is available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
     },
 
     /// An error occurred during execution
@@ -381,6 +405,41 @@ impl AgentEvent {
             total_turns,
             total_usage,
             duration,
+            estimated_cost_usd: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn done_with_cost(
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        duration: Duration,
+        estimated_cost_usd: Option<f64>,
+    ) -> Self {
+        Self::Done {
+            thread_id,
+            total_turns,
+            total_usage,
+            duration,
+            estimated_cost_usd,
+        }
+    }
+
+    #[must_use]
+    pub const fn budget_exceeded(
+        thread_id: ThreadId,
+        total_turns: usize,
+        total_usage: TokenUsage,
+        estimated_cost_usd: Option<f64>,
+        limit: BudgetLimitKind,
+    ) -> Self {
+        Self::BudgetExceeded {
+            thread_id,
+            total_turns,
+            total_usage,
+            estimated_cost_usd,
+            limit,
         }
     }
 
@@ -895,6 +954,7 @@ mod tests {
                 total_turns: 2,
                 total_usage: usage.clone(),
                 duration: Duration::from_millis(1500),
+                estimated_cost_usd: Some(0.0123),
             },
         ]
     }
@@ -931,6 +991,13 @@ mod tests {
             AgentEvent::Cancelled {
                 turn: 1,
                 usage: usage.clone(),
+            },
+            AgentEvent::BudgetExceeded {
+                thread_id: ThreadId::from_string("thread-1"),
+                total_turns: 3,
+                total_usage: usage.clone(),
+                estimated_cost_usd: Some(0.5),
+                limit: BudgetLimitKind::CostUsd,
             },
             AgentEvent::ContextCompacted {
                 original_count: 10,

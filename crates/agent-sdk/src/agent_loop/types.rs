@@ -8,7 +8,7 @@ use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::RunOptions;
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentState, ListenExecutionContext,
-    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions,
+    PendingToolCallInfo, ThreadId, TokenUsage, ToolResult, TurnOptions, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 use std::sync::Arc;
@@ -304,6 +304,8 @@ pub(super) struct RunLoopParameters<Ctx, P, H, M, S> {
     pub(super) cancel_token: CancellationToken,
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<mpsc::Receiver<AgentInput>>,
+    /// Per-tool reminder configuration for the run.
+    pub(super) reminder_config: Option<crate::reminders::ReminderConfig>,
     /// Trace metadata applied to the root span (and threaded through
     /// every event emission as `langfuse.trace.output`).
     ///
@@ -354,6 +356,8 @@ pub(super) struct RunLoopTurnsParams<'a, Ctx, P, H, M, S> {
     /// Optional channel for receiving new messages in persistent mode.
     pub(super) input_rx: Option<&'a mut mpsc::Receiver<AgentInput>>,
     pub(super) turn_options: &'a TurnOptions,
+    /// Per-tool reminder configuration applied after tools execute.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
     #[cfg(feature = "otel")]
     pub(super) observability_store: Option<&'a Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -367,6 +371,9 @@ pub(super) struct PersistentDoneParams<'a, H, M> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) current_turn: usize,
     pub(super) cancel_token: &'a CancellationToken,
+    /// Provider/model provenance, used to estimate the run cost reported
+    /// on the terminal `Done` state when the input channel closes.
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
@@ -380,6 +387,9 @@ pub(super) struct RunLoopTurnResultParams<'a, H, M, S> {
     pub(super) authority: &'a Arc<dyn EventAuthority>,
     pub(super) cancel_token: &'a CancellationToken,
     pub(super) current_turn: usize,
+    /// Provider/model provenance, used to estimate the run cost reported on
+    /// the terminal `Done` state on the persistent input-channel-closed path.
+    pub(super) provenance: &'a AuditProvenance,
 }
 
 pub(super) struct SingleTurnResumeParams<Ctx, H, M, S> {
@@ -425,6 +435,8 @@ pub(super) struct TurnParameters<Ctx, P, H, M, S> {
     pub(super) audit_sink: Arc<dyn ToolAuditSink>,
     pub(super) cancel_token: CancellationToken,
     pub(super) turn_options: TurnOptions,
+    /// Per-tool reminder configuration for the turn.
+    pub(super) reminder_config: Option<crate::reminders::ReminderConfig>,
     /// Trace metadata applied to the root span. See
     /// [`RunLoopParameters::run_options`] for the full contract.
     /// Only consumed on the otel build path — see the gating note
@@ -456,6 +468,8 @@ pub(super) struct ExecuteTurnParameters<'a, Ctx, P, H, M, S> {
     pub(super) audit_sink: &'a Arc<dyn ToolAuditSink>,
     pub(super) provenance: &'a AuditProvenance,
     pub(super) turn_options: &'a TurnOptions,
+    /// Per-tool reminder configuration applied after tools execute.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
     /// Run-level cancellation token, threaded into the LLM call and the
     /// compaction path so both phases are raced against cancel.
     pub(super) cancel_token: &'a CancellationToken,
@@ -562,6 +576,13 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     /// Copied into any [`AgentContinuation`] this phase emits so the
     /// resume-side [`TurnSummary`] can report the same value.
     pub(super) stop_reason: Option<StopReason>,
+    /// Cap on how many adjacent `Observe`-tier tool calls run concurrently
+    /// within one parallel batch. `None` keeps the unbounded behavior.
+    pub(super) max_parallel_tools: Option<usize>,
+    /// Per-tool reminders (keyed by tool name) appended to matching tool
+    /// results before they are fed back to the model. `None` disables the
+    /// reminder pass.
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
 }
 
 pub(super) struct TurnCompletionParams<'a, H, M> {
@@ -597,6 +618,12 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     /// Stop reason from the LLM call that produced `pending_tool_calls`.
     /// Forwarded into any [`AgentContinuation`] this phase emits.
     pub(super) stop_reason: Option<StopReason>,
+    /// Cap on concurrent `Observe`-tier tool execution; see
+    /// [`AgentConfig::max_parallel_tools`].
+    pub(super) max_parallel_tools: Option<usize>,
+    /// Per-tool reminders to apply to matching results; see
+    /// [`crate::reminders::ReminderConfig`].
+    pub(super) reminder_config: Option<&'a crate::reminders::ReminderConfig>,
 }
 
 pub(super) struct TurnStopReasonParams<'a, P, H, M> {
@@ -633,6 +660,10 @@ pub(super) struct ConvertTurnResultParams<'a, H, S> {
     pub(super) provenance: &'a AuditProvenance,
     /// Execution options selected by the caller for this turn.
     pub(super) turn_options: &'a TurnOptions,
+    /// Run-level usage budgets, checked at the single-turn continuation
+    /// boundary so the turn yields [`TurnOutcome::BudgetExceeded`] instead
+    /// of [`TurnOutcome::NeedsMoreTurns`] when a limit is hit.
+    pub(super) usage_limits: Option<&'a UsageLimits>,
 }
 
 /// Extracted content from an LLM response: (thinking, text, `tool_uses`).
