@@ -350,9 +350,9 @@ pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
 ///
 /// Note: `OpenRouter` keys models by its own `vendor/model` slug, which does not
 /// always match the native id our chat endpoints expect (dotted vs dashed
-/// versions, route suffixes, aggregate ids like `openrouter/auto`). See
-/// [`split_openrouter_id`] for the keying limitation and why we do not rewrite
-/// slugs. Prefer [`ModelsDevSource`] for first-party model coverage.
+/// versions, route suffixes, aggregate ids like `openrouter/auto`). The
+/// internal slug-splitting helper documents the keying limitation and why we do
+/// not rewrite slugs. Prefer [`ModelsDevSource`] for first-party model coverage.
 pub struct OpenRouterSource {
     client: reqwest::Client,
     url: String,

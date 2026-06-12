@@ -36,7 +36,7 @@ pub enum StructuredOutputSupport {
 /// A single model entry returned by a provider's live model-listing endpoint.
 ///
 /// This is the *dynamic* counterpart to the static
-/// [`ModelCapabilities`](crate::model_capabilities::ModelCapabilities) table: it
+/// [`ModelCapabilities`] table: it
 /// is populated from the provider's own `/models` API at runtime, so newly
 /// shipped models appear without an SDK code change. Fields beyond `id` are
 /// optional because not every provider's listing endpoint reports them.
