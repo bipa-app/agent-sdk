@@ -2495,11 +2495,19 @@ where
             .await);
         }
         super::llm::PostLlmGuardrail::RetryWithFeedback(feedback) => {
+            // Account the rejected turn's usage into the cumulative total
+            // *before* returning the retry result. Otherwise the rejected
+            // turn's tokens are lost (cost under-report) and, with
+            // `max_turns: None`, a deterministically-rejecting guardrail
+            // would loop forever because `total_usage` never advances and
+            // the budget check can never trip.
+            let turn_usage = apply_turn_usage(ctx, &response);
             return Err(retry_with_feedback_result(RetryWithFeedbackParams {
                 thread_id: &ctx.thread_id,
                 turn: ctx.turn,
                 response: &response,
                 feedback: &feedback,
+                turn_usage,
                 message_store,
                 event_store,
                 hooks,
@@ -2553,22 +2561,69 @@ struct RetryWithFeedbackParams<'a, H, M> {
     turn: usize,
     response: &'a ChatResponse,
     feedback: &'a str,
+    /// Usage already applied to `ctx.total_usage` for the rejected turn, so
+    /// the returned `Continue { turn_usage }` carries it into the turn
+    /// summary (rather than the zeroed default that dropped the usage).
+    turn_usage: TokenUsage,
     message_store: &'a Arc<M>,
     event_store: &'a Arc<dyn EventStore>,
     hooks: &'a Arc<H>,
     authority: &'a Arc<dyn EventAuthority>,
 }
 
+/// Build the user message that carries guardrail feedback back to the model
+/// after a [`ResponseDecision::RetryWithFeedback`].
+///
+/// When the rejected assistant response contained `tool_use` blocks, the
+/// persisted assistant message still carries them, so the very next user
+/// message **must** contain a matching `tool_result` for each `tool_use` id
+/// or Anthropic-style providers reject the request with a 400 (every
+/// `tool_use` must be answered by a `tool_result`). We attach the guardrail
+/// feedback to each synthesized `tool_result` (flagged `is_error`) so the
+/// model both sees the steering and the conversation stays balanced.
+///
+/// When there are no `tool_use` blocks, a plain-text user message is enough.
+fn build_retry_feedback_message(response: &ChatResponse, feedback: &str) -> Message {
+    let tool_use_ids: Vec<&str> = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if tool_use_ids.is_empty() {
+        return Message::user(feedback);
+    }
+
+    let blocks = tool_use_ids
+        .into_iter()
+        .map(|id| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: feedback.to_string(),
+            is_error: Some(true),
+        })
+        .collect();
+    Message::user_with_content(blocks)
+}
+
 /// Honor [`ResponseDecision::RetryWithFeedback`]: persist the rejected
 /// assistant response (so message alternation stays valid), append the
 /// guardrail feedback as a user message so the model can correct itself,
 /// and continue to the next turn.
+///
+/// If the rejected assistant response contained `tool_use` blocks, the
+/// feedback user message carries a matching `tool_result` for each of them
+/// (see [`build_retry_feedback_message`]) so the persisted history stays a
+/// valid Anthropic-style conversation (`tool_use` → `tool_result`).
 async fn retry_with_feedback_result<H, M>(
     RetryWithFeedbackParams {
         thread_id,
         turn,
         response,
         feedback,
+        turn_usage,
         message_store,
         event_store,
         hooks,
@@ -2587,10 +2642,8 @@ where
             false,
         ));
     }
-    if let Err(error) = message_store
-        .append(thread_id, Message::user(feedback))
-        .await
-    {
+    let feedback_message = build_retry_feedback_message(response, feedback);
+    if let Err(error) = message_store.append(thread_id, feedback_message).await {
         return InternalTurnResult::Error(AgentError::new(
             format!("Failed to append guardrail feedback message: {error}"),
             false,
@@ -2611,9 +2664,10 @@ where
         ),
     )
     .await;
-    InternalTurnResult::Continue {
-        turn_usage: TokenUsage::default(),
-    }
+    // Carry the rejected turn's usage (already added to `ctx.total_usage`
+    // by the caller) into the turn summary so cost accounting and the
+    // budget check both advance.
+    InternalTurnResult::Continue { turn_usage }
 }
 
 /// Build the `PendingToolCalls` result that hands an external tool

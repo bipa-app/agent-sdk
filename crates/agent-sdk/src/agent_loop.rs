@@ -66,19 +66,32 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Bound on the [`AgentLoop::run_stream`] tee channel.
+///
+/// The event store is the durable source of truth, so the live stream is a
+/// best-effort mirror. Bounding the channel keeps a slow (or stalled) stream
+/// consumer from growing memory without limit: once this many events are
+/// buffered, [`TeeEventStore::append`] drops the newest event rather than
+/// blocking the run loop (whose forward progress and persistence must not
+/// depend on a consumer's read rate). Callers that need every event should
+/// read the configured [`EventStore`] back instead of relying on the stream.
+const RUN_STREAM_CHANNEL_CAPACITY: usize = 1024;
+
 /// An [`EventStore`] decorator that forwards a clone of every appended
-/// [`AgentEvent`] to an unbounded channel before delegating to the wrapped
+/// [`AgentEvent`] to a bounded channel before delegating to the wrapped
 /// store.
 ///
 /// This is the tee behind [`AgentLoop::run_stream`]: the run loop writes
 /// every event through the configured store as usual, and the matching
 /// [`AgentEvent`] is mirrored onto the stream so callers consume events live
-/// without implementing an [`EventStore`]. The forward is best-effort — if
-/// the consumer has dropped the stream the send fails silently and the run
-/// continues unaffected.
+/// without implementing an [`EventStore`]. The forward is best-effort and
+/// lossy under backpressure — if the consumer has dropped the stream, or is
+/// too slow and the bounded buffer ([`RUN_STREAM_CHANNEL_CAPACITY`]) is full,
+/// the send is skipped (the newest event is dropped) and the run continues
+/// unaffected. The dropped events remain durably recorded in `inner`.
 struct TeeEventStore {
     inner: Arc<dyn EventStore>,
-    tx: mpsc::UnboundedSender<AgentEvent>,
+    tx: mpsc::Sender<AgentEvent>,
 }
 
 #[async_trait]
@@ -89,7 +102,16 @@ impl EventStore for TeeEventStore {
         turn: usize,
         envelope: AgentEventEnvelope,
     ) -> anyhow::Result<()> {
-        let _ = self.tx.send(envelope.event.clone());
+        // `try_send` (never `send().await`): the run loop must not stall on a
+        // slow stream consumer. A `Full` error means the consumer is behind,
+        // so the event is dropped from the live stream only — it is still
+        // persisted to `inner` below and readable via the store.
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(envelope.event.clone()) {
+            log::debug!(
+                "run_stream tee channel full (capacity {RUN_STREAM_CHANNEL_CAPACITY}); \
+                 dropping event from live stream (still persisted to the store)"
+            );
+        }
         self.inner.append(thread_id, turn, envelope).await
     }
 
@@ -843,7 +865,7 @@ where
     where
         Ctx: Clone,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(RUN_STREAM_CHANNEL_CAPACITY);
         let event_store: Arc<dyn EventStore> = Arc::new(TeeEventStore {
             inner: Arc::clone(&self.event_store),
             tx,
@@ -865,7 +887,7 @@ where
         warn_on_detached_run_handle(handle);
         drop(state_rx);
 
-        tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        tokio_stream::wrappers::ReceiverStream::new(rx)
     }
 
     /// Run a single turn of the agent loop — the authoritative server boundary.
