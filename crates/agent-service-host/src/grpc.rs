@@ -1358,6 +1358,85 @@ impl AgentControlService for GrpcControlService {
                 .await?,
         ))
     }
+
+    /// Cancel a root task and its entire descendant subtree.
+    ///
+    /// Interior (non-root) task ids are rejected with
+    /// `FAILED_PRECONDITION`: on the durable SQL backends `cancel_tree`
+    /// does not rebalance an out-of-subtree parent left in
+    /// `WaitingOnChildren`, so cancelling an interior task would strand
+    /// that parent forever. Restricting the RPC to roots avoids that
+    /// liveness deadlock until the rebalance lands.
+    ///
+    /// The `reason` is recorded in the server logs only; it is not
+    /// persisted on the task row.
+    async fn cancel_task(
+        &self,
+        request: Request<pb::CancelTaskRequest>,
+    ) -> Result<Response<pb::CancelTaskResponse>, Status> {
+        let request = request.into_inner();
+        let task_id = parse_task_id(&request.task_id)?;
+
+        // Resolve the task first so an unknown id surfaces a clean
+        // NOT_FOUND (matching `GetTask`) instead of the INTERNAL that
+        // `cancel_tree`'s own existence-check error would map to. The
+        // loaded row also carries the thread id for the cancellation log.
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(&task_id)
+            .await
+            .map_err(internal_status("loading task for cancellation"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+
+        // Thread guard: reject a `(thread_id, task_id)` pair whose task
+        // belongs to a different thread rather than cancelling some other
+        // thread's work. An empty `thread_id` skips the guard.
+        if !request.thread_id.trim().is_empty() {
+            let thread_id = parse_thread_id(&request.thread_id)?;
+            if task.thread_id != thread_id {
+                return Err(Status::failed_precondition(format!(
+                    "task {task_id} does not belong to thread {thread_id}",
+                )));
+            }
+        }
+
+        // Restrict cancellation to root turns. `cancel_tree` on an
+        // interior task cancels that subtree but leaves an out-of-subtree
+        // parent stuck in `WaitingOnChildren` on the durable SQL backends
+        // — a liveness deadlock this RPC would make client-triggerable.
+        if !task.kind.is_root() {
+            return Err(Status::failed_precondition(
+                "CancelTask only supports root tasks; cancelling an interior task is not yet supported",
+            ));
+        }
+
+        info!(
+            task_id = %task_id,
+            thread_id = %task.thread_id,
+            reason = %request.reason,
+            "cancelling task tree",
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let cancelled = self
+            .shared
+            .stores
+            .task_store
+            .cancel_tree(&task_id, now)
+            .await
+            .map_err(internal_status("cancelling task tree"))?;
+
+        let cancelled_task_ids: Vec<String> = cancelled.iter().map(ToString::to_string).collect();
+        let cancelled_count = u32::try_from(cancelled_task_ids.len())
+            .map_err(|_| Status::internal("cancelled task count out of range"))?;
+
+        Ok(Response::new(pb::CancelTaskResponse {
+            cancelled_task_ids,
+            cancelled_count,
+        }))
+    }
 }
 
 type EventStream =
@@ -2775,9 +2854,11 @@ mod tests {
     use agent_sdk_foundation::llm::{
         ChatOutcome, ChatRequest, ChatResponse, StopReason, Tool, Usage,
     };
+    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope};
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;
+    use agent_server::journal::task::{ChildSpawnSpec, SuspensionPayload};
     use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
     use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
     use anyhow::{Context, Result, anyhow, bail};
@@ -4829,5 +4910,277 @@ mod tests {
             event: budget_exceeded_event(),
         };
         assert!(is_done_event(&committed));
+    }
+
+    /// Create a thread and admit one root turn through the in-process
+    /// control service. No host/worker runs in this fixture, so the
+    /// returned root turn stays non-terminal (`Pending`) until a cancel
+    /// transitions it — exactly the state `CancelTask` must handle.
+    ///
+    /// Returns `(thread_id, root_task_id)`.
+    async fn seed_pending_root(
+        service: &GrpcControlService,
+        label: &str,
+    ) -> Result<(String, String)> {
+        let thread = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: format!("{label}-create"),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .context("create_thread missing snapshot")?
+            .thread_id;
+        let task = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: format!("{label}-submit"),
+                thread_id: thread.clone(),
+                input: vec![text_input("do work")],
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("submit_thread_work missing task")?;
+        Ok((thread, task.task_id))
+    }
+
+    /// `CancelTask` transitions a queued/running root turn to
+    /// `CANCELLED` and reports the ids it cancelled.
+    #[tokio::test]
+    async fn cancel_task_cancels_a_pending_root_turn() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-pending").await?;
+
+        let cancel = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: "user aborted".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(cancel.cancelled_task_ids, vec![task_id.clone()]);
+        assert_eq!(cancel.cancelled_count, 1);
+
+        let after = service
+            .get_task(Request::new(pb::GetTaskRequest {
+                task_id: task_id.clone(),
+            }))
+            .await?
+            .into_inner()
+            .task
+            .context("get_task missing task")?;
+        assert_eq!(after.status, pb::TaskStatus::Cancelled as i32, "{after:?}");
+        Ok(())
+    }
+
+    /// Cancelling an unknown task id is a clean `NOT_FOUND`, not the
+    /// INTERNAL that `cancel_tree`'s own existence check would surface.
+    #[tokio::test]
+    async fn cancel_task_returns_not_found_for_unknown_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "00000000-0000-7000-8000-000000000000".into(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("cancel on unknown task must error");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        Ok(())
+    }
+
+    /// A blank `task_id` is rejected up front with `INVALID_ARGUMENT`.
+    #[tokio::test]
+    async fn cancel_task_rejects_blank_task_id() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService { shared };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: "   ".into(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("blank task_id must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        Ok(())
+    }
+
+    /// Re-cancelling an already-terminal subtree is a no-op: the second
+    /// call succeeds and reports zero newly-cancelled ids.
+    #[tokio::test]
+    async fn cancel_task_is_idempotent_on_already_terminal_subtree() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (_thread, task_id) = seed_pending_root(&service, "cancel-idem").await?;
+
+        let first = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first.cancelled_count, 1);
+
+        let second = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner();
+        assert!(
+            second.cancelled_task_ids.is_empty(),
+            "{:?}",
+            second.cancelled_task_ids,
+        );
+        assert_eq!(second.cancelled_count, 0);
+        Ok(())
+    }
+
+    /// Seed a real interior task: admit a root turn, lease it `Running`,
+    /// then spawn one `ToolRuntime` child under it. The child is a
+    /// non-root, out-of-subtree task — the case `CancelTask` must reject.
+    ///
+    /// Returns `(thread_id, root_task_id, child_task_id)`.
+    async fn seed_interior_tool_child(
+        shared: &GrpcShared,
+        thread_name: &str,
+    ) -> Result<(ThreadId, String, String)> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let thread_id = ThreadId::from_string(thread_name);
+        let root = AgentTask::new_root_turn(thread_id.clone(), now, 5);
+        let root_id = root.id.clone();
+        let store = &shared.stores.task_store;
+        store
+            .submit_root_turn(root.clone())
+            .await
+            .context("submit root for interior-child fixture")?;
+
+        let worker = WorkerId::from_string("w-interior");
+        let lease = LeaseId::from_string("l-interior");
+        store
+            .try_acquire_task(
+                &root_id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::seconds(60),
+                now,
+            )
+            .await
+            .context("acquire root for interior-child fixture")?
+            .context("acquire returned None")?;
+
+        let continuation = ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread_id.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread_id.clone()),
+            response_id: None,
+            stop_reason: None,
+            response_content: Vec::new(),
+        });
+        let (_parent, children) = store
+            .spawn_tool_children(
+                &root_id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2)],
+                SuspensionPayload {
+                    continuation,
+                    suspended_messages: Vec::new(),
+                },
+                None,
+                now,
+            )
+            .await
+            .context("spawn tool child for interior-child fixture")?;
+        let child = children
+            .first()
+            .context("spawn_tool_children returned no child")?;
+        assert!(!child.kind.is_root(), "child must be a non-root task");
+
+        Ok((thread_id, root_id.to_string(), child.id.to_string()))
+    }
+
+    /// `CancelTask` rejects an interior (non-root) task id with
+    /// `FAILED_PRECONDITION`. Cancelling such a task on the durable SQL
+    /// backends would strand the out-of-subtree parent in
+    /// `WaitingOnChildren`, so the RPC only supports root tasks.
+    #[tokio::test]
+    async fn cancel_task_rejects_interior_task() -> Result<()> {
+        let shared = event_test_shared()?;
+        let (_thread, _root_id, child_id) =
+            seed_interior_tool_child(&shared, "t-cancel-interior").await?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: child_id,
+                reason: String::new(),
+                thread_id: String::new(),
+            }))
+            .await
+            .expect_err("cancelling an interior task must reject");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        Ok(())
+    }
+
+    /// `CancelTask` enforces the thread guard: a `(thread_id, task_id)`
+    /// pair whose task belongs to a different thread is rejected with
+    /// `FAILED_PRECONDITION` rather than cancelling another thread's work.
+    #[tokio::test]
+    async fn cancel_task_rejects_thread_mismatch() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+
+        let (thread, task_id) = seed_pending_root(&service, "cancel-thread-guard").await?;
+
+        let err = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: format!("{thread}-other"),
+            }))
+            .await
+            .expect_err("thread mismatch must reject");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+
+        // The matching thread guard still permits the cancel, proving the
+        // guard only blocks genuine mismatches.
+        let ok = service
+            .cancel_task(Request::new(pb::CancelTaskRequest {
+                task_id: task_id.clone(),
+                reason: String::new(),
+                thread_id: thread,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(ok.cancelled_task_ids, vec![task_id]);
+        Ok(())
     }
 }
