@@ -5,6 +5,10 @@
 //! [`EventStore`] so we observe every [`AgentEvent`] the agent loop emits — the
 //! agent writes a [`AgentEvent::TextDelta`] for each streamed chunk.
 //!
+//! Rather than hand-roll the full [`EventStore`] surface, this uses the SDK's
+//! reusable [`ObservingEventStore`] decorator: pass an inner store plus a
+//! closure that runs on every appended envelope.
+//!
 //! # Running
 //!
 //! ```bash
@@ -15,60 +19,9 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use agent_sdk::{
-    AgentEvent, AgentEventEnvelope, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
-    StoredTurnEvents, ThreadId, ToolContext, builder, providers::AnthropicProvider,
+    AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore, ObservingEventStore,
+    ThreadId, ToolContext, builder, providers::AnthropicProvider,
 };
-use async_trait::async_trait;
-
-/// Wraps an [`InMemoryEventStore`], printing streamed text as it arrives and
-/// delegating all persistence to the inner store.
-struct PrintingEventStore {
-    inner: Arc<InMemoryEventStore>,
-}
-
-impl PrintingEventStore {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(InMemoryEventStore::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl EventStore for PrintingEventStore {
-    async fn append(
-        &self,
-        thread_id: &ThreadId,
-        turn: usize,
-        envelope: AgentEventEnvelope,
-    ) -> anyhow::Result<()> {
-        if let AgentEvent::TextDelta { delta, .. } = &envelope.event {
-            print!("{delta}");
-            let _ = std::io::stdout().flush();
-        }
-        self.inner.append(thread_id, turn, envelope).await
-    }
-
-    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> anyhow::Result<()> {
-        self.inner.finish_turn(thread_id, turn).await
-    }
-
-    async fn get_turn(
-        &self,
-        thread_id: &ThreadId,
-        turn: usize,
-    ) -> anyhow::Result<Option<StoredTurnEvents>> {
-        self.inner.get_turn(thread_id, turn).await
-    }
-
-    async fn get_turns(&self, thread_id: &ThreadId) -> anyhow::Result<Vec<StoredTurnEvents>> {
-        self.inner.get_turns(thread_id).await
-    }
-
-    async fn clear(&self, thread_id: &ThreadId) -> anyhow::Result<()> {
-        self.inner.clear(thread_id).await
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,7 +30,17 @@ async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable must be set"))?;
 
-    let event_store = Arc::new(PrintingEventStore::new());
+    // Wrap an in-memory store so we observe each streamed delta as it is
+    // appended; the inner store still persists every envelope.
+    let event_store: Arc<dyn EventStore> = Arc::new(ObservingEventStore::new(
+        InMemoryEventStore::new(),
+        |envelope| {
+            if let AgentEvent::TextDelta { delta, .. } = &envelope.event {
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+            }
+        },
+    ));
     let agent = builder::<()>()
         .provider(AnthropicProvider::sonnet(api_key))
         .event_store(event_store)
