@@ -57,6 +57,11 @@ cloudflare = ["anthropic", "openai", "gemini"]
 # replay mode. Gated because cassette (de)serialization pulls in extra
 # serde wiring most consumers never need.
 record-replay = []
+# Third-party model capability/pricing feed (models.dev / OpenRouter) plus the
+# layered `ModelRegistry` resolver. Gated because it makes outbound HTTP to a
+# third-party catalog; the default offline build keeps using the static
+# `model_capabilities` table only.
+model-discovery = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

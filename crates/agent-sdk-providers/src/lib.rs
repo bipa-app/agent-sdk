@@ -47,6 +47,8 @@ pub mod fallback;
 pub(crate) mod http;
 pub mod impls;
 pub mod model_capabilities;
+#[cfg(feature = "model-discovery")]
+pub mod model_catalog;
 pub mod provider;
 #[cfg(feature = "record-replay")]
 pub mod record_replay;
@@ -58,7 +60,7 @@ pub mod structured;
 
 // Convenience re-exports — provider trait and streaming
 pub use fallback::FallbackProvider;
-pub use provider::{LlmProvider, StructuredOutputSupport, collect_stream};
+pub use provider::{LlmProvider, ModelInfo, StructuredOutputSupport, collect_stream};
 #[cfg(feature = "record-replay")]
 pub use record_replay::{RecordReplayMode, RecordReplayProvider};
 pub use refresh::{RefreshingProvider, is_unauthorized_error};
@@ -90,6 +92,13 @@ pub use impls::{OpenAIProvider, OpenAIResponsesProvider};
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
+};
+
+// Dynamic model-discovery: third-party capability/pricing feed + layered registry.
+#[cfg(feature = "model-discovery")]
+pub use model_catalog::{
+    CatalogEntry, ModelCatalogSource, ModelRegistry, ModelsDevSource, OpenRouterSource,
+    ResolvedModel, ResolvedSource,
 };
 
 // Search provider

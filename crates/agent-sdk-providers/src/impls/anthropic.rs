@@ -122,6 +122,36 @@ pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
 }
 
+/// Parse the Anthropic `GET /v1/models` response body into [`ModelInfo`] rows.
+///
+/// The Messages API list endpoint returns `{ "data": [{ "id", "display_name",
+/// ... }] }`. It does not report token limits, so those fields stay `None`.
+fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
+    #[derive(serde::Deserialize)]
+    struct ListResponse {
+        #[serde(default)]
+        data: Vec<ModelRow>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelRow {
+        id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    }
+    let parsed: ListResponse = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("failed to parse Anthropic models list: {e}"))?;
+    Ok(parsed
+        .data
+        .into_iter()
+        .map(|row| crate::provider::ModelInfo {
+            id: row.id,
+            display_name: row.display_name,
+            context_window: None,
+            max_output_tokens: None,
+        })
+        .collect())
+}
+
 /// Cache-control breakpoints resolved for the three cacheable prefixes of an
 /// Anthropic request, in decreasing order of prefix stability. A `None` field
 /// means "do not mark this prefix with `cache_control`".
@@ -954,6 +984,29 @@ impl LlmProvider for AnthropicProvider {
         Ok(())
     }
 
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        let builder = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_auth(builder)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Anthropic list_models returned HTTP {status}: {body}"
+            ));
+        }
+        parse_models_list(&body)
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -981,6 +1034,26 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ANTHROPIC_MODELS_FIXTURE: &str = r#"{
+      "data": [
+        {"type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+        {"type": "model", "id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}
+      ],
+      "has_more": false
+    }"#;
+
+    #[test]
+    fn parse_models_list_reads_id_and_display_name() -> anyhow::Result<()> {
+        let models = parse_models_list(ANTHROPIC_MODELS_FIXTURE)?;
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-opus-4-8");
+        assert_eq!(models[0].display_name.as_deref(), Some("Claude Opus 4.8"));
+        // Anthropic's listing endpoint reports no token limits.
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_output_tokens, None);
+        Ok(())
+    }
 
     // ===================
     // Constructor Tests

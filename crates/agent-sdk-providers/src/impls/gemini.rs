@@ -484,6 +484,29 @@ impl LlmProvider for GeminiProvider {
         })
     }
 
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        let builder = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_auth(builder)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Gemini list_models returned HTTP {status}: {body}"
+            ));
+        }
+        parse_models_list(&body)
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -497,9 +520,91 @@ impl LlmProvider for GeminiProvider {
     }
 }
 
+/// Parse the Gemini `GET /v1beta/models` response body into [`ModelInfo`] rows.
+///
+/// The endpoint returns `{ "models": [{ "name": "models/<id>", "displayName",
+/// "inputTokenLimit", "outputTokenLimit", "supportedGenerationMethods" }] }`.
+/// Entries that do not support `generateContent` (e.g. embedding-only models)
+/// are dropped, and the `models/` prefix is stripped from `name` to recover the
+/// bare model id the chat endpoint expects.
+fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
+    #[derive(serde::Deserialize)]
+    struct ListResponse {
+        #[serde(default)]
+        models: Vec<ModelRow>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelRow {
+        name: String,
+        #[serde(rename = "displayName", default)]
+        display_name: Option<String>,
+        #[serde(rename = "inputTokenLimit", default)]
+        input_token_limit: Option<u32>,
+        #[serde(rename = "outputTokenLimit", default)]
+        output_token_limit: Option<u32>,
+        #[serde(rename = "supportedGenerationMethods", default)]
+        supported_generation_methods: Vec<String>,
+    }
+    let parsed: ListResponse = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("failed to parse Gemini models list: {e}"))?;
+    Ok(parsed
+        .models
+        .into_iter()
+        .filter(|row| {
+            row.supported_generation_methods.is_empty()
+                || row
+                    .supported_generation_methods
+                    .iter()
+                    .any(|m| m == "generateContent")
+        })
+        .map(|row| crate::provider::ModelInfo {
+            id: row
+                .name
+                .strip_prefix("models/")
+                .unwrap_or(&row.name)
+                .to_owned(),
+            display_name: row.display_name,
+            context_window: row.input_token_limit,
+            max_output_tokens: row.output_token_limit,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GEMINI_MODELS_FIXTURE: &str = r#"{
+      "models": [
+        {
+          "name": "models/gemini-2.5-pro",
+          "displayName": "Gemini 2.5 Pro",
+          "inputTokenLimit": 1048576,
+          "outputTokenLimit": 65536,
+          "supportedGenerationMethods": ["generateContent", "countTokens"]
+        },
+        {
+          "name": "models/text-embedding-004",
+          "displayName": "Text Embedding 004",
+          "inputTokenLimit": 2048,
+          "outputTokenLimit": 1,
+          "supportedGenerationMethods": ["embedContent"]
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parse_models_list_strips_prefix_and_maps_limits() -> anyhow::Result<()> {
+        let models = parse_models_list(GEMINI_MODELS_FIXTURE)?;
+        // The embedding-only model is filtered out (no `generateContent`).
+        assert_eq!(models.len(), 1);
+        let pro = &models[0];
+        assert_eq!(pro.id, "gemini-2.5-pro");
+        assert_eq!(pro.display_name.as_deref(), Some("Gemini 2.5 Pro"));
+        assert_eq!(pro.context_window, Some(1_048_576));
+        assert_eq!(pro.max_output_tokens, Some(65_536));
+        Ok(())
+    }
 
     #[test]
     fn test_new_creates_provider_with_custom_model() {
