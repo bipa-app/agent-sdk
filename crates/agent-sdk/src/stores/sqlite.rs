@@ -23,8 +23,9 @@
 //!
 //! # One store, four traits
 //!
-//! [`SqliteStore`] is cheap to [`Clone`] (it shares a single pooled connection
-//! behind an [`Arc`]), so the same store can back every slot on the builder:
+//! [`SqliteStore`] is cheap to [`Clone`] (it shares one
+//! `Arc<Mutex<Connection>>`, not a connection pool), so the same store can back
+//! every slot on the builder:
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -58,16 +59,19 @@ use agent_sdk_foundation::llm;
 use agent_sdk_foundation::types::{AgentState, ThreadId, ToolExecution};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{EventStore, MessageStore, StateStore, StoredTurnEvents, ToolExecutionStore};
+
+/// How long a blocked writer waits for a competing connection to release its
+/// lock before `SQLite` returns `SQLITE_BUSY`. The headline use case
+/// (restart-and-resume) can briefly contend with a lingering process still
+/// checkpointing the WAL, so we wait a few seconds rather than failing fast.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Schema applied on open. `CREATE TABLE IF NOT EXISTS` makes opening an
 /// existing database a no-op, which is exactly the resume path.
 const SCHEMA: &str = "\
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS agent_messages (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT NOT NULL,
@@ -109,9 +113,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_tool_executions_operation
 /// Single-file SQLite-backed implementation of every SDK store trait.
 ///
 /// See the [module docs](self) for resume semantics and a wiring example.
-/// Cloning shares the same underlying database connection, so a clone handed to
-/// the agent builder observes everything the kept handle records (and vice
-/// versa).
+/// Cloning shares the same single `Arc<Mutex<Connection>>` (not a pool), so a
+/// clone handed to the agent builder observes everything the kept handle
+/// records (and vice versa); all database calls serialize on that one mutex.
 #[derive(Clone)]
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -131,6 +135,14 @@ impl SqliteStore {
         let path = path.as_ref();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite database at {}", path.display()))?;
+        // WAL lets readers run concurrently with a writer, and `busy_timeout`
+        // makes a blocked writer wait for a competing connection instead of
+        // failing fast with `SQLITE_BUSY` — important for restart-and-resume,
+        // where a lingering process may still be checkpointing the WAL.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable WAL journal mode")?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("failed to set sqlite busy timeout")?;
         conn.execute_batch(SCHEMA)
             .context("failed to initialize sqlite store schema")?;
         Ok(Self {
@@ -346,7 +358,14 @@ impl EventStore for SqliteStore {
         let turn_i64 = i64::try_from(turn).context("turn index exceeds i64 range")?;
         let payload = serde_json::to_string(&envelope).context("failed to encode event")?;
         self.with_conn(move |conn| {
-            let finished: Option<i64> = conn
+            // `BEGIN IMMEDIATE` takes the write lock up front so the
+            // finished-turn barrier check and the insert are one atomic unit:
+            // a concurrent connection cannot slip a `finish_turn` between them,
+            // and the whole append is a single WAL commit instead of three.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("failed to begin append transaction")?;
+            let finished: Option<i64> = tx
                 .query_row(
                     "SELECT finished FROM agent_event_turns WHERE thread_id = ?1 AND turn = ?2",
                     params![thread, turn_i64],
@@ -355,17 +374,18 @@ impl EventStore for SqliteStore {
                 .optional()
                 .context("failed to read turn state")?;
             anyhow::ensure!(finished != Some(1), "cannot append to finished turn {turn}");
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO agent_event_turns (thread_id, turn, finished)
                  VALUES (?1, ?2, 0)",
                 params![thread, turn_i64],
             )
             .context("failed to record turn")?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO agent_events (thread_id, turn, payload) VALUES (?1, ?2, ?3)",
                 params![thread, turn_i64, payload],
             )
             .context("failed to append event")?;
+            tx.commit().context("failed to commit append transaction")?;
             Ok(())
         })
         .await
@@ -375,7 +395,13 @@ impl EventStore for SqliteStore {
         let thread = thread_id.0.clone();
         let turn_i64 = i64::try_from(turn).context("turn index exceeds i64 range")?;
         self.with_conn(move |conn| {
-            let finished: Option<i64> = conn
+            // `BEGIN IMMEDIATE` makes the already-finished check and the
+            // finish write atomic against a concurrent connection, so the
+            // barrier cannot be double-finished or raced by an append.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("failed to begin finish_turn transaction")?;
+            let finished: Option<i64> = tx
                 .query_row(
                     "SELECT finished FROM agent_event_turns WHERE thread_id = ?1 AND turn = ?2",
                     params![thread, turn_i64],
@@ -384,12 +410,14 @@ impl EventStore for SqliteStore {
                 .optional()
                 .context("failed to read turn state")?;
             anyhow::ensure!(finished != Some(1), "turn {turn} is already finished");
-            conn.execute(
+            tx.execute(
                 "INSERT INTO agent_event_turns (thread_id, turn, finished) VALUES (?1, ?2, 1)
                  ON CONFLICT(thread_id, turn) DO UPDATE SET finished = 1",
                 params![thread, turn_i64],
             )
             .context("failed to finish turn")?;
+            tx.commit()
+                .context("failed to commit finish_turn transaction")?;
             Ok(())
         })
         .await
@@ -608,9 +636,13 @@ impl ToolExecutionStore for SqliteStore {
     ) -> Result<Option<ToolExecution>> {
         let id = operation_id.to_owned();
         self.with_conn(move |conn| {
+            // Two rows can share an `operation_id`; pick the most recently
+            // written one so this matches `InMemoryExecutionStore`'s
+            // latest-wins contract (its `HashMap` keeps only the last writer).
             let payload: Option<String> = conn
                 .query_row(
-                    "SELECT payload FROM agent_tool_executions WHERE operation_id = ?1 LIMIT 1",
+                    "SELECT payload FROM agent_tool_executions WHERE operation_id = ?1
+                     ORDER BY rowid DESC LIMIT 1",
                     params![id],
                     |row| row.get(0),
                 )
@@ -752,6 +784,92 @@ mod tests {
         .await
         .expect_err("append after finish must fail");
         assert!(error.to_string().contains("cannot append to finished turn"));
+        Ok(())
+    }
+
+    /// The finish barrier rejects an append to a finished turn within a single
+    /// process too (not only across reopen), and an append to an unfinished
+    /// turn still succeeds afterward.
+    #[tokio::test]
+    async fn rejects_append_after_finish_in_process() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("agent.db");
+        let thread_id = ThreadId::new();
+        let seq = SequenceCounter::new();
+
+        let store = SqliteStore::open(&path)?;
+        EventStore::append(
+            &store,
+            &thread_id,
+            1,
+            AgentEventEnvelope::wrap(AgentEvent::text("m1", "early"), &seq),
+        )
+        .await?;
+        store.finish_turn(&thread_id, 1).await?;
+
+        let error = EventStore::append(
+            &store,
+            &thread_id,
+            1,
+            AgentEventEnvelope::wrap(AgentEvent::text("late", "late"), &seq),
+        )
+        .await
+        .expect_err("append after finish must fail");
+        assert!(error.to_string().contains("cannot append to finished turn"));
+
+        // A different, unfinished turn still accepts appends.
+        EventStore::append(
+            &store,
+            &thread_id,
+            2,
+            AgentEventEnvelope::wrap(AgentEvent::text("m2", "ok"), &seq),
+        )
+        .await?;
+        assert_eq!(store.event_count(&thread_id).await?, 2);
+        Ok(())
+    }
+
+    /// Two executions sharing one `operation_id` must resolve to the most
+    /// recently written one, matching `InMemoryExecutionStore`'s latest-wins
+    /// `HashMap` contract instead of returning an indeterminate row.
+    #[tokio::test]
+    async fn operation_id_lookup_is_latest_wins() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("agent.db");
+        let store = SqliteStore::open(&path)?;
+        let thread_id = ThreadId::new();
+
+        let mut first = ToolExecution::new_in_flight(
+            "call_first",
+            thread_id.clone(),
+            "tool",
+            "Tool",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
+        );
+        first.set_operation_id("op_shared");
+        store.record_execution(first).await?;
+
+        let mut second = ToolExecution::new_in_flight(
+            "call_second",
+            thread_id,
+            "tool",
+            "Tool",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc(),
+        );
+        second.set_operation_id("op_shared");
+        store.record_execution(second).await?;
+
+        assert_eq!(
+            store
+                .get_execution_by_operation_id("op_shared")
+                .await?
+                .context("op_shared resolves")?
+                .tool_call_id,
+            "call_second",
+            "the most recently written execution must win"
+        );
         Ok(())
     }
 
