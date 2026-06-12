@@ -4,7 +4,7 @@ use super::types::{
     LlmStreamIds, StreamError,
 };
 use crate::events::AgentEvent;
-use crate::hooks::AgentHooks;
+use crate::hooks::{AgentHooks, RequestDecision, ResponseDecision};
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, LlmProvider, StreamAccumulator, StreamDelta, Usage,
 };
@@ -13,6 +13,72 @@ use futures::StreamExt;
 use log::{error, warn};
 use std::sync::Arc;
 use tokio::time::sleep;
+
+/// Outcome of the [`AgentHooks::pre_llm_request`] input guardrail applied
+/// immediately before the provider chat call.
+pub(super) enum PreLlmGuardrail {
+    /// Proceed with this (possibly hook-substituted) request. Boxed because
+    /// [`ChatRequest`] is large relative to the `Blocked` string.
+    Proceed(Box<ChatRequest>),
+    /// The hook refused the call; the string explains why.
+    Blocked(String),
+}
+
+/// Run the [`AgentHooks::pre_llm_request`] input guardrail.
+///
+/// [`DefaultHooks`](crate::hooks::DefaultHooks) returns
+/// [`RequestDecision::Proceed`] unchanged, so the default path is a no-op
+/// and existing runs are unaffected.
+pub(super) async fn apply_pre_llm_request<H>(
+    hooks: &Arc<H>,
+    request: ChatRequest,
+) -> PreLlmGuardrail
+where
+    H: AgentHooks,
+{
+    match hooks.pre_llm_request(&request).await {
+        RequestDecision::Modify(modified) => PreLlmGuardrail::Proceed(modified),
+        RequestDecision::Block(reason) => PreLlmGuardrail::Blocked(reason),
+        // `RequestDecision::Proceed` and any future `#[non_exhaustive]`
+        // variant proceed unchanged — fail-open matches the historical
+        // no-hook path.
+        _ => PreLlmGuardrail::Proceed(Box::new(request)),
+    }
+}
+
+/// Outcome of the [`AgentHooks::on_llm_response`] output guardrail applied
+/// after the provider responds but before the response is persisted.
+pub(super) enum PostLlmGuardrail {
+    /// Accept the response unchanged.
+    Accept,
+    /// Reject the response; the string explains why.
+    Blocked(String),
+    /// Reject the response and steer a retry by feeding the string back to
+    /// the model on the next turn.
+    RetryWithFeedback(String),
+}
+
+/// Run the [`AgentHooks::on_llm_response`] output guardrail.
+///
+/// [`DefaultHooks`](crate::hooks::DefaultHooks) returns
+/// [`ResponseDecision::Accept`], so the default path is a no-op.
+pub(super) async fn apply_on_llm_response<H>(
+    hooks: &Arc<H>,
+    response: &ChatResponse,
+) -> PostLlmGuardrail
+where
+    H: AgentHooks,
+{
+    match hooks.on_llm_response(response).await {
+        ResponseDecision::Block(reason) => PostLlmGuardrail::Blocked(reason),
+        ResponseDecision::RetryWithFeedback(feedback) => {
+            PostLlmGuardrail::RetryWithFeedback(feedback)
+        }
+        // `ResponseDecision::Accept` and any future `#[non_exhaustive]`
+        // variant accept the response unchanged.
+        _ => PostLlmGuardrail::Accept,
+    }
+}
 
 /// Per-call `OTel` observation hooks for the LLM span.
 ///

@@ -11,6 +11,7 @@ use super::types::{
 
 use crate::types::TurnOptions;
 
+use super::budget;
 use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::AgentEvent;
@@ -20,7 +21,8 @@ use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
-    ContinuationEnvelope, ThreadId, TokenUsage, ToolResult, TurnOutcome, TurnSummary,
+    BudgetLimitKind, ContinuationEnvelope, ThreadId, TokenUsage, ToolResult, TurnOutcome,
+    TurnSummary, UsageLimits,
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 use log::warn;
@@ -1116,10 +1118,77 @@ const fn turn_outcome_keeps_turn_open(outcome: &TurnOutcome) -> bool {
     matches!(outcome, TurnOutcome::AwaitingConfirmation { .. })
 }
 
-fn done_run_state(ctx: &TurnContext) -> AgentRunState {
+fn done_run_state(ctx: &TurnContext, provenance: &AuditProvenance) -> AgentRunState {
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
+        estimated_cost_usd: budget::estimate_cost_usd(provenance, &ctx.total_usage),
+    }
+}
+
+/// Evaluate the run-level usage budget against the cumulative `usage`.
+///
+/// Returns `Some((limit, estimated_cost))` when a configured limit has been
+/// exceeded — the cost is carried alongside so terminal events / states can
+/// report it — and `None` when budgeting is disabled or the run is still
+/// within budget.
+fn budget_status(
+    usage_limits: Option<&UsageLimits>,
+    provenance: &AuditProvenance,
+    usage: &TokenUsage,
+) -> Option<(BudgetLimitKind, Option<f64>)> {
+    let limits = usage_limits?;
+    let cost = budget::estimate_cost_usd(provenance, usage);
+    let limit = budget::check_budget(limits, usage, cost)?;
+    Some((limit, cost))
+}
+
+/// Emit the terminal [`AgentEvent::BudgetExceeded`] (under the next,
+/// not-yet-started turn) and build the matching [`AgentRunState`].
+///
+/// Mirrors [`emit_cancelled_event`]: the previous turn was already closed
+/// by the in-loop result handler, so the terminal event is keyed under
+/// `ctx.turn + 1` to avoid appending to a finished turn.
+async fn budget_exceeded_run_state<H>(
+    ctx: &TurnContext,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    limit: BudgetLimitKind,
+    estimated_cost_usd: Option<f64>,
+) -> AgentRunState
+where
+    H: AgentHooks,
+{
+    warn!(
+        "Run-level usage budget exceeded (turn={}, limit={limit:?})",
+        ctx.turn
+    );
+    let event_turn = ctx.turn.saturating_add(1);
+    if let Err(error) = send_event(
+        event_store,
+        &ctx.thread_id,
+        event_turn,
+        hooks,
+        authority,
+        AgentEvent::budget_exceeded(
+            ctx.thread_id.clone(),
+            ctx.turn,
+            ctx.total_usage.clone(),
+            estimated_cost_usd,
+            limit,
+        ),
+    )
+    .await
+    {
+        return AgentRunState::Error(error);
+    }
+    let _ = finish_turn_or_error(event_store, &ctx.thread_id, event_turn).await;
+    AgentRunState::BudgetExceeded {
+        total_turns: turns_to_u32(ctx.turn),
+        total_usage: ctx.total_usage.clone(),
+        estimated_cost_usd,
+        limit,
     }
 }
 
@@ -1207,6 +1276,7 @@ async fn handle_persistent_done<M, H>(
         authority,
         current_turn,
         cancel_token,
+        provenance,
     }: PersistentDoneParams<'_, H, M>,
 ) -> Option<AgentRunState>
 where
@@ -1264,7 +1334,7 @@ where
                     )))
                 }
                 // Sender dropped — no more injected messages. Exit cleanly.
-                None => Some(done_run_state(ctx)),
+                None => Some(done_run_state(ctx, provenance)),
             }
         }
         () = cancel_token.cancelled() => {
@@ -1319,6 +1389,7 @@ async fn handle_run_loop_turn_result<H, M, S>(
         authority,
         cancel_token,
         current_turn,
+        provenance,
     }: RunLoopTurnResultParams<'_, H, M, S>,
 ) -> RunLoopTurnAction
 where
@@ -1346,6 +1417,7 @@ where
                     authority,
                     current_turn,
                     cancel_token,
+                    provenance,
                 })
                 .await
                 .map_or(RunLoopTurnAction::Continue, RunLoopTurnAction::Return)
@@ -1434,6 +1506,7 @@ async fn finish_run_loop_success<H, S>(
     event_store: &Arc<dyn EventStore>,
     hooks: &Arc<H>,
     authority: &Arc<dyn EventAuthority>,
+    provenance: &AuditProvenance,
 ) -> AgentRunState
 where
     H: AgentHooks,
@@ -1444,17 +1517,19 @@ where
     }
 
     let duration = ctx.start_time.elapsed();
+    let estimated_cost_usd = budget::estimate_cost_usd(provenance, &ctx.total_usage);
     if let Err(error) = send_event(
         event_store,
         &ctx.thread_id,
         ctx.turn,
         hooks,
         authority,
-        AgentEvent::done(
+        AgentEvent::done_with_cost(
             ctx.thread_id.clone(),
             ctx.turn,
             ctx.total_usage.clone(),
             duration,
+            estimated_cost_usd,
         ),
     )
     .await
@@ -1468,6 +1543,7 @@ where
     AgentRunState::Done {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
+        estimated_cost_usd,
     }
 }
 
@@ -1491,6 +1567,7 @@ pub(super) async fn run_loop_turns<Ctx, P, H, M, S>(
         cancel_token,
         mut input_rx,
         turn_options,
+        reminder_config,
         #[cfg(feature = "otel")]
         observability_store,
     }: RunLoopTurnsParams<'_, Ctx, P, H, M, S>,
@@ -1557,6 +1634,7 @@ where
             audit_sink,
             provenance,
             turn_options,
+            reminder_config,
             cancel_token,
             #[cfg(feature = "otel")]
             observability_store,
@@ -1574,10 +1652,23 @@ where
             authority,
             cancel_token,
             current_turn,
+            provenance,
         })
         .await
         {
-            RunLoopTurnAction::Continue => {}
+            RunLoopTurnAction::Continue => {
+                // The turn completed and the run would continue; stop here
+                // instead of starting another (potentially costly) turn if
+                // the cumulative usage has crossed a configured budget.
+                if let Some((limit, cost)) =
+                    budget_status(config.usage_limits.as_ref(), provenance, &ctx.total_usage)
+                {
+                    return Some(
+                        budget_exceeded_run_state(ctx, event_store, hooks, authority, limit, cost)
+                            .await,
+                    );
+                }
+            }
             RunLoopTurnAction::FinishRun => return None,
             RunLoopTurnAction::Return(state) => return Some(state),
         }
@@ -1823,6 +1914,12 @@ where
             AgentRunState::Done {
                 total_turns,
                 total_usage,
+                ..
+            }
+            | AgentRunState::BudgetExceeded {
+                total_turns,
+                total_usage,
+                ..
             }
             | AgentRunState::Refusal {
                 total_turns,
@@ -1847,6 +1944,61 @@ where
     result
 }
 
+/// Borrowed dependencies threaded into [`run_loop_resume_branch`].
+struct RunLoopResumeDeps<'a, Ctx, H, M> {
+    tool_context: &'a ToolContext<Ctx>,
+    thread_id: &'a ThreadId,
+    tools: &'a Arc<ToolRegistry<Ctx>>,
+    hooks: &'a Arc<H>,
+    event_store: &'a Arc<dyn EventStore>,
+    authority: &'a Arc<dyn EventAuthority>,
+    message_store: &'a Arc<M>,
+    execution_store: Option<&'a Arc<dyn ToolExecutionStore>>,
+    audit_sink: &'a Arc<dyn crate::hooks::ToolAuditSink>,
+    provenance: &'a AuditProvenance,
+}
+
+/// Run the looping-mode resume branch: build the resume-scoped tool context
+/// and execute the pending tool confirmation. Returns `Some(state)` when the
+/// run terminated during resume. Extracted from [`run_loop_inner`] to keep it
+/// under the clippy line ceiling.
+async fn run_loop_resume_branch<Ctx, H, M>(
+    resume_data: ResumeData,
+    turn: usize,
+    total_usage: &TokenUsage,
+    state: &AgentState,
+    deps: RunLoopResumeDeps<'_, Ctx, H, M>,
+) -> Option<AgentRunState>
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+    M: MessageStore,
+{
+    let resume_tool_context = deps.tool_context.clone().with_event_store(
+        Arc::clone(deps.event_store),
+        deps.thread_id.clone(),
+        turn,
+        Arc::clone(deps.authority),
+    );
+    handle_run_loop_resume_state(ResumeProcessingParameters {
+        resume_data,
+        turn,
+        total_usage,
+        state,
+        thread_id: deps.thread_id,
+        tool_context: &resume_tool_context,
+        tools: deps.tools,
+        hooks: deps.hooks,
+        event_store: deps.event_store,
+        authority: deps.authority,
+        message_store: deps.message_store,
+        execution_store: deps.execution_store,
+        audit_sink: deps.audit_sink,
+        provenance: deps.provenance,
+    })
+    .await
+}
+
 async fn run_loop_inner<Ctx, P, H, M, S>(
     RunLoopParameters {
         event_store,
@@ -1866,6 +2018,7 @@ async fn run_loop_inner<Ctx, P, H, M, S>(
         audit_sink,
         cancel_token,
         mut input_rx,
+        reminder_config,
         #[cfg(feature = "otel")]
             run_options: _,
         #[cfg(feature = "otel")]
@@ -1908,33 +2061,28 @@ where
         resume_data,
     } = init_state;
 
-    if let Some(resume_data) = resume_data {
-        let resume_tool_context = tool_context.clone().with_event_store(
-            Arc::clone(&event_store),
-            thread_id.clone(),
-            turn,
-            Arc::clone(&authority),
-        );
-        if let Some(outcome) = handle_run_loop_resume_state(ResumeProcessingParameters {
+    if let Some(resume_data) = resume_data
+        && let Some(outcome) = run_loop_resume_branch(
             resume_data,
             turn,
-            total_usage: &total_usage,
-            state: &state,
-            thread_id: &thread_id,
-            tool_context: &resume_tool_context,
-            tools: &tools,
-            hooks: &hooks,
-            event_store: &event_store,
-            authority: &authority,
-            message_store: &message_store,
-            execution_store: execution_store.as_ref(),
-            audit_sink: &audit_sink,
-            provenance: &provenance,
-        })
+            &total_usage,
+            &state,
+            RunLoopResumeDeps {
+                tool_context: &tool_context,
+                thread_id: &thread_id,
+                tools: &tools,
+                hooks: &hooks,
+                event_store: &event_store,
+                authority: &authority,
+                message_store: &message_store,
+                execution_store: execution_store.as_ref(),
+                audit_sink: &audit_sink,
+                provenance: &provenance,
+            },
+        )
         .await
-        {
-            return outcome;
-        }
+    {
+        return outcome;
     }
 
     let mut ctx = build_turn_context(
@@ -1968,6 +2116,7 @@ where
         cancel_token: &cancel_token,
         input_rx: input_rx.as_mut(),
         turn_options: &default_turn_options,
+        reminder_config: reminder_config.as_ref(),
         #[cfg(feature = "otel")]
         observability_store: observability_store.as_ref(),
     })
@@ -1976,7 +2125,15 @@ where
         return outcome;
     }
 
-    finish_run_loop_success(ctx, &state_store, &event_store, &hooks, &authority).await
+    finish_run_loop_success(
+        ctx,
+        &state_store,
+        &event_store,
+        &hooks,
+        &authority,
+        &provenance,
+    )
+    .await
 }
 
 /// Run a single turn of the agent loop.
@@ -2099,6 +2256,7 @@ async fn run_single_turn_inner<Ctx, P, H, M, S>(
         audit_sink,
         cancel_token,
         turn_options,
+        reminder_config,
         #[cfg(feature = "otel")]
             run_options: _,
         #[cfg(feature = "otel")]
@@ -2203,6 +2361,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        reminder_config,
         cancel_token,
         turn,
         total_usage,
@@ -2239,6 +2398,7 @@ struct SingleTurnExecuteParams<Ctx, P, H, M, S> {
     audit_sink: Arc<dyn crate::hooks::ToolAuditSink>,
     provenance: agent_sdk_foundation::audit::AuditProvenance,
     turn_options: TurnOptions,
+    reminder_config: Option<crate::reminders::ReminderConfig>,
     cancel_token: CancellationToken,
     turn: usize,
     total_usage: TokenUsage,
@@ -2268,6 +2428,7 @@ async fn run_single_turn_execute<Ctx, P, H, M, S>(
         audit_sink,
         provenance,
         turn_options,
+        reminder_config,
         cancel_token,
         turn,
         total_usage,
@@ -2320,6 +2481,7 @@ where
         audit_sink: &audit_sink,
         provenance: &provenance,
         turn_options: &turn_options,
+        reminder_config: reminder_config.as_ref(),
         cancel_token: &cancel_token,
         #[cfg(feature = "otel")]
         observability_store: observability_store.as_ref(),
@@ -2337,6 +2499,7 @@ where
         state_store: &state_store,
         provenance: &provenance,
         turn_options: &turn_options,
+        usage_limits: config.usage_limits.as_ref(),
     })
     .await;
 
@@ -2412,17 +2575,19 @@ where
         warn!("Failed to save final state: {e}");
     }
     let duration = ctx.start_time.elapsed();
+    let estimated_cost_usd = budget::estimate_cost_usd(provenance, &ctx.total_usage);
     if let Err(error) = send_event(
         event_store,
         thread_id,
         current_turn,
         hooks,
         authority,
-        AgentEvent::done(
+        AgentEvent::done_with_cost(
             thread_id.clone(),
             ctx.turn,
             ctx.total_usage.clone(),
             duration,
+            estimated_cost_usd,
         ),
     )
     .await
@@ -2433,6 +2598,81 @@ where
     TurnOutcome::Done {
         total_turns: turns_to_u32(ctx.turn),
         total_usage: ctx.total_usage.clone(),
+        summary,
+    }
+}
+
+struct ConvertContinueParams<'a, H, S> {
+    ctx: TurnContext,
+    turn_usage: TokenUsage,
+    state_store: &'a Arc<S>,
+    event_store: &'a Arc<dyn EventStore>,
+    hooks: &'a Arc<H>,
+    authority: &'a Arc<dyn EventAuthority>,
+    thread_id: ThreadId,
+    current_turn: usize,
+    provenance: &'a AuditProvenance,
+    turn_options: &'a TurnOptions,
+    usage_limits: Option<&'a UsageLimits>,
+}
+
+/// Build the single-turn outcome for an [`InternalTurnResult::Continue`].
+///
+/// The turn produced tool results and would continue; if the cumulative
+/// usage has crossed a configured budget, yield [`TurnOutcome::BudgetExceeded`]
+/// (emitting the terminal event) instead of [`TurnOutcome::NeedsMoreTurns`]
+/// so the caller does not dispatch another turn. Extracted from
+/// [`convert_turn_result`] to keep it under the clippy line ceiling.
+async fn convert_continue_turn<H: AgentHooks, S: StateStore>(
+    ConvertContinueParams {
+        ctx,
+        turn_usage,
+        state_store,
+        event_store,
+        hooks,
+        authority,
+        thread_id,
+        current_turn,
+        provenance,
+        turn_options,
+        usage_limits,
+    }: ConvertContinueParams<'_, H, S>,
+) -> TurnOutcome {
+    if let Err(e) = state_store.save(&ctx.state).await {
+        warn!("Failed to save state checkpoint: {e}");
+    }
+    if let Some((limit, estimated_cost_usd)) =
+        budget_status(usage_limits, provenance, &ctx.total_usage)
+    {
+        let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage);
+        let _ = send_event(
+            event_store,
+            &thread_id,
+            current_turn,
+            hooks,
+            authority,
+            AgentEvent::budget_exceeded(
+                thread_id.clone(),
+                ctx.turn,
+                ctx.total_usage.clone(),
+                estimated_cost_usd,
+                limit,
+            ),
+        )
+        .await;
+        return TurnOutcome::BudgetExceeded {
+            total_turns: turns_to_u32(ctx.turn),
+            total_usage: ctx.total_usage,
+            estimated_cost_usd,
+            limit,
+            summary,
+        };
+    }
+    let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
+    TurnOutcome::NeedsMoreTurns {
+        turn: ctx.turn,
+        turn_usage,
+        total_usage: ctx.total_usage,
         summary,
     }
 }
@@ -2449,20 +2689,25 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
         state_store,
         provenance,
         turn_options,
+        usage_limits,
     }: ConvertTurnResultParams<'_, H, S>,
 ) -> TurnOutcome {
     match result {
         InternalTurnResult::Continue { turn_usage } => {
-            if let Err(e) = state_store.save(&ctx.state).await {
-                warn!("Failed to save state checkpoint: {e}");
-            }
-            let summary = build_turn_summary(&ctx, provenance, turn_options, turn_usage.clone());
-            TurnOutcome::NeedsMoreTurns {
-                turn: ctx.turn,
+            convert_continue_turn(ConvertContinueParams {
+                ctx,
                 turn_usage,
-                total_usage: ctx.total_usage,
-                summary,
-            }
+                state_store,
+                event_store,
+                hooks,
+                authority,
+                thread_id,
+                current_turn,
+                provenance,
+                turn_options,
+                usage_limits,
+            })
+            .await
         }
         InternalTurnResult::Done => {
             convert_done_turn(ConvertDoneParams {

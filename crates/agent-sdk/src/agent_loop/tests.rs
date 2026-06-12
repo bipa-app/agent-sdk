@@ -2,15 +2,19 @@ use super::test_utils::*;
 use super::*;
 use crate::context::{CompactionConfig, CompactionResult, ContextCompactor};
 use crate::events::{AgentEvent, AgentEventEnvelope};
-use crate::hooks::{AgentHooks, AllowAllHooks, ToolDecision};
-use crate::llm::{ChatOutcome, Content, ContentBlock, Message, Role, StreamDelta, StreamErrorKind};
+use crate::hooks::{AgentHooks, AllowAllHooks, RequestDecision, ToolDecision};
+use crate::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, Role, StopReason,
+    StreamDelta, StreamErrorKind, Usage,
+};
+use crate::reminders::{ReminderConfig, ToolReminder};
 use crate::stores::{
     EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StateStore, StoredTurnEvents,
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{
-    AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolResult,
-    ToolTier, TurnOptions, TurnOutcome,
+    AgentConfig, AgentInput, AgentRunState, BudgetLimitKind, ContinuationEnvelope, ToolInvocation,
+    ToolResult, ToolTier, TurnOptions, TurnOutcome, UsageLimits,
 };
 use crate::types::{AgentState, RetryConfig};
 use anyhow::Context;
@@ -1591,6 +1595,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         compactor: None,
         execution_store: None,
         audit_sink: Arc::new(crate::hooks::NoopAuditSink),
+        reminder_config: None,
         #[cfg(feature = "otel")]
         observability_store: None,
     };
@@ -5440,5 +5445,425 @@ async fn run_persistent_unsupported_input_errors() -> anyhow::Result<()> {
         matches!(state, AgentRunState::Error(_)),
         "injecting Continue should error the run, got {state:?}"
     );
+    Ok(())
+}
+
+// ===========================================================================
+// AGENT-LOOP feature cluster: budgets, parallel cap, guardrails, reminders,
+// run_stream.
+// ===========================================================================
+
+/// Provider that reports a priced provider/model (`openai` / `gpt-4o`) so the
+/// run can estimate a non-`None` cost. Always returns a terminal text turn
+/// with a fixed usage so the cost is deterministic.
+struct PricedProvider;
+
+#[async_trait]
+impl crate::llm::LlmProvider for PricedProvider {
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatOutcome> {
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_priced".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "all done".to_string(),
+            }],
+            model: "gpt-4o".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 2_000,
+                output_tokens: 1_000,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "gpt-4o"
+    }
+
+    fn provider(&self) -> &'static str {
+        "openai"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeToolName {
+    Probe,
+}
+
+impl crate::tools::ToolName for ProbeToolName {}
+
+/// Observe-tier tool that records the peak number of concurrently-executing
+/// invocations. Yields twice mid-execution so that, if two invocations are
+/// allowed to overlap, the in-flight counter is observed at 2.
+struct ConcurrencyProbeTool {
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+impl crate::tools::Tool<()> for ConcurrencyProbeTool {
+    type Name = ProbeToolName;
+
+    fn name(&self) -> ProbeToolName {
+        ProbeToolName::Probe
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Probe"
+    }
+
+    fn description(&self) -> &'static str {
+        "Records peak concurrency of observe-tier execution."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": { "message": { "type": "string" } } })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+        // Yield so an overlapping invocation would be observed in-flight.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let message = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        Ok(ToolResult::success(format!("probe:{message}")))
+    }
+}
+
+#[tokio::test]
+async fn test_usage_budget_total_tokens_breach_stops_run() -> anyhow::Result<()> {
+    // The first (tool-use) turn accrues 30 tokens (10 in + 20 out), over the
+    // 25-token limit, so the run stops with BudgetExceeded instead of looping.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        MockProvider::text_response("should not be reached"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let config = AgentConfig {
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(25),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded { limit, .. } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+        }
+        other => anyhow::bail!("expected BudgetExceeded, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::BudgetExceeded {
+                limit: BudgetLimitKind::TotalTokens,
+                ..
+            }
+        )),
+        "a BudgetExceeded event must be emitted",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
+    // gpt-4o pricing for 2000 in / 1000 out = $0.0025 + $0.005 = $0.0075.
+    let agent = builder::<()>()
+        .provider(PricedProvider)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_cost_usd: Some(10.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::Done {
+            estimated_cost_usd: Some(cost),
+            ..
+        } => {
+            assert!(
+                (cost - 0.0075).abs() < 1e-9,
+                "unexpected estimated cost: {cost}"
+            );
+        }
+        other => anyhow::bail!("expected Done with Some(cost), got {other:?}"),
+    }
+
+    // The Done event carries the same cost on the wire.
+    let done_cost = events.iter().find_map(|e| match &e.event {
+        AgentEvent::Done {
+            estimated_cost_usd, ..
+        } => Some(*estimated_cost_usd),
+        _ => None,
+    });
+    assert_eq!(done_cost, Some(Some(0.0075)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_parallel_tools_one_runs_sequentially() -> anyhow::Result<()> {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("call_a", "probe", json!({"message": "a"})),
+            ("call_b", "probe", json!({"message": "b"})),
+            ("call_c", "probe", json!({"message": "c"})),
+        ]),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(ConcurrencyProbeTool {
+        in_flight: Arc::clone(&in_flight),
+        max_in_flight: Arc::clone(&max_in_flight),
+    });
+
+    let config = AgentConfig {
+        max_parallel_tools: Some(1),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(matches!(state, AgentRunState::Done { .. }));
+    assert_eq!(
+        max_in_flight.load(Ordering::SeqCst),
+        1,
+        "Some(1) must run observe-tier tools strictly sequentially",
+    );
+
+    // Result order is preserved: ToolCallEnd ids appear in input order.
+    let tool_end_ids: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::ToolCallEnd { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_end_ids,
+        vec![
+            "call_a".to_string(),
+            "call_b".to_string(),
+            "call_c".to_string()
+        ],
+        "sequential execution must preserve input ordering",
+    );
+
+    Ok(())
+}
+
+struct BlockingRequestHooks;
+
+#[async_trait]
+impl AgentHooks for BlockingRequestHooks {
+    async fn pre_llm_request(&self, _request: &ChatRequest) -> RequestDecision {
+        RequestDecision::Block("policy violation".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_pre_llm_request_block_ends_run() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("never sent")]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(BlockingRequestHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::Error(error) => {
+            assert!(
+                error.message.contains("blocked by guardrail")
+                    && error.message.contains("policy violation"),
+                "unexpected error message: {}",
+                error.message
+            );
+        }
+        other => anyhow::bail!("expected Error from guardrail block, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::Error { message, .. } if message.contains("blocked by guardrail")
+        )),
+        "a guardrail-block error event must be emitted",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tool_reminder_fires_after_trigger() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let reminders = ReminderConfig::new()
+        .with_tool_reminder("echo", ToolReminder::always("REMEMBER_TO_VERIFY_OUTPUT"));
+
+    let message_store = InMemoryStore::new();
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(InMemoryStore::new())
+        .with_reminders(reminders)
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let _ = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let reminded = history.iter().any(|m| {
+        let Content::Blocks(blocks) = &m.content else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult { content, .. }
+                    if content.contains("REMEMBER_TO_VERIFY_OUTPUT")
+                        && content.contains("<system-reminder>")
+            )
+        })
+    });
+    assert!(
+        reminded,
+        "the configured tool reminder must be appended to the echo tool result",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_yields_same_events_as_store() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("streamed hello")]);
+    let store = new_event_store();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(store.clone())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let stream = agent.run_stream(
+        thread_id.clone(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let streamed: Vec<AgentEvent> = stream.collect().await;
+
+    assert!(!streamed.is_empty(), "run_stream must yield events");
+
+    let stored: Vec<AgentEvent> = store
+        .get_events(&thread_id)
+        .await?
+        .into_iter()
+        .map(|envelope| envelope.event)
+        .collect();
+
+    // AgentEvent is not PartialEq; compare the JSON wire forms, which is the
+    // durable contract the stream is meant to mirror.
+    let streamed_json: anyhow::Result<Vec<serde_json::Value>> = streamed
+        .iter()
+        .map(|e| serde_json::to_value(e).map_err(anyhow::Error::from))
+        .collect();
+    let stored_json: anyhow::Result<Vec<serde_json::Value>> = stored
+        .iter()
+        .map(|e| serde_json::to_value(e).map_err(anyhow::Error::from))
+        .collect();
+    assert_eq!(streamed_json?, stored_json?);
+
     Ok(())
 }

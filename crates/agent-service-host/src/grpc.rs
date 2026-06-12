@@ -2725,6 +2725,10 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
             total_turns,
             total_usage,
             duration,
+            // `estimated_cost_usd` is not (yet) surfaced on the wire DoneEvent;
+            // absorbing it keeps the projection compiling. Surfacing cost in the
+            // proto is a follow-up on the host/proto side.
+            ..
         } => Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
             thread_id: thread_id.0.clone(),
             total_turns: map_u64(*total_turns, "total_turns")?,

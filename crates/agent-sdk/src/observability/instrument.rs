@@ -404,6 +404,7 @@ pub(crate) fn flush_root_trace_state(sink: &RootSpanEventSink, state: &trace_io:
 pub(crate) const fn run_state_outcome(state: &crate::types::AgentRunState) -> &'static str {
     match state {
         crate::types::AgentRunState::Done { .. } => "done",
+        crate::types::AgentRunState::BudgetExceeded { .. } => "budget_exceeded",
         crate::types::AgentRunState::Refusal { .. } => "refusal",
         crate::types::AgentRunState::AwaitingConfirmation { .. } => "awaiting_confirmation",
         crate::types::AgentRunState::Cancelled { .. } => "cancelled",
@@ -419,6 +420,7 @@ pub(crate) const fn run_state_outcome(state: &crate::types::AgentRunState) -> &'
 pub(crate) const fn turn_outcome_str(outcome: &crate::types::TurnOutcome) -> &'static str {
     match outcome {
         crate::types::TurnOutcome::Done { .. } => "done",
+        crate::types::TurnOutcome::BudgetExceeded { .. } => "budget_exceeded",
         crate::types::TurnOutcome::Refusal { .. } => "refusal",
         crate::types::TurnOutcome::NeedsMoreTurns { .. } => "needs_more_turns",
         crate::types::TurnOutcome::AwaitingConfirmation { .. } => "awaiting_confirmation",
