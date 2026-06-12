@@ -577,7 +577,7 @@ async fn test_metrics_emitted_b3() -> Result<()> {
 
     // 7c — LLM retries record on the rate-limit retry path.
     let provider = StubProvider::new(vec![
-        agent_sdk::llm::ChatOutcome::RateLimited,
+        agent_sdk::llm::ChatOutcome::RateLimited(None),
         StubProvider::text_response("Done"),
     ]);
     let agent = builder::<()>()

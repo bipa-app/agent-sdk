@@ -1003,6 +1003,7 @@ async fn build_chat_request(
         thinking,
         tool_choice: None,
         response_format: None,
+        cache: None,
     })
 }
 

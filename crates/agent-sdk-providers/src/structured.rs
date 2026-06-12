@@ -28,12 +28,17 @@
 //! This mirrors the Claude SDK's `output_format` +
 //! `error_max_structured_output_retries` behaviour.
 
+use std::pin::Pin;
+
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, ResponseFormat, Tool, ToolChoice,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Message, ResponseFormat, Tool,
+    ToolChoice, Usage,
 };
 use agent_sdk_foundation::types::ToolTier;
+use futures::{Stream, StreamExt};
 
 use crate::provider::{LlmProvider, StructuredOutputSupport};
+use crate::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 
 /// The forced tool name used for the tool-forcing fallback (Anthropic).
 const RESPOND_TOOL_NAME: &str = "respond";
@@ -159,7 +164,7 @@ pub async fn run_structured(
         let outcome = provider.chat(attempt_request).await?;
         let response = match outcome {
             ChatOutcome::Success(response) => response,
-            ChatOutcome::RateLimited => {
+            ChatOutcome::RateLimited(_) => {
                 return Err(StructuredOutputError::ProviderOutcome(
                     "rate limited".to_owned(),
                 ));
@@ -201,10 +206,7 @@ pub async fn run_structured(
             continue;
         };
 
-        let errors: Vec<String> = validator
-            .iter_errors(&value)
-            .map(|error| format!("at `{}`: {error}", error.instance_path()))
-            .collect();
+        let errors = collect_schema_errors(&validator, &value);
 
         if errors.is_empty() {
             return Ok(StructuredOutput {
@@ -231,6 +233,369 @@ pub async fn run_structured(
         errors: last_errors,
         last_value,
     })
+}
+
+/// An incremental update emitted by [`run_structured_stream`].
+#[derive(Debug, Clone)]
+pub enum StructuredStreamUpdate {
+    /// A best-effort, not-yet-validated object parsed from the partial
+    /// response as it streams in. Successive `Partial`s grow toward the final
+    /// value; a consumer can render them as a live preview. Because the
+    /// underlying JSON is incomplete, a partial may contain truncated string
+    /// values and is never schema-validated.
+    Partial(serde_json::Value),
+    /// The final, schema-validated structured output. Exactly one `Final` is
+    /// emitted on success and it is always the last item in the stream.
+    Final(StructuredOutput),
+}
+
+/// A stream of [`StructuredStreamUpdate`]s produced by [`run_structured_stream`].
+pub type StructuredStream<'a> =
+    Pin<Box<dyn Stream<Item = Result<StructuredStreamUpdate, StructuredOutputError>> + Send + 'a>>;
+
+/// Streaming counterpart to [`run_structured`].
+///
+/// Drives the same bounded, schema-validated exchange, but streams the first
+/// attempt so callers see the structured object build incrementally
+/// ([`StructuredStreamUpdate::Partial`]) before the validated
+/// [`StructuredStreamUpdate::Final`] arrives. If the first (streamed) attempt
+/// fails schema validation, the bounded re-prompt loop continues
+/// non-streaming, reusing the exact retry machinery of [`run_structured`].
+///
+/// This is additive: existing [`run_structured`] callers are unaffected.
+///
+/// # Errors
+///
+/// The stream yields a single [`StructuredOutputError`] (and then ends) when
+/// the request lacks a response format, the schema is invalid, the provider
+/// errors, or the model never produces schema-valid output within
+/// [`StructuredConfig::max_retries`].
+pub fn run_structured_stream(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    config: StructuredConfig,
+) -> StructuredStream<'_> {
+    Box::pin(async_stream::stream! {
+        let mut request = request;
+        let Some(response_format) = request.response_format.clone() else {
+            yield Err(StructuredOutputError::MissingResponseFormat);
+            return;
+        };
+        let validator = match jsonschema::validator_for(&response_format.schema) {
+            Ok(validator) => validator,
+            Err(e) => {
+                yield Err(StructuredOutputError::InvalidSchema(e.to_string()));
+                return;
+            }
+        };
+
+        let support = provider.structured_output_support();
+        if matches!(support, StructuredOutputSupport::ToolForcing) {
+            apply_tool_forcing(&mut request, &response_format);
+        }
+
+        let max_attempts = config.max_retries.saturating_add(1);
+        let model = provider.model().to_owned();
+        let mut last_value: Option<serde_json::Value> = None;
+        let mut last_errors = String::new();
+
+        for attempt in 0..max_attempts {
+            // The first attempt streams (emitting partials); retries reuse the
+            // non-streaming path so the re-prompt machinery is shared verbatim.
+            let response = if attempt == 0 {
+                let mut attempt_stream =
+                    Box::pin(stream_first_attempt(provider, request.clone(), support, model.clone()));
+                let mut completed: Option<ChatResponse> = None;
+                while let Some(item) = attempt_stream.next().await {
+                    match item {
+                        StreamAttemptItem::Partial(value) => {
+                            yield Ok(StructuredStreamUpdate::Partial(value));
+                        }
+                        StreamAttemptItem::Complete(response) => completed = Some(response),
+                        StreamAttemptItem::Failed(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                }
+                // `stream_first_attempt` always terminates with `Complete` or
+                // `Failed`; the `None` arm is an unreachable safety net.
+                match completed {
+                    Some(response) => response,
+                    None => return,
+                }
+            } else {
+                match provider.chat(request.clone()).await {
+                    Ok(ChatOutcome::Success(response)) => response,
+                    Ok(other) => {
+                        yield Err(non_success_outcome_error(&other));
+                        return;
+                    }
+                    Err(e) => {
+                        yield Err(StructuredOutputError::Transport(e));
+                        return;
+                    }
+                }
+            };
+
+            let Some(value) = extract_candidate(&response, support) else {
+                if attempt + 1 >= max_attempts {
+                    yield Err(StructuredOutputError::NoStructuredOutput);
+                    return;
+                }
+                append_correction(
+                    &mut request,
+                    &response,
+                    support,
+                    "Your previous reply did not contain a structured answer. \
+                     Respond with a single JSON value that satisfies the requested schema.",
+                );
+                "missing structured output".clone_into(&mut last_errors);
+                continue;
+            };
+
+            let errors = collect_schema_errors(&validator, &value);
+
+            if errors.is_empty() {
+                yield Ok(StructuredStreamUpdate::Final(StructuredOutput {
+                    value,
+                    response,
+                    retries: attempt,
+                }));
+                return;
+            }
+
+            last_errors = errors.join("; ");
+            last_value = Some(value);
+
+            if attempt + 1 < max_attempts {
+                let correction = format!(
+                    "Your previous JSON output did not satisfy the schema. \
+                     Fix these validation errors and resend the full JSON value: {last_errors}"
+                );
+                append_correction(&mut request, &response, support, &correction);
+            }
+        }
+
+        yield Err(StructuredOutputError::RetriesExhausted {
+            attempts: max_attempts,
+            errors: last_errors,
+            last_value,
+        });
+    })
+}
+
+/// An item produced by [`stream_first_attempt`]: an incremental partial, the
+/// terminal accumulated response, or a typed failure.
+enum StreamAttemptItem {
+    Partial(serde_json::Value),
+    Complete(ChatResponse),
+    Failed(StructuredOutputError),
+}
+
+/// Stream the first structured-output attempt, emitting de-duplicated partial
+/// objects as the response builds and finishing with the accumulated response
+/// (or a typed failure). Factored out of [`run_structured_stream`] so the
+/// orchestration loop stays small.
+fn stream_first_attempt(
+    provider: &dyn LlmProvider,
+    request: ChatRequest,
+    support: StructuredOutputSupport,
+    model: String,
+) -> impl Stream<Item = StreamAttemptItem> + Send + '_ {
+    async_stream::stream! {
+        let mut accumulator = StreamAccumulator::new();
+        let mut partial_buf = String::new();
+        let mut respond_tool_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut last_partial: Option<serde_json::Value> = None;
+        let mut stream_error: Option<(String, StreamErrorKind)> = None;
+
+        let mut stream = provider.chat_stream(request);
+        while let Some(item) = stream.next().await {
+            let delta = match item {
+                Ok(delta) => delta,
+                Err(e) => {
+                    yield StreamAttemptItem::Failed(StructuredOutputError::Transport(e));
+                    return;
+                }
+            };
+
+            accumulate_partial_buffer(&delta, support, &mut partial_buf, &mut respond_tool_ids);
+            if let StreamDelta::Error { message, kind } = &delta {
+                stream_error = Some((message.clone(), *kind));
+            }
+            accumulator.apply(&delta);
+
+            if let Some(value) = partial_from_buffer(&partial_buf)
+                && last_partial.as_ref() != Some(&value)
+            {
+                last_partial = Some(value.clone());
+                yield StreamAttemptItem::Partial(value);
+            }
+        }
+
+        if let Some((message, kind)) = stream_error {
+            yield StreamAttemptItem::Failed(stream_error_to_outcome(&message, kind));
+            return;
+        }
+
+        yield StreamAttemptItem::Complete(build_streamed_response(accumulator, model));
+    }
+}
+
+/// Append the relevant part of a streamed delta to the running partial buffer
+/// so [`partial_from_buffer`] can re-parse it. For native providers this is the
+/// model's text output; for tool-forcing it is the forced `respond` tool's
+/// input JSON.
+fn accumulate_partial_buffer(
+    delta: &StreamDelta,
+    support: StructuredOutputSupport,
+    buffer: &mut String,
+    respond_tool_ids: &mut std::collections::HashSet<String>,
+) {
+    match (support, delta) {
+        (StructuredOutputSupport::Native, StreamDelta::TextDelta { delta, .. }) => {
+            buffer.push_str(delta);
+        }
+        (StructuredOutputSupport::ToolForcing, StreamDelta::ToolUseStart { id, name, .. })
+            if name == RESPOND_TOOL_NAME =>
+        {
+            respond_tool_ids.insert(id.clone());
+        }
+        (StructuredOutputSupport::ToolForcing, StreamDelta::ToolInputDelta { id, delta, .. })
+            if respond_tool_ids.contains(id) =>
+        {
+            buffer.push_str(delta);
+        }
+        _ => {}
+    }
+}
+
+/// Map a recorded streaming error into the structured-output error surface.
+fn stream_error_to_outcome(message: &str, kind: StreamErrorKind) -> StructuredOutputError {
+    let label = match kind {
+        StreamErrorKind::RateLimited => "rate limited".to_owned(),
+        StreamErrorKind::InvalidRequest => format!("invalid request: {message}"),
+        _ => format!("server error: {message}"),
+    };
+    StructuredOutputError::ProviderOutcome(label)
+}
+
+/// Map a non-success [`ChatOutcome`] from a retry attempt into a typed error.
+fn non_success_outcome_error(outcome: &ChatOutcome) -> StructuredOutputError {
+    let label = match outcome {
+        ChatOutcome::RateLimited(_) => "rate limited".to_owned(),
+        ChatOutcome::InvalidRequest(msg) => format!("invalid request: {msg}"),
+        ChatOutcome::ServerError(msg) => format!("server error: {msg}"),
+        _ => "unrecognized provider outcome".to_owned(),
+    };
+    StructuredOutputError::ProviderOutcome(label)
+}
+
+/// Materialize a [`ChatResponse`] from a fully-consumed stream accumulator.
+fn build_streamed_response(mut accumulator: StreamAccumulator, model: String) -> ChatResponse {
+    let usage = accumulator.take_usage().unwrap_or(Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    });
+    let stop_reason = accumulator.take_stop_reason();
+    ChatResponse {
+        id: String::new(),
+        content: accumulator.into_content_blocks(),
+        model,
+        stop_reason,
+        usage,
+    }
+}
+
+/// Best-effort parse of a partial JSON object/array from an in-flight buffer.
+///
+/// Returns the repaired value only when the buffer (after closing any open
+/// containers) parses to an object or array; otherwise `None` so the caller
+/// simply waits for more data.
+fn partial_from_buffer(buffer: &str) -> Option<serde_json::Value> {
+    let trimmed = buffer.trim_start();
+    // Tolerate a streamed leading ```json fence.
+    let body = trimmed
+        .strip_prefix("```")
+        .and_then(|rest| rest.split_once('\n').map(|(_, body)| body))
+        .unwrap_or(trimmed)
+        .trim();
+    if body.is_empty() {
+        return None;
+    }
+    let repaired = repair_partial_json(body);
+    serde_json::from_str::<serde_json::Value>(&repaired)
+        .ok()
+        .filter(|value| value.is_object() || value.is_array())
+}
+
+/// Close any open strings/containers in a partial JSON fragment so it parses.
+///
+/// Truncated string *values* are kept (closed with `"`); a dangling separator
+/// (`,`) is dropped and a dangling key (`"k":`) is completed with `null`. The
+/// result is not guaranteed to parse (e.g. a half-typed key), in which case the
+/// caller discards it.
+fn repair_partial_json(buffer: &str) -> String {
+    let mut in_string = false;
+    let mut escape = false;
+    let mut stack: Vec<char> = Vec::new();
+
+    for ch in buffer.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = buffer.to_owned();
+    if escape {
+        out.pop();
+    }
+    if in_string {
+        out.push('"');
+    }
+    out.truncate(out.trim_end().len());
+    if out.ends_with(',') {
+        out.pop();
+        out.truncate(out.trim_end().len());
+    } else if out.ends_with(':') {
+        out.push_str(" null");
+    }
+    for closer in stack.iter().rev() {
+        out.push(*closer);
+    }
+    out
+}
+
+/// Collect human-readable schema-validation errors for a candidate value
+/// (empty when it satisfies the schema).
+fn collect_schema_errors(
+    validator: &jsonschema::Validator,
+    value: &serde_json::Value,
+) -> Vec<String> {
+    validator
+        .iter_errors(value)
+        .map(|error| format!("at `{}`: {error}", error.instance_path()))
+        .collect()
 }
 
 /// Inject the forced "respond" tool for providers without native JSON mode.
@@ -447,6 +812,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: Some(ResponseFormat::new("person", person_schema())),
+            cache: None,
         }
     }
 
@@ -768,7 +1134,7 @@ mod tests {
         let provider = ScriptedProvider::new(
             "openai",
             StructuredOutputSupport::Native,
-            vec![ChatOutcome::RateLimited],
+            vec![ChatOutcome::RateLimited(None)],
         );
 
         let err = run_structured(
@@ -802,5 +1168,185 @@ mod tests {
         .expect_err("never produced JSON");
         assert!(matches!(err, StructuredOutputError::NoStructuredOutput));
         assert_eq!(provider.call_count(), 2);
+    }
+
+    // ── Streaming structured output ───────────────────────────────────
+
+    /// A provider that serves a fixed list of streaming deltas from
+    /// `chat_stream`. The non-streaming `chat` is only exercised on retries
+    /// (none of the streaming tests below need it).
+    struct StreamingProvider {
+        provider_name: &'static str,
+        model: String,
+        support: StructuredOutputSupport,
+        deltas: Mutex<Vec<StreamDelta>>,
+    }
+
+    impl StreamingProvider {
+        fn new(
+            provider_name: &'static str,
+            support: StructuredOutputSupport,
+            deltas: Vec<StreamDelta>,
+        ) -> Self {
+            Self {
+                provider_name,
+                model: "scripted-model".to_owned(),
+                support,
+                deltas: Mutex::new(deltas),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            Ok(ChatOutcome::ServerError("chat() not used".to_owned()))
+        }
+
+        fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+            let deltas = self.deltas.lock().map(|d| d.clone()).unwrap_or_default();
+            Box::pin(async_stream::stream! {
+                for delta in deltas {
+                    yield Ok(delta);
+                }
+            })
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn provider(&self) -> &'static str {
+            self.provider_name
+        }
+
+        fn structured_output_support(&self) -> StructuredOutputSupport {
+            self.support
+        }
+    }
+
+    async fn drive_stream(
+        mut stream: StructuredStream<'_>,
+    ) -> Result<(Vec<serde_json::Value>, Option<StructuredOutput>)> {
+        let mut partials = Vec::new();
+        let mut final_out = None;
+        while let Some(update) = stream.next().await {
+            match update? {
+                StructuredStreamUpdate::Partial(value) => partials.push(value),
+                StructuredStreamUpdate::Final(out) => final_out = Some(out),
+            }
+        }
+        Ok((partials, final_out))
+    }
+
+    #[tokio::test]
+    async fn streaming_native_emits_partials_then_validated_final() -> Result<()> {
+        let provider = StreamingProvider::new(
+            "openai",
+            StructuredOutputSupport::Native,
+            vec![
+                StreamDelta::TextDelta {
+                    delta: r#"{"name": "Ada""#.to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::TextDelta {
+                    delta: r#", "age": 36}"#.to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ],
+        );
+
+        let stream = run_structured_stream(
+            &provider,
+            request_with_format(),
+            StructuredConfig::default(),
+        );
+        let (partials, final_out) = drive_stream(stream).await?;
+
+        assert!(!partials.is_empty(), "expected at least one partial");
+        // The first partial sees only the name before the age streamed in.
+        assert_eq!(partials[0]["name"], "Ada");
+        let final_out = final_out.expect("a validated final value");
+        assert_eq!(final_out.value["name"], "Ada");
+        assert_eq!(final_out.value["age"], 36);
+        assert_eq!(final_out.retries, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_forcing_reads_partial_tool_input() -> Result<()> {
+        let provider = StreamingProvider::new(
+            "anthropic",
+            StructuredOutputSupport::ToolForcing,
+            vec![
+                StreamDelta::ToolUseStart {
+                    id: "call_1".to_owned(),
+                    name: RESPOND_TOOL_NAME.to_owned(),
+                    block_index: 0,
+                    thought_signature: None,
+                },
+                StreamDelta::ToolInputDelta {
+                    id: "call_1".to_owned(),
+                    delta: r#"{"name": "Linus""#.to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::ToolInputDelta {
+                    id: "call_1".to_owned(),
+                    delta: r#", "age": 54}"#.to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ],
+        );
+
+        let stream = run_structured_stream(
+            &provider,
+            request_with_format(),
+            StructuredConfig::default(),
+        );
+        let (partials, final_out) = drive_stream(stream).await?;
+
+        assert_eq!(partials[0]["name"], "Linus");
+        let final_out = final_out.expect("a validated final value");
+        assert_eq!(final_out.value["age"], 54);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_missing_response_format_errors() {
+        let provider =
+            StreamingProvider::new("openai", StructuredOutputSupport::Native, Vec::new());
+        let mut req = request_with_format();
+        req.response_format = None;
+
+        let mut stream = run_structured_stream(&provider, req, StructuredConfig::default());
+        let first = stream.next().await.expect("one item");
+        assert!(matches!(
+            first,
+            Err(StructuredOutputError::MissingResponseFormat)
+        ));
+    }
+
+    #[test]
+    fn partial_from_buffer_repairs_incomplete_json() {
+        assert_eq!(
+            partial_from_buffer(r#"{"name": "Ada""#).map(|v| v["name"].clone()),
+            Some(serde_json::json!("Ada"))
+        );
+        assert_eq!(
+            partial_from_buffer(r#"{"a": 1,"#),
+            Some(serde_json::json!({"a": 1}))
+        );
+        assert_eq!(
+            partial_from_buffer(r#"{"a":"#),
+            Some(serde_json::json!({"a": null}))
+        );
+        assert!(partial_from_buffer("").is_none());
+        assert!(partial_from_buffer("not json").is_none());
     }
 }

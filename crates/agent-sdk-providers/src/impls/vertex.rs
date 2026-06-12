@@ -49,7 +49,13 @@ const TCP_KEEPALIVE_SECS: u64 = 30;
 const CHAT_READ_TIMEOUT_SECS: u64 = 300;
 
 const fn vertex_cache_control() -> anthropic_data::ApiCacheControl {
-    anthropic_data::ApiCacheControl::ephemeral()
+    anthropic_data::ApiCacheControl::ephemeral_with_ttl(None)
+}
+
+/// Build the Claude-on-Vertex tool list, caching the tool prefix with the
+/// Vertex ephemeral breakpoint.
+fn build_vertex_claude_tools(request: &ChatRequest) -> Option<Vec<anthropic_data::ApiTool>> {
+    anthropic_data::build_api_tools_with_cache(request, Some(vertex_cache_control()))
 }
 
 /// Google Vertex AI LLM provider.
@@ -375,6 +381,12 @@ impl VertexProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed.
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -387,7 +399,7 @@ impl VertexProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
+            return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
         if status.is_server_error() {
@@ -609,7 +621,7 @@ impl VertexProvider {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
         let messages = Self::build_cached_vertex_claude_messages(&request);
-        let tools = anthropic_data::build_api_tools(&request);
+        let tools = build_vertex_claude_tools(&request);
         let thinking = thinking_config
             .as_ref()
             .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
@@ -664,6 +676,12 @@ impl VertexProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed.
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -676,7 +694,7 @@ impl VertexProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
+            return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
         if status.is_server_error() {
@@ -730,7 +748,7 @@ impl VertexProvider {
                 return;
             }
             let messages = Self::build_cached_vertex_claude_messages(&request);
-            let tools = anthropic_data::build_api_tools(&request);
+            let tools = build_vertex_claude_tools(&request);
             let thinking = thinking_config
                 .as_ref()
                 .map(anthropic_data::ApiThinkingConfig::from_thinking_config);
@@ -1123,6 +1141,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 

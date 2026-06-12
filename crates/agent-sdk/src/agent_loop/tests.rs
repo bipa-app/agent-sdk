@@ -571,12 +571,12 @@ async fn test_unknown_tool_handling() -> anyhow::Result<()> {
 async fn test_rate_limit_handling() -> anyhow::Result<()> {
     // Provide enough RateLimited responses to exhaust all retries (max_retries + 1)
     let provider = MockProvider::new(vec![
-        ChatOutcome::RateLimited,
-        ChatOutcome::RateLimited,
-        ChatOutcome::RateLimited,
-        ChatOutcome::RateLimited,
-        ChatOutcome::RateLimited,
-        ChatOutcome::RateLimited, // 6th attempt exceeds max_retries (5)
+        ChatOutcome::RateLimited(None),
+        ChatOutcome::RateLimited(None),
+        ChatOutcome::RateLimited(None),
+        ChatOutcome::RateLimited(None),
+        ChatOutcome::RateLimited(None),
+        ChatOutcome::RateLimited(None), // 6th attempt exceeds max_retries (5)
     ]);
 
     // Use fast retry config for faster tests
@@ -612,7 +612,7 @@ async fn test_rate_limit_handling() -> anyhow::Result<()> {
 async fn test_rate_limit_recovery() -> anyhow::Result<()> {
     // Rate limited once, then succeeds
     let provider = MockProvider::new(vec![
-        ChatOutcome::RateLimited,
+        ChatOutcome::RateLimited(None),
         MockProvider::text_response("Recovered after rate limit"),
     ]);
 

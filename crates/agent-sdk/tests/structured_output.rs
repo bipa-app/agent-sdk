@@ -106,6 +106,7 @@ fn request() -> ChatRequest {
         thinking: None,
         tool_choice: None,
         response_format: Some(ResponseFormat::new("ticket", ticket_schema())),
+        cache: None,
     }
 }
 

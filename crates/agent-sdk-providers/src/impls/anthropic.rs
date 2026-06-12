@@ -10,14 +10,15 @@ use crate::attachments::validate_request_attachments;
 use crate::provider::LlmProvider;
 use crate::streaming::{StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode, Usage,
+    CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, ThinkingConfig, ThinkingMode,
+    Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
     ApiMessagesRequest, ApiOutputConfig, ApiThinkingConfig, ApiToolChoice, build_api_messages,
-    build_api_tools, is_message_stop_event, map_content_blocks, map_stop_reason, parse_sse_event,
-    take_next_sse_event,
+    build_api_tools_with_cache, is_message_stop_event, map_content_blocks, map_stop_reason,
+    parse_sse_event, take_next_sse_event,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -119,6 +120,24 @@ fn oauth_tool_collision_message(first: &str, second: &str) -> String {
 #[must_use]
 pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
+}
+
+/// Cache-control breakpoints resolved for the three cacheable prefixes of an
+/// Anthropic request, in decreasing order of prefix stability. A `None` field
+/// means "do not mark this prefix with `cache_control`".
+struct CacheRegions {
+    tools: Option<data::ApiCacheControl>,
+    system: Option<data::ApiCacheControl>,
+    messages: Option<data::ApiCacheControl>,
+}
+
+impl CacheRegions {
+    /// No caching anywhere (request opted out via `CacheConfig`).
+    const DISABLED: Self = Self {
+        tools: None,
+        system: None,
+        messages: None,
+    };
 }
 
 /// Authentication mode for the Anthropic provider.
@@ -238,22 +257,21 @@ impl AnthropicProvider {
     fn build_system_prompt_for_request<'a>(
         &self,
         system: &'a str,
+        cache_control: Option<data::ApiCacheControl>,
     ) -> Option<data::ApiSystemPrompt<'a>> {
-        let cc = Self::cache_control();
-
         match self.auth_mode {
-            AuthMode::ApiKey => data::build_api_system_prompt(system, Some(cc)),
+            AuthMode::ApiKey => data::build_api_system_prompt(system, cache_control),
             AuthMode::OAuth => {
                 let mut blocks = vec![data::ApiSystemBlock {
                     block_type: "text",
                     text: Self::OAUTH_IDENTITY,
-                    cache_control: Some(cc.clone()),
+                    cache_control: cache_control.clone(),
                 }];
                 if !system.is_empty() {
                     blocks.push(data::ApiSystemBlock {
                         block_type: "text",
                         text: system,
-                        cache_control: Some(cc),
+                        cache_control,
                     });
                 }
                 Some(data::ApiSystemPrompt::Blocks(blocks))
@@ -261,13 +279,39 @@ impl AnthropicProvider {
         }
     }
 
-    const fn cache_control() -> data::ApiCacheControl {
-        data::ApiCacheControl::ephemeral()
+    /// Resolve the per-prefix cache breakpoints for a request from its optional
+    /// [`CacheConfig`](agent_sdk_foundation::llm::CacheConfig).
+    ///
+    /// With no config (the default) this reproduces the historical behaviour:
+    /// an ephemeral breakpoint on the tools, system, and last-user-message
+    /// prefixes. An opted-out config disables all breakpoints; a TTL flows onto
+    /// every breakpoint; and `max_breakpoints` caps how many prefixes are
+    /// marked, in decreasing order of stability (tools, system, conversation).
+    fn cache_regions(request: &ChatRequest) -> CacheRegions {
+        let (enabled, ttl, max_breakpoints) =
+            request.cache.as_ref().map_or((true, None, None), |cfg| {
+                (cfg.enabled, cfg.ttl, cfg.max_breakpoints)
+            });
+        if !enabled {
+            return CacheRegions::DISABLED;
+        }
+        let control = data::ApiCacheControl::ephemeral_with_ttl(ttl.map(CacheTtl::as_wire_str));
+        let limit = max_breakpoints.unwrap_or(u8::MAX);
+        CacheRegions {
+            tools: (limit >= 1).then(|| control.clone()),
+            system: (limit >= 2).then(|| control.clone()),
+            messages: (limit >= 3).then_some(control),
+        }
     }
 
-    fn build_cached_api_messages(request: &ChatRequest) -> Vec<data::ApiMessage> {
+    fn build_cached_api_messages(
+        request: &ChatRequest,
+        cache_control: Option<data::ApiCacheControl>,
+    ) -> Vec<data::ApiMessage> {
         let mut messages = build_api_messages(request);
-        data::apply_cache_control_to_last_user_message(&mut messages, Self::cache_control());
+        if let Some(cache_control) = cache_control {
+            data::apply_cache_control_to_last_user_message(&mut messages, cache_control);
+        }
         messages
     }
 
@@ -422,9 +466,14 @@ impl LlmProvider for AnthropicProvider {
                 &first, &second,
             )));
         }
-        let messages = Self::build_cached_api_messages(&request);
+        let CacheRegions {
+            tools: tools_cache,
+            system: system_cache,
+            messages: messages_cache,
+        } = Self::cache_regions(&request);
+        let messages = Self::build_cached_api_messages(&request, messages_cache);
         let tools = if self.is_oauth() {
-            build_api_tools(&request).map(|tools| {
+            build_api_tools_with_cache(&request, tools_cache).map(|tools| {
                 tools
                     .into_iter()
                     .map(|mut t| {
@@ -434,7 +483,7 @@ impl LlmProvider for AnthropicProvider {
                     .collect::<Vec<_>>()
             })
         } else {
-            build_api_tools(&request)
+            build_api_tools_with_cache(&request, tools_cache)
         };
         let thinking = thinking_config
             .as_ref()
@@ -444,7 +493,7 @@ impl LlmProvider for AnthropicProvider {
             .and_then(|t| t.effort)
             .map(|effort| ApiOutputConfig { effort });
 
-        let system = self.build_system_prompt_for_request(&request.system);
+        let system = self.build_system_prompt_for_request(&request.system, system_cache);
         let max_tokens = self.effective_max_tokens(&request);
         let tool_choice = request
             .tool_choice
@@ -491,6 +540,13 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed
+        // (`bytes()` takes the response by value).
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -503,7 +559,7 @@ impl LlmProvider for AnthropicProvider {
         );
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited);
+            return Ok(ChatOutcome::RateLimited(retry_after));
         }
 
         if status.is_server_error() {
@@ -591,9 +647,14 @@ impl LlmProvider for AnthropicProvider {
                 return;
             }
 
-            let messages = Self::build_cached_api_messages(&request);
+            let CacheRegions {
+                tools: tools_cache,
+                system: system_cache,
+                messages: messages_cache,
+            } = Self::cache_regions(&request);
+            let messages = Self::build_cached_api_messages(&request, messages_cache);
             let tools = if is_oauth {
-                build_api_tools(&request).map(|tools| {
+                build_api_tools_with_cache(&request, tools_cache).map(|tools| {
                     tools
                         .into_iter()
                         .map(|mut t| {
@@ -603,7 +664,7 @@ impl LlmProvider for AnthropicProvider {
                         .collect::<Vec<_>>()
                 })
             } else {
-                build_api_tools(&request)
+                build_api_tools_with_cache(&request, tools_cache)
             };
             let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
                 Ok(thinking) => thinking,
@@ -623,7 +684,7 @@ impl LlmProvider for AnthropicProvider {
                 .and_then(|t| t.effort)
                 .map(|effort| ApiOutputConfig { effort });
 
-            let system = self.build_system_prompt_for_request(&request.system);
+            let system = self.build_system_prompt_for_request(&request.system, system_cache);
             let max_tokens = self.effective_max_tokens(&request);
             let tool_choice = request
                 .tool_choice
@@ -1173,6 +1234,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 

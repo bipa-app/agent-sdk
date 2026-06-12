@@ -31,9 +31,25 @@
     feature = "cloudflare",
 ))]
 pub mod attachments;
+pub mod fallback;
+// `Retry-After` header parsing for 429 responses. Only ever called from a
+// provider impl (each gated behind its provider feature), so it is dead code
+// when no provider is compiled in — gate it on "any provider feature" to keep
+// `--no-default-features` builds `-D warnings`-clean.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "openai-codex",
+    feature = "gemini",
+    feature = "vertex",
+    feature = "cloudflare",
+))]
+pub(crate) mod http;
 pub mod impls;
 pub mod model_capabilities;
 pub mod provider;
+#[cfg(feature = "record-replay")]
+pub mod record_replay;
 pub mod refresh;
 pub mod router;
 pub mod search;
@@ -41,11 +57,17 @@ pub mod streaming;
 pub mod structured;
 
 // Convenience re-exports — provider trait and streaming
+pub use fallback::FallbackProvider;
 pub use provider::{LlmProvider, StructuredOutputSupport, collect_stream};
+#[cfg(feature = "record-replay")]
+pub use record_replay::{RecordReplayMode, RecordReplayProvider};
 pub use refresh::{RefreshingProvider, is_unauthorized_error};
 pub use router::{ModelRouter, ModelTier, TaskComplexity};
 pub use streaming::{StreamAccumulator, StreamBox, StreamDelta};
-pub use structured::{StructuredConfig, StructuredOutput, StructuredOutputError, run_structured};
+pub use structured::{
+    StructuredConfig, StructuredOutput, StructuredOutputError, StructuredStream,
+    StructuredStreamUpdate, run_structured, run_structured_stream,
+};
 
 // Re-export all core LLM types so consumers can `use agent_sdk_providers::*`
 pub use agent_sdk_foundation::llm::*;

@@ -254,7 +254,7 @@ impl TurnScript {
         // non-streaming outcome variant.
         if let Some(StreamDelta::Error { message, kind }) = self.deltas.first() {
             return match kind {
-                StreamErrorKind::RateLimited => ChatOutcome::RateLimited,
+                StreamErrorKind::RateLimited => ChatOutcome::RateLimited(None),
                 StreamErrorKind::InvalidRequest => ChatOutcome::InvalidRequest(message.clone()),
                 // `StreamErrorKind::ServerError`, plus the `#[non_exhaustive]`
                 // catch-all: an unclassified error maps to a server error.

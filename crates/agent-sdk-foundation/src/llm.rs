@@ -4,6 +4,8 @@
 //! and the server.  The module intentionally contains **no** async traits
 //! or runtime-specific logic so it can be depended on from thin crates.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 // ── Thinking ──────────────────────────────────────────────────────────
@@ -153,6 +155,96 @@ impl ResponseFormat {
     }
 }
 
+/// Time-to-live for a provider-side prompt-cache breakpoint.
+///
+/// Only the values the Anthropic Messages API accepts are modelled, so the
+/// enum maps losslessly onto the wire `ttl` string. Providers without an
+/// equivalent control ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// Five-minute ephemeral cache (the provider default).
+    FiveMinutes,
+    /// One-hour ephemeral cache (extended retention).
+    OneHour,
+}
+
+impl CacheTtl {
+    /// The wire string a provider sends for this TTL (`"5m"` / `"1h"`).
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
+/// Caller-facing control over provider-side prompt caching.
+///
+/// This is additive: a [`ChatRequest`] with `cache = None` preserves each
+/// provider's default caching behaviour. Set it to shape (or disable) caching:
+///
+/// - `enabled = false` opts the request out of caching entirely — providers
+///   send no `cache_control` breakpoints.
+/// - `ttl` selects the cache retention window (Anthropic ephemeral TTL).
+/// - `max_breakpoints` caps how many cache breakpoints the provider may emit,
+///   in decreasing order of prefix stability (tools, then system, then the
+///   conversation tail). `None` leaves the provider's default count.
+///
+/// Providers without a prompt-cache control ignore every field gracefully.
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    /// Whether prompt caching is enabled for this request.
+    pub enabled: bool,
+    /// Optional cache retention window. `None` uses the provider default.
+    pub ttl: Option<CacheTtl>,
+    /// Optional cap on the number of cache breakpoints the provider emits.
+    pub max_breakpoints: Option<u8>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self::enabled()
+    }
+}
+
+impl CacheConfig {
+    /// An enabled cache config with provider defaults (no TTL override, all
+    /// breakpoints).
+    #[must_use]
+    pub const fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ttl: None,
+            max_breakpoints: None,
+        }
+    }
+
+    /// A config that opts the request out of provider-side caching.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ttl: None,
+            max_breakpoints: None,
+        }
+    }
+
+    /// Set the cache retention window.
+    #[must_use]
+    pub const fn with_ttl(mut self, ttl: CacheTtl) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Cap the number of cache breakpoints the provider may emit.
+    #[must_use]
+    pub const fn with_max_breakpoints(mut self, max_breakpoints: u8) -> Self {
+        self.max_breakpoints = Some(max_breakpoints);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: String,
@@ -181,6 +273,12 @@ pub struct ChatRequest {
     /// runtime validates the final output against the schema. When `None`
     /// (default) the model responds freely.
     pub response_format: Option<ResponseFormat>,
+    /// Optional control over provider-side prompt caching.
+    ///
+    /// When `None` (default) each provider keeps its built-in caching
+    /// behaviour. When `Some`, providers that support prompt caching honour
+    /// the [`CacheConfig`] (TTL, opt-out, breakpoint cap); others ignore it.
+    pub cache: Option<CacheConfig>,
 }
 
 impl ChatRequest {
@@ -216,6 +314,7 @@ impl ChatRequest {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 
@@ -260,6 +359,13 @@ impl ChatRequest {
     #[must_use]
     pub fn with_response_format(mut self, response_format: ResponseFormat) -> Self {
         self.response_format = Some(response_format);
+        self
+    }
+
+    /// Set the provider-side prompt-cache control ([`CacheConfig`]).
+    #[must_use]
+    pub const fn with_cache(mut self, cache: CacheConfig) -> Self {
+        self.cache = Some(cache);
         self
     }
 }
@@ -524,7 +630,7 @@ impl StopReason {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     /// Total input tokens reported by the provider.
     pub input_tokens: u32,
@@ -541,9 +647,59 @@ pub struct Usage {
 #[non_exhaustive]
 pub enum ChatOutcome {
     Success(ChatResponse),
-    RateLimited,
+    /// The provider rate-limited the request (HTTP 429).
+    ///
+    /// Carries the retry delay parsed from the response's `Retry-After`
+    /// header when the provider supplied one (see [`parse_retry_after`]), so
+    /// the caller can honour the server's hint instead of guessing a backoff.
+    /// `None` when no usable `Retry-After` was present.
+    RateLimited(Option<Duration>),
     InvalidRequest(String),
     ServerError(String),
+}
+
+/// Parse the value of an HTTP `Retry-After` header into a [`Duration`].
+///
+/// Per [RFC 9110 §10.2.3], `Retry-After` is either a non-negative number of
+/// seconds (delta-seconds) or an IMF-fixdate HTTP timestamp
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`). For the date form the delay is the
+/// difference between that instant and now; a timestamp at or before now (or
+/// any value that cannot be parsed) yields `None`.
+///
+/// [RFC 9110 §10.2.3]: https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3
+#[must_use]
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // delta-seconds: a bare non-negative integer number of seconds.
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    // IMF-fixdate: compute the remaining delay from now, dropping past dates.
+    let target = parse_imf_fixdate(trimmed)?;
+    let now = time::OffsetDateTime::now_utc();
+    if target <= now {
+        return None;
+    }
+    (target - now).try_into().ok()
+}
+
+/// Parse an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as a UTC instant.
+fn parse_imf_fixdate(value: &str) -> Option<time::OffsetDateTime> {
+    // IMF-fixdate is always UTC ("GMT"); parse the civil datetime and assume
+    // UTC. A custom description avoids depending on the `macros` feature.
+    let format = time::format_description::parse(
+        "[weekday repr:short], [day] [month repr:short] [year] \
+         [hour]:[minute]:[second] GMT",
+    )
+    .ok()?;
+    time::PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(time::PrimitiveDateTime::assume_utc)
 }
 
 #[cfg(test)]
@@ -802,5 +958,70 @@ mod tests {
         assert_eq!(back.role, Role::User);
         assert!(matches!(back.content, Content::Text(s) if s == "hi"));
         Ok(())
+    }
+
+    // ── Retry-After parsing ─────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after("125"), Some(Duration::from_secs(125)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_retry_after("  30 "), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_garbage_and_empty() {
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("   "), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        // Negative deltas are not valid delta-seconds.
+        assert_eq!(parse_retry_after("-5"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_past_imf_date_is_none() {
+        // A date well in the past must not produce a (would-be negative) delay.
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_future_imf_date_is_some() {
+        // Far-future date: must parse and yield a positive, large delay (the
+        // 1_000_000s ≈ 11.6-day lower bound is trivially exceeded by a year-9999
+        // target and avoids a round-unit literal).
+        let parsed = parse_retry_after("Fri, 31 Dec 9999 23:59:59 GMT");
+        assert!(parsed.is_some_and(|d| d > Duration::from_secs(1_000_000)));
+    }
+
+    // ── CacheConfig ─────────────────────────────────────────────
+
+    #[test]
+    fn cache_ttl_wire_strings() {
+        assert_eq!(CacheTtl::FiveMinutes.as_wire_str(), "5m");
+        assert_eq!(CacheTtl::OneHour.as_wire_str(), "1h");
+    }
+
+    #[test]
+    fn cache_config_builders_and_default_request_cache_is_none() {
+        let req = ChatRequest::new("sys", vec![Message::user("hi")]);
+        assert!(
+            req.cache.is_none(),
+            "default request must not set a cache config"
+        );
+
+        let enabled = CacheConfig::enabled().with_ttl(CacheTtl::OneHour);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.ttl, Some(CacheTtl::OneHour));
+        assert_eq!(enabled.max_breakpoints, None);
+
+        let disabled = CacheConfig::disabled();
+        assert!(!disabled.enabled);
+
+        let capped = CacheConfig::enabled().with_max_breakpoints(2);
+        assert_eq!(capped.max_breakpoints, Some(2));
+
+        let req = ChatRequest::new("s", vec![]).with_cache(CacheConfig::disabled());
+        assert!(req.cache.is_some_and(|c| !c.enabled));
     }
 }

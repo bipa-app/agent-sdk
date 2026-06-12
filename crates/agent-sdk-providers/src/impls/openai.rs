@@ -453,6 +453,12 @@ impl LlmProvider for OpenAIProvider {
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         let status = response.status();
+        // Read `Retry-After` off the 429 response before the body is consumed.
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::http::retry_after_from_headers(response.headers())
+        } else {
+            None
+        };
         let bytes = response
             .bytes()
             .await
@@ -464,7 +470,7 @@ impl LlmProvider for OpenAIProvider {
             bytes.len()
         );
 
-        decode_chat_response(status, &bytes)
+        decode_chat_response(status, &bytes, retry_after)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -882,9 +888,13 @@ fn fallback_stream_stop_reason(
 
 /// Map an HTTP status + body into a [`ChatOutcome`], parsing the success body
 /// into a [`ChatResponse`].
-fn decode_chat_response(status: StatusCode, bytes: &[u8]) -> Result<ChatOutcome> {
+fn decode_chat_response(
+    status: StatusCode,
+    bytes: &[u8],
+    retry_after: Option<std::time::Duration>,
+) -> Result<ChatOutcome> {
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return Ok(ChatOutcome::RateLimited);
+        return Ok(ChatOutcome::RateLimited(retry_after));
     }
 
     if status.is_server_error() {
@@ -2012,6 +2022,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -2038,6 +2049,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         let api_messages = build_api_messages(&request);
@@ -2057,6 +2069,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         }
     }
 
@@ -2722,6 +2735,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             response_format: None,
+            cache: None,
         };
 
         assert!(should_use_responses_api(

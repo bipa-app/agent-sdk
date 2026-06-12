@@ -223,7 +223,9 @@ where
         // `AutoRetryStart` event; `failure_message` is the error the
         // run surfaces once the retry budget is exhausted. They differ
         // per variant, so both are resolved here and threaded through.
-        let (kind, retry_reason, failure_message) = match outcome {
+        // `override_delay` carries a provider-supplied `Retry-After` hint
+        // (rate limits only) that supersedes the exponential backoff.
+        let (kind, retry_reason, failure_message, override_delay) = match outcome {
             ChatOutcome::Success(response) => {
                 if attempt > 0 {
                     send_auto_retry_end_event(event_ctx, attempt, true, None).await;
@@ -237,15 +239,17 @@ where
                     attempt,
                 );
             }
-            ChatOutcome::RateLimited => (
+            ChatOutcome::RateLimited(retry_after) => (
                 "rate_limited",
                 "Rate limited by LLM provider".to_string(),
                 format!("Rate limited after {max_retries} retries"),
+                retry_after,
             ),
             ChatOutcome::ServerError(msg) => (
                 "server_error",
                 msg.clone(),
                 format!("Server error after {max_retries} retries: {msg}"),
+                None,
             ),
             // `ChatOutcome` is `#[non_exhaustive]`; an unrecognized outcome is
             // handled like a server error (retry, then surface a clear failure).
@@ -253,6 +257,7 @@ where
                 "server_error",
                 "Unrecognized provider outcome".to_string(),
                 format!("Unrecognized provider outcome after {max_retries} retries"),
+                None,
             ),
         };
 
@@ -265,6 +270,7 @@ where
             error_kind: kind,
             retry_reason,
             failure_message,
+            override_delay,
             #[cfg(feature = "otel")]
             span_observer: span_observer.as_mut(),
             #[cfg(not(feature = "otel"))]
@@ -298,6 +304,9 @@ struct RetryBackoff<'a, 'o, H> {
     retry_reason: String,
     /// Error surfaced once the retry budget is exhausted.
     failure_message: String,
+    /// Provider-supplied retry delay (from a 429 `Retry-After`) that overrides
+    /// the computed exponential backoff. Clamped to `config.retry.max_delay_ms`.
+    override_delay: Option<std::time::Duration>,
     #[cfg(feature = "otel")]
     span_observer: Option<&'a mut LlmSpanObserver<'o>>,
     #[cfg(not(feature = "otel"))]
@@ -320,6 +329,7 @@ where
         error_kind,
         retry_reason,
         failure_message,
+        override_delay,
         #[cfg(feature = "otel")]
         span_observer,
         #[cfg(not(feature = "otel"))]
@@ -336,7 +346,13 @@ where
         return RetryStep::GiveUp(LlmOutcome::Error(AgentError::new(failure_message, true)));
     }
 
-    let delay = calculate_backoff_delay(attempt, &config.retry);
+    // A provider `Retry-After` hint wins over the exponential backoff, but is
+    // clamped to the configured ceiling so a hostile/oversized header cannot
+    // stall the turn. The attempt still counts against `max_retries`.
+    let delay = override_delay.map_or_else(
+        || calculate_backoff_delay(attempt, &config.retry),
+        |hint| clamp_to_max_delay(hint, config.retry.max_delay_ms),
+    );
     let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     warn!("LLM {error_kind}, retrying (attempt={attempt}, delay_ms={delay_ms})");
     #[cfg(feature = "otel")]
@@ -351,6 +367,14 @@ where
         return RetryStep::Cancelled;
     }
     RetryStep::Retry
+}
+
+/// Clamp a provider-supplied retry delay to the configured maximum.
+fn clamp_to_max_delay(delay: std::time::Duration, max_delay_ms: u64) -> std::time::Duration {
+    let ms = u64::try_from(delay.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(max_delay_ms);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Sleep for `delay`, but return early if the cancel token fires first.
