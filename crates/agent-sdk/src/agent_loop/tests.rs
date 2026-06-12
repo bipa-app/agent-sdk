@@ -5768,3 +5768,269 @@ async fn test_run_stream_yields_same_events_as_store() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Guardrail `RetryWithFeedback`: balanced history + usage preservation.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Output guardrail that rejects the first `reject_count` responses with
+/// `RetryWithFeedback` and accepts the rest. With `reject_count = usize::MAX`
+/// it rejects forever, which is the deterministically-rejecting case used to
+/// prove a budget (or other terminal limit) eventually stops the run.
+struct RejectNHooks {
+    feedback: String,
+    reject_count: usize,
+    seen: Arc<AtomicUsize>,
+}
+
+impl RejectNHooks {
+    fn new(feedback: &str, reject_count: usize) -> Self {
+        Self {
+            feedback: feedback.to_string(),
+            reject_count,
+            seen: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentHooks for RejectNHooks {
+    async fn on_llm_response(&self, _response: &ChatResponse) -> crate::hooks::ResponseDecision {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if n < self.reject_count {
+            crate::hooks::ResponseDecision::RetryWithFeedback(self.feedback.clone())
+        } else {
+            crate::hooks::ResponseDecision::Accept
+        }
+    }
+}
+
+/// Validate that a persisted message history is a balanced Anthropic-style
+/// conversation: every assistant `tool_use` id is answered by a `tool_result`
+/// with the same id in the immediately-following user message.
+fn assert_tool_use_history_balanced(history: &[Message]) -> anyhow::Result<()> {
+    for (idx, message) in history.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Content::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        let tool_use_ids: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if tool_use_ids.is_empty() {
+            continue;
+        }
+        let next = history
+            .get(idx + 1)
+            .context("assistant tool_use must be followed by a user message")?;
+        anyhow::ensure!(
+            next.role == Role::User,
+            "message after assistant tool_use must be a user message, got {:?}",
+            next.role
+        );
+        let Content::Blocks(next_blocks) = &next.content else {
+            anyhow::bail!("user reply to tool_use must carry tool_result blocks, got plain text");
+        };
+        let result_ids: Vec<&str> = next_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for id in tool_use_ids {
+            anyhow::ensure!(
+                result_ids.contains(&id),
+                "tool_use id {id} has no matching tool_result in the next user message",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_with_feedback_balances_tool_use_history() -> anyhow::Result<()> {
+    // The first response carries a `tool_use` block and is rejected once.
+    // The appended feedback user message must contain a matching
+    // `tool_result` so the persisted history stays valid for Anthropic-style
+    // providers (which 400 on an unanswered `tool_use`).
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("recovered"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(RejectNHooks::new("please avoid calling that tool", 1))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "run should complete after the steered retry, got {state:?}",
+    );
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    assert_tool_use_history_balanced(&history)?;
+
+    // The synthesized tool_result must carry the guardrail feedback and be
+    // flagged as an error so the model sees the steering.
+    let fed_back = history.iter().any(|m| {
+        let Content::Blocks(blocks) = &m.content else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id, content, is_error }
+                    if tool_use_id == "call_1"
+                        && content.contains("please avoid calling that tool")
+                        && *is_error == Some(true)
+            )
+        })
+    });
+    assert!(
+        fed_back,
+        "the guardrail feedback must be delivered via the call_1 tool_result",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_with_feedback_preserves_usage_and_terminates_on_budget() -> anyhow::Result<()> {
+    // A guardrail that rejects *every* response would loop forever with
+    // `max_turns: None` if the rejected turn's usage were dropped (the
+    // budget could never trip). Each mock response accrues 30 tokens
+    // (10 in + 20 out), so a 25-token budget must stop the run on the first
+    // rejected turn — proving the usage is applied before the retry result.
+    let provider = MockProvider::new(vec![
+        MockProvider::text_response("reject me 1"),
+        MockProvider::text_response("reject me 2"),
+        MockProvider::text_response("reject me 3"),
+    ]);
+
+    let config = AgentConfig {
+        max_turns: None,
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(25),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(RejectNHooks::new("never good enough", usize::MAX))
+        .config(config)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded {
+            limit, total_usage, ..
+        } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+            assert!(
+                total_usage.input_tokens + total_usage.output_tokens > 25,
+                "cumulative usage must advance past the budget, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!(
+            "a deterministically-rejecting guardrail must terminate on budget, got {other:?}",
+        ),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::BudgetExceeded {
+                limit: BudgetLimitKind::TotalTokens,
+                ..
+            }
+        )),
+        "a BudgetExceeded event must close the run",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_tee_channel_is_bounded() -> anyhow::Result<()> {
+    use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use tokio::sync::mpsc;
+
+    // The tee channel must be bounded so a slow/absent consumer cannot grow
+    // memory without limit. Append more events than the channel can hold,
+    // with nobody reading `rx`: every append must succeed (drop-on-full,
+    // never error or block), the inner store must retain *all* events
+    // durably, and the channel must buffer at most its capacity.
+    let inner = new_event_store();
+    let (tx, mut rx) = mpsc::channel(RUN_STREAM_CHANNEL_CAPACITY);
+    let tee = TeeEventStore {
+        inner: Arc::clone(&inner) as Arc<dyn EventStore>,
+        tx,
+    };
+
+    let thread_id = ThreadId::new();
+    let seq = SequenceCounter::new();
+    let total = RUN_STREAM_CHANNEL_CAPACITY + 50;
+    for i in 0..total {
+        let envelope =
+            AgentEventEnvelope::wrap(AgentEvent::text("msg", format!("event {i}")), &seq);
+        // Drop-on-full must never surface as an error to the run loop.
+        tee.append(&thread_id, 0, envelope).await?;
+    }
+
+    // Durable store keeps every event — the stream is the only lossy side.
+    assert_eq!(inner.event_count(&thread_id).await?, total);
+
+    // The bounded channel buffered at most its capacity; the rest were
+    // dropped from the live stream rather than queued unboundedly.
+    drop(tee);
+    let mut buffered = 0;
+    while rx.try_recv().is_ok() {
+        buffered += 1;
+    }
+    assert!(
+        buffered <= RUN_STREAM_CHANNEL_CAPACITY,
+        "tee channel buffered {buffered} events, exceeding the {RUN_STREAM_CHANNEL_CAPACITY} cap",
+    );
+    assert!(
+        buffered < total,
+        "with a full bounded channel some events must be dropped from the stream",
+    );
+
+    Ok(())
+}
