@@ -29,15 +29,14 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use agent_sdk::{
-    AgentConfig, AgentEvent, AgentEventEnvelope, AgentInput, CancellationToken, EventStore,
-    InMemoryEventStore, LlmProvider, ThreadId, ToolContext, builder,
+    AgentConfig, AgentEvent, AgentInput, CancellationToken, EventStore, InMemoryEventStore,
+    LlmProvider, ObservingEventStore, ThreadId, ToolContext, builder,
     providers::{
         AnthropicProvider, CloudflareAIGatewayProvider, GeminiProvider, OpenAIProvider,
         VertexProvider,
     },
 };
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use clap::Args as ClapArgs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -277,34 +276,19 @@ fn build_vertex(args: &ProviderArgs) -> Result<VertexProvider> {
     Ok(VertexProvider::new(access_token, project_id, region, model))
 }
 
-/// An [`EventStore`] decorator that prints streaming text to stdout as the
-/// agent produces it, then delegates persistence to an inner store.
+/// Build the authoritative event store: an [`ObservingEventStore`] that prints
+/// streamed text to stdout as the agent produces it, then delegates persistence
+/// to an in-memory inner store.
 ///
-/// This is the idiomatic way to "stream to stdout" with the public SDK: the
+/// This is the idiomatic way to "stream to stdout" with the public SDK — the
 /// agent loop writes every [`AgentEvent`] through the configured event store,
-/// so wrapping that store lets us observe events live without an in-process
-/// channel.
-struct StreamToStdout {
-    inner: Arc<InMemoryEventStore>,
-}
-
-impl StreamToStdout {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(InMemoryEventStore::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl EventStore for StreamToStdout {
-    async fn append(
-        &self,
-        thread_id: &ThreadId,
-        turn: usize,
-        envelope: AgentEventEnvelope,
-    ) -> Result<()> {
-        match &envelope.event {
+/// so the reusable [`ObservingEventStore`] decorator lets us observe events live
+/// (via the closure) without hand-rolling the full [`EventStore`] surface or an
+/// in-process channel.
+fn streaming_event_store() -> Arc<dyn EventStore> {
+    Arc::new(ObservingEventStore::new(
+        InMemoryEventStore::new(),
+        |envelope| match &envelope.event {
             AgentEvent::TextDelta { delta, .. } => {
                 print!("{delta}");
                 // Deltas arrive mid-line; flush so they show up immediately.
@@ -314,29 +298,8 @@ impl EventStore for StreamToStdout {
                 eprintln!("\nerror: {message}");
             }
             _ => {}
-        }
-        self.inner.append(thread_id, turn, envelope).await
-    }
-
-    async fn finish_turn(&self, thread_id: &ThreadId, turn: usize) -> Result<()> {
-        self.inner.finish_turn(thread_id, turn).await
-    }
-
-    async fn get_turn(
-        &self,
-        thread_id: &ThreadId,
-        turn: usize,
-    ) -> Result<Option<agent_sdk::StoredTurnEvents>> {
-        self.inner.get_turn(thread_id, turn).await
-    }
-
-    async fn get_turns(&self, thread_id: &ThreadId) -> Result<Vec<agent_sdk::StoredTurnEvents>> {
-        self.inner.get_turns(thread_id).await
-    }
-
-    async fn clear(&self, thread_id: &ThreadId) -> Result<()> {
-        self.inner.clear(thread_id).await
-    }
+        },
+    ))
 }
 
 /// Entry point for `agent-sdk run`.
@@ -534,14 +497,13 @@ type CliAgent<P> = agent_sdk::AgentLoop<
 >;
 
 fn build_agent<P: LlmProvider + 'static>(provider: P, system: String) -> CliAgent<P> {
-    let event_store = Arc::new(StreamToStdout::new());
     builder::<()>()
         .provider(provider)
         .config(AgentConfig {
             system_prompt: system,
             ..Default::default()
         })
-        .event_store(event_store)
+        .event_store(streaming_event_store())
         .build()
 }
 
