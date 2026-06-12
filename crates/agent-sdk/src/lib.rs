@@ -404,6 +404,7 @@
 //! | `web`          | No  | `html2text` | [`web`] search + fetch tools |
 //! | `mcp`          | No  | — | [`mcp`] Model Context Protocol client (stdio + streamable-HTTP/SSE) |
 //! | `skills`       | No  | `serde_yaml_ng` | [`skills`] markdown skill loader |
+//! | `sqlite`       | No  | `rusqlite` (bundled) | Durable single-file [`SqliteStore`] session store |
 //! | `otel`         | No  | `opentelemetry` | OpenTelemetry tracing instrumentation |
 //!
 //! A minimal Anthropic-only build pulls no WebSocket, HTML, or YAML crates:
@@ -503,6 +504,11 @@ pub use stores::{
     EventStore, InMemoryEventStore, InMemoryExecutionStore, InMemoryStore, MessageStore,
     ObservingEventStore, StateStore, StoredTurnEvents, ToolExecutionStore,
 };
+// Durable, single-file SQLite-backed store implementing all four store traits.
+// Behind the `sqlite` feature so the default build pulls no SQLite dependency.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
+pub use stores::sqlite::SqliteStore;
 pub use tools::{
     AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,
     Tool, ToolContext, ToolLogic, ToolName, ToolRegistry, ToolStatus, TypedTool, TypedToolAdapter,
