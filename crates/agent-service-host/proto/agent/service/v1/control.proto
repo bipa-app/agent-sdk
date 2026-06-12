@@ -209,13 +209,20 @@ message DecideConfirmationResponse {
   TaskSnapshot parent_task = 2;
 }
 
-// Cancel a queued or running task and its entire descendant subtree.
+// Cancel a queued or running root task and its entire descendant subtree.
 //
-// Cancellation cascades from `task_id` through every live descendant
-// (tool-runtime children, and across subagent-invocation links into
-// child threads) by way of the durable `cancel_tree` transition. Each
-// cancelled row drops its worker lease, so any worker still holding the
-// row fails its next heartbeat / complete / fail CAS.
+// `task_id` must reference a root turn. Cancellation cascades from the
+// root through every live descendant (tool-runtime children, and across
+// subagent-invocation links into child threads) by way of the durable
+// `cancel_tree` transition. Each cancelled row drops its worker lease, so
+// any worker still holding the row fails its next heartbeat / complete /
+// fail CAS.
+//
+// Cancelling an interior (non-root) task is not yet supported: the durable
+// SQL backends do not rebalance an out-of-subtree parent left in
+// `WAITING_ON_CHILDREN`, which would strand the parent forever. The RPC
+// rejects interior task ids with `FAILED_PRECONDITION` until that
+// rebalance lands; interior cancel is a planned future addition.
 //
 // The call is idempotent: rows already in a terminal state
 // (`COMPLETED` / `FAILED` / `CANCELLED`) are left untouched and are
@@ -226,15 +233,22 @@ message DecideConfirmationResponse {
 //
 // * `INVALID_ARGUMENT` for a blank `task_id`.
 // * `NOT_FOUND` if `task_id` doesn't resolve to a known task.
+// * `FAILED_PRECONDITION` if `task_id` resolves to a non-root task, or if
+//   the loaded task does not belong to the supplied `thread_id` guard.
 message CancelTaskRequest {
-  // The task whose subtree should be cancelled. Any task in the tree may
-  // be supplied — passing a root turn cancels the whole tree, while
-  // passing an interior task cancels only that task and its descendants.
+  // The root task whose subtree should be cancelled. Must reference a
+  // root turn; interior (non-root) task ids are rejected with
+  // `FAILED_PRECONDITION`.
   string task_id = 1;
 
-  // Optional human-readable reason recorded for observability. May be
-  // empty; it does not alter cancellation behaviour.
+  // Optional human-readable reason recorded in the server logs. May be
+  // empty; it is not persisted and does not alter cancellation behaviour.
   string reason = 2;
+
+  // Thread guard. When non-empty, the server rejects a `(thread_id,
+  // task_id)` pair whose task does not belong to `thread_id` rather than
+  // cancelling some other thread's work. May be empty to skip the guard.
+  string thread_id = 3;
 }
 
 message CancelTaskResponse {
@@ -281,7 +295,8 @@ service AgentControlService {
   // Apply a durable confirmation decision to an awaiting task.
   rpc DecideConfirmation(DecideConfirmationRequest) returns (DecideConfirmationResponse);
 
-  // Cancel a queued or running task and its entire descendant subtree
-  // via the durable cancellation-tree transition.
+  // Cancel a queued or running root task and its entire descendant
+  // subtree via the durable cancellation-tree transition. Interior
+  // (non-root) task ids are rejected; see `CancelTaskRequest`.
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }
