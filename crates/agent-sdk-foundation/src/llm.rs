@@ -692,7 +692,7 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
 fn parse_imf_fixdate(value: &str) -> Option<time::OffsetDateTime> {
     // IMF-fixdate is always UTC ("GMT"); parse the civil datetime and assume
     // UTC. A custom description avoids depending on the `macros` feature.
-    let format = time::format_description::parse(
+    let format = time::format_description::parse_borrowed::<1>(
         "[weekday repr:short], [day] [month repr:short] [year] \
          [hour]:[minute]:[second] GMT",
     )
