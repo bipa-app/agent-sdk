@@ -19,6 +19,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -38,6 +39,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_mins(2);
 /// Upper bound on the number of cached WebSocket sessions retained at once.
 const MAX_WEBSOCKET_SESSIONS: usize = 512;
+/// Environment variable that forces the Codex provider onto the HTTP transport,
+/// skipping the WebSocket path entirely. Set to a truthy value (`1`, `true`,
+/// `yes`, `on`) when the environment cannot complete the `wss` upgrade (a
+/// corporate proxy / firewall that black-holes websockets). Honored at provider
+/// construction.
+const OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV: &str = "OPENAI_CODEX_DISABLE_WEBSOCKETS";
+
+/// Interpret a raw environment-variable value as a boolean. Absent or
+/// unrecognized values are treated as `false` so the default (WebSocket-first)
+/// behavior is preserved. Split out from the env read so the truthiness logic is
+/// unit-testable without mutating the process environment (`std::env::set_var`
+/// is `unsafe`, which `#![forbid(unsafe_code)]` rejects even in tests).
+fn parse_disable_websockets_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Read [`OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV`] as a boolean.
+fn websockets_disabled_from_env() -> bool {
+    parse_disable_websockets_value(
+        std::env::var(OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Build an HTTP client with a connect/keepalive timeout, matching the sibling
 /// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
@@ -92,6 +122,23 @@ pub struct OpenAICodexResponsesProvider {
     thinking: Option<ThinkingConfig>,
     account_id: Option<String>,
     websocket_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<WebsocketSessionState>>>>>,
+    /// Hard opt-out: when set, the WebSocket transport is never attempted and
+    /// every turn goes straight to HTTP. Sourced from
+    /// [`with_websockets_disabled`](Self::with_websockets_disabled) or the
+    /// [`OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV`] environment variable.
+    websockets_disabled: bool,
+    /// Cross-session "websockets don't work in this environment" memory. The
+    /// per-session [`WebsocketSessionState::websocket_disabled`] flag only
+    /// protects the session that hit the failure, so a fresh session would
+    /// re-pay the full connect/warmup timeout penalty. A *transport*
+    /// (connectivity) failure latches this provider-level flag so every
+    /// subsequent session skips the WebSocket attempt and goes straight to
+    /// HTTP. The environment self-heals after the first failed session instead
+    /// of stalling on every one. Latches once per process and never resets — a
+    /// genuinely WS-hostile network does not recover mid-process, and a
+    /// once-per-process latch is the simplest correct behavior. Auth/request
+    /// failures (401/client errors) deliberately do *not* set this flag.
+    websockets_unhealthy: Arc<AtomicBool>,
 }
 
 type CodexWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -127,6 +174,8 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            websockets_disabled: websockets_disabled_from_env(),
+            websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -141,6 +190,8 @@ impl OpenAICodexResponsesProvider {
             thinking: None,
             account_id: None,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            websockets_disabled: websockets_disabled_from_env(),
+            websockets_unhealthy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -180,6 +231,28 @@ impl OpenAICodexResponsesProvider {
     #[must_use]
     pub fn with_reasoning_effort(self, effort: ReasoningEffort) -> Self {
         self.with_thinking(ThinkingConfig::default().with_effort(map_reasoning_effort(effort)))
+    }
+
+    /// Force the HTTP transport, skipping the WebSocket path entirely.
+    ///
+    /// In a WebSocket-hostile environment (a corporate proxy / firewall that
+    /// black-holes the `wss` upgrade) the WebSocket-first transport stalls for
+    /// up to the connect + warmup timeout budget on every fresh session before
+    /// falling back to HTTP. An operator who knows their network cannot do
+    /// `wss` can set this to skip the penalty entirely. The
+    /// `OPENAI_CODEX_DISABLE_WEBSOCKETS` environment variable does the
+    /// same without a code change.
+    #[must_use]
+    pub const fn with_websockets_disabled(mut self, disabled: bool) -> Self {
+        self.websockets_disabled = disabled;
+        self
+    }
+
+    /// Whether the WebSocket transport should be skipped for this turn: either
+    /// it was hard-disabled (builder / env) or a prior session in this process
+    /// already proved the environment cannot complete the `wss` transport.
+    fn skip_websocket(&self) -> bool {
+        self.websockets_disabled || self.websockets_unhealthy.load(Ordering::Relaxed)
     }
 
     const fn max_output_tokens(request: &ChatRequest) -> Option<u32> {
@@ -513,9 +586,24 @@ impl LlmProvider for OpenAICodexResponsesProvider {
 
             let mut sse_turn_state: Option<String> = None;
 
-            if let Some(session_id) = request.session_id.as_deref() {
+            // Skip the WebSocket transport entirely when it is hard-disabled
+            // (builder / env) or a prior session already proved this environment
+            // cannot complete the `wss` transport. The turn falls through to the
+            // HTTP request path below without paying any WebSocket connect /
+            // warmup timeout penalty.
+            if let Some(session_id) = request.session_id.as_deref().filter(|_| !self.skip_websocket()) {
                 let session = self.websocket_session(session_id).await;
                 let mut websocket_session = session.lock().await;
+
+                // Latched on a TRANSPORT/connectivity failure (connect timeout,
+                // upgrade failure, warmup connection-closed/timeout, mid-stream
+                // disconnect before output) so every later session in this
+                // process skips the WebSocket attempt. Auth/request failures
+                // (401 / client-error wrapped events) deliberately do NOT latch
+                // this — a transient auth blip must not force HTTP-only forever.
+                let mark_websocket_transport_unhealthy = || {
+                    self.websockets_unhealthy.store(true, Ordering::Relaxed);
+                };
 
                 // If the previous turn for this session was abandoned mid-flight
                 // (its stream was dropped — the SDK's cancellation mechanism), its
@@ -558,6 +646,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     );
                                     if attempt == 1 {
                                         websocket_session.websocket_disabled = true;
+                                        mark_websocket_transport_unhealthy();
                                     }
                                     continue;
                                 }
@@ -606,6 +695,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 reset_websocket_connection(&mut websocket_session);
                                 if attempt == 1 {
                                     websocket_session.websocket_disabled = true;
+                                    mark_websocket_transport_unhealthy();
                                 }
                                 continue;
                             }
@@ -632,6 +722,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     reset_websocket_connection(&mut websocket_session);
                                     if attempt == 1 {
                                         websocket_session.websocket_disabled = true;
+                                        mark_websocket_transport_unhealthy();
                                     }
                                     continue 'websocket_attempts;
                                 };
@@ -646,6 +737,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         reset_websocket_connection(&mut websocket_session);
                                         if attempt == 1 {
                                             websocket_session.websocket_disabled = true;
+                                            mark_websocket_transport_unhealthy();
                                         }
                                         continue 'websocket_attempts;
                                     }
@@ -708,6 +800,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     reset_websocket_connection(&mut websocket_session);
                                                     if attempt == 1 {
                                                         websocket_session.websocket_disabled = true;
+                                                        mark_websocket_transport_unhealthy();
                                                     }
                                                     continue 'websocket_attempts;
                                                 }
@@ -774,6 +867,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         reset_websocket_connection(&mut websocket_session);
                                                         if attempt == 1 {
                                                             websocket_session.websocket_disabled = true;
+                                                            mark_websocket_transport_unhealthy();
                                                         }
                                                         continue 'websocket_attempts;
                                                     }
@@ -796,6 +890,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             reset_websocket_connection(&mut websocket_session);
                                             if attempt == 1 {
                                                 websocket_session.websocket_disabled = true;
+                                                mark_websocket_transport_unhealthy();
                                             }
                                             continue 'websocket_attempts;
                                         }
@@ -809,6 +904,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         reset_websocket_connection(&mut websocket_session);
                                         if attempt == 1 {
                                             websocket_session.websocket_disabled = true;
+                                            mark_websocket_transport_unhealthy();
                                         }
                                         continue 'websocket_attempts;
                                     }
@@ -855,6 +951,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                             reset_websocket_connection(&mut websocket_session);
                             if attempt == 1 {
                                 websocket_session.websocket_disabled = true;
+                                mark_websocket_transport_unhealthy();
                             }
                             continue;
                         }
@@ -889,6 +986,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 reset_websocket_connection(&mut websocket_session);
                                 if attempt == 1 {
                                     websocket_session.websocket_disabled = true;
+                                    mark_websocket_transport_unhealthy();
                                 }
                                 continue 'websocket_attempts;
                             };
@@ -907,6 +1005,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     reset_websocket_connection(&mut websocket_session);
                                     if attempt == 1 {
                                         websocket_session.websocket_disabled = true;
+                                        mark_websocket_transport_unhealthy();
                                     }
                                     continue 'websocket_attempts;
                                 }
@@ -1191,6 +1290,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         reset_websocket_connection(&mut websocket_session);
                                         if attempt == 1 {
                                             websocket_session.websocket_disabled = true;
+                                            mark_websocket_transport_unhealthy();
                                         }
                                         continue 'websocket_attempts;
                                     }
@@ -1209,6 +1309,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                     reset_websocket_connection(&mut websocket_session);
                                     if attempt == 1 {
                                         websocket_session.websocket_disabled = true;
+                                        mark_websocket_transport_unhealthy();
                                     }
                                     continue 'websocket_attempts;
                                 }
@@ -3004,5 +3105,285 @@ mod tests {
             starts,
             vec![("first".to_string(), 1), ("second".to_string(), 2)]
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Transport selection: force-HTTP knob + cross-session WS-unhealthy memory
+    // ────────────────────────────────────────────────────────────────────
+
+    use crate::provider::LlmProvider;
+    use agent_sdk_foundation::llm::{ChatRequest, Message};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A truthy OAuth-shaped token so `build_headers` can extract an account id
+    /// without a real network call.
+    fn oauth_token() -> String {
+        test_token()
+    }
+
+    fn streaming_request(session_id: &str) -> ChatRequest {
+        ChatRequest::new("You are helpful.", vec![Message::user("hello")])
+            .with_max_tokens(1024)
+            .with_session_id(session_id)
+    }
+
+    /// Read a single HTTP/1.1 request head (up to the blank line) from a stream.
+    async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while stream.read_exact(&mut byte).await.is_ok() {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Minimal SSE body that drives the HTTP fallback to a clean `Done`.
+    const HTTP_SSE_BODY: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Spawn an HTTP-only server that records whether any WebSocket upgrade was
+    /// attempted and serves a fixed SSE body to plain POSTs. Returns the base
+    /// URL plus the (`ws_attempts`, `http_requests`) counters.
+    async fn spawn_http_only_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_attempts = Arc::new(AtomicUsize::new(0));
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let ws_attempts_task = ws_attempts.clone();
+        let http_requests_task = http_requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let ws_attempts = ws_attempts_task.clone();
+                let http_requests = http_requests_task.clone();
+                tokio::spawn(async move {
+                    let head = read_http_head(&mut stream).await;
+                    if head.to_ascii_lowercase().contains("upgrade: websocket") {
+                        ws_attempts.fetch_add(1, Ordering::Relaxed);
+                        // Refuse the upgrade; a black-holed proxy would simply
+                        // never complete it, but refusing fast keeps the test
+                        // deterministic.
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    http_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        HTTP_SSE_BODY.len(),
+                        HTTP_SSE_BODY,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            format!("http://{addr}/backend-api"),
+            ws_attempts,
+            http_requests,
+        )
+    }
+
+    /// Drain a stream, returning whether it completed without a transport error.
+    async fn drain_ok(provider: &OpenAICodexResponsesProvider, request: ChatRequest) -> bool {
+        let mut stream = std::pin::pin!(provider.chat_stream(request));
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamDelta::Error { .. }) | Err(_) => saw_error = true,
+                Ok(_) => {}
+            }
+        }
+        !saw_error
+    }
+
+    #[tokio::test]
+    async fn websockets_disabled_builder_goes_straight_to_http() {
+        let (base_url, ws_attempts, http_requests) = spawn_http_only_server().await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_websockets_disabled(true);
+
+        assert!(drain_ok(&provider, streaming_request("session-a")).await);
+
+        assert_eq!(
+            ws_attempts.load(Ordering::Relaxed),
+            0,
+            "no websocket upgrade may be attempted when websockets are disabled",
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn parse_disable_websockets_value_recognizes_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                parse_disable_websockets_value(Some(value)),
+                "value={value:?} should disable websockets",
+            );
+        }
+        for value in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !parse_disable_websockets_value(Some(value)),
+                "value={value:?} should NOT disable websockets",
+            );
+        }
+        assert!(!parse_disable_websockets_value(None));
+    }
+
+    #[tokio::test]
+    async fn websockets_disabled_via_env_value_goes_straight_to_http() {
+        // The env var feeds `with_websockets_disabled` through
+        // `parse_disable_websockets_value` at construction. `std::env::set_var`
+        // is `unsafe` and rejected by `#![forbid(unsafe_code)]`, so we drive the
+        // exact value the env reader would produce for `"1"` end-to-end here.
+        let disabled = parse_disable_websockets_value(Some("1"));
+        assert!(disabled);
+
+        let (base_url, ws_attempts, http_requests) = spawn_http_only_server().await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        )
+        .with_websockets_disabled(disabled);
+
+        assert!(drain_ok(&provider, streaming_request("session-env")).await);
+
+        assert_eq!(
+            ws_attempts.load(Ordering::Relaxed),
+            0,
+            "no websocket upgrade may be attempted when the env var forces HTTP-only",
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_marked_ws_unhealthy_skips_websocket_on_new_session() {
+        let (base_url, ws_attempts, http_requests) = spawn_http_only_server().await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        );
+
+        // Simulate a prior session having latched the provider-level transport
+        // signal after a connectivity failure.
+        provider.websockets_unhealthy.store(true, Ordering::Relaxed);
+
+        // A brand-new session must skip the websocket attempt entirely.
+        assert!(drain_ok(&provider, streaming_request("fresh-session")).await);
+
+        assert_eq!(
+            ws_attempts.load(Ordering::Relaxed),
+            0,
+            "a websocket-unhealthy provider must not attempt a new upgrade",
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+    }
+
+    /// Spawn a server that completes the WebSocket handshake then emits a
+    /// wrapped 401 error event. Plain POSTs get the HTTP SSE body. Returns the
+    /// base URL plus the http-request counter (for the fallback assertion).
+    async fn spawn_ws_unauthorized_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let http_requests_task = http_requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let http_requests = http_requests_task.clone();
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    // Non-destructively peek the head to route WS vs HTTP, then
+                    // hand the still-unread stream to the right handler.
+                    let mut peek = [0u8; 1024];
+                    let Ok(n) = stream.peek(&mut peek).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
+
+                    if head.contains("upgrade: websocket") {
+                        // `accept_async` reads and completes the handshake from
+                        // the untouched stream, so no manual SHA-1 is needed.
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        let payload =
+                            r#"{"type":"error","status":401,"error":{"message":"unauthorized"}}"#;
+                        let _ = ws
+                            .send(WebSocketMessage::Text(payload.to_string().into()))
+                            .await;
+                        let _ = ws.send(WebSocketMessage::Close(None)).await;
+                        return;
+                    }
+
+                    // Plain HTTP POST: drain the request head, then reply.
+                    let _ = read_http_head(&mut stream).await;
+                    http_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        HTTP_SSE_BODY.len(),
+                        HTTP_SSE_BODY,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/backend-api"), http_requests)
+    }
+
+    #[tokio::test]
+    async fn ws_unauthorized_disables_session_but_not_provider() {
+        let (base_url, http_requests) = spawn_ws_unauthorized_server().await;
+        let provider = OpenAICodexResponsesProvider::with_base_url(
+            oauth_token(),
+            MODEL_GPT53_CODEX.to_string(),
+            base_url,
+        );
+
+        // The websocket warmup hits a wrapped 401, disables the session's
+        // websocket, and falls back to HTTP — which completes cleanly.
+        assert!(drain_ok(&provider, streaming_request("auth-session")).await);
+
+        // The auth failure is a request problem, NOT a transport problem: the
+        // provider-level flag must stay clear so a transient blip does not
+        // force HTTP-only forever.
+        assert!(
+            !provider.websockets_unhealthy.load(Ordering::Relaxed),
+            "a 401 must not mark the provider websocket-transport-unhealthy",
+        );
+        // The per-session flag was set, so this same session now goes straight
+        // to HTTP without another websocket attempt.
+        let session = provider.websocket_session("auth-session").await;
+        assert!(session.lock().await.websocket_disabled);
+
+        assert!(http_requests.load(Ordering::Relaxed) >= 1);
     }
 }
