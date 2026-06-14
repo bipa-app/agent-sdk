@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.10.0...agent-sdk-foundation-v0.11.0) - 2026-06-14
+
+### Added
+
+- *(providers)* rate-limit Retry-After, prompt-cache control, failover, streaming-structured output, record/replay provider ([#311](https://github.com/bipa-app/agent-sdk/pull/311))
+
 ## [0.10.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.9.2...agent-sdk-foundation-v0.10.0) - 2026-06-11
 
 ### Added

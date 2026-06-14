@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.10.0...agent-sdk-providers-v0.11.0) - 2026-06-14
+
+### Added
+
+- *(providers)* rate-limit Retry-After, prompt-cache control, failover, streaming-structured output, record/replay provider ([#311](https://github.com/bipa-app/agent-sdk/pull/311))
+
+### Fixed
+
+- *(providers)* stop Codex WebSocket stalls in WS-hostile networks ([#318](https://github.com/bipa-app/agent-sdk/pull/318))
+
 ## [0.10.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.9.2...agent-sdk-providers-v0.10.0) - 2026-06-11
 
 ### Added
