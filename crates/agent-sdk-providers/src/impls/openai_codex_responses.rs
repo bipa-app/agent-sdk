@@ -240,7 +240,7 @@ impl OpenAICodexResponsesProvider {
     /// up to the connect + warmup timeout budget on every fresh session before
     /// falling back to HTTP. An operator who knows their network cannot do
     /// `wss` can set this to skip the penalty entirely. The
-    /// [`OPENAI_CODEX_DISABLE_WEBSOCKETS_ENV`] environment variable does the
+    /// `OPENAI_CODEX_DISABLE_WEBSOCKETS` environment variable does the
     /// same without a code change.
     #[must_use]
     pub const fn with_websockets_disabled(mut self, disabled: bool) -> Self {
