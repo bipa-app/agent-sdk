@@ -59,6 +59,10 @@ fn split_openrouter_id(id: &str) -> (String, String) {
 }
 
 /// Parse the `OpenRouter` `/models` body into catalog entries.
+///
+/// # Errors
+///
+/// Returns an error if the body is not valid `OpenRouter` JSON.
 pub fn parse_openrouter(json: &str) -> Result<Vec<CatalogEntry>> {
     let parsed: OpenRouterResponse =
         serde_json::from_str(json).context("failed to parse OpenRouter models response")?;
@@ -125,6 +129,10 @@ impl Default for OpenRouterSource {
 
 impl OpenRouterSource {
     /// Create a source pointing at the canonical `OpenRouter` models endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the feed HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: build_feed_client()?,

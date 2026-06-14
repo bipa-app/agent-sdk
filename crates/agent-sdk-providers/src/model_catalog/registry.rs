@@ -205,7 +205,7 @@ mod tests {
       }
     }"#;
 
-    pub(crate) struct StaticSource(pub(crate) Vec<CatalogEntry>);
+    struct StaticSource(Vec<CatalogEntry>);
 
     #[async_trait]
     impl ModelCatalogSource for StaticSource {

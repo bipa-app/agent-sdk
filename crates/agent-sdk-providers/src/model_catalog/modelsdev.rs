@@ -60,6 +60,10 @@ fn pricing_from_modelsdev_cost(cost: &ModelsDevCost) -> Option<Pricing> {
 }
 
 /// Parse the models.dev `api.json` body into catalog entries.
+///
+/// # Errors
+///
+/// Returns an error if the body is not valid models.dev JSON.
 pub fn parse_modelsdev(json: &str) -> Result<Vec<CatalogEntry>> {
     let providers: HashMap<String, ModelsDevProvider> =
         serde_json::from_str(json).context("failed to parse models.dev api.json")?;
@@ -68,10 +72,8 @@ pub fn parse_modelsdev(json: &str) -> Result<Vec<CatalogEntry>> {
         let provider = map_modelsdev_provider(&provider_key);
         for model in provider_obj.models.into_values() {
             let pricing = model.cost.as_ref().and_then(pricing_from_modelsdev_cost);
-            let (context_window, max_output_tokens) = match model.limit {
-                Some(limit) => (limit.context, limit.output),
-                None => (None, None),
-            };
+            let context_window = model.limit.as_ref().and_then(|limit| limit.context);
+            let max_output_tokens = model.limit.and_then(|limit| limit.output);
             entries.push(CatalogEntry {
                 provider: provider.clone(),
                 model_id: model.id,
@@ -109,6 +111,10 @@ impl Default for ModelsDevSource {
 
 impl ModelsDevSource {
     /// Create a source pointing at the canonical models.dev endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the feed HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: build_feed_client()?,
