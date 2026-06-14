@@ -21,6 +21,8 @@ pub mod openai_responses;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
+pub(crate) mod model_listing;
+
 #[cfg(feature = "anthropic")]
 pub use anthropic::{AnthropicProvider, is_oauth_token};
 #[cfg(feature = "cloudflare")]

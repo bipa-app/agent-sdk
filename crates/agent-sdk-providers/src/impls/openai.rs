@@ -626,21 +626,8 @@ impl LlmProvider for OpenAIProvider {
             .client
             .get(format!("{}/models", self.base_url))
             .header("Content-Type", "application/json");
-        let response = self
-            .apply_headers(builder)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "OpenAI list_models returned HTTP {status}: {body}"
-            ));
-        }
+        let builder = self.apply_headers(builder);
+        let body = crate::impls::model_listing::fetch_model_list_body(builder, "OpenAI").await?;
         parse_models_list(&body)
     }
 

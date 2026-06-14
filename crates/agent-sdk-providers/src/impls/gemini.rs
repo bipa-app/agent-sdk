@@ -507,21 +507,9 @@ impl LlmProvider for GeminiProvider {
                 .get(format!("{}/models", self.base_url))
                 .header("Content-Type", "application/json")
                 .query(&query);
-            let response = self
-                .apply_auth(builder)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
-            if !status.is_success() {
-                return Err(anyhow::anyhow!(
-                    "Gemini list_models returned HTTP {status}: {body}"
-                ));
-            }
+            let builder = self.apply_auth(builder);
+            let body =
+                crate::impls::model_listing::fetch_model_list_body(builder, "Gemini").await?;
             let page = parse_models_page(&body)?;
             rows.extend(page.models);
             match page.next_page_token {
@@ -608,11 +596,10 @@ fn finalize_gemini_models(rows: Vec<GeminiModelRow>) -> Vec<crate::provider::Mod
                     .any(|m| m == "generateContent")
         })
         .map(|row| crate::provider::ModelInfo {
-            id: row
-                .name
-                .strip_prefix("models/")
-                .unwrap_or(&row.name)
-                .to_owned(),
+            id: match row.name.strip_prefix("models/") {
+                Some(stripped) => stripped.to_owned(),
+                None => row.name.clone(),
+            },
             display_name: row.display_name,
             context_window: row.input_token_limit,
             max_output_tokens: row.output_token_limit,

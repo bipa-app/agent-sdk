@@ -1025,21 +1025,9 @@ impl LlmProvider for AnthropicProvider {
                 .get(format!("{}/v1/models", self.base_url))
                 .header("Content-Type", "application/json")
                 .query(&query);
-            let response = self
-                .apply_auth(builder)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("list_models request failed: {e}"))?;
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to read list_models body: {e}"))?;
-            if !status.is_success() {
-                return Err(anyhow::anyhow!(
-                    "Anthropic list_models returned HTTP {status}: {body}"
-                ));
-            }
+            let builder = self.apply_auth(builder);
+            let body =
+                crate::impls::model_listing::fetch_model_list_body(builder, "Anthropic").await?;
             let page = parse_models_page(&body)?;
             models.extend(page.models);
             if !page.has_more {
