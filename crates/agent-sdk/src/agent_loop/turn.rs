@@ -23,6 +23,7 @@ use crate::types::{
 };
 use agent_sdk_foundation::audit::AuditProvenance;
 
+use futures::StreamExt;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -1307,6 +1308,8 @@ pub(super) async fn execute_pending_tool_calls_for_turn<Ctx, H>(
         state,
         response_id,
         stop_reason,
+        max_parallel_tools,
+        reminder_config,
     }: ToolBatchExecutionParams<'_, Ctx, H>,
 ) -> Result<Vec<(String, ToolResult)>, InternalTurnResult>
 where
@@ -1355,14 +1358,31 @@ where
         if first_tier == ToolTier::Observe {
             let end = observe_run_end(&pending_tool_calls, idx);
 
-            // Borrow the slice for the duration of `join_all` only — the
-            // borrow ends before we touch `pending_tool_calls` mutably below.
-            let outcomes = futures::future::join_all(
-                pending_tool_calls[idx..end]
-                    .iter()
-                    .map(|p| execute_tool_call(p, &execution_ctx)),
-            )
-            .await;
+            // Adjacent observe-tier calls run concurrently, but the
+            // in-flight count is bounded by `max_parallel_tools`
+            // (`None` = unbounded for the batch, `Some(1)` = sequential).
+            // `buffered` polls up to `concurrency` futures at once and
+            // yields results in input order, so downstream ordering is
+            // unchanged regardless of the cap.
+            //
+            // The slice is borrowed only for the duration of the stream —
+            // the borrow ends before we touch `pending_tool_calls` mutably
+            // below.
+            let batch_len = end - idx;
+            let concurrency =
+                max_parallel_tools.map_or(batch_len, |cap| cap.clamp(1, batch_len.max(1)));
+            // Collect the per-call futures eagerly (as `join_all` did) so the
+            // borrow of `execution_ctx` is captured by each future directly,
+            // then drive them with bounded concurrency. `buffered` yields in
+            // input order so result ordering is unchanged.
+            let batch_futures: Vec<_> = pending_tool_calls[idx..end]
+                .iter()
+                .map(|p| execute_tool_call(p, &execution_ctx))
+                .collect();
+            let outcomes: Vec<ToolExecutionOutcome> = futures::stream::iter(batch_futures)
+                .buffered(concurrency)
+                .collect()
+                .await;
 
             let mut outcomes = outcomes.into_iter();
             while let Some(outcome) = outcomes.next() {
@@ -1410,7 +1430,41 @@ where
         }
     }
 
+    if let Some(config) = reminder_config {
+        apply_tool_reminders(config, &pending_tool_calls, &mut tool_results);
+    }
+
     Ok(tool_results)
+}
+
+/// Append any configured per-tool reminders to the matching tool results.
+///
+/// For each completed result, looks up the originating tool's
+/// [`ToolReminder`](crate::reminders::ToolReminder)s by name and, for every
+/// one whose [`ReminderTrigger`](crate::reminders::ReminderTrigger) fires
+/// against the requested input and the produced result, appends the reminder
+/// (wrapped in `<system-reminder>` tags) to the result the model sees.
+fn apply_tool_reminders(
+    config: &crate::reminders::ReminderConfig,
+    pending_tool_calls: &[PendingToolCallInfo],
+    tool_results: &mut [(String, ToolResult)],
+) {
+    if !config.enabled || config.tool_reminders.is_empty() {
+        return;
+    }
+    for (tool_id, result) in tool_results.iter_mut() {
+        let Some(pending) = pending_tool_calls.iter().find(|p| p.id == *tool_id) else {
+            continue;
+        };
+        let Some(reminders) = config.tool_reminders.get(&pending.name) else {
+            continue;
+        };
+        for reminder in reminders {
+            if reminder.trigger.should_trigger(&pending.input, result) {
+                crate::reminders::append_reminder(result, &reminder.content);
+            }
+        }
+    }
 }
 
 /// Find the end (exclusive) of the run of consecutive `ToolTier::Observe`
@@ -1535,6 +1589,8 @@ pub(super) async fn execute_turn_tool_phase<Ctx, H, M>(
         message_store,
         response_id,
         stop_reason,
+        max_parallel_tools,
+        reminder_config,
     }: TurnToolPhaseParams<'_, Ctx, H, M>,
 ) -> Result<(), InternalTurnResult>
 where
@@ -1559,6 +1615,8 @@ where
         state,
         response_id,
         stop_reason,
+        max_parallel_tools,
+        reminder_config,
     })
     .await?;
 
@@ -1949,6 +2007,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        reminder_config,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -1983,6 +2042,7 @@ where
         audit_sink,
         provenance,
         turn_options,
+        reminder_config,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -2136,6 +2196,7 @@ async fn execute_turn_inner<Ctx, P, H, M, S>(
         audit_sink,
         provenance,
         turn_options,
+        reminder_config,
         cancel_token,
         #[cfg(feature = "otel")]
         observability_store,
@@ -2232,6 +2293,8 @@ where
         hooks,
         message_store,
         state_store,
+        config,
+        reminder_config,
         compaction_config,
         compactor,
         execution_store,
@@ -2302,6 +2365,24 @@ where
     H: AgentHooks,
     M: MessageStore,
 {
+    // Input guardrail (`pre_llm_request`): runs once per turn, before the
+    // retry-wrapped chat call. `DefaultHooks` proceeds unchanged.
+    let request = match super::llm::apply_pre_llm_request(hooks, request).await {
+        super::llm::PreLlmGuardrail::Proceed(request) => *request,
+        super::llm::PreLlmGuardrail::Blocked(reason) => {
+            return Err(guardrail_block_result(
+                &ctx.thread_id,
+                ctx.turn,
+                event_store,
+                hooks,
+                authority,
+                "request",
+                &reason,
+            )
+            .await);
+        }
+    };
+
     let mut message_id = uuid::Uuid::new_v4().to_string();
     let mut thinking_id = uuid::Uuid::new_v4().to_string();
     let response = match request_llm_response(LlmCallParams {
@@ -2349,11 +2430,196 @@ where
         }
     };
 
+    // Output guardrail (`on_llm_response`): runs once on the produced
+    // response, before it is processed/persisted. `DefaultHooks` accepts.
+    match super::llm::apply_on_llm_response(hooks, &response).await {
+        super::llm::PostLlmGuardrail::Accept => {}
+        super::llm::PostLlmGuardrail::Blocked(reason) => {
+            return Err(guardrail_block_result(
+                &ctx.thread_id,
+                ctx.turn,
+                event_store,
+                hooks,
+                authority,
+                "response",
+                &reason,
+            )
+            .await);
+        }
+        super::llm::PostLlmGuardrail::RetryWithFeedback(feedback) => {
+            // Account the rejected turn's usage into the cumulative total
+            // *before* returning the retry result. Otherwise the rejected
+            // turn's tokens are lost (cost under-report) and, with
+            // `max_turns: None`, a deterministically-rejecting guardrail
+            // would loop forever because `total_usage` never advances and
+            // the budget check can never trip.
+            let turn_usage = apply_turn_usage(ctx, &response);
+            return Err(retry_with_feedback_result(RetryWithFeedbackParams {
+                thread_id: &ctx.thread_id,
+                turn: ctx.turn,
+                response: &response,
+                feedback: &feedback,
+                turn_usage,
+                message_store,
+                event_store,
+                hooks,
+                authority,
+            })
+            .await);
+        }
+    }
+
     Ok(TurnLlmResponse {
         response,
         message_id,
         thinking_id,
     })
+}
+
+/// Emit a guardrail-block error event and build the terminal
+/// [`InternalTurnResult::Error`] the turn returns when an input/output
+/// guardrail blocks the LLM call.
+async fn guardrail_block_result<H>(
+    thread_id: &ThreadId,
+    turn: usize,
+    event_store: &Arc<dyn EventStore>,
+    hooks: &Arc<H>,
+    authority: &Arc<dyn EventAuthority>,
+    phase: &str,
+    reason: &str,
+) -> InternalTurnResult
+where
+    H: AgentHooks,
+{
+    let message = format!("LLM {phase} blocked by guardrail: {reason}");
+    warn!("{message}");
+    if let Err(error) = send_event(
+        event_store,
+        thread_id,
+        turn,
+        hooks,
+        authority,
+        AgentEvent::error(message.clone(), false),
+    )
+    .await
+    {
+        return InternalTurnResult::Error(error);
+    }
+    InternalTurnResult::Error(AgentError::new(message, false))
+}
+
+struct RetryWithFeedbackParams<'a, H, M> {
+    thread_id: &'a ThreadId,
+    turn: usize,
+    response: &'a ChatResponse,
+    feedback: &'a str,
+    /// Usage already applied to `ctx.total_usage` for the rejected turn, so
+    /// the returned `Continue { turn_usage }` carries it into the turn
+    /// summary (rather than the zeroed default that dropped the usage).
+    turn_usage: TokenUsage,
+    message_store: &'a Arc<M>,
+    event_store: &'a Arc<dyn EventStore>,
+    hooks: &'a Arc<H>,
+    authority: &'a Arc<dyn EventAuthority>,
+}
+
+/// Build the user message that carries guardrail feedback back to the model
+/// after a [`ResponseDecision::RetryWithFeedback`].
+///
+/// When the rejected assistant response contained `tool_use` blocks, the
+/// persisted assistant message still carries them, so the very next user
+/// message **must** contain a matching `tool_result` for each `tool_use` id
+/// or Anthropic-style providers reject the request with a 400 (every
+/// `tool_use` must be answered by a `tool_result`). We attach the guardrail
+/// feedback to each synthesized `tool_result` (flagged `is_error`) so the
+/// model both sees the steering and the conversation stays balanced.
+///
+/// When there are no `tool_use` blocks, a plain-text user message is enough.
+fn build_retry_feedback_message(response: &ChatResponse, feedback: &str) -> Message {
+    let tool_use_ids: Vec<&str> = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if tool_use_ids.is_empty() {
+        return Message::user(feedback);
+    }
+
+    let blocks = tool_use_ids
+        .into_iter()
+        .map(|id| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: feedback.to_string(),
+            is_error: Some(true),
+        })
+        .collect();
+    Message::user_with_content(blocks)
+}
+
+/// Honor [`ResponseDecision::RetryWithFeedback`]: persist the rejected
+/// assistant response (so message alternation stays valid), append the
+/// guardrail feedback as a user message so the model can correct itself,
+/// and continue to the next turn.
+///
+/// If the rejected assistant response contained `tool_use` blocks, the
+/// feedback user message carries a matching `tool_result` for each of them
+/// (see [`build_retry_feedback_message`]) so the persisted history stays a
+/// valid Anthropic-style conversation (`tool_use` → `tool_result`).
+async fn retry_with_feedback_result<H, M>(
+    RetryWithFeedbackParams {
+        thread_id,
+        turn,
+        response,
+        feedback,
+        turn_usage,
+        message_store,
+        event_store,
+        hooks,
+        authority,
+    }: RetryWithFeedbackParams<'_, H, M>,
+) -> InternalTurnResult
+where
+    H: AgentHooks,
+    M: MessageStore,
+{
+    warn!("LLM response rejected by guardrail; steering a retry with feedback");
+    let assistant = build_assistant_message(response);
+    if let Err(error) = message_store.append(thread_id, assistant).await {
+        return InternalTurnResult::Error(AgentError::new(
+            format!("Failed to append assistant message for guardrail retry: {error}"),
+            false,
+        ));
+    }
+    let feedback_message = build_retry_feedback_message(response, feedback);
+    if let Err(error) = message_store.append(thread_id, feedback_message).await {
+        return InternalTurnResult::Error(AgentError::new(
+            format!("Failed to append guardrail feedback message: {error}"),
+            false,
+        ));
+    }
+    // Best-effort: surface the steering as an error-tier event so streaming
+    // consumers can see the retry was triggered. A persistence failure here
+    // must not mask the (successful) message appends, so it is ignored.
+    let _ = send_event(
+        event_store,
+        thread_id,
+        turn,
+        hooks,
+        authority,
+        AgentEvent::error(
+            format!("LLM response rejected by guardrail; retrying: {feedback}"),
+            true,
+        ),
+    )
+    .await;
+    // Carry the rejected turn's usage (already added to `ctx.total_usage`
+    // by the caller) into the turn summary so cost accounting and the
+    // budget check both advance.
+    InternalTurnResult::Continue { turn_usage }
 }
 
 /// Build the `PendingToolCalls` result that hands an external tool
@@ -2396,6 +2662,8 @@ async fn process_response_and_run_tools<Ctx, P, H, M, S>(
     hooks: &Arc<H>,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
+    config: &AgentConfig,
+    reminder_config: Option<&crate::reminders::ReminderConfig>,
     compaction_config: Option<&CompactionConfig>,
     compactor: Option<&Arc<dyn ContextCompactor>>,
     execution_store: Option<&Arc<dyn ToolExecutionStore>>,
@@ -2488,6 +2756,8 @@ where
         message_store,
         response_id: ctx.response_id.clone(),
         stop_reason: ctx.stop_reason,
+        max_parallel_tools: config.max_parallel_tools,
+        reminder_config,
     })
     .await
     {

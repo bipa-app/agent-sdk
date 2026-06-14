@@ -2469,7 +2469,52 @@ fn map_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event>
     if let Some(payload) = map_tool_event_payload(event)? {
         return Ok(payload);
     }
+    if let Some(payload) = map_subagent_event_payload(event) {
+        return Ok(payload);
+    }
     map_lifecycle_event_payload(event)
+}
+
+fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::Event> {
+    let AgentEvent::SubagentProgress {
+        subagent_id,
+        subagent_name,
+        nickname,
+        child_thread_id,
+        child_root_task_id,
+        subagent_task_id,
+        max_turns,
+        current_turn,
+        model,
+        tool_name,
+        tool_context,
+        completed,
+        success,
+        tool_count,
+        total_tokens,
+    } = event
+    else {
+        return None;
+    };
+    Some(pb::event_envelope::Event::SubagentProgress(
+        pb::SubagentProgressEvent {
+            subagent_id: subagent_id.clone(),
+            subagent_name: subagent_name.clone(),
+            nickname: nickname.clone(),
+            child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
+            child_root_task_id: child_root_task_id.clone(),
+            subagent_task_id: subagent_task_id.clone(),
+            max_turns: *max_turns,
+            current_turn: *current_turn,
+            model: model.clone(),
+            tool_name: tool_name.clone(),
+            tool_context: tool_context.clone(),
+            completed: *completed,
+            success: *success,
+            tool_count: *tool_count,
+            total_tokens: *total_tokens,
+        },
+    ))
 }
 
 fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
@@ -2592,6 +2637,31 @@ fn map_tool_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_enve
     }
 }
 
+/// Project a terminal run-completion event onto the wire `DoneEvent`.
+///
+/// Shared by [`AgentEvent::Done`] and [`AgentEvent::BudgetExceeded`]: the
+/// proto has no dedicated budget event, so a budget-terminated run reuses
+/// the `done` frame. This keeps the streaming contract additive — a
+/// replay/follow consumer always receives a closing `done` frame and the
+/// stream terminates (see [`is_done_event`]) instead of failing with
+/// INTERNAL on an unmapped variant. `BudgetExceeded` carries no wall-clock
+/// duration, so it passes [`std::time::Duration::ZERO`]; the limit/cost
+/// detail stays available via the durable event log. (`estimated_cost_usd`
+/// is likewise not yet surfaced on the wire `DoneEvent`.)
+fn map_done_event(
+    thread_id: &ThreadId,
+    total_turns: usize,
+    total_usage: &TokenUsage,
+    duration: std::time::Duration,
+) -> RpcResult<pb::event_envelope::Event> {
+    Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
+        thread_id: thread_id.0.clone(),
+        total_turns: map_u64(total_turns, "total_turns")?,
+        total_usage: Some(map_token_usage(total_usage)),
+        duration: Some(map_duration(duration)?),
+    }))
+}
+
 fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
     match event {
         AgentEvent::TurnComplete { turn, usage } => Ok(pb::event_envelope::Event::TurnComplete(
@@ -2600,17 +2670,26 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 usage: Some(map_token_usage(usage)),
             },
         )),
+        // Both terminal run-completion markers project to `DoneEvent`. See
+        // `map_done_event` for why `BudgetExceeded` reuses the `done` frame.
         AgentEvent::Done {
             thread_id,
             total_turns,
             total_usage,
             duration,
-        } => Ok(pb::event_envelope::Event::Done(pb::DoneEvent {
-            thread_id: thread_id.0.clone(),
-            total_turns: map_u64(*total_turns, "total_turns")?,
-            total_usage: Some(map_token_usage(total_usage)),
-            duration: Some(map_duration(*duration)?),
-        })),
+            ..
+        } => map_done_event(thread_id, *total_turns, total_usage, *duration),
+        AgentEvent::BudgetExceeded {
+            thread_id,
+            total_turns,
+            total_usage,
+            ..
+        } => map_done_event(
+            thread_id,
+            *total_turns,
+            total_usage,
+            std::time::Duration::ZERO,
+        ),
         AgentEvent::Error {
             message,
             recoverable,
@@ -2629,41 +2708,6 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
                 new_count: map_u64(*new_count, "new_count")?,
                 original_tokens: map_u64(*original_tokens, "original_tokens")?,
                 new_tokens: map_u64(*new_tokens, "new_tokens")?,
-            },
-        )),
-        AgentEvent::SubagentProgress {
-            subagent_id,
-            subagent_name,
-            nickname,
-            child_thread_id,
-            child_root_task_id,
-            subagent_task_id,
-            max_turns,
-            current_turn,
-            model,
-            tool_name,
-            tool_context,
-            completed,
-            success,
-            tool_count,
-            total_tokens,
-        } => Ok(pb::event_envelope::Event::SubagentProgress(
-            pb::SubagentProgressEvent {
-                subagent_id: subagent_id.clone(),
-                subagent_name: subagent_name.clone(),
-                nickname: nickname.clone(),
-                child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
-                child_root_task_id: child_root_task_id.clone(),
-                subagent_task_id: subagent_task_id.clone(),
-                max_turns: *max_turns,
-                current_turn: *current_turn,
-                model: model.clone(),
-                tool_name: tool_name.clone(),
-                tool_context: tool_context.clone(),
-                completed: *completed,
-                success: *success,
-                tool_count: *tool_count,
-                total_tokens: *total_tokens,
             },
         )),
         AgentEvent::AutoRetryStart {
@@ -2704,7 +2748,14 @@ where
 }
 
 const fn is_done_event(event: &agent_server::CommittedEvent) -> bool {
-    matches!(event.event, AgentEvent::Done { .. })
+    // Both `Done` and `BudgetExceeded` are terminal run-completion markers
+    // (the latter is emitted in place of `Done` when a budget trips), so a
+    // budget-terminated thread's replay/follow stream closes cleanly with
+    // `ThreadCompleted` rather than hanging waiting for a `Done`.
+    matches!(
+        event.event,
+        AgentEvent::Done { .. } | AgentEvent::BudgetExceeded { .. }
+    )
 }
 
 #[cfg(test)]
@@ -4731,5 +4782,52 @@ mod tests {
 
         daemon.stop().await?;
         result
+    }
+
+    fn budget_exceeded_event() -> AgentEvent {
+        AgentEvent::BudgetExceeded {
+            thread_id: ThreadId::from_string("t-budget"),
+            total_turns: 3,
+            total_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            estimated_cost_usd: Some(0.25),
+            limit: agent_sdk_foundation::types::BudgetLimitKind::TotalTokens,
+        }
+    }
+
+    #[test]
+    fn budget_exceeded_projects_to_done_event() -> Result<()> {
+        // Previously `BudgetExceeded` fell through to `Status::internal`, so a
+        // budget-terminated thread's replay/follow stream failed with INTERNAL.
+        // It must now project to a terminal `DoneEvent` carrying the run totals.
+        let payload = map_event_payload(&budget_exceeded_event())?;
+        match payload {
+            EventPayload::Done(done) => {
+                assert_eq!(done.thread_id, "t-budget");
+                assert_eq!(done.total_turns, 3);
+                let usage = done.total_usage.context("done event must carry usage")?;
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+            }
+            other => bail!("BudgetExceeded must map to a Done event, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exceeded_is_terminal_for_follow_streams() {
+        // `is_done_event` drives stream closure, so a budget-terminated thread
+        // closes with ThreadCompleted instead of hanging waiting for `Done`.
+        let committed = agent_server::CommittedEvent {
+            event_id: uuid::Uuid::now_v7(),
+            thread_id: ThreadId::from_string("t-budget"),
+            sequence: 7,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            event: budget_exceeded_event(),
+        };
+        assert!(is_done_event(&committed));
     }
 }

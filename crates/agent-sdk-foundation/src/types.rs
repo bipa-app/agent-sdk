@@ -80,6 +80,24 @@ pub struct AgentConfig {
     /// non-cooperative tools. `None` (default) disables the boundary
     /// timeout entirely.
     pub tool_timeout_ms: Option<u64>,
+    /// Optional run-level token / cost budgets.
+    ///
+    /// When set, the agent loop checks the cumulative token usage (and the
+    /// estimated USD cost, when the provider/model has pricing metadata)
+    /// at every turn-continuation boundary. If a configured limit is
+    /// exceeded the run stops with
+    /// [`AgentRunState::BudgetExceeded`] / [`TurnOutcome::BudgetExceeded`]
+    /// instead of starting another turn. `None` (default) disables
+    /// budgeting entirely.
+    pub usage_limits: Option<UsageLimits>,
+    /// Maximum number of read-only (`ToolTier::Observe`) tool calls the SDK
+    /// runs concurrently within a single parallel batch.
+    ///
+    /// `None` (default) keeps the historical unbounded behavior — every
+    /// adjacent observe-tier call in a turn is dispatched at once.
+    /// `Some(1)` forces strictly sequential execution; `Some(n)` caps the
+    /// in-flight count at `n`. Result ordering is always preserved.
+    pub max_parallel_tools: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -92,8 +110,38 @@ impl Default for AgentConfig {
             retry: RetryConfig::default(),
             streaming: false,
             tool_timeout_ms: None,
+            usage_limits: None,
+            max_parallel_tools: None,
         }
     }
+}
+
+/// Run-level token / cost budgets applied by the agent loop.
+///
+/// Each limit is independent and optional. A `None` field imposes no
+/// constraint. When a limit is exceeded the run terminates with a
+/// [`BudgetLimitKind`] identifying which limit fired.
+#[derive(Clone, Debug, Default)]
+pub struct UsageLimits {
+    /// Maximum cumulative tokens (input + output, summed across every
+    /// turn) before the run stops.
+    pub max_total_tokens: Option<u64>,
+    /// Maximum estimated cost in USD before the run stops.
+    ///
+    /// Only enforced when the run's provider/model has pricing metadata in
+    /// [`agent_sdk_providers`](https://docs.rs/agent-sdk-providers); models
+    /// without pricing never trip this limit.
+    pub max_cost_usd: Option<f64>,
+}
+
+/// Which run-level budget was exceeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimitKind {
+    /// The cumulative token budget ([`UsageLimits::max_total_tokens`]) was hit.
+    TotalTokens,
+    /// The estimated-cost budget ([`UsageLimits::max_cost_usd`]) was hit.
+    CostUsd,
 }
 
 /// Configuration for retry behavior on transient errors.
@@ -310,6 +358,20 @@ pub enum AgentRunState {
     Done {
         total_turns: u32,
         total_usage: TokenUsage,
+        /// Estimated cost of the run in USD, when the provider/model has
+        /// pricing metadata; `None` otherwise.
+        estimated_cost_usd: Option<f64>,
+    },
+
+    /// Agent was stopped because a run-level usage budget was exceeded.
+    BudgetExceeded {
+        total_turns: u32,
+        total_usage: TokenUsage,
+        /// Estimated cost of the run in USD at the moment the budget was
+        /// hit, when pricing metadata is available.
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
     },
 
     /// Agent was refused by the model (safety/policy).
@@ -778,6 +840,21 @@ pub enum TurnOutcome {
         summary: TurnSummary,
     },
 
+    /// A run-level usage budget was exceeded; the turn stops instead of
+    /// continuing to the next LLM round-trip.
+    BudgetExceeded {
+        /// Total turns executed
+        total_turns: u32,
+        /// Cumulative token usage
+        total_usage: TokenUsage,
+        /// Estimated cost of the run in USD, when pricing is available.
+        estimated_cost_usd: Option<f64>,
+        /// Which budget limit was exceeded.
+        limit: BudgetLimitKind,
+        /// Structured server-facing outcome metadata.
+        summary: TurnSummary,
+    },
+
     /// A tool requires user confirmation.
     ///
     /// Present this to the user and call `run_turn` with `AgentInput::Resume`
@@ -860,6 +937,7 @@ impl TurnOutcome {
         match self {
             Self::NeedsMoreTurns { summary, .. }
             | Self::Done { summary, .. }
+            | Self::BudgetExceeded { summary, .. }
             | Self::AwaitingConfirmation { summary, .. }
             | Self::Refusal { summary, .. }
             | Self::Cancelled { summary, .. }

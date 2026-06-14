@@ -2,15 +2,19 @@ use super::test_utils::*;
 use super::*;
 use crate::context::{CompactionConfig, CompactionResult, ContextCompactor};
 use crate::events::{AgentEvent, AgentEventEnvelope};
-use crate::hooks::{AgentHooks, AllowAllHooks, ToolDecision};
-use crate::llm::{ChatOutcome, Content, ContentBlock, Message, Role, StreamDelta, StreamErrorKind};
+use crate::hooks::{AgentHooks, AllowAllHooks, RequestDecision, ToolDecision};
+use crate::llm::{
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, Role, StopReason,
+    StreamDelta, StreamErrorKind, Usage,
+};
+use crate::reminders::{ReminderConfig, ToolReminder};
 use crate::stores::{
     EventStore, InMemoryEventStore, InMemoryStore, MessageStore, StateStore, StoredTurnEvents,
 };
 use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
 use crate::types::{
-    AgentConfig, AgentInput, AgentRunState, ContinuationEnvelope, ToolInvocation, ToolResult,
-    ToolTier, TurnOptions, TurnOutcome,
+    AgentConfig, AgentInput, AgentRunState, BudgetLimitKind, ContinuationEnvelope, ToolInvocation,
+    ToolResult, ToolTier, TurnOptions, TurnOutcome, UsageLimits,
 };
 use crate::types::{AgentState, RetryConfig};
 use anyhow::Context;
@@ -1591,6 +1595,7 @@ async fn test_multi_tool_results_batched_into_single_message() -> anyhow::Result
         compactor: None,
         execution_store: None,
         audit_sink: Arc::new(crate::hooks::NoopAuditSink),
+        reminder_config: None,
         #[cfg(feature = "otel")]
         observability_store: None,
     };
@@ -5341,5 +5346,691 @@ async fn run_persistent_unsupported_input_errors() -> anyhow::Result<()> {
         matches!(state, AgentRunState::Error(_)),
         "injecting Continue should error the run, got {state:?}"
     );
+    Ok(())
+}
+
+// ===========================================================================
+// AGENT-LOOP feature cluster: budgets, parallel cap, guardrails, reminders,
+// run_stream.
+// ===========================================================================
+
+/// Provider that reports a priced provider/model (`openai` / `gpt-4o`) so the
+/// run can estimate a non-`None` cost. Always returns a terminal text turn
+/// with a fixed usage so the cost is deterministic.
+struct PricedProvider;
+
+#[async_trait]
+impl crate::llm::LlmProvider for PricedProvider {
+    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatOutcome> {
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_priced".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "all done".to_string(),
+            }],
+            model: "gpt-4o".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 2_000,
+                output_tokens: 1_000,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "gpt-4o"
+    }
+
+    fn provider(&self) -> &'static str {
+        "openai"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeToolName {
+    Probe,
+}
+
+impl crate::tools::ToolName for ProbeToolName {}
+
+/// Observe-tier tool that records the peak number of concurrently-executing
+/// invocations. Yields twice mid-execution so that, if two invocations are
+/// allowed to overlap, the in-flight counter is observed at 2.
+struct ConcurrencyProbeTool {
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+impl crate::tools::Tool<()> for ConcurrencyProbeTool {
+    type Name = ProbeToolName;
+
+    fn name(&self) -> ProbeToolName {
+        ProbeToolName::Probe
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Probe"
+    }
+
+    fn description(&self) -> &'static str {
+        "Records peak concurrency of observe-tier execution."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": { "message": { "type": "string" } } })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+        // Yield so an overlapping invocation would be observed in-flight.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let message = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        Ok(ToolResult::success(format!("probe:{message}")))
+    }
+}
+
+#[tokio::test]
+async fn test_usage_budget_total_tokens_breach_stops_run() -> anyhow::Result<()> {
+    // The first (tool-use) turn accrues 30 tokens (10 in + 20 out), over the
+    // 25-token limit, so the run stops with BudgetExceeded instead of looping.
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "x"})),
+        MockProvider::text_response("should not be reached"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let config = AgentConfig {
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(25),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded { limit, .. } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+        }
+        other => anyhow::bail!("expected BudgetExceeded, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::BudgetExceeded {
+                limit: BudgetLimitKind::TotalTokens,
+                ..
+            }
+        )),
+        "a BudgetExceeded event must be emitted",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_under_budget_done_reports_estimated_cost() -> anyhow::Result<()> {
+    // gpt-4o pricing for 2000 in / 1000 out = $0.0025 + $0.005 = $0.0075.
+    let agent = builder::<()>()
+        .provider(PricedProvider)
+        .config(AgentConfig {
+            usage_limits: Some(UsageLimits {
+                max_cost_usd: Some(10.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::Done {
+            estimated_cost_usd: Some(cost),
+            ..
+        } => {
+            assert!(
+                (cost - 0.0075).abs() < 1e-9,
+                "unexpected estimated cost: {cost}"
+            );
+        }
+        other => anyhow::bail!("expected Done with Some(cost), got {other:?}"),
+    }
+
+    // The Done event carries the same cost on the wire.
+    let done_cost = events.iter().find_map(|e| match &e.event {
+        AgentEvent::Done {
+            estimated_cost_usd, ..
+        } => Some(*estimated_cost_usd),
+        _ => None,
+    });
+    assert_eq!(done_cost, Some(Some(0.0075)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_parallel_tools_one_runs_sequentially() -> anyhow::Result<()> {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("call_a", "probe", json!({"message": "a"})),
+            ("call_b", "probe", json!({"message": "b"})),
+            ("call_c", "probe", json!({"message": "c"})),
+        ]),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(ConcurrencyProbeTool {
+        in_flight: Arc::clone(&in_flight),
+        max_in_flight: Arc::clone(&max_in_flight),
+    });
+
+    let config = AgentConfig {
+        max_parallel_tools: Some(1),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .event_store(new_event_store())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(matches!(state, AgentRunState::Done { .. }));
+    assert_eq!(
+        max_in_flight.load(Ordering::SeqCst),
+        1,
+        "Some(1) must run observe-tier tools strictly sequentially",
+    );
+
+    // Result order is preserved: ToolCallEnd ids appear in input order.
+    let tool_end_ids: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::ToolCallEnd { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_end_ids,
+        vec![
+            "call_a".to_string(),
+            "call_b".to_string(),
+            "call_c".to_string()
+        ],
+        "sequential execution must preserve input ordering",
+    );
+
+    Ok(())
+}
+
+struct BlockingRequestHooks;
+
+#[async_trait]
+impl AgentHooks for BlockingRequestHooks {
+    async fn pre_llm_request(&self, _request: &ChatRequest) -> RequestDecision {
+        RequestDecision::Block("policy violation".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_pre_llm_request_block_ends_run() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response("never sent")]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(BlockingRequestHooks)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::Error(error) => {
+            assert!(
+                error.message.contains("blocked by guardrail")
+                    && error.message.contains("policy violation"),
+                "unexpected error message: {}",
+                error.message
+            );
+        }
+        other => anyhow::bail!("expected Error from guardrail block, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::Error { message, .. } if message.contains("blocked by guardrail")
+        )),
+        "a guardrail-block error event must be emitted",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tool_reminder_fires_after_trigger() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let reminders = ReminderConfig::new()
+        .with_tool_reminder("echo", ToolReminder::always("REMEMBER_TO_VERIFY_OUTPUT"));
+
+    let message_store = InMemoryStore::new();
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(AllowAllHooks)
+        .message_store(message_store)
+        .state_store(InMemoryStore::new())
+        .with_reminders(reminders)
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let _ = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let reminded = history.iter().any(|m| {
+        let Content::Blocks(blocks) = &m.content else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult { content, .. }
+                    if content.contains("REMEMBER_TO_VERIFY_OUTPUT")
+                        && content.contains("<system-reminder>")
+            )
+        })
+    });
+    assert!(
+        reminded,
+        "the configured tool reminder must be appended to the echo tool result",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_yields_same_events_as_store() -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    let provider = MockProvider::new(vec![MockProvider::text_response("streamed hello")]);
+    let store = new_event_store();
+    let agent = builder::<()>()
+        .provider(provider)
+        .event_store(store.clone())
+        .build();
+
+    let thread_id = ThreadId::new();
+    let stream = agent.run_stream(
+        thread_id.clone(),
+        AgentInput::Text("hi".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let streamed: Vec<AgentEvent> = stream.collect().await;
+
+    assert!(!streamed.is_empty(), "run_stream must yield events");
+
+    let stored: Vec<AgentEvent> = store
+        .get_events(&thread_id)
+        .await?
+        .into_iter()
+        .map(|envelope| envelope.event)
+        .collect();
+
+    // AgentEvent is not PartialEq; compare the JSON wire forms, which is the
+    // durable contract the stream is meant to mirror.
+    let streamed_json: anyhow::Result<Vec<serde_json::Value>> = streamed
+        .iter()
+        .map(|e| serde_json::to_value(e).map_err(anyhow::Error::from))
+        .collect();
+    let stored_json: anyhow::Result<Vec<serde_json::Value>> = stored
+        .iter()
+        .map(|e| serde_json::to_value(e).map_err(anyhow::Error::from))
+        .collect();
+    assert_eq!(streamed_json?, stored_json?);
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Guardrail `RetryWithFeedback`: balanced history + usage preservation.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Output guardrail that rejects the first `reject_count` responses with
+/// `RetryWithFeedback` and accepts the rest. With `reject_count = usize::MAX`
+/// it rejects forever, which is the deterministically-rejecting case used to
+/// prove a budget (or other terminal limit) eventually stops the run.
+struct RejectNHooks {
+    feedback: String,
+    reject_count: usize,
+    seen: Arc<AtomicUsize>,
+}
+
+impl RejectNHooks {
+    fn new(feedback: &str, reject_count: usize) -> Self {
+        Self {
+            feedback: feedback.to_string(),
+            reject_count,
+            seen: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentHooks for RejectNHooks {
+    async fn on_llm_response(&self, _response: &ChatResponse) -> crate::hooks::ResponseDecision {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if n < self.reject_count {
+            crate::hooks::ResponseDecision::RetryWithFeedback(self.feedback.clone())
+        } else {
+            crate::hooks::ResponseDecision::Accept
+        }
+    }
+}
+
+/// Validate that a persisted message history is a balanced Anthropic-style
+/// conversation: every assistant `tool_use` id is answered by a `tool_result`
+/// with the same id in the immediately-following user message.
+fn assert_tool_use_history_balanced(history: &[Message]) -> anyhow::Result<()> {
+    for (idx, message) in history.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Content::Blocks(blocks) = &message.content else {
+            continue;
+        };
+        let tool_use_ids: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if tool_use_ids.is_empty() {
+            continue;
+        }
+        let next = history
+            .get(idx + 1)
+            .context("assistant tool_use must be followed by a user message")?;
+        anyhow::ensure!(
+            next.role == Role::User,
+            "message after assistant tool_use must be a user message, got {:?}",
+            next.role
+        );
+        let Content::Blocks(next_blocks) = &next.content else {
+            anyhow::bail!("user reply to tool_use must carry tool_result blocks, got plain text");
+        };
+        let result_ids: Vec<&str> = next_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for id in tool_use_ids {
+            anyhow::ensure!(
+                result_ids.contains(&id),
+                "tool_use id {id} has no matching tool_result in the next user message",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_with_feedback_balances_tool_use_history() -> anyhow::Result<()> {
+    // The first response carries a `tool_use` block and is rejected once.
+    // The appended feedback user message must contain a matching
+    // `tool_result` so the persisted history stays valid for Anthropic-style
+    // providers (which 400 on an unanswered `tool_use`).
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("call_1", "echo", json!({"message": "hi"})),
+        MockProvider::text_response("recovered"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EchoTool);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(RejectNHooks::new("please avoid calling that tool", 1))
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, _events) = run_recorded(
+        &agent,
+        thread_id.clone(),
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    assert!(
+        matches!(state, AgentRunState::Done { .. }),
+        "run should complete after the steered retry, got {state:?}",
+    );
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    assert_tool_use_history_balanced(&history)?;
+
+    // The synthesized tool_result must carry the guardrail feedback and be
+    // flagged as an error so the model sees the steering.
+    let fed_back = history.iter().any(|m| {
+        let Content::Blocks(blocks) = &m.content else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id, content, is_error }
+                    if tool_use_id == "call_1"
+                        && content.contains("please avoid calling that tool")
+                        && *is_error == Some(true)
+            )
+        })
+    });
+    assert!(
+        fed_back,
+        "the guardrail feedback must be delivered via the call_1 tool_result",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_with_feedback_preserves_usage_and_terminates_on_budget() -> anyhow::Result<()> {
+    // A guardrail that rejects *every* response would loop forever with
+    // `max_turns: None` if the rejected turn's usage were dropped (the
+    // budget could never trip). Each mock response accrues 30 tokens
+    // (10 in + 20 out), so a 25-token budget must stop the run on the first
+    // rejected turn — proving the usage is applied before the retry result.
+    let provider = MockProvider::new(vec![
+        MockProvider::text_response("reject me 1"),
+        MockProvider::text_response("reject me 2"),
+        MockProvider::text_response("reject me 3"),
+    ]);
+
+    let config = AgentConfig {
+        max_turns: None,
+        usage_limits: Some(UsageLimits {
+            max_total_tokens: Some(25),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(RejectNHooks::new("never good enough", usize::MAX))
+        .config(config)
+        .message_store(InMemoryStore::new())
+        .state_store(InMemoryStore::new())
+        .event_store(new_event_store())
+        .build_with_stores();
+
+    let thread_id = ThreadId::new();
+    let (state, events) = run_recorded(
+        &agent,
+        thread_id,
+        AgentInput::Text("go".to_string()),
+        ToolContext::new(()),
+    )
+    .await?;
+
+    match state {
+        AgentRunState::BudgetExceeded {
+            limit, total_usage, ..
+        } => {
+            assert_eq!(limit, BudgetLimitKind::TotalTokens);
+            assert!(
+                total_usage.input_tokens + total_usage.output_tokens > 25,
+                "cumulative usage must advance past the budget, got {total_usage:?}",
+            );
+        }
+        other => anyhow::bail!(
+            "a deterministically-rejecting guardrail must terminate on budget, got {other:?}",
+        ),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::BudgetExceeded {
+                limit: BudgetLimitKind::TotalTokens,
+                ..
+            }
+        )),
+        "a BudgetExceeded event must close the run",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_stream_tee_channel_is_bounded() -> anyhow::Result<()> {
+    use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
+    use tokio::sync::mpsc;
+
+    // The tee channel must be bounded so a slow/absent consumer cannot grow
+    // memory without limit. Append more events than the channel can hold,
+    // with nobody reading `rx`: every append must succeed (drop-on-full,
+    // never error or block), the inner store must retain *all* events
+    // durably, and the channel must buffer at most its capacity.
+    let inner = new_event_store();
+    let (tx, mut rx) = mpsc::channel(RUN_STREAM_CHANNEL_CAPACITY);
+    let tee = TeeEventStore {
+        inner: Arc::clone(&inner) as Arc<dyn EventStore>,
+        tx,
+    };
+
+    let thread_id = ThreadId::new();
+    let seq = SequenceCounter::new();
+    let total = RUN_STREAM_CHANNEL_CAPACITY + 50;
+    for i in 0..total {
+        let envelope =
+            AgentEventEnvelope::wrap(AgentEvent::text("msg", format!("event {i}")), &seq);
+        // Drop-on-full must never surface as an error to the run loop.
+        tee.append(&thread_id, 0, envelope).await?;
+    }
+
+    // Durable store keeps every event — the stream is the only lossy side.
+    assert_eq!(inner.event_count(&thread_id).await?, total);
+
+    // The bounded channel buffered at most its capacity; the rest were
+    // dropped from the live stream rather than queued unboundedly.
+    drop(tee);
+    let mut buffered = 0;
+    while rx.try_recv().is_ok() {
+        buffered += 1;
+    }
+    assert!(
+        buffered <= RUN_STREAM_CHANNEL_CAPACITY,
+        "tee channel buffered {buffered} events, exceeding the {RUN_STREAM_CHANNEL_CAPACITY} cap",
+    );
+    assert!(
+        buffered < total,
+        "with a full bounded channel some events must be dropped from the stream",
+    );
+
     Ok(())
 }
