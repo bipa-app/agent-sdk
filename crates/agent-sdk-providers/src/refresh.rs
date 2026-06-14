@@ -258,6 +258,12 @@ where
         })
     }
 
+    /// Delegate live model discovery to the current inner snapshot so wrapping
+    /// in a refreshing provider never silently loses `list_models`.
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        self.snapshot().await.list_models().await
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -371,6 +377,15 @@ mod tests {
                 .ok()
                 .context("outcomes lock poisoned")?;
             queue.pop_front().context("MockProvider: no queued outcome")
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+            Ok(vec![crate::provider::ModelInfo {
+                id: "mock-discovered-model".to_owned(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+            }])
         }
 
         fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
@@ -502,6 +517,20 @@ mod tests {
                 .is_err()
         );
         assert!(wrapped.validate_thinking_config(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn wrapper_delegates_list_models_to_inner_snapshot() -> Result<()> {
+        let mock = MockProvider::new();
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+
+        // Without delegation this would return the trait-default "unsupported"
+        // error, silently losing discovery through the wrapper.
+        let models = wrapped.list_models().await?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "mock-discovered-model");
+        Ok(())
     }
 
     // Test 1

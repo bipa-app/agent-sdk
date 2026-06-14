@@ -29,6 +29,12 @@ const TCP_KEEPALIVE_SECS: u64 = 30;
 /// Streaming requests intentionally have no overall timeout.
 const CHAT_READ_TIMEOUT_SECS: u64 = 300;
 
+/// Max page size the Gemini `ListModels` endpoint accepts (default is 50).
+const MODELS_PAGE_SIZE: u32 = 1000;
+/// Upper bound on pages followed by `list_models`, guarding against a server
+/// that never clears `nextPageToken`.
+const MODELS_MAX_PAGES: usize = 100;
+
 /// Build the shared HTTP client with connect + keepalive timeouts, falling back
 /// to a default client (with a logged warning) if the builder fails.
 fn build_http_client() -> reqwest::Client {
@@ -484,6 +490,36 @@ impl LlmProvider for GeminiProvider {
         })
     }
 
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        // The endpoint paginates (default `pageSize=50`). Request the max page
+        // size and follow `nextPageToken` until exhausted, collecting *raw*
+        // rows. The `generateContent` filter is applied only after every page is
+        // in hand, so server-side truncation cannot hide a chat-capable model.
+        let mut rows: Vec<GeminiModelRow> = Vec::new();
+        let mut page_token: Option<String> = None;
+        for _ in 0..MODELS_MAX_PAGES {
+            let mut query: Vec<(&str, String)> = vec![("pageSize", MODELS_PAGE_SIZE.to_string())];
+            if let Some(token) = &page_token {
+                query.push(("pageToken", token.clone()));
+            }
+            let builder = self
+                .client
+                .get(format!("{}/models", self.base_url))
+                .header("Content-Type", "application/json")
+                .query(&query);
+            let builder = self.apply_auth(builder);
+            let body =
+                crate::impls::model_listing::fetch_model_list_body(builder, "Gemini").await?;
+            let page = parse_models_page(&body)?;
+            rows.extend(page.models);
+            match page.next_page_token {
+                Some(token) if !token.is_empty() => page_token = Some(token),
+                _ => break,
+            }
+        }
+        Ok(finalize_gemini_models(rows))
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -497,9 +533,183 @@ impl LlmProvider for GeminiProvider {
     }
 }
 
+/// A raw Gemini model row, kept un-filtered so the `generateContent` filter can
+/// be applied only *after* every page has been collected (so server-side page
+/// truncation cannot hide a chat-capable model behind a page boundary).
+#[derive(serde::Deserialize)]
+struct GeminiModelRow {
+    name: String,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(rename = "inputTokenLimit", default)]
+    input_token_limit: Option<u32>,
+    #[serde(rename = "outputTokenLimit", default)]
+    output_token_limit: Option<u32>,
+    #[serde(rename = "supportedGenerationMethods", default)]
+    supported_generation_methods: Vec<String>,
+}
+
+/// One page of the Gemini `ListModels` response: raw rows plus the cursor used
+/// to follow pagination.
+struct GeminiModelsPage {
+    models: Vec<GeminiModelRow>,
+    next_page_token: Option<String>,
+}
+
+/// Parse one page of the Gemini `GET /v1beta/models` response body.
+///
+/// The endpoint returns `{ "models": [{ "name": "models/<id>", "displayName",
+/// "inputTokenLimit", "outputTokenLimit", "supportedGenerationMethods" }],
+/// "nextPageToken": "..." }`. It paginates with a default `pageSize` of 50;
+/// `nextPageToken` drives the next request. Raw rows are returned un-filtered so
+/// the caller can apply the `generateContent` filter once all pages are in hand.
+fn parse_models_page(body: &str) -> Result<GeminiModelsPage> {
+    #[derive(serde::Deserialize)]
+    struct ListResponse {
+        #[serde(default)]
+        models: Vec<GeminiModelRow>,
+        #[serde(rename = "nextPageToken", default)]
+        next_page_token: Option<String>,
+    }
+    let parsed: ListResponse = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("failed to parse Gemini models list: {e}"))?;
+    Ok(GeminiModelsPage {
+        models: parsed.models,
+        next_page_token: parsed.next_page_token,
+    })
+}
+
+/// Filter accumulated rows to chat-capable models and project them into
+/// [`ModelInfo`].
+///
+/// Entries that do not support `generateContent` (e.g. embedding-only models)
+/// are dropped, and the `models/` prefix is stripped from `name` to recover the
+/// bare model id the chat endpoint expects. Applied *after* all pages are
+/// collected so a chat-capable model never gets hidden by page truncation.
+fn finalize_gemini_models(rows: Vec<GeminiModelRow>) -> Vec<crate::provider::ModelInfo> {
+    rows.into_iter()
+        .filter(|row| {
+            row.supported_generation_methods.is_empty()
+                || row
+                    .supported_generation_methods
+                    .iter()
+                    .any(|m| m == "generateContent")
+        })
+        .map(|row| crate::provider::ModelInfo {
+            id: match row.name.strip_prefix("models/") {
+                Some(stripped) => stripped.to_owned(),
+                None => row.name.clone(),
+            },
+            display_name: row.display_name,
+            context_window: row.input_token_limit,
+            max_output_tokens: row.output_token_limit,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GEMINI_MODELS_FIXTURE: &str = r#"{
+      "models": [
+        {
+          "name": "models/gemini-2.5-pro",
+          "displayName": "Gemini 2.5 Pro",
+          "inputTokenLimit": 1048576,
+          "outputTokenLimit": 65536,
+          "supportedGenerationMethods": ["generateContent", "countTokens"]
+        },
+        {
+          "name": "models/text-embedding-004",
+          "displayName": "Text Embedding 004",
+          "inputTokenLimit": 2048,
+          "outputTokenLimit": 1,
+          "supportedGenerationMethods": ["embedContent"]
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parse_models_page_strips_prefix_and_maps_limits() -> anyhow::Result<()> {
+        let page = parse_models_page(GEMINI_MODELS_FIXTURE)?;
+        let models = finalize_gemini_models(page.models);
+        // The embedding-only model is filtered out (no `generateContent`).
+        assert_eq!(models.len(), 1);
+        let pro = &models[0];
+        assert_eq!(pro.id, "gemini-2.5-pro");
+        assert_eq!(pro.display_name.as_deref(), Some("Gemini 2.5 Pro"));
+        assert_eq!(pro.context_window, Some(1_048_576));
+        assert_eq!(pro.max_output_tokens, Some(65_536));
+        assert_eq!(page.next_page_token, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_models_follows_pagination_and_filters_after_all_pages() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Page 1: a chat model plus an embedding-only model, then a page token.
+        // The embedding model must NOT be filtered out mid-pagination — the
+        // filter runs only after every page is collected.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param_is_missing("pageToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+                  "models": [
+                    {
+                      "name": "models/gemini-2.5-pro",
+                      "displayName": "Gemini 2.5 Pro",
+                      "inputTokenLimit": 1048576,
+                      "outputTokenLimit": 65536,
+                      "supportedGenerationMethods": ["generateContent"]
+                    },
+                    {
+                      "name": "models/text-embedding-004",
+                      "displayName": "Embedding",
+                      "supportedGenerationMethods": ["embedContent"]
+                    }
+                  ],
+                  "nextPageToken": "page-2"
+                }"#,
+            ))
+            .mount(&server)
+            .await;
+
+        // Page 2: requested with `pageToken=page-2`; final page (no token).
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("pageToken", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+                  "models": [
+                    {
+                      "name": "models/gemini-3-flash",
+                      "displayName": "Gemini 3 Flash",
+                      "inputTokenLimit": 1048576,
+                      "outputTokenLimit": 65536,
+                      "supportedGenerationMethods": ["generateContent"]
+                    }
+                  ]
+                }"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new("test-key".to_string(), "gemini-test".to_string())
+            .with_base_url(server.uri());
+        let models = provider.list_models().await?;
+
+        // Both chat models from both pages are returned; the embedding-only
+        // model is dropped by the post-pagination filter.
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["gemini-2.5-pro", "gemini-3-flash"]);
+        Ok(())
+    }
 
     #[test]
     fn test_new_creates_provider_with_custom_model() {

@@ -9,6 +9,7 @@ use agent_sdk_foundation::llm::{
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
 use crate::model_capabilities::{
     ModelCapabilities, default_max_output_tokens, get_model_capabilities,
@@ -32,10 +33,47 @@ pub enum StructuredOutputSupport {
     ToolForcing,
 }
 
+/// A single model entry returned by a provider's live model-listing endpoint.
+///
+/// This is the *dynamic* counterpart to the static
+/// [`ModelCapabilities`] table: it
+/// is populated from the provider's own `/models` API at runtime, so newly
+/// shipped models appear without an SDK code change. Fields beyond `id` are
+/// optional because not every provider's listing endpoint reports them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The model identifier as the provider's chat endpoint expects it.
+    pub id: String,
+    /// Human-friendly display name, when the listing endpoint provides one.
+    pub display_name: Option<String>,
+    /// Maximum total context window in tokens, when reported.
+    pub context_window: Option<u32>,
+    /// Maximum output tokens per response, when reported.
+    pub max_output_tokens: Option<u32>,
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Non-streaming chat completion.
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome>;
+
+    /// List the models the provider currently exposes, queried live from the
+    /// provider's own model-listing endpoint.
+    ///
+    /// The default implementation returns an error: model discovery is an
+    /// additive capability, so a provider that has not implemented it stays
+    /// source-compatible while reporting that the operation is unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider does not support live model listing,
+    /// or when the underlying HTTP request or response parsing fails.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        Err(anyhow::anyhow!(
+            "list_models is not supported for provider {}",
+            self.provider()
+        ))
+    }
 
     /// Streaming chat completion.
     ///

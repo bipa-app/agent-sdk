@@ -621,6 +621,16 @@ impl LlmProvider for OpenAIProvider {
         })
     }
 
+    async fn list_models(&self) -> Result<Vec<crate::provider::ModelInfo>> {
+        let builder = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .header("Content-Type", "application/json");
+        let builder = self.apply_headers(builder);
+        let body = crate::impls::model_listing::fetch_model_list_body(builder, "OpenAI").await?;
+        parse_models_list(&body)
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -632,6 +642,35 @@ impl LlmProvider for OpenAIProvider {
     fn configured_thinking(&self) -> Option<&ThinkingConfig> {
         self.thinking.as_ref()
     }
+}
+
+/// Parse the `OpenAI` `GET /models` response body into [`ModelInfo`] rows.
+///
+/// The Chat Completions list endpoint returns `{ "data": [{ "id", ... }] }`
+/// and reports neither a display name nor token limits, so those fields stay
+/// `None`. This shape is shared by the OpenAI-compatible vendor APIs.
+fn parse_models_list(body: &str) -> Result<Vec<crate::provider::ModelInfo>> {
+    #[derive(Deserialize)]
+    struct ListResponse {
+        #[serde(default)]
+        data: Vec<ModelRow>,
+    }
+    #[derive(Deserialize)]
+    struct ModelRow {
+        id: String,
+    }
+    let parsed: ListResponse = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("failed to parse OpenAI models list: {e}"))?;
+    Ok(parsed
+        .data
+        .into_iter()
+        .map(|row| crate::provider::ModelInfo {
+            id: row.id,
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+        })
+        .collect())
 }
 
 /// Apply a tool call update to the accumulator.
@@ -1544,6 +1583,26 @@ where
 mod tests {
     use super::*;
     use anyhow::Context as _;
+
+    const OPENAI_MODELS_FIXTURE: &str = r#"{
+      "object": "list",
+      "data": [
+        {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
+        {"id": "gpt-4o", "object": "model", "owned_by": "openai"}
+      ]
+    }"#;
+
+    #[test]
+    fn parse_models_list_reads_ids() -> anyhow::Result<()> {
+        let models = parse_models_list(OPENAI_MODELS_FIXTURE)?;
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.4");
+        assert_eq!(models[1].id, "gpt-4o");
+        // The Chat Completions list endpoint reports no name or limits.
+        assert_eq!(models[0].display_name, None);
+        assert_eq!(models[0].context_window, None);
+        Ok(())
+    }
 
     // ===================
     // Constructor Tests

@@ -21,6 +21,13 @@ pub mod openai_responses;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
+// Shared live model-listing HTTP helper. Only the Anthropic, OpenAI, and
+// Gemini provider impls call it (vertex/cloudflare pull those in), so gate it
+// behind exactly those features to avoid a dead-code error in single-provider
+// or no-default-features builds.
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "gemini"))]
+pub(crate) mod model_listing;
+
 #[cfg(feature = "anthropic")]
 pub use anthropic::{AnthropicProvider, is_oauth_token};
 #[cfg(feature = "cloudflare")]
