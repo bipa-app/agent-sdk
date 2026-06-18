@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.11.0...agent-sdk-foundation-v0.11.1) - 2026-06-18
+
+### Fixed
+
+- *(loop)* durably backfill orphaned tool_use instead of 400ing ([#323](https://github.com/bipa-app/agent-sdk/pull/323))
+
 ## [0.11.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.10.0...agent-sdk-foundation-v0.11.0) - 2026-06-14
 
 ### Added
