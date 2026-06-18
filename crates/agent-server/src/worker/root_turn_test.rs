@@ -3835,3 +3835,175 @@ async fn selector_error_fails_the_turn() -> Result<()> {
 
     Ok(())
 }
+
+/// Provider that records the messages of the request it receives, so a
+/// test can assert the worker never ships an unbalanced `tool_use`
+/// history to the model.
+struct CapturingProvider {
+    captured: std::sync::Mutex<Option<Vec<agent_sdk_foundation::llm::Message>>>,
+}
+
+impl CapturingProvider {
+    fn new() -> Self {
+        Self {
+            captured: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn captured(&self) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+        self.captured
+            .lock()
+            .map_err(|_| anyhow::anyhow!("captured lock poisoned"))?
+            .clone()
+            .context("provider was never called")
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CapturingProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        *self
+            .captured
+            .lock()
+            .map_err(|_| anyhow::anyhow!("captured lock poisoned"))? = Some(request.messages);
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_capture_01".into(),
+            content: vec![ContentBlock::Text {
+                text: "Understood — asking one at a time.".into(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Collect the `tool_use_id`s closed by a synthetic "User cancelled"
+/// error result across a message list.
+fn cancelled_result_ids(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<&str> {
+    use agent_sdk_foundation::llm::{Content, USER_CANCELLED_TOOL_RESULT};
+    let mut ids = Vec::new();
+    for message in messages {
+        if let Content::Blocks(blocks) = &message.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: Some(true),
+                } = block
+                    && content == USER_CANCELLED_TOOL_RESULT
+                {
+                    ids.push(tool_use_id.as_str());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Regression for the exact screenshot 400: a prior turn asked several
+/// questions (an assistant `tool_use` turn was persisted to the
+/// suspension draft) and was then abandoned/cancelled, leaving the draft
+/// unanswered. When the user types a fresh follow-up, the next root turn
+/// must NOT ship that orphaned `tool_use` to the provider — the worker
+/// backfills "User cancelled" results durably before the request is built,
+/// so the conversation continues instead of failing the provider's
+/// `tool_use`/`tool_result` pairing check.
+#[tokio::test]
+async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
+    use agent_sdk_foundation::llm::{self, Message};
+
+    let stores = TestStores::new();
+    let thread = thread_a();
+
+    // A prior turn's suspension left an assistant turn with four unanswered
+    // questions in the durable draft (committed_turns is still 0 — it never
+    // completed).
+    let ask = |id: &str| ContentBlock::ToolUse {
+        id: id.to_string(),
+        name: "ask_user".to_string(),
+        input: serde_json::json!({ "question": "?" }),
+        thought_signature: None,
+    };
+    stores
+        .messages
+        .set_draft(
+            &thread,
+            vec![
+                Message::user("plan this"),
+                Message::assistant_with_content(vec![ask("q1"), ask("q2"), ask("q3"), ask("q4")]),
+            ],
+            t0(),
+        )
+        .await?;
+
+    // A fresh root turn carrying the user's follow-up.
+    let task = create_and_acquire_task(&stores.tasks, &thread).await?;
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let provider = CapturingProvider::new();
+    let outcome = execute_root_turn(
+        inputs,
+        "I only received one of the questions",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await
+    .context("execute_root_turn")?;
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+
+    // The request actually handed to the provider is balanced — the four
+    // unanswered questions are closed with "User cancelled" results.
+    let request_messages = provider.captured()?;
+    assert!(
+        !llm::has_unbalanced_tool_use(&request_messages),
+        "request handed to the provider must be balanced",
+    );
+    assert_eq!(
+        cancelled_result_ids(&request_messages),
+        vec!["q1", "q2", "q3", "q4"],
+        "every unanswered question is closed with a cancelled result",
+    );
+
+    // The repair is durable, not a transient patch: the projection draft is
+    // cleared and the committed history is balanced, so the next load is
+    // clean without re-synthesizing.
+    let durable = stores.messages.get_history(&thread).await?;
+    assert!(
+        !llm::has_unbalanced_tool_use(&durable),
+        "durable projection history must be balanced after the turn",
+    );
+    let projection = stores
+        .messages
+        .get(&thread)
+        .await?
+        .context("projection exists")?;
+    assert!(
+        !projection.has_draft(),
+        "the orphaned draft must be cleared, not left dangling",
+    );
+
+    Ok(())
+}

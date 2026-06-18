@@ -702,6 +702,170 @@ fn parse_imf_fixdate(value: &str) -> Option<time::OffsetDateTime> {
         .map(time::PrimitiveDateTime::assume_utc)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Tool-use / tool-result balancing
+// ─────────────────────────────────────────────────────────────────────
+
+/// Default `tool_result` text used to close a `tool_use` block the user
+/// cancelled (or otherwise abandoned) before it produced a real result.
+///
+/// Surfaced to the model so it understands the call did not run, rather
+/// than silently dropping the loop. Used by [`balance_tool_results`].
+pub const USER_CANCELLED_TOOL_RESULT: &str = "User cancelled";
+
+/// Collect the `tool_use` block ids carried by a single message, in the
+/// order they appear. Empty for any message that carries no `tool_use`
+/// blocks (the common case for user messages and text-only assistant
+/// turns).
+fn message_tool_use_ids(message: &Message) -> Vec<&str> {
+    match &message.content {
+        Content::Text(_) => Vec::new(),
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Collect the set of `tool_use_id`s answered by `tool_result` blocks in a
+/// single message. Empty unless the message actually carries
+/// `tool_result` blocks.
+fn message_tool_result_ids(message: &Message) -> std::collections::HashSet<&str> {
+    match &message.content {
+        Content::Text(_) => std::collections::HashSet::new(),
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Collect every `tool_use_id` answered by a `tool_result` block *anywhere*
+/// in `messages`.
+///
+/// Answeredness is judged across the whole conversation, not just the
+/// message immediately after a `tool_use`: an id that already has a real
+/// `tool_result` somewhere must never be synthesized again, or balancing
+/// would emit a duplicate `tool_result` for the same id (itself an API
+/// rejection) and mislabel a successful call as cancelled.
+fn all_answered_tool_use_ids(messages: &[Message]) -> std::collections::HashSet<&str> {
+    messages.iter().flat_map(message_tool_result_ids).collect()
+}
+
+/// True when `messages` contains a `tool_use` block whose id is not
+/// answered by any `tool_result` block anywhere in the conversation.
+///
+/// This is exactly the condition the Anthropic Messages API rejects with
+/// *"`tool_use` ids were found without `tool_result` blocks immediately
+/// after"*. It arises whenever a turn is interrupted after the assistant
+/// `tool_use` was persisted but before every result was recorded — most
+/// commonly when the user answers one of several questions and cancels
+/// the rest, or cancels a tool mid-flight.
+#[must_use]
+pub fn has_unbalanced_tool_use(messages: &[Message]) -> bool {
+    let answered = all_answered_tool_use_ids(messages);
+    messages
+        .iter()
+        .flat_map(message_tool_use_ids)
+        .any(|id| !answered.contains(id))
+}
+
+/// Close every unanswered `tool_use` loop in `messages`.
+///
+/// Re-balances the conversation so each `tool_use` block is answered by a
+/// `tool_result` block in the immediately following message, synthesizing
+/// an error `tool_result` carrying `cancel_text` for every id left
+/// unanswered.
+///
+/// The Anthropic Messages API requires that an assistant message's
+/// `tool_use` ids each have a matching `tool_result` in the *next*
+/// message. A turn that is cancelled or abandoned after the assistant
+/// `tool_use` was persisted — but before all tool results landed — leaves
+/// the conversation unbalanced, and the next request 400s. This pass
+/// closes those loops so the conversation can continue.
+///
+/// Behaviour per assistant `tool_use` message:
+/// - An id that already has a real `tool_result` anywhere in the
+///   conversation is left alone (never duplicated or relabelled cancelled).
+/// - If the following message already answers some ids (the partial case:
+///   the user answered one question and cancelled the others), the missing
+///   results are appended to that existing message.
+/// - Otherwise a fresh user message carrying the synthetic results is
+///   inserted directly after the assistant message.
+///
+/// Idempotent and order-preserving: a no-op clone when history is already
+/// balanced (see [`has_unbalanced_tool_use`]).
+#[must_use]
+pub fn balance_tool_results(messages: &[Message], cancel_text: &str) -> Vec<Message> {
+    // Judge answeredness across the whole conversation so a real result
+    // that is not at idx+1 still suppresses synthesis (no duplicate id).
+    let answered = all_answered_tool_use_ids(messages);
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 1);
+    let mut idx = 0;
+    while idx < messages.len() {
+        let message = &messages[idx];
+        let tool_use_ids = message_tool_use_ids(message);
+        if tool_use_ids.is_empty() {
+            out.push(message.clone());
+            idx += 1;
+            continue;
+        }
+
+        let synthetic: Vec<ContentBlock> = tool_use_ids
+            .iter()
+            .filter(|id| !answered.contains(*id))
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: (*id).to_owned(),
+                content: cancel_text.to_owned(),
+                is_error: Some(true),
+            })
+            .collect();
+
+        out.push(message.clone());
+
+        let next = messages.get(idx + 1);
+
+        if synthetic.is_empty() {
+            // Already balanced — leave the following message for the next
+            // loop iteration to handle normally.
+            idx += 1;
+            continue;
+        }
+
+        // A following message that already carries tool_result blocks is
+        // *the* results message for this turn (the partial-answer case):
+        // merge the synthetic results into it. Anything else (a fresh user
+        // prompt, another assistant turn, or end-of-history) gets a brand
+        // new results message inserted right after the assistant turn.
+        match next {
+            Some(next_message) if !message_tool_result_ids(next_message).is_empty() => {
+                let mut merged = next_message.clone();
+                if let Content::Blocks(blocks) = &mut merged.content {
+                    blocks.extend(synthetic);
+                } else {
+                    // A text-only message can't carry tool_result blocks, so
+                    // this arm is unreachable given the guard above, but stay
+                    // defensive rather than silently dropping the results.
+                    merged.content = Content::Blocks(synthetic);
+                }
+                out.push(merged);
+                idx += 2;
+            }
+            _ => {
+                out.push(Message::user_with_content(synthetic));
+                idx += 1;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,5 +1187,170 @@ mod tests {
 
         let req = ChatRequest::new("s", vec![]).with_cache(CacheConfig::disabled());
         assert!(req.cache.is_some_and(|c| !c.enabled));
+    }
+
+    fn assistant_tool_uses(ids: &[&str]) -> Message {
+        let blocks = ids
+            .iter()
+            .map(|id| ContentBlock::ToolUse {
+                id: (*id).to_string(),
+                name: "ask_user".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            })
+            .collect();
+        Message::assistant_with_content(blocks)
+    }
+
+    fn tool_results(ids: &[&str]) -> Message {
+        let blocks = ids
+            .iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: (*id).to_string(),
+                content: "answered".to_string(),
+                is_error: None,
+            })
+            .collect();
+        Message::user_with_content(blocks)
+    }
+
+    fn assert_balanced(messages: &[Message]) {
+        assert!(
+            !has_unbalanced_tool_use(messages),
+            "expected balanced history, found an orphaned tool_use",
+        );
+    }
+
+    #[test]
+    fn balanced_history_is_left_untouched() {
+        let messages = vec![
+            Message::user("hi"),
+            assistant_tool_uses(&["a"]),
+            tool_results(&["a"]),
+        ];
+        assert!(!has_unbalanced_tool_use(&messages));
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(out.len(), 3);
+        assert_balanced(&out);
+    }
+
+    #[test]
+    fn partial_cancellation_merges_into_existing_results_message() {
+        // Four questions, one answered, three cancelled.
+        let messages = vec![
+            assistant_tool_uses(&["q1", "q2", "q3", "q4"]),
+            tool_results(&["q1"]),
+        ];
+        assert!(has_unbalanced_tool_use(&messages));
+
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(
+            out.len(),
+            2,
+            "synthetic results merge into the existing message"
+        );
+        assert_balanced(&out);
+
+        let Content::Blocks(blocks) = &out[1].content else {
+            panic!("results message must carry blocks");
+        };
+        let cancelled: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: Some(true),
+                } if content == USER_CANCELLED_TOOL_RESULT => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled, vec!["q2", "q3", "q4"]);
+    }
+
+    #[test]
+    fn all_cancelled_with_no_following_message_appends_results() {
+        // Cancel-all: the assistant turn is the last message, no results at all.
+        let messages = vec![assistant_tool_uses(&["q1", "q2"])];
+        assert!(has_unbalanced_tool_use(&messages));
+
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(out.len(), 2, "a fresh results message is inserted");
+        assert_eq!(out[1].role, Role::User);
+        assert_balanced(&out);
+    }
+
+    #[test]
+    fn orphan_followed_by_user_prompt_inserts_results_between() {
+        // A fresh user turn arrived after an abandoned tool_use turn: the
+        // results must be inserted *between* them, not after the prompt.
+        let messages = vec![
+            assistant_tool_uses(&["q1"]),
+            Message::user("a brand new question from the user"),
+        ];
+        assert!(has_unbalanced_tool_use(&messages));
+
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(out.len(), 3);
+        assert_balanced(&out);
+        // Order: assistant tool_use, synthetic results, then the user prompt.
+        assert!(!message_tool_use_ids(&out[0]).is_empty());
+        assert!(!message_tool_result_ids(&out[1]).is_empty());
+        assert!(out[2].content.first_text() == Some("a brand new question from the user"));
+    }
+
+    #[test]
+    fn balancing_is_idempotent() {
+        let messages = vec![
+            assistant_tool_uses(&["q1", "q2", "q3"]),
+            tool_results(&["q2"]),
+        ];
+        let once = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        let twice = balance_tool_results(&once, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(once.len(), twice.len());
+        assert_balanced(&twice);
+    }
+
+    #[test]
+    fn no_tool_use_history_is_a_noop() {
+        let messages = vec![Message::user("hi"), Message::assistant("hello")];
+        assert!(!has_unbalanced_tool_use(&messages));
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn real_result_not_at_idx1_is_not_duplicated_or_relabelled() {
+        // A `tool_use` whose genuine result is separated from it by another
+        // message must NOT get a synthetic "User cancelled" result — that
+        // would emit two tool_result blocks for the same id (a 400) and lie
+        // that a successful call was cancelled. Answeredness is judged over
+        // the whole conversation, so the real result suppresses synthesis.
+        let messages = vec![
+            assistant_tool_uses(&["a"]),
+            Message::user("an interjection between the call and its result"),
+            tool_results(&["a"]),
+        ];
+        // No id is genuinely unanswered, so there is nothing to balance.
+        assert!(!has_unbalanced_tool_use(&messages));
+
+        let out = balance_tool_results(&messages, USER_CANCELLED_TOOL_RESULT);
+        // Exactly one tool_result for "a", and none of them is a synthetic
+        // cancellation.
+        let a_results: Vec<&ContentBlock> = out
+            .iter()
+            .flat_map(|m| match &m.content {
+                Content::Blocks(b) => b.as_slice(),
+                Content::Text(_) => &[][..],
+            })
+            .filter(
+                |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "a"),
+            )
+            .collect();
+        assert_eq!(a_results.len(), 1, "must not duplicate the real result");
+        assert!(
+            !matches!(a_results[0], ContentBlock::ToolResult { content, .. } if content == USER_CANCELLED_TOOL_RESULT),
+            "the real successful result must not be relabelled cancelled",
+        );
     }
 }

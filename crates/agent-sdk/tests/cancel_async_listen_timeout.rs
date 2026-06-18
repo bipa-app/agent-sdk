@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, oneshot};
 
-const CRASH_RECOVERY_MARKER: &str = "Tool execution was interrupted by a crash. Please retry.";
+const ORPHAN_RECOVERY_MARKER: &str = agent_sdk::llm::USER_CANCELLED_TOOL_RESULT;
 
 // ── Scripted provider ────────────────────────────────────────────────
 
@@ -204,7 +204,7 @@ fn tool_results_for(history: &[Message], tool_use_id: &str) -> Vec<String> {
         .collect()
 }
 
-fn assert_no_crash_recovery_marker(history: &[Message]) {
+fn assert_no_orphan_recovery_marker(history: &[Message]) {
     for message in history {
         let Content::Blocks(blocks) = &message.content else {
             continue;
@@ -212,8 +212,8 @@ fn assert_no_crash_recovery_marker(history: &[Message]) {
         for block in blocks {
             if let ContentBlock::ToolResult { content, .. } = block {
                 assert!(
-                    !content.contains(CRASH_RECOVERY_MARKER),
-                    "cancellation/timeout must not borrow the crash-recovery synth string; \
+                    !content.contains(ORPHAN_RECOVERY_MARKER),
+                    "cancellation/timeout must not borrow the orphan-recovery synth string; \
                      got tool_result content {content:?}",
                 );
             }
@@ -418,7 +418,7 @@ async fn sdk_cancels_async_tool_poll_loop_and_commits_one_result() -> Result<()>
         vec!["Cancelled by user".to_string()],
         "exactly one 'Cancelled by user' tool_result expected",
     );
-    assert_no_crash_recovery_marker(&history);
+    assert_no_orphan_recovery_marker(&history);
     Ok(())
 }
 
@@ -478,7 +478,7 @@ async fn sdk_cancels_listen_tool_execute_and_commits_one_result() -> Result<()> 
         vec!["Cancelled by user".to_string()],
         "exactly one 'Cancelled by user' tool_result expected",
     );
-    assert_no_crash_recovery_marker(&history);
+    assert_no_orphan_recovery_marker(&history);
     Ok(())
 }
 
@@ -549,6 +549,6 @@ async fn per_tool_timeout_stops_non_cooperative_tool_with_balanced_history() -> 
         vec!["Tool timed out".to_string()],
         "exactly one 'Tool timed out' tool_result expected",
     );
-    assert_no_crash_recovery_marker(&history);
+    assert_no_orphan_recovery_marker(&history);
     Ok(())
 }

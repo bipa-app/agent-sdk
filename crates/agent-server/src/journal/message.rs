@@ -142,17 +142,29 @@ impl MessageProjection {
         Ok(self)
     }
 
-    /// Replace the entire message history atomically.
+    /// Replace the entire message history atomically, dropping any
+    /// in-flight draft.
     ///
-    /// Used for context compaction: the caller replaces all existing
-    /// messages with a condensed summary. This is a full swap — the
-    /// old history is discarded and the new one takes its place.
+    /// Used for context compaction and orphaned-tool_use backfill: the
+    /// caller replaces all committed messages with a condensed summary or
+    /// a balanced history. This is a full swap — the old history is
+    /// discarded and the new one takes its place.
+    ///
+    /// The in-flight draft is cleared in the same operation. The draft is
+    /// a snapshot taken *relative to the old committed history*; once that
+    /// history is replaced, the draft is stale, and — because callers fold
+    /// the draft into `messages` before replacing — leaving it would make
+    /// [`super::thread_recover::recover_thread`] fold the same messages in
+    /// twice. Clearing it here (rather than via a separate `clear_draft`
+    /// call) closes the crash window where a replace succeeds but the
+    /// follow-up clear does not, leaving a draft that double-folds.
     ///
     /// Unlike [`Self::append_committed`], an empty replacement is
     /// allowed (clears the history).
     #[must_use]
     pub fn replace_history(mut self, messages: Vec<llm::Message>, now: OffsetDateTime) -> Self {
         self.messages = messages;
+        self.draft_messages = Vec::new();
         self.version += 1;
         self.updated_at = now;
         self
@@ -463,22 +475,27 @@ mod tests {
     }
 
     #[test]
-    fn draft_survives_commit_history_extensions_until_cleared() {
-        // Sanity: append_committed and replace_history operate on the
-        // committed slot only. The draft must persist verbatim until
-        // an explicit clear_draft / set_draft.
+    fn append_committed_preserves_draft_but_replace_history_clears_it() {
+        // `append_committed` operates on the committed slot only, so the
+        // draft persists verbatim across it. `replace_history` is a full
+        // swap of the committed history that callers reach only after
+        // folding the draft into the new history — so it clears the draft
+        // in the same operation, closing the crash window where a separate
+        // clear could fail and leave a draft that double-folds on recover.
         let p = MessageProjection::new(thread_id(), t0());
         let p = p.set_draft(vec![llm::Message::user("draft")], t_plus(1));
 
         let p = p
             .append_committed(vec![llm::Message::user("committed-1")], t_plus(2))
             .unwrap();
-        assert!(p.has_draft());
+        assert!(p.has_draft(), "append_committed must preserve the draft");
         assert_eq!(p.draft_messages.len(), 1);
 
         let p = p.replace_history(vec![llm::Message::user("[summary]")], t_plus(3));
-        assert!(p.has_draft());
-        assert_eq!(p.draft_messages.len(), 1);
+        assert!(
+            !p.has_draft(),
+            "replace_history must clear the draft atomically",
+        );
     }
 
     #[test]

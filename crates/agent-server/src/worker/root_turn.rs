@@ -599,6 +599,23 @@ async fn execute_root_turn_inner(
     deps.event_notifier
         .notify(std::slice::from_ref(&start_committed));
 
+    // 2.4 Backfill any tool_use loop the prior turn left open.
+    //
+    //     A fresh root turn executes only after the previous root turn
+    //     on this thread is terminal (`promote_next_root` serialises one
+    //     root turn per thread), so nothing is legitimately awaiting a
+    //     tool result here. `recover_thread` preserves the raw suspension
+    //     draft verbatim, which may end in an assistant `tool_use` whose
+    //     `tool_result`s never landed — the user answered one question
+    //     and cancelled the rest, or the prior turn was cancelled. Those
+    //     unanswered `tool_use` blocks are abandoned and are closed
+    //     durably now (not patched into the outgoing request), so an
+    //     orphaned `tool_use` can never reach a provider and the thread
+    //     is balanced the moment it is next loaded.
+    backfill_orphaned_tool_results(deps, &inputs.staged_stores.messages, thread_id, now)
+        .await
+        .context("pre-call orphaned tool_use backfill")?;
+
     // 2.5 Pre-call auto-compaction.
     //
     //     Compaction operates on the staged history (which excludes
@@ -1005,6 +1022,65 @@ async fn build_chat_request(
         response_format: None,
         cache: None,
     })
+}
+
+/// Durably close any `tool_use` loop left open in the recovered history
+/// before a fresh turn builds its request.
+///
+/// [`recover_thread`] deliberately preserves the raw suspension draft (its
+/// module doc delegates "dangling tool-use repair" to the caller). That
+/// draft may end in an assistant `tool_use` whose `tool_result`s never
+/// landed — the user answered one question and cancelled the rest, or the
+/// prior turn was cancelled / abandoned. Because a fresh root turn only
+/// runs once the prior turn on the thread is terminal, no result is
+/// legitimately pending, so every unanswered `tool_use` is closed with a
+/// [`USER_CANCELLED_TOOL_RESULT`](agent_sdk_foundation::llm::USER_CANCELLED_TOOL_RESULT)
+/// error result.
+///
+/// The repair is written through to the durable projection (mirroring the
+/// pre-call compaction rewrite: `replace_history` + `clear_draft`) rather
+/// than patched into the outgoing request, so the thread is balanced the
+/// moment it is next loaded and an orphaned `tool_use` can never reach a
+/// provider. No-op when the recovered history is already balanced.
+async fn backfill_orphaned_tool_results(
+    deps: &RootTurnDeps<'_>,
+    staged_messages: &crate::journal::staged::StagedMessageStore,
+    thread_id: &agent_sdk_foundation::ThreadId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let history = staged_messages
+        .get_history(thread_id)
+        .await
+        .context("read staged history for orphan backfill")?;
+
+    if !llm::has_unbalanced_tool_use(&history) {
+        return Ok(());
+    }
+
+    let balanced = llm::balance_tool_results(&history, llm::USER_CANCELLED_TOOL_RESULT);
+    log::warn!(
+        "thread {thread_id}: closing {} unanswered tool_use block(s) with cancelled results",
+        balanced.len().saturating_sub(history.len()),
+    );
+
+    // Durable projection: fold the balanced history into the committed
+    // head. `replace_history` atomically drops the in-flight draft in the
+    // same transaction (the draft is exactly what we just folded in), so
+    // there is no window where a crash leaves a stale draft to double-fold.
+    // `recover_thread` treats the committed projection as the source of
+    // truth, so the next load sees a balanced thread.
+    deps.message_store
+        .replace_history(thread_id, balanced.clone(), now)
+        .await
+        .context("persist balanced projection history")?;
+
+    // In-memory staged buffer the request is built from.
+    staged_messages
+        .replace_history(thread_id, balanced)
+        .await
+        .context("replace staged buffer with balanced history")?;
+
+    Ok(())
 }
 
 /// Maximum retries for a transient LLM stream error.  After this many
