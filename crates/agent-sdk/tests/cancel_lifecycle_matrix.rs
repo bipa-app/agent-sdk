@@ -19,7 +19,7 @@
 //!   the token fire)
 //! - caller-cancel must not outrun background teardown
 //! - persistence not gated on a clean finish
-//! - hard-abort → `synthesize_error_tool_results` produces a
+//! - hard-abort → `recover_orphaned_tool_use` produces a
 //!   provider-acceptable next turn
 //!
 //! **Message lifecycle / ordering rows covered here**
@@ -55,10 +55,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, oneshot};
 
-/// Marker the SDK writes only on the crash-recovery synth path
-/// (`synthesize_error_tool_results`). Cooperative cancellation and
-/// timeout must never borrow it.
-const CRASH_RECOVERY_MARKER: &str = "Tool execution was interrupted by a crash. Please retry.";
+/// Marker the SDK writes only on the orphan-recovery path
+/// (`recover_orphaned_tool_use` → `balance_tool_results`), which closes an
+/// abandoned `tool_use` at load. Cooperative cancellation and timeout
+/// produce their own distinct result text and must never borrow it.
+const ORPHAN_RECOVERY_MARKER: &str = agent_sdk::llm::USER_CANCELLED_TOOL_RESULT;
 
 // ── Shared in-memory store ───────────────────────────────────────────
 
@@ -170,7 +171,7 @@ fn tool_use_ids(history: &[Message]) -> Vec<String> {
         .collect()
 }
 
-fn assert_no_crash_recovery_marker(history: &[Message]) {
+fn assert_no_orphan_recovery_marker(history: &[Message]) {
     for message in history {
         let Content::Blocks(blocks) = &message.content else {
             continue;
@@ -178,8 +179,8 @@ fn assert_no_crash_recovery_marker(history: &[Message]) {
         for block in blocks {
             if let ContentBlock::ToolResult { content, .. } = block {
                 assert!(
-                    !content.contains(CRASH_RECOVERY_MARKER),
-                    "cooperative cancellation must not borrow the crash-recovery synth \
+                    !content.contains(ORPHAN_RECOVERY_MARKER),
+                    "cooperative cancellation must not borrow the orphan-recovery synth \
                      string; got tool_result content {content:?}",
                 );
             }
@@ -647,7 +648,7 @@ async fn cancel_during_parallel_observe_join_all_balances_every_call() -> Result
             "each parallel tool_use must get exactly one balanced cancel result ({id})",
         );
     }
-    assert_no_crash_recovery_marker(&history);
+    assert_no_orphan_recovery_marker(&history);
     assert_cancelled_event_terminal(&event_store, &thread_id).await?;
     Ok(())
 }
@@ -780,7 +781,7 @@ async fn cancel_vs_result_race_is_deterministic_and_balanced() -> Result<()> {
                 "iteration {iteration}: tool_use {id} must have exactly one result",
             );
         }
-        assert_no_crash_recovery_marker(&history);
+        assert_no_orphan_recovery_marker(&history);
     }
     Ok(())
 }
@@ -1040,7 +1041,7 @@ async fn abort_signal_is_forwarded_into_in_flight_tools() -> Result<()> {
         "the committed result must be a balanced cancel/cooperative result; got {:?}",
         results[0],
     );
-    assert_no_crash_recovery_marker(&history);
+    assert_no_orphan_recovery_marker(&history);
     Ok(())
 }
 
@@ -1165,18 +1166,18 @@ async fn persistence_is_not_gated_on_a_clean_finish() -> Result<()> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-//  Hard-abort → synthesize_error_tool_results
+//  Hard-abort → recover_orphaned_tool_use
 // ═════════════════════════════════════════════════════════════════════
 
-/// Hard-abort → `synthesize_error_tool_results` produces a
+/// Hard-abort → `recover_orphaned_tool_use` produces a
 /// provider-acceptable next turn.
 ///
 /// This is the edge-case `cancel_mid_tool.rs` explicitly scoped out: a
 /// **hard abort** (the run task is `JoinHandle::abort()`'d mid-tool, the
 /// same shape as a process crash) can leave the assistant `tool_use`
 /// persisted but the `tool_result` never committed — an orphan. The next
-/// `Text` run must detect the orphan and synthesize crash-recovery
-/// error results so the request the SDK assembles for the provider is
+/// `Text` run must detect the orphan and synthesize
+/// cancellation results so the request the SDK assembles for the provider is
 /// balanced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_abort_then_synth_yields_provider_acceptable_next_turn() -> Result<()> {
@@ -1218,7 +1219,7 @@ async fn hard_abort_then_synth_yields_provider_acceptable_next_turn() -> Result<
     );
 
     // ── Next run: a fresh user `Text` input triggers
-    //    recover_orphaned_tool_use → synthesize_error_tool_results
+    //    recover_orphaned_tool_use → balance_tool_results
     //    before the new turn's LLM call. ──
     let provider = RecordingProvider::new(vec![text_response("recovered after crash")]);
     let requests = provider.request_handle();
@@ -1245,12 +1246,12 @@ async fn hard_abort_then_synth_yields_provider_acceptable_next_turn() -> Result<
         "the recovery run must complete Done; got {final_state:?}",
     );
 
-    // History is now balanced and carries the crash-recovery synth
+    // History is now balanced and carries the orphan-recovery synth
     // result for the orphaned tool_use.
     let history = store.get_history(&thread_id).await?;
     assert!(
         orphan_tool_use_ids(&history).is_empty(),
-        "synthesize_error_tool_results must balance the orphan; {history:#?}",
+        "recover_orphaned_tool_use must balance the orphan; {history:#?}",
     );
     let results = tool_results_for(&history, "toolu_crashed");
     assert_eq!(
@@ -1259,8 +1260,8 @@ async fn hard_abort_then_synth_yields_provider_acceptable_next_turn() -> Result<
         "exactly one synth result; got {results:?}"
     );
     assert!(
-        results[0].contains(CRASH_RECOVERY_MARKER),
-        "the synth result must be the crash-recovery marker; got {:?}",
+        results[0].contains(ORPHAN_RECOVERY_MARKER),
+        "the synth result must be the orphan-recovery marker; got {:?}",
         results[0],
     );
 
@@ -1583,7 +1584,7 @@ async fn composite_new_input_mid_stream_then_cancel_mid_tool() -> Result<()> {
         vec!["Cancelled by user".to_string()],
         "the cancelled tool must commit exactly one balanced result",
     );
-    assert_no_crash_recovery_marker(&in_flight_history);
+    assert_no_orphan_recovery_marker(&in_flight_history);
 
     // 2. Queued message ran next, cleanly, with balanced history.
     assert!(

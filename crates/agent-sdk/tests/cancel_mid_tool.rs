@@ -34,8 +34,8 @@
 //! (`JoinHandle::abort()`) is the same shape as a process crash
 //! from the SDK's perspective and is intentionally out of scope —
 //! that's the edge case of an edge case and is the territory of the
-//! existing `synthesize_error_tool_results` recovery helper, which
-//! this test deliberately does not exercise.
+//! `recover_orphaned_tool_use` load-time backfill, which this test
+//! deliberately does not exercise.
 
 use agent_sdk::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, Role,
@@ -53,10 +53,10 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, oneshot};
 
 /// Marker the SDK puts in the synthesised user message when the
-/// crash-recovery code path (`synthesize_error_tool_results`) runs.
+/// orphan-recovery path (`recover_orphaned_tool_use`) runs.
 /// Cooperative cancellation should never produce this string — the
 /// test asserts on its absence.
-const CRASH_RECOVERY_MARKER: &str = "Tool execution was interrupted by a crash. Please retry.";
+const ORPHAN_RECOVERY_MARKER: &str = agent_sdk::llm::USER_CANCELLED_TOOL_RESULT;
 
 /// LLM provider whose `chat()` returns the next pre-scripted outcome
 /// and records every request it received so the test can inspect the
@@ -412,7 +412,7 @@ async fn run_second_after_cancel(
     Ok((final_state, requests_handle))
 }
 
-fn assert_no_crash_recovery_marker(history: &[Message]) {
+fn assert_no_orphan_recovery_marker(history: &[Message]) {
     for message in history {
         let Content::Blocks(blocks) = &message.content else {
             continue;
@@ -420,7 +420,7 @@ fn assert_no_crash_recovery_marker(history: &[Message]) {
         for block in blocks {
             if let ContentBlock::ToolResult { content, .. } = block {
                 assert!(
-                    !content.contains(CRASH_RECOVERY_MARKER),
+                    !content.contains(ORPHAN_RECOVERY_MARKER),
                     "graceful cancellation must not borrow the crash-recovery \
                      synth string; got tool_result content {content:?}",
                 );
@@ -466,13 +466,13 @@ async fn sdk_cancels_non_cooperative_tool_and_persists_clean_history() -> Result
          tool_use, with content 'Cancelled by user'; got {results:?}",
     );
 
-    // ── Assertion 3: crash-recovery marker never appears ────────────
+    // ── Assertion 3: orphan-recovery marker never appears ──────────
     //
-    // If this assertion fires, the SDK has routed the cancellation
-    // through `synthesize_error_tool_results`, which is the wrong
-    // code path — that helper is reserved for actual crashes
-    // (orphaned tool_use blocks recovered on the *next* run).
-    assert_no_crash_recovery_marker(&history_after_cancel);
+    // If this assertion fires, the SDK has routed the cooperative
+    // cancellation through `recover_orphaned_tool_use`, which is the
+    // wrong code path — that backfill is reserved for orphaned
+    // tool_use blocks recovered on the *next* run.
+    assert_no_orphan_recovery_marker(&history_after_cancel);
 
     // ── Run 2: user sends a new message; SDK loads clean history ────
     let (final_state_2, provider_2_requests) = run_second_after_cancel(&store, &thread_id).await?;

@@ -4727,7 +4727,8 @@ async fn message_input_recovers_orphaned_tool_use() -> anyhow::Result<()> {
     let message_store = InMemoryStore::new();
     let thread_id = ThreadId::new();
 
-    // Seed a crash-orphaned assistant tool_use with no following tool_result.
+    // Seed an orphaned assistant tool_use with no following tool_result
+    // (a prior turn that was cancelled/abandoned mid-flight).
     message_store
         .append(
             &thread_id,
@@ -4763,15 +4764,17 @@ async fn message_input_recovers_orphaned_tool_use() -> anyhow::Result<()> {
     .await?;
     assert!(matches!(state, AgentRunState::Done { .. }));
 
-    // The fix runs crash recovery for Message inputs, synthesizing an error
-    // tool_result for the orphaned tool_use before appending the user message.
+    // Message inputs run orphan recovery at load, durably closing the
+    // unanswered tool_use with a "User cancelled" error result before the
+    // user message is appended — so the history handed to the model is
+    // balanced and the conversation continues.
     let history = message_store.get_history(&thread_id).await?;
     let has_recovery = history.iter().any(|m| match &m.content {
         Content::Blocks(blocks) => blocks.iter().any(|b| {
             matches!(
                 b,
                 ContentBlock::ToolResult { is_error: Some(true), content, .. }
-                    if content.contains("interrupted by a crash")
+                    if content == crate::llm::USER_CANCELLED_TOOL_RESULT
             )
         }),
         Content::Text(_) => false,
@@ -4779,6 +4782,10 @@ async fn message_input_recovers_orphaned_tool_use() -> anyhow::Result<()> {
     assert!(
         has_recovery,
         "Message input must trigger orphaned tool_use recovery; history={history:?}"
+    );
+    assert!(
+        !crate::llm::has_unbalanced_tool_use(&history),
+        "history must be balanced after recovery; history={history:?}"
     );
     Ok(())
 }

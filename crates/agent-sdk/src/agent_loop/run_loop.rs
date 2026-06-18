@@ -15,7 +15,7 @@ use crate::authority::EventAuthority;
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::AgentEvent;
 use crate::hooks::AgentHooks;
-use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role, StopReason};
+use crate::llm::{LlmProvider, Message, StopReason};
 use crate::stores::{EventStore, MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
@@ -1716,60 +1716,22 @@ where
     }
 }
 
-/// Checks if the last message in the history is an assistant message with
-/// `ToolUse` content blocks but no subsequent user message containing
-/// `ToolResult` blocks. This indicates a crash between persisting the
-/// assistant response and executing tools.
-fn has_orphaned_tool_use(messages: &[Message]) -> bool {
-    let Some(last) = messages.last() else {
-        return false;
-    };
-    if last.role != Role::Assistant {
-        return false;
-    }
-    let Content::Blocks(blocks) = &last.content else {
-        return false;
-    };
-    blocks
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-}
-
-/// Synthesizes error `ToolResult` blocks for every `ToolUse` in the last
-/// assistant message, allowing the conversation to continue after a crash.
-fn synthesize_error_tool_results(messages: &[Message]) -> Option<Message> {
-    let last = messages.last()?;
-    let Content::Blocks(blocks) = &last.content else {
-        return None;
-    };
-
-    let result_blocks: Vec<ContentBlock> = blocks
-        .iter()
-        .filter_map(|b| {
-            if let ContentBlock::ToolUse { id, .. } = b {
-                Some(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: "Tool execution was interrupted by a crash. Please retry.".to_string(),
-                    is_error: Some(true),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if result_blocks.is_empty() {
-        return None;
-    }
-
-    Some(Message {
-        role: Role::User,
-        content: Content::Blocks(result_blocks),
-    })
-}
-
-/// Recovers from orphaned `tool_use` messages by appending synthetic error
+/// Recovers from orphaned `tool_use` messages by writing synthetic
 /// `tool_result` blocks so the conversation can continue.
+///
+/// A `tool_use` is "orphaned" when its id is not answered by a
+/// `tool_result` in the immediately following message — the condition the
+/// Anthropic Messages API rejects. This happens when a turn is interrupted
+/// after the assistant `tool_use` was persisted but before every result
+/// landed: a crash between the LLM response and tool execution, or — more
+/// commonly — the user answering one of several questions and cancelling
+/// the rest.
+///
+/// Unlike a naive last-message check, [`crate::llm::balance_tool_results`]
+/// also repairs the *partial* case (some results present, some missing) by
+/// folding the synthetic results into the existing results message, so the
+/// durable history is left fully balanced rather than re-balanced on every
+/// subsequent request.
 async fn recover_orphaned_tool_use<M>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,
@@ -1782,19 +1744,21 @@ where
         .await
         .map_err(|e| AgentError::new(format!("Failed to get history for recovery: {e}"), false))?;
 
-    if has_orphaned_tool_use(&history) {
-        warn!("Detected orphaned tool_use blocks — synthesizing error results for crash recovery");
-        if let Some(recovery_msg) = synthesize_error_tool_results(&history) {
-            message_store
-                .append(thread_id, recovery_msg)
-                .await
-                .map_err(|e| {
-                    AgentError::new(
-                        format!("Failed to append recovery tool results: {e}"),
-                        false,
-                    )
-                })?;
-        }
+    if crate::llm::has_unbalanced_tool_use(&history) {
+        warn!(
+            "Detected orphaned tool_use blocks — synthesizing cancelled tool results for recovery"
+        );
+        let balanced =
+            crate::llm::balance_tool_results(&history, crate::llm::USER_CANCELLED_TOOL_RESULT);
+        message_store
+            .replace_history(thread_id, balanced)
+            .await
+            .map_err(|e| {
+                AgentError::new(
+                    format!("Failed to persist recovered tool results: {e}"),
+                    false,
+                )
+            })?;
     }
     Ok(())
 }
@@ -2577,77 +2541,108 @@ pub(super) async fn convert_turn_result<H: AgentHooks, S: StateStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{Content, ContentBlock};
 
-    #[test]
-    fn test_has_orphaned_tool_use_empty_history() {
-        assert!(!has_orphaned_tool_use(&[]));
-    }
-
-    #[test]
-    fn test_has_orphaned_tool_use_user_last() {
-        let messages = vec![Message::user("hello")];
-        assert!(!has_orphaned_tool_use(&messages));
-    }
-
-    #[test]
-    fn test_has_orphaned_tool_use_assistant_text_only() {
-        let messages = vec![Message::assistant("Sure, I can help.")];
-        assert!(!has_orphaned_tool_use(&messages));
-    }
-
-    #[test]
-    fn test_has_orphaned_tool_use_assistant_with_tool_use() {
-        let messages = vec![Message {
-            role: Role::Assistant,
-            content: Content::Blocks(vec![ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
-                name: "read".to_string(),
-                input: serde_json::json!({"path": "/test"}),
+    fn assistant_with_tool_uses(ids: &[&str]) -> Message {
+        let blocks = ids
+            .iter()
+            .map(|id| ContentBlock::ToolUse {
+                id: (*id).to_string(),
+                name: "ask_user".to_string(),
+                input: serde_json::json!({}),
                 thought_signature: None,
-            }]),
-        }];
-        assert!(has_orphaned_tool_use(&messages));
+            })
+            .collect();
+        Message::assistant_with_content(blocks)
     }
 
-    #[test]
-    fn test_synthesize_error_tool_results() {
-        let messages = vec![Message {
-            role: Role::Assistant,
-            content: Content::Blocks(vec![
-                ContentBlock::Text {
-                    text: "Let me read that.".to_string(),
-                },
-                ContentBlock::ToolUse {
-                    id: "tool_1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({"path": "/test"}),
-                    thought_signature: None,
-                },
-                ContentBlock::ToolUse {
-                    id: "tool_2".to_string(),
-                    name: "grep".to_string(),
-                    input: serde_json::json!({"pattern": "foo"}),
-                    thought_signature: None,
-                },
-            ]),
-        }];
+    #[tokio::test]
+    async fn recover_orphaned_tool_use_is_noop_when_balanced() -> anyhow::Result<()> {
+        use crate::stores::InMemoryStore;
 
-        let recovery = synthesize_error_tool_results(&messages);
-        assert!(recovery.is_some());
+        let store = Arc::new(InMemoryStore::new());
+        let thread = ThreadId::new();
+        store.append(&thread, Message::user("hi")).await?;
+        store
+            .append(&thread, assistant_with_tool_uses(&["a"]))
+            .await?;
+        store
+            .append(&thread, Message::tool_result("a", "done", false))
+            .await?;
 
-        let msg = recovery.unwrap();
-        assert_eq!(msg.role, Role::User);
+        recover_orphaned_tool_use(&thread, &store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
 
-        let Content::Blocks(blocks) = &msg.content else {
-            panic!("Expected Blocks");
+        let history = store.get_history(&thread).await?;
+        assert_eq!(history.len(), 3, "balanced history is left untouched");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_tool_use_fills_partial_cancellation() -> anyhow::Result<()> {
+        use crate::stores::InMemoryStore;
+
+        // The screenshot case: four questions, one answered, three cancelled.
+        let store = Arc::new(InMemoryStore::new());
+        let thread = ThreadId::new();
+        store
+            .append(&thread, assistant_with_tool_uses(&["q1", "q2", "q3", "q4"]))
+            .await?;
+        store
+            .append(&thread, Message::tool_result("q1", "answered", false))
+            .await?;
+
+        recover_orphaned_tool_use(&thread, &store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+
+        let history = store.get_history(&thread).await?;
+        assert!(
+            !crate::llm::has_unbalanced_tool_use(&history),
+            "history must be balanced after recovery",
+        );
+
+        // q2/q3/q4 now carry "User cancelled" error results.
+        let Content::Blocks(blocks) = &history[1].content else {
+            panic!("results message must carry blocks");
         };
-        assert_eq!(blocks.len(), 2);
-        for block in blocks {
-            let ContentBlock::ToolResult { is_error, .. } = block else {
-                panic!("Expected ToolResult");
-            };
-            assert_eq!(*is_error, Some(true));
-        }
+        let cancelled: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: Some(true),
+                } if content == crate::llm::USER_CANCELLED_TOOL_RESULT => {
+                    Some(tool_use_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled, vec!["q2", "q3", "q4"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_tool_use_handles_all_cancelled() -> anyhow::Result<()> {
+        use crate::stores::InMemoryStore;
+
+        // Cancel-all: the assistant tool_use turn is the last message.
+        let store = Arc::new(InMemoryStore::new());
+        let thread = ThreadId::new();
+        store
+            .append(&thread, assistant_with_tool_uses(&["q1", "q2"]))
+            .await?;
+
+        recover_orphaned_tool_use(&thread, &store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+
+        let history = store.get_history(&thread).await?;
+        assert_eq!(history.len(), 2, "a synthetic results message is appended");
+        assert!(!crate::llm::has_unbalanced_tool_use(&history));
+        Ok(())
     }
 
     #[test]
