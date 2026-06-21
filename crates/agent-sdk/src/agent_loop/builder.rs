@@ -43,6 +43,7 @@ pub struct AgentLoopBuilder<Ctx, P, H, M, S> {
     compactor: Option<Arc<dyn ContextCompactor>>,
     execution_store: Option<Arc<dyn ToolExecutionStore>>,
     audit_sink: Option<Arc<dyn crate::hooks::ToolAuditSink>>,
+    reminder_config: Option<crate::reminders::ReminderConfig>,
     #[cfg(feature = "otel")]
     observability_store: Option<Arc<dyn crate::observability::ObservabilityStore>>,
 }
@@ -64,6 +65,7 @@ impl<Ctx> AgentLoopBuilder<Ctx, (), (), (), ()> {
             compactor: None,
             execution_store: None,
             audit_sink: None,
+            reminder_config: None,
             #[cfg(feature = "otel")]
             observability_store: None,
         }
@@ -93,6 +95,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compactor: self.compactor,
             execution_store: self.execution_store,
             audit_sink: self.audit_sink,
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -121,6 +124,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compactor: self.compactor,
             execution_store: self.execution_store,
             audit_sink: self.audit_sink,
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -145,6 +149,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compactor: self.compactor,
             execution_store: self.execution_store,
             audit_sink: self.audit_sink,
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -169,6 +174,7 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
             compactor: self.compactor,
             execution_store: self.execution_store,
             audit_sink: self.audit_sink,
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -278,6 +284,35 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
     #[must_use]
     pub fn config(mut self, config: AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Enable per-tool system reminders.
+    ///
+    /// When set, the agent loop evaluates the configuration's
+    /// [`tool_reminders`](crate::reminders::ReminderConfig::tool_reminders)
+    /// after each tool executes and appends any reminder whose
+    /// [`ReminderTrigger`](crate::reminders::ReminderTrigger) matches
+    /// (wrapped in `<system-reminder>` tags) to the tool result the model
+    /// reads on the next turn.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use agent_sdk::{builder, reminders::{ReminderConfig, ToolReminder}};
+    ///
+    /// let reminders = ReminderConfig::new()
+    ///     .with_tool_reminder("write", ToolReminder::always(
+    ///         "Consider reading the file back to verify the content.",
+    ///     ));
+    /// let agent = builder()
+    ///     .provider(my_provider)
+    ///     .with_reminders(reminders)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_reminders(mut self, reminders: crate::reminders::ReminderConfig) -> Self {
+        self.reminder_config = Some(reminders);
         self
     }
 
@@ -408,6 +443,7 @@ where
             audit_sink: self
                 .audit_sink
                 .unwrap_or_else(|| Arc::new(crate::hooks::NoopAuditSink)),
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
@@ -456,6 +492,7 @@ where
             audit_sink: self
                 .audit_sink
                 .unwrap_or_else(|| Arc::new(crate::hooks::NoopAuditSink)),
+            reminder_config: self.reminder_config,
             #[cfg(feature = "otel")]
             observability_store: self.observability_store,
         }
