@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.1...agent-sdk-providers-v0.11.2) - 2026-07-01
+
+### Added
+
+- *(model-capabilities)* add claude-sonnet-5 ([#326](https://github.com/bipa-app/agent-sdk/pull/326))
+
 ## [0.11.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.10.0...agent-sdk-providers-v0.11.0) - 2026-06-14
 
 ### Added
