@@ -186,6 +186,18 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
     },
     ModelCapabilities {
         provider: "anthropic",
+        model_id: "claude-sonnet-5",
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        pricing: Some(Pricing::flat(3.0, 15.0).with_notes("Anthropic Sonnet 5 standard pricing $3/$15 per 1M; introductory $2/$10 through 2026-08-31. A new tokenizer produces ~30% more tokens than Sonnet 4.6, so equivalent-text cost differs even at unchanged per-token rates.")),
+        supports_thinking: true,
+        supports_adaptive_thinking: true,
+        source_url: ANTHROPIC_MODELS_URL,
+        source_status: SourceStatus::Official,
+        notes: Some("Sonnet 5 is adaptive-only: adaptive thinking is on by default (applies even when `thinking` is unset) and `ThinkingMode::Enabled { budget_tokens }` returns 400 from the Anthropic API — same as Opus 4.8. Non-default sampling params (temperature/top_p/top_k) also return 400 (constraint inherited from Opus 4.7). Uses a new tokenizer (~30% more tokens than Sonnet 4.6)."),
+    },
+    ModelCapabilities {
+        provider: "anthropic",
         model_id: "claude-sonnet-4-6",
         context_window: Some(1_000_000),
         max_output_tokens: Some(64_000),
@@ -824,6 +836,16 @@ mod tests {
         let caps = get_model_capabilities("anthropic", "claude-opus-4-6").unwrap();
         assert_eq!(caps.context_window, Some(1_000_000));
         assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn test_lookup_anthropic_sonnet_5() {
+        let caps = get_model_capabilities("anthropic", "claude-sonnet-5").unwrap();
+        assert_eq!(caps.context_window, Some(1_000_000));
+        assert_eq!(caps.max_output_tokens, Some(128_000));
+        assert!(caps.supports_thinking);
+        // Adaptive-only (like Opus 4.8): manual budget_tokens 400s; adaptive is required.
         assert!(caps.supports_adaptive_thinking);
     }
 
