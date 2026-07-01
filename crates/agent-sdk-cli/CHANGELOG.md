@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.11.1...agent-sdk-cli-v0.11.2) - 2026-07-01
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.11.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-cli-v0.10.0...agent-sdk-cli-v0.11.0) - 2026-06-14
 
 ### Other
