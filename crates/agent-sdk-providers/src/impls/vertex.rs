@@ -10,7 +10,7 @@
 
 use crate::attachments::validate_request_attachments;
 use crate::impls::anthropic::{
-    MODEL_FABLE_5, MODEL_OPUS_46, MODEL_OPUS_47, MODEL_OPUS_48, MODEL_SONNET_46,
+    MODEL_FABLE_5, MODEL_OPUS_46, MODEL_OPUS_47, MODEL_OPUS_48, MODEL_SONNET_5, MODEL_SONNET_46,
     data as anthropic_data,
 };
 use crate::impls::gemini::data::{
@@ -158,7 +158,12 @@ impl VertexProvider {
     fn requires_anthropic_adaptive_thinking(&self) -> bool {
         matches!(
             self.model.as_str(),
-            MODEL_SONNET_46 | MODEL_OPUS_46 | MODEL_OPUS_47 | MODEL_OPUS_48 | MODEL_FABLE_5
+            MODEL_SONNET_46
+                | MODEL_SONNET_5
+                | MODEL_OPUS_46
+                | MODEL_OPUS_47
+                | MODEL_OPUS_48
+                | MODEL_FABLE_5
         )
     }
 
