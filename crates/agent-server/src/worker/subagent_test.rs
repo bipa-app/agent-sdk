@@ -976,6 +976,7 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
             spec: sample_spec(task),
             child_root_input: child_root_input(task),
             spawn_index: u32::try_from(idx).expect("test idx fits in u32"),
+            child_caller_metadata: None,
         })
         .collect();
 
@@ -1087,12 +1088,14 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
             spec: sample_spec("A"),
             child_root_input: child_root_input("A"),
             spawn_index: 0,
+            child_caller_metadata: None,
         },
         SubagentBatchEntry {
             child_thread_id: agent_sdk_foundation::ThreadId::new(),
             spec: sample_spec("ghost"),
             child_root_input: child_root_input("ghost"),
             spawn_index: 5, // out of bounds — only 2 pending tool calls
+            child_caller_metadata: None,
         },
     ];
 
@@ -1139,6 +1142,7 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
             child_root_input: child_root_input(task),
             spawn_index: 0,
             payload: parent_suspension_payload(&parent.thread_id, task),
+            child_caller_metadata: None,
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1205,6 +1209,49 @@ async fn spawn_flow_creates_invocation_child_thread_and_child_root() -> Result<(
 }
 
 #[tokio::test]
+async fn spawn_carries_child_caller_metadata_onto_child_root() -> Result<()> {
+    // When the host supplies child_caller_metadata, it must land on the
+    // child ROOT task so an AgentDefinitionRegistry can resolve a
+    // per-subagent model/toolset from it. `None` (the default, covered
+    // by every other test) leaves caller_metadata unset.
+    let task_store = InMemoryAgentTaskStore::new();
+    let thread_store = InMemoryThreadStore::new();
+    let event_repo = InMemoryEventRepository::new();
+    let (parent, worker, lease) = running_parent_root(&task_store).await?;
+    let task = "Inspect durable linkage";
+    let spec = sample_spec(task);
+    let caller = serde_json::json!({ "subagent": "deep_research", "model": "claude-opus-4-8" });
+
+    let created = spawn_subagent_invocation(
+        &parent.id,
+        &worker,
+        &lease,
+        SubagentInvocationSpawn {
+            child_thread_id: agent_sdk_foundation::ThreadId::new(),
+            spec: spec.clone(),
+            child_root_input: child_root_input(task),
+            spawn_index: 0,
+            payload: parent_suspension_payload(&parent.thread_id, task),
+            child_caller_metadata: Some(caller.clone()),
+        },
+        &SubagentInvocationDeps {
+            task_store: &task_store,
+            thread_store: &thread_store,
+            event_repo: &event_repo,
+        },
+        t_plus(2),
+    )
+    .await?;
+
+    assert_eq!(
+        created.child_root_task.caller_metadata.as_ref(),
+        Some(&caller),
+        "child root must carry the host-supplied caller metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
     let task_store = InMemoryAgentTaskStore::new();
     let thread_store = InMemoryThreadStore::new();
@@ -1224,6 +1271,7 @@ async fn spawn_flow_tolerates_parent_progress_commit_failures() -> Result<()> {
             child_root_input: child_root_input(task),
             spawn_index: 0,
             payload: parent_suspension_payload(&parent.thread_id, task),
+            child_caller_metadata: None,
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1387,6 +1435,7 @@ async fn spawn_flow_rejects_non_confirm_tier_subagent_tools() -> Result<()> {
                 task,
                 ToolTier::Observe,
             ),
+            child_caller_metadata: None,
         },
         &SubagentInvocationDeps {
             task_store: &task_store,

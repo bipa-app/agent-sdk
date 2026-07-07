@@ -3256,6 +3256,7 @@ FOR UPDATE SKIP LOCKED
             child_root_input,
             payload,
             spawn_index,
+            child_caller_metadata,
         } = spawn;
 
         let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
@@ -3264,9 +3265,10 @@ FOR UPDATE SKIP LOCKED
         validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
         ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
 
-        let child_root = AgentTask::new_root_turn_with_input(
+        let child_root = AgentTask::new_root_turn_with_optional_caller(
             child_thread_id.clone(),
             child_root_input,
+            child_caller_metadata,
             now,
             AgentTask::DEFAULT_MAX_ATTEMPTS,
         );
@@ -3339,12 +3341,14 @@ FOR UPDATE SKIP LOCKED
                 child_root_input,
                 payload: _per_entry_payload,
                 spawn_index,
+                child_caller_metadata,
             } = spawn;
             ensure_child_thread_available_for_spawn_tx(&mut tx, &child_thread_id).await?;
 
-            let child_root = AgentTask::new_root_turn_with_input(
+            let child_root = AgentTask::new_root_turn_with_optional_caller(
                 child_thread_id.clone(),
                 child_root_input,
+                child_caller_metadata,
                 now,
                 AgentTask::DEFAULT_MAX_ATTEMPTS,
             );

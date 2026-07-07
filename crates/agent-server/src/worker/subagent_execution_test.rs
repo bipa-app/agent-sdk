@@ -427,6 +427,7 @@ fn child_spawn(thread_id: &ThreadId) -> crate::journal::SubagentInvocationSpawn 
         }],
         spawn_index: 0,
         payload: parent_suspension_payload(thread_id),
+        child_caller_metadata: None,
     }
 }
 

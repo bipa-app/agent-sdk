@@ -450,6 +450,7 @@ fn child_spawn(parent_thread: &ThreadId, tool_id: &str) -> SubagentInvocationSpa
         }],
         spawn_index: 0,
         payload: parent_suspension_payload(parent_thread, tool_id),
+        child_caller_metadata: None,
     }
 }
 
@@ -1804,6 +1805,7 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
         }],
         spawn_index: 0,
         payload: parent_suspension_payload(&child_thread, "call-grand-b"),
+        child_caller_metadata: None,
     };
     let spawned_b = spawn_subagent_invocation(
         &child_running.id,

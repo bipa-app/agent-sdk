@@ -751,6 +751,31 @@ impl AgentTask {
         task
     }
 
+    /// Allocate a root turn with input and OPTIONAL caller metadata —
+    /// `Some` behaves like [`Self::new_root_turn_with_input_and_caller`],
+    /// `None` like [`Self::new_root_turn_with_input`]. Lets a spawn path thread
+    /// a caller identity through only when the host supplied one, without
+    /// branching at every call site.
+    #[must_use]
+    pub fn new_root_turn_with_optional_caller(
+        thread_id: ThreadId,
+        input: Vec<SubmittedInputItem>,
+        caller_metadata: Option<serde_json::Value>,
+        now: OffsetDateTime,
+        max_attempts: u32,
+    ) -> Self {
+        match caller_metadata {
+            Some(caller) => Self::new_root_turn_with_input_and_caller(
+                thread_id,
+                input,
+                caller,
+                now,
+                max_attempts,
+            ),
+            None => Self::new_root_turn_with_input(thread_id, input, now, max_attempts),
+        }
+    }
+
     /// Allocate a fresh child task under `parent`.
     ///
     /// The child inherits `parent.root_id` and `parent.thread_id`, sets
