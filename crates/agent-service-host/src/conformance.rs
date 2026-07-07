@@ -62,6 +62,7 @@ mod tests {
         AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
         TaskStatus, WorkerId,
     };
+    use agent_server::journal::task_state::TaskState;
     use agent_server::journal::thread_store::ThreadStore;
     use agent_server::journal::turn_attempt::{
         CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
@@ -524,6 +525,123 @@ mod tests {
         assert_eq!(completed_child.status, TaskStatus::Completed);
         let resumed = resumed_parent.context("parent should be returned")?;
         assert_eq!(resumed.status, TaskStatus::Pending);
+        Ok(())
+    }
+
+    /// R2 steering wake: `enqueue_steering_resume` parks the parent in a
+    /// steering `ready_to_resume` state, `repark_after_steering` re-binds
+    /// the survivor under a dense `spawn_index` and re-parks in
+    /// `waiting_on_children`, and the survivor's eventual completion fans
+    /// the parent back in — budget-neutral, no new children. Exercised on
+    /// every backend so the SQL child re-index path is covered on the
+    /// durable stores.
+    async fn test_steering_wake_and_repark(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let tid = "conformance-steering";
+        let root = fresh_root(tid, 60);
+        task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
+            .await?;
+
+        let (parent, children) = task_store
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![
+                    ChildSpawnSpec { max_attempts: 3 },
+                    ChildSpawnSpec { max_attempts: 3 },
+                ],
+                suspension_payload(tid),
+                None,
+                t_plus(62),
+            )
+            .await?;
+        assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(children.len(), 2);
+
+        // Child 0 finishes during the wave; child 1 keeps running.
+        let cw = WorkerId::new();
+        let cl = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &children[0].id,
+                cw.clone(),
+                cl.clone(),
+                t_plus(90),
+                t_plus(63),
+            )
+            .await?;
+        task_store
+            .complete_task(&children[0].id, &cw, &cl, t_plus(64))
+            .await?;
+
+        // Wake the parked parent.
+        let note = vec![agent_sdk_foundation::llm::ContentBlock::Text {
+            text: "status?".into(),
+        }];
+        let woken = task_store
+            .enqueue_steering_resume(&root.id, note, t_plus(65))
+            .await?
+            .context("wake must succeed on a parked parent")?;
+        assert_eq!(woken.status, TaskStatus::Pending);
+        assert!(woken.state.is_steering_resume());
+
+        // Acquire and re-park on the survivor under a fresh binding.
+        let sw = WorkerId::new();
+        let sl = LeaseId::new();
+        task_store
+            .try_acquire_task(&root.id, sw.clone(), sl.clone(), t_plus(200), t_plus(67))
+            .await?;
+        let reparked = task_store
+            .repark_after_steering(
+                &root.id,
+                &sw,
+                &sl,
+                suspension_payload(tid),
+                vec![children[1].id.clone()],
+                t_plus(68),
+            )
+            .await?;
+        assert_eq!(reparked.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(reparked.pending_child_count, 1);
+        match &reparked.state {
+            TaskState::WaitingOnChildren { child_ids, .. } => {
+                assert_eq!(child_ids, &vec![children[1].id.clone()]);
+            }
+            other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
+        }
+        // Survivor re-indexed to dense position 0; still non-terminal.
+        let survivor = task_store.get(&children[1].id).await?.context("survivor")?;
+        assert_eq!(survivor.spawn_index, Some(0));
+        assert!(!survivor.status.is_terminal());
+
+        // Survivor finishes → the parent fans in to ReadyToResume.
+        let c2w = WorkerId::new();
+        let c2l = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &children[1].id,
+                c2w.clone(),
+                c2l.clone(),
+                t_plus(200),
+                t_plus(70),
+            )
+            .await?;
+        let (_done, parent_after) = task_store
+            .complete_task(&children[1].id, &c2w, &c2l, t_plus(71))
+            .await?;
+        let ready = parent_after.context("parent returned on final fan-in")?;
+        assert_eq!(ready.status, TaskStatus::Pending);
+        assert!(matches!(ready.state, TaskState::ReadyToResume { .. }));
         Ok(())
     }
 
@@ -1317,6 +1435,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_steering_wake() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_steering_wake_and_repark(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_cancel_tree() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_cancel_tree(s.task.as_ref()).await
@@ -1482,6 +1606,13 @@ mod tests {
     async fn conformance_sqlite_child_spawn() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_steering_wake() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_steering_wake_and_repark(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -1888,6 +2019,15 @@ mod tests {
             return Ok(());
         };
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_steering_wake() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_steering_wake_and_repark(&store).await
     }
 
     #[cfg(feature = "postgres")]

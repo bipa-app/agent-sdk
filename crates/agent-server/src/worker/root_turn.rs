@@ -400,6 +400,93 @@ pub async fn cancel_root_turn(
     Ok(cancelled)
 }
 
+/// Revert a failed steering wake (R2) back to its pre-wake parked
+/// state instead of failing the root task.
+///
+/// A steering wake is a [`TaskState::ReadyToResume`] row carrying a
+/// non-empty `steering` payload that woke a parent while its mission
+/// children were still **running**. If the bounded steering exchange
+/// fails — e.g. a provider outage exactly when the user asked "how is
+/// it going?", or a deterministic interim-construction error — the
+/// naive path ([`fail_root_turn`]) marks the parent `Failed` while its
+/// children keep running. [`AgentTaskStore::fail_task`] does not
+/// cascade (only [`AgentTaskStore::cancel_tree`] does), so those
+/// workers are stranded: they burn budget on a dead mission and their
+/// eventual results are orphaned on the "parent not waiting" branch.
+///
+/// The steering exchange writes nothing to the task row before it
+/// fails, so the durable `ReadyToResume` state still carries the
+/// original continuation, suspended messages, and child ids untouched.
+/// This re-parks the parent on exactly those children via
+/// [`AgentTaskStore::repark_after_steering`], which derives the live
+/// child count from the journal and either parks again in
+/// [`TaskStatus::WaitingOnChildren`] (children still running) or flips
+/// straight to `Pending` + [`TaskState::ReadyToResume`] with an empty
+/// steering payload (every child already finished) so the ordinary
+/// fan-in ([`resume_from_children`]) resumes the mission.
+///
+/// The (now-unanswerable) steering note is intentionally dropped.
+/// Dropping it also clears the wake trigger, so the row is never
+/// re-woken into the same failing exchange — that removes the
+/// wake→error→re-park loop the durable steering-attempt cap (which
+/// only bites on lease expiry) would not otherwise bound. The failure
+/// is surfaced as a non-fatal error event so the note's author still
+/// learns the reply did not land.
+///
+/// `parent` is the owned steering-resume row (its durable state carries
+/// the intact continuation, suspended messages, and child ids);
+/// `worker_id` / `lease_id` are the caller's validated ownership token.
+///
+/// # Errors
+/// - The `parent`'s durable state carries no continuation (defends the
+///   state ↔ status invariant).
+/// - The store rejects the re-park (CAS: not running / not owned / not
+///   a steering resume — e.g. a sweep already requeued the row).
+pub async fn revert_steering_wake(
+    parent: &AgentTask,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    // Best-effort close the steering exchange's open turn attempt — the
+    // LLM round failed, so the attempt never closed on its own.
+    best_effort_close_open_attempts(&parent.id, deps.attempt_store, now).await;
+
+    let continuation = parent
+        .state
+        .continuation()
+        .context("steering revert: durable state carries no continuation")?
+        .clone();
+    let payload = SuspensionPayload {
+        continuation,
+        suspended_messages: parent.state.suspended_messages().to_vec(),
+    };
+    // The original child ids, in spawn order — the re-park re-indexes
+    // them to the continuation's original `pending_tool_calls`, i.e. the
+    // identity mapping they already had, so the fan-in resolves exactly
+    // as if the wake never happened.
+    let child_ids = parent.state.child_ids().to_vec();
+
+    let reparked = deps
+        .task_store
+        .repark_after_steering(&parent.id, worker_id, lease_id, payload, child_ids, now)
+        .await
+        .context("revert failed steering wake to parked state")?;
+
+    // Surface the failure as a non-fatal error event (best-effort — the
+    // durable re-park already succeeded; an event-commit failure must
+    // not override that outcome).
+    let error_event = AgentEvent::error(format!("{error:#}"), false);
+    let _ = deps
+        .event_repo
+        .commit_event(&parent.thread_id, error_event, now)
+        .await;
+
+    Ok(reparked)
+}
+
 /// Best-effort close any open (non-closed) turn attempts for a task.
 ///
 /// Iterates all attempts and closes any that are still open with the
@@ -2936,13 +3023,14 @@ fn extract_pending_tool_calls(
 // Resume from completed child tool results (Phase 4.5)
 // ─────────────────────────────────────────────────────────────────────
 
-/// Prior suspension state passed to the resume path so the LLM sees the
-/// full conversation that led to the tool calls whose results are now
-/// available.
-struct ResumeContext<'a> {
+/// The prior turn's continuation plus the replay-history prefix
+/// (original user prompt + original assistant + the tool-results /
+/// steering-interim user message) threaded into a re-suspension's
+/// `suspended_messages`. Bundled so [`suspend_resumed_turn`] stays
+/// within the argument-count budget.
+struct ResumeSuspension<'a> {
     continuation: &'a AgentContinuation,
-    suspended_messages: &'a [llm::Message],
-    child_results: &'a [(String, ToolResult)],
+    history_prefix: Vec<llm::Message>,
 }
 
 /// Resume a suspended root turn after all child tool tasks have
@@ -3133,17 +3221,14 @@ pub async fn resume_root_turn(
     } = llm_call.await?;
     let commit_now = OffsetDateTime::now_utc();
 
-    let prior = ResumeContext {
-        continuation: &continuation,
-        suspended_messages: &suspended_messages,
-        child_results: &child_results,
-    };
-
     // 5. Branch: tool calls → re-suspend; text-only → commit.
     if response.has_tool_use() {
         return suspend_resumed_turn(
             inputs,
-            &prior,
+            ResumeSuspension {
+                continuation: &continuation,
+                history_prefix: build_resumed_draft_messages(&suspended_messages, &child_results),
+            },
             response,
             attempt,
             deps,
@@ -3410,7 +3495,7 @@ fn build_resumed_draft_messages(
 /// complete history.
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
-    prior: &ResumeContext<'_>,
+    prior: ResumeSuspension<'_>,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
@@ -3435,10 +3520,14 @@ async fn suspend_resumed_turn(
         .context("build resume continuation")?;
 
     // Build suspended messages that capture the FULL conversation
-    // through this point: original user prompt + original assistant +
-    // tool results + new assistant response.
-    let mut new_suspended =
-        build_resumed_draft_messages(prior.suspended_messages, prior.child_results);
+    // through this point: the caller-supplied replay-history prefix
+    // (original user prompt + original assistant + the tool-results /
+    // steering-interim user message) followed by the new assistant
+    // response. Threading the prefix through — rather than rebuilding it
+    // from `child_results` here — lets the steering all-terminal path
+    // preserve its interim-results-plus-note user message in the replay
+    // history instead of dropping the directive.
+    let mut new_suspended = prior.history_prefix;
     // New assistant response (with new tool-use blocks).
     new_suspended.push(build_full_assistant_message(&response));
 
@@ -3754,4 +3843,676 @@ pub async fn resume_from_children(
         now,
     ))
     .await
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 5.5: steering wake (R2) — early resume of a parked parent
+// ─────────────────────────────────────────────────────────────────────
+
+/// `UUIDv5` namespace for deriving re-attach tool-use ids from the
+/// original tool-use id. Deterministic derivation makes the re-park
+/// idempotent across a lease-expiry requeue: re-running the steering
+/// exchange from the durable steering `ReadyToResume` state re-issues the
+/// identical ids, so a crash between the wake and the re-park never
+/// orphans or duplicates a binding.
+const STEERING_REATTACH_NAMESPACE: Uuid =
+    Uuid::from_u128(0x9c47_5a17_e2b1_4f3d_8a6c_0b1e_5d90_2f7a);
+
+/// Derive the re-issued tool-use id for a still-running child from its
+/// current tool-use id. Stable across retries and distinct across
+/// wake generations (each generation derives from the previous id).
+pub(crate) fn derive_reattach_tool_use_id(original_id: &str) -> String {
+    Uuid::new_v5(&STEERING_REATTACH_NAMESPACE, original_id.as_bytes()).to_string()
+}
+
+/// Typed interim tool-result payload for a child that is still running
+/// when a steering wake fans in. Honest — never a fabricated child
+/// result — the coordinator sees the child has not finished and that
+/// its real result will arrive at the next fan-in.
+fn steering_interim_tool_result() -> ToolResult {
+    let payload = serde_json::json!({
+        "status": "running",
+        "note": "child is still executing; its final result will follow at the next fan-in",
+    });
+    ToolResult {
+        success: true,
+        output: payload.to_string(),
+        data: None,
+        documents: Vec::new(),
+        duration_ms: None,
+    }
+}
+
+/// A child still running at steering-wake time that must re-attach
+/// under a freshly re-issued tool-use id.
+struct SurvivingChild {
+    /// Child task id — its journal binding is preserved (never
+    /// re-spawned).
+    child_id: AgentTaskId,
+    /// Index into the *original* continuation's `pending_tool_calls`
+    /// this child resolved. Used to look up its tool name/input for the
+    /// re-issued binding.
+    pending_index: usize,
+}
+
+/// Bundle of everything the steering LLM round + re-park consumes,
+/// grouped so [`run_steering_exchange`] stays within the argument-count
+/// budget.
+struct SteeringExchange {
+    /// The original (unchanged) continuation from the parked batch.
+    continuation: AgentContinuation,
+    /// Messages buffered at the original suspension point.
+    suspended_messages: Vec<llm::Message>,
+    /// Opaque steering content appended to the interim user message.
+    steering: Vec<llm::ContentBlock>,
+    /// Interim fan-in plan (results for every pending id + survivors).
+    interim: SteeringInterim,
+}
+
+/// Interim fan-in plan built at steering-wake time.
+struct SteeringInterim {
+    /// One `(tool_use_id, ToolResult)` per original pending tool call,
+    /// in pending order: real payloads for finished children, typed
+    /// `status: running` payloads for still-running children. Every
+    /// pending id is present — the wire contract forbids a partial
+    /// fan-in.
+    interim_results: Vec<(String, ToolResult)>,
+    /// Still-running children, in pending order.
+    surviving: Vec<SurvivingChild>,
+}
+
+/// Build the interim fan-in: read every parked child, emit a real or
+/// typed-interim tool result for each pending tool-use id, and collect
+/// the still-running children that will re-attach.
+async fn build_steering_interim(
+    continuation: &AgentContinuation,
+    child_ids: &[AgentTaskId],
+    task_store: &dyn AgentTaskStore,
+) -> Result<SteeringInterim> {
+    let pending = &continuation.pending_tool_calls;
+
+    // Map spawn_index → child from the parked batch.
+    let mut by_index: BTreeMap<usize, AgentTask> = BTreeMap::new();
+    for child_id in child_ids {
+        let child = task_store
+            .get(child_id)
+            .await
+            .with_context(|| format!("read steering child {child_id}"))?
+            .with_context(|| format!("steering child {child_id} does not exist"))?;
+        let spawn_index = child
+            .spawn_index
+            .context("steering child missing spawn_index")?;
+        let idx = usize::try_from(spawn_index).context("spawn_index exceeds usize")?;
+        by_index.insert(idx, child);
+    }
+
+    let mut interim_results = Vec::with_capacity(pending.len());
+    let mut surviving = Vec::new();
+    for (idx, call) in pending.iter().enumerate() {
+        let child = by_index.get(&idx).with_context(|| {
+            format!("steering wake: no child resolves pending tool call at index {idx}")
+        })?;
+        if child.status.is_terminal() {
+            // Finished during the wave — fold its real, already-augmented
+            // result into the coordinator's history now.
+            let result = extract_child_tool_result(child)?;
+            interim_results.push((call.id.clone(), result));
+        } else {
+            interim_results.push((call.id.clone(), steering_interim_tool_result()));
+            surviving.push(SurvivingChild {
+                child_id: child.id.clone(),
+                pending_index: idx,
+            });
+        }
+    }
+
+    Ok(SteeringInterim {
+        interim_results,
+        surviving,
+    })
+}
+
+/// Build the one user message the steering LLM call sees: an interim
+/// tool-result block for every pending tool-use id, followed by the
+/// drained steering content. Exactly one user message keeps the
+/// alternating-role wire contract intact.
+fn build_steering_resume_message(
+    interim_results: &[(String, ToolResult)],
+    steering: &[llm::ContentBlock],
+) -> llm::Message {
+    let mut blocks: Vec<llm::ContentBlock> = interim_results
+        .iter()
+        .map(|(tool_use_id, result)| llm::ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: result.output.clone(),
+            is_error: if result.success { None } else { Some(true) },
+        })
+        .collect();
+    blocks.extend(steering.iter().cloned());
+    llm::Message::user_with_content(blocks)
+}
+
+/// Build the re-attach bindings for the still-running children: one
+/// [`PendingToolCallInfo`] (dense-ordered) plus its matching assistant
+/// `ToolUse` content block, both keyed by a freshly re-issued
+/// deterministic tool-use id.
+fn build_steering_reattach(
+    prior: &AgentContinuation,
+    surviving: &[SurvivingChild],
+) -> Result<(Vec<PendingToolCallInfo>, Vec<llm::ContentBlock>)> {
+    let mut pending = Vec::with_capacity(surviving.len());
+    let mut blocks = Vec::with_capacity(surviving.len());
+    for child in surviving {
+        let orig = prior
+            .pending_tool_calls
+            .get(child.pending_index)
+            .with_context(|| {
+                format!(
+                    "steering re-attach: pending index {} out of bounds",
+                    child.pending_index
+                )
+            })?;
+        let new_id = derive_reattach_tool_use_id(&orig.id);
+        pending.push(PendingToolCallInfo {
+            id: new_id.clone(),
+            name: orig.name.clone(),
+            display_name: orig.display_name.clone(),
+            tier: orig.tier,
+            input: orig.input.clone(),
+            effective_input: orig.effective_input.clone(),
+            listen_context: orig.listen_context.clone(),
+        });
+        blocks.push(llm::ContentBlock::ToolUse {
+            id: new_id,
+            name: orig.name.clone(),
+            input: orig.input.clone(),
+            thought_signature: None,
+        });
+    }
+    Ok((pending, blocks))
+}
+
+/// Build the combined assistant message re-parked into history: the
+/// model's answer (text / thinking only — any tool-use it emitted is
+/// dropped, since a steering reply is text and the re-park owns the
+/// tool-use batch) followed by the synthetic re-attach `ToolUse`
+/// blocks.
+fn build_steering_assistant_message(
+    response: &llm::ChatResponse,
+    reattach_blocks: Vec<llm::ContentBlock>,
+) -> llm::Message {
+    let mut blocks: Vec<llm::ContentBlock> = response
+        .content
+        .iter()
+        .filter(|block| {
+            matches!(
+                block,
+                llm::ContentBlock::Text { .. }
+                    | llm::ContentBlock::Thinking { .. }
+                    | llm::ContentBlock::RedactedThinking { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    blocks.extend(reattach_blocks);
+    llm::Message {
+        role: llm::Role::Assistant,
+        content: llm::Content::Blocks(blocks),
+    }
+}
+
+/// Build the re-parked continuation: accumulate usage, swap in the
+/// re-issued pending tool calls, keep the same turn number (the mission
+/// turn has not completed).
+fn build_steering_continuation(
+    prior: &AgentContinuation,
+    response: &llm::ChatResponse,
+    reattach_pending: Vec<PendingToolCallInfo>,
+) -> ContinuationEnvelope {
+    let response_usage = response_token_usage(response);
+    let mut turn_usage = prior.turn_usage.clone();
+    turn_usage.add(&response_usage);
+    let mut total_usage = prior.state.total_usage.clone();
+    total_usage.add(&response_usage);
+    let updated_state = AgentState {
+        total_usage: total_usage.clone(),
+        ..prior.state.clone()
+    };
+    ContinuationEnvelope::wrap(AgentContinuation {
+        thread_id: prior.thread_id.clone(),
+        turn: prior.turn,
+        total_usage,
+        turn_usage,
+        pending_tool_calls: reattach_pending,
+        awaiting_index: 0,
+        completed_results: Vec::new(),
+        state: updated_state,
+        response_id: sanitized_response_id(response),
+        stop_reason: response.stop_reason,
+        response_content: response.content.clone(),
+    })
+}
+
+/// Resume a parent woken for a steering exchange.
+///
+/// The parent is a [`TaskState::ReadyToResume`] row carrying a
+/// non-empty `steering` payload; this runs one bounded LLM round and
+/// then deterministically re-parks on the still-running children.
+///
+/// This is the R2 "steering wake" entry point (sibling of
+/// [`resume_from_children`]). Unlike the all-at-once fan-in, it fires
+/// while children are still running: the host acquired the `Pending`
+/// row a steering-wake sweep produced via
+/// [`AgentTaskStore::enqueue_steering_resume`], so the parent is now
+/// `Running` and this worker owns its lease.
+///
+/// The exchange:
+///
+/// 1. Reads every parked child and builds ONE user message carrying an
+///    interim tool-result for **every** pending tool-use id (real
+///    payloads for finished children, typed `status: running` payloads
+///    for still-running ones) followed by the drained steering content.
+///    The wire contract is preserved — no pending id is omitted.
+/// 2. Calls the LLM once (bounded — the founder-accepted "one extra
+///    round per steering exchange").
+/// 3. If children are still running, re-issues deterministic synthetic
+///    tool-use ids for them, appends a combined assistant message
+///    (the answer + the re-attach batch) to the durable history, and
+///    re-parks via [`AgentTaskStore::repark_after_steering`] — the
+///    still-running children re-bind to the new ids by `spawn_index`,
+///    so their eventual real results reach the coordinator with nothing
+///    lost or duplicated. No child is cancelled, re-spawned, or
+///    re-counted.
+/// 4. If every child already finished, commits the answer as the
+///    completed turn (the ordinary text-only resume commit).
+///
+/// # Errors
+/// - Parent is not a `ReadyToResume` row with a steering payload.
+/// - Interim construction fails (a pending id with no resolving child).
+/// - The LLM call, event commit, re-park, or commit fails.
+pub async fn resume_for_steering(
+    inputs: RootWorkerInputs,
+    parent: &AgentTask,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    // An early steering resume is a `ReadyToResume` row carrying a
+    // non-empty `steering` payload (the overload that keeps the durable
+    // `kind` unchanged). An empty steering payload is an ordinary
+    // fan-in and must go through `resume_from_children` instead.
+    let (continuation, suspended_messages, child_ids, steering) = match &parent.state {
+        TaskState::ReadyToResume {
+            continuation,
+            suspended_messages,
+            child_ids,
+            steering,
+        } if !steering.is_empty() => (
+            continuation.payload.clone(),
+            suspended_messages.clone(),
+            child_ids.clone(),
+            steering.clone(),
+        ),
+        other => bail!(
+            "resume_for_steering requires a ReadyToResume state with a steering payload, got {:?}",
+            std::mem::discriminant(other),
+        ),
+    };
+
+    let interim = build_steering_interim(&continuation, &child_ids, deps.task_store)
+        .await
+        .context("build steering interim fan-in")?;
+
+    // Box-pin the heavy body so `resume_for_steering`'s own future
+    // stays under the `clippy::large_futures` threshold — same pattern
+    // `resume_from_children` uses.
+    Box::pin(run_steering_exchange(
+        inputs,
+        SteeringExchange {
+            continuation,
+            suspended_messages,
+            steering,
+            interim,
+        },
+        provider,
+        deps,
+        now,
+    ))
+    .await
+}
+
+async fn run_steering_exchange(
+    inputs: RootWorkerInputs,
+    exchange: SteeringExchange,
+    provider: &dyn LlmProvider,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let SteeringExchange {
+        continuation,
+        suspended_messages,
+        steering,
+        interim,
+    } = exchange;
+
+    // Stage the interim fan-in + steering note and run one bounded LLM
+    // round.
+    let steering_message = build_steering_resume_message(&interim.interim_results, &steering);
+    let StreamedTurn {
+        response,
+        content_ids,
+        attempt,
+    } = stage_and_call_steering_llm(
+        &inputs,
+        deps,
+        provider,
+        &suspended_messages,
+        &steering_message,
+        &continuation.state,
+        now,
+    )
+    .await?;
+    let commit_now = OffsetDateTime::now_utc();
+
+    // Every child already finished: the interim message carried all
+    // real results, so the steering answer resolves the turn.
+    if interim.surviving.is_empty() {
+        // A steering reply that itself acts on the redirect ("change of
+        // plan: also do X") emits tool_use. With no survivors to
+        // re-attach, there is no re-park batch to conflict with, so we
+        // mirror the ordinary resume path and spawn the follow-up wave
+        // instead of dropping the tool_use and force-completing the
+        // mission turn (which `commit_resumed_turn` would do via
+        // `build_assistant_message`'s tool_use filter). The steering
+        // user message (interim results + note) is threaded into the
+        // replay history so the directive survives for the next resume.
+        if response.has_tool_use() {
+            let mut history_prefix = suspended_messages;
+            history_prefix.push(steering_message);
+            return suspend_resumed_turn(
+                inputs,
+                ResumeSuspension {
+                    continuation: &continuation,
+                    history_prefix,
+                },
+                response,
+                attempt,
+                deps,
+                commit_now,
+                &content_ids,
+            )
+            .await;
+        }
+
+        // Text-only steering answer: the ordinary text-only resume
+        // commit completes the mission turn.
+        return commit_resumed_turn(
+            inputs,
+            &continuation,
+            &response,
+            &attempt,
+            deps,
+            commit_now,
+            &content_ids,
+        )
+        .await;
+    }
+
+    // Otherwise re-park on the still-running children under fresh bindings.
+    repark_after_steering_exchange(
+        &inputs,
+        deps,
+        SteeringRepark {
+            continuation,
+            suspended_messages,
+            steering_message,
+            surviving: interim.surviving,
+            response,
+            content_ids,
+            attempt,
+        },
+        commit_now,
+    )
+    .await
+}
+
+/// Open a resume-style turn attempt, buffer the steering transcript
+/// into the staged stores, and stream one bounded LLM round. Returns
+/// the streamed turn (response + content ids + successful attempt).
+///
+/// Mirrors the resume path's setup: no fresh `Start` event (the
+/// original turn's `Start` anchors replay), pre-call auto-compaction on
+/// the committed-only seed, and the resume sentinel user input so
+/// `build_chat_request` appends no extra prompt.
+async fn stage_and_call_steering_llm(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    provider: &dyn LlmProvider,
+    suspended_messages: &[llm::Message],
+    steering_message: &llm::Message,
+    state: &AgentState,
+    now: OffsetDateTime,
+) -> Result<StreamedTurn> {
+    let definition = inputs.definition();
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    let resume_input = super::user_input::UserInput::resume();
+    let resume_audit = resume_input.audit_summary();
+    let attempt = open_attempt(
+        inputs,
+        definition,
+        &resume_audit,
+        deps.attempt_store,
+        now,
+        None,
+    )
+    .await
+    .context("open steering resume turn attempt")?;
+
+    #[cfg(feature = "otel")]
+    let resume_root_cx = load_root_span_ids(deps.attempt_store, &inputs.bootstrap.task_id)
+        .await
+        .and_then(|(trace, span)| {
+            agent_sdk::observability::loop_instrument::remote_parent_context(&trace, &span)
+        });
+
+    // Pre-call auto-compaction on the committed-only seed (same
+    // contract as the resume path). No-op when unconfigured.
+    super::compaction::maybe_compact_staged_history(
+        deps,
+        &inputs.staged_stores.messages,
+        thread_id,
+        now,
+    )
+    .await
+    .context("pre-call auto-compaction (steering resume path)")?;
+
+    // Buffer suspended messages + the interim-results-and-steering user
+    // message on top of the committed seed, and refresh the recovery
+    // draft with the full in-flight transcript.
+    for msg in suspended_messages {
+        inputs
+            .staged_stores
+            .messages
+            .append(thread_id, msg.clone())
+            .await
+            .context("append suspended message (steering)")?;
+    }
+    inputs
+        .staged_stores
+        .messages
+        .append(thread_id, steering_message.clone())
+        .await
+        .context("append steering interim + note message")?;
+    inputs
+        .staged_stores
+        .state
+        .save(state)
+        .await
+        .context("save continuation agent state (steering)")?;
+    let mut draft = suspended_messages.to_vec();
+    draft.push(steering_message.clone());
+    snapshot_suspension_draft(
+        deps,
+        thread_id,
+        &inputs.bootstrap.task_id,
+        draft,
+        now,
+        "snapshot steering resume draft",
+    )
+    .await;
+
+    let chat_request = build_chat_request(
+        definition,
+        &inputs.staged_stores.messages,
+        thread_id,
+        &resume_input,
+        inputs.bootstrap.task.caller_metadata.as_ref(),
+    )
+    .await
+    .context("build steering resume chat request")?;
+
+    let llm_call = call_llm_with_retry(LlmRetryParams {
+        inputs,
+        definition,
+        user_input: &resume_input,
+        attempt_audit_prompt: &resume_audit,
+        provider,
+        chat_request,
+        initial_attempt: attempt,
+        deps,
+        thread_id,
+        now,
+    });
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::trace::FutureExt;
+        match resume_root_cx {
+            Some(cx) => llm_call.with_context(cx).await,
+            None => llm_call.await,
+        }
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        llm_call.await
+    }
+}
+
+/// Everything the steering re-park tail consumes, grouped so
+/// [`repark_after_steering_exchange`] stays within the argument-count
+/// budget.
+struct SteeringRepark {
+    continuation: AgentContinuation,
+    suspended_messages: Vec<llm::Message>,
+    steering_message: llm::Message,
+    surviving: Vec<SurvivingChild>,
+    response: llm::ChatResponse,
+    content_ids: ContentIds,
+    attempt: TurnAttempt,
+}
+
+/// Re-park a running steering exchange on the still-running children:
+/// close the attempt, re-issue deterministic tool-use ids, append the
+/// combined assistant answer + re-attach batch to the durable history,
+/// re-park via [`AgentTaskStore::repark_after_steering`], and commit the
+/// answer's content events so the user sees the mid-wave reply.
+async fn repark_after_steering_exchange(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    repark: SteeringRepark,
+    now: OffsetDateTime,
+) -> Result<RootTurnOutcome> {
+    let SteeringRepark {
+        continuation,
+        suspended_messages,
+        steering_message,
+        surviving,
+        response,
+        content_ids,
+        attempt,
+    } = repark;
+    let thread_id = &inputs.bootstrap.thread_id;
+
+    if response.has_tool_use() {
+        log::warn!(
+            "steering resume on thread {thread_id}: model emitted tool_use in a steering \
+             reply; dropping it — a steering exchange is bounded to a reply and the re-park \
+             owns the tool-use batch. Directives take effect at the next fan-in.",
+        );
+    }
+
+    // Close the attempt — the LLM call itself succeeded.
+    close_attempt_or_propagate_already_closed(
+        &attempt,
+        &response,
+        deps,
+        "close attempt on steering re-park",
+        now,
+    )
+    .await?;
+
+    let (reattach_pending, reattach_blocks) = build_steering_reattach(&continuation, &surviving)
+        .context("build steering re-attach bindings")?;
+    let reattach_child_ids: Vec<AgentTaskId> =
+        surviving.iter().map(|c| c.child_id.clone()).collect();
+
+    let assistant_message = build_steering_assistant_message(&response, reattach_blocks);
+    let new_continuation = build_steering_continuation(&continuation, &response, reattach_pending);
+
+    // Full replay history for the re-parked continuation: original
+    // suspended messages + interim/steering user message + combined
+    // assistant answer with the re-attach batch.
+    let mut new_suspended = Vec::with_capacity(suspended_messages.len() + 2);
+    new_suspended.extend(suspended_messages);
+    new_suspended.push(steering_message);
+    new_suspended.push(assistant_message);
+
+    let payload = SuspensionPayload {
+        continuation: new_continuation,
+        suspended_messages: new_suspended.clone(),
+    };
+    let reparked = deps
+        .task_store
+        .repark_after_steering(
+            &inputs.bootstrap.task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            payload,
+            reattach_child_ids,
+            now,
+        )
+        .await
+        .context("re-park parent after steering exchange")?;
+
+    // Refresh the projection draft with the re-parked transcript so a
+    // recovery before the next fan-in surfaces the full history.
+    snapshot_suspension_draft(
+        deps,
+        thread_id,
+        &inputs.bootstrap.task_id,
+        new_suspended,
+        now,
+        "refresh steering re-park draft",
+    )
+    .await;
+
+    // Commit the answer's content events so the user sees the mid-wave
+    // reply. No `TurnComplete` / `Done` — the mission turn is still
+    // parked. No `ToolCallStart` for the re-attach batch — those are
+    // synthetic re-bindings, not new tool starts.
+    let content_events = build_content_events(&response, &content_ids);
+    let committed_events = if content_events.is_empty() {
+        Vec::new()
+    } else {
+        deps.event_repo
+            .commit_event_batch(thread_id, content_events, now)
+            .await
+            .context("commit steering answer content events")?
+    };
+
+    Ok(RootTurnOutcome::Suspended {
+        parent_task: reparked,
+        child_tasks: Vec::new(),
+        committed_events,
+    })
 }

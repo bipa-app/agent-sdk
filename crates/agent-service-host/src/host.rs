@@ -64,7 +64,7 @@ use agent_server::worker::{
     AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
     execute_subagent_task, fail_root_turn, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
-    resume_from_children,
+    resume_for_steering, resume_from_children, revert_steering_wake,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -1130,7 +1130,23 @@ async fn execute_root_task(
             .await
             .context("resolve runtime provider")?;
 
-        if matches!(task.state, TaskState::ReadyToResume { .. }) {
+        if task.state.is_steering_resume() {
+            // R2 steering wake: a mailbox note woke this parked parent
+            // early (a `ReadyToResume` row carrying a steering payload).
+            // Answer with interim child results, then re-park on the
+            // still-running children. The spawn selector is not
+            // consulted — the re-park re-binds existing children rather
+            // than spawning new ones.
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector_and_compaction(
+                selector.as_ref(),
+                runtime.compaction_config(),
+                runtime.compaction_config().map(|_| &provider),
+            );
+            resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
+                .await
+                .context("resume parked root task for steering wake")
+        } else if matches!(task.state, TaskState::ReadyToResume { .. }) {
             let selector = runtime.subagent_spawn_selector();
             let deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),
@@ -1175,18 +1191,115 @@ async fn execute_root_task(
             publish_events(stores, &committed_events);
             Ok(())
         }
-        Err(err) => {
-            warn!(
-                task_id = %task.id,
-                thread_id = %task.thread_id,
-                error = %err,
-                "root task execution failed; marking task failed",
-            );
-            fail_root_task(stores, &task, &err, error_watermark, now).await?;
-            promote_next_root(stores, &task, now).await?;
-            Ok(())
+        Err(err) => fail_or_revert_root_task(stores, &task, &err, error_watermark, now).await,
+    }
+}
+
+/// Handle a failed root-task execution.
+///
+/// A steering wake ([`TaskState::ReadyToResume`] with a non-empty
+/// steering payload) that fails mid-exchange must NOT fail the parent:
+/// its mission children are still RUNNING and `fail_task` does not
+/// cascade, so failing here would strand those workers and orphan their
+/// eventual results. Such a failure is reverted to the pre-wake parked
+/// state (see [`revert_failed_steering_wake`]) so the ordinary fan-in
+/// resumes the mission when the children finish. Any other failure — or
+/// a revert that itself fails — marks the root `Failed` and promotes the
+/// next queued root.
+async fn fail_or_revert_root_task(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    err: &anyhow::Error,
+    error_watermark: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    if task.state.is_steering_resume() {
+        match revert_failed_steering_wake(stores, task, err, error_watermark, now).await {
+            // Reverted (or the lease had already moved on) — the root is
+            // not terminal, so do not promote a successor.
+            Ok(()) => return Ok(()),
+            Err(revert_err) => {
+                warn!(
+                    task_id = %task.id,
+                    thread_id = %task.thread_id,
+                    steering_error = %err,
+                    revert_error = %revert_err,
+                    "steering wake revert failed; falling back to failing the root task",
+                );
+                // Fall through to the ordinary fail path.
+            }
         }
     }
+    warn!(
+        task_id = %task.id,
+        thread_id = %task.thread_id,
+        error = %err,
+        "root task execution failed; marking task failed",
+    );
+    fail_root_task(stores, task, err, error_watermark, now).await?;
+    promote_next_root(stores, task, now).await?;
+    Ok(())
+}
+
+/// Revert a failed steering wake back to its pre-wake parked state so
+/// its still-running mission children are not stranded.
+///
+/// Re-reads the row first: if the lease has moved on (a sweep requeued
+/// it, another worker re-acquired, or the row is no longer a steering
+/// resume) this skips cleanly and leaves the terminal decision to
+/// whoever owns the row — the same ownership guard [`fail_root_task`]
+/// uses. On the owned path it delegates to
+/// [`revert_steering_wake`](agent_server::worker::revert_steering_wake),
+/// which re-parks on the original children and surfaces the failure as
+/// an event, then publishes the newly committed events.
+///
+/// Returns `Ok(())` whether the revert ran or was skipped; the caller
+/// must not promote a successor either way because the root is not
+/// terminal. Propagates only genuine store errors so the caller can
+/// fall back to failing the task.
+async fn revert_failed_steering_wake(
+    stores: &StoreRegistry,
+    task: &AgentTask,
+    error: &anyhow::Error,
+    event_watermark: u64,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    let (worker_id, lease_id) = running_lease(task)?;
+
+    let current = stores
+        .task_store
+        .get(&task.id)
+        .await
+        .context("re-read steering task before revert")?;
+    let still_owned = current.as_ref().is_some_and(|t| {
+        t.status == TaskStatus::Running
+            && t.worker_id.as_ref() == Some(&worker_id)
+            && t.lease_id.as_ref() == Some(&lease_id)
+            && t.state.is_steering_resume()
+    });
+    let Some(current) = current.filter(|_| still_owned) else {
+        warn!(
+            task_id = %task.id,
+            thread_id = %task.thread_id,
+            "skip steering revert: lease no longer owned or row is no longer a steering resume",
+        );
+        return Ok(());
+    };
+
+    revert_steering_wake(
+        &current,
+        &worker_id,
+        &lease_id,
+        error,
+        &stores.root_turn_deps(),
+        now,
+    )
+    .await
+    .context("revert failed steering wake")?;
+
+    let new_events = newly_committed_events(stores, &task.thread_id, event_watermark).await?;
+    publish_events(stores, &new_events);
+    Ok(())
 }
 
 async fn execute_tool_task(

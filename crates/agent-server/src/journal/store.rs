@@ -830,6 +830,91 @@ pub trait AgentTaskStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
+    /// Wake a parent parked in [`TaskStatus::WaitingOnChildren`] for an
+    /// early **steering** resume (R2), atomically flipping it to
+    /// [`TaskStatus::Pending`] with a
+    /// [`crate::journal::TaskState::ReadyToResume`] payload carrying a
+    /// non-empty `steering` block (the overload that keeps the durable
+    /// state `kind` unchanged).
+    ///
+    /// This is the host-driven entry point a steering-wake sweep calls
+    /// when its mailbox is non-empty and the parent is parked. The
+    /// transition is a single CAS on the parent's status:
+    ///
+    /// - If the parent is in [`TaskStatus::WaitingOnChildren`], it is
+    ///   moved to `Pending` + `ReadyToResume{ steering }` (dropping
+    ///   `pending_child_count` to zero) and `Ok(Some(parent))` is
+    ///   returned. A worker then acquires the `Pending` row and runs
+    ///   [`crate::worker::resume_for_steering`].
+    /// - If the parent is in **any other status** (already woken,
+    ///   running its exchange, already fanned in to `ReadyToResume`,
+    ///   or terminal), the wake is a no-op and `Ok(None)` is returned.
+    ///   This makes the sweep idempotent and closes the double-resume
+    ///   race: if the last child fans the parent in to `ReadyToResume`
+    ///   first, the wake simply declines and the ordinary resume path
+    ///   delivers the steering note at that boundary instead.
+    ///
+    /// # Errors
+    /// - `steering content must be non-empty` — an empty payload is
+    ///   ambiguous with an ordinary fan-in and is rejected.
+    /// - `task does not exist` — if no row with `parent_id` is stored.
+    /// - Row-level errors from
+    ///   [`AgentTask::begin_steering_resume`].
+    async fn enqueue_steering_resume(
+        &self,
+        parent_id: &AgentTaskId,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>>;
+
+    /// Re-park a running steering exchange (a
+    /// [`crate::journal::TaskState::ReadyToResume`] row whose `steering`
+    /// payload is set) on the still-running children, updating each
+    /// re-attach child's
+    /// `spawn_index` to its position in the new continuation's
+    /// `pending_tool_calls` and transitioning the parent back to
+    /// [`TaskStatus::WaitingOnChildren`] (or straight to
+    /// [`TaskStatus::Pending`] + [`crate::journal::TaskState::ReadyToResume`]
+    /// when every re-attach child has already finished).
+    ///
+    /// A successful call, under a single write:
+    ///
+    /// 1. CAS-checks the parent exists, is in [`TaskStatus::Running`],
+    ///    is owned by `(worker, lease)`, and carries a steering
+    ///    `ReadyToResume` state (non-empty `steering`).
+    /// 2. Rewrites `reattach[i].spawn_index = i` for every re-attach
+    ///    child so the ordinary fan-in aggregation maps them onto the
+    ///    new continuation's tool-use ids.
+    /// 3. Derives the live child count from the journal (non-terminal
+    ///    children among `reattach`) and re-parks the parent via
+    ///    [`AgentTask::repark_after_steering`], dropping the lease.
+    ///
+    /// `reattach` is the ordered list of still-running child ids; the
+    /// new `child_ids` recorded on the parent equals `reattach`. The
+    /// completed children from the parked batch are intentionally
+    /// dropped from the parent's tracked `child_ids` (their real
+    /// results were already folded into the steering LLM history).
+    ///
+    /// # Errors
+    /// - `repark rejected: task does not exist` — no row with
+    ///   `parent_id`.
+    /// - `repark rejected: not running` / `worker mismatch` / `lease
+    ///   mismatch` — CAS failure.
+    /// - `repark rejected: not a steering resume` — the row is running
+    ///   but not in `SteeringResume`.
+    /// - `repark rejected: re-attach child … missing` — a `reattach`
+    ///   id is not a child of the parent.
+    /// - Row-level errors from [`AgentTask::repark_after_steering`].
+    async fn repark_after_steering(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask>;
+
     /// Pause a running task on a user confirmation, dropping the
     /// lease atomically with the typed-state mutation.
     ///
@@ -2769,6 +2854,134 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.by_id.insert(paused.id.clone(), paused.clone());
         drop(inner);
         Ok(paused)
+    }
+
+    async fn enqueue_steering_resume(
+        &self,
+        parent_id: &AgentTaskId,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        // A steering wake is distinguished from an ordinary fan-in only
+        // by a non-empty steering payload (both share the ReadyToResume
+        // kind). An empty payload would create a ReadyToResume whose
+        // children are still running — a broken fan-in — so reject it.
+        if steering.is_empty() {
+            return Err(anyhow!(
+                "steering wake rejected: steering content must be non-empty"
+            ));
+        }
+        let mut inner = self.inner.write().await;
+        let old =
+            inner.by_id.get(parent_id).cloned().ok_or_else(|| {
+                anyhow!("steering wake rejected: task {parent_id} does not exist")
+            })?;
+
+        // Idempotent CAS: only a parked parent can be woken. Any other
+        // status means the parent already left the WaitingOnChildren
+        // state (a concurrent last-child fan-in reached ReadyToResume,
+        // a prior wake is mid-exchange, or the row is terminal) — the
+        // sweep declines rather than racing.
+        if old.status != TaskStatus::WaitingOnChildren {
+            drop(inner);
+            return Ok(None);
+        }
+
+        let woken = old
+            .clone()
+            .begin_steering_resume(steering, now)
+            .context("steering wake rejected: begin_steering_resume transition failed")?;
+        inner.rebalance_after_row_change(&old, &woken);
+        inner.by_id.insert(woken.id.clone(), woken.clone());
+        drop(inner);
+        Ok(Some(woken))
+    }
+
+    async fn repark_after_steering(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut inner = self.inner.write().await;
+        let old = inner
+            .by_id
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
+
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if !old.state.is_steering_resume() {
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not a steering resume"
+            ));
+        }
+
+        // Re-index the re-attach children to dense spawn_index
+        // positions matching the new continuation's pending_tool_calls
+        // order. Build every updated child row first so a validation
+        // error on any child rolls the whole batch back cleanly.
+        let mut updated_children: Vec<AgentTask> = Vec::with_capacity(reattach.len());
+        for (idx, child_id) in reattach.iter().enumerate() {
+            let mut child =
+                inner.by_id.get(child_id).cloned().ok_or_else(|| {
+                    anyhow!("repark rejected: re-attach child {child_id} missing")
+                })?;
+            if child.parent_id.as_ref() != Some(parent_id) {
+                return Err(anyhow!(
+                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
+                ));
+            }
+            child.spawn_index =
+                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
+            child.updated_at = now;
+            child
+                .validate()
+                .context("repark rejected: re-attach child validate failed")?;
+            updated_children.push(child);
+        }
+        // spawn_index is not an indexed field, so a plain primary-key
+        // overwrite keeps every secondary index consistent.
+        for child in updated_children {
+            inner.by_id.insert(child.id.clone(), child);
+        }
+
+        // Live count is journal-authoritative (matches the completion
+        // path's recompute): a re-attach child that finished during the
+        // steering LLM call is already terminal here and excluded.
+        let live = inner.count_live_children(parent_id);
+        let reparked = old
+            .clone()
+            .repark_after_steering(live, payload, reattach, now)
+            .context("repark rejected: repark_after_steering transition failed")?;
+        inner.rebalance_after_row_change(&old, &reparked);
+        inner.by_id.insert(reparked.id.clone(), reparked.clone());
+        drop(inner);
+        Ok(reparked)
     }
 
     async fn pause_on_confirmation(
@@ -10643,6 +10856,228 @@ mod tests {
             assert_eq!(all[0].status, TaskStatus::Completed);
             assert_eq!(all[0].attempt, 1, "each root touched exactly once");
         }
+        Ok(())
+    }
+
+    // ── R2 steering wake: enqueue_steering_resume / repark_after_steering ──
+
+    /// A non-empty steering payload (a wake requires non-empty content).
+    fn steering_note() -> Vec<agent_sdk_foundation::llm::ContentBlock> {
+        vec![agent_sdk_foundation::llm::ContentBlock::Text {
+            text: "status?".into(),
+        }]
+    }
+
+    /// Park a fresh parent on two tool children (both Pending).
+    async fn parked_with_two_children(
+        store: &InMemoryAgentTaskStore,
+        name: &str,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let (parent, worker, lease) = running_root_for_spawn(store, name).await?;
+        let (parked, children) = store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(2), ChildSpawnSpec::new(2)],
+                SuspensionPayload {
+                    continuation: sample_continuation(name),
+                    suspended_messages: Vec::new(),
+                },
+                None,
+                t_plus(2),
+            )
+            .await
+            .context("spawn tool children")?;
+        Ok((parked, children[0].clone(), children[1].clone()))
+    }
+
+    async fn complete_child(
+        store: &InMemoryAgentTaskStore,
+        child_id: &AgentTaskId,
+        output: &str,
+        secs: i64,
+    ) -> Result<()> {
+        let worker = WorkerId::from_string("w-child");
+        let lease = LeaseId::from_string("l-child");
+        store
+            .try_acquire_task(
+                child_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(secs + 5),
+                t_plus(secs),
+            )
+            .await?
+            .context("acquire child")?;
+        let result = agent_sdk_foundation::ToolResult {
+            success: true,
+            output: output.to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: None,
+        };
+        store
+            .complete_task_with_result(
+                child_id,
+                &worker,
+                &lease,
+                serde_json::to_value(result).context("serialize child result")?,
+                t_plus(secs + 1),
+            )
+            .await
+            .context("complete child")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_steering_resume_declines_when_parent_not_parked() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        // A running root is not WaitingOnChildren — the wake must decline.
+        let (parent, _worker, _lease) = running_root_for_spawn(&store, "t-steer-decline").await?;
+        let out = store
+            .enqueue_steering_resume(
+                &parent.id,
+                vec![agent_sdk_foundation::llm::ContentBlock::Text { text: "hi".into() }],
+                t_plus(5),
+            )
+            .await?;
+        assert!(
+            out.is_none(),
+            "wake must decline a parent that is not parked"
+        );
+        // The row is untouched.
+        let after = store.get(&parent.id).await?.context("parent")?;
+        assert_eq!(after.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repark_after_steering_rejects_bad_cas_and_non_steering_state() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parked, c0, c1) = parked_with_two_children(&store, "t-steer-cas").await?;
+        store
+            .enqueue_steering_resume(&parked.id, steering_note(), t_plus(10))
+            .await?
+            .context("woken")?;
+        let worker = WorkerId::from_string("w-steer");
+        let lease = LeaseId::from_string("l-steer");
+        store
+            .try_acquire_task(
+                &parked.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(900),
+                t_plus(11),
+            )
+            .await?
+            .context("acquire woken parent")?;
+
+        // Wrong lease → CAS reject; the parent is left running.
+        let bad = store
+            .repark_after_steering(
+                &parked.id,
+                &worker,
+                &LeaseId::from_string("l-wrong"),
+                SuspensionPayload {
+                    continuation: sample_continuation("t-steer-cas"),
+                    suspended_messages: Vec::new(),
+                },
+                vec![c0.id.clone(), c1.id.clone()],
+                t_plus(12),
+            )
+            .await;
+        assert!(
+            format!("{:#}", bad.unwrap_err()).contains("lease mismatch"),
+            "wrong lease must be rejected",
+        );
+
+        // A genuinely running root (state None) is not a steering resume.
+        let (running_root, w2, l2) = running_root_for_spawn(&store, "t-not-steer").await?;
+        let err = store
+            .repark_after_steering(
+                &running_root.id,
+                &w2,
+                &l2,
+                SuspensionPayload {
+                    continuation: sample_continuation("t-not-steer"),
+                    suspended_messages: Vec::new(),
+                },
+                Vec::new(),
+                t_plus(13),
+            )
+            .await;
+        assert!(
+            format!("{:#}", err.unwrap_err()).contains("not a steering resume"),
+            "non-steering running row must be rejected",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repark_after_steering_all_children_terminal_goes_ready_to_resume() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parked, c0, c1) = parked_with_two_children(&store, "t-steer-ready").await?;
+        assert_eq!(store.list_children(&parked.id).await?.len(), 2);
+
+        // Wake; then BOTH children finish while the parent sits in
+        // SteeringResume (Pending). The completions must not flip the
+        // parent — the race guard keeps the wake authoritative.
+        store
+            .enqueue_steering_resume(&parked.id, steering_note(), t_plus(10))
+            .await?
+            .context("woken")?;
+        complete_child(&store, &c0.id, "r0", 11).await?;
+        complete_child(&store, &c1.id, "r1", 13).await?;
+        let mid = store.get(&parked.id).await?.context("mid")?;
+        assert_eq!(mid.status, TaskStatus::Pending);
+        assert!(
+            mid.state.is_steering_resume(),
+            "child completions under SteeringResume must not re-flip the parent",
+        );
+
+        // Acquire + re-park: every re-attach child is already terminal,
+        // so live == 0 and the parent lands in ReadyToResume for the
+        // ordinary fan-in. Re-attach in reversed order to prove the
+        // dense spawn_index re-mapping.
+        let worker = WorkerId::from_string("w-steer");
+        let lease = LeaseId::from_string("l-steer");
+        store
+            .try_acquire_task(
+                &parked.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(900),
+                t_plus(20),
+            )
+            .await?
+            .context("acquire woken parent")?;
+        let reparked = store
+            .repark_after_steering(
+                &parked.id,
+                &worker,
+                &lease,
+                SuspensionPayload {
+                    continuation: sample_continuation("t-steer-ready"),
+                    suspended_messages: Vec::new(),
+                },
+                vec![c1.id.clone(), c0.id.clone()],
+                t_plus(21),
+            )
+            .await
+            .context("repark")?;
+        assert_eq!(reparked.status, TaskStatus::Pending);
+        match &reparked.state {
+            TaskState::ReadyToResume { child_ids, .. } => {
+                assert_eq!(child_ids, &vec![c1.id.clone(), c0.id.clone()]);
+            }
+            other => panic!("expected ReadyToResume, got {other:?}"),
+        }
+        // Re-attach order drives the dense spawn_index (c1 → 0, c0 → 1).
+        assert_eq!(store.get(&c1.id).await?.context("c1")?.spawn_index, Some(0));
+        assert_eq!(store.get(&c0.id).await?.context("c0")?.spawn_index, Some(1));
+        // Budget-neutral: the wake / re-park spawned nothing.
+        assert_eq!(store.list_children(&parked.id).await?.len(), 2);
         Ok(())
     }
 }

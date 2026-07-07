@@ -2551,6 +2551,116 @@ impl AgentTaskStore for SqliteDurableStore {
         Ok(paused)
     }
 
+    async fn enqueue_steering_resume(
+        &self,
+        parent_id: &AgentTaskId,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        // A steering wake is distinguished from an ordinary fan-in only
+        // by a non-empty steering payload (both share the ReadyToResume
+        // kind). An empty payload would create a ReadyToResume whose
+        // children are still running — a broken fan-in — so reject it.
+        if steering.is_empty() {
+            return Err(anyhow!(
+                "steering wake rejected: steering content must be non-empty"
+            ));
+        }
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("steering wake rejected: task {parent_id} does not exist"))?;
+
+        // Idempotent CAS: decline unless the parent is still parked.
+        if old.status != TaskStatus::WaitingOnChildren {
+            return Ok(None);
+        }
+
+        let woken = old
+            .clone()
+            .begin_steering_resume(steering, now)
+            .context("steering wake rejected: begin_steering_resume transition failed")?;
+        Self::update_task_tx(&mut tx, &woken).await?;
+        tx.commit()
+            .await
+            .context("commit enqueue_steering_resume")?;
+        Ok(Some(woken))
+    }
+
+    async fn repark_after_steering(
+        &self,
+        parent_id: &AgentTaskId,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        payload: SuspensionPayload,
+        reattach: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let mut tx = self.begin().await?;
+        let old = Self::load_task_tx(&mut tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("repark rejected: task {parent_id} does not exist"))?;
+        if old.status != TaskStatus::Running {
+            let status = old.status;
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not running (status {status:?})"
+            ));
+        }
+        match &old.worker_id {
+            Some(current) if current == worker => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: worker mismatch on task {parent_id}"
+                ));
+            }
+        }
+        match &old.lease_id {
+            Some(current) if current == lease => {}
+            _ => {
+                return Err(anyhow!(
+                    "repark rejected: lease mismatch on task {parent_id}"
+                ));
+            }
+        }
+        if !old.state.is_steering_resume() {
+            return Err(anyhow!(
+                "repark rejected: task {parent_id} is not a steering resume"
+            ));
+        }
+
+        // Re-index the re-attach children to dense spawn_index
+        // positions matching the new continuation's tool-use order.
+        for (idx, child_id) in reattach.iter().enumerate() {
+            let mut child = Self::load_task_tx(&mut tx, child_id)
+                .await?
+                .ok_or_else(|| anyhow!("repark rejected: re-attach child {child_id} missing"))?;
+            if child.parent_id.as_ref() != Some(parent_id) {
+                return Err(anyhow!(
+                    "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
+                ));
+            }
+            child.spawn_index =
+                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
+            child.updated_at = now;
+            child
+                .validate()
+                .context("repark rejected: re-attach child validate failed")?;
+            Self::update_task_tx(&mut tx, &child).await?;
+        }
+
+        // Journal-authoritative live count (matches the completion
+        // path): a re-attach child that finished during the steering
+        // LLM call is already terminal and excluded.
+        let live = Self::load_live_child_count_tx(&mut tx, parent_id).await?;
+        let reparked = old
+            .clone()
+            .repark_after_steering(live, payload, reattach, now)
+            .context("repark rejected: repark_after_steering transition failed")?;
+        Self::update_task_tx(&mut tx, &reparked).await?;
+        tx.commit().await.context("commit repark_after_steering")?;
+        Ok(reparked)
+    }
+
     async fn pause_on_confirmation(
         &self,
         id: &AgentTaskId,
