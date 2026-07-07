@@ -270,6 +270,29 @@ mod in_memory_bundle {
                 .pause_on_children(task_id, worker, lease, child_count, payload, now)
                 .await
         }
+        async fn enqueue_steering_resume(
+            &self,
+            parent_id: &AgentTaskId,
+            steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+            now: OffsetDateTime,
+        ) -> Result<Option<AgentTask>> {
+            self.task
+                .enqueue_steering_resume(parent_id, steering, now)
+                .await
+        }
+        async fn repark_after_steering(
+            &self,
+            parent_id: &AgentTaskId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+            payload: SuspensionPayload,
+            reattach: Vec<AgentTaskId>,
+            now: OffsetDateTime,
+        ) -> Result<AgentTask> {
+            self.task
+                .repark_after_steering(parent_id, worker, lease, payload, reattach, now)
+                .await
+        }
         async fn pause_on_confirmation(
             &self,
             task_id: &AgentTaskId,

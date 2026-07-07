@@ -1166,8 +1166,11 @@ impl AgentTask {
                 to: TaskStatus::Running,
             });
         }
-        // ReadyToResume is a continuation after child completion, not a
-        // new attempt — don't consume the retry budget on resume.
+        // ReadyToResume is a continuation of an in-flight turn (child
+        // fan-in or early steering resume — both share the variant),
+        // not a new attempt — don't consume the retry budget on
+        // acquisition. Budget is charged on lease-release instead (see
+        // `release_lease`), which caps a poisoned resume.
         if !matches!(self.state, TaskState::ReadyToResume { .. }) {
             let next_attempt = self.attempt.saturating_add(1);
             if next_attempt > self.max_attempts {
@@ -1195,15 +1198,16 @@ impl AgentTask {
     /// heartbeat. Note that this does NOT decrement `attempt` — the failed
     /// attempt still counts against the retry budget.
     ///
-    /// When the task is in [`TaskState::ReadyToResume`], `attempt` is
-    /// incremented (capped at `max_attempts`) to bound retries on the
-    /// resume path. Without this bump, a poisoned resume that keeps
-    /// crashing would loop forever because `mark_running` deliberately
-    /// does not consume budget on `ReadyToResume`. The cap matters for
-    /// the legitimate first resume: if the original attempt already
-    /// burned the only budget slot, the recovery matrix sees the
-    /// already-exhausted row and fails it closed instead of reaching
-    /// `mark_running`.
+    /// When the task is in [`TaskState::ReadyToResume`] (an ordinary
+    /// child fan-in or an early steering resume — both share the
+    /// variant), `attempt` is incremented (capped at `max_attempts`) to
+    /// bound retries on the resume path. Without this bump, a poisoned
+    /// resume that keeps crashing would loop forever because
+    /// `mark_running` deliberately does not consume budget on
+    /// `ReadyToResume`. The cap matters for the legitimate first
+    /// resume: if the original attempt already burned the only budget
+    /// slot, the recovery matrix sees the already-exhausted row and
+    /// fails it closed instead of reaching `mark_running`.
     ///
     /// # Errors
     /// Returns [`TaskSchemaError::InvalidTransition`] if the task is not in
@@ -1320,6 +1324,8 @@ impl AgentTask {
                     continuation,
                     suspended_messages,
                     child_ids,
+                    // A child fan-in carries no steering note.
+                    steering: Vec::new(),
                 },
                 // Defensive: if state is somehow not WaitingOnChildren,
                 // clear it. This shouldn't happen because the status
@@ -1382,11 +1388,146 @@ impl AgentTask {
                     continuation,
                     suspended_messages,
                     child_ids,
+                    // A child fan-in carries no steering note.
+                    steering: Vec::new(),
                 },
                 TaskState::SubagentInvocation { invocation } => {
                     TaskState::SubagentInvocation { invocation }
                 }
                 other => other,
+            };
+        }
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Wake a parent parked in [`TaskStatus::WaitingOnChildren`] for an
+    /// early **steering** resume (R2). Flips the row to
+    /// [`TaskStatus::Pending`] with a [`TaskState::ReadyToResume`]
+    /// payload whose `steering` block is **non-empty** — the overload
+    /// that keeps the durable state `kind` unchanged — carrying the
+    /// original continuation, suspended messages, child ids, and the
+    /// opaque `steering` content the host wants answered.
+    ///
+    /// `pending_child_count` is dropped to zero because the row is no
+    /// longer in `WaitingOnChildren`: a child that completes after this
+    /// transition therefore takes the "parent not waiting" branch in
+    /// the completion path and can no longer flip the parent to
+    /// [`TaskState::ReadyToResume`]. That is the race guard — exactly
+    /// one of {steering wake, last-child fan-in} wins the CAS, never
+    /// both. The still-running children keep running; the eventual
+    /// re-park recomputes the live count from the journal.
+    ///
+    /// # Errors
+    /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
+    ///   [`TaskStatus::WaitingOnChildren`].
+    pub fn begin_steering_resume(
+        mut self,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::WaitingOnChildren {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        }
+        // The status guard above guarantees WaitingOnChildren; the
+        // else arm defends the state ↔ status invariant.
+        let TaskState::WaitingOnChildren {
+            continuation,
+            suspended_messages,
+            child_ids,
+        } = self.state
+        else {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        };
+        self.status = TaskStatus::Pending;
+        self.pending_child_count = 0;
+        self.worker_id = None;
+        self.lease_id = None;
+        self.lease_expires_at = None;
+        self.last_heartbeat_at = None;
+        // Reuse the ReadyToResume variant with a non-empty `steering`
+        // payload: the durable `kind` stays `ready_to_resume` so no
+        // backend CHECK-constraint migration is needed, and the worker
+        // dispatches to the steering exchange because `steering` is set.
+        self.state = TaskState::ReadyToResume {
+            continuation,
+            suspended_messages,
+            child_ids,
+            steering,
+        };
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Re-park a running steering exchange (a `ReadyToResume` row whose
+    /// `steering` payload is set) on the still-running children.
+    ///
+    /// `live_children` is the authoritative count of the re-attach
+    /// children that are still non-terminal, derived from the journal
+    /// at re-park time (never a caller-maintained running total). The
+    /// `payload` carries the *new* continuation whose
+    /// `pending_tool_calls` are the freshly re-issued tool-use ids, plus
+    /// the full replay history (original suspended messages + interim
+    /// tool-results message + assistant answer + the synthetic re-attach
+    /// assistant message). `child_ids` is the re-attach set.
+    ///
+    /// - `live_children > 0`: the parent parks again in
+    ///   [`TaskStatus::WaitingOnChildren`] so the remaining children's
+    ///   completions eventually fan back in.
+    /// - `live_children == 0`: every re-attach child already finished
+    ///   (e.g. during the steering LLM call) so the parent goes straight
+    ///   to [`TaskStatus::Pending`] with [`TaskState::ReadyToResume`] and
+    ///   the ordinary resume path materializes the final answer.
+    ///
+    /// Either way the lease is dropped atomically with the transition.
+    ///
+    /// # Errors
+    /// - [`TaskSchemaError::InvalidTransition`] if the task is not in
+    ///   [`TaskStatus::Running`].
+    pub fn repark_after_steering(
+        mut self,
+        live_children: u32,
+        payload: SuspensionPayload,
+        child_ids: Vec<AgentTaskId>,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::Running {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        }
+        self.worker_id = None;
+        self.lease_id = None;
+        self.lease_expires_at = None;
+        self.last_heartbeat_at = None;
+        if live_children > 0 {
+            self.status = TaskStatus::WaitingOnChildren;
+            self.pending_child_count = live_children;
+            self.state = TaskState::WaitingOnChildren {
+                continuation: Box::new(payload.continuation),
+                suspended_messages: payload.suspended_messages,
+                child_ids,
+            };
+        } else {
+            self.status = TaskStatus::Pending;
+            self.pending_child_count = 0;
+            // Empty `steering` → an ordinary fan-in on the next
+            // acquisition (`resume_from_children`), since every
+            // re-attach child is already terminal.
+            self.state = TaskState::ReadyToResume {
+                continuation: Box::new(payload.continuation),
+                suspended_messages: payload.suspended_messages,
+                child_ids,
+                steering: Vec::new(),
             };
         }
         self.updated_at = now;
@@ -2038,6 +2179,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            steering: Vec::new(),
         };
 
         let err = task

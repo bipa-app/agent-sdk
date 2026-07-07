@@ -194,6 +194,29 @@ pub enum TaskState {
     /// and actively resuming). The canonical durable form is
     /// [`TaskStatus::Pending`]; acquisition preserves the payload while
     /// flipping the row to `Running`.
+    ///
+    /// # R2 steering wake overload
+    ///
+    /// This variant doubles as the durable state for an **early
+    /// steering resume** (R2). A steering-wake sweep flips a parked
+    /// [`TaskStatus::WaitingOnChildren`] parent into `Pending` +
+    /// `ReadyToResume` with a **non-empty** `steering` payload (and
+    /// `pending_child_count` dropped to zero) so a concurrently
+    /// completing child can no longer flip the parent — that closes the
+    /// double-resume race. A worker acquires the row and dispatches on
+    /// `steering`:
+    ///
+    /// - `steering` **empty** → the ordinary child fan-in
+    ///   ([`crate::worker::resume_from_children`]); every child is
+    ///   terminal.
+    /// - `steering` **non-empty** → the bounded steering exchange
+    ///   ([`crate::worker::resume_for_steering`]); children may still be
+    ///   running. It answers the note with interim child results and
+    ///   re-parks on the survivors under freshly re-issued bindings.
+    ///
+    /// Reusing this variant (rather than a new one) keeps the durable
+    /// wire `kind` — and therefore every backend's state/status CHECK
+    /// constraint — unchanged: no schema migration is needed for R2.
     ReadyToResume {
         /// Versioned continuation envelope from the original
         /// suspension. Contains pending tool calls, usage, and agent
@@ -211,6 +234,15 @@ pub enum TaskState {
         /// aggregation path reads only the current round's children.
         #[serde(default)]
         child_ids: Vec<super::task::AgentTaskId>,
+        /// Opaque steering content the host drained from its mailbox
+        /// and handed to a steering wake. **Empty** for an ordinary
+        /// child fan-in; **non-empty** marks an early steering resume
+        /// whose bounded LLM round answers the note. Carried durably so
+        /// a daemon restart between the wake and the re-park re-runs the
+        /// exchange from the journal alone. The SDK treats these blocks
+        /// as opaque — the host owns their rendering.
+        #[serde(default)]
+        steering: Vec<llm::ContentBlock>,
     },
 }
 
@@ -356,6 +388,26 @@ impl TaskState {
             Self::SubagentInvocation { invocation } => Some(invocation),
             _ => None,
         }
+    }
+
+    /// Borrow the opaque steering content carried by a
+    /// [`TaskState::ReadyToResume`] payload. Empty for an ordinary
+    /// child fan-in and every other variant; non-empty only for an
+    /// early steering resume (R2).
+    #[must_use]
+    pub fn steering(&self) -> &[llm::ContentBlock] {
+        match self {
+            Self::ReadyToResume { steering, .. } => steering,
+            _ => &[],
+        }
+    }
+
+    /// `true` if this is a [`TaskState::ReadyToResume`] carrying a
+    /// non-empty steering payload — i.e. an early steering resume (R2)
+    /// rather than an ordinary child fan-in.
+    #[must_use]
+    pub const fn is_steering_resume(&self) -> bool {
+        matches!(self, Self::ReadyToResume { steering, .. } if !steering.is_empty())
     }
 }
 
@@ -609,6 +661,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            steering: Vec::new(),
         };
         let json = serde_json::to_string(&ready)?;
         let recovered: TaskState = serde_json::from_str(&json)?;
@@ -627,6 +680,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            steering: Vec::new(),
         };
 
         assert!(state.is_compatible_with_status(TaskStatus::Pending));
@@ -677,6 +731,7 @@ mod tests {
             continuation: Box::new(sample_continuation()),
             suspended_messages: Vec::new(),
             child_ids: Vec::new(),
+            steering: Vec::new(),
         })?;
         assert_eq!(ready_value["kind"], serde_json::json!("ready_to_resume"));
         assert!(ready_value.get("continuation").is_some());
