@@ -6,8 +6,9 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn, execute_root_turn,
-    fail_root_turn, resume_from_children, resume_root_turn,
+    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
+    derive_reattach_tool_use_id, execute_root_turn, fail_root_turn, resume_for_steering,
+    resume_from_children, resume_root_turn,
 };
 use std::sync::Arc;
 
@@ -4004,6 +4005,538 @@ async fn fresh_turn_backfills_orphaned_tool_use_durably() -> Result<()> {
         !projection.has_draft(),
         "the orphaned draft must be cleared, not left dangling",
     );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 5.5: steering wake (R2)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Mock provider that records the messages of the last chat request so
+/// tests can assert the wire contract (every pending `tool_use` id
+/// resolved) and returns a fixed text answer.
+struct SteeringCaptureProvider {
+    response_text: String,
+    captured: std::sync::Mutex<Vec<agent_sdk_foundation::llm::Message>>,
+    call_count: AtomicUsize,
+}
+
+impl SteeringCaptureProvider {
+    fn new(text: &str) -> Self {
+        Self {
+            response_text: text.to_owned(),
+            captured: std::sync::Mutex::new(Vec::new()),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn captured(&self) -> Vec<agent_sdk_foundation::llm::Message> {
+        self.captured.lock().expect("capture lock").clone()
+    }
+
+    fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SteeringCaptureProvider {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        *self.captured.lock().expect("capture lock") = request.messages;
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "msg_steer_01".into(),
+            content: vec![ContentBlock::Text {
+                text: self.response_text.clone(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 90,
+                output_tokens: 30,
+                cached_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Find the content of the first `tool_result` block for `id` across a
+/// message list.
+fn find_tool_result<'a>(
+    messages: &'a [agent_sdk_foundation::llm::Message],
+    id: &str,
+) -> Option<&'a str> {
+    for message in messages {
+        if let agent_sdk_foundation::llm::Content::Blocks(blocks) = &message.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                    && tool_use_id == id
+                {
+                    return Some(content.as_str());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn messages_contain_text(messages: &[agent_sdk_foundation::llm::Message], needle: &str) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            &message.content,
+            agent_sdk_foundation::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Text { text } if text.contains(needle)
+                ))
+        )
+    })
+}
+
+/// A `bash` tool-call tuple for `suspend_leaving_children_running`.
+fn bash_call(id: &str) -> (String, String, serde_json::Value) {
+    (id.into(), "bash".into(), serde_json::json!({"command": id}))
+}
+
+/// Suspend a fresh turn at the tool boundary and return the parked
+/// parent + its (still-running, uncompleted) children.
+async fn suspend_leaving_children_running(
+    stores: &TestStores,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+) -> Result<(AgentTask, Vec<AgentTask>)> {
+    let provider = MockToolCallProvider::new(tool_calls);
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome =
+        execute_root_turn(inputs, "Run tools", &provider, &stores.deps(), t_plus(5)).await?;
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended");
+    };
+    Ok((parent_task, child_tasks))
+}
+
+/// Acquire a specific child and complete it with a real result at the
+/// given timestamps (kept monotonic vs. surrounding steering events).
+async fn complete_child_at(
+    stores: &TestStores,
+    child: &AgentTask,
+    result: &agent_sdk_foundation::ToolResult,
+    acquire_at: time::OffsetDateTime,
+    complete_at: time::OffsetDateTime,
+) -> Result<()> {
+    let worker = WorkerId::from_string("child_w");
+    let lease = LeaseId::from_string("child_l");
+    stores
+        .tasks
+        .try_acquire_task(
+            &child.id,
+            worker.clone(),
+            lease.clone(),
+            complete_at,
+            acquire_at,
+        )
+        .await?
+        .context("acquire child")?;
+    stores
+        .tasks
+        .complete_task_with_result(
+            &child.id,
+            &worker,
+            &lease,
+            serde_json::to_value(result).context("serialize child result")?,
+            complete_at,
+        )
+        .await
+        .context("complete child")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![bash_call("call_0"), bash_call("call_1")],
+    ))
+    .await?;
+    assert_eq!(children.len(), 2);
+
+    // Child 0 finishes during the wave; child 1 keeps running.
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done-0"),
+        t_plus(8),
+        t_plus(9),
+    )
+    .await?;
+    let parked = stores.tasks.get(&parent.id).await?.context("parked")?;
+    assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(parked.pending_child_count, 1);
+
+    // Fire the wake with a steering note.
+    let woken = stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "how is it going?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    assert_eq!(woken.status, TaskStatus::Pending);
+    assert!(woken.state.is_steering_resume());
+
+    // The pool acquires the Pending row and runs the exchange.
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(21),
+        )
+        .await?
+        .context("acquire woken parent")?;
+    assert_eq!(acquired.status, TaskStatus::Running);
+
+    let bootstrap = sample_bootstrap_with_tools(acquired.clone());
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(21),
+    )
+    .await?;
+    let provider = SteeringCaptureProvider::new("One task is done, one is still running.");
+    let outcome =
+        resume_for_steering(inputs, &acquired, &provider, &stores.deps(), t_plus(25)).await?;
+    assert_eq!(provider.calls(), 1, "exactly one bounded LLM round");
+
+    // Wire contract on the steering call: a tool_result for EVERY
+    // pending id (real for the finished child, typed-interim for the
+    // running one), plus the steering note.
+    let msgs = provider.captured();
+    assert_eq!(find_tool_result(&msgs, "call_0"), Some("done-0"));
+    let interim = find_tool_result(&msgs, "call_1").context("interim result for call_1")?;
+    assert!(interim.contains("running"), "interim payload: {interim}");
+    assert!(messages_contain_text(&msgs, "how is it going?"));
+
+    // Re-park: no new children, parent waits on the survivor under a
+    // fresh binding, the finished child is dropped from tracking.
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = outcome
+    else {
+        panic!("expected Suspended re-park");
+    };
+    assert!(child_tasks.is_empty(), "re-attach must spawn nothing");
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    assert_eq!(parent_task.pending_child_count, 1);
+    let reattach_id = derive_reattach_tool_use_id("call_1");
+    match &parent_task.state {
+        TaskState::WaitingOnChildren {
+            continuation,
+            child_ids,
+            ..
+        } => {
+            assert_eq!(child_ids.as_slice(), std::slice::from_ref(&children[1].id));
+            let pending = &continuation.payload.pending_tool_calls;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, reattach_id);
+            assert_eq!(pending[0].name, "bash");
+        }
+        other => panic!("expected WaitingOnChildren re-park, got {other:?}"),
+    }
+    // Survivor re-indexed to dense position 0.
+    let child1 = stores.tasks.get(&children[1].id).await?.context("child1")?;
+    assert_eq!(child1.spawn_index, Some(0));
+
+    // Survivor finishes → the real result reaches the coordinator under
+    // the fresh binding (nothing lost, nothing duplicated).
+    assert_survivor_fanin_delivers(&stores, &parent, &children[1], &reattach_id).await
+}
+
+/// Complete the still-running survivor, drive the ordinary fan-in, and
+/// assert the coordinator's final LLM history resolves the re-issued
+/// binding with the survivor's REAL result.
+async fn assert_survivor_fanin_delivers(
+    stores: &TestStores,
+    parent: &AgentTask,
+    survivor: &AgentTask,
+    reattach_id: &str,
+) -> Result<()> {
+    complete_child_at(
+        stores,
+        survivor,
+        &ok_result("done-1"),
+        t_plus(50),
+        t_plus(55),
+    )
+    .await?;
+    let ready = stores.tasks.get(&parent.id).await?.context("ready")?;
+    assert_eq!(ready.status, TaskStatus::Pending);
+    assert!(matches!(ready.state, TaskState::ReadyToResume { .. }));
+
+    let final_acq = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(60),
+        )
+        .await?
+        .context("acquire for final fan-in")?;
+    let bootstrap = sample_bootstrap_with_tools(final_acq.clone());
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(60),
+    )
+    .await?;
+    let provider = SteeringCaptureProvider::new("All finished.");
+    let outcome =
+        resume_from_children(inputs, &final_acq, &provider, &stores.deps(), t_plus(65)).await?;
+    assert_eq!(
+        find_tool_result(&provider.captured(), reattach_id),
+        Some("done-1"),
+        "final fan-in must resolve the re-issued binding with the real result",
+    );
+    assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn steering_wake_child_completing_concurrently_does_not_double_resume() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![(
+            "call_only".into(),
+            "bash".into(),
+            serde_json::json!({"command": "x"}),
+        )],
+    ))
+    .await?;
+    assert_eq!(children.len(), 1);
+
+    // Wake the parent (→ Pending + SteeringResume, pending_child_count 0).
+    let woken = stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "status?".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    assert!(woken.state.is_steering_resume());
+
+    // Race: the child completes while the parent is parked in
+    // SteeringResume. The completion must NOT flip the parent to
+    // ReadyToResume — the wake already owns the resume.
+    complete_child_at(
+        &stores,
+        &children[0],
+        &ok_result("done"),
+        t_plus(21),
+        t_plus(22),
+    )
+    .await?;
+    let after = stores
+        .tasks
+        .get(&parent.id)
+        .await?
+        .context("after complete")?;
+    assert_eq!(
+        after.status,
+        TaskStatus::Pending,
+        "concurrent completion must not re-flip the parent",
+    );
+    assert!(
+        after.state.is_steering_resume(),
+        "parent stays in SteeringResume — no double resume",
+    );
+
+    // The single acquire runs the exchange; every child is now terminal
+    // so the answer completes the turn (one resume, no orphan).
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(30),
+        )
+        .await?
+        .context("acquire woken parent")?;
+    let bootstrap = sample_bootstrap_with_tools(acquired.clone());
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(30),
+    )
+    .await?;
+    let provider = SteeringCaptureProvider::new("Everything finished while you asked.");
+    let outcome =
+        resume_for_steering(inputs, &acquired, &provider, &stores.deps(), t_plus(35)).await?;
+
+    // Wire contract still holds: the finished child's real result is in
+    // the history.
+    assert_eq!(
+        find_tool_result(&provider.captured(), "call_only"),
+        Some("done")
+    );
+    let RootTurnOutcome::Completed { completed_task, .. } = outcome else {
+        panic!("expected Completed turn when no children survive");
+    };
+    assert_eq!(completed_task.status, TaskStatus::Completed);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn steering_wake_restart_between_wake_and_repark_resumes_cleanly() -> Result<()> {
+    let stores = TestStores::new();
+    let (parent, children) = Box::pin(suspend_leaving_children_running(
+        &stores,
+        vec![(
+            "call_0".into(),
+            "bash".into(),
+            serde_json::json!({"command": "a"}),
+        )],
+    ))
+    .await?;
+
+    // Wake, then acquire (a worker starts the exchange) ...
+    stores
+        .tasks
+        .enqueue_steering_resume(
+            &parent.id,
+            vec![ContentBlock::Text {
+                text: "ping".into(),
+            }],
+            t_plus(20),
+        )
+        .await?
+        .context("woken")?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_crash"),
+            LeaseId::from_string("lease_crash"),
+            t_plus(100),
+            t_plus(21),
+        )
+        .await?
+        .context("acquire")?;
+    assert_eq!(acquired.status, TaskStatus::Running);
+
+    // ... the daemon crashes before re-park. The lease expires and the
+    // recovery sweep requeues the row — SteeringResume is preserved so
+    // the durable continuation stays authoritative.
+    let recovered = stores.tasks.release_expired_leases(t_plus(200)).await?;
+    assert_eq!(recovered.len(), 1, "the wedged steering row must requeue");
+    let requeued = stores.tasks.get(&parent.id).await?.context("requeued")?;
+    assert_eq!(requeued.status, TaskStatus::Pending);
+    assert!(
+        requeued.state.is_steering_resume(),
+        "requeue must preserve the steering continuation",
+    );
+    // Fresh turn consumed attempt 1; the crash's lease-release bumps to
+    // 2 (poisoned-resume cap). Acquiring the steering resume did NOT
+    // consume budget (it is a continuation, not a new attempt).
+    assert_eq!(
+        requeued.attempt, 2,
+        "lease-release bumps the steering-resume attempt"
+    );
+
+    // A fresh worker re-acquires and re-runs the exchange to completion.
+    let reacquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(210),
+        )
+        .await?
+        .context("re-acquire after restart")?;
+    let bootstrap = sample_bootstrap_with_tools(reacquired.clone());
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(210),
+    )
+    .await?;
+    let provider = SteeringCaptureProvider::new("Still working.");
+    let outcome =
+        resume_for_steering(inputs, &reacquired, &provider, &stores.deps(), t_plus(215)).await?;
+
+    // Re-park is deterministic: the survivor re-attaches under the same
+    // derived id a first run would have produced.
+    let RootTurnOutcome::Suspended { parent_task, .. } = outcome else {
+        panic!("expected Suspended re-park after restart");
+    };
+    assert_eq!(parent_task.status, TaskStatus::WaitingOnChildren);
+    match &parent_task.state {
+        TaskState::WaitingOnChildren { continuation, .. } => {
+            assert_eq!(
+                continuation.payload.pending_tool_calls[0].id,
+                derive_reattach_tool_use_id("call_0"),
+            );
+        }
+        other => panic!("expected WaitingOnChildren, got {other:?}"),
+    }
+    // The survivor was never cancelled or re-spawned.
+    let child = stores.tasks.get(&children[0].id).await?.context("child")?;
+    assert!(!child.status.is_terminal());
 
     Ok(())
 }

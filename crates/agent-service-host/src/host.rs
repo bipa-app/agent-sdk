@@ -64,7 +64,7 @@ use agent_server::worker::{
     AgentDefinitionRegistry, RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome,
     execute_subagent_task, fail_root_turn, guarded_tool_execution, pause_tool_for_confirmation,
     resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
-    resume_from_children,
+    resume_for_steering, resume_from_children,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -1130,7 +1130,23 @@ async fn execute_root_task(
             .await
             .context("resolve runtime provider")?;
 
-        if matches!(task.state, TaskState::ReadyToResume { .. }) {
+        if task.state.is_steering_resume() {
+            // R2 steering wake: a mailbox note woke this parked parent
+            // early (a `ReadyToResume` row carrying a steering payload).
+            // Answer with interim child results, then re-park on the
+            // still-running children. The spawn selector is not
+            // consulted — the re-park re-binds existing children rather
+            // than spawning new ones.
+            let selector = runtime.subagent_spawn_selector();
+            let deps = stores.root_turn_deps_with_selector_and_compaction(
+                selector.as_ref(),
+                runtime.compaction_config(),
+                runtime.compaction_config().map(|_| &provider),
+            );
+            resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
+                .await
+                .context("resume parked root task for steering wake")
+        } else if matches!(task.state, TaskState::ReadyToResume { .. }) {
             let selector = runtime.subagent_spawn_selector();
             let deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),

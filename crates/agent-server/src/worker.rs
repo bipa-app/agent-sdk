@@ -134,7 +134,7 @@ pub use definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 pub use registry::{AgentDefinitionRegistry, InMemoryAgentDefinitionRegistry};
 pub use root_turn::{
     RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn, execute_root_turn,
-    fail_root_turn, resume_from_children, resume_root_turn,
+    fail_root_turn, resume_for_steering, resume_from_children, resume_root_turn,
 };
 pub use subagent::{
     EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
