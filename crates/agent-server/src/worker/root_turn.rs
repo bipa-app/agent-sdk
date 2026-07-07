@@ -400,6 +400,93 @@ pub async fn cancel_root_turn(
     Ok(cancelled)
 }
 
+/// Revert a failed steering wake (R2) back to its pre-wake parked
+/// state instead of failing the root task.
+///
+/// A steering wake is a [`TaskState::ReadyToResume`] row carrying a
+/// non-empty `steering` payload that woke a parent while its mission
+/// children were still **running**. If the bounded steering exchange
+/// fails — e.g. a provider outage exactly when the user asked "how is
+/// it going?", or a deterministic interim-construction error — the
+/// naive path ([`fail_root_turn`]) marks the parent `Failed` while its
+/// children keep running. [`AgentTaskStore::fail_task`] does not
+/// cascade (only [`AgentTaskStore::cancel_tree`] does), so those
+/// workers are stranded: they burn budget on a dead mission and their
+/// eventual results are orphaned on the "parent not waiting" branch.
+///
+/// The steering exchange writes nothing to the task row before it
+/// fails, so the durable `ReadyToResume` state still carries the
+/// original continuation, suspended messages, and child ids untouched.
+/// This re-parks the parent on exactly those children via
+/// [`AgentTaskStore::repark_after_steering`], which derives the live
+/// child count from the journal and either parks again in
+/// [`TaskStatus::WaitingOnChildren`] (children still running) or flips
+/// straight to `Pending` + [`TaskState::ReadyToResume`] with an empty
+/// steering payload (every child already finished) so the ordinary
+/// fan-in ([`resume_from_children`]) resumes the mission.
+///
+/// The (now-unanswerable) steering note is intentionally dropped.
+/// Dropping it also clears the wake trigger, so the row is never
+/// re-woken into the same failing exchange — that removes the
+/// wake→error→re-park loop the durable steering-attempt cap (which
+/// only bites on lease expiry) would not otherwise bound. The failure
+/// is surfaced as a non-fatal error event so the note's author still
+/// learns the reply did not land.
+///
+/// `parent` is the owned steering-resume row (its durable state carries
+/// the intact continuation, suspended messages, and child ids);
+/// `worker_id` / `lease_id` are the caller's validated ownership token.
+///
+/// # Errors
+/// - The `parent`'s durable state carries no continuation (defends the
+///   state ↔ status invariant).
+/// - The store rejects the re-park (CAS: not running / not owned / not
+///   a steering resume — e.g. a sweep already requeued the row).
+pub async fn revert_steering_wake(
+    parent: &AgentTask,
+    worker_id: &WorkerId,
+    lease_id: &LeaseId,
+    error: &anyhow::Error,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<AgentTask> {
+    // Best-effort close the steering exchange's open turn attempt — the
+    // LLM round failed, so the attempt never closed on its own.
+    best_effort_close_open_attempts(&parent.id, deps.attempt_store, now).await;
+
+    let continuation = parent
+        .state
+        .continuation()
+        .context("steering revert: durable state carries no continuation")?
+        .clone();
+    let payload = SuspensionPayload {
+        continuation,
+        suspended_messages: parent.state.suspended_messages().to_vec(),
+    };
+    // The original child ids, in spawn order — the re-park re-indexes
+    // them to the continuation's original `pending_tool_calls`, i.e. the
+    // identity mapping they already had, so the fan-in resolves exactly
+    // as if the wake never happened.
+    let child_ids = parent.state.child_ids().to_vec();
+
+    let reparked = deps
+        .task_store
+        .repark_after_steering(&parent.id, worker_id, lease_id, payload, child_ids, now)
+        .await
+        .context("revert failed steering wake to parked state")?;
+
+    // Surface the failure as a non-fatal error event (best-effort — the
+    // durable re-park already succeeded; an event-commit failure must
+    // not override that outcome).
+    let error_event = AgentEvent::error(format!("{error:#}"), false);
+    let _ = deps
+        .event_repo
+        .commit_event(&parent.thread_id, error_event, now)
+        .await;
+
+    Ok(reparked)
+}
+
 /// Best-effort close any open (non-closed) turn attempts for a task.
 ///
 /// Iterates all attempts and closes any that are still open with the
@@ -2936,13 +3023,14 @@ fn extract_pending_tool_calls(
 // Resume from completed child tool results (Phase 4.5)
 // ─────────────────────────────────────────────────────────────────────
 
-/// Prior suspension state passed to the resume path so the LLM sees the
-/// full conversation that led to the tool calls whose results are now
-/// available.
-struct ResumeContext<'a> {
+/// The prior turn's continuation plus the replay-history prefix
+/// (original user prompt + original assistant + the tool-results /
+/// steering-interim user message) threaded into a re-suspension's
+/// `suspended_messages`. Bundled so [`suspend_resumed_turn`] stays
+/// within the argument-count budget.
+struct ResumeSuspension<'a> {
     continuation: &'a AgentContinuation,
-    suspended_messages: &'a [llm::Message],
-    child_results: &'a [(String, ToolResult)],
+    history_prefix: Vec<llm::Message>,
 }
 
 /// Resume a suspended root turn after all child tool tasks have
@@ -3133,17 +3221,14 @@ pub async fn resume_root_turn(
     } = llm_call.await?;
     let commit_now = OffsetDateTime::now_utc();
 
-    let prior = ResumeContext {
-        continuation: &continuation,
-        suspended_messages: &suspended_messages,
-        child_results: &child_results,
-    };
-
     // 5. Branch: tool calls → re-suspend; text-only → commit.
     if response.has_tool_use() {
         return suspend_resumed_turn(
             inputs,
-            &prior,
+            ResumeSuspension {
+                continuation: &continuation,
+                history_prefix: build_resumed_draft_messages(&suspended_messages, &child_results),
+            },
             response,
             attempt,
             deps,
@@ -3410,7 +3495,7 @@ fn build_resumed_draft_messages(
 /// complete history.
 async fn suspend_resumed_turn(
     inputs: RootWorkerInputs,
-    prior: &ResumeContext<'_>,
+    prior: ResumeSuspension<'_>,
     response: llm::ChatResponse,
     attempt: TurnAttempt,
     deps: &RootTurnDeps<'_>,
@@ -3435,10 +3520,14 @@ async fn suspend_resumed_turn(
         .context("build resume continuation")?;
 
     // Build suspended messages that capture the FULL conversation
-    // through this point: original user prompt + original assistant +
-    // tool results + new assistant response.
-    let mut new_suspended =
-        build_resumed_draft_messages(prior.suspended_messages, prior.child_results);
+    // through this point: the caller-supplied replay-history prefix
+    // (original user prompt + original assistant + the tool-results /
+    // steering-interim user message) followed by the new assistant
+    // response. Threading the prefix through — rather than rebuilding it
+    // from `child_results` here — lets the steering all-terminal path
+    // preserve its interim-results-plus-note user message in the replay
+    // history instead of dropping the directive.
+    let mut new_suspended = prior.history_prefix;
     // New assistant response (with new tool-use blocks).
     new_suspended.push(build_full_assistant_message(&response));
 
@@ -4125,10 +4214,38 @@ async fn run_steering_exchange(
     .await?;
     let commit_now = OffsetDateTime::now_utc();
 
-    // Every child already finished: the steering answer completes the
-    // turn (the interim message already carried all real results), so
-    // this is the ordinary text-only resume commit.
+    // Every child already finished: the interim message carried all
+    // real results, so the steering answer resolves the turn.
     if interim.surviving.is_empty() {
+        // A steering reply that itself acts on the redirect ("change of
+        // plan: also do X") emits tool_use. With no survivors to
+        // re-attach, there is no re-park batch to conflict with, so we
+        // mirror the ordinary resume path and spawn the follow-up wave
+        // instead of dropping the tool_use and force-completing the
+        // mission turn (which `commit_resumed_turn` would do via
+        // `build_assistant_message`'s tool_use filter). The steering
+        // user message (interim results + note) is threaded into the
+        // replay history so the directive survives for the next resume.
+        if response.has_tool_use() {
+            let mut history_prefix = suspended_messages;
+            history_prefix.push(steering_message);
+            return suspend_resumed_turn(
+                inputs,
+                ResumeSuspension {
+                    continuation: &continuation,
+                    history_prefix,
+                },
+                response,
+                attempt,
+                deps,
+                commit_now,
+                &content_ids,
+            )
+            .await;
+        }
+
+        // Text-only steering answer: the ordinary text-only resume
+        // commit completes the mission turn.
         return commit_resumed_turn(
             inputs,
             &continuation,
