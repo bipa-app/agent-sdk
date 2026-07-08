@@ -841,6 +841,11 @@ impl LlmProvider for AnthropicProvider {
                 std::collections::HashMap::new();
 
             let mut received_message_stop = false;
+            // Set when Anthropic streamed a terminal `error` event (parsed
+            // into a StreamDelta::Error below). Suppresses the generic
+            // "stream ended without message_stop" fallback so the caller
+            // sees the real error, not a second misleading one.
+            let mut stream_errored = false;
             let mut pending_stop_reason: Option<agent_sdk_foundation::llm::StopReason> = None;
             let mut chunk_count: u64 = 0;
             let mut total_bytes: u64 = 0;
@@ -911,6 +916,11 @@ impl LlmProvider for AnthropicProvider {
                         {
                             *name = from_claude_code_name(name, &original_tool_names);
                         }
+                        // A terminal error event ends the stream — flag it
+                        // so the no-message_stop fallback stays silent.
+                        if matches!(delta, StreamDelta::Error { .. }) {
+                            stream_errored = true;
+                        }
                         yield Ok(delta);
                     }
                     // After message_stop (which emits Usage), emit Done
@@ -955,6 +965,9 @@ impl LlmProvider for AnthropicProvider {
                     {
                         *name = from_claude_code_name(name, &original_tool_names);
                     }
+                    if matches!(delta, StreamDelta::Error { .. }) {
+                        stream_errored = true;
+                    }
                     yield Ok(delta);
                 }
                 // After message_stop (which emits Usage), emit Done
@@ -968,8 +981,12 @@ impl LlmProvider for AnthropicProvider {
             // Mark stream as properly completed
             drop_guard.completed = true;
 
-            // If stream ended without message_stop, emit a server-error (transient) signal
-            if !received_message_stop {
+            // If stream ended without message_stop AND without a parsed
+            // error event, emit a generic server-error (transient) signal.
+            // When Anthropic streamed a terminal `error` event, it was
+            // already surfaced above with its real message + kind — don't
+            // mask it with this generic one.
+            if !received_message_stop && !stream_errored {
                 log::warn!(
                     "SSE stream ended without message_stop event - stream may have been interrupted chunk_count={chunk_count} total_bytes={total_bytes}"
                 );

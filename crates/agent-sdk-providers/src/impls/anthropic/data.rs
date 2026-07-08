@@ -4,7 +4,7 @@
 //! (`OAuth2` Bearer auth for Claude models on Vertex AI) since they share the same
 //! request/response format.
 
-use crate::streaming::StreamDelta;
+use crate::streaming::{StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
     ChatRequest, Content, ContentBlock, ContentSource, Message, Role, StopReason, Usage,
 };
@@ -776,6 +776,42 @@ pub fn is_message_stop_event(event_block: &str) -> bool {
     )
 }
 
+/// Parse an Anthropic SSE `error` event payload into a message + the
+/// classified [`StreamErrorKind`]. Shape:
+/// `{"type":"error","error":{"type":"overloaded_error","message":"..."}}`.
+///
+/// Error-type mapping mirrors Anthropic's HTTP status classes so retry
+/// policy behaves the same whether the error arrives as an HTTP response
+/// or a mid-stream event: overload / rate-limit are retriable; caller
+/// errors (invalid request, auth, too-large) are not; anything else is
+/// treated as a transient server error (retriable) rather than dropped.
+fn parse_stream_error_event(data: &str) -> (String, StreamErrorKind) {
+    let value: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+    let error = value.get("error");
+    let error_type = error
+        .and_then(|e| e.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown_error");
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Anthropic streamed an error event");
+    let kind = match error_type {
+        "overloaded_error" | "rate_limit_error" => StreamErrorKind::RateLimited,
+        "invalid_request_error"
+        | "authentication_error"
+        | "permission_error"
+        | "not_found_error"
+        | "request_too_large" => StreamErrorKind::InvalidRequest,
+        // api_error, timeout_error, and any unrecognized type → transient.
+        _ => StreamErrorKind::ServerError,
+    };
+    (
+        format!("Anthropic stream error ({error_type}): {message}"),
+        kind,
+    )
+}
+
 /// Parse an SSE event block and return the corresponding `StreamDelta`.
 pub fn parse_sse_event(
     event_block: &str,
@@ -888,6 +924,17 @@ pub fn parse_sse_event(
                 cached_input_tokens: *cached_input_tokens,
                 cache_creation_input_tokens: *cache_creation_input_tokens,
             }))
+        }
+        "error" => {
+            // Anthropic can stream a TERMINAL `error` event mid-stream
+            // (most commonly `overloaded_error` during high load). Without
+            // this branch the event is dropped and the stream ends without
+            // a `message_stop`, so the caller surfaces a misleading generic
+            // "stream ended unexpectedly" ServerError — hiding the real
+            // cause and always classifying it retriable. Parse it so the
+            // real message + the correct error kind reach the caller.
+            let (message, kind) = parse_stream_error_event(&data);
+            Some(StreamDelta::Error { message, kind })
         }
         _ => None,
     }
@@ -1559,6 +1606,47 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta",
             Some(StreamDelta::SignatureDelta { delta, block_index })
             if delta == "sig_123" && block_index == 0
         ));
+    }
+
+    fn parse_error_event(event: &str) -> Option<StreamDelta> {
+        parse_sse_event(
+            event,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+        )
+    }
+
+    #[test]
+    fn overloaded_error_event_parses_to_retriable_error() {
+        // Anthropic streams this mid-stream during high load — previously
+        // dropped, surfacing a misleading "stream ended unexpectedly".
+        let event = r#"event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let delta = parse_error_event(event);
+        match delta {
+            Some(StreamDelta::Error { message, kind }) => {
+                assert_eq!(kind, StreamErrorKind::RateLimited);
+                assert!(message.contains("overloaded_error"));
+                assert!(message.contains("Overloaded"));
+            }
+            other => panic!("expected StreamDelta::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_request_error_event_is_non_retriable() {
+        let event = r#"event: error
+data: {"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+        match parse_error_event(event) {
+            Some(StreamDelta::Error { kind, .. }) => {
+                assert_eq!(kind, StreamErrorKind::InvalidRequest);
+            }
+            other => panic!("expected StreamDelta::Error, got {other:?}"),
+        }
     }
 
     #[test]
