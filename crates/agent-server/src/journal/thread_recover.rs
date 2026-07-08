@@ -125,6 +125,20 @@ pub struct ThreadRecoveryView {
     /// — continuing" notice.
     pub draft_messages: Vec<llm::Message>,
 
+    /// The committed conversation head WITHOUT the in-flight draft —
+    /// i.e. [`Self::messages`] minus [`Self::draft_messages`].
+    ///
+    /// Sourced from the message projection (post-compaction when a
+    /// mid-turn `replace_history` ran), falling back to the
+    /// checkpoint's frozen snapshot only when the projection row is
+    /// absent. This is the compaction-durable seed for resuming an
+    /// already-suspended root task: the resume path re-supplies the
+    /// suspended draft + child results itself, so the seed must
+    /// exclude the draft — but it must NOT revert to the checkpoint's
+    /// pre-compaction `messages`, or every resume re-compacts the same
+    /// history. See [`super::staged::StagedStores::from_recovery_view_committed_only`].
+    pub committed_messages: Vec<llm::Message>,
+
     /// The turn number the next attempt should target.
     ///
     /// Equal to `thread.committed_turns + 1` (1 for a fresh thread).
@@ -219,6 +233,9 @@ pub async fn recover_thread(
             messages: draft_messages.clone(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            // No committed turns yet — the committed head is empty; the
+            // draft (if any) lives only in `messages`/`draft_messages`.
+            committed_messages: Vec::new(),
             draft_messages,
             next_turn_number: 1,
         });
@@ -259,17 +276,24 @@ pub async fn recover_thread(
     //    checkpoint), but keeps recovery robust against rare
     //    storage divergence.
     let next_turn = thread.committed_turns + 1;
-    let mut messages = if committed_messages.is_empty() {
+    // Committed head: the projection's current `messages` (post-
+    // compaction when a mid-turn `replace_history` ran), or the
+    // checkpoint's frozen snapshot only when the projection row is
+    // missing. Captured before folding in the draft so it can seed
+    // resume attempts without the draft (see `committed_messages`).
+    let committed_head = if committed_messages.is_empty() {
         checkpoint.messages.clone()
     } else {
         committed_messages
     };
+    let mut messages = committed_head.clone();
     messages.extend(draft_messages.iter().cloned());
     Ok(ThreadRecoveryView {
         thread,
         messages,
         agent_state_snapshot: checkpoint.agent_state_snapshot.clone(),
         latest_checkpoint: Some(checkpoint),
+        committed_messages: committed_head,
         draft_messages,
         next_turn_number: next_turn,
     })
@@ -284,7 +308,7 @@ mod tests {
     use super::super::checkpoint_store::InMemoryCheckpointStore;
     use super::super::commit::{CompletedTurnCommit, commit_completed_turn};
     use super::super::event_repository::InMemoryEventRepository;
-    use super::super::message_store::InMemoryMessageProjectionStore;
+    use super::super::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
     use super::super::task::AgentTaskId;
     use super::super::thread_store::InMemoryThreadStore;
     use super::super::turn_attempt::{OpenAttemptParams, TurnAttemptOutcome};
@@ -597,6 +621,69 @@ mod tests {
             .as_ref()
             .context("checkpoint should be present")?;
         assert_eq!(ckpt.task_id, task_b);
+        Ok(())
+    }
+
+    // ── Compaction durability ────────────────────────────────────
+
+    /// After a mid-turn `replace_history` rewrites the projection head
+    /// (auto-compaction), `recover_thread` must expose the COMPACTED
+    /// projection as `committed_messages` — the resume seed — while
+    /// `latest_checkpoint.messages` stays at the frozen pre-compaction
+    /// snapshot. This is the invariant that stops a resumed turn from
+    /// re-compacting the same over-threshold history every tool round.
+    #[tokio::test]
+    async fn recover_sources_committed_messages_from_projection_after_compaction() -> Result<()> {
+        let s = Stores::new();
+        let task = AgentTaskId::from_string("task_compact");
+
+        s.commit_turn(
+            &thread_a(),
+            &task,
+            vec![
+                llm::Message::user("turn 1 question"),
+                llm::Message::assistant("turn 1 answer"),
+            ],
+            serde_json::json!({"turn": 1}),
+            t_plus(1),
+        )
+        .await
+        .context("commit turn 1")?;
+
+        // Pre-compaction: projection and checkpoint agree (2 messages).
+        let before = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
+            .await
+            .context("recover before compaction")?;
+        assert_eq!(before.committed_messages.len(), 2);
+
+        // Mid-turn auto-compaction rewrites the projection head only.
+        let compacted = vec![llm::Message::user("[summary of turn 1]")];
+        s.messages
+            .replace_history(&thread_a(), compacted.clone(), t_plus(2))
+            .await
+            .context("replace_history (compaction)")?;
+
+        let after = recover_thread(&thread_a(), &s.threads, &s.checkpoints, &s.messages, t0())
+            .await
+            .context("recover after compaction")?;
+
+        // committed_messages follows the compacted projection...
+        assert_eq!(after.committed_messages.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&after.committed_messages)?,
+            serde_json::to_value(&compacted)?,
+        );
+        // ...while the checkpoint still holds the frozen 2-message snapshot.
+        let ckpt = after
+            .latest_checkpoint
+            .as_ref()
+            .context("checkpoint present")?;
+        assert_eq!(
+            ckpt.messages.len(),
+            2,
+            "checkpoint keeps the pre-compaction snapshot",
+        );
+
         Ok(())
     }
 

@@ -320,7 +320,8 @@ impl StagedStores {
     }
 
     /// Construct staged stores from a recovery view, but seed messages
-    /// only from the latest committed checkpoint.
+    /// from the committed conversation head only — excluding the
+    /// in-flight draft.
     ///
     /// This is used when resuming an already-suspended root task. The
     /// task state supplies `suspended_messages` and completed child
@@ -328,16 +329,23 @@ impl StagedStores {
     /// seed would duplicate the assistant `tool_use` before the
     /// matching `tool_result` is appended.
     ///
+    /// Seeds from [`ThreadRecoveryView::committed_messages`] (the
+    /// message projection's committed head), NOT the checkpoint's
+    /// frozen `messages` snapshot. The distinction is load-bearing:
+    /// when a mid-turn auto-compaction rewrites the projection via
+    /// `replace_history`, the checkpoint still holds the
+    /// pre-compaction history — so seeding from the checkpoint makes
+    /// every tool-round resume re-read the same over-threshold history
+    /// and re-compact it from scratch (a per-round summarization loop).
+    /// The projection head reflects the compaction, so a resume picks
+    /// up the compacted state and does not re-compact.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `agent_state_snapshot` cannot be
     /// deserialized into [`AgentState`].
     pub fn from_recovery_view_committed_only(view: &ThreadRecoveryView) -> Result<Self> {
-        let messages = view
-            .latest_checkpoint
-            .as_ref()
-            .map_or_else(Vec::new, |checkpoint| checkpoint.messages.clone());
-        Self::from_recovery_view_with_messages(view, messages)
+        Self::from_recovery_view_with_messages(view, view.committed_messages.clone())
     }
 
     fn from_recovery_view_with_messages(
@@ -552,6 +560,7 @@ mod tests {
             messages: Vec::new(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            committed_messages: Vec::new(),
             draft_messages: Vec::new(),
             next_turn_number: 1,
         };
@@ -591,6 +600,7 @@ mod tests {
             messages: sample_messages(),
             agent_state_snapshot: snapshot,
             latest_checkpoint: None,
+            committed_messages: sample_messages(),
             draft_messages: Vec::new(),
             next_turn_number: 4,
         };
@@ -653,6 +663,7 @@ mod tests {
             messages: view_messages,
             agent_state_snapshot: snapshot,
             latest_checkpoint: Some(checkpoint),
+            committed_messages: committed.clone(),
             draft_messages: draft,
             next_turn_number: 2,
         };
@@ -668,6 +679,69 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: when a mid-turn auto-compaction has rewritten the
+    /// projection (so `committed_messages` is the small compacted head)
+    /// but the checkpoint still holds the large pre-compaction snapshot,
+    /// the committed-only resume seed must follow the PROJECTION, not the
+    /// frozen checkpoint. Seeding from the checkpoint is what made every
+    /// tool-round resume re-compact the same over-threshold history.
+    #[tokio::test]
+    async fn committed_only_seeds_from_projection_not_frozen_checkpoint() -> Result<()> {
+        // Large pre-compaction history, frozen in the checkpoint.
+        let pre_compaction = vec![
+            llm::Message::user("turn 1 question"),
+            llm::Message::assistant("turn 1 answer"),
+            llm::Message::user("turn 2 question"),
+            llm::Message::assistant("turn 2 answer"),
+            llm::Message::user("turn 3 question"),
+        ];
+        // Small compacted head the projection now holds.
+        let compacted = vec![llm::Message::user("[summary of turns 1-3]")];
+
+        let snapshot = serde_json::to_value(AgentState::new(thread_a()))?;
+        let checkpoint = super::super::checkpoint::Checkpoint::new(
+            super::super::checkpoint::NewCheckpointParams {
+                thread_id: thread_a(),
+                turn_number: 1,
+                task_id: super::super::task::AgentTaskId::from_string("task_precompact"),
+                messages: pre_compaction.clone(),
+                agent_state_snapshot: snapshot.clone(),
+                turn_usage: TokenUsage::default(),
+                now: time::OffsetDateTime::now_utc(),
+            },
+        )?;
+
+        // The view carries the compacted head in `committed_messages`
+        // while `latest_checkpoint.messages` stays at the frozen
+        // pre-compaction snapshot — exactly the mid-turn-compaction state.
+        let view = ThreadRecoveryView {
+            thread: super::super::thread::Thread::new(thread_a(), time::OffsetDateTime::now_utc()),
+            messages: compacted.clone(),
+            agent_state_snapshot: snapshot,
+            latest_checkpoint: Some(checkpoint),
+            committed_messages: compacted.clone(),
+            draft_messages: Vec::new(),
+            next_turn_number: 2,
+        };
+
+        let staged = StagedStores::from_recovery_view_committed_only(&view)?;
+        let seeded = staged.messages.get_history(&thread_a()).await?;
+
+        // Seed is the compacted head, NOT the 5-message frozen checkpoint.
+        assert_eq!(seeded.len(), 1, "resume must seed the compacted projection");
+        assert_eq!(
+            serde_json::to_value(&seeded)?,
+            serde_json::to_value(&compacted)?,
+        );
+        assert_ne!(
+            serde_json::to_value(&seeded)?,
+            serde_json::to_value(&pre_compaction)?,
+            "resume must NOT re-read the pre-compaction checkpoint snapshot",
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn staged_stores_mutations_do_not_affect_seed() -> Result<()> {
         let view = ThreadRecoveryView {
@@ -675,6 +749,7 @@ mod tests {
             messages: sample_messages(),
             agent_state_snapshot: serde_json::Value::Null,
             latest_checkpoint: None,
+            committed_messages: sample_messages(),
             draft_messages: Vec::new(),
             next_turn_number: 1,
         };
