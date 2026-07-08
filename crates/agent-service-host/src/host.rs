@@ -966,6 +966,13 @@ async fn run_task_with_heartbeat(
         return;
     };
 
+    // Per-task cancellation token wired into the worker's `RootTurnDeps`
+    // (seam B). The heartbeat loop trips it on a terminal lease rejection
+    // — a `cancel_tree` drops the lease, so a running worker aborts the
+    // stream and commits the completed prefix of the cancelled turn
+    // within one heartbeat interval. A child of `cancel`, so host
+    // shutdown still cascades to it.
+    let task_cancel = cancel.child_token();
     let heartbeat_cancel = cancel.child_token();
     let heartbeat_handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
         stores: stores.clone(),
@@ -976,9 +983,10 @@ async fn run_task_with_heartbeat(
         lease_duration,
         heartbeat_interval,
         cancel: heartbeat_cancel.clone(),
+        task_cancel: task_cancel.clone(),
     }));
 
-    let exec_result = Box::pin(execute_acquired_task(task, stores, runtime, cancel)).await;
+    let exec_result = Box::pin(execute_acquired_task(task, stores, runtime, &task_cancel)).await;
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -1003,7 +1011,15 @@ pub(crate) struct HeartbeatLoopParams {
     pub(crate) lease_id: LeaseId,
     pub(crate) lease_duration: time::Duration,
     pub(crate) heartbeat_interval: std::time::Duration,
+    /// Trips when the heartbeat loop itself should stop (exec finished /
+    /// host shutdown).
     pub(crate) cancel: CancellationToken,
+    /// Trips the running worker's turn when the lease is terminally
+    /// rejected (the row is no longer ours — most commonly a
+    /// `cancel_tree`), so the worker aborts the stream and enters the
+    /// partial-commit-on-cancel path (seam B) instead of only failing at
+    /// the final commit CAS.
+    pub(crate) task_cancel: CancellationToken,
 }
 
 pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
@@ -1016,6 +1032,7 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         lease_duration,
         heartbeat_interval,
         cancel,
+        task_cancel,
     } = params;
     let mut ticker = tokio::time::interval(heartbeat_interval);
     // Skip the immediate first tick — the lease was just set by
@@ -1040,7 +1057,11 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
             Err(err) if heartbeat_error_is_terminal(&err) => {
                 // Lease rejection (not-running / worker-mismatch /
                 // lease-mismatch): the row is no longer ours, so further
-                // heartbeats can only fail. Exit cleanly.
+                // heartbeats can only fail. Trip the per-task token so a
+                // still-running worker aborts its stream and enters the
+                // partial-commit-on-cancel path (seam B) — the common
+                // cause is a `cancel_tree` that dropped our lease — then
+                // exit cleanly.
                 warn!(
                     %worker_id,
                     task_id = %task_id,
@@ -1048,6 +1069,7 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                     error = %err,
                     "heartbeat rejected; ticker exiting (lease no longer owned)",
                 );
+                task_cancel.cancel();
                 return;
             }
             Err(err) => {
@@ -1092,7 +1114,7 @@ async fn execute_acquired_task(
     cancel: &CancellationToken,
 ) -> Result<()> {
     match task.kind {
-        TaskKind::RootTurn => execute_root_task(task, stores, runtime).await,
+        TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
         TaskKind::Subagent => execute_subagent_task_entry(task, stores).await,
     }
@@ -1102,6 +1124,7 @@ async fn execute_root_task(
     task: AgentTask,
     stores: &StoreRegistry,
     runtime: Arc<ExecutionRuntime>,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let error_watermark = stores
@@ -1138,32 +1161,35 @@ async fn execute_root_task(
             // consulted — the re-park re-binds existing children rather
             // than spawning new ones.
             let selector = runtime.subagent_spawn_selector();
-            let deps = stores.root_turn_deps_with_selector_and_compaction(
+            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),
                 runtime.compaction_config(),
                 runtime.compaction_config().map(|_| &provider),
             );
+            deps.cancel = Some(cancel);
             resume_for_steering(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume parked root task for steering wake")
         } else if matches!(task.state, TaskState::ReadyToResume { .. }) {
             let selector = runtime.subagent_spawn_selector();
-            let deps = stores.root_turn_deps_with_selector_and_compaction(
+            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),
                 runtime.compaction_config(),
                 runtime.compaction_config().map(|_| &provider),
             );
+            deps.cancel = Some(cancel);
             resume_from_children(inputs, &task, provider.as_ref(), &deps, now)
                 .await
                 .context("resume root task from durable child results")
         } else {
             let user_input = root_task_user_input(&task)?;
             let selector = runtime.subagent_spawn_selector();
-            let deps = stores.root_turn_deps_with_selector_and_compaction(
+            let mut deps = stores.root_turn_deps_with_selector_and_compaction(
                 selector.as_ref(),
                 runtime.compaction_config(),
                 runtime.compaction_config().map(|_| &provider),
             );
+            deps.cancel = Some(cancel);
             agent_server::worker::execute_root_turn(
                 inputs,
                 user_input,
@@ -2072,6 +2098,7 @@ mod tests {
             lease_duration: time::Duration::seconds(30),
             heartbeat_interval: std::time::Duration::from_secs(1),
             cancel: cancel.clone(),
+            task_cancel: CancellationToken::new(),
         }));
 
         // Auto-advance the synthetic clock past two heartbeat ticks.
@@ -2127,6 +2154,7 @@ mod tests {
         // Spawn the heartbeat with a stale lease — its first CAS will fail.
         let stale_lease = LeaseId::new();
         let cancel = CancellationToken::new();
+        let task_cancel = CancellationToken::new();
         let handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
             stores: stores.clone(),
             task_id,
@@ -2136,6 +2164,7 @@ mod tests {
             lease_duration: time::Duration::seconds(30),
             heartbeat_interval: std::time::Duration::from_millis(100),
             cancel: cancel.clone(),
+            task_cancel: task_cancel.clone(),
         }));
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2146,6 +2175,14 @@ mod tests {
             "heartbeat must exit on lease mismatch"
         );
         handle.await?;
+
+        // On a terminal lease rejection the loop trips the per-task token
+        // so a still-running root worker aborts its stream and enters the
+        // partial-commit-on-cancel path (seam B).
+        assert!(
+            task_cancel.is_cancelled(),
+            "lease-lost heartbeat must cancel the per-task token",
+        );
         Ok(())
     }
 

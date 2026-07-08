@@ -6,9 +6,10 @@
 //! child-outcome aggregation and resume-from-children path.
 
 use super::root_turn::{
-    RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
-    derive_reattach_tool_use_id, execute_root_turn, fail_root_turn, resume_for_steering,
-    resume_from_children, resume_root_turn, revert_steering_wake,
+    PartialCancelCommit, RootTurnDeps, RootTurnOutcome, aggregate_child_outcomes, cancel_root_turn,
+    commit_partial_turn_on_cancel, derive_reattach_tool_use_id, execute_root_turn, fail_root_turn,
+    provider_valid_split, resume_for_steering, resume_from_children, resume_root_turn,
+    revert_steering_wake,
 };
 use std::sync::Arc;
 
@@ -18,23 +19,25 @@ use crate::journal::event_repository::{EventRepository, InMemoryEventRepository}
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
-use crate::journal::task::{AgentTask, LeaseId, TaskKind, TaskStatus, WorkerId};
+use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::{InMemoryThreadStore, ThreadStore};
-use crate::journal::turn_attempt::TurnAttempt;
+use crate::journal::turn_attempt::{TurnAttempt, TurnAttemptOutcome};
 use crate::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, ContentBlock, Role, StopReason, Tool, Usage,
 };
 use agent_sdk_providers::LlmProvider;
+use agent_sdk_providers::streaming::{StreamBox, StreamDelta};
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::Duration;
+use tokio_util::sync::CancellationToken;
 
 // ─────────────────────────────────────────────────────────────────────
 // Mock LLM providers
@@ -2097,24 +2100,38 @@ async fn cancel_suspended_turn_cancels_children() -> Result<()> {
         assert_eq!(c.status, TaskStatus::Cancelled);
     }
 
-    // No durable projection writes leaked.
+    // The completed prefix of the cancelled turn is committed before the
+    // subtree is torn down. The suspension draft was
+    // `[user, assistant+tool_use]`; its largest provider-valid prefix is
+    // the bare user prompt, which commits as turn 1. The trailing
+    // (unresulted) assistant tool_use is dropped from the commit and
+    // re-seeded as the draft so the next turn's backfill can close it.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(committed.len(), 1, "only the provider-valid prefix commits");
     assert_eq!(
-        stores
-            .threads
-            .get(&thread_a())
-            .await?
-            .context("thread")?
-            .committed_turns,
-        0
+        committed[0].role,
+        agent_sdk_foundation::llm::Role::User,
+        "the committed prefix is the user prompt",
     );
-    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
-    assert!(
-        stores
-            .checkpoints
-            .list_by_thread(&thread_a())
-            .await?
-            .is_empty()
+
+    // Exactly one checkpoint at turn 1.
+    assert_eq!(
+        stores.checkpoints.list_by_thread(&thread_a()).await?.len(),
+        1,
     );
+
+    // The dropped trailing assistant tool_use survives as the re-seeded
+    // draft.
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
+    assert!(projection.has_draft());
+    assert_eq!(projection.draft_messages.len(), 1);
 
     Ok(())
 }
@@ -4889,5 +4906,644 @@ async fn steering_wake_failure_reverts_to_parked_state_without_stranding_childre
     );
     assert!(matches!(outcome, RootTurnOutcome::Completed { .. }));
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Commit the completed prefix of a cancelled turn (partial commit)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Flatten the text blocks of a message for content assertions.
+fn message_text(message: &agent_sdk_foundation::llm::Message) -> String {
+    use agent_sdk_foundation::llm::Content;
+    match &message.content {
+        Content::Text(text) => text.clone(),
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+/// An assistant message carrying a thinking block (with signature) plus a
+/// `tool_use` block — the shape whose byte-verbatim preservation matters.
+fn assistant_thinking_tool_use(
+    thinking: &str,
+    signature: &str,
+    tool_id: &str,
+) -> agent_sdk_foundation::llm::Message {
+    use agent_sdk_foundation::llm::{Content, Message};
+    Message {
+        role: Role::Assistant,
+        content: Content::Blocks(vec![
+            ContentBlock::Thinking {
+                thinking: thinking.to_owned(),
+                signature: Some(signature.to_owned()),
+            },
+            ContentBlock::ToolUse {
+                id: tool_id.to_owned(),
+                name: "bash".to_owned(),
+                input: serde_json::json!({"command": "ls"}),
+                thought_signature: None,
+            },
+        ]),
+    }
+}
+
+// ── provider_valid_split matrix ─────────────────────────────────────
+
+#[test]
+fn provider_valid_split_empty() {
+    let (prefix, suffix) = provider_valid_split(Vec::new());
+    assert!(prefix.is_empty());
+    assert!(suffix.is_empty());
+}
+
+#[test]
+fn provider_valid_split_user_only() {
+    let (prefix, suffix) =
+        provider_valid_split(vec![agent_sdk_foundation::llm::Message::user("hi")]);
+    assert_eq!(prefix.len(), 1);
+    assert!(suffix.is_empty());
+}
+
+#[test]
+fn provider_valid_split_balanced_round_commits_in_full() {
+    let messages = vec![
+        agent_sdk_foundation::llm::Message::user("do it"),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        ),
+        agent_sdk_foundation::llm::Message::tool_result("call_1", "file.txt", false),
+    ];
+    let (prefix, suffix) = provider_valid_split(messages);
+    assert_eq!(prefix.len(), 3, "a balanced round commits in full");
+    assert!(suffix.is_empty());
+}
+
+#[test]
+fn provider_valid_split_unbalanced_drops_trailing_tool_use() {
+    let messages = vec![
+        agent_sdk_foundation::llm::Message::user("do it"),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        ),
+    ];
+    let (prefix, suffix) = provider_valid_split(messages);
+    // Prefix is exactly the user prompt; the unresulted tool_use is
+    // retained as the suffix.
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(prefix[0].role, Role::User);
+    assert_eq!(suffix.len(), 1);
+    assert_eq!(suffix[0].role, Role::Assistant);
+}
+
+#[test]
+fn provider_valid_split_multi_cycle_with_trailing_unbalanced() {
+    // [u, a+tu1, tr1, a+tu2] → prefix keeps the first balanced round,
+    // drops the trailing unresulted tool_use.
+    let messages = vec![
+        agent_sdk_foundation::llm::Message::user("q"),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        ),
+        agent_sdk_foundation::llm::Message::tool_result("call_1", "out", false),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "call_2",
+            "bash",
+            serde_json::json!({"command": "pwd"}),
+        ),
+    ];
+    let (prefix, suffix) = provider_valid_split(messages);
+    assert_eq!(prefix.len(), 3, "first balanced round is retained");
+    assert_eq!(suffix.len(), 1, "trailing unresulted tool_use is dropped");
+    assert!(!agent_sdk_foundation::llm::has_unbalanced_tool_use(&prefix));
+}
+
+#[test]
+fn provider_valid_split_preserves_thinking_verbatim() {
+    // Balanced round whose assistant carries a thinking block with a
+    // signature: the committed prefix must be byte-identical.
+    let asst = assistant_thinking_tool_use("let me think", "sig-abc123", "call_1");
+    let messages = vec![
+        agent_sdk_foundation::llm::Message::user("q"),
+        asst.clone(),
+        agent_sdk_foundation::llm::Message::tool_result("call_1", "out", false),
+    ];
+    let (prefix, suffix) = provider_valid_split(messages);
+    assert_eq!(prefix.len(), 3);
+    assert!(suffix.is_empty());
+    // The thinking block (and its signature) round-tripped unchanged.
+    assert_eq!(
+        serde_json::to_value(&prefix[1]).unwrap(),
+        serde_json::to_value(&asst).unwrap(),
+        "thinking + signature must commit byte-verbatim",
+    );
+}
+
+// ── commit_partial_turn_on_cancel unit behavior ─────────────────────
+
+#[tokio::test]
+async fn partial_commit_empty_candidate_is_a_strict_no_op() -> Result<()> {
+    let stores = TestStores::new();
+    // Seed the thread row (get_or_create).
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+
+    let suffix = commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id: &thread_a(),
+            task_id: &task.id,
+            candidate: Vec::new(),
+            expected_turn: 1,
+            agent_state_snapshot: serde_json::Value::Null,
+        },
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?;
+
+    assert!(suffix.is_empty());
+    // No attempt row, no thread mutation, no projection write.
+    assert!(stores.attempts.list_by_task(&task.id).await?.is_empty());
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 0);
+    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_commit_unbalanced_candidate_commits_prefix_returns_suffix() -> Result<()> {
+    let stores = TestStores::new();
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+
+    let candidate = vec![
+        agent_sdk_foundation::llm::Message::user("prompt"),
+        agent_sdk_foundation::llm::Message::assistant_with_tool_use(
+            None,
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        ),
+    ];
+    let suffix = commit_partial_turn_on_cancel(
+        PartialCancelCommit {
+            thread_id: &thread_a(),
+            task_id: &task.id,
+            candidate,
+            expected_turn: 1,
+            agent_state_snapshot: serde_json::Value::Null,
+        },
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?;
+
+    // The user prompt committed; the tool_use came back as suffix.
+    assert_eq!(suffix.len(), 1);
+    assert_eq!(suffix[0].role, Role::Assistant);
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].role, Role::User);
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+    // Usage is not double-billed onto the thread aggregate.
+    assert_eq!(thread.total_usage.input_tokens, 0);
+    assert_eq!(thread.total_usage.output_tokens, 0);
+    Ok(())
+}
+
+// ── Seam B: fresh-turn mid-stream cancel ────────────────────────────
+
+/// Streaming provider that models a real mid-stream cancel: it streams
+/// one text delta, optionally flips the task's durable status to
+/// `Cancelled` via `cancel_tree` (mirroring a stop/ESC that drops the
+/// worker's lease), trips the shared cancellation token, streams a
+/// second delta, then ends WITHOUT a `Done` marker so the worker's
+/// biased cancel branch wins on the next poll. The streamed
+/// "partial answer" lives only in the accumulator and must be dropped.
+struct MidStreamCancelProvider {
+    cancel: CancellationToken,
+    cancel_tree: Option<(InMemoryAgentTaskStore, AgentTaskId, time::OffsetDateTime)>,
+}
+
+#[async_trait]
+impl LlmProvider for MidStreamCancelProvider {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        anyhow::bail!("MidStreamCancelProvider drives only the streaming path")
+    }
+
+    fn chat_stream(&self, _request: ChatRequest) -> StreamBox<'_> {
+        let cancel = self.cancel.clone();
+        let cancel_tree = self.cancel_tree.clone();
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamDelta::TextDelta {
+                delta: "partial ".to_owned(),
+                block_index: 0,
+            });
+            if let Some((store, task_id, now)) = cancel_tree {
+                let _ = store.cancel_tree(&task_id, now).await;
+            }
+            cancel.cancel();
+            yield Ok(StreamDelta::TextDelta {
+                delta: "answer".to_owned(),
+                block_index: 0,
+            });
+        })
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn fresh_turn_mid_stream_cancel_commits_user_prompt() -> Result<()> {
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelProvider {
+        cancel: cancel.clone(),
+        cancel_tree: Some((stores.tasks.clone(), task_id.clone(), t_plus(2))),
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = execute_root_turn(
+        inputs,
+        "What is the capital of France?",
+        &provider,
+        &deps,
+        t_plus(5),
+    )
+    .await;
+    let error = result.err().context("cancelled turn must return Err")?;
+    assert!(
+        format!("{error:#}").to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error:#}",
+    );
+
+    // The completed prefix — exactly the user prompt — commits as turn 1.
+    // The streamed "partial answer" is dropped (accumulator-only).
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(committed.len(), 1, "only the user prompt commits");
+    assert_eq!(committed[0].role, Role::User);
+    assert!(message_text(&committed[0]).contains("capital of France"));
+    assert!(
+        !committed.iter().any(|m| m.role == Role::Assistant),
+        "the mid-stream assistant response must not leak into the commit",
+    );
+
+    // Exactly one checkpoint at turn 1.
+    assert_eq!(
+        stores.checkpoints.list_by_thread(&thread_a()).await?.len(),
+        1,
+    );
+
+    // A synthetic cancel-commit attempt was opened and closed Cancelled.
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    let synthetic = attempts
+        .iter()
+        .find(|a| a.provider == "cancel-commit")
+        .context("synthetic cancel-commit attempt")?;
+    assert!(synthetic.is_closed());
+    assert_eq!(synthetic.outcome, Some(TurnAttemptOutcome::Cancelled));
+
+    // The next turn's recovered context contains the committed prompt.
+    let view = crate::journal::thread_recover::recover_thread(
+        &thread_a(),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(6),
+    )
+    .await?;
+    assert_eq!(view.next_turn_number, 2);
+    assert!(
+        view.messages
+            .iter()
+            .any(|m| message_text(m).contains("capital of France")),
+        "the rebuilt context must carry the cancelled turn's prompt",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_lost_mid_stream_does_not_partial_commit() -> Result<()> {
+    // The token trips mid-stream but the task's durable status stays
+    // Running (a lease-lost requeue, NOT a user cancel). Seam B's status
+    // guard must skip the partial commit so the re-run owns turn N.
+    let stores = TestStores::new();
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelProvider {
+        cancel: cancel.clone(),
+        // No cancel_tree: the task stays Running.
+        cancel_tree: None,
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = execute_root_turn(inputs, "a question", &provider, &deps, t_plus(5)).await;
+    assert!(result.is_err(), "cancel still aborts the turn");
+
+    // No partial commit: the task was never Cancelled.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 0);
+    assert!(stores.messages.get_history(&thread_a()).await?.is_empty());
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert!(
+        !attempts.iter().any(|a| a.provider == "cancel-commit"),
+        "no synthetic cancel-commit attempt on a lease-lost requeue",
+    );
+    Ok(())
+}
+
+// ── Seam B: resume mid-stream cancel (balanced-draft-drop regression) ─
+
+#[tokio::test]
+async fn resume_mid_stream_cancel_commits_tool_results_and_clears_draft() -> Result<()> {
+    let stores = TestStores::new();
+
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_foundation::ToolResult {
+            success: true,
+            output: "file1.txt\nfile2.txt".to_owned(),
+            data: None,
+            documents: Vec::new(),
+            duration_ms: Some(50),
+        },
+    )];
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )],
+        &child_results,
+    ))
+    .await?;
+
+    // Re-acquire the parent for the resume path.
+    let parent_id = parent.id.clone();
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent_id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire parent")?;
+
+    let bootstrap = sample_bootstrap_with_tools(acquired);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
+
+    // Cancel mid-resume: the token trips and the task's durable status
+    // flips to Cancelled before the resume LLM call.
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelProvider {
+        cancel: cancel.clone(),
+        cancel_tree: Some((stores.tasks.clone(), parent_id.clone(), t_plus(22))),
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+
+    let result = resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &provider,
+        &deps,
+        t_plus(25),
+    )
+    .await;
+    assert!(result.is_err(), "a cancelled resume must return Err");
+
+    // The full balanced resume delta committed: user prompt + assistant
+    // tool_use + tool_results — the balanced-draft-drop is fixed.
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1);
+
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        committed.len() >= 3,
+        "resume delta commits in full (prompt + tool_use + results), got {}",
+        committed.len(),
+    );
+    assert!(
+        !agent_sdk_foundation::llm::has_unbalanced_tool_use(&committed),
+        "the committed history is provider-valid",
+    );
+    // The tool result survives into committed history.
+    assert!(
+        committed
+            .iter()
+            .any(|m| message_text(m).contains("file1.txt") || has_tool_result_for(m, "call_1")),
+        "the completed tool results survive the cancel",
+    );
+
+    // The draft was cleared in the commit transaction.
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
+    assert!(!projection.has_draft(), "commit clears the in-flight draft");
+
+    Ok(())
+}
+
+/// True if `message` carries a `tool_result` for `tool_use_id`.
+fn has_tool_result_for(message: &agent_sdk_foundation::llm::Message, tool_use_id: &str) -> bool {
+    use agent_sdk_foundation::llm::Content;
+    matches!(
+        &message.content,
+        Content::Blocks(blocks)
+            if blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id: id, .. } if id == tool_use_id
+            ))
+    )
+}
+
+// ── Seam A: parked WaitingOnChildren cancel + next-turn backfill ─────
+
+#[tokio::test]
+async fn parked_cancel_commits_prefix_and_next_turn_backfill_closes_without_dup() -> Result<()> {
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+
+    // Suspend at a tool boundary → parent WaitingOnChildren, draft =
+    // [user, assistant+tool_use].
+    let outcome = execute_root_turn(inputs, "run ls", &provider, &stores.deps(), t_plus(5)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+
+    // Cancel the parked parent via cancel_root_turn (seam A).
+    cancel_root_turn(&task_id, &stores.deps(), t_plus(6)).await?;
+
+    // The user prompt committed as turn 1; the trailing tool_use is the
+    // re-seeded draft.
+    let committed = stores.messages.get_history(&thread_a()).await?;
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].role, Role::User);
+    let projection = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?;
+    assert_eq!(
+        projection.draft_messages.len(),
+        1,
+        "trailing tool_use re-seeded"
+    );
+
+    // Run a fresh next turn on a NEW task. The pre-call backfill must
+    // close the orphaned tool_use with a cancelled result WITHOUT
+    // duplicating the already-committed user prompt.
+    let next_task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let next_bootstrap = sample_bootstrap(next_task);
+    let next_inputs = build_root_worker_inputs(
+        next_bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(10),
+    )
+    .await?;
+    let next_provider = MockTextProvider::new("all done");
+    let next_outcome = execute_root_turn(
+        next_inputs,
+        "and now?",
+        &next_provider,
+        &stores.deps(),
+        t_plus(11),
+    )
+    .await?;
+    assert!(matches!(next_outcome, RootTurnOutcome::Completed { .. }));
+
+    let final_history = stores.messages.get_history(&thread_a()).await?;
+    assert!(
+        !agent_sdk_foundation::llm::has_unbalanced_tool_use(&final_history),
+        "the next turn balances the orphaned tool_use",
+    );
+    // The cancelled prefix's user prompt appears exactly once (no dup).
+    let run_ls_count = final_history
+        .iter()
+        .filter(|m| message_text(m).contains("run ls"))
+        .count();
+    assert_eq!(run_ls_count, 1, "the committed prefix is not duplicated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn double_cancel_root_turn_commits_prefix_once() -> Result<()> {
+    let stores = TestStores::new();
+    let provider =
+        MockToolCallProvider::single("call_a", "bash", serde_json::json!({"command": "ls"}));
+
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let bootstrap = sample_bootstrap_with_tools(task);
+    let inputs = build_root_worker_inputs(
+        bootstrap,
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let outcome = execute_root_turn(inputs, "run ls", &provider, &stores.deps(), t_plus(5)).await?;
+    assert!(matches!(outcome, RootTurnOutcome::Suspended { .. }));
+
+    cancel_root_turn(&task_id, &stores.deps(), t_plus(6)).await?;
+    // Second cancel finds the row already terminal (Cancelled) — no
+    // longer parked — so seam A skips the commit; even if it were
+    // retried, the expected_turn CAS would block a re-commit.
+    let second = cancel_root_turn(&task_id, &stores.deps(), t_plus(7)).await?;
+    assert!(
+        second.is_empty(),
+        "second cancel on a terminal tree is a no-op"
+    );
+
+    let thread = stores.threads.get(&thread_a()).await?.context("thread")?;
+    assert_eq!(thread.committed_turns, 1, "the prefix commits exactly once");
+    assert_eq!(
+        stores.checkpoints.list_by_thread(&thread_a()).await?.len(),
+        1,
+    );
     Ok(())
 }
