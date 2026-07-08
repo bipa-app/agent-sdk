@@ -130,6 +130,13 @@ pub struct SubagentSpawnPlan {
     /// Empty means "let `spawn_subagent_invocation` derive it from
     /// `spec.prompt + spec.task`".
     pub child_root_input: Vec<SubmittedInputItem>,
+    /// Opaque caller identity/spec projection for the child ROOT turn.
+    /// A host `AgentDefinitionRegistry` reads this from the child root's
+    /// `caller_metadata` to resolve a per-subagent model/toolset/prompt
+    /// instead of falling back to the parent role. `None` reproduces the
+    /// prior behavior (child root has no caller metadata). The SDK
+    /// treats it as opaque JSON — it neither parses nor imposes a shape.
+    pub child_caller_metadata: Option<serde_json::Value>,
 }
 
 /// Decides, per pending tool call, whether the worker should route
@@ -369,6 +376,7 @@ mod tests {
             spec,
             child_thread_id: ThreadId::new(),
             child_root_input: Vec::new(),
+            child_caller_metadata: None,
         }
     }
 

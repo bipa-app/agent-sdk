@@ -1436,6 +1436,10 @@ pub struct SubagentBatchEntry {
     pub child_root_input: Vec<SubmittedInputItem>,
     /// Index into the shared continuation's `pending_tool_calls`.
     pub spawn_index: u32,
+    /// Host-supplied caller metadata to stamp on the child's durable
+    /// root turn (`None` when the caller supplies none). Propagated
+    /// verbatim into the child's `SubagentInvocationSpawn`.
+    pub child_caller_metadata: Option<serde_json::Value>,
 }
 
 /// Persist N durable subagent invocations atomically under one parent
@@ -1662,6 +1666,7 @@ pub async fn spawn_subagent_batch_invocations(
             spec: entry.spec,
             child_root_input: entry.child_root_input,
             spawn_index: entry.spawn_index,
+            child_caller_metadata: entry.child_caller_metadata,
             payload: payload.clone(),
         })
         .collect();

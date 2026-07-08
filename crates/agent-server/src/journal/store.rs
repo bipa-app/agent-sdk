@@ -231,6 +231,10 @@ pub struct SubagentInvocationSpawn {
     pub child_root_input: Vec<SubmittedInputItem>,
     pub spawn_index: u32,
     pub payload: SuspensionPayload,
+    /// Opaque caller metadata for the child root turn (see
+    /// [`crate::worker::subagent_spawn_selector::SubagentSpawnPlan::child_caller_metadata`]).
+    /// `None` = child root has no caller metadata (prior behavior).
+    pub child_caller_metadata: Option<serde_json::Value>,
 }
 
 /// The idempotency key a [`AgentTaskStore::submit_root_turn_idempotent`]
@@ -2078,10 +2082,12 @@ impl Inner {
                 child_root_input,
                 spawn_index,
                 payload: _per_entry_payload,
+                child_caller_metadata,
             } = spawn;
-            let child_root = AgentTask::new_root_turn_with_input(
+            let child_root = AgentTask::new_root_turn_with_optional_caller(
                 child_thread_id.clone(),
                 child_root_input,
+                child_caller_metadata,
                 now,
                 RuntimePolicy::server_default().max_attempts,
             );
@@ -3150,6 +3156,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             child_root_input,
             spawn_index,
             payload,
+            child_caller_metadata,
         } = spawn;
 
         let old_parent = inner
@@ -3194,9 +3201,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             ));
         }
 
-        let child_root = AgentTask::new_root_turn_with_input(
+        let child_root = AgentTask::new_root_turn_with_optional_caller(
             child_thread_id.clone(),
             child_root_input,
+            child_caller_metadata,
             now,
             RuntimePolicy::server_default().max_attempts,
         );
@@ -7499,6 +7507,7 @@ mod tests {
                         continuation: sample_continuation(thread_name),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(2),
             )
@@ -7687,6 +7696,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn"),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(2),
             )
@@ -7766,6 +7776,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(2),
             )
@@ -7791,6 +7802,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-spawn-cas"),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(3),
             )
@@ -7841,6 +7853,7 @@ mod tests {
                     continuation: sample_continuation("t-subagent-batch"),
                     suspended_messages: Vec::new(),
                 },
+                child_caller_metadata: None,
             })
             .collect();
 
@@ -7971,6 +7984,7 @@ mod tests {
                     continuation: sample_continuation("t-subagent-batch-dup"),
                     suspended_messages: Vec::new(),
                 },
+                child_caller_metadata: None,
             },
             SubagentInvocationSpawn {
                 child_thread_id: dup_thread.clone(),
@@ -7981,6 +7995,7 @@ mod tests {
                     continuation: sample_continuation("t-subagent-batch-dup"),
                     suspended_messages: Vec::new(),
                 },
+                child_caller_metadata: None,
             },
         ];
 
@@ -8032,6 +8047,7 @@ mod tests {
                     continuation: sample_continuation("t-subagent-batch-cas"),
                     suspended_messages: Vec::new(),
                 },
+                child_caller_metadata: None,
             }]
         };
 
@@ -8088,6 +8104,7 @@ mod tests {
                         continuation: sample_continuation("t-subagent-terminal"),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(2),
             )
@@ -9672,6 +9689,7 @@ mod tests {
                         continuation: sample_continuation("t-nested-gp-child"),
                         suspended_messages: Vec::new(),
                     },
+                    child_caller_metadata: None,
                 },
                 t_plus(4),
             )

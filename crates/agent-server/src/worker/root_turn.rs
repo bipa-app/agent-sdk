@@ -2663,6 +2663,7 @@ async fn spawn_single_subagent_invocation(
         child_root_input: plan.child_root_input.clone(),
         spawn_index: spawn_index_u32,
         payload,
+        child_caller_metadata: plan.child_caller_metadata.clone(),
     };
     let invocation_deps = super::subagent::SubagentInvocationDeps {
         task_store: deps.task_store,
@@ -2709,6 +2710,7 @@ async fn spawn_multi_subagent_invocations(
             spec: plan.spec.clone(),
             child_root_input: plan.child_root_input.clone(),
             spawn_index: spawn_index_u32,
+            child_caller_metadata: plan.child_caller_metadata.clone(),
         });
     }
     let invocation_deps = super::subagent::SubagentInvocationDeps {

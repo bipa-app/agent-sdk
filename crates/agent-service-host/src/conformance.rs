@@ -217,6 +217,7 @@ mod tests {
                     spec: sample_subagent_spec(),
                     child_root_input: sample_subagent_input(),
                     spawn_index: 0,
+                    child_caller_metadata: None,
                     payload: suspension_payload(parent_thread),
                 },
                 t_plus(2),
