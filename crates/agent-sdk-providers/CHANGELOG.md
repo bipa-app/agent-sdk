@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.4](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.3...agent-sdk-providers-v0.11.4) - 2026-07-08
+
+### Fixed
+
+- *(anthropic)* surface mid-stream SSE `error` events instead of dropping them ([#334](https://github.com/bipa-app/agent-sdk/pull/334))
+
 ## [0.11.3](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.2...agent-sdk-providers-v0.11.3) - 2026-07-07
 
 ### Other
