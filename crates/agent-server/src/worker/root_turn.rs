@@ -360,7 +360,7 @@ pub async fn fail_root_turn(
 /// Before tearing the subtree down, this commits the completed prefix of
 /// a **parked** turn (`WaitingOnChildren`, or `Pending` +
 /// [`TaskState::ReadyToResume`]) so the next turn's LLM context survives
-/// the cancel — see [`commit_partial_turn_on_cancel`]. A `Running` task
+/// the cancel — see `commit_partial_turn_on_cancel`. A `Running` task
 /// is skipped here: its live worker loop owns the commit (seam B), and
 /// committing from both seams would race on the same turn number. The
 /// partial commit is best-effort — any error is logged and swallowed so
@@ -580,7 +580,7 @@ pub(crate) fn provider_valid_split(
     (messages, suffix)
 }
 
-/// Parameters for [`commit_partial_turn_on_cancel`].
+/// Parameters for `commit_partial_turn_on_cancel`.
 pub(crate) struct PartialCancelCommit<'a> {
     /// Thread the cancelled turn belongs to.
     pub(crate) thread_id: &'a agent_sdk_foundation::ThreadId,
