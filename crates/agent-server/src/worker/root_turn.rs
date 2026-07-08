@@ -373,7 +373,7 @@ pub async fn fail_root_turn(
 /// `TaskState` to `None`; the durable message-projection draft slot
 /// survives, so a re-seeded suffix (the dropped trailing
 /// `assistant + tool_use`) is closed by the next turn's
-/// [`backfill_orphaned_tool_results`].
+/// `backfill_orphaned_tool_results`.
 ///
 /// # Returns
 ///
