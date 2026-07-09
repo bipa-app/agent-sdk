@@ -17,7 +17,7 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -86,6 +86,8 @@ const OPENAI_CODEX_RESPONSES_WEBSOCKETS_BETA_HEADER: &str = "responses_websocket
 const OPENAI_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const OPENAI_CODEX_WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str =
     "websocket_connection_limit_reached";
+const OPENAI_RESPONSES_REASONING_PROVIDER: &str = "openai-responses";
+const OPENAI_MESSAGE_ITEM_TYPE: &str = "message";
 
 // GPT-5.4 (frontier reasoning with 1.05M context)
 pub const MODEL_GPT54: &str = "gpt-5.4";
@@ -384,19 +386,33 @@ impl OpenAICodexResponsesProvider {
     }
 
     fn map_response(api_response: ApiResponse) -> ChatResponse {
-        let content = build_content_blocks(&api_response.output);
+        let refused = output_contains_refusal(&api_response.output);
+        let mut content = build_content_blocks(&api_response.output);
         let has_tool_calls = content
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-        let stop_reason = if has_tool_calls {
+        let stop_reason = if matches!(api_response.status, Some(ApiStatus::Incomplete)) {
+            Some(
+                api_response
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|details| details.reason.as_deref())
+                    .map_or(StopReason::Unknown, incomplete_stop_reason),
+            )
+        } else if refused {
+            Some(StopReason::Refusal)
+        } else if has_tool_calls {
             Some(StopReason::ToolUse)
         } else {
             api_response.status.map(|status| match status {
                 ApiStatus::Completed => StopReason::EndTurn,
-                ApiStatus::Incomplete => StopReason::MaxTokens,
-                ApiStatus::Failed => StopReason::StopSequence,
+                ApiStatus::Incomplete | ApiStatus::Failed => StopReason::Unknown,
             })
         };
+
+        if stop_reason != Some(StopReason::ToolUse) {
+            content.retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+        }
 
         ChatResponse {
             id: api_response.id,
@@ -410,15 +426,7 @@ impl OpenAICodexResponsesProvider {
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 },
-                |usage| Usage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cached_input_tokens: usage
-                        .input_tokens_details
-                        .as_ref()
-                        .map_or(0, |details| details.cached_tokens),
-                    cache_creation_input_tokens: 0,
-                },
+                |usage| usage_from_api_usage(&usage),
             ),
         }
     }
@@ -762,17 +770,35 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             reset_websocket_connection(&mut websocket_session);
                                             continue 'websocket_attempts;
                                         }
-                                        if let Ok(event) =
-                                            serde_json::from_str::<ApiStreamEvent>(&text)
-                                        {
+                                        let event = match decode_stream_event(&text) {
+                                            Ok(event) => event,
+                                            Err(error) => {
+                                                reset_websocket_connection(
+                                                    &mut websocket_session,
+                                                );
+                                                yield Ok(StreamDelta::Error {
+                                                    message: error.to_string(),
+                                                    kind: StreamErrorKind::ServerError,
+                                                });
+                                                return;
+                                            }
+                                        };
                                             match event.r#type.as_str() {
-                                                "response.output_item.added" => {
-                                                    if let Some(item) = event.item
-                                                        && let Ok(item) =
-                                                            serde_json::from_value::<ApiOutputItem>(item)
-                                                        && let Some(item) =
-                                                            output_item_to_input_item(item)
-                                                    {
+                                                "response.output_item.done" => {
+                                                    let item = match decode_output_item(event.item) {
+                                                        Ok(item) => item,
+                                                        Err(error) => {
+                                                            reset_websocket_connection(
+                                                                &mut websocket_session,
+                                                            );
+                                                            yield Ok(StreamDelta::Error {
+                                                                message: error.to_string(),
+                                                                kind: StreamErrorKind::ServerError,
+                                                            });
+                                                            return;
+                                                        }
+                                                    };
+                                                    if let Some(item) = output_item_to_input_item(item) {
                                                         warmup_response_items.push(item);
                                                     }
                                                 }
@@ -806,10 +832,23 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 }
                                                 _ => {}
                                             }
-                                        }
                                     }
                                     WebSocketMessage::Binary(bytes) => {
-                                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                        let text = match String::from_utf8(bytes.to_vec()) {
+                                            Ok(text) => text,
+                                            Err(error) => {
+                                                reset_websocket_connection(
+                                                    &mut websocket_session,
+                                                );
+                                                yield Ok(StreamDelta::Error {
+                                                    message: format!(
+                                                        "invalid OpenAI Codex websocket UTF-8: {error}"
+                                                    ),
+                                                    kind: StreamErrorKind::ServerError,
+                                                });
+                                                return;
+                                            }
+                                        };
                                             if let Some((status, message)) =
                                                 parse_wrapped_websocket_error_event(&text)
                                             {
@@ -828,18 +867,35 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 continue 'websocket_attempts;
                                             }
 
-                                            if let Ok(event) =
-                                                serde_json::from_str::<ApiStreamEvent>(&text)
-                                            {
+                                            let event = match decode_stream_event(&text) {
+                                                Ok(event) => event,
+                                                Err(error) => {
+                                                    reset_websocket_connection(
+                                                        &mut websocket_session,
+                                                    );
+                                                    yield Ok(StreamDelta::Error {
+                                                        message: error.to_string(),
+                                                        kind: StreamErrorKind::ServerError,
+                                                    });
+                                                    return;
+                                                }
+                                            };
                                                 match event.r#type.as_str() {
-                                                    "response.output_item.added" => {
-                                                        if let Some(item) = event.item
-                                                            && let Ok(item) = serde_json::from_value::<
-                                                                ApiOutputItem,
-                                                            >(item)
-                                                            && let Some(item) =
-                                                                output_item_to_input_item(item)
-                                                        {
+                                                    "response.output_item.done" => {
+                                                        let item = match decode_output_item(event.item) {
+                                                            Ok(item) => item,
+                                                            Err(error) => {
+                                                                reset_websocket_connection(
+                                                                    &mut websocket_session,
+                                                                );
+                                                                yield Ok(StreamDelta::Error {
+                                                                    message: error.to_string(),
+                                                                    kind: StreamErrorKind::ServerError,
+                                                                });
+                                                                return;
+                                                            }
+                                                        };
+                                                        if let Some(item) = output_item_to_input_item(item) {
                                                             warmup_response_items.push(item);
                                                         }
                                                     }
@@ -873,8 +929,6 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     }
                                                     _ => {}
                                                 }
-                                            }
-                                        }
                                     }
                                     WebSocketMessage::Ping(payload) => {
                                         if let Some(connection) =
@@ -960,7 +1014,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                         let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
                         let mut response_id: Option<String> = None;
                         let mut response_items = Vec::new();
+                        let mut streamed_reasoning_summaries = HashSet::new();
                         let mut emitted_output = false;
+                        let mut refused = false;
 
                         loop {
                             let message_result = if let Some(connection) =
@@ -1040,21 +1096,60 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                         reset_websocket_connection(&mut websocket_session);
                                         continue 'websocket_attempts;
                                     }
-                                    if let Ok(event) = serde_json::from_str::<ApiStreamEvent>(&text) {
-                                        match event.r#type.as_str() {
+                                    let event = match decode_stream_event(&text) {
+                                        Ok(event) => event,
+                                        Err(error) => {
+                                            reset_websocket_connection(&mut websocket_session);
+                                            yield Ok(StreamDelta::Error {
+                                                message: error.to_string(),
+                                                kind: StreamErrorKind::ServerError,
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    match event.r#type.as_str() {
                                             "response.output_text.delta" => {
                                                 if let Some(delta) = event.delta {
                                                     emitted_output = true;
                                                     yield Ok(StreamDelta::TextDelta {
                                                         delta,
-                                                        block_index: 0,
+                                                        block_index: output_block_index(event.output_index),
+                                                    });
+                                                }
+                                            }
+                                            "response.refusal.delta" => {
+                                                refused = true;
+                                                if let Some(delta) = event.delta {
+                                                    emitted_output = true;
+                                                    yield Ok(StreamDelta::TextDelta {
+                                                        delta,
+                                                        block_index: output_block_index(
+                                                            event.output_index,
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                            "response.reasoning_summary_text.delta" => {
+                                                if let Some(delta) = event.delta {
+                                                    let output_index = event.output_index.unwrap_or(0);
+                                                    streamed_reasoning_summaries.insert(output_index);
+                                                    emitted_output = true;
+                                                    yield Ok(StreamDelta::ThinkingDelta {
+                                                        delta,
+                                                        block_index: reasoning_summary_block_index(
+                                                            Some(output_index),
+                                                        ),
                                                     });
                                                 }
                                             }
                                             "response.function_call_arguments.delta" => {
+                                                let block_index = event
+                                                    .output_index
+                                                    .map(|index| index.saturating_mul(2));
                                                 if let (Some(call_id), Some(delta)) =
                                                     (event.call_id, event.delta)
                                                 {
+                                                    emitted_output = true;
                                                     let order = tool_calls.len();
                                                     let acc = tool_calls
                                                         .entry(call_id.clone())
@@ -1063,22 +1158,54 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                             name: event.name.unwrap_or_default(),
                                                             arguments: String::new(),
                                                             order,
+                                                            block_index,
                                                         });
                                                     acc.arguments.push_str(&delta);
                                                 }
                                             }
-                                            "response.output_item.added" => {
-                                                if let Some(item) = event.item
-                                                    && let Ok(item) =
-                                                        serde_json::from_value::<ApiOutputItem>(item)
-                                                    && let Some(item) = output_item_to_input_item(item)
-                                                {
+                                            "response.output_item.done" => {
+                                                let item = match decode_output_item(event.item) {
+                                                    Ok(item) => item,
+                                                    Err(error) => {
+                                                        reset_websocket_connection(
+                                                            &mut websocket_session,
+                                                        );
+                                                        yield Ok(StreamDelta::Error {
+                                                            message: error.to_string(),
+                                                            kind: StreamErrorKind::ServerError,
+                                                        });
+                                                        return;
+                                                    }
+                                                };
+                                                let block_index = event.output_index.unwrap_or(0);
+                                                let include_summary = !streamed_reasoning_summaries
+                                                    .contains(&block_index);
+                                                for delta in output_item_stream_deltas(
+                                                    &item,
+                                                    block_index,
+                                                    include_summary,
+                                                ) {
+                                                    emitted_output = true;
+                                                    yield Ok(delta);
+                                                }
+                                                if let Some(item) = output_item_to_input_item(item) {
                                                     response_items.push(item);
                                                 }
                                             }
                                             "response.completed"
                                             | "response.incomplete"
                                             | "response.done" => {
+                                                let response_status = event
+                                                    .response
+                                                    .as_ref()
+                                                    .and_then(|response| response.status);
+                                                let incomplete_reason = event
+                                                    .response
+                                                    .as_ref()
+                                                    .and_then(|response| {
+                                                        response.incomplete_details.as_ref()
+                                                    })
+                                                    .and_then(|details| details.reason.clone());
                                                 if let Some(resp) = event.response {
                                                     if let Some(u) = resp.usage {
                                                         usage = Some(usage_from_api_usage(&u));
@@ -1087,12 +1214,26 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                         response_id = Some(id);
                                                     }
                                                 }
-                                                let final_status = Some(match event.r#type.as_str() {
-                                                    "response.incomplete" => ApiStatus::Incomplete,
-                                                    _ => ApiStatus::Completed,
-                                                });
-                                                for delta in emit_accumulated_tool_calls(&tool_calls) {
-                                                    yield Ok(delta);
+                                                let final_status = match event.r#type.as_str() {
+                                                    "response.incomplete" => {
+                                                        Some(ApiStatus::Incomplete)
+                                                    }
+                                                    "response.done" => response_status
+                                                        .or(Some(ApiStatus::Completed)),
+                                                    _ => Some(ApiStatus::Completed),
+                                                };
+                                                let stop_reason = stop_reason_from_stream_state(
+                                                    &tool_calls,
+                                                    final_status,
+                                                    refused,
+                                                    incomplete_reason.as_deref(),
+                                                );
+                                                if stop_reason == Some(StopReason::ToolUse) {
+                                                    for delta in
+                                                        emit_accumulated_tool_calls(&tool_calls)
+                                                    {
+                                                        yield Ok(delta);
+                                                    }
                                                 }
                                                 if let Some(u) = usage.take() {
                                                     yield Ok(StreamDelta::Usage(u));
@@ -1106,10 +1247,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 // may reuse this connection/baseline.
                                                 websocket_session.in_flight = false;
                                                 yield Ok(StreamDelta::Done {
-                                                    stop_reason: Some(stop_reason_from_stream_state(
-                                                        &tool_calls,
-                                                        final_status,
-                                                    )),
+                                                    stop_reason,
                                                 });
                                                 return;
                                             }
@@ -1132,11 +1270,22 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 return;
                                             }
                                             _ => {}
-                                        }
                                     }
                                 }
                                 WebSocketMessage::Binary(bytes) => {
-                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                    let text = match String::from_utf8(bytes.to_vec()) {
+                                        Ok(text) => text,
+                                        Err(error) => {
+                                            reset_websocket_connection(&mut websocket_session);
+                                            yield Ok(StreamDelta::Error {
+                                                message: format!(
+                                                    "invalid OpenAI Codex websocket UTF-8: {error}"
+                                                ),
+                                                kind: StreamErrorKind::ServerError,
+                                            });
+                                            return;
+                                        }
+                                    };
                                         if let Some((status, message)) =
                                             parse_wrapped_websocket_error_event(&text)
                                         {
@@ -1165,23 +1314,65 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             continue 'websocket_attempts;
                                         }
 
-                                        if let Ok(event) =
-                                            serde_json::from_str::<ApiStreamEvent>(&text)
-                                        {
+                                        let event = match decode_stream_event(&text) {
+                                            Ok(event) => event,
+                                            Err(error) => {
+                                                reset_websocket_connection(
+                                                    &mut websocket_session,
+                                                );
+                                                yield Ok(StreamDelta::Error {
+                                                    message: error.to_string(),
+                                                    kind: StreamErrorKind::ServerError,
+                                                });
+                                                return;
+                                            }
+                                        };
                                             match event.r#type.as_str() {
                                                 "response.output_text.delta" => {
                                                     if let Some(delta) = event.delta {
                                                         emitted_output = true;
                                                         yield Ok(StreamDelta::TextDelta {
                                                             delta,
-                                                            block_index: 0,
+                                                            block_index: output_block_index(event.output_index),
+                                                        });
+                                                    }
+                                                }
+                                                "response.refusal.delta" => {
+                                                    refused = true;
+                                                    if let Some(delta) = event.delta {
+                                                        emitted_output = true;
+                                                        yield Ok(StreamDelta::TextDelta {
+                                                            delta,
+                                                            block_index: output_block_index(
+                                                                event.output_index,
+                                                            ),
+                                                        });
+                                                    }
+                                                }
+                                                "response.reasoning_summary_text.delta" => {
+                                                    if let Some(delta) = event.delta {
+                                                        let output_index =
+                                                            event.output_index.unwrap_or(0);
+                                                        streamed_reasoning_summaries
+                                                            .insert(output_index);
+                                                        emitted_output = true;
+                                                        yield Ok(StreamDelta::ThinkingDelta {
+                                                            delta,
+                                                            block_index:
+                                                                reasoning_summary_block_index(Some(
+                                                                    output_index,
+                                                                )),
                                                         });
                                                     }
                                                 }
                                                 "response.function_call_arguments.delta" => {
+                                                    let block_index = event
+                                                        .output_index
+                                                        .map(|index| index.saturating_mul(2));
                                                     if let (Some(call_id), Some(delta)) =
                                                         (event.call_id, event.delta)
                                                     {
+                                                        emitted_output = true;
                                                         let order = tool_calls.len();
                                                         let acc = tool_calls
                                                             .entry(call_id.clone())
@@ -1190,17 +1381,41 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                                 name: event.name.unwrap_or_default(),
                                                                 arguments: String::new(),
                                                                 order,
+                                                                block_index,
                                                             });
                                                         acc.arguments.push_str(&delta);
                                                     }
                                                 }
-                                                "response.output_item.added" => {
-                                                    if let Some(item) = event.item
-                                                        && let Ok(item) = serde_json::from_value::<
-                                                            ApiOutputItem,
-                                                        >(item)
-                                                        && let Some(item) =
-                                                            output_item_to_input_item(item)
+                                                "response.output_item.done" => {
+                                                    let item =
+                                                        match decode_output_item(event.item) {
+                                                            Ok(item) => item,
+                                                            Err(error) => {
+                                                                reset_websocket_connection(
+                                                                    &mut websocket_session,
+                                                                );
+                                                                yield Ok(StreamDelta::Error {
+                                                                    message: error.to_string(),
+                                                                    kind: StreamErrorKind::ServerError,
+                                                                });
+                                                                return;
+                                                            }
+                                                        };
+                                                    let block_index =
+                                                        event.output_index.unwrap_or(0);
+                                                    let include_summary =
+                                                        !streamed_reasoning_summaries
+                                                            .contains(&block_index);
+                                                    for delta in output_item_stream_deltas(
+                                                        &item,
+                                                        block_index,
+                                                        include_summary,
+                                                    ) {
+                                                        emitted_output = true;
+                                                        yield Ok(delta);
+                                                    }
+                                                    if let Some(item) =
+                                                        output_item_to_input_item(item)
                                                     {
                                                         response_items.push(item);
                                                     }
@@ -1208,6 +1423,17 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                 "response.completed"
                                                 | "response.incomplete"
                                                 | "response.done" => {
+                                                    let response_status = event
+                                                        .response
+                                                        .as_ref()
+                                                        .and_then(|response| response.status);
+                                                    let incomplete_reason = event
+                                                        .response
+                                                        .as_ref()
+                                                        .and_then(|response| {
+                                                            response.incomplete_details.as_ref()
+                                                        })
+                                                        .and_then(|details| details.reason.clone());
                                                     if let Some(resp) = event.response {
                                                         if let Some(u) = resp.usage {
                                                             usage = Some(usage_from_api_usage(&u));
@@ -1216,16 +1442,30 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                             response_id = Some(id);
                                                         }
                                                     }
-                                                    let final_status = Some(
+                                                    let final_status =
                                                         match event.r#type.as_str() {
-                                                            "response.incomplete" => ApiStatus::Incomplete,
-                                                            _ => ApiStatus::Completed,
-                                                        },
-                                                    );
-                                                    for delta in
-                                                        emit_accumulated_tool_calls(&tool_calls)
+                                                            "response.incomplete" => {
+                                                                Some(ApiStatus::Incomplete)
+                                                            }
+                                                            "response.done" => response_status
+                                                                .or(Some(ApiStatus::Completed)),
+                                                            _ => Some(ApiStatus::Completed),
+                                                        };
+                                                    let stop_reason =
+                                                        stop_reason_from_stream_state(
+                                                            &tool_calls,
+                                                            final_status,
+                                                            refused,
+                                                            incomplete_reason.as_deref(),
+                                                        );
+                                                    if stop_reason
+                                                        == Some(StopReason::ToolUse)
                                                     {
-                                                        yield Ok(delta);
+                                                        for delta in
+                                                            emit_accumulated_tool_calls(&tool_calls)
+                                                        {
+                                                            yield Ok(delta);
+                                                        }
                                                     }
                                                     if let Some(u) = usage.take() {
                                                         yield Ok(StreamDelta::Usage(u));
@@ -1241,12 +1481,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     // turn may reuse the connection.
                                                     websocket_session.in_flight = false;
                                                     yield Ok(StreamDelta::Done {
-                                                        stop_reason: Some(
-                                                            stop_reason_from_stream_state(
-                                                                &tool_calls,
-                                                                final_status,
-                                                            ),
-                                                        ),
+                                                        stop_reason,
                                                     });
                                                     return;
                                                 }
@@ -1269,8 +1504,6 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                                     return;
                                                 }
                                                 _ => {}
-                                            }
-                                        }
                                     }
                                 }
                                 WebSocketMessage::Ping(payload) => {
@@ -1384,6 +1617,9 @@ impl LlmProvider for OpenAICodexResponsesProvider {
             let mut usage: Option<Usage> = None;
             let mut tool_calls: HashMap<String, ToolCallAccumulator> = HashMap::new();
             let mut final_status: Option<ApiStatus> = None;
+            let mut streamed_reasoning_summaries = HashSet::new();
+            let mut refused = false;
+            let mut incomplete_reason: Option<String> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 let Ok(chunk) = chunk_result else {
@@ -1403,26 +1639,81 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     };
 
                     if data == "[DONE]" {
-                        for delta in emit_accumulated_tool_calls(&tool_calls) {
-                            yield Ok(delta);
+                        let Some(stop_reason) =
+                            stop_reason_from_stream_state(
+                                &tool_calls,
+                                final_status,
+                                refused,
+                                incomplete_reason.as_deref(),
+                            )
+                        else {
+                            yield Ok(StreamDelta::Error {
+                                message: "OpenAI Codex stream sent [DONE] before a terminal response event"
+                                    .to_owned(),
+                                kind: StreamErrorKind::ServerError,
+                            });
+                            return;
+                        };
+                        if stop_reason == StopReason::ToolUse {
+                            for delta in emit_accumulated_tool_calls(&tool_calls) {
+                                yield Ok(delta);
+                            }
                         }
                         if let Some(u) = usage.take() {
                             yield Ok(StreamDelta::Usage(u));
                         }
                         yield Ok(StreamDelta::Done {
-                            stop_reason: Some(stop_reason_from_stream_state(&tool_calls, final_status)),
+                            stop_reason: Some(stop_reason),
                         });
                         return;
                     }
 
-                    if let Ok(event) = serde_json::from_str::<ApiStreamEvent>(data) {
-                        match event.r#type.as_str() {
+                    let event = match decode_stream_event(data) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            yield Ok(StreamDelta::Error {
+                                message: format!(
+                                    "invalid OpenAI Codex Responses stream event: {error}"
+                                ),
+                                kind: StreamErrorKind::ServerError,
+                            });
+                            return;
+                        }
+                    };
+                    match event.r#type.as_str() {
                             "response.output_text.delta" => {
                                 if let Some(delta) = event.delta {
-                                    yield Ok(StreamDelta::TextDelta { delta, block_index: 0 });
+                                    yield Ok(StreamDelta::TextDelta {
+                                        delta,
+                                        block_index: output_block_index(event.output_index),
+                                    });
+                                }
+                            }
+                            "response.refusal.delta" => {
+                                refused = true;
+                                if let Some(delta) = event.delta {
+                                    yield Ok(StreamDelta::TextDelta {
+                                        delta,
+                                        block_index: output_block_index(event.output_index),
+                                    });
+                                }
+                            }
+                            "response.reasoning_summary_text.delta" => {
+                                if let Some(delta) = event.delta {
+                                    let output_index = event.output_index.unwrap_or(0);
+                                    streamed_reasoning_summaries.insert(output_index);
+                                    yield Ok(StreamDelta::ThinkingDelta {
+                                        delta,
+                                        block_index: reasoning_summary_block_index(Some(
+                                            output_index,
+                                        )),
+                                    });
                                 }
                             }
                             "response.function_call_arguments.delta" => {
+                                let block_index = event
+                                    .output_index
+                                    .map(|index| index.saturating_mul(2));
                                 if let (Some(call_id), Some(delta)) = (event.call_id, event.delta) {
                                     let order = tool_calls.len();
                                     let acc = tool_calls.entry(call_id.clone()).or_insert_with(|| {
@@ -1431,21 +1722,56 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                             name: event.name.unwrap_or_default(),
                                             arguments: String::new(),
                                             order,
+                                            block_index,
                                         }
                                     });
                                     acc.arguments.push_str(&delta);
                                 }
                             }
+                            "response.output_item.done" => {
+                                let item = match decode_output_item(event.item) {
+                                    Ok(item) => item,
+                                    Err(error) => {
+                                        yield Ok(StreamDelta::Error {
+                                            message: error.to_string(),
+                                            kind: StreamErrorKind::ServerError,
+                                        });
+                                        return;
+                                    }
+                                };
+                                let block_index = event.output_index.unwrap_or(0);
+                                let include_summary =
+                                    !streamed_reasoning_summaries.contains(&block_index);
+                                for delta in output_item_stream_deltas(
+                                    &item,
+                                    block_index,
+                                    include_summary,
+                                ) {
+                                    yield Ok(delta);
+                                }
+                            }
                             "response.completed" | "response.incomplete" | "response.done" => {
+                                let response_status = event
+                                    .response
+                                    .as_ref()
+                                    .and_then(|response| response.status);
+                                incomplete_reason = event
+                                    .response
+                                    .as_ref()
+                                    .and_then(|response| response.incomplete_details.as_ref())
+                                    .and_then(|details| details.reason.clone());
                                 if let Some(resp) = event.response
                                     && let Some(u) = resp.usage
                                 {
                                     usage = Some(usage_from_api_usage(&u));
                                 }
-                                final_status = Some(match event.r#type.as_str() {
-                                    "response.incomplete" => ApiStatus::Incomplete,
-                                    _ => ApiStatus::Completed,
-                                });
+                                final_status = match event.r#type.as_str() {
+                                    "response.incomplete" => Some(ApiStatus::Incomplete),
+                                    "response.done" => {
+                                        response_status.or(Some(ApiStatus::Completed))
+                                    }
+                                    _ => Some(ApiStatus::Completed),
+                                };
                             }
                             "response.failed" => {
                                 let message = event
@@ -1460,16 +1786,32 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                                 return;
                             }
                             _ => {}
-                        }
                     }
                 }
             }
 
+            let Some(stop_reason) = stop_reason_from_stream_state(
+                &tool_calls,
+                final_status,
+                refused,
+                incomplete_reason.as_deref(),
+            ) else {
+                yield Ok(StreamDelta::Error {
+                    message: "OpenAI Codex stream ended before a terminal response event".to_owned(),
+                    kind: StreamErrorKind::ServerError,
+                });
+                return;
+            };
+            if stop_reason == StopReason::ToolUse {
+                for delta in emit_accumulated_tool_calls(&tool_calls) {
+                    yield Ok(delta);
+                }
+            }
             if let Some(u) = usage {
                 yield Ok(StreamDelta::Usage(u));
             }
             yield Ok(StreamDelta::Done {
-                stop_reason: Some(stop_reason_from_stream_state(&tool_calls, final_status)),
+                stop_reason: Some(stop_reason),
             });
         })
     }
@@ -1497,90 +1839,146 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
     // Convert user/assistant messages. The system prompt is sent separately as
     // `instructions`, matching pi's Codex transport.
     for msg in &request.messages {
+        let role = match msg.role {
+            agent_sdk_foundation::llm::Role::User => ApiRole::User,
+            agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
+        };
         match &msg.content {
             Content::Text(text) => {
                 items.push(ApiInputItem::Message(ApiMessage {
-                    role: match msg.role {
-                        agent_sdk_foundation::llm::Role::User => ApiRole::User,
-                        agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
-                    },
+                    role,
                     content: ApiMessageContent::Text(text.clone()),
+                    phase: api_message_phase(role, false),
                 }));
             }
-            Content::Blocks(blocks) => {
-                let mut content_parts = Vec::new();
-
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            let part = match msg.role {
-                                agent_sdk_foundation::llm::Role::Assistant => {
-                                    ApiInputContent::OutputText { text: text.clone() }
-                                }
-                                agent_sdk_foundation::llm::Role::User => {
-                                    ApiInputContent::InputText { text: text.clone() }
-                                }
-                            };
-                            content_parts.push(part);
-                        }
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
-                        ContentBlock::Image { source } => {
-                            content_parts.push(ApiInputContent::Image {
-                                image_url: format!(
-                                    "data:{};base64,{}",
-                                    source.media_type, source.data
-                                ),
-                            });
-                        }
-                        ContentBlock::Document { source } => {
-                            content_parts.push(ApiInputContent::File {
-                                filename: suggested_filename(&source.media_type),
-                                file_data: format!(
-                                    "data:{};base64,{}",
-                                    source.media_type, source.data
-                                ),
-                            });
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            items.push(ApiInputItem::FunctionCall(ApiFunctionCall::new(
-                                id.clone(),
-                                name.clone(),
-                                serde_json::to_string(input).unwrap_or_default(),
-                            )));
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } => {
-                            items.push(ApiInputItem::FunctionCallOutput(
-                                ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
-                            ));
-                        }
-                        // `ContentBlock` is `#[non_exhaustive]`; a block kind this
-                        // SDK version cannot represent on the wire is skipped.
-                        _ => {
-                            log::warn!("Skipping unrecognized OpenAI Responses content block");
-                        }
-                    }
-                }
-
-                if !content_parts.is_empty() {
-                    items.push(ApiInputItem::Message(ApiMessage {
-                        role: match msg.role {
-                            agent_sdk_foundation::llm::Role::User => ApiRole::User,
-                            agent_sdk_foundation::llm::Role::Assistant => ApiRole::Assistant,
-                        },
-                        content: ApiMessageContent::Parts(content_parts),
-                    }));
-                }
-            }
+            Content::Blocks(blocks) => append_block_input(&mut items, role, blocks),
         }
     }
 
     items
+}
+
+fn append_block_input(items: &mut Vec<ApiInputItem>, role: ApiRole, blocks: &[ContentBlock]) {
+    let mut content_parts = Vec::new();
+    let mut phase = api_message_phase(
+        role,
+        blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })),
+    );
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                let part = if matches!(role, ApiRole::Assistant) {
+                    ApiInputContent::OutputText { text: text.clone() }
+                } else {
+                    ApiInputContent::InputText { text: text.clone() }
+                };
+                content_parts.push(part);
+            }
+            ContentBlock::OpaqueReasoning { provider, data }
+                if matches!(role, ApiRole::Assistant)
+                    && is_message_state_marker(provider, data) =>
+            {
+                flush_message_parts(items, role, phase.clone(), &mut content_parts);
+                phase = data
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            ContentBlock::OpaqueReasoning { provider, data }
+                if provider == OPENAI_RESPONSES_REASONING_PROVIDER
+                    && data.get("type").and_then(serde_json::Value::as_str)
+                        == Some("reasoning") =>
+            {
+                flush_message_parts(items, role, phase.clone(), &mut content_parts);
+                items.push(ApiInputItem::OpaqueReasoning(data.clone()));
+            }
+            ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::OpaqueReasoning { .. } => {}
+            ContentBlock::Image { source } => content_parts.push(ApiInputContent::Image {
+                image_url: format!("data:{};base64,{}", source.media_type, source.data),
+            }),
+            ContentBlock::Document { source } => content_parts.push(ApiInputContent::File {
+                filename: suggested_filename(&source.media_type),
+                file_data: format!("data:{};base64,{}", source.media_type, source.data),
+            }),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                flush_message_parts(items, role, phase.clone(), &mut content_parts);
+                items.push(ApiInputItem::FunctionCall(ApiFunctionCall::new(
+                    id.clone(),
+                    name.clone(),
+                    serde_json::to_string(input).unwrap_or_default(),
+                )));
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                flush_message_parts(items, role, phase.clone(), &mut content_parts);
+                items.push(ApiInputItem::FunctionCallOutput(
+                    ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
+                ));
+            }
+            _ => log::warn!("Skipping unrecognized OpenAI Responses content block"),
+        }
+    }
+
+    flush_message_parts(items, role, phase, &mut content_parts);
+}
+
+fn api_message_phase(role: ApiRole, has_tool_use: bool) -> Option<String> {
+    match (role, has_tool_use) {
+        (ApiRole::Assistant, true) => Some("commentary".to_owned()),
+        (ApiRole::Assistant, false) => Some("final_answer".to_owned()),
+        (ApiRole::User, _) => None,
+    }
+}
+
+fn message_state_marker(role: &str, phase: Option<&str>) -> serde_json::Value {
+    let mut marker = serde_json::Map::new();
+    marker.insert(
+        "type".to_owned(),
+        serde_json::Value::String(OPENAI_MESSAGE_ITEM_TYPE.to_owned()),
+    );
+    marker.insert(
+        "role".to_owned(),
+        serde_json::Value::String(role.to_owned()),
+    );
+    if let Some(phase) = phase {
+        marker.insert(
+            "phase".to_owned(),
+            serde_json::Value::String(phase.to_owned()),
+        );
+    }
+    serde_json::Value::Object(marker)
+}
+
+fn is_message_state_marker(provider: &str, data: &serde_json::Value) -> bool {
+    provider == OPENAI_RESPONSES_REASONING_PROVIDER
+        && data.get("type").and_then(serde_json::Value::as_str) == Some(OPENAI_MESSAGE_ITEM_TYPE)
+        && data.get("content").is_none()
+}
+
+fn flush_message_parts(
+    items: &mut Vec<ApiInputItem>,
+    role: ApiRole,
+    phase: Option<String>,
+    content_parts: &mut Vec<ApiInputContent>,
+) {
+    if content_parts.is_empty() {
+        return;
+    }
+    items.push(ApiInputItem::Message(ApiMessage {
+        role,
+        content: ApiMessageContent::Parts(std::mem::take(content_parts)),
+        phase,
+    }));
 }
 
 /// Recursively fix a JSON schema for `OpenAI` strict mode.
@@ -1773,17 +2171,59 @@ fn suggested_filename(media_type: &str) -> String {
     }
 }
 
+fn reasoning_output_item(fields: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let mut item = fields.clone();
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("reasoning".to_owned()),
+    );
+    serde_json::Value::Object(item)
+}
+
+fn reasoning_summary_texts(fields: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    fields
+        .get("summary")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|summary| {
+            summary.get("type").and_then(serde_json::Value::as_str) == Some("summary_text")
+        })
+        .filter_map(|summary| {
+            summary
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
     for item in output {
         match item {
-            ApiOutputItem::Message { content, .. } => {
+            ApiOutputItem::Message {
+                role,
+                phase,
+                content,
+            } => {
+                blocks.push(ContentBlock::OpaqueReasoning {
+                    provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                    data: message_state_marker(role, phase.as_deref()),
+                });
                 for c in content {
-                    if let ApiOutputContent::Text { text } = c
-                        && !text.is_empty()
-                    {
-                        blocks.push(ContentBlock::Text { text: text.clone() });
+                    match c {
+                        ApiOutputContent::Text { text }
+                        | ApiOutputContent::Refusal { refusal: text }
+                            if !text.is_empty() =>
+                        {
+                            blocks.push(ContentBlock::Text { text: text.clone() });
+                        }
+                        ApiOutputContent::Text { .. }
+                        | ApiOutputContent::Refusal { .. }
+                        | ApiOutputContent::Unknown => {}
                     }
                 }
             }
@@ -1802,6 +2242,18 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
                     thought_signature: None,
                 });
             }
+            ApiOutputItem::Reasoning { fields } => {
+                blocks.push(ContentBlock::OpaqueReasoning {
+                    provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                    data: reasoning_output_item(fields),
+                });
+                blocks.extend(reasoning_summary_texts(fields).into_iter().map(|thinking| {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature: None,
+                    }
+                }));
+            }
             ApiOutputItem::Unknown => {
                 // Skip unknown output types
             }
@@ -1809,6 +2261,18 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
     }
 
     blocks
+}
+
+fn output_contains_refusal(output: &[ApiOutputItem]) -> bool {
+    output.iter().any(|item| {
+        matches!(
+            item,
+            ApiOutputItem::Message { content, .. }
+                if content
+                    .iter()
+                    .any(|content| matches!(content, ApiOutputContent::Refusal { .. }))
+        )
+    })
 }
 
 fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
@@ -1919,6 +2383,8 @@ struct ToolCallAccumulator {
     /// Registration order, used to assign deterministic, distinct block indices
     /// when emitting (`HashMap` iteration order is otherwise nondeterministic).
     order: usize,
+    /// Responses output-item index, when the stream reports it.
+    block_index: Option<usize>,
 }
 
 fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
@@ -1929,7 +2395,62 @@ fn usage_from_api_usage(usage: &ApiUsage) -> Usage {
             .input_tokens_details
             .as_ref()
             .map_or(0, |details| details.cached_tokens),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cache_write_tokens),
+    }
+}
+
+fn output_block_index(output_index: Option<usize>) -> usize {
+    output_index.unwrap_or(0).saturating_mul(2)
+}
+
+fn reasoning_summary_block_index(output_index: Option<usize>) -> usize {
+    output_block_index(output_index).saturating_add(1)
+}
+
+fn decode_stream_event(data: &str) -> Result<ApiStreamEvent> {
+    serde_json::from_str(data).context("invalid OpenAI Codex Responses stream event")
+}
+
+fn decode_output_item(item: Option<serde_json::Value>) -> Result<ApiOutputItem> {
+    let item = item.context("OpenAI Codex output_item.done omitted item")?;
+    serde_json::from_value(item).context("invalid OpenAI Codex output item")
+}
+
+fn output_item_stream_deltas(
+    item: &ApiOutputItem,
+    output_index: usize,
+    include_summary: bool,
+) -> Vec<StreamDelta> {
+    let block_index = output_index.saturating_mul(2);
+    match item {
+        ApiOutputItem::Message { role, phase, .. } => {
+            vec![StreamDelta::OpaqueReasoning {
+                provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                data: message_state_marker(role, phase.as_deref()),
+                block_index,
+            }]
+        }
+        ApiOutputItem::Reasoning { fields } => {
+            let mut deltas = vec![StreamDelta::OpaqueReasoning {
+                provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                data: reasoning_output_item(fields),
+                block_index,
+            }];
+            if include_summary {
+                let summary_block_index = block_index.saturating_add(1);
+                deltas.extend(reasoning_summary_texts(fields).into_iter().map(|delta| {
+                    StreamDelta::ThinkingDelta {
+                        delta,
+                        block_index: summary_block_index,
+                    }
+                }));
+            }
+            deltas
+        }
+        ApiOutputItem::FunctionCall { .. } | ApiOutputItem::Unknown => Vec::new(),
     }
 }
 
@@ -1941,11 +2462,13 @@ fn emit_accumulated_tool_calls(
     // HashMap::values(), so StreamAccumulator's stable sort preserved
     // nondeterministic insertion order for multi-tool turns.
     let mut accs: Vec<&ToolCallAccumulator> = tool_calls.values().collect();
-    accs.sort_by_key(|acc| acc.order);
+    accs.sort_by_key(|acc| (acc.block_index.unwrap_or(usize::MAX), acc.order));
 
     let mut deltas = Vec::with_capacity(accs.len() * 2);
     for (idx, acc) in accs.iter().enumerate() {
-        let block_index = idx + 1;
+        let block_index = acc
+            .block_index
+            .unwrap_or_else(|| idx.saturating_add(1).saturating_mul(2));
         deltas.push(StreamDelta::ToolUseStart {
             id: acc.id.clone(),
             name: acc.name.clone(),
@@ -1964,15 +2487,27 @@ fn emit_accumulated_tool_calls(
 fn stop_reason_from_stream_state(
     tool_calls: &HashMap<String, ToolCallAccumulator>,
     status: Option<ApiStatus>,
-) -> StopReason {
-    if tool_calls.is_empty() {
-        match status.unwrap_or(ApiStatus::Completed) {
-            ApiStatus::Completed => StopReason::EndTurn,
-            ApiStatus::Incomplete => StopReason::MaxTokens,
-            ApiStatus::Failed => StopReason::StopSequence,
+    refused: bool,
+    incomplete_reason: Option<&str>,
+) -> Option<StopReason> {
+    let status = status?;
+    Some(match status {
+        ApiStatus::Incomplete => {
+            incomplete_reason.map_or(StopReason::Unknown, incomplete_stop_reason)
         }
-    } else {
-        StopReason::ToolUse
+        ApiStatus::Failed => StopReason::Unknown,
+        ApiStatus::Completed if refused => StopReason::Refusal,
+        ApiStatus::Completed if !tool_calls.is_empty() => StopReason::ToolUse,
+        ApiStatus::Completed => StopReason::EndTurn,
+    })
+}
+
+fn incomplete_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "max_output_tokens" => StopReason::MaxTokens,
+        "content_filter" => StopReason::Refusal,
+        "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
+        _ => StopReason::Unknown,
     }
 }
 
@@ -2039,22 +2574,37 @@ fn parse_wrapped_websocket_error_event(payload: &str) -> Option<(StatusCode, Str
 
 fn output_item_to_input_item(item: ApiOutputItem) -> Option<ApiInputItem> {
     match item {
-        ApiOutputItem::Message { content, .. } => {
+        ApiOutputItem::Message {
+            role,
+            phase,
+            content,
+        } => {
+            let role = if role == "user" {
+                ApiRole::User
+            } else {
+                ApiRole::Assistant
+            };
             let parts: Vec<ApiInputContent> = content
                 .into_iter()
                 .filter_map(|content| match content {
-                    ApiOutputContent::Text { text } if !text.is_empty() => {
+                    ApiOutputContent::Text { text }
+                    | ApiOutputContent::Refusal { refusal: text }
+                        if !text.is_empty() =>
+                    {
                         Some(ApiInputContent::OutputText { text })
                     }
-                    ApiOutputContent::Unknown | ApiOutputContent::Text { .. } => None,
+                    ApiOutputContent::Unknown
+                    | ApiOutputContent::Text { .. }
+                    | ApiOutputContent::Refusal { .. } => None,
                 })
                 .collect();
             if parts.is_empty() {
                 None
             } else {
                 Some(ApiInputItem::Message(ApiMessage {
-                    role: ApiRole::Assistant,
+                    role,
                     content: ApiMessageContent::Parts(parts),
+                    phase,
                 }))
             }
         }
@@ -2065,6 +2615,9 @@ fn output_item_to_input_item(item: ApiOutputItem) -> Option<ApiInputItem> {
         } => Some(ApiInputItem::FunctionCall(ApiFunctionCall::new(
             call_id, name, arguments,
         ))),
+        ApiOutputItem::Reasoning { fields } => Some(ApiInputItem::OpaqueReasoning(
+            reasoning_output_item(&fields),
+        )),
         ApiOutputItem::Unknown => None,
     }
 }
@@ -2280,12 +2833,15 @@ enum ApiInputItem {
     Message(ApiMessage),
     FunctionCall(ApiFunctionCall),
     FunctionCallOutput(ApiFunctionCallOutput),
+    OpaqueReasoning(serde_json::Value),
 }
 
 #[derive(Clone, PartialEq, Serialize)]
 struct ApiMessage {
     role: ApiRole,
     content: ApiMessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
@@ -2378,6 +2934,14 @@ struct ApiResponse {
     usage: Option<ApiUsage>,
     #[serde(default)]
     error: Option<ApiErrorBody>,
+    #[serde(default)]
+    incomplete_details: Option<ApiIncompleteDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -2400,6 +2964,8 @@ struct ApiUsage {
 struct ApiInputTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -2407,8 +2973,9 @@ struct ApiInputTokensDetails {
 enum ApiOutputItem {
     #[serde(rename = "message")]
     Message {
-        #[serde(rename = "role")]
-        _role: String,
+        role: String,
+        #[serde(default)]
+        phase: Option<String>,
         content: Vec<ApiOutputContent>,
     },
     #[serde(rename = "function_call")]
@@ -2416,6 +2983,11 @@ enum ApiOutputItem {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
     },
     #[serde(other)]
     Unknown,
@@ -2426,6 +2998,8 @@ enum ApiOutputItem {
 enum ApiOutputContent {
     #[serde(rename = "output_text")]
     Text { text: String },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     #[serde(other)]
     Unknown,
 }
@@ -2437,6 +3011,8 @@ enum ApiOutputContent {
 #[derive(Deserialize)]
 struct ApiStreamEvent {
     r#type: String,
+    #[serde(default)]
+    output_index: Option<usize>,
     #[serde(default)]
     delta: Option<String>,
     #[serde(default)]
@@ -2457,6 +3033,10 @@ struct ApiStreamResponse {
     usage: Option<ApiUsage>,
     #[serde(default)]
     error: Option<ApiErrorBody>,
+    #[serde(default)]
+    status: Option<ApiStatus>,
+    #[serde(default)]
+    incomplete_details: Option<ApiIncompleteDetails>,
 }
 
 #[derive(Deserialize)]
@@ -2549,15 +3129,12 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_responses_rejects_adaptive_thinking() {
+    fn test_openai_responses_accepts_adaptive_thinking() {
         let provider = OpenAICodexResponsesProvider::codex("test-key".to_string());
-        let error = provider
-            .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
-            .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("adaptive thinking is not supported")
+            provider
+                .validate_thinking_config(Some(&ThinkingConfig::adaptive()))
+                .is_ok()
         );
     }
 
@@ -2673,16 +3250,19 @@ mod tests {
                 ApiInputItem::Message(ApiMessage {
                     role: ApiRole::User,
                     content: ApiMessageContent::Text("first".to_string()),
+                    phase: None,
                 }),
                 ApiInputItem::Message(ApiMessage {
                     role: ApiRole::Assistant,
                     content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
                         text: "answer".to_string(),
                     }]),
+                    phase: Some("final_answer".to_owned()),
                 }),
                 ApiInputItem::Message(ApiMessage {
                     role: ApiRole::User,
                     content: ApiMessageContent::Text("follow up".to_string()),
+                    phase: None,
                 }),
             ],
             tools: None,
@@ -2703,6 +3283,7 @@ mod tests {
             input: vec![ApiInputItem::Message(ApiMessage {
                 role: ApiRole::User,
                 content: ApiMessageContent::Text("first".to_string()),
+                phase: None,
             })],
             ..request.clone()
         };
@@ -2715,6 +3296,7 @@ mod tests {
                 content: ApiMessageContent::Parts(vec![ApiInputContent::OutputText {
                     text: "answer".to_string(),
                 }]),
+                phase: Some("final_answer".to_owned()),
             })],
             turn_state: None,
             prewarmed: false,
@@ -2733,6 +3315,7 @@ mod tests {
             ApiInputItem::Message(ApiMessage {
                 role: ApiRole::User,
                 content: ApiMessageContent::Text(text),
+                ..
             }) => assert_eq!(text, "follow up"),
             _ => panic!("expected incremental follow-up user message"),
         }
@@ -2768,6 +3351,7 @@ mod tests {
             input: vec![ApiInputItem::Message(ApiMessage {
                 role: ApiRole::User,
                 content: ApiMessageContent::Text("first".to_string()),
+                phase: None,
             })],
             tools: None,
             max_output_tokens: None,
@@ -2896,6 +3480,7 @@ mod tests {
             ApiInputItem::Message(ApiMessage {
                 role: ApiRole::User,
                 content: ApiMessageContent::Parts(parts),
+                ..
             }) => assert!(matches!(
                 parts.as_slice(),
                 [ApiInputContent::InputText { text }] if text == "question"
@@ -2907,6 +3492,7 @@ mod tests {
             ApiInputItem::Message(ApiMessage {
                 role: ApiRole::Assistant,
                 content: ApiMessageContent::Parts(parts),
+                ..
             }) => assert!(matches!(
                 parts.as_slice(),
                 [ApiInputContent::OutputText { text }] if text == "answer"
@@ -2943,15 +3529,107 @@ mod tests {
     #[test]
     fn test_build_content_blocks_text() {
         let output = vec![ApiOutputItem::Message {
-            _role: "assistant".to_owned(),
+            role: "assistant".to_owned(),
+            phase: Some("final_answer".to_owned()),
             content: vec![ApiOutputContent::Text {
                 text: "Hello!".to_owned(),
             }],
         }];
 
         let blocks = build_content_blocks(&output);
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello!"));
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::OpaqueReasoning { data, .. }
+                if data["phase"] == "final_answer"
+        ));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "Hello!"));
+    }
+
+    #[test]
+    fn assistant_message_phases_round_trip_without_duplicate_text() -> anyhow::Result<()> {
+        let output: Vec<ApiOutputItem> = serde_json::from_value(serde_json::json!([
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Working."}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }
+        ]))?;
+        let blocks = build_content_blocks(&output);
+        let request =
+            ChatRequest::new(String::new(), vec![Message::assistant_with_content(blocks)]);
+        let value = serde_json::to_value(build_api_input(&request))?;
+        let items = value
+            .as_array()
+            .context("Codex input must serialize as an array")?;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["phase"], "commentary");
+        assert_eq!(items[0]["content"][0]["text"], "Working.");
+        assert_eq!(items[1]["phase"], "final_answer");
+        assert_eq!(items[1]["content"][0]["text"], "Done.");
+        assert_eq!(value.to_string().matches("Working.").count(), 1);
+        assert_eq!(value.to_string().matches("Done.").count(), 1);
+
+        let direct: ApiOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Working."}]
+        }))?;
+        let direct = output_item_to_input_item(direct)
+            .context("message output should become a continuation input")?;
+        assert_eq!(serde_json::to_value(direct)?["phase"], "commentary");
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_phase_and_reasoning_summary_preserve_block_order() -> anyhow::Result<()> {
+        let message: ApiOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Working."}]
+        }))?;
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        accumulator.apply(&StreamDelta::TextDelta {
+            delta: "Working.".to_owned(),
+            block_index: output_block_index(Some(0)),
+        });
+        for delta in output_item_stream_deltas(&message, 0, true) {
+            accumulator.apply(&delta);
+        }
+        let message_blocks = accumulator.into_content_blocks();
+        assert!(matches!(
+            message_blocks.as_slice(),
+            [ContentBlock::OpaqueReasoning { data, .. }, ContentBlock::Text { text }]
+                if data["phase"] == "commentary" && text == "Working."
+        ));
+
+        let reasoning: ApiOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "ciphertext",
+            "summary": [{"type": "summary_text", "text": "Checked."}]
+        }))?;
+        let mut accumulator = crate::streaming::StreamAccumulator::new();
+        for delta in output_item_stream_deltas(&reasoning, 1, true) {
+            accumulator.apply(&delta);
+        }
+        let reasoning_blocks = accumulator.into_content_blocks();
+        assert!(matches!(
+            reasoning_blocks.as_slice(),
+            [ContentBlock::OpaqueReasoning { data, .. }, ContentBlock::Thinking { thinking, .. }]
+                if data["encrypted_content"] == "ciphertext" && thinking == "Checked."
+        ));
+        Ok(())
     }
 
     #[test]
@@ -2967,6 +3645,187 @@ mod tests {
         assert!(
             matches!(&blocks[0], ContentBlock::ToolUse { id, name, .. } if id == "call_123" && name == "test_tool")
         );
+    }
+
+    #[test]
+    fn incomplete_and_refusal_responses_suppress_partial_tools() -> anyhow::Result<()> {
+        let incomplete: ApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_incomplete",
+            "model": "gpt-5.3-codex",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "model_context_window_exceeded"},
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_partial",
+                "name": "lookup",
+                "arguments": "{"
+            }]
+        }))?;
+        let incomplete = OpenAICodexResponsesProvider::map_response(incomplete);
+        assert_eq!(
+            incomplete.stop_reason,
+            Some(StopReason::ModelContextWindowExceeded)
+        );
+        assert!(
+            !incomplete
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        );
+
+        let refusal: ApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_refusal",
+            "model": "gpt-5.3-codex",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_partial",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "refusal", "refusal": "Cannot comply."}]
+                }
+            ]
+        }))?;
+        let refusal = OpenAICodexResponsesProvider::map_response(refusal);
+        assert_eq!(refusal.stop_reason, Some(StopReason::Refusal));
+        assert!(
+            !refusal
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        );
+        assert!(matches!(
+            refusal.content.last(),
+            Some(ContentBlock::Text { text }) if text == "Cannot comply."
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_output_item_is_preserved_and_summary_is_visible() -> anyhow::Result<()> {
+        let raw = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_123",
+            "status": "completed",
+            "encrypted_content": "ciphertext",
+            "summary": [
+                {"type": "summary_text", "text": "Checked the relevant constraints."}
+            ]
+        });
+        let item: ApiOutputItem = serde_json::from_value(raw.clone())?;
+        let replay_item = output_item_to_input_item(item);
+        let Some(replay_item) = replay_item else {
+            anyhow::bail!("reasoning item was not converted to a replay item");
+        };
+        assert_eq!(serde_json::to_value(replay_item)?, raw);
+
+        let item: ApiOutputItem = serde_json::from_value(raw.clone())?;
+        let blocks = build_content_blocks(&[item]);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::OpaqueReasoning { provider, data, .. }
+                if provider == OPENAI_RESPONSES_REASONING_PROVIDER && data == &raw
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Thinking { thinking, signature, .. }
+                if thinking == "Checked the relevant constraints." && signature.is_none()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn matching_opaque_reasoning_replays_as_a_top_level_item_in_source_order() -> anyhow::Result<()>
+    {
+        let raw = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_123",
+            "encrypted_content": "ciphertext",
+            "summary": []
+        });
+        let request = ChatRequest::new(
+            "",
+            vec![agent_sdk_foundation::llm::Message {
+                role: agent_sdk_foundation::llm::Role::Assistant,
+                content: Content::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "before".to_owned(),
+                    },
+                    ContentBlock::OpaqueReasoning {
+                        provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                        data: raw.clone(),
+                    },
+                    ContentBlock::OpaqueReasoning {
+                        provider: "another-provider".to_owned(),
+                        data: serde_json::json!({"type": "reasoning", "id": "ignored"}),
+                    },
+                    ContentBlock::Text {
+                        text: "after".to_owned(),
+                    },
+                ]),
+            }],
+        );
+
+        assert_eq!(
+            serde_json::to_value(build_api_input(&request))?,
+            serde_json::json!([
+                {
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "before"}]
+                },
+                raw,
+                {
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "after"}]
+                }
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_maps_cache_write_tokens() -> anyhow::Result<()> {
+        let usage: ApiUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 2048,
+            "output_tokens": 128,
+            "input_tokens_details": {
+                "cached_tokens": 1024,
+                "cache_write_tokens": 512
+            }
+        }))?;
+
+        let usage = usage_from_api_usage(&usage);
+        assert_eq!(usage.cached_input_tokens, 1024);
+        assert_eq!(usage.cache_creation_input_tokens, 512);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_stop_reason_requires_a_semantic_terminal_event() {
+        let tool_calls = HashMap::new();
+        assert!(stop_reason_from_stream_state(&tool_calls, None, false, None).is_none());
+        assert!(matches!(
+            stop_reason_from_stream_state(&tool_calls, Some(ApiStatus::Completed), false, None,),
+            Some(StopReason::EndTurn)
+        ));
+        assert!(matches!(
+            stop_reason_from_stream_state(
+                &tool_calls,
+                Some(ApiStatus::Incomplete),
+                false,
+                Some("max_output_tokens"),
+            ),
+            Some(StopReason::MaxTokens)
+        ));
     }
 
     #[test]
@@ -3079,6 +3938,7 @@ mod tests {
                 name: "second".to_string(),
                 arguments: "{}".to_string(),
                 order: 1,
+                block_index: None,
             },
         );
         tool_calls.insert(
@@ -3088,6 +3948,7 @@ mod tests {
                 name: "first".to_string(),
                 arguments: "{}".to_string(),
                 order: 0,
+                block_index: None,
             },
         );
 
@@ -3103,7 +3964,7 @@ mod tests {
             .collect();
         assert_eq!(
             starts,
-            vec![("first".to_string(), 1), ("second".to_string(), 2)]
+            vec![("first".to_string(), 2), ("second".to_string(), 4)]
         );
     }
 
@@ -3155,7 +4016,9 @@ mod tests {
     /// Spawn an HTTP-only server that records whether any WebSocket upgrade was
     /// attempted and serves a fixed SSE body to plain POSTs. Returns the base
     /// URL plus the (`ws_attempts`, `http_requests`) counters.
-    async fn spawn_http_only_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    async fn spawn_http_only_server_with_body(
+        sse_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let ws_attempts = Arc::new(AtomicUsize::new(0));
@@ -3187,8 +4050,8 @@ mod tests {
                     http_requests.fetch_add(1, Ordering::Relaxed);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
-                        HTTP_SSE_BODY.len(),
-                        HTTP_SSE_BODY,
+                        sse_body.len(),
+                        sse_body,
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
@@ -3200,6 +4063,10 @@ mod tests {
             ws_attempts,
             http_requests,
         )
+    }
+
+    async fn spawn_http_only_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        spawn_http_only_server_with_body(HTTP_SSE_BODY).await
     }
 
     /// Drain a stream, returning whether it completed without a transport error.
@@ -3233,6 +4100,125 @@ mod tests {
             "no websocket upgrade may be attempted when websockets are disabled",
         );
         assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn premature_http_stream_termination_is_an_error() {
+        for (case, sse_body) in [
+            ("done", "data: [DONE]\n\n"),
+            (
+                "eof",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ),
+        ] {
+            let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+            let provider = OpenAICodexResponsesProvider::with_base_url(
+                oauth_token(),
+                MODEL_GPT53_CODEX.to_string(),
+                base_url,
+            )
+            .with_websockets_disabled(true);
+            let mut stream = std::pin::pin!(
+                provider.chat_stream(streaming_request(&format!("premature-{case}")))
+            );
+            let mut saw_error = false;
+            let mut saw_done = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(StreamDelta::Error { .. }) | Err(_) => saw_error = true,
+                    Ok(StreamDelta::Done { .. }) => saw_done = true,
+                    Ok(_) => {}
+                }
+            }
+            assert!(saw_error, "case={case} must surface a stream error");
+            assert!(!saw_done, "case={case} must not synthesize success");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_http_events_and_items_fail_closed() -> anyhow::Result<()> {
+        for (case, sse_body) in [
+            ("event", "data: {not-json}\n\n"),
+            (
+                "item",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\"}}\n\n",
+            ),
+        ] {
+            let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+            let provider = OpenAICodexResponsesProvider::with_base_url(
+                oauth_token(),
+                MODEL_GPT53_CODEX.to_owned(),
+                base_url,
+            )
+            .with_websockets_disabled(true);
+            let mut stream = std::pin::pin!(
+                provider.chat_stream(streaming_request(&format!("malformed-{case}")))
+            );
+            let first = stream
+                .next()
+                .await
+                .context("malformed stream must emit an error")??;
+            assert!(matches!(
+                first,
+                StreamDelta::Error {
+                    kind: StreamErrorKind::ServerError,
+                    ..
+                }
+            ));
+            assert!(stream.next().await.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_tool_http_terminals_suppress_partial_tool_calls() -> anyhow::Result<()> {
+        for (case, sse_body, expected_stop) in [
+            (
+                "incomplete",
+                concat!(
+                    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"lookup\",\"delta\":\"{\"}\n\n",
+                    "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                StopReason::MaxTokens,
+            ),
+            (
+                "refusal",
+                concat!(
+                    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_1\",\"name\":\"lookup\",\"delta\":\"{}\"}\n\n",
+                    "data: {\"type\":\"response.refusal.delta\",\"output_index\":1,\"delta\":\"Cannot comply.\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                StopReason::Refusal,
+            ),
+        ] {
+            let (base_url, _, _) = spawn_http_only_server_with_body(sse_body).await;
+            let provider = OpenAICodexResponsesProvider::with_base_url(
+                oauth_token(),
+                MODEL_GPT53_CODEX.to_owned(),
+                base_url,
+            )
+            .with_websockets_disabled(true);
+            let mut stream = std::pin::pin!(
+                provider.chat_stream(streaming_request(&format!("terminal-{case}")))
+            );
+            let mut deltas = Vec::new();
+            while let Some(delta) = stream.next().await {
+                deltas.push(delta?);
+            }
+            assert!(matches!(
+                deltas.last(),
+                Some(StreamDelta::Done {
+                    stop_reason: Some(stop_reason)
+                }) if *stop_reason == expected_stop
+            ));
+            assert!(!deltas.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::ToolUseStart { .. } | StreamDelta::ToolInputDelta { .. }
+            )));
+        }
+        Ok(())
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! ([`OpenAIResponsesProvider`]). The reroute (`should_use_responses_api`) fires
 //! when:
 //!
-//! - the model only exists on the Responses surface (e.g. `gpt-5.2-codex`), or
+//! - the model only exists on the Responses surface (e.g. `gpt-5.3-codex`), or
+//! - GPT-5.6 is used against the official `OpenAI` API with automatic routing, or
+//! - the configured exact reasoning controls require the Responses API, or
 //! - the request carries attachments (images / documents), or
 //! - the request is *agentic* (has tools or tool-use/tool-result blocks) against
 //!   the official `api.openai.com` base URL.
@@ -20,24 +22,33 @@
 //! (the BYOK / gateway auth mechanism) so a rerouted request keeps connection
 //! reuse and authenticates identically to a non-rerouted one.
 
-use crate::attachments::{request_has_attachments, validate_request_attachments};
+use crate::attachments::request_has_attachments;
+use crate::model_features::{ModelApiSurface, get_model_features};
 use crate::provider::LlmProvider;
 use crate::streaming::{SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind};
 use agent_sdk_foundation::llm::{
-    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, StopReason,
-    ThinkingConfig, ThinkingMode, Usage,
+    ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, StopReason, ThinkingConfig,
+    ToolChoice, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::de::Error as _;
+use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::openai_reasoning::{
+    OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
+    OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAITextVerbosity, OpenAIToolChoice,
+    is_gpt56_model, legacy_reasoning_effort, validate_reasoning_config, validate_tool_choice,
+};
 use super::openai_responses::OpenAIResponsesProvider;
+use super::openai_schema::normalize_strict_schema;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_RESPONSES_REASONING_PROVIDER: &str = "openai-responses";
 
 /// Build an HTTP client with connect/keepalive timeouts matching the sibling
 /// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
@@ -54,10 +65,28 @@ fn build_http_client() -> reqwest::Client {
 /// Check if a model requires the Responses API instead of Chat Completions.
 fn requires_responses_api(model: &str) -> bool {
     model == MODEL_GPT52_CODEX
+        || get_model_features(model).is_some_and(|features| {
+            features.api_surfaces.contains(&ModelApiSurface::Responses)
+                && !features
+                    .api_surfaces
+                    .contains(&ModelApiSurface::ChatCompletions)
+        })
 }
 
 fn is_official_openai_base_url(base_url: &str) -> bool {
-    base_url == DEFAULT_BASE_URL || base_url.contains("api.openai.com")
+    url::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.openai.com"))
+}
+
+fn chat_store(base_url: &str, config: Option<&OpenAIReasoningConfig>) -> Option<bool> {
+    config
+        .and_then(OpenAIReasoningConfig::store)
+        .or_else(|| is_official_openai_base_url(base_url).then_some(false))
+}
+
+fn chat_prompt_cache_key<'a>(base_url: &str, session_id: Option<&'a str>) -> Option<&'a str> {
+    is_official_openai_base_url(base_url)
+        .then_some(session_id)
+        .flatten()
 }
 
 fn request_is_agentic(request: &ChatRequest) -> bool {
@@ -75,11 +104,61 @@ fn request_is_agentic(request: &ChatRequest) -> bool {
     })
 }
 
-fn should_use_responses_api(base_url: &str, model: &str, request: &ChatRequest) -> bool {
-    requires_responses_api(model)
-        || request_has_attachments(request)
-        || (is_official_openai_base_url(base_url) && request_is_agentic(request))
+fn request_has_openai_responses_history(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        matches!(
+            &message.content,
+            Content::Blocks(blocks)
+                if blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::OpaqueReasoning { provider, .. }
+                            if provider == OPENAI_RESPONSES_REASONING_PROVIDER
+                    )
+                })
+        )
+    })
 }
+
+fn should_use_responses_api(
+    base_url: &str,
+    model: &str,
+    request: &ChatRequest,
+    reasoning: Option<&OpenAIReasoningConfig>,
+) -> bool {
+    let surface = reasoning.map_or(OpenAIApiSurface::Auto, OpenAIReasoningConfig::api_surface);
+    let explicitly_requests_responses = matches!(surface, OpenAIApiSurface::Responses);
+    let explicitly_requests_chat = matches!(surface, OpenAIApiSurface::ChatCompletions);
+    let response_only_reasoning = !explicitly_requests_chat
+        && reasoning.is_some_and(|config| {
+            matches!(config.api_surface(), OpenAIApiSurface::Responses)
+                || config.mode().is_some()
+                || config.context().is_some()
+                || config.summary().is_some()
+        });
+    let response_history_route =
+        !explicitly_requests_chat && request_has_openai_responses_history(request);
+    let official_auto_route = is_official_openai_base_url(base_url)
+        && !explicitly_requests_chat
+        && (is_gpt56_model(model) || request_is_agentic(request));
+
+    let attachment_route = !explicitly_requests_chat
+        && request_has_attachments(request)
+        && (is_official_openai_base_url(base_url) || explicitly_requests_responses);
+
+    requires_responses_api(model)
+        || explicitly_requests_responses
+        || response_only_reasoning
+        || response_history_route
+        || attachment_route
+        || official_auto_route
+}
+
+// GPT-5.6 series
+pub const MODEL_GPT56: &str = "gpt-5.6";
+pub const MODEL_GPT56_SOL: &str = "gpt-5.6-sol";
+pub const MODEL_GPT56_TERRA: &str = "gpt-5.6-terra";
+pub const MODEL_GPT56_LUNA: &str = "gpt-5.6-luna";
 
 // GPT-5.4 series
 pub const MODEL_GPT54: &str = "gpt-5.4";
@@ -134,6 +213,7 @@ pub struct OpenAIProvider {
     model: String,
     base_url: String,
     thinking: Option<ThinkingConfig>,
+    reasoning: Option<OpenAIReasoningConfig>,
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
 }
@@ -151,6 +231,7 @@ impl OpenAIProvider {
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             thinking: None,
+            reasoning: None,
             extra_headers: Vec::new(),
         }
     }
@@ -193,6 +274,7 @@ impl OpenAIProvider {
             model: model.into(),
             base_url: base_url.into(),
             thinking: None,
+            reasoning: None,
             extra_headers: Vec::new(),
         }
     }
@@ -237,6 +319,30 @@ impl OpenAIProvider {
     #[must_use]
     pub fn minimax_m2_5(api_key: String) -> Self {
         Self::minimax(api_key, MODEL_MINIMAX_M2_5.to_owned())
+    }
+
+    /// Create a provider using the GPT-5.6 alias, which routes to GPT-5.6 Sol.
+    #[must_use]
+    pub fn gpt56(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT56.to_owned())
+    }
+
+    /// Create a provider using GPT-5.6 Sol (frontier reasoning and coding).
+    #[must_use]
+    pub fn gpt56_sol(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT56_SOL.to_owned())
+    }
+
+    /// Create a provider using GPT-5.6 Terra (balanced intelligence and cost).
+    #[must_use]
+    pub fn gpt56_terra(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT56_TERRA.to_owned())
+    }
+
+    /// Create a provider using GPT-5.6 Luna (cost-sensitive, high-volume work).
+    #[must_use]
+    pub fn gpt56_luna(api_key: String) -> Self {
+        Self::new(api_key, MODEL_GPT56_LUNA.to_owned())
     }
 
     /// Create a provider using GPT-5.2 Instant (speed-optimized for routine queries).
@@ -349,8 +455,22 @@ impl OpenAIProvider {
 
     /// Set the provider-owned thinking configuration for this model.
     #[must_use]
-    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
+        self.reasoning = None;
+        self
+    }
+
+    /// Set exact `OpenAI` reasoning and related response controls.
+    ///
+    /// This is the lossless path for GPT-5.6 `none` / `xhigh` / `max`, pro
+    /// mode, persisted reasoning context, summaries, and API-surface selection.
+    /// Calling this after [`with_thinking`](Self::with_thinking) replaces the
+    /// legacy provider-owned thinking configuration.
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: OpenAIReasoningConfig) -> Self {
+        self.reasoning = Some(reasoning);
+        self.thinking = None;
         self
     }
 
@@ -374,6 +494,207 @@ impl OpenAIProvider {
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 
+    fn effective_max_tokens(&self, request: &ChatRequest) -> u32 {
+        if request.max_tokens_explicit {
+            request.max_tokens
+        } else {
+            self.default_max_tokens()
+        }
+    }
+
+    fn resolve_openai_reasoning(
+        &self,
+        request_thinking: Option<&ThinkingConfig>,
+    ) -> Result<Option<OpenAIReasoningConfig>> {
+        let legacy = if request_thinking.is_some() || self.reasoning.is_none() {
+            self.resolve_thinking_config(request_thinking)?
+        } else {
+            None
+        };
+
+        let config = match (self.reasoning.clone(), legacy.as_ref()) {
+            (Some(config), Some(thinking)) => {
+                Some(config.with_optional_effort(legacy_reasoning_effort(thinking)))
+            }
+            (Some(config), None) => Some(config),
+            (None, Some(thinking)) => Some(
+                OpenAIReasoningConfig::new()
+                    .with_optional_effort(legacy_reasoning_effort(thinking)),
+            ),
+            (None, None) => None,
+        };
+
+        if let Some(config) = &config {
+            validate_reasoning_config(&self.model, config)?;
+        }
+        Ok(config)
+    }
+
+    fn validate_chat_attachments(&self, request: &ChatRequest) -> Result<()> {
+        if request_has_attachments(request) {
+            anyhow::bail!(
+                "OpenAI Chat Completions request for model={} contains image or document attachments that this provider cannot serialize; use the Responses API",
+                self.model
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_chat_opaque_reasoning(request: &ChatRequest) -> Result<()> {
+        if request_has_openai_responses_history(request) {
+            anyhow::bail!(
+                "OpenAI Responses reasoning history cannot be serialized through Chat Completions; use the Responses API"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_requested_api_surface(&self) -> Result<()> {
+        if self
+            .reasoning
+            .as_ref()
+            .is_some_and(|config| matches!(config.api_surface(), OpenAIApiSurface::ChatCompletions))
+            && requires_responses_api(&self.model)
+        {
+            anyhow::bail!(
+                "model={} is only available through the OpenAI Responses API",
+                self.model
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_chat_reasoning_controls(config: Option<&OpenAIReasoningConfig>) -> Result<()> {
+        let Some(config) = config else {
+            return Ok(());
+        };
+        if config.mode().is_some() || config.context().is_some() || config.summary().is_some() {
+            anyhow::bail!(
+                "OpenAI reasoning mode, context, and summary controls require the Responses API"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_chat_response_format(
+        &self,
+        response_format: Option<&agent_sdk_foundation::llm::ResponseFormat>,
+    ) -> Result<()> {
+        if !is_official_openai_base_url(&self.base_url) {
+            return Ok(());
+        }
+        let Some(response_format) = response_format.filter(|format| format.strict) else {
+            return Ok(());
+        };
+        let mut schema = response_format.schema.clone();
+        if !normalize_strict_schema(&mut schema) {
+            anyhow::bail!(
+                "OpenAI strict structured output `{}` contains a free-form object schema",
+                response_format.name
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_chat_prompt_cache_options(
+        &self,
+        request: &ChatRequest,
+        config: Option<&OpenAIReasoningConfig>,
+    ) -> Result<ChatPromptCachePlan> {
+        let exact_options = ApiPromptCacheOptions::from_config(config);
+        if !is_gpt56_model(&self.model) && request.cache.is_some() {
+            return Ok(ChatPromptCachePlan {
+                options: exact_options,
+                explicit_breakpoints: 0,
+            });
+        }
+        let Some(cache) = request.cache.as_ref() else {
+            return Ok(ChatPromptCachePlan {
+                options: exact_options,
+                explicit_breakpoints: 0,
+            });
+        };
+
+        if let Some(ttl) = cache.ttl {
+            anyhow::bail!(
+                "OpenAI GPT-5.6 prompt caching supports only a 30m TTL; shared cache TTL {} cannot be represented for model={}",
+                ttl.as_wire_str(),
+                self.model
+            );
+        }
+
+        if !cache.enabled {
+            return Ok(ChatPromptCachePlan {
+                options: Some(ApiPromptCacheOptions::new(OpenAIPromptCacheMode::Explicit)),
+                explicit_breakpoints: 0,
+            });
+        }
+
+        if let Some(max_breakpoints) = cache.max_breakpoints {
+            return Ok(ChatPromptCachePlan {
+                options: Some(ApiPromptCacheOptions {
+                    mode: Some(OpenAIPromptCacheMode::Explicit),
+                    ttl: config.and_then(OpenAIReasoningConfig::prompt_cache_ttl),
+                }),
+                explicit_breakpoints: usize::from(max_breakpoints.min(4)),
+            });
+        }
+
+        Ok(ChatPromptCachePlan {
+            options: exact_options,
+            explicit_breakpoints: 0,
+        })
+    }
+
+    fn resolve_chat_tool_choice(
+        request_choice: Option<&ToolChoice>,
+        config: Option<&OpenAIReasoningConfig>,
+        tools: Option<&[agent_sdk_foundation::llm::Tool]>,
+    ) -> Result<Option<ApiToolChoice>> {
+        if let Some(choice) = request_choice {
+            if let ToolChoice::Tool(name) = choice
+                && !tools
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|tool| tool.name == *name)
+            {
+                anyhow::bail!("OpenAI tool_choice names unknown function `{name}`");
+            }
+            return Ok(Some(ApiToolChoice::from_tool_choice(choice)));
+        }
+
+        validate_tool_choice(config, tools)?;
+        Ok(config
+            .and_then(OpenAIReasoningConfig::tool_choice)
+            .map(ApiToolChoice::from_openai_tool_choice))
+    }
+
+    async fn send_chat_request(
+        &self,
+        api_request: &ApiChatRequest<'_>,
+    ) -> Result<(StatusCode, Vec<u8>, Option<std::time::Duration>)> {
+        let builder = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Content-Type", "application/json");
+        let response = self
+            .apply_headers(builder)
+            .json(api_request)
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("request failed: {error}"))?;
+        let status = response.status();
+        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| crate::http::retry_after_from_headers(response.headers()))
+            .flatten();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to read response body: {error}"))?
+            .to_vec();
+        Ok((status, bytes, retry_after))
+    }
+
     /// Build the `OpenAIResponsesProvider` used for the transparent Responses-API
     /// reroute, forwarding this provider's pooled client, thinking config, and
     /// extra headers so the rerouted request reuses connections and authenticates
@@ -389,6 +710,9 @@ impl OpenAIProvider {
         if let Some(thinking) = self.thinking.clone() {
             provider = provider.with_thinking(thinking);
         }
+        if let Some(reasoning) = self.reasoning.clone() {
+            provider = provider.with_reasoning(reasoning);
+        }
         provider
     }
 }
@@ -396,73 +720,102 @@ impl OpenAIProvider {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        if let Err(error) = self.validate_requested_api_surface() {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         // Route official OpenAI agentic flows to the Responses API, preserving
         // the pooled client and extra_headers (BYOK / gateway auth).
-        if should_use_responses_api(&self.base_url, &self.model, &request) {
+        if should_use_responses_api(
+            &self.base_url,
+            &self.model,
+            &request,
+            self.reasoning.as_ref(),
+        ) {
             return self.responses_reroute().chat(request).await;
         }
 
-        let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-            Ok(thinking) => thinking,
+        let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
+            Ok(reasoning) => reasoning,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
-        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+        if let Err(error) = Self::validate_chat_reasoning_controls(reasoning_config.as_ref()) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        let reasoning = build_api_reasoning(thinking_config.as_ref());
-        let messages = build_api_messages(&request);
-        let tools: Option<Vec<ApiTool>> = request
-            .tools
-            .map(|ts| ts.into_iter().map(convert_tool).collect());
-        let tool_choice = request
-            .tool_choice
+        if let Err(error) = Self::validate_chat_opaque_reasoning(&request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
+        if let Err(error) = self.validate_chat_attachments(&request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
+        if let Err(error) = self.validate_chat_response_format(request.response_format.as_ref()) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
+        let prompt_cache =
+            match self.resolve_chat_prompt_cache_options(&request, reasoning_config.as_ref()) {
+                Ok(plan) => plan,
+                Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+            };
+        let tool_choice = match Self::resolve_chat_tool_choice(
+            request.tool_choice.as_ref(),
+            reasoning_config.as_ref(),
+            request.tools.as_deref(),
+        ) {
+            Ok(choice) => choice,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let official_openai = is_official_openai_base_url(&self.base_url);
+        let reasoning = build_chat_api_reasoning(
+            reasoning_config.as_ref(),
+            official_openai || self.reasoning.is_some(),
+        );
+        let verbosity = reasoning_config
             .as_ref()
-            .map(ApiToolChoice::from_tool_choice);
+            .and_then(OpenAIReasoningConfig::verbosity);
+        let store = chat_store(&self.base_url, reasoning_config.as_ref());
+        let parallel_tool_calls = reasoning_config
+            .as_ref()
+            .and_then(OpenAIReasoningConfig::parallel_tool_calls);
+        let safety_identifier = reasoning_config
+            .as_ref()
+            .and_then(OpenAIReasoningConfig::safety_identifier);
+        let prompt_cache_key = chat_prompt_cache_key(&self.base_url, request.session_id.as_deref());
+        let max_tokens = self.effective_max_tokens(&request);
+        let messages = build_api_messages_with_cache(&request, prompt_cache.explicit_breakpoints);
+        let tools: Option<Vec<ApiTool>> = request.tools.map(|ts| {
+            ts.into_iter()
+                .map(|tool| convert_tool(tool, official_openai))
+                .collect()
+        });
         let response_format = request
             .response_format
             .as_ref()
-            .map(ApiResponseFormat::from_response_format);
+            .map(|format| ApiResponseFormat::from_response_format(format, official_openai));
 
         let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
         let api_request = ApiChatRequest {
             model: &self.model,
             messages: &messages,
-            max_completion_tokens: Some(request.max_tokens),
-            max_tokens: include_max_tokens_alias.then_some(request.max_tokens),
+            max_completion_tokens: Some(max_tokens),
+            max_tokens: include_max_tokens_alias.then_some(max_tokens),
             tools: tools.as_deref(),
             tool_choice,
             reasoning,
             response_format,
+            verbosity,
+            prompt_cache_options: prompt_cache.options,
+            store,
+            parallel_tool_calls,
+            safety_identifier,
+            prompt_cache_key,
         };
 
         log::debug!(
             "OpenAI LLM request model={} max_tokens={}",
             self.model,
-            request.max_tokens
+            max_tokens
         );
 
-        let builder = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Content-Type", "application/json");
-        let response = self
-            .apply_headers(builder)
-            .json(&api_request)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-
-        let status = response.status();
-        // Read `Retry-After` off the 429 response before the body is consumed.
-        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-            crate::http::retry_after_from_headers(response.headers())
-        } else {
-            None
-        };
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
+        let (status, bytes, retry_after) = self.send_chat_request(&api_request).await?;
 
         log::debug!(
             "OpenAI LLM response status={} body_len={}",
@@ -475,9 +828,22 @@ impl LlmProvider for OpenAIProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+        if let Err(error) = self.validate_requested_api_surface() {
+            return Box::pin(async_stream::stream! {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+            });
+        }
         // Route official OpenAI agentic flows to the Responses API, preserving
         // the pooled client and extra_headers (BYOK / gateway auth).
-        if should_use_responses_api(&self.base_url, &self.model, &request) {
+        if should_use_responses_api(
+            &self.base_url,
+            &self.model,
+            &request,
+            self.reasoning.as_ref(),
+        ) {
             let responses_provider = self.responses_reroute();
             return Box::pin(async_stream::stream! {
                 let mut stream = std::pin::pin!(responses_provider.chat_stream(request));
@@ -488,8 +854,8 @@ impl LlmProvider for OpenAIProvider {
         }
 
         Box::pin(async_stream::stream! {
-            let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                Ok(thinking) => thinking,
+            let reasoning_config = match self.resolve_openai_reasoning(request.thinking.as_ref()) {
+                Ok(reasoning) => reasoning,
                 Err(error) => {
                     yield Ok(StreamDelta::Error {
                         message: error.to_string(),
@@ -498,26 +864,91 @@ impl LlmProvider for OpenAIProvider {
                     return;
                 }
             };
-            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            if let Err(error) = Self::validate_chat_reasoning_controls(reasoning_config.as_ref()) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
                     kind: StreamErrorKind::InvalidRequest,
                 });
                 return;
             }
-            let reasoning = build_api_reasoning(thinking_config.as_ref());
-            let messages = build_api_messages(&request);
+            if let Err(error) = Self::validate_chat_opaque_reasoning(&request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
+            if let Err(error) = self.validate_chat_attachments(&request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
+            if let Err(error) = self.validate_chat_response_format(request.response_format.as_ref()) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    kind: StreamErrorKind::InvalidRequest,
+                });
+                return;
+            }
+            let prompt_cache = match self
+                .resolve_chat_prompt_cache_options(&request, reasoning_config.as_ref())
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        kind: StreamErrorKind::InvalidRequest,
+                    });
+                    return;
+                }
+            };
+            let tool_choice = match Self::resolve_chat_tool_choice(
+                request.tool_choice.as_ref(),
+                reasoning_config.as_ref(),
+                request.tools.as_deref(),
+            ) {
+                Ok(choice) => choice,
+                Err(error) => {
+                    yield Ok(StreamDelta::Error {
+                        message: error.to_string(),
+                        kind: StreamErrorKind::InvalidRequest,
+                    });
+                    return;
+                }
+            };
+            let official_openai = is_official_openai_base_url(&self.base_url);
+            let reasoning = build_chat_api_reasoning(
+                reasoning_config.as_ref(),
+                official_openai || self.reasoning.is_some(),
+            );
+            let verbosity = reasoning_config
+                .as_ref()
+                .and_then(OpenAIReasoningConfig::verbosity);
+            let store = chat_store(&self.base_url, reasoning_config.as_ref());
+            let parallel_tool_calls = reasoning_config
+                .as_ref()
+                .and_then(OpenAIReasoningConfig::parallel_tool_calls);
+            let safety_identifier = reasoning_config
+                .as_ref()
+                .and_then(OpenAIReasoningConfig::safety_identifier);
+            let prompt_cache_key =
+                chat_prompt_cache_key(&self.base_url, request.session_id.as_deref());
+            let max_tokens = self.effective_max_tokens(&request);
+            let messages =
+                build_api_messages_with_cache(&request, prompt_cache.explicit_breakpoints);
             let tools: Option<Vec<ApiTool>> = request
                 .tools
-                .map(|ts| ts.into_iter().map(convert_tool).collect());
-            let tool_choice = request
-                .tool_choice
-                .as_ref()
-                .map(ApiToolChoice::from_tool_choice);
+                .map(|ts| {
+                    ts.into_iter()
+                        .map(|tool| convert_tool(tool, official_openai))
+                        .collect()
+                });
             let response_format = request
                 .response_format
                 .as_ref()
-                .map(ApiResponseFormat::from_response_format);
+                .map(|format| ApiResponseFormat::from_response_format(format, official_openai));
 
             let include_max_tokens_alias = use_max_tokens_alias(&self.base_url);
             let include_stream_usage = use_stream_usage_options(&self.base_url);
@@ -525,12 +956,18 @@ impl LlmProvider for OpenAIProvider {
             let api_request = ApiChatRequestStreaming {
                 model: &self.model,
                 messages: &messages,
-                max_completion_tokens: Some(request.max_tokens),
-                max_tokens: include_max_tokens_alias.then_some(request.max_tokens),
+                max_completion_tokens: Some(max_tokens),
+                max_tokens: include_max_tokens_alias.then_some(max_tokens),
                 tools: tools.as_deref(),
                 tool_choice,
                 reasoning,
                 response_format,
+                verbosity,
+                prompt_cache_options: prompt_cache.options,
+                store,
+                parallel_tool_calls,
+                safety_identifier,
+                prompt_cache_key,
                 stream_options: include_stream_usage.then_some(ApiStreamOptions {
                     include_usage: true,
                 }),
@@ -539,7 +976,7 @@ impl LlmProvider for OpenAIProvider {
                 stream: true,
             };
 
-            log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, request.max_tokens);
+            log::debug!("OpenAI streaming LLM request model={} max_tokens={}", self.model, max_tokens);
 
             let stream_builder = self.client
                 .post(format!("{}/chat/completions", self.base_url))
@@ -611,13 +1048,11 @@ impl LlmProvider for OpenAIProvider {
                 }
             }
 
-            // Stream ended without [DONE] - emit what we have. Infer the stop
-            // reason from accumulated tool calls (same heuristic as the [DONE]
-            // arm) so a stream that dies mid-tool-call doesn't report EndTurn.
-            let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(&tool_calls));
-            for delta in build_stream_end_deltas(&tool_calls, usage.take(), sr) {
-                yield Ok(delta);
-            }
+            // A successful Chat Completions stream terminates with [DONE]. An
+            // EOF before that sentinel is transport truncation, even if a
+            // finish_reason happened to arrive first; synthesizing Done would
+            // let callers commit a partial response as a successful turn.
+            yield Err(anyhow::anyhow!("OpenAI stream ended before [DONE] sentinel"));
         })
     }
 
@@ -731,6 +1166,13 @@ fn step_completion_stream(
                     block_index: 0,
                 });
             }
+            SseProcessResult::RefusalDelta(c) => {
+                immediate.push(StreamDelta::TextDelta {
+                    delta: c,
+                    block_index: 0,
+                });
+                *stop_reason = Some(StopReason::Refusal);
+            }
             SseProcessResult::ThinkingDelta(c) => {
                 immediate.push(StreamDelta::ThinkingDelta {
                     delta: c,
@@ -744,7 +1186,20 @@ fn step_completion_stream(
                 arguments,
             } => apply_tool_call_update(tool_calls, index, id, name, arguments),
             SseProcessResult::Usage(u) => *usage = Some(u),
-            SseProcessResult::Done(sr) => *stop_reason = Some(sr),
+            SseProcessResult::Done(sr) => {
+                if !matches!(stop_reason, Some(StopReason::Refusal)) {
+                    *stop_reason = Some(sr);
+                }
+            }
+            SseProcessResult::Malformed(message) => {
+                return SseLineOutcome {
+                    immediate,
+                    terminal: Some(vec![StreamDelta::Error {
+                        message,
+                        kind: StreamErrorKind::ServerError,
+                    }]),
+                };
+            }
             SseProcessResult::Sentinel => {
                 let sr = stop_reason.unwrap_or_else(|| fallback_stream_stop_reason(tool_calls));
                 let terminal = build_stream_end_deltas(tool_calls, usage.take(), sr);
@@ -769,22 +1224,24 @@ fn build_stream_end_deltas(
 ) -> Vec<StreamDelta> {
     let mut deltas = Vec::new();
 
-    // Emit tool calls. `idx` comes from the wire `tool_calls[].index`; use
-    // saturating_add so a hostile `usize::MAX` index cannot overflow-panic in
-    // debug builds. StreamAccumulator sorts by index so order stays stable.
-    for (idx, tool) in tool_calls {
-        let block_index = idx.saturating_add(1);
-        deltas.push(StreamDelta::ToolUseStart {
-            id: tool.id.clone(),
-            name: tool.name.clone(),
-            block_index,
-            thought_signature: None,
-        });
-        deltas.push(StreamDelta::ToolInputDelta {
-            id: tool.id.clone(),
-            delta: tool.arguments.clone(),
-            block_index,
-        });
+    if matches!(stop_reason, StopReason::ToolUse) {
+        // `idx` comes from the wire `tool_calls[].index`; use saturating_add so
+        // a hostile `usize::MAX` index cannot overflow-panic in debug builds.
+        // StreamAccumulator sorts by index so order stays stable.
+        for (idx, tool) in tool_calls {
+            let block_index = idx.saturating_add(1);
+            deltas.push(StreamDelta::ToolUseStart {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                block_index,
+                thought_signature: None,
+            });
+            deltas.push(StreamDelta::ToolInputDelta {
+                id: tool.id.clone(),
+                delta: tool.arguments.clone(),
+                block_index,
+            });
+        }
     }
 
     // Emit usage
@@ -804,6 +1261,8 @@ fn build_stream_end_deltas(
 enum SseProcessResult {
     /// Emit a text delta.
     TextDelta(String),
+    /// Emit structured refusal text and mark the turn as refused.
+    RefusalDelta(String),
     /// Emit a thinking/reasoning delta (reasoning-model fallback when the model
     /// streams its output via `reasoning_content`/`reasoning` and `content` is
     /// empty, mirroring the non-streaming `build_content_blocks` fallback).
@@ -819,6 +1278,8 @@ enum SseProcessResult {
     Usage(Usage),
     /// Stream is done with a stop reason.
     Done(StopReason),
+    /// The provider emitted a malformed JSON event.
+    Malformed(String),
     /// Stream sentinel [DONE] was received.
     Sentinel,
 }
@@ -829,8 +1290,13 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
         return vec![SseProcessResult::Sentinel];
     }
 
-    let Ok(chunk) = serde_json::from_str::<SseChunk>(data) else {
-        return vec![];
+    let chunk = match serde_json::from_str::<SseChunk>(data) {
+        Ok(chunk) => chunk,
+        Err(error) => {
+            return vec![SseProcessResult::Malformed(format!(
+                "invalid OpenAI Chat Completions stream event: {error}"
+            ))];
+        }
     };
 
     let mut results = Vec::new();
@@ -844,29 +1310,32 @@ fn process_sse_data(data: &str) -> Vec<SseProcessResult> {
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens),
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cache_write_tokens),
         }));
     }
 
     // Process choices
     if let Some(choice) = chunk.choices.into_iter().next() {
-        // Handle text content delta. When `content` is empty/absent but the
-        // model streamed reasoning tokens (DeepSeek-style answer-in-
-        // `reasoning_content`, or `OpenRouter`-normalized `reasoning`), surface
-        // the reasoning as a thinking delta so the usable output is not silently
-        // dropped under streaming. This mirrors the non-streaming
-        // `build_content_blocks` fallback: text content takes precedence and the
-        // reasoning fallback only fires when `content` is empty.
-        if let Some(content) = choice.delta.content
-            && !content.is_empty()
-        {
+        let content = choice.delta.content.filter(|content| !content.is_empty());
+        let refusal = choice.delta.refusal.filter(|refusal| !refusal.is_empty());
+        let has_visible_output = content.is_some() || refusal.is_some();
+
+        if let Some(content) = content {
             results.push(SseProcessResult::TextDelta(content));
-        } else if let Some(reasoning) = choice
-            .delta
-            .reasoning_content
-            .as_deref()
-            .or(choice.delta.reasoning.as_deref())
-            .filter(|r| !r.is_empty())
+        }
+        if let Some(refusal) = refusal {
+            results.push(SseProcessResult::RefusalDelta(refusal));
+        }
+        if !has_visible_output
+            && let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .as_deref()
+                .or(choice.delta.reasoning.as_deref())
+                .filter(|reasoning| !reasoning.is_empty())
         {
             results.push(SseProcessResult::ThinkingDelta(reasoning.to_owned()));
         }
@@ -912,9 +1381,8 @@ fn use_openrouter_usage_options(base_url: &str) -> bool {
     base_url.contains("openrouter.ai")
 }
 
-/// Infer the stream stop reason when the provider never sent an explicit
-/// `finish_reason` (truncated stream / EOF): a turn with accumulated tool
-/// calls is a `ToolUse`, otherwise a plain `EndTurn`.
+/// Infer the stop reason at a valid `[DONE]` sentinel when the provider omitted
+/// an explicit `finish_reason`.
 fn fallback_stream_stop_reason(
     tool_calls: &std::collections::HashMap<usize, ToolCallAccumulator>,
 ) -> StopReason {
@@ -957,8 +1425,15 @@ fn decode_chat_response(
         .next()
         .ok_or_else(|| anyhow::anyhow!("no choices in response"))?;
 
-    let content = build_content_blocks(&choice.message);
-    let stop_reason = choice.finish_reason.as_deref().map(map_finish_reason);
+    let stop_reason = if refusal_text(&choice.message).is_some() {
+        Some(StopReason::Refusal)
+    } else {
+        choice.finish_reason.as_deref().map(map_finish_reason)
+    };
+    let mut content = build_content_blocks(&choice.message);
+    if !matches!(stop_reason, Some(StopReason::ToolUse)) {
+        content.retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+    }
 
     Ok(ChatOutcome::Success(ChatResponse {
         id: api_response.id,
@@ -973,7 +1448,11 @@ fn decode_chat_response(
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens),
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: api_response
+                .usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cache_write_tokens),
         },
     }))
 }
@@ -983,51 +1462,34 @@ fn map_finish_reason(finish_reason: &str) -> StopReason {
         "stop" => StopReason::EndTurn,
         "tool_calls" => StopReason::ToolUse,
         "length" => StopReason::MaxTokens,
-        "content_filter" | "network_error" => StopReason::StopSequence,
-        "sensitive" => StopReason::Refusal,
+        "content_filter" | "refusal" | "sensitive" => StopReason::Refusal,
+        "network_error" => StopReason::Unknown,
         unknown => {
             log::debug!("Unknown finish_reason from OpenAI-compatible API: {unknown}");
-            StopReason::StopSequence
+            StopReason::Unknown
         }
     }
 }
 
-fn build_api_reasoning(thinking: Option<&ThinkingConfig>) -> Option<ApiReasoning> {
-    thinking
-        .and_then(resolve_reasoning_effort)
-        .map(|effort| ApiReasoning { effort })
-}
-
-const fn resolve_reasoning_effort(config: &ThinkingConfig) -> Option<ReasoningEffort> {
-    if let Some(effort) = config.effort {
-        return Some(map_effort(effort));
-    }
-
-    match &config.mode {
-        ThinkingMode::Adaptive => None,
-        ThinkingMode::Enabled { budget_tokens } => Some(map_budget_to_reasoning(*budget_tokens)),
-    }
-}
-
-const fn map_effort(effort: Effort) -> ReasoningEffort {
-    match effort {
-        Effort::Low => ReasoningEffort::Low,
-        Effort::Medium => ReasoningEffort::Medium,
-        Effort::High => ReasoningEffort::High,
-        Effort::Max => ReasoningEffort::XHigh,
-    }
-}
-
-const fn map_budget_to_reasoning(budget_tokens: u32) -> ReasoningEffort {
-    if budget_tokens <= 4_096 {
-        ReasoningEffort::Low
-    } else if budget_tokens <= 16_384 {
-        ReasoningEffort::Medium
-    } else if budget_tokens <= 32_768 {
-        ReasoningEffort::High
-    } else {
-        ReasoningEffort::XHigh
-    }
+fn build_chat_api_reasoning(
+    config: Option<&OpenAIReasoningConfig>,
+    first_party_wire: bool,
+) -> Option<ApiChatReasoning> {
+    config
+        .and_then(OpenAIReasoningConfig::effort)
+        .map(|effort| {
+            if first_party_wire {
+                ApiChatReasoning {
+                    reasoning_effort: Some(effort),
+                    reasoning: None,
+                }
+            } else {
+                ApiChatReasoning {
+                    reasoning_effort: None,
+                    reasoning: Some(ApiCompatibleReasoning { effort }),
+                }
+            }
+        })
 }
 
 const fn api_role(role: agent_sdk_foundation::llm::Role) -> ApiRole {
@@ -1091,6 +1553,7 @@ fn append_block_messages(
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id.clone()),
+                    prompt_cache_breakpoint: false,
                 });
             }
             // `ContentBlock` is `#[non_exhaustive]`; a block kind this SDK
@@ -1135,11 +1598,20 @@ fn append_block_messages(
                 Some(tool_calls)
             },
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         });
     }
 }
 
+#[cfg(test)]
 fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
+    build_api_messages_with_cache(request, 0)
+}
+
+fn build_api_messages_with_cache(
+    request: &ChatRequest,
+    explicit_cache_breakpoints: usize,
+) -> Vec<ApiMessage> {
     let mut messages = Vec::new();
 
     // Add system message first (OpenAI uses a separate message for system prompt)
@@ -1150,6 +1622,7 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         });
     }
 
@@ -1163,22 +1636,65 @@ fn build_api_messages(request: &ChatRequest) -> Vec<ApiMessage> {
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    prompt_cache_breakpoint: false,
                 });
             }
             Content::Blocks(blocks) => append_block_messages(&mut messages, msg.role, blocks),
         }
     }
 
+    apply_chat_cache_breakpoints(&mut messages, explicit_cache_breakpoints);
     messages
 }
 
-fn convert_tool(t: agent_sdk_foundation::llm::Tool) -> ApiTool {
+fn apply_chat_cache_breakpoints(messages: &mut [ApiMessage], max_breakpoints: usize) {
+    if max_breakpoints == 0 {
+        return;
+    }
+
+    let max_breakpoints = max_breakpoints.min(4);
+    let message_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| message.content.as_ref().map(|_| index))
+        .collect();
+
+    let mut selected = Vec::with_capacity(max_breakpoints);
+    // Chat Completions has no marker field on tool definitions. A breakpoint on
+    // the system message still closes the prefix after tools + system, so it is
+    // the most stable representable boundary before conversation-tail markers.
+    if let Some(system_index) = message_indices
+        .iter()
+        .copied()
+        .find(|index| messages[*index].role == ApiRole::System)
+    {
+        selected.push(system_index);
+    }
+
+    let remaining = max_breakpoints.saturating_sub(selected.len());
+    let tail_candidates: Vec<usize> = message_indices
+        .into_iter()
+        .filter(|index| !selected.contains(index))
+        .collect();
+    let keep_from = tail_candidates.len().saturating_sub(remaining);
+    selected.extend_from_slice(&tail_candidates[keep_from..]);
+
+    for index in selected {
+        messages[index].prompt_cache_breakpoint = true;
+    }
+}
+
+fn convert_tool(t: agent_sdk_foundation::llm::Tool, normalize_for_openai_strict: bool) -> ApiTool {
+    let mut parameters = t.input_schema;
+    let strict =
+        (normalize_for_openai_strict && normalize_strict_schema(&mut parameters)).then_some(true);
     ApiTool {
         r#type: "function".to_owned(),
         function: ApiFunction {
             name: t.name,
             description: t.description,
-            parameters: t.input_schema,
+            parameters,
+            strict,
         },
     }
 }
@@ -1195,17 +1711,33 @@ fn reasoning_text(message: &ApiResponseMessage) -> Option<&str> {
         .filter(|r| !r.is_empty())
 }
 
+fn refusal_text(message: &ApiResponseMessage) -> Option<&str> {
+    message
+        .refusal
+        .as_deref()
+        .filter(|refusal| !refusal.is_empty())
+}
+
 fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
-    // Add text content if present
-    if let Some(content) = &message.content
-        && !content.is_empty()
-    {
+    let content = message
+        .content
+        .as_ref()
+        .filter(|content| !content.is_empty());
+    let refusal = refusal_text(message);
+    let has_visible_output = content.is_some() || refusal.is_some();
+    if let Some(content) = content {
         blocks.push(ContentBlock::Text {
             text: content.clone(),
         });
-    } else if let Some(reasoning) = reasoning_text(message) {
+    }
+    if let Some(refusal) = refusal {
+        blocks.push(ContentBlock::Text {
+            text: refusal.to_owned(),
+        });
+    }
+    if !has_visible_output && let Some(reasoning) = reasoning_text(message) {
         // Reasoning-model fallback: when `content` is empty/absent but the model
         // produced reasoning tokens (DeepSeek-style answer-in-`reasoning_content`,
         // or any reasoning model truncated under a tight `max_tokens` before it
@@ -1251,10 +1783,22 @@ struct ApiChatRequest<'a> {
     tools: Option<&'a [ApiTool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ApiToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ApiReasoning>,
+    #[serde(flatten)]
+    reasoning: Option<ApiChatReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ApiResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbosity: Option<OpenAITextVerbosity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<ApiPromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_identifier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1269,10 +1813,22 @@ struct ApiChatRequestStreaming<'a> {
     tools: Option<&'a [ApiTool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ApiToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ApiReasoning>,
+    #[serde(flatten)]
+    reasoning: Option<ApiChatReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ApiResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbosity: Option<OpenAITextVerbosity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<ApiPromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_identifier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ApiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1287,11 +1843,16 @@ struct ApiChatRequestStreaming<'a> {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ApiToolChoice {
-    String(String),
+    Mode(&'static str),
     Named {
         #[serde(rename = "type")]
-        choice_type: String,
+        choice_type: &'static str,
         function: ApiToolChoiceFunction,
+    },
+    AllowedTools {
+        #[serde(rename = "type")]
+        choice_type: &'static str,
+        allowed_tools: ApiChatAllowedTools,
     },
 }
 
@@ -1300,13 +1861,51 @@ struct ApiToolChoiceFunction {
     name: String,
 }
 
+#[derive(Serialize)]
+struct ApiChatAllowedTools {
+    mode: OpenAIAllowedToolsMode,
+    tools: Vec<ApiChatAllowedTool>,
+}
+
+#[derive(Serialize)]
+struct ApiChatAllowedTool {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    function: ApiToolChoiceFunction,
+}
+
 impl ApiToolChoice {
-    fn from_tool_choice(tc: &agent_sdk_foundation::llm::ToolChoice) -> Self {
+    fn from_tool_choice(tc: &ToolChoice) -> Self {
         match tc {
-            agent_sdk_foundation::llm::ToolChoice::Auto => Self::String("auto".to_owned()),
-            agent_sdk_foundation::llm::ToolChoice::Tool(name) => Self::Named {
-                choice_type: "function".to_owned(),
+            ToolChoice::Auto => Self::Mode("auto"),
+            ToolChoice::Tool(name) => Self::Named {
+                choice_type: "function",
                 function: ApiToolChoiceFunction { name: name.clone() },
+            },
+        }
+    }
+
+    fn from_openai_tool_choice(choice: &OpenAIToolChoice) -> Self {
+        match choice {
+            OpenAIToolChoice::None => Self::Mode("none"),
+            OpenAIToolChoice::Auto => Self::Mode("auto"),
+            OpenAIToolChoice::Required => Self::Mode("required"),
+            OpenAIToolChoice::Function(name) => Self::Named {
+                choice_type: "function",
+                function: ApiToolChoiceFunction { name: name.clone() },
+            },
+            OpenAIToolChoice::AllowedTools { mode, tools } => Self::AllowedTools {
+                choice_type: "allowed_tools",
+                allowed_tools: ApiChatAllowedTools {
+                    mode: *mode,
+                    tools: tools
+                        .iter()
+                        .map(|name| ApiChatAllowedTool {
+                            tool_type: "function",
+                            function: ApiToolChoiceFunction { name: name.clone() },
+                        })
+                        .collect(),
+                },
             },
         }
     }
@@ -1330,12 +1929,19 @@ struct ApiJsonSchema {
 }
 
 impl ApiResponseFormat {
-    fn from_response_format(rf: &agent_sdk_foundation::llm::ResponseFormat) -> Self {
+    fn from_response_format(
+        rf: &agent_sdk_foundation::llm::ResponseFormat,
+        normalize_for_openai_strict: bool,
+    ) -> Self {
+        let mut schema = rf.schema.clone();
+        if rf.strict && normalize_for_openai_strict {
+            let _ = normalize_strict_schema(&mut schema);
+        }
         Self {
             format_type: "json_schema",
             json_schema: ApiJsonSchema {
                 name: rf.name.clone(),
-                schema: rf.schema.clone(),
+                schema,
                 strict: rf.strict,
             },
         }
@@ -1354,25 +1960,53 @@ struct ApiOpenRouterUsageOptions {
     include: bool,
 }
 
+#[derive(Serialize)]
+struct ApiChatReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<OpenAIReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ApiCompatibleReasoning>,
+}
+
+#[derive(Serialize)]
+struct ApiCompatibleReasoning {
+    effort: OpenAIReasoningEffort,
+}
+
 #[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
+struct ApiPromptCacheOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<OpenAIPromptCacheMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<OpenAIPromptCacheTtl>,
 }
 
-#[derive(Serialize)]
-struct ApiReasoning {
-    effort: ReasoningEffort,
+#[derive(Clone, Copy)]
+struct ChatPromptCachePlan {
+    options: Option<ApiPromptCacheOptions>,
+    explicit_breakpoints: usize,
 }
 
-#[derive(Serialize)]
+impl ApiPromptCacheOptions {
+    const fn new(mode: OpenAIPromptCacheMode) -> Self {
+        Self {
+            mode: Some(mode),
+            ttl: None,
+        }
+    }
+
+    fn from_config(config: Option<&OpenAIReasoningConfig>) -> Option<Self> {
+        let config = config?;
+        let options = Self {
+            mode: config.prompt_cache_mode(),
+            ttl: config.prompt_cache_ttl(),
+        };
+        (options.mode.is_some() || options.ttl.is_some()).then_some(options)
+    }
+}
+
 struct ApiMessage {
     role: ApiRole,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     /// `DeepSeek`-style thinking-mode multi-turn requires the prior assistant
     /// `reasoning_content` to be echoed back on a tool-call turn or the API
@@ -1380,12 +2014,59 @@ struct ApiMessage {
     /// Thinking block AND a tool call; omitted entirely otherwise (including
     /// reasoning-only turns, since legacy `deepseek-reasoner` 400s if
     /// `reasoning_content` appears in input) so the normal path is unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    prompt_cache_breakpoint: bool,
+}
+
+impl Serialize for ApiMessage {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut message = serializer.serialize_struct("ApiMessage", 5)?;
+        message.serialize_field("role", &self.role)?;
+        if let Some(content) = self.content.as_deref() {
+            if self.prompt_cache_breakpoint {
+                message.serialize_field(
+                    "content",
+                    &[ApiChatTextPart {
+                        part_type: "text",
+                        text: content,
+                        prompt_cache_breakpoint: ApiChatPromptCacheBreakpoint {
+                            mode: OpenAIPromptCacheMode::Explicit,
+                        },
+                    }],
+                )?;
+            } else {
+                message.serialize_field("content", content)?;
+            }
+        }
+        if let Some(reasoning_content) = self.reasoning_content.as_deref() {
+            message.serialize_field("reasoning_content", reasoning_content)?;
+        }
+        if let Some(tool_calls) = self.tool_calls.as_ref() {
+            message.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = self.tool_call_id.as_deref() {
+            message.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        message.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ApiChatTextPart<'a> {
+    #[serde(rename = "type")]
+    part_type: &'static str,
+    text: &'a str,
+    prompt_cache_breakpoint: ApiChatPromptCacheBreakpoint,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ApiChatPromptCacheBreakpoint {
+    mode: OpenAIPromptCacheMode,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1421,6 +2102,8 @@ struct ApiFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 // ============================================================================
@@ -1444,6 +2127,8 @@ struct ApiChoice {
 #[derive(Deserialize)]
 struct ApiResponseMessage {
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
     tool_calls: Option<Vec<ApiResponseToolCall>>,
     /// `DeepSeek`-style chain-of-thought, returned at the same level as
     /// `content` (`DeepSeek` V4 / some `OpenRouter` providers).
@@ -1481,6 +2166,8 @@ struct ApiUsage {
 struct ApiPromptTokensDetails {
     #[serde(default, deserialize_with = "deserialize_u32_from_number")]
     cached_tokens: u32,
+    #[serde(default, deserialize_with = "deserialize_u32_from_number")]
+    cache_write_tokens: u32,
 }
 
 // ============================================================================
@@ -1515,6 +2202,8 @@ struct SseChoice {
 #[derive(Deserialize)]
 struct SseDelta {
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
     tool_calls: Option<Vec<SseToolCallDelta>>,
     /// `DeepSeek`-style streamed chain-of-thought, returned at the same level as
     /// `content` (`DeepSeek` V4 / some `OpenRouter` providers).
@@ -1592,6 +2281,16 @@ mod tests {
       ]
     }"#;
 
+    fn function_tool(name: &str) -> agent_sdk_foundation::llm::Tool {
+        agent_sdk_foundation::llm::Tool {
+            name: name.to_owned(),
+            description: format!("Call {name}"),
+            input_schema: serde_json::json!({"type": "object"}),
+            display_name: name.to_owned(),
+            tier: agent_sdk_foundation::ToolTier::Observe,
+        }
+    }
+
     #[test]
     fn parse_models_list_reads_ids() -> anyhow::Result<()> {
         let models = parse_models_list(OPENAI_MODELS_FIXTURE)?;
@@ -1659,6 +2358,32 @@ mod tests {
 
         assert_eq!(provider.model(), MODEL_GPT54);
         assert_eq!(provider.provider(), "openai");
+    }
+
+    #[test]
+    fn test_gpt56_factories_create_expected_providers() {
+        for (provider, expected_model) in [
+            (
+                OpenAIProvider::gpt56("test-api-key".to_string()),
+                MODEL_GPT56,
+            ),
+            (
+                OpenAIProvider::gpt56_sol("test-api-key".to_string()),
+                MODEL_GPT56_SOL,
+            ),
+            (
+                OpenAIProvider::gpt56_terra("test-api-key".to_string()),
+                MODEL_GPT56_TERRA,
+            ),
+            (
+                OpenAIProvider::gpt56_luna("test-api-key".to_string()),
+                MODEL_GPT56_LUNA,
+            ),
+        ] {
+            assert_eq!(provider.model(), expected_model);
+            assert_eq!(provider.provider(), "openai");
+            assert_eq!(provider.default_max_tokens(), 128_000);
+        }
     }
 
     #[test]
@@ -1795,6 +2520,11 @@ mod tests {
 
     #[test]
     fn test_model_constants_have_expected_values() {
+        // GPT-5.6 series
+        assert_eq!(MODEL_GPT56, "gpt-5.6");
+        assert_eq!(MODEL_GPT56_SOL, "gpt-5.6-sol");
+        assert_eq!(MODEL_GPT56_TERRA, "gpt-5.6-terra");
+        assert_eq!(MODEL_GPT56_LUNA, "gpt-5.6-luna");
         // GPT-5.4 / GPT-5.3 Codex
         assert_eq!(MODEL_GPT54, "gpt-5.4");
         assert_eq!(MODEL_GPT53_CODEX, "gpt-5.3-codex");
@@ -1872,6 +2602,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         };
 
         let json = serde_json::to_string(&message).unwrap();
@@ -1897,6 +2628,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         };
 
         let json = serde_json::to_string(&message).unwrap();
@@ -1915,6 +2647,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some("call_123".to_string()),
+            prompt_cache_breakpoint: false,
         };
 
         let json = serde_json::to_string(&message).unwrap();
@@ -1936,6 +2669,7 @@ mod tests {
                         "arg": {"type": "string"}
                     }
                 }),
+                strict: Some(true),
             },
         };
 
@@ -1979,6 +2713,67 @@ mod tests {
             response.choices[0].message.content,
             Some("Hello!".to_string())
         );
+    }
+
+    #[test]
+    fn structured_refusal_is_visible_and_sets_refusal_stop_reason() -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "id": "chatcmpl-refusal",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "refusal": "I cannot help with that."
+                },
+                "finish_reason": "stop"
+            }],
+            "model": "gpt-5.6",
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 6
+            }
+        });
+        let bytes = serde_json::to_vec(&body)?;
+        let outcome = decode_chat_response(StatusCode::OK, &bytes, None)?;
+        let ChatOutcome::Success(response) = outcome else {
+            anyhow::bail!("structured refusal did not decode as a successful provider response");
+        };
+
+        assert_eq!(response.first_text(), Some("I cannot help with that."));
+        assert_eq!(response.stop_reason, Some(StopReason::Refusal));
+        Ok(())
+    }
+
+    #[test]
+    fn non_tool_terminal_suppresses_nonstream_tool_calls() -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "id": "chatcmpl-truncated-tool",
+            "choices": [{
+                "message": {
+                    "content": "partial",
+                    "tool_calls": [{
+                        "id": "call_partial",
+                        "type": "function",
+                        "function": {
+                            "name": "delete_record",
+                            "arguments": "{\"id\":"
+                        }
+                    }]
+                },
+                "finish_reason": "length"
+            }],
+            "model": "gpt-5.6",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 6}
+        });
+        let bytes = serde_json::to_vec(&body)?;
+        let ChatOutcome::Success(response) = decode_chat_response(StatusCode::OK, &bytes, None)?
+        else {
+            anyhow::bail!("truncated response did not decode as a successful provider response");
+        };
+
+        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(response.first_text(), Some("partial"));
+        assert!(!response.has_tool_use());
+        Ok(())
     }
 
     #[test]
@@ -2043,7 +2838,7 @@ mod tests {
         );
         assert_eq!(
             map_finish_reason(response.choices[0].finish_reason.as_deref().unwrap()),
-            StopReason::StopSequence
+            StopReason::Unknown
         );
     }
 
@@ -2052,16 +2847,11 @@ mod tests {
         assert_eq!(map_finish_reason("stop"), StopReason::EndTurn);
         assert_eq!(map_finish_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_finish_reason("length"), StopReason::MaxTokens);
-        assert_eq!(
-            map_finish_reason("content_filter"),
-            StopReason::StopSequence
-        );
+        assert_eq!(map_finish_reason("content_filter"), StopReason::Refusal);
         assert_eq!(map_finish_reason("sensitive"), StopReason::Refusal);
-        assert_eq!(map_finish_reason("network_error"), StopReason::StopSequence);
-        assert_eq!(
-            map_finish_reason("some_new_reason"),
-            StopReason::StopSequence
-        );
+        assert_eq!(map_finish_reason("refusal"), StopReason::Refusal);
+        assert_eq!(map_finish_reason("network_error"), StopReason::Unknown);
+        assert_eq!(map_finish_reason("some_new_reason"), StopReason::Unknown);
     }
 
     // ===================
@@ -2295,21 +3085,37 @@ mod tests {
         let tool = agent_sdk_foundation::llm::Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}}
+            }),
             display_name: "Test Tool".to_string(),
             tier: agent_sdk_foundation::ToolTier::Observe,
         };
 
-        let api_tool = convert_tool(tool);
+        let compatible_tool = convert_tool(tool.clone(), false);
+        assert!(compatible_tool.function.strict.is_none());
+        assert_eq!(
+            compatible_tool.function.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}}
+            })
+        );
+
+        let api_tool = convert_tool(tool, true);
         assert_eq!(api_tool.r#type, "function");
         assert_eq!(api_tool.function.name, "test_tool");
         assert_eq!(api_tool.function.description, "A test tool");
+        assert_eq!(api_tool.function.strict, Some(true));
+        assert_eq!(api_tool.function.parameters["additionalProperties"], false);
     }
 
     #[test]
     fn test_build_content_blocks_text_only() {
         let message = ApiResponseMessage {
             content: Some("Hello!".to_string()),
+            refusal: None,
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
@@ -2324,6 +3130,7 @@ mod tests {
     fn test_build_content_blocks_with_tool_calls() {
         let message = ApiResponseMessage {
             content: Some("Let me help.".to_string()),
+            refusal: None,
             tool_calls: Some(vec![ApiResponseToolCall {
                 id: "call_123".to_string(),
                 function: ApiResponseFunctionCall {
@@ -2349,6 +3156,7 @@ mod tests {
         // while content is null. Without the fallback this dropped all output.
         let message = ApiResponseMessage {
             content: None,
+            refusal: None,
             tool_calls: None,
             reasoning_content: Some("The answer is 42.".to_string()),
             reasoning: None,
@@ -2366,6 +3174,7 @@ mod tests {
         // Some OpenRouter upstreams normalize reasoning under `reasoning`.
         let message = ApiResponseMessage {
             content: Some(String::new()),
+            refusal: None,
             tool_calls: None,
             reasoning_content: None,
             reasoning: Some("Considering options...".to_string()),
@@ -2382,6 +3191,7 @@ mod tests {
     fn test_build_content_blocks_prefers_reasoning_content_over_reasoning() {
         let message = ApiResponseMessage {
             content: None,
+            refusal: None,
             tool_calls: None,
             reasoning_content: Some("primary".to_string()),
             reasoning: Some("secondary".to_string()),
@@ -2400,6 +3210,7 @@ mod tests {
         // surfaced as a Thinking block when there is usable text content.
         let message = ApiResponseMessage {
             content: Some("Final answer.".to_string()),
+            refusal: None,
             tool_calls: None,
             reasoning_content: Some("internal chain of thought".to_string()),
             reasoning: None,
@@ -2416,6 +3227,7 @@ mod tests {
         // tool call (reasoning model under tight max_tokens that still tool-called).
         let message = ApiResponseMessage {
             content: None,
+            refusal: None,
             tool_calls: Some(vec![ApiResponseToolCall {
                 id: "call_1".to_string(),
                 function: ApiResponseFunctionCall {
@@ -2441,6 +3253,7 @@ mod tests {
         // (behavior unchanged for the empty case).
         let message = ApiResponseMessage {
             content: None,
+            refusal: None,
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
@@ -2601,23 +3414,29 @@ mod tests {
     }
 
     #[test]
-    fn test_api_usage_deserializes_cached_tokens() {
+    fn test_api_usage_deserializes_cache_read_and_write_tokens() -> anyhow::Result<()> {
         let json = r#"{
             "prompt_tokens": 42,
             "completion_tokens": 7,
             "prompt_tokens_details": {
-                "cached_tokens": 10
+                "cached_tokens": 10,
+                "cache_write_tokens": 6
             }
         }"#;
 
-        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        let usage: ApiUsage = serde_json::from_str(json)?;
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 7);
-        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 10);
+        let details = usage
+            .prompt_tokens_details
+            .context("prompt token details missing")?;
+        assert_eq!(details.cached_tokens, 10);
+        assert_eq!(details.cache_write_tokens, 6);
+        Ok(())
     }
 
     #[test]
-    fn test_process_sse_data_maps_cached_tokens_to_cache_read_usage() {
+    fn test_process_sse_data_maps_cache_read_and_write_usage() {
         let results = process_sse_data(
             r#"{
                 "choices": [],
@@ -2625,7 +3444,8 @@ mod tests {
                     "prompt_tokens": 42,
                     "completion_tokens": 7,
                     "prompt_tokens_details": {
-                        "cached_tokens": 10
+                        "cached_tokens": 10,
+                        "cache_write_tokens": 6
                     }
                 }
             }"#,
@@ -2637,7 +3457,7 @@ mod tests {
                 input_tokens: 42,
                 output_tokens: 7,
                 cached_input_tokens: 10,
-                cache_creation_input_tokens: 0,
+                cache_creation_input_tokens: 6,
             })]
         ));
     }
@@ -2750,6 +3570,36 @@ mod tests {
     }
 
     #[test]
+    fn streamed_refusal_is_visible_and_preserves_refusal_stop_reason() -> anyhow::Result<()> {
+        let mut tool_calls = HashMap::new();
+        let mut usage = None;
+        let mut stop_reason = None;
+        let chunk = step_completion_stream(
+            r#"{"choices":[{"delta":{"refusal":"Cannot comply."},"finish_reason":"stop"}]}"#,
+            &mut tool_calls,
+            &mut usage,
+            &mut stop_reason,
+        );
+
+        assert!(matches!(
+            chunk.immediate.as_slice(),
+            [StreamDelta::TextDelta { delta, .. }] if delta == "Cannot comply."
+        ));
+        assert_eq!(stop_reason, Some(StopReason::Refusal));
+
+        let done = step_completion_stream("[DONE]", &mut tool_calls, &mut usage, &mut stop_reason)
+            .terminal
+            .context("[DONE] did not finalize refusal stream")?;
+        assert!(done.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Done {
+                stop_reason: Some(StopReason::Refusal)
+            }
+        )));
+        Ok(())
+    }
+
+    #[test]
     fn test_api_usage_rejects_fractional_numbers() {
         let json = r#"{
             "prompt_tokens": 42.5,
@@ -2769,10 +3619,15 @@ mod tests {
     }
 
     #[test]
-    fn test_requires_responses_api_only_for_legacy_codex_model() {
+    fn test_requires_responses_api_for_codex_models() {
         assert!(requires_responses_api(MODEL_GPT52_CODEX));
-        assert!(!requires_responses_api(MODEL_GPT53_CODEX));
+        assert!(requires_responses_api(MODEL_GPT52_PRO));
+        assert!(requires_responses_api(MODEL_GPT53_CODEX));
         assert!(!requires_responses_api(MODEL_GPT54));
+        assert!(!requires_responses_api(MODEL_GPT56));
+        assert!(!requires_responses_api(MODEL_GPT56_SOL));
+        assert!(!requires_responses_api(MODEL_GPT56_TERRA));
+        assert!(!requires_responses_api(MODEL_GPT56_LUNA));
     }
 
     #[test]
@@ -2797,34 +3652,408 @@ mod tests {
             cache: None,
         };
 
-        assert!(should_use_responses_api(
-            DEFAULT_BASE_URL,
+        for model in [
             MODEL_GPT54,
-            &request
-        ));
+            MODEL_GPT56,
+            MODEL_GPT56_SOL,
+            MODEL_GPT56_TERRA,
+            MODEL_GPT56_LUNA,
+        ] {
+            assert!(should_use_responses_api(
+                DEFAULT_BASE_URL,
+                model,
+                &request,
+                None
+            ));
+        }
         assert!(!should_use_responses_api(
             BASE_URL_KIMI,
             MODEL_GPT54,
-            &request
+            &request,
+            None,
         ));
     }
 
     #[test]
-    fn test_build_api_reasoning_maps_enabled_budget_to_effort() {
-        let reasoning = build_api_reasoning(Some(&ThinkingConfig::new(40_000))).unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::XHigh));
+    fn official_gpt56_auto_routes_but_custom_base_url_does_not() {
+        let request = ChatRequest::new(String::new(), vec![]);
+        assert!(should_use_responses_api(
+            DEFAULT_BASE_URL,
+            MODEL_GPT56,
+            &request,
+            None,
+        ));
+        assert!(!should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT56,
+            &request,
+            None,
+        ));
     }
 
     #[test]
-    fn test_build_api_reasoning_uses_explicit_effort() {
-        let reasoning =
-            build_api_reasoning(Some(&ThinkingConfig::adaptive_with_effort(Effort::High))).unwrap();
-        assert!(matches!(reasoning.effort, ReasoningEffort::High));
+    fn response_only_reasoning_controls_trigger_reroute() {
+        let request = ChatRequest::new(String::new(), vec![]);
+        let reasoning = OpenAIReasoningConfig::new()
+            .with_mode(super::super::openai_reasoning::OpenAIReasoningMode::Pro);
+        assert!(should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT56,
+            &request,
+            Some(&reasoning),
+        ));
+
+        let forced_chat = reasoning.with_api_surface(OpenAIApiSurface::ChatCompletions);
+        assert!(!should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT56,
+            &request,
+            Some(&forced_chat),
+        ));
+        assert!(OpenAIProvider::validate_chat_reasoning_controls(Some(&forced_chat)).is_err());
+
+        let codex = OpenAIProvider::gpt53_codex("test-key".to_owned()).with_reasoning(
+            OpenAIReasoningConfig::new().with_api_surface(OpenAIApiSurface::ChatCompletions),
+        );
+        assert!(codex.validate_requested_api_surface().is_err());
     }
 
     #[test]
-    fn test_build_api_reasoning_omits_adaptive_without_effort() {
-        assert!(build_api_reasoning(Some(&ThinkingConfig::adaptive())).is_none());
+    fn openai_responses_history_reroutes_auto_and_forced_chat_rejects() {
+        let request = ChatRequest::new(
+            String::new(),
+            vec![agent_sdk_foundation::llm::Message::assistant_with_content(
+                vec![ContentBlock::OpaqueReasoning {
+                    provider: OPENAI_RESPONSES_REASONING_PROVIDER.to_owned(),
+                    data: serde_json::json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "ciphertext"
+                    }),
+                }],
+            )],
+        );
+
+        assert!(should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT54,
+            &request,
+            None,
+        ));
+
+        let forced_chat =
+            OpenAIReasoningConfig::new().with_api_surface(OpenAIApiSurface::ChatCompletions);
+        assert!(!should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT54,
+            &request,
+            Some(&forced_chat),
+        ));
+        assert!(OpenAIProvider::validate_chat_opaque_reasoning(&request).is_err());
+    }
+
+    #[test]
+    fn exact_chat_tool_choice_maps_and_validates() -> anyhow::Result<()> {
+        let tools = vec![function_tool("read_file")];
+
+        let required = OpenAIReasoningConfig::new().with_tool_choice(OpenAIToolChoice::Required);
+        let choice = OpenAIProvider::resolve_chat_tool_choice(None, Some(&required), Some(&tools))?
+            .context("required tool choice was omitted")?;
+        assert_eq!(serde_json::to_value(choice)?, serde_json::json!("required"));
+
+        let forced = OpenAIReasoningConfig::new()
+            .with_tool_choice(OpenAIToolChoice::Function("read_file".to_owned()));
+        let choice = OpenAIProvider::resolve_chat_tool_choice(None, Some(&forced), Some(&tools))?
+            .context("forced tool choice was omitted")?;
+        assert_eq!(
+            serde_json::to_value(choice)?,
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}})
+        );
+
+        let allowed =
+            OpenAIReasoningConfig::new().with_tool_choice(OpenAIToolChoice::AllowedTools {
+                mode: OpenAIAllowedToolsMode::Required,
+                tools: vec!["read_file".to_owned()],
+            });
+        let choice = OpenAIProvider::resolve_chat_tool_choice(None, Some(&allowed), Some(&tools))?
+            .context("allowed-tools choice was omitted")?;
+        assert_eq!(
+            serde_json::to_value(choice)?,
+            serde_json::json!({
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "required",
+                    "tools": [
+                        {"type": "function", "function": {"name": "read_file"}}
+                    ]
+                }
+            })
+        );
+
+        let missing = OpenAIReasoningConfig::new()
+            .with_tool_choice(OpenAIToolChoice::Function("missing".to_owned()));
+        assert!(
+            OpenAIProvider::resolve_chat_tool_choice(None, Some(&missing), Some(&tools)).is_err()
+        );
+        assert!(OpenAIProvider::resolve_chat_tool_choice(None, Some(&required), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generic_tool_choice_overrides_provider_exact_choice() -> anyhow::Result<()> {
+        let tools = vec![function_tool("read_file")];
+        let request_choice = ToolChoice::Tool("read_file".to_owned());
+        let provider_choice =
+            OpenAIReasoningConfig::new().with_tool_choice(OpenAIToolChoice::AllowedTools {
+                mode: super::super::openai_reasoning::OpenAIAllowedToolsMode::Required,
+                tools: vec!["missing".to_owned()],
+            });
+        let request = ChatRequest::new(String::new(), vec![])
+            .with_tools(tools.clone())
+            .with_tool_choice(request_choice.clone());
+
+        assert!(!should_use_responses_api(
+            "https://gateway.example/v1",
+            MODEL_GPT54,
+            &request,
+            Some(&provider_choice),
+        ));
+        let choice = OpenAIProvider::resolve_chat_tool_choice(
+            Some(&request_choice),
+            Some(&provider_choice),
+            Some(&tools),
+        )?
+        .context("generic tool choice was omitted")?;
+        assert_eq!(
+            serde_json::to_value(choice)?,
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generic_cache_control_overrides_exact_defaults_and_rejects_unmappable_ttl()
+    -> anyhow::Result<()> {
+        use agent_sdk_foundation::llm::{CacheConfig, CacheTtl};
+
+        let provider = OpenAIProvider::gpt56("test-key".to_owned());
+        let exact = OpenAIReasoningConfig::new()
+            .with_prompt_cache_mode(OpenAIPromptCacheMode::Explicit)
+            .with_prompt_cache_ttl(OpenAIPromptCacheTtl::ThirtyMinutes);
+
+        let inherited_plan = provider.resolve_chat_prompt_cache_options(
+            &ChatRequest::new(String::new(), vec![]),
+            Some(&exact),
+        )?;
+        assert_eq!(inherited_plan.explicit_breakpoints, 0);
+        let inherited = inherited_plan
+            .options
+            .context("exact prompt-cache options were omitted")?;
+        assert_eq!(
+            serde_json::to_value(inherited)?,
+            serde_json::json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let enabled = ChatRequest::new(String::new(), vec![]).with_cache(CacheConfig::enabled());
+        let enabled_plan = provider.resolve_chat_prompt_cache_options(&enabled, Some(&exact))?;
+        assert_eq!(enabled_plan.explicit_breakpoints, 0);
+        let enabled = enabled_plan
+            .options
+            .context("generic enabled cache options were omitted")?;
+        assert_eq!(
+            serde_json::to_value(enabled)?,
+            serde_json::json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let disabled = ChatRequest::new(String::new(), vec![]).with_cache(CacheConfig::disabled());
+        let disabled_plan = provider.resolve_chat_prompt_cache_options(&disabled, Some(&exact))?;
+        assert_eq!(disabled_plan.explicit_breakpoints, 0);
+        let disabled = disabled_plan
+            .options
+            .context("generic disabled cache options were omitted")?;
+        assert_eq!(
+            serde_json::to_value(disabled)?,
+            serde_json::json!({"mode": "explicit"})
+        );
+
+        let zero_breakpoints = ChatRequest::new(String::new(), vec![])
+            .with_cache(CacheConfig::enabled().with_max_breakpoints(0));
+        let zero_breakpoints_plan =
+            provider.resolve_chat_prompt_cache_options(&zero_breakpoints, Some(&exact))?;
+        assert_eq!(zero_breakpoints_plan.explicit_breakpoints, 0);
+        let zero_breakpoints = zero_breakpoints_plan
+            .options
+            .context("zero-breakpoint cache options were omitted")?;
+        assert_eq!(
+            serde_json::to_value(zero_breakpoints)?,
+            serde_json::json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let two_breakpoints = ChatRequest::new(String::new(), vec![])
+            .with_cache(CacheConfig::enabled().with_max_breakpoints(2));
+        let two_breakpoints =
+            provider.resolve_chat_prompt_cache_options(&two_breakpoints, Some(&exact))?;
+        assert_eq!(two_breakpoints.explicit_breakpoints, 2);
+
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            for cache in [
+                CacheConfig::enabled().with_ttl(ttl),
+                CacheConfig::disabled().with_ttl(ttl),
+            ] {
+                let request = ChatRequest::new(String::new(), vec![]).with_cache(cache);
+                let error = provider
+                    .resolve_chat_prompt_cache_options(&request, Some(&exact))
+                    .err()
+                    .context("shared cache TTL was silently accepted")?;
+                assert!(error.to_string().contains("supports only a 30m TTL"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chat_cache_breakpoints_prioritize_system_then_conversation_tail() -> anyhow::Result<()> {
+        let request = ChatRequest::new(
+            "system",
+            vec![
+                agent_sdk_foundation::llm::Message::user("one"),
+                agent_sdk_foundation::llm::Message::assistant("two"),
+                agent_sdk_foundation::llm::Message::user("three"),
+                agent_sdk_foundation::llm::Message::assistant("four"),
+                agent_sdk_foundation::llm::Message::user("five"),
+            ],
+        );
+        let json = serde_json::to_value(build_api_messages_with_cache(&request, 9))?;
+        let messages = json.as_array().context("messages must be an array")?;
+        let marked = messages
+            .iter()
+            .filter(|message| message["content"].is_array())
+            .count();
+        assert_eq!(marked, 4);
+        assert_eq!(messages[0]["content"][0]["text"], "system");
+        assert_eq!(
+            messages[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(messages[1]["content"], "one");
+        assert_eq!(messages[2]["content"], "two");
+        assert_eq!(messages[5]["content"][0]["text"], "five");
+        assert_eq!(
+            messages[5]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+
+        let one_breakpoint = serde_json::to_value(build_api_messages_with_cache(&request, 1))?;
+        let messages = one_breakpoint
+            .as_array()
+            .context("messages must be an array")?;
+        assert!(messages[0]["content"].is_array());
+        assert!(messages[5]["content"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_strict_response_format_rejects_free_form_objects() -> anyhow::Result<()> {
+        let format = agent_sdk_foundation::llm::ResponseFormat::new(
+            "freeform",
+            serde_json::json!({"type": "object"}),
+        );
+        assert!(
+            OpenAIProvider::gpt54("test-key".to_owned())
+                .validate_chat_response_format(Some(&format))
+                .is_err()
+        );
+        assert!(
+            OpenAIProvider::with_base_url("test-key", MODEL_GPT54, "https://gateway.example/v1",)
+                .validate_chat_response_format(Some(&format))
+                .is_ok()
+        );
+
+        let structured = agent_sdk_foundation::llm::ResponseFormat::new(
+            "structured",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"optional_name": {"type": "string"}}
+            }),
+        );
+        let compatible = ApiResponseFormat::from_response_format(&structured, false);
+        let compatible_json = serde_json::to_value(compatible)?;
+        assert!(
+            compatible_json["json_schema"]["schema"]
+                .get("required")
+                .is_none()
+        );
+
+        let official = ApiResponseFormat::from_response_format(&structured, true);
+        let official_json = serde_json::to_value(official)?;
+        assert_eq!(
+            official_json["json_schema"]["schema"]["required"],
+            serde_json::json!(["optional_name"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forced_or_custom_chat_rejects_unserialized_attachments() {
+        let request = ChatRequest::new(
+            String::new(),
+            vec![agent_sdk_foundation::llm::Message::user_with_content(vec![
+                ContentBlock::Image {
+                    source: agent_sdk_foundation::llm::ContentSource::new("image/png", "aGVsbG8="),
+                },
+            ])],
+        );
+        let forced_chat =
+            OpenAIReasoningConfig::new().with_api_surface(OpenAIApiSurface::ChatCompletions);
+
+        assert!(!should_use_responses_api(
+            DEFAULT_BASE_URL,
+            MODEL_GPT54,
+            &request,
+            Some(&forced_chat),
+        ));
+        assert!(
+            OpenAIProvider::gpt54("test-key".to_owned())
+                .with_reasoning(forced_chat)
+                .validate_chat_attachments(&request)
+                .is_err()
+        );
+        assert!(
+            OpenAIProvider::with_base_url("test-key", MODEL_GPT54, "https://gateway.example/v1",)
+                .validate_chat_attachments(&request)
+                .is_err()
+        );
+        assert!(should_use_responses_api(
+            DEFAULT_BASE_URL,
+            MODEL_GPT54,
+            &request,
+            None,
+        ));
+    }
+
+    #[test]
+    fn legacy_budget_and_effort_mapping_remains_compatible() {
+        assert_eq!(
+            legacy_reasoning_effort(&ThinkingConfig::new(40_000)),
+            Some(OpenAIReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            legacy_reasoning_effort(&ThinkingConfig::adaptive_with_effort(
+                agent_sdk_foundation::llm::Effort::High,
+            )),
+            Some(OpenAIReasoningEffort::High)
+        );
+        assert_eq!(legacy_reasoning_effort(&ThinkingConfig::adaptive()), None);
+    }
+
+    #[test]
+    fn effective_max_tokens_uses_model_default_unless_explicit() {
+        let provider = OpenAIProvider::gpt56("test-key".to_string());
+        let implicit = ChatRequest::new(String::new(), vec![]);
+        assert_eq!(provider.effective_max_tokens(&implicit), 128_000);
+
+        let explicit = implicit.with_max_tokens(8_192);
+        assert_eq!(provider.effective_max_tokens(&explicit), 8_192);
     }
 
     #[test]
@@ -2857,6 +4086,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequest {
@@ -2868,11 +4098,88 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(!json.contains("\"max_tokens\""));
+        assert!(json.contains("\"store\":false"));
+    }
+
+    #[test]
+    fn custom_chat_omits_first_party_storage_and_cache_defaults() {
+        let explicit_store = OpenAIReasoningConfig::new().with_store(true);
+
+        assert_eq!(chat_store(DEFAULT_BASE_URL, None), Some(false));
+        assert_eq!(
+            chat_store("https://gateway.example/v1", Some(&explicit_store)),
+            Some(true)
+        );
+        assert_eq!(chat_store("https://gateway.example/v1", None), None);
+        assert_eq!(
+            chat_prompt_cache_key(DEFAULT_BASE_URL, Some("thread-42")),
+            Some("thread-42")
+        );
+        assert_eq!(
+            chat_prompt_cache_key("https://gateway.example/v1", Some("thread-42")),
+            None
+        );
+    }
+
+    #[test]
+    fn official_openai_url_detection_uses_the_exact_parsed_host() {
+        assert!(is_official_openai_base_url(DEFAULT_BASE_URL));
+        assert!(is_official_openai_base_url(
+            "https://api.openai.com/custom-prefix/v1"
+        ));
+        assert!(!is_official_openai_base_url(
+            "https://api.openai.com.attacker.example/v1"
+        ));
+        assert!(!is_official_openai_base_url(
+            "https://gateway.example/v1?upstream=api.openai.com"
+        ));
+        assert!(!is_official_openai_base_url("not a URL api.openai.com"));
+    }
+
+    #[test]
+    fn test_request_serializes_openai_application_controls() -> anyhow::Result<()> {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_owned()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            prompt_cache_breakpoint: false,
+        }];
+        let request = ApiChatRequest {
+            model: MODEL_GPT56,
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(true),
+            parallel_tool_calls: Some(false),
+            safety_identifier: Some("safety-user-42"),
+            prompt_cache_key: Some("thread-42"),
+        };
+
+        let json = serde_json::to_value(request)?;
+        assert_eq!(json["store"], true);
+        assert_eq!(json["parallel_tool_calls"], false);
+        assert_eq!(json["safety_identifier"], "safety-user-42");
+        assert_eq!(json["prompt_cache_key"], "thread-42");
+        Ok(())
     }
 
     #[test]
@@ -2883,6 +4190,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequest {
@@ -2894,11 +4202,18 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
+        assert!(!json.contains("\"store\""));
     }
 
     #[test]
@@ -2909,6 +4224,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequestStreaming {
@@ -2920,6 +4236,12 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
@@ -2960,6 +4282,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
         let request = ApiChatRequestStreaming {
             model: "anthropic/claude-3.5",
@@ -2970,6 +4293,12 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
             stream_options: Some(ApiStreamOptions {
                 include_usage: true,
             }),
@@ -3005,6 +4334,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequestStreaming {
@@ -3016,6 +4346,12 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
             stream_options: None,
             usage: None,
             stream: true,
@@ -3025,16 +4361,18 @@ mod tests {
         assert!(json.contains("\"max_completion_tokens\":1024"));
         assert!(json.contains("\"max_tokens\":1024"));
         assert!(!json.contains("\"stream_options\""));
+        assert!(!json.contains("\"store\""));
     }
 
     #[test]
-    fn test_request_serialization_includes_reasoning_when_present() {
+    fn test_request_serialization_uses_top_level_reasoning_effort() -> anyhow::Result<()> {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
             content: Some("Hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequest {
@@ -3044,14 +4382,58 @@ mod tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
-            reasoning: Some(ApiReasoning {
-                effort: ReasoningEffort::High,
-            }),
+            reasoning: build_chat_api_reasoning(
+                Some(&OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::High)),
+                true,
+            ),
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"reasoning\":{\"effort\":\"high\"}"));
+        let json = serde_json::to_value(&request)?;
+        assert_eq!(json["reasoning_effort"], "high");
+        assert!(json.get("reasoning").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_compatible_request_serialization_preserves_nested_reasoning() -> anyhow::Result<()> {
+        let messages = vec![ApiMessage {
+            role: ApiRole::User,
+            content: Some("Hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            prompt_cache_breakpoint: false,
+        }];
+        let reasoning = OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::High);
+
+        let request = ApiChatRequest {
+            model: "compatible-model",
+            messages: &messages,
+            max_completion_tokens: Some(1024),
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: build_chat_api_reasoning(Some(&reasoning), false),
+            response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: None,
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        let json = serde_json::to_value(&request)?;
+        assert_eq!(json["reasoning"]["effort"], "high");
+        assert!(json.get("reasoning_effort").is_none());
+        Ok(())
     }
 
     #[test]
@@ -3062,6 +4444,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let response_format = Some(ApiResponseFormat::from_response_format(
@@ -3069,6 +4452,7 @@ mod tests {
                 "person",
                 serde_json::json!({"type": "object"}),
             ),
+            true,
         ));
 
         let request = ApiChatRequest {
@@ -3080,6 +4464,12 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -3142,6 +4532,59 @@ mod tests {
     }
 
     #[test]
+    fn malformed_chat_sse_is_an_immediate_server_error() -> anyhow::Result<()> {
+        let mut tool_calls = HashMap::new();
+        let mut usage = None;
+        let mut stop_reason = None;
+        let outcome = step_completion_stream(
+            "{not valid json",
+            &mut tool_calls,
+            &mut usage,
+            &mut stop_reason,
+        );
+        let SseLineOutcome {
+            immediate,
+            terminal,
+        } = outcome;
+        let terminal = terminal.context("malformed SSE event did not terminate the stream")?;
+
+        assert!(immediate.is_empty());
+        assert!(matches!(
+            terminal.as_slice(),
+            [StreamDelta::Error {
+                kind: StreamErrorKind::ServerError,
+                ..
+            }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn non_tool_stream_terminal_suppresses_accumulated_tool_calls() {
+        let tool_calls = HashMap::from([(
+            0,
+            ToolCallAccumulator {
+                id: "call_partial".to_owned(),
+                name: "delete_record".to_owned(),
+                arguments: "{\"id\":".to_owned(),
+            },
+        )]);
+
+        let truncated = build_stream_end_deltas(&tool_calls, None, StopReason::MaxTokens);
+        assert!(!truncated.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolUseStart { .. } | StreamDelta::ToolInputDelta { .. }
+        )));
+
+        let tool_terminal = build_stream_end_deltas(&tool_calls, None, StopReason::ToolUse);
+        assert!(
+            tool_terminal
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::ToolUseStart { .. }))
+        );
+    }
+
+    #[test]
     fn test_response_format_omitted_when_absent() {
         let messages = vec![ApiMessage {
             role: ApiRole::User,
@@ -3149,6 +4592,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            prompt_cache_breakpoint: false,
         }];
 
         let request = ApiChatRequest {
@@ -3160,9 +4604,57 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             response_format: None,
+            verbosity: None,
+            prompt_cache_options: None,
+            store: Some(false),
+            parallel_tool_calls: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("response_format"));
+    }
+
+    #[tokio::test]
+    async fn stream_eof_before_done_is_an_error() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url("test-key", MODEL_GPT4O, server.uri());
+        let request = ChatRequest::new(
+            String::new(),
+            vec![agent_sdk_foundation::llm::Message::user("hello")],
+        );
+        let items = provider.chat_stream(request).collect::<Vec<_>>().await;
+
+        assert!(items.iter().any(|item| matches!(
+            item,
+            Ok(StreamDelta::TextDelta { delta, .. }) if delta == "partial"
+        )));
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(StreamDelta::Done { .. })))
+        );
+        let last = items.last().context("stream emitted no events")?;
+        let Err(error) = last else {
+            anyhow::bail!("truncated stream did not end with an error");
+        };
+        assert!(error.to_string().contains("before [DONE] sentinel"));
+        Ok(())
     }
 }

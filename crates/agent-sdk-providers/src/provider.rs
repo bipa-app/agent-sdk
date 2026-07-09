@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::model_capabilities::{
     ModelCapabilities, default_max_output_tokens, get_model_capabilities,
 };
+use crate::model_features::{ModelFeatures, get_model_features};
 use crate::streaming::{StreamAccumulator, StreamBox, StreamDelta, StreamErrorKind};
 
 /// How a provider satisfies a [`ResponseFormat`](agent_sdk_foundation::llm::ResponseFormat)
@@ -109,6 +110,13 @@ pub trait LlmProvider: Send + Sync {
                                 | ContentBlock::Document { .. } => {
                                     // Not streamed in the default implementation
                                 }
+                                ContentBlock::OpaqueReasoning { provider, data } => {
+                                    yield Ok(StreamDelta::OpaqueReasoning {
+                                        provider: provider.clone(),
+                                        data: data.clone(),
+                                        block_index: idx,
+                                    });
+                                }
                                 ContentBlock::ToolUse { id, name, input, thought_signature } => {
                                     yield Ok(StreamDelta::ToolUseStart {
                                         id: id.clone(),
@@ -188,6 +196,18 @@ pub trait LlmProvider: Send + Sync {
             "vertex" => get_model_capabilities("gemini", self.model()),
             _ => None,
         })
+    }
+
+    /// API-shape feature metadata for this provider/model, when known.
+    ///
+    /// This complements [`Self::capabilities`] with endpoint, reasoning,
+    /// caching, and tool-control information that does not fit the legacy
+    /// context/pricing record.
+    fn model_features(&self) -> Option<&'static ModelFeatures> {
+        match self.provider() {
+            "openai" | "openai-responses" | "openai-codex" => get_model_features(self.model()),
+            _ => None,
+        }
     }
 
     /// Validate a thinking configuration against the provider/model capabilities.
@@ -377,6 +397,11 @@ pub async fn collect_stream(mut stream: StreamBox<'_>, model: String) -> Result<
             }
             ContentBlock::RedactedThinking { .. } => {
                 log::debug!("  content_block[{i}]: RedactedThinking");
+            }
+            ContentBlock::OpaqueReasoning { provider, .. } => {
+                log::debug!(
+                    "  content_block[{i}]: OpaqueReasoning provider={provider} payload=<redacted>"
+                );
             }
             ContentBlock::ToolUse {
                 id, name, input, ..

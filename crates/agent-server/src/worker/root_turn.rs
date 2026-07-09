@@ -938,9 +938,10 @@ async fn best_effort_commit_parked_cancel(
 ///
 /// - **Text-only** (no tool calls): buffers messages, commits the turn,
 ///   and advances the task to `Completed`.
-/// - **Tool calls present**: builds a [`ContinuationEnvelope`], spawns
-///   one `tool_runtime` child per tool call, and parks the parent task
-///   in `WaitingOnChildren`.
+/// - **Tool handoff**: when tool-use blocks accompany `ToolUse` (or a
+///   legacy missing) stop reason, builds a [`ContinuationEnvelope`],
+///   spawns one `tool_runtime` child per tool call, and parks the parent
+///   task in `WaitingOnChildren`.
 ///
 /// # Errors
 ///
@@ -1224,12 +1225,12 @@ async fn execute_root_turn_inner(
         start_committed,
     };
 
-    // 4. Branch: tool calls → suspend; text-only → commit.
+    // 4. Branch: authorized tool handoff → suspend; otherwise commit.
     //
     // Start was committed in step 2 (before streaming).  The branches
     // commit only the consolidated content events, `TurnComplete`, and
     // `Done` — atomically, with the message-projection write.
-    if response.has_tool_use() {
+    if response_requests_tool_dispatch(&response) {
         return suspend_at_tool_boundary(
             inputs,
             &user_input,
@@ -2522,7 +2523,7 @@ fn buffer_stream_delta(
             DeltaStep::Fail(outcome, error)
         }
         // Done / Usage / ToolUseStart / ToolInputDelta / SignatureDelta /
-        // RedactedThinking are handled by the accumulator and don't need
+        // RedactedThinking / OpaqueReasoning are handled by the accumulator and don't need
         // to be re-emitted as events. The catch-all also covers future
         // `#[non_exhaustive]` deltas, which the accumulator likewise
         // consumes.
@@ -2722,6 +2723,22 @@ async fn buffer_turn_messages(
     Ok(())
 }
 
+/// Whether a response is allowed to start a new tool-dispatch wave.
+///
+/// A reported stop reason is the provider's authoritative declaration of
+/// whether the response is a tool handoff.  If a malformed response combines
+/// a terminal reason with `ToolUse` blocks, the terminal commit path drops
+/// those blocks from persisted history rather than spawning children that the
+/// provider did not authorize.  `None` remains a legacy-compatible fallback
+/// for older provider adapters that emitted tool calls without a stop reason.
+fn response_requests_tool_dispatch(response: &llm::ChatResponse) -> bool {
+    response.has_tool_use() && stop_reason_allows_tool_dispatch(response.stop_reason)
+}
+
+const fn stop_reason_allows_tool_dispatch(stop_reason: Option<llm::StopReason>) -> bool {
+    matches!(stop_reason, None | Some(llm::StopReason::ToolUse))
+}
+
 /// Build an assistant message from a chat response, preserving text
 /// and thinking blocks.
 fn build_assistant_message(response: &llm::ChatResponse) -> llm::Message {
@@ -2741,6 +2758,12 @@ fn build_assistant_message(response: &llm::ChatResponse) -> llm::Message {
             }),
             llm::ContentBlock::RedactedThinking { data } => {
                 Some(llm::ContentBlock::RedactedThinking { data: data.clone() })
+            }
+            llm::ContentBlock::OpaqueReasoning { provider, data } => {
+                Some(llm::ContentBlock::OpaqueReasoning {
+                    provider: provider.clone(),
+                    data: data.clone(),
+                })
             }
             // Tool-use blocks filtered out (text-only path).
             _ => None,
@@ -3709,8 +3732,8 @@ pub async fn resume_root_turn(
     };
     let commit_now = OffsetDateTime::now_utc();
 
-    // 5. Branch: tool calls → re-suspend; text-only → commit.
-    if response.has_tool_use() {
+    // 5. Branch: authorized tool handoff → re-suspend; otherwise commit.
+    if response_requests_tool_dispatch(&response) {
         return suspend_resumed_turn(
             inputs,
             ResumeSuspension {
@@ -4551,6 +4574,7 @@ fn build_steering_assistant_message(
                 llm::ContentBlock::Text { .. }
                     | llm::ContentBlock::Thinking { .. }
                     | llm::ContentBlock::RedactedThinking { .. }
+                    | llm::ContentBlock::OpaqueReasoning { .. }
             )
         })
         .cloned()
@@ -4727,7 +4751,7 @@ async fn run_steering_exchange(
         // `build_assistant_message`'s tool_use filter). The steering
         // user message (interim results + note) is threaded into the
         // replay history so the directive survives for the next resume.
-        if response.has_tool_use() {
+        if response_requests_tool_dispatch(&response) {
             let mut history_prefix = suspended_messages;
             history_prefix.push(steering_message);
             return suspend_resumed_turn(
@@ -5016,4 +5040,31 @@ async fn repark_after_steering_exchange(
         child_tasks: Vec::new(),
         committed_events,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_tool_use_or_missing_stop_reason_allows_tool_dispatch() {
+        assert!(stop_reason_allows_tool_dispatch(None));
+        assert!(stop_reason_allows_tool_dispatch(Some(
+            llm::StopReason::ToolUse
+        )));
+
+        for stop_reason in [
+            llm::StopReason::EndTurn,
+            llm::StopReason::MaxTokens,
+            llm::StopReason::StopSequence,
+            llm::StopReason::Refusal,
+            llm::StopReason::ModelContextWindowExceeded,
+            llm::StopReason::Unknown,
+        ] {
+            assert!(
+                !stop_reason_allows_tool_dispatch(Some(stop_reason)),
+                "terminal stop reason {stop_reason:?} must not authorize tool dispatch"
+            );
+        }
+    }
 }

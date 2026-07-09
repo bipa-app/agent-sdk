@@ -17,7 +17,11 @@ pub mod openai;
 #[cfg(feature = "openai-codex")]
 pub mod openai_codex_responses;
 #[cfg(feature = "openai")]
+pub mod openai_reasoning;
+#[cfg(feature = "openai")]
 pub mod openai_responses;
+#[cfg(feature = "openai")]
+pub(crate) mod openai_schema;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
@@ -38,6 +42,12 @@ pub use gemini::GeminiProvider;
 pub use openai::OpenAIProvider;
 #[cfg(feature = "openai-codex")]
 pub use openai_codex_responses::OpenAICodexResponsesProvider;
+#[cfg(feature = "openai")]
+pub use openai_reasoning::{
+    OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
+    OpenAIReasoningConfig, OpenAIReasoningContext, OpenAIReasoningEffort, OpenAIReasoningMode,
+    OpenAIReasoningSummary, OpenAITextVerbosity, OpenAIToolChoice,
+};
 #[cfg(feature = "openai")]
 pub use openai_responses::OpenAIResponsesProvider;
 #[cfg(feature = "vertex")]

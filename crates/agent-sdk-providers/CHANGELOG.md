@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(openai)* add GPT-5.6 Sol, Terra, and Luna factories; exact reasoning, API-surface, tool, storage, and prompt-cache controls; and surface-scoped capability metadata
+
+### Fixed
+
+- *(openai)* preserve encrypted Responses reasoning items across tool turns, surface refusals and incomplete responses accurately, normalize strict schemas, retain output-item ordering, and reject truncated streams instead of committing partial success
+- *(openai)* serialize Chat Completions `reasoning_effort` as a scalar, remove the implicit 4K output cap for known models, map cache-write usage, and honor explicit GPT-5.6 cache breakpoints
+
 ## [0.11.6](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.5...agent-sdk-providers-v0.11.6) - 2026-07-09
 
 ### Fixed

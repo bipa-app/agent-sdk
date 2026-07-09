@@ -49,6 +49,7 @@ pub mod impls;
 pub mod model_capabilities;
 #[cfg(feature = "model-discovery")]
 pub mod model_catalog;
+pub mod model_features;
 pub mod provider;
 #[cfg(feature = "record-replay")]
 pub mod record_replay;
@@ -86,12 +87,23 @@ pub use impls::VertexProvider;
 #[cfg(feature = "anthropic")]
 pub use impls::{AnthropicProvider, is_oauth_token};
 #[cfg(feature = "openai")]
-pub use impls::{OpenAIProvider, OpenAIResponsesProvider};
+pub use impls::{
+    OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
+    OpenAIProvider, OpenAIReasoningConfig, OpenAIReasoningContext, OpenAIReasoningEffort,
+    OpenAIReasoningMode, OpenAIReasoningSummary, OpenAIResponsesProvider, OpenAITextVerbosity,
+    OpenAIToolChoice,
+};
 
 // Model capabilities
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
+};
+pub use model_features::{
+    ModelApiSurface, ModelFeatureSet, ModelFeatures, ModelInputModality, ModelPromptCacheFeatures,
+    ModelPromptCacheMode, ModelPromptCacheTtl, ModelReasoningContext, ModelReasoningEffort,
+    ModelReasoningFeatures, ModelReasoningMode, ModelReasoningStateReplay, ModelReasoningSummary,
+    ModelToolChoice, ModelToolFeatures, get_model_features, supported_model_features,
 };
 
 // Dynamic model-discovery: third-party capability/pricing feed + layered registry.

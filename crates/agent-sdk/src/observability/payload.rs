@@ -150,6 +150,17 @@ impl PayloadRedactor {
     }
 
     fn convert_block(&self, block: &ContentBlock) -> Option<Value> {
+        // Opaque provider state and redacted-thinking blocks carry nothing
+        // safe to surface. In particular, do not run opaque JSON through the
+        // ordinary PII redactor: ciphertext and future provider-owned fields
+        // must never leave the SDK via telemetry.
+        if matches!(
+            block,
+            ContentBlock::OpaqueReasoning { .. } | ContentBlock::RedactedThinking { .. }
+        ) {
+            return None;
+        }
+
         match block {
             ContentBlock::Text { text } => Some(json!({"text": self.mask_str(text)})),
             ContentBlock::Thinking { thinking, .. } => Some(json!({
@@ -199,9 +210,8 @@ impl PayloadRedactor {
                 }
                 Some(part)
             }
-            // Redacted-thinking blocks carry nothing to surface; this also
-            // omits unknown future `#[non_exhaustive]` block kinds from the
-            // observability payload.
+            // Unknown future `#[non_exhaustive]` block kinds are likewise
+            // omitted from the observability payload.
             _ => None,
         }
     }
@@ -388,6 +398,29 @@ mod tests {
         let content = result["content"].as_array().expect("array");
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "visible");
+    }
+
+    #[test]
+    fn opaque_reasoning_is_omitted_from_observability_payloads() {
+        let secret = "opaque-secret-that-must-not-leave-the-sdk";
+        let message = Message {
+            role: Role::Assistant,
+            content: Content::Blocks(vec![
+                ContentBlock::OpaqueReasoning {
+                    provider: "test-provider".to_owned(),
+                    data: json!({"encrypted_content": secret}),
+                },
+                ContentBlock::Text {
+                    text: "visible".to_owned(),
+                },
+            ]),
+        };
+        let request = empty_request("", vec![message]);
+        let payload = PayloadRedactor::noop().convert_input_messages(&request);
+
+        assert_eq!(payload[0]["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload[0]["content"][0]["text"], "visible");
+        assert!(!payload.to_string().contains(secret));
     }
 
     #[test]

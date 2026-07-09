@@ -40,6 +40,9 @@ use futures::{Stream, StreamExt};
 use crate::provider::{LlmProvider, StructuredOutputSupport};
 use crate::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 
+#[cfg(feature = "openai")]
+use crate::impls::openai_schema::normalized_strict_schema;
+
 /// The forced tool name used for the tool-forcing fallback (Anthropic).
 const RESPOND_TOOL_NAME: &str = "respond";
 
@@ -87,6 +90,11 @@ pub enum StructuredOutputError {
     /// The schema supplied in the response format is not a valid JSON Schema.
     #[error("invalid output JSON schema: {0}")]
     InvalidSchema(String),
+
+    /// The schema is valid JSON Schema, but `OpenAI` strict mode cannot preserve
+    /// its dynamic-property semantics.
+    #[error("output JSON schema is incompatible with OpenAI strict mode: {0}")]
+    IncompatibleSchema(String),
 
     /// The model produced no extractable structured value (no JSON text /
     /// no forced tool call).
@@ -141,8 +149,7 @@ pub async fn run_structured(
         .ok_or(StructuredOutputError::MissingResponseFormat)?;
 
     // Compile the validator once; reuse it across every retry.
-    let validator = jsonschema::validator_for(&response_format.schema)
-        .map_err(|e| StructuredOutputError::InvalidSchema(e.to_string()))?;
+    let validator = validator_for_provider(provider, &response_format)?;
 
     let support = provider.structured_output_support();
     if matches!(support, StructuredOutputSupport::ToolForcing) {
@@ -281,10 +288,10 @@ pub fn run_structured_stream(
             yield Err(StructuredOutputError::MissingResponseFormat);
             return;
         };
-        let validator = match jsonschema::validator_for(&response_format.schema) {
+        let validator = match validator_for_provider(provider, &response_format) {
             Ok(validator) => validator,
-            Err(e) => {
-                yield Err(StructuredOutputError::InvalidSchema(e.to_string()));
+            Err(error) => {
+                yield Err(error);
                 return;
             }
         };
@@ -598,6 +605,52 @@ fn collect_schema_errors(
         .collect()
 }
 
+/// Return the schema against which the structured runner should validate a
+/// provider response.
+///
+/// `OpenAI` strict mode does not use the caller's schema verbatim: it closes
+/// objects, requires all properties, and represents caller-optional properties
+/// as nullable. The provider sends that normalized schema on the wire, so the
+/// local validator must use the same one or it can reject a response `OpenAI`
+/// correctly produced (for example, an optional field emitted as `null`).
+#[cfg(feature = "openai")]
+fn validation_schema_for_provider(
+    provider: &dyn LlmProvider,
+    response_format: &ResponseFormat,
+) -> Result<serde_json::Value, StructuredOutputError> {
+    if response_format.strict
+        && matches!(
+            provider.structured_output_support(),
+            StructuredOutputSupport::Native
+        )
+        && matches!(provider.provider(), "openai" | "openai-responses")
+    {
+        return normalized_strict_schema(&response_format.schema)
+            .map_err(|error| StructuredOutputError::IncompatibleSchema(error.to_string()));
+    }
+
+    Ok(response_format.schema.clone())
+}
+
+#[cfg(feature = "openai")]
+fn validator_for_provider(
+    provider: &dyn LlmProvider,
+    response_format: &ResponseFormat,
+) -> Result<jsonschema::Validator, StructuredOutputError> {
+    let validation_schema = validation_schema_for_provider(provider, response_format)?;
+    jsonschema::validator_for(&validation_schema)
+        .map_err(|error| StructuredOutputError::InvalidSchema(error.to_string()))
+}
+
+#[cfg(not(feature = "openai"))]
+fn validator_for_provider(
+    _provider: &dyn LlmProvider,
+    response_format: &ResponseFormat,
+) -> Result<jsonschema::Validator, StructuredOutputError> {
+    jsonschema::validator_for(&response_format.schema)
+        .map_err(|error| StructuredOutputError::InvalidSchema(error.to_string()))
+}
+
 /// Inject the forced "respond" tool for providers without native JSON mode.
 fn apply_tool_forcing(request: &mut ChatRequest, response_format: &ResponseFormat) {
     let respond_tool = Tool {
@@ -826,6 +879,22 @@ mod tests {
         }
     }
 
+    fn request_with_optional_property_format() -> ChatRequest {
+        let mut request = request_with_format();
+        request.response_format = Some(ResponseFormat::new(
+            "optional-person",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "nickname": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ));
+        request
+    }
+
     fn success(content: Vec<ContentBlock>) -> ChatOutcome {
         ChatOutcome::Success(ChatResponse {
             id: "resp".to_owned(),
@@ -899,6 +968,72 @@ mod tests {
 
         assert_eq!(out.value["name"], "Grace");
         Ok(())
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn native_openai_validates_against_the_normalized_strict_schema() -> Result<()> {
+        for provider_name in ["openai", "openai-responses"] {
+            let provider = ScriptedProvider::new(
+                provider_name,
+                StructuredOutputSupport::Native,
+                vec![success(text_block(r#"{"name": "Ada", "nickname": null}"#))],
+            );
+
+            let output = run_structured(
+                &provider,
+                request_with_optional_property_format(),
+                StructuredConfig::default(),
+            )
+            .await?;
+
+            assert_eq!(output.value["nickname"], serde_json::Value::Null);
+            assert_eq!(provider.call_count(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_non_openai_uses_the_caller_schema() -> Result<()> {
+        let provider = ScriptedProvider::new(
+            "gemini",
+            StructuredOutputSupport::Native,
+            vec![success(text_block(r#"{"name": "Ada"}"#))],
+        );
+
+        let output = run_structured(
+            &provider,
+            request_with_optional_property_format(),
+            StructuredConfig::default(),
+        )
+        .await?;
+
+        assert_eq!(output.value["name"], "Ada");
+        assert!(output.value.get("nickname").is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn native_openai_rejects_dynamic_property_schemas_before_calling_provider() {
+        let provider = ScriptedProvider::new("openai", StructuredOutputSupport::Native, Vec::new());
+        let mut request = request_with_format();
+        request.response_format = Some(ResponseFormat::new(
+            "dynamic-properties",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"fixed": {"type": "string"}},
+                "additionalProperties": {"type": "string"}
+            }),
+        ));
+
+        let result = run_structured(&provider, request, StructuredConfig::default()).await;
+
+        assert!(matches!(
+            result,
+            Err(StructuredOutputError::IncompatibleSchema(_))
+        ));
+        assert_eq!(provider.call_count(), 0);
     }
 
     // ── Happy path: tool-forcing fallback (Anthropic) ─────────────────
@@ -1283,6 +1418,35 @@ mod tests {
         assert_eq!(final_out.value["name"], "Ada");
         assert_eq!(final_out.value["age"], 36);
         assert_eq!(final_out.retries, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn streaming_native_openai_uses_the_normalized_strict_schema() -> Result<()> {
+        let provider = StreamingProvider::new(
+            "openai-responses",
+            StructuredOutputSupport::Native,
+            vec![
+                StreamDelta::TextDelta {
+                    delta: r#"{"name": "Ada", "nickname": null}"#.to_owned(),
+                    block_index: 0,
+                },
+                StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ],
+        );
+
+        let stream = run_structured_stream(
+            &provider,
+            request_with_optional_property_format(),
+            StructuredConfig::default(),
+        );
+        let (_, final_output) = drive_stream(stream).await?;
+        let final_output = final_output.ok_or_else(|| anyhow::anyhow!("missing final output"))?;
+
+        assert_eq!(final_output.value["nickname"], serde_json::Value::Null);
         Ok(())
     }
 

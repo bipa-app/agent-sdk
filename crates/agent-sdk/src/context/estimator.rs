@@ -31,6 +31,12 @@ impl TokenEstimator {
     /// because they contain encrypted reasoning that the model must process.
     const REDACTED_THINKING_MIN_TOKENS: usize = 512;
 
+    /// Minimum estimate for an opaque provider reasoning item.
+    ///
+    /// The SDK never interprets the item, but it is still replayed into model
+    /// context and therefore needs a conservative non-zero estimate.
+    const OPAQUE_REASONING_MIN_TOKENS: usize = 512;
+
     /// Estimate tokens for a text string.
     #[must_use]
     pub const fn estimate_text(text: &str) -> usize {
@@ -68,6 +74,14 @@ impl TokenEstimator {
                 let raw_bytes = data.len() * 3 / 4;
                 let estimated = raw_bytes.div_ceil(Self::CHARS_PER_TOKEN);
                 estimated.max(Self::REDACTED_THINKING_MIN_TOKENS)
+            }
+            ContentBlock::OpaqueReasoning { provider, data } => {
+                // Account for the wire-sized JSON without allocating a
+                // serialized copy or exposing any payload value to logs.
+                let payload_tokens = Self::estimate_json_len(data)
+                    .div_ceil(Self::CHARS_PER_TOKEN)
+                    .max(Self::OPAQUE_REASONING_MIN_TOKENS);
+                Self::estimate_text(provider) + payload_tokens
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 // Estimate the serialized JSON length without actually
@@ -285,6 +299,23 @@ mod tests {
 
         let estimate = TokenEstimator::estimate_block(&block);
         assert_eq!(estimate, TokenEstimator::REDACTED_THINKING_MIN_TOKENS);
+    }
+
+    #[test]
+    fn estimate_opaque_reasoning_uses_payload_size_with_a_floor() {
+        let small = ContentBlock::OpaqueReasoning {
+            provider: "test-provider".to_owned(),
+            data: json!({"encrypted_content": "x"}),
+        };
+        let large = ContentBlock::OpaqueReasoning {
+            provider: "test-provider".to_owned(),
+            data: json!({"encrypted_content": "x".repeat(8_192)}),
+        };
+
+        let small_estimate = TokenEstimator::estimate_block(&small);
+        let large_estimate = TokenEstimator::estimate_block(&large);
+        assert!(small_estimate >= TokenEstimator::OPAQUE_REASONING_MIN_TOKENS);
+        assert!(large_estimate > small_estimate);
     }
 
     #[test]

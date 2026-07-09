@@ -219,6 +219,7 @@ where
                                     | StreamDelta::ToolInputDelta { .. }
                                     | StreamDelta::SignatureDelta { .. }
                                     | StreamDelta::RedactedThinking { .. }
+                                    | StreamDelta::OpaqueReasoning { .. }
                             ) {
                                 saw_output = true;
                             }
@@ -707,6 +708,40 @@ mod tests {
         assert!(matches!(
             deltas[0].as_ref().ok(),
             Some(StreamDelta::TextDelta { delta, .. }) if delta == "partial"
+        ));
+        assert!(matches!(
+            deltas[1].as_ref().ok(),
+            Some(StreamDelta::Error { message, .. }) if message.contains("401")
+        ));
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.stream_call_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_stream_401_after_opaque_reasoning_does_not_retry() -> Result<()> {
+        let mock = MockProvider::new();
+        mock.queue_stream(vec![
+            MockStreamItem::Ok(StreamDelta::OpaqueReasoning {
+                provider: "test-provider".to_owned(),
+                data: serde_json::json!({"encrypted_content": "ciphertext"}),
+                block_index: 0,
+            }),
+            MockStreamItem::Ok(StreamDelta::Error {
+                message: "401 Unauthorized".into(),
+                kind: StreamErrorKind::InvalidRequest,
+            }),
+        ])?;
+
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wrapped = wrap_success(&mock, &refresh_count);
+        let deltas = drain(wrapped.chat_stream(empty_request())).await;
+
+        assert_eq!(deltas.len(), 2);
+        assert!(matches!(
+            deltas[0].as_ref().ok(),
+            Some(StreamDelta::OpaqueReasoning { provider, .. })
+                if provider == "test-provider"
         ));
         assert!(matches!(
             deltas[1].as_ref().ok(),
