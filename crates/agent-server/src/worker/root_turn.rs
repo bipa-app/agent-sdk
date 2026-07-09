@@ -1356,7 +1356,7 @@ async fn commit_text_only_turn(
     committed_events.push(close_ctx.start_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
 
-    let (completed_task, _parent) = deps
+    let (completed_task, resumed_invocation) = deps
         .task_store
         .complete_task(
             task_id,
@@ -1366,6 +1366,19 @@ async fn commit_text_only_turn(
         )
         .await
         .context("complete root task")?;
+
+    // When this root turn is a subagent's child root, its terminal
+    // transition resumes the linked subagent invocation task
+    // (`WaitingOnChildren` → `Pending`) in the same locked scope. Nudge
+    // a parked worker so it claims the now-runnable invocation
+    // immediately instead of waiting out the acquisition ticker. A
+    // `None` (no linked invocation) or non-runnable row leaves the poll
+    // backstop to handle it.
+    if resumed_invocation.is_some_and(|t| t.status.is_runnable())
+        && let Some(signal) = deps.wakeup
+    {
+        signal.notify_workers();
+    }
 
     // Text-only completion: the turn is done, so finalize the root
     // `invoke_agent` span with its full duration + outcome. Usage is
@@ -3869,7 +3882,7 @@ async fn commit_resumed_turn(
     let committed_events = commit.committed_events.clone();
 
     // Advance the root task to Completed.
-    let (completed_task, _parent) = deps
+    let (completed_task, resumed_invocation) = deps
         .task_store
         .complete_task(
             task_id,
@@ -3879,6 +3892,19 @@ async fn commit_resumed_turn(
         )
         .await
         .context("complete resumed root task")?;
+
+    // When this root turn is a subagent's child root, its terminal
+    // transition resumes the linked subagent invocation task
+    // (`WaitingOnChildren` → `Pending`) in the same locked scope. Nudge
+    // a parked worker so it claims the now-runnable invocation
+    // immediately instead of waiting out the acquisition ticker. A
+    // `None` (no linked invocation) or non-runnable row leaves the poll
+    // backstop to handle it.
+    if resumed_invocation.is_some_and(|t| t.status.is_runnable())
+        && let Some(signal) = deps.wakeup
+    {
+        signal.notify_workers();
+    }
 
     // The resumed turn completed (no further tool calls) — finalize the
     // root `invoke_agent` span with its full duration spanning the tool

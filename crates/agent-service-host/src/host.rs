@@ -1123,7 +1123,7 @@ async fn execute_acquired_task(
     match task.kind {
         TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel).await,
         TaskKind::ToolRuntime => execute_tool_task(task, stores, runtime, cancel).await,
-        TaskKind::Subagent => execute_subagent_task_entry(task, stores).await,
+        TaskKind::Subagent => execute_subagent_task_entry(task, stores, runtime).await,
     }
 }
 
@@ -1439,7 +1439,11 @@ async fn execute_tool_task(
     }
 }
 
-async fn execute_subagent_task_entry(task: AgentTask, stores: &StoreRegistry) -> Result<()> {
+async fn execute_subagent_task_entry(
+    task: AgentTask,
+    stores: &StoreRegistry,
+    runtime: Arc<ExecutionRuntime>,
+) -> Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let (worker_id, lease_id) = running_lease(&task)?;
 
@@ -1458,9 +1462,23 @@ async fn execute_subagent_task_entry(task: AgentTask, stores: &StoreRegistry) ->
 
     match execute_subagent_task(bootstrap, &stores.subagent_result_deps(), now).await {
         Ok(SubagentTaskOutcome {
-            committed_events, ..
+            committed_events,
+            parent_task,
+            ..
         }) => {
             publish_events(stores, &committed_events);
+            // Completing the last child of a batch flips the parent
+            // root turn from `WaitingOnChildren` to `Pending` (runnable)
+            // in the same terminal transition. Nudge a parked worker so
+            // it resumes the parent turn immediately instead of waiting
+            // out the acquisition ticker. A `None` parent (still other
+            // live children) or a non-runnable parent leaves the poll
+            // backstop to handle it.
+            if parent_task.is_some_and(|p| p.status.is_runnable())
+                && let Some(signal) = runtime.wakeup_signal()
+            {
+                signal.notify_workers();
+            }
             Ok(())
         }
         Err(err) => {
