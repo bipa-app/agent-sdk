@@ -584,7 +584,9 @@ fn canonical_cache(cache: Option<&CacheConfig>) -> serde_json::Value {
 
     serde_json::json!({
         "enabled": cache.enabled,
-        "ttl": cache.ttl.map(|ttl| ttl.as_wire_str()),
+        "ttl": cache
+            .ttl
+            .map(agent_sdk_foundation::llm::CacheTtl::as_wire_str),
         "max_breakpoints": cache.max_breakpoints,
     })
 }
@@ -701,7 +703,7 @@ mod tests {
                     .with_ttl(CacheTtl::OneHour)
                     .with_max_breakpoints(2),
             ),
-            baseline.clone().with_session_id("session-1"),
+            baseline.with_session_id("session-1"),
             cached_content,
             explicitly_default_max_tokens,
         ];
