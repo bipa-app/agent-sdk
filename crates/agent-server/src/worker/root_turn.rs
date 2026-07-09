@@ -675,13 +675,32 @@ pub(crate) async fn commit_partial_turn_on_cancel(
                 response_model: None,
                 stop_reason: None,
                 outcome: TurnAttemptOutcome::Cancelled,
+                // Zero by design: this synthetic attempt exists only
+                // because the commit transaction requires an attempt id
+                // to close — the turn's REAL token usage already lives
+                // on its real attempt rows, closed by the cancel path.
+                // Repeating those numbers here would double-count in
+                // every consumer that sums attempt rows (cost ledgers,
+                // usage sweeps).
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
             },
             messages: prefix,
+            // Zero for the same reason: `turn_usage` advances the
+            // thread's aggregate token totals, which never included
+            // uncommitted turns — the measured usage stays on the
+            // attempt rows (the billing source of truth). Folding it in
+            // here would change aggregate semantics and double-count
+            // against attempt-summing readers.
             turn_usage: TokenUsage::default(),
             agent_state_snapshot,
+            // Empty by design: the turn's real events (tool calls,
+            // deltas) were committed INCREMENTALLY during streaming —
+            // that persistence is the very thing this salvage relies
+            // on. This field carries lifecycle events (`turn_complete`
+            // etc.), and fabricating one would falsely mark a cancelled
+            // turn as completed to every downstream consumer.
             events: Vec::new(),
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
             now,
