@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.5](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.4...agent-sdk-providers-v0.11.5) - 2026-07-09
+
+### Added
+
+- wire task wakeup + interleaved-thinking beta on API-key auth (Fixes 1, 3, 8) ([#338](https://github.com/bipa-app/agent-sdk/pull/338))
+
 ## [0.11.4](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.11.3...agent-sdk-providers-v0.11.4) - 2026-07-08
 
 ### Fixed
