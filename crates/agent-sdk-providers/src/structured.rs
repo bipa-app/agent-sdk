@@ -632,6 +632,7 @@ fn validation_schema_for_provider(
     Ok(response_format.schema.clone())
 }
 
+#[cfg(feature = "openai")]
 fn validator_for_provider(
     provider: &dyn LlmProvider,
     response_format: &ResponseFormat,
@@ -642,11 +643,12 @@ fn validator_for_provider(
 }
 
 #[cfg(not(feature = "openai"))]
-fn validation_schema_for_provider(
+fn validator_for_provider(
     _provider: &dyn LlmProvider,
     response_format: &ResponseFormat,
-) -> Result<serde_json::Value, StructuredOutputError> {
-    Ok(response_format.schema.clone())
+) -> Result<jsonschema::Validator, StructuredOutputError> {
+    jsonschema::validator_for(&response_format.schema)
+        .map_err(|error| StructuredOutputError::InvalidSchema(error.to_string()))
 }
 
 /// Inject the forced "respond" tool for providers without native JSON mode.

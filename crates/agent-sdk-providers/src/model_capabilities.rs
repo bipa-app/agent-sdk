@@ -290,48 +290,56 @@ const MODEL_CAPABILITIES: &[ModelCapabilities] = &[
         model_id: "gpt-5.6",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        pricing: None,
+        pricing: Some(Pricing::flat_with_cached(5.0, 30.0, 0.5).with_notes(
+            "Standard tier base rates. Cache writes cost $6.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: OPENAI_GPT56_SOL_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Official alias for GPT-5.6 Sol. Base rates are $5 input, $0.50 cached input, and $30 output per 1M tokens. Structured pricing is omitted because the current Pricing type cannot represent long-context or cache-write rates."),
+        notes: Some("Official alias for GPT-5.6 Sol."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-5.6-sol",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        pricing: None,
+        pricing: Some(Pricing::flat_with_cached(5.0, 30.0, 0.5).with_notes(
+            "Standard tier base rates. Cache writes cost $6.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: OPENAI_GPT56_SOL_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $5 input, $0.50 cached input, and $30 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-5.6-terra",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        pricing: None,
+        pricing: Some(Pricing::flat_with_cached(2.5, 15.0, 0.25).with_notes(
+            "Standard tier base rates. Cache writes cost $3.125/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: OPENAI_GPT56_TERRA_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $2.50 input, $0.25 cached input, and $15 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
     },
     ModelCapabilities {
         provider: "openai",
         model_id: "gpt-5.6-luna",
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        pricing: None,
+        pricing: Some(Pricing::flat_with_cached(1.0, 6.0, 0.1).with_notes(
+            "Standard tier base rates. Cache writes cost $1.25/M input tokens. Requests with more than 272K input tokens cost 2x input and 1.5x output for the full request.",
+        )),
         supports_thinking: true,
         supports_adaptive_thinking: true,
         source_url: OPENAI_GPT56_LUNA_URL,
         source_status: SourceStatus::Official,
-        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output. Base rates are $1 input, $0.10 cached input, and $6 output per 1M tokens; structured pricing is omitted because long-context and cache-write rates are not representable."),
+        notes: Some("Supports Chat Completions and Responses, 1.05M context, and 128K max output."),
     },
     ModelCapabilities {
         provider: "openai",
@@ -954,7 +962,12 @@ mod tests {
     fn test_lookup_openai_gpt56_family() -> anyhow::Result<()> {
         use anyhow::Context as _;
 
-        for model_id in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for (model_id, input, cached_input, output, cache_write_note) in [
+            ("gpt-5.6", 5.0, 0.5, 30.0, "$6.25/M"),
+            ("gpt-5.6-sol", 5.0, 0.5, 30.0, "$6.25/M"),
+            ("gpt-5.6-terra", 2.5, 0.25, 15.0, "$3.125/M"),
+            ("gpt-5.6-luna", 1.0, 0.1, 6.0, "$1.25/M"),
+        ] {
             let caps = get_model_capabilities("openai", model_id)
                 .with_context(|| format!("{model_id} capabilities missing"))?;
             assert_eq!(caps.context_window, Some(1_050_000));
@@ -962,11 +975,15 @@ mod tests {
             assert!(caps.supports_thinking);
             assert!(caps.supports_adaptive_thinking);
             assert_eq!(caps.source_status, SourceStatus::Official);
-            assert!(
-                caps.pricing.is_none(),
-                "tiered GPT-5.6 pricing must not produce a flat cost estimate"
-            );
-            assert!(caps.notes.is_some_and(|notes| notes.contains("Base rates")));
+            let pricing = caps
+                .pricing
+                .with_context(|| format!("{model_id} pricing missing"))?;
+            assert_eq!(pricing.input, Some(PricePoint::new(input)));
+            assert_eq!(pricing.cached_input, Some(PricePoint::new(cached_input)));
+            assert_eq!(pricing.output, Some(PricePoint::new(output)));
+            assert!(pricing.notes.is_some_and(|notes| {
+                notes.contains(cache_write_note) && notes.contains("more than 272K")
+            }));
         }
 
         Ok(())
